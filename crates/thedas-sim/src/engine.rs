@@ -1386,6 +1386,21 @@ pub fn call(
                 _ => Value::Resource(cell_string(c)),
             })
         }
+        // Dragon Age II: a number from ability `a[2]`'s row of the abilities table (M2DA 1,
+        // `ABI_*`), in the column whose name hashes to `a[1]`, for creature `a[0]`.
+        // Provisional: DA2's script.ldf declares it; how an upgrade the creature has to the
+        // ability changes the number is not traced, so the ability's own row answers.
+        "GetUpgradableAbilityHashedM2DAInt" | "GetUpgradableAbilityHashedM2DAFloat" => {
+            let table = h.sim.world.tables.get(1, "");
+            let c = table
+                .as_ref()
+                .and_then(|t| t.cell_by_hash(int(a, 1) as u32, int(a, 2) as i64));
+            ok(if name.ends_with("Float") {
+                Value::Float(cell_float(c))
+            } else {
+                Value::Int(cell_int(c))
+            })
+        }
         "GetM2DARows" => ok(Value::Int(
             h.sim
                 .world
@@ -4108,6 +4123,12 @@ pub fn call(
         "max" => ok(Value::Int(int(a, 0).max(int(a, 1)))),
         "minf" => ok(Value::Float(float(a, 0).min(float(a, 1)))),
         "maxf" => ok(Value::Float(float(a, 0).max(float(a, 1)))),
+        // Dragon Age II: whether `nInt` has every bit of `nFlag`. Provisional: from its
+        // script.ldf name and its callers' single-bit flags.
+        "hasflag" => ok(b((int(a, 0) & int(a, 1)) == int(a, 1))),
+        // Dragon Age II presentation calls (a sound parameter, blood decals on the ground):
+        // nothing in the simulation changes.
+        "SetAudioGameParameter" | "SpawnRandomDecals" => void(),
         // The player's profile unlocks, the cross-game vault and the GUI attribute tree are
         // not kept: none is set.
         "GetGlobalUnlock" | "GetVaultInt" | "GetAttributeBool" => ok(Value::Int(0)),
@@ -4940,7 +4961,10 @@ mod tests {
         string GetLocalString(object o, int n) = 991;\n\
         void SetLocalInt(object o, int n, int v) = 992;\n\
         int GetLocalInt(object o, int n) = 993;\n\
-        void PlayCutscene(resource r) = 994;\n";
+        void PlayCutscene(resource r) = 994;\n\
+        int hasflag(int nInt, int nFlag) = 420;\n\
+        int GetUpgradableAbilityHashedM2DAInt(object o, int nColumnHash, int nAbilityId) = 875;\n\
+        float GetUpgradableAbilityHashedM2DAFloat(object o, int nColumnHash, int nAbilityId) = 876;\n";
 
     #[test]
     fn dragon_age_2_functions_read_and_set_template_fields() {
@@ -4990,6 +5014,24 @@ mod tests {
         assert_eq!(
             run(&mut s, 1, "minf", &[Value::Float(2.5), Value::Float(1.5)]),
             Some(Value::Float(1.5))
+        );
+        assert_eq!(
+            run(
+                &mut s,
+                1,
+                "hasflag",
+                &[Value::Int(0b1010), Value::Int(0b1000)]
+            ),
+            Some(Value::Int(1))
+        );
+        assert_eq!(
+            run(
+                &mut s,
+                1,
+                "hasflag",
+                &[Value::Int(0b1010), Value::Int(0b0100)]
+            ),
+            Some(Value::Int(0))
         );
     }
 
@@ -5110,6 +5152,47 @@ mod tests {
         assert_eq!(
             read(&mut s, "GetHashedM2DAString", "Nope", 3),
             Some(Value::String(String::new()))
+        );
+    }
+
+    #[test]
+    fn dragon_age_2_upgradable_ability_numbers_come_from_the_ability_row() {
+        let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        s.world.tables().insert(
+            "#1",
+            &["Range", "Charges"],
+            vec![(307001, vec![Cell::Float(2.5), Cell::Int(3)])],
+        );
+        let npc = s.world.spawn(ObjectKind::Creature, "npc");
+        let col = |name: &str| Value::Int(thedas_formats::gda::column_hash(name) as i32);
+        let o = Value::Object(npc);
+        assert_eq!(
+            run(
+                &mut s,
+                1,
+                "GetUpgradableAbilityHashedM2DAFloat",
+                &[o.clone(), col("Range"), Value::Int(307001)]
+            ),
+            Some(Value::Float(2.5))
+        );
+        assert_eq!(
+            run(
+                &mut s,
+                1,
+                "GetUpgradableAbilityHashedM2DAInt",
+                &[o.clone(), col("Charges"), Value::Int(307001)]
+            ),
+            Some(Value::Int(3))
+        );
+        assert_eq!(
+            run(
+                &mut s,
+                1,
+                "GetUpgradableAbilityHashedM2DAInt",
+                &[o, col("Charges"), Value::Int(1)]
+            ),
+            Some(Value::Int(0))
         );
     }
 

@@ -447,12 +447,15 @@ const PAUSED_VOICES: [&str; 3] = ["VOambient", "VOconversation", "VOnarration"];
 ///   0x5bb7d6).
 /// - Death cues `death` (0xafed2c), character creation `chargen` (0xafed1c).
 /// - The interface, loading and the rest leave the track as it is.
+///
+/// A sound event can cue a track too ([`MusicDirector::cue`]): the cutscenes'
+/// `music/cutscene/*_switch` events.
 #[derive(Clone, Debug, PartialEq)]
 struct MusicDirector {
     mode: i32,
     track: &'static str,
-    /// A combat cue waiting: seconds left.
-    delayed: Option<f32>,
+    /// A cue waiting: seconds left and the track.
+    delayed: Option<(f32, &'static str)>,
 }
 
 impl MusicDirector {
@@ -471,7 +474,7 @@ impl MusicDirector {
             self.delayed = None;
             match mode {
                 GM_COMBAT if matches!(old, GM_GUI | GM_DIALOG | GM_CUTSCENE) => {
-                    self.delayed = Some(6.0)
+                    self.delayed = Some((6.0, "combat"))
                 }
                 GM_COMBAT => self.track = "combat",
                 GM_CUTSCENE if old == GM_DIALOG => {}
@@ -481,15 +484,44 @@ impl MusicDirector {
                 GM_CHARGEN => self.track = "chargen",
                 _ => {}
             }
-        } else if let Some(left) = self.delayed.as_mut() {
+        } else if let Some((left, track)) = self.delayed.as_mut() {
             *left -= dt;
             if *left <= 0.0 {
+                self.track = track;
                 self.delayed = None;
-                self.track = "combat";
             }
         }
         self.track
     }
+
+    /// A sound event's music cue (see `thedas_audio::MusicCue`), as the director takes it
+    /// when the event starts (0x5bac80 -> 0x5b70c0): with no delay the track is cued at
+    /// once; otherwise the cue waits like the deferred combat cue, replacing any waiting
+    /// one, until a game mode change drops it.
+    fn cue(&mut self, track: &'static str, delay: f32) {
+        if delay > 0.0 {
+            self.delayed = Some((delay, track));
+        } else {
+            self.track = track;
+        }
+    }
+}
+
+/// A `&'static str` for a music track name (the director's tracks are few: the theme's
+/// own and the cutscenes' cues), kept once each.
+fn intern_track(name: &str) -> &'static str {
+    static NAMES: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<&'static str>>> =
+        std::sync::OnceLock::new();
+    let mut names = NAMES
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(n) = names.get(name) {
+        return n;
+    }
+    let n: &'static str = Box::leak(name.to_string().into_boxed_str());
+    names.insert(n);
+    n
 }
 
 const GM_EXPLORE: i32 = 0;
@@ -2147,13 +2179,22 @@ impl GameAudio {
         }
         let mode = game_mode(&state);
         self.follow_mode(mode);
+        // Music cues of events started last frame (cutscenes' switch events).
+        for cue in self.engine.take_music_cues() {
+            log::info!(
+                "audio: music cue {} from {} (in {} s)",
+                cue.track,
+                cue.event,
+                cue.delay
+            );
+            self.director.cue(intern_track(&cue.track), cue.delay);
+        }
         let (was, before) = (self.director.mode, self.director.track);
         let track = self.director.update(mode, dt);
         if mode != was || track != before {
-            let waiting = if self.director.delayed.is_some() {
-                " (combat cue in 6 s)"
-            } else {
-                ""
+            let waiting = match self.director.delayed {
+                Some((left, t)) => format!(" ({t} cue in {left:.1} s)"),
+                None => String::new(),
             };
             log::info!("audio: game mode {was} -> {mode}: music track {track}{waiting}");
         }
@@ -2452,6 +2493,23 @@ mod tests {
         // Death and the rest: at once.
         assert!(music_cuts("main", "Death", GM_DEAD));
         assert!(music_cuts("Death", "main", GM_EXPLORE));
+    }
+
+    #[test]
+    fn a_sound_event_cues_a_track_at_once_or_after_its_delay() {
+        let mut d = MusicDirector::new();
+        d.update(GM_CUTSCENE, 0.1);
+        d.cue("pre400_ogre", 0.0);
+        assert_eq!(d.update(GM_CUTSCENE, 0.1), "pre400_ogre");
+        d.cue("tower", 1.0);
+        assert_eq!(d.update(GM_CUTSCENE, 0.5), "pre400_ogre");
+        assert_eq!(d.update(GM_CUTSCENE, 0.6), "tower");
+        // A mode change drops a waiting cue.
+        d.cue("other", 1.0);
+        assert_eq!(d.update(GM_EXPLORE, 0.1), "main");
+        assert_eq!(d.update(GM_EXPLORE, 2.0), "main");
+        assert_eq!(intern_track("pre400_ogre"), "pre400_ogre");
+        assert!(std::ptr::eq(intern_track("x1"), intern_track("x1")));
     }
 
     #[test]
