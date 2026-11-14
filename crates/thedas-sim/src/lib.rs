@@ -27,6 +27,7 @@ pub mod cuttracks;
 pub mod decay;
 pub mod derived;
 pub mod dialog;
+mod encounter;
 pub mod engine;
 pub mod fmath;
 pub mod inventory;
