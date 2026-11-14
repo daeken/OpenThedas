@@ -1640,11 +1640,12 @@ impl AreaRenderer {
         width: u32,
         height: u32,
     ) -> Result<Vec<u8>, GpuError> {
-        self.capture_with(ctx, camera, width, height, &mut [])
+        self.capture_with(ctx, camera, width, height, &mut [], &mut |_, _| {})
     }
 
     /// [`AreaRenderer::capture`] with `overlays` drawn over this renderer's pass (see
-    /// [`AreaRenderer::render_over`]).
+    /// [`AreaRenderer::render_over`]); `under` draws into the frame after this renderer's
+    /// pass and before the overlays (what lies on the ground under the creatures).
     pub fn capture_with(
         &mut self,
         ctx: &GpuContext,
@@ -1652,6 +1653,7 @@ impl AreaRenderer {
         width: u32,
         height: u32,
         overlays: &mut [&mut AreaRenderer],
+        under: &mut dyn FnMut(&mut wgpu::CommandEncoder, &wgpu::TextureView),
     ) -> Result<Vec<u8>, GpuError> {
         let target = ctx.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("capture"),
@@ -1690,6 +1692,7 @@ impl AreaRenderer {
         }
         self.finish_shadows(&mut encoder);
         self.render_pass(ctx, &mut encoder, &view, width, height, camera, None);
+        under(&mut encoder, &view);
         if !overlays.is_empty() {
             let depth = self.depth(&ctx.device, width, height);
             for o in overlays.iter_mut() {
