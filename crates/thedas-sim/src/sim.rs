@@ -86,6 +86,9 @@ pub struct Sim {
     /// Instructions a single script run may take.
     pub script_budget: u64,
     pub chargen_policy: ChargenPolicy,
+    /// Which game the install holds (set when a session opens it). Dragon Age II's
+    /// character creation has no quick start of its own (see [`Sim::start_chargen`]).
+    pub game: thedas_vfs::Game,
     pub cutscene_policy: CutscenePolicy,
     pub party_picker_policy: PartyPickerPolicy,
     /// The player's "auto-pause when combat starts" option (`GetAutoPauseCombatStatus`);
@@ -583,6 +586,7 @@ impl Sim {
             depth: 0,
             script_budget: 5_000_000,
             chargen_policy: ChargenPolicy::default(),
+            game: thedas_vfs::Game::Origins,
             cutscene_policy: CutscenePolicy::default(),
             party_picker_policy: PartyPickerPolicy::default(),
             auto_pause_combat: false,
@@ -1828,6 +1832,15 @@ impl Sim {
         // Level-up (mode 1) only starts when someone asked for it (`request_level_up`), so
         // it is left for them to finish.
         if self.chargen_policy == ChargenPolicy::QuickStart && mode == 0 {
+            // Dragon Age II's `sys_chargen` gives the hero no class when creation simply
+            // ends, and its prologue reads the class from the class abilities that choosing
+            // one grants. So the quick start chooses as a player would: male (gender 1),
+            // then warrior (class 1), each as the old and the new choice the screen sends.
+            // Provisional: the events' integers are read from DA2's `sys_chargen`.
+            if self.game == thedas_vfs::Game::DragonAge2 {
+                self.chargen_event("CHARGEN_SELECT_GENDER", vec![1, 1], Vec::new());
+                self.chargen_event("CHARGEN_SELECT_CLASS", vec![0, 1], Vec::new());
+            }
             self.chargen_event("CHARGEN_END", vec![mode, 0], Vec::new());
         }
     }
@@ -1902,6 +1915,39 @@ impl Sim {
 
     /// Moves an object and sends trigger ENTER/EXIT events for creatures that cross a
     /// trigger's outline. Movement is a teleport: only the destination is tested.
+    /// `DestroyObject`: an area of effect ends; anything else but the hero is removed, an
+    /// item first leaving whoever holds it: taken off if worn (its effects end and the
+    /// wearer hears UNEQUIP), then out of the inventory, so no dangling ids stay behind (the
+    /// City Elf house script destroys the hero's starting clothes). Provisional: the exe's
+    /// container removal on destruction is not traced.
+    pub(crate) fn destroy_object(&mut self, id: ObjectId) {
+        if self
+            .world
+            .get(id)
+            .is_some_and(|o| o.kind == ObjectKind::AreaOfEffect)
+        {
+            self.destroy_aoe(id);
+            return;
+        }
+        if Some(id) == self.world.hero {
+            return;
+        }
+        let holders: Vec<ObjectId> = self
+            .world
+            .objects
+            .values()
+            .filter(|o| o.inventory.contains(&id))
+            .map(|o| o.id)
+            .collect();
+        for holder in holders {
+            self.unequip(holder, id);
+            if let Some(o) = self.world.get_mut(holder) {
+                o.inventory.retain(|&i| i != id);
+            }
+        }
+        self.world.objects.remove(&id);
+    }
+
     pub fn move_object(&mut self, id: ObjectId, position: [f32; 3], area: Option<ObjectId>) {
         if let Some(o) = self.world.get_mut(id) {
             o.position = position;

@@ -1069,34 +1069,7 @@ pub fn call(
             }))
         }
         "DestroyObject" => {
-            let id = obj(a, 0);
-            if h.object(id)
-                .is_some_and(|o| o.kind == ObjectKind::AreaOfEffect)
-            {
-                h.sim.destroy_aoe(id);
-                return void();
-            }
-            if Some(id) != h.sim.world.hero {
-                // An item leaves whoever holds it: taken off if worn (its effects end and the
-                // wearer hears UNEQUIP), then out of the inventory, so no dangling ids stay
-                // behind (the City Elf house script destroys the hero's starting clothes).
-                // Provisional: the exe's container removal on destruction is not traced.
-                let holders: Vec<ObjectId> = h
-                    .sim
-                    .world
-                    .objects
-                    .values()
-                    .filter(|o| o.inventory.contains(&id))
-                    .map(|o| o.id)
-                    .collect();
-                for holder in holders {
-                    h.sim.unequip(holder, id);
-                    if let Some(o) = h.sim.world.get_mut(holder) {
-                        o.inventory.retain(|&i| i != id);
-                    }
-                }
-                h.sim.world.objects.remove(&id);
-            }
+            h.sim.destroy_object(obj(a, 0));
             void()
         }
         "CreateObject" => {
@@ -3072,6 +3045,31 @@ pub fn call(
         // hero; the owner must be an active, living creature. Nothing here looks at the game
         // mode: a conversation may start in combat (and replaces it, see
         // `Sim::start_conversation`).
+        // Dragon Age II's `int BeginConversation(object oTarget, resource rConversationFile)`
+        // has no owner argument: the script's object talks to the target. Provisional: from
+        // DA2's script.ldf declaration and its prologue, whose plot script starts the
+        // player's own conversation (`pro000_opening_pc`) running as the player's creature.
+        "BeginConversation" if matches!(a.get(1), Some(Value::Resource(_) | Value::String(_))) => {
+            let target = obj(a, 0);
+            let owner = if h
+                .object(caller)
+                .is_some_and(|o| o.kind == ObjectKind::Creature)
+            {
+                caller
+            } else {
+                target
+            };
+            let target = if target == owner {
+                h.sim.world.hero.unwrap_or(target)
+            } else {
+                target
+            };
+            let can = h
+                .object(owner)
+                .is_some_and(|o| o.kind == ObjectKind::Creature && o.active && !o.dead);
+            let ok_ = can && h.sim.start_conversation(target, owner, &string(a, 1));
+            ok(b(ok_))
+        }
         "BeginConversation" => {
             let owner = obj(a, 1);
             let mut target = obj(a, 0);

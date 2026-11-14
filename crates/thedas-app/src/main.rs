@@ -1910,6 +1910,8 @@ impl App {
             return None;
         }
         let (mut done, mut failed) = workspace::apply(&changes, &overrides);
+        // Objects moved in a saved file, moved in the world after the meshes.
+        let mut moves = Vec::new();
         // Saved meshes: read against the game's own files, not earlier live edits.
         if !glbs.is_empty() {
             let vfs = self.live.as_ref().map(|l| l.sim().vfs.clone());
@@ -1923,11 +1925,14 @@ impl App {
             };
             for g in &glbs {
                 match workspace::import_glb(g, &overrides, &read) {
-                    Ok((written, notes)) => {
-                        for n in notes {
+                    Ok(r) => {
+                        for n in &r.notes {
                             log::info!("live edits: {}: {n}", g.display());
                         }
-                        done.extend(written);
+                        done.extend(r.written);
+                        if let Some(m) = r.moved {
+                            moves.push(m);
+                        }
                     }
                     Err(e) => failed.push(format!("{}: {e}", g.display())),
                 }
@@ -1942,13 +1947,42 @@ impl App {
                 l.reload(&done);
             }
         }
+        let mut placed = Vec::new();
+        for (id, tag, p) in moves {
+            // The exported object, if it is still that one; else the one with its tag here.
+            let target = self.live.as_ref().and_then(|l| {
+                let sim = l.sim();
+                match sim.world.get(id) {
+                    Some(o) if o.tag.eq_ignore_ascii_case(&tag) => Some(id),
+                    _ => sim.world.find_tag(&tag, 0),
+                }
+            });
+            match target {
+                Some(t) => {
+                    let n = self.place_object(
+                        thedas_sim::commands::SimCommand::MoveObject {
+                            target: t,
+                            position: p.position,
+                            facing: p.facing,
+                        },
+                        format!("move {tag} (from Blender)"),
+                    );
+                    placed.push(n);
+                }
+                None => failed.push(format!("{tag}: not in the world to move")),
+            }
+        }
+        let mut said = Vec::new();
+        if !done.is_empty() {
+            said.push(format!("{} updated", done.join(", ")));
+        }
+        said.extend(placed);
+        if said.is_empty() {
+            said.push("nothing written".into());
+        }
         let note = format!(
             "Live edits: {}{}",
-            if done.is_empty() {
-                "nothing written".to_string()
-            } else {
-                format!("{} updated", done.join(", "))
-            },
+            said.join("; "),
             if failed.is_empty() {
                 String::new()
             } else {
@@ -2003,6 +2037,63 @@ impl App {
                         m.live_note = Some(note);
                     }
                 }
+                modmode::Action::Move {
+                    id,
+                    position,
+                    facing,
+                } => {
+                    self.mod_mode_place(
+                        thedas_sim::commands::SimCommand::MoveObject {
+                            target: id,
+                            position,
+                            facing,
+                        },
+                        format!("move {id}"),
+                    );
+                }
+                modmode::Action::MoveToView(id) => {
+                    if let Some(at) = self.view_point() {
+                        let facing = self
+                            .live
+                            .as_ref()
+                            .and_then(|l| l.sim().world.get(id).map(|o| o.facing))
+                            .unwrap_or(0.0);
+                        self.mod_mode_place(
+                            thedas_sim::commands::SimCommand::MoveObject {
+                                target: id,
+                                position: at,
+                                facing,
+                            },
+                            format!("move {id} to the view"),
+                        );
+                    }
+                }
+                modmode::Action::Spawn { creature, template } => {
+                    if let Some(at) = self.view_point() {
+                        // Facing the camera.
+                        let facing = (self.camera.yaw.to_degrees() + 90.0).rem_euclid(360.0);
+                        let kind = if creature {
+                            thedas_sim::world::ObjectKind::Creature
+                        } else {
+                            thedas_sim::world::ObjectKind::Placeable
+                        };
+                        self.mod_mode_place(
+                            thedas_sim::commands::SimCommand::CreateObject {
+                                kind,
+                                template: template.clone(),
+                                position: at,
+                                facing,
+                            },
+                            format!("spawn {template}"),
+                        );
+                    }
+                }
+                modmode::Action::Remove(id) => {
+                    self.mod_mode_place(
+                        thedas_sim::commands::SimCommand::DestroyObject { target: id },
+                        format!("remove {id}"),
+                    );
+                }
                 modmode::Action::Export(id) => {
                     let note = self.export_glb(id);
                     if let Some(m) = self.mod_mode.as_mut() {
@@ -2031,6 +2122,55 @@ impl App {
                 m.scrub = None;
             }
         }
+    }
+
+    /// A move, spawn or removal from mod mode: applied as mod mode's command, kept in its
+    /// history (with what undoes it), and the objects drawn anew.
+    fn mod_mode_place(
+        &mut self,
+        command: thedas_sim::commands::SimCommand,
+        what: String,
+    ) -> String {
+        if self.mod_mode.is_none() {
+            return "mod mode is not open".into();
+        }
+        self.place_object(command, what)
+    }
+
+    /// [`App::mod_mode_place`], also when mod mode's panels were never opened (live edits
+    /// from the launch option): the history is kept once they are.
+    fn place_object(&mut self, command: thedas_sim::commands::SimCommand, what: String) -> String {
+        let Some(live) = self.live.as_mut() else {
+            return "not playing".into();
+        };
+        let edit = {
+            let mut sim = live.sim();
+            modconv::object_edit(&mut sim, command, what)
+        };
+        let Some(m) = self.mod_mode.as_mut() else {
+            log::info!("mod mode: {}", edit.text);
+            return edit.text;
+        };
+        // Positions are read each frame, and a made or removed object changes the objects'
+        // key, which rebuilds them.
+        let note = edit.text.clone();
+        log::info!("mod mode: {note}");
+        m.placed = Some(note.clone());
+        m.convs.status = note.clone();
+        m.convs.history.push(edit);
+        note
+    }
+
+    /// Where the middle of the view meets the ground (or the object there), in the world.
+    fn view_point(&mut self) -> Option<[f32; 3]> {
+        let (live, g) = (self.live.as_mut()?, self.gfx.as_ref()?);
+        let (w, h) = (g.config.width as f32, g.config.height as f32);
+        let (origin, dir) = self.camera.ray(w / 2.0, h / 2.0, w, h);
+        let at = match live.pick(origin, dir)? {
+            live::Pick::Ground(p) => p,
+            live::Pick::Object(id) => live.sim().world.get(id)?.position,
+        };
+        Some(at)
     }
 
     /// Carries out a world-state browser request on the simulation.
@@ -3173,6 +3313,15 @@ impl App {
                     log::info!("leading with {tag}");
                 }
             }
+            // `SwapWeaponSets` (keymap.gda binds it to /): the controlled party member's other
+            // weapon set, as the quickbar's weapon set button. Provisional: the key is fixed
+            // here, not read from the player's bindings.
+            KeyCode::Slash if self.live.is_some() => {
+                if let Some(live) = self.live.as_ref() {
+                    switch_weapon_set(live);
+                    log::info!("weapon set switched");
+                }
+            }
             // The quickbar's first ten slots: 1 to 9, then 0.
             c if self.live.is_some() && quickslot_key(c).is_some() => {
                 let slot = quickslot_key(c).unwrap_or(0);
@@ -3644,6 +3793,10 @@ impl App {
                     None => format!("quickslot {}", slot + 1),
                 });
             }
+            Step::SwapWeapons => {
+                self.key_down(KeyCode::Slash);
+                log.push("weapon set key".into());
+            }
             Step::Pause => {
                 // As the Space key does (a training tutorial takes it as its unpause).
                 if let Some(live) = self.live.as_mut() {
@@ -3707,6 +3860,68 @@ impl App {
             Step::ModWorld => log.push(self.mod_mode_world_step(None)),
             Step::ModPlot(name) => log.push(self.mod_mode_world_step(Some(name))),
             &Step::ModLive(on) => log.push(workspace::mount(on).unwrap_or_else(|e| e)),
+            &Step::ModMove(position, facing) => {
+                log.push(match self.mod_mode.as_ref().and_then(|m| m.selected) {
+                    Some(id) => self.mod_mode_place(
+                        thedas_sim::commands::SimCommand::MoveObject {
+                            target: id,
+                            position,
+                            facing,
+                        },
+                        format!("move {id}"),
+                    ),
+                    None => "modmove: nothing inspected".into(),
+                })
+            }
+            Step::ModMoveView => {
+                let id = self.mod_mode.as_ref().and_then(|m| m.selected);
+                log.push(match (id, self.view_point()) {
+                    (Some(id), Some(at)) => {
+                        let facing = self
+                            .live
+                            .as_ref()
+                            .and_then(|l| l.sim().world.get(id).map(|o| o.facing))
+                            .unwrap_or(0.0);
+                        self.mod_mode_place(
+                            thedas_sim::commands::SimCommand::MoveObject {
+                                target: id,
+                                position: at,
+                                facing,
+                            },
+                            format!("move {id} to the view"),
+                        )
+                    }
+                    (None, _) => "modmoveview: nothing inspected".into(),
+                    (_, None) => "modmoveview: the view meets no ground".into(),
+                });
+            }
+            Step::ModSpawn(creature, template) => {
+                let kind = if *creature {
+                    thedas_sim::world::ObjectKind::Creature
+                } else {
+                    thedas_sim::world::ObjectKind::Placeable
+                };
+                let facing = (self.camera.yaw.to_degrees() + 90.0).rem_euclid(360.0);
+                log.push(match self.view_point() {
+                    Some(at) => self.mod_mode_place(
+                        thedas_sim::commands::SimCommand::CreateObject {
+                            kind,
+                            template: template.clone(),
+                            position: at,
+                            facing,
+                        },
+                        format!("spawn {template}"),
+                    ),
+                    None => "modspawn: the view meets no ground".into(),
+                });
+            }
+            Step::ModRemove => log.push(match self.mod_mode.as_ref().and_then(|m| m.selected) {
+                Some(id) => self.mod_mode_place(
+                    thedas_sim::commands::SimCommand::DestroyObject { target: id },
+                    format!("remove {id}"),
+                ),
+                None => "modremove: nothing inspected".into(),
+            }),
             Step::ModSync => log.push(
                 self.live_edit_sync()
                     .unwrap_or_else(|| "Live edits: nothing changed".into()),
@@ -5203,6 +5418,8 @@ enum Step {
     Quickslot(i32),
     /// Space: the game pauses or carries on.
     Pause,
+    /// The weapon set key (/).
+    SwapWeapons,
     /// F10: mod mode's panels open or close (windowed only).
     ModMode,
     /// Mod mode's inspector picks the creature or placeable with this tag nearest the
@@ -5234,6 +5451,15 @@ enum Step {
     ModLive(bool),
     /// Live edits look for saved textures now (`modsync`).
     ModSync,
+    /// The inspected object is put at a place, turned to a facing (`modmove X,Y,Z F`).
+    ModMove([f32; 3], f32),
+    /// The inspected object is put where the view's middle meets the ground (`modmoveview`).
+    ModMoveView,
+    /// A creature or placeable is made from a template where the view's middle meets the
+    /// ground (`modspawn creature TEMPLATE`, `modspawn placeable TEMPLATE`).
+    ModSpawn(bool, String),
+    /// The inspected object is removed (`modremove`).
+    ModRemove,
     /// A variable set from the world-state browser (`modlocal WHO NAME TYPE VALUE`, WHO
     /// `module`, `area` or an object's tag; TYPE `int`, `float`, `string`, `object` or
     /// `resource`, or `remove` with no value).
@@ -5374,6 +5600,18 @@ fn set_client_option(ui: Option<&ui::UiLayer>, live: Option<&live::Live>, name: 
             },
         );
     }
+}
+
+/// The weapon set key: the controlled party member switches to its other set, as the
+/// quickbar's weapon set button does.
+fn switch_weapon_set(live: &live::Live) {
+    live.sim().input(
+        thedas_sim::commands::CommandSource::Player,
+        thedas_sim::commands::SimCommand::GuiMessage {
+            name: thedas_sim::inventory::MSG_SWITCH_WEAPON_SET.into(),
+            args: vec!["-1".into()],
+        },
+    );
 }
 
 /// Whether the screen up is one the game put up that the player leaves by its Close: a store,
@@ -5605,6 +5843,7 @@ fn parse_step(s: &str) -> Result<Step> {
             Step::Leader(arg[1..].parse::<usize>()? - 1)
         }
         "key" if arg.eq_ignore_ascii_case("space") => Step::Pause,
+        "key" if arg == "/" => Step::SwapWeapons,
         "key" if arg.eq_ignore_ascii_case("f10") => Step::ModMode,
         "modmode" => Step::ModMode,
         "modselect" if !arg.is_empty() => Step::ModSelect(arg.to_string()),
@@ -5639,6 +5878,27 @@ fn parse_step(s: &str) -> Result<Step> {
             _ => bail!("modlive takes on or off"),
         }),
         "modsync" => Step::ModSync,
+        "modmove" => {
+            let (at, f) = arg.split_once(' ').context("modmove takes X,Y,Z FACING")?;
+            let v: Vec<f32> = at
+                .split(',')
+                .map(|x| x.trim().parse::<f32>())
+                .collect::<Result<_, _>>()
+                .context("modmove's place is X,Y,Z")?;
+            let [x, y, z] = v[..] else {
+                bail!("modmove's place is X,Y,Z");
+            };
+            Step::ModMove([x, y, z], f.trim().parse().context("modmove's facing")?)
+        }
+        "modmoveview" => Step::ModMoveView,
+        "modspawn" => match arg.split_once(' ') {
+            Some(("creature", t)) if !t.trim().is_empty() => Step::ModSpawn(true, t.trim().into()),
+            Some(("placeable", t)) if !t.trim().is_empty() => {
+                Step::ModSpawn(false, t.trim().into())
+            }
+            _ => bail!("modspawn takes creature|placeable TEMPLATE"),
+        },
+        "modremove" => Step::ModRemove,
         "modlocal" => {
             let mut w = arg.splitn(4, ' ');
             let (Some(who), Some(name), Some(kind)) = (w.next(), w.next(), w.next()) else {
@@ -5973,6 +6233,10 @@ fn main() -> Result<()> {
                     | Step::ModExport
                     | Step::ModLive(_)
                     | Step::ModSync
+                    | Step::ModMove(..)
+                    | Step::ModMoveView
+                    | Step::ModSpawn(..)
+                    | Step::ModRemove
                     | Step::ModLocal(..) => {
                         println!("mod mode: windowed only")
                     }
@@ -6360,6 +6624,10 @@ fn main() -> Result<()> {
                         Some(ability) => println!("aiming ability {ability}"),
                         None => println!("quickslot {}", slot + 1),
                     },
+                    Step::SwapWeapons => {
+                        switch_weapon_set(l);
+                        println!("weapon set switched");
+                    }
                     Step::Pause => {
                         // As the Space key does (a training tutorial takes it as its unpause).
                         l.toggle_pause();
@@ -6827,6 +7095,18 @@ mod tests {
             ]
         );
         assert!(parse_steps("modflag gen00pt_party 3").is_err());
+        assert_eq!(
+            parse_steps("modmove 1,2.5,-3 90; modmoveview; modspawn creature c_wolf; modremove")
+                .unwrap(),
+            vec![
+                Step::ModMove([1.0, 2.5, -3.0], 90.0),
+                Step::ModMoveView,
+                Step::ModSpawn(true, "c_wolf".into()),
+                Step::ModRemove,
+            ]
+        );
+        assert!(parse_steps("modspawn trigger x").is_err());
+        assert!(parse_steps("modmove 1,2 0").is_err());
         assert_eq!(
             parse_steps(
                 "modfly; modflyto; modworld; modplot plt_a; modlocal module X string a b; \
