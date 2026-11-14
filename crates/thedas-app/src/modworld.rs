@@ -127,9 +127,46 @@ pub struct Snapshot {
     pub area: Option<VarSet>,
     /// The inspected object's variables.
     pub object: Option<VarSet>,
+    /// The inspected creature's properties and the effects on it.
+    pub stats: Option<Stats>,
     pub things: Vec<Thing>,
     /// The plots with stored flags.
     pub plots: Vec<Plot>,
+}
+
+/// One of a creature's properties.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Stat {
+    pub id: i32,
+    /// Its name from the scripts' `PROPERTY_*` constants.
+    pub name: String,
+    pub base: f32,
+    /// A depletable's current value (health, mana or stamina).
+    pub current: Option<f32>,
+    /// What effects and worn items add.
+    pub modifier: f32,
+    pub total: f32,
+}
+
+/// One effect on a creature.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EffectLine {
+    /// Its type's name from the scripts' `EFFECT_TYPE_*` constants.
+    pub kind: String,
+    pub ability: i32,
+    pub creator: Option<String>,
+    /// Seconds left, for one that runs out.
+    pub left_s: Option<f32>,
+    pub hostile: bool,
+    pub numbers: String,
+}
+
+/// A creature's properties and effects.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Stats {
+    pub id: ObjectId,
+    pub stats: Vec<Stat>,
+    pub effects: Vec<EffectLine>,
 }
 
 /// What the browser asks the app to do.
@@ -155,6 +192,13 @@ pub enum WorldAction {
     },
     /// Undo history entry n (see [`crate::modconv::Convs::history`]).
     Undo(usize),
+    /// Set a creature's property: its base, its current value, or both.
+    SetStat {
+        target: ObjectId,
+        property: i32,
+        base: Option<f32>,
+        current: Option<f32>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -180,6 +224,8 @@ pub struct WorldBrowser {
     call_script: bool,
     editing: Option<Editing>,
     adding: Adding,
+    /// A property being typed: (property, base, current).
+    stat_edit: Option<(i32, f32, Option<f32>)>,
 }
 
 impl WorldBrowser {
@@ -281,6 +327,10 @@ impl WorldBrowser {
                 Some(set) => {
                     ui.label(format!("{}'s variables", set.tag));
                     vars(ui, "object", set, &keep, editing, adding, actions);
+                    if let Some(st) = &snap.stats {
+                        ui.separator();
+                        stats(ui, st, &keep, &mut self.stat_edit, actions);
+                    }
                 }
             },
             Tab::Plots => {
@@ -591,6 +641,17 @@ pub fn carry_out(
             convs.history.push(edit);
             browser.snapshot = Some(snapshot(sim, selected));
         }
+        WorldAction::SetStat {
+            target,
+            property,
+            base,
+            current,
+        } => {
+            let edit = crate::modconv::set_property(sim, target, property, base, current);
+            convs.status = edit.text.clone();
+            convs.history.push(edit);
+            browser.snapshot = Some(snapshot(sim, selected));
+        }
         WorldAction::Undo(n) => {
             crate::modconv::carry_out(sim, convs, crate::modconv::ConvAction::Undo(n), selected);
             browser.snapshot = Some(snapshot(sim, selected));
@@ -619,6 +680,7 @@ pub fn snapshot(sim: &mut Sim, selected: Option<ObjectId>) -> Snapshot {
         })
     };
     let (module, area, object) = (set(w.module), set(w.area), set(selected));
+    let stats = selected.and_then(|s| creature_stats(sim, s));
     let mut things: Vec<Thing> = w
         .objects
         .values()
@@ -669,6 +731,7 @@ pub fn snapshot(sim: &mut Sim, selected: Option<ObjectId>) -> Snapshot {
         module,
         area,
         object,
+        stats,
         things,
         plots,
     }
@@ -762,6 +825,181 @@ fn var(name: &str, kind: &'static str, value: String) -> Var {
         value,
         raw: None,
     }
+}
+
+/// The names the scripts give numbers, by prefix: `PROPERTY_ATTRIBUTE_STRENGTH` ->
+/// `STRENGTH` (first name wins).
+fn constant_names(sim: &Sim, prefixes: &[&str]) -> std::collections::BTreeMap<i32, String> {
+    use thedas_script::ldf::ConstValue;
+    let mut out = std::collections::BTreeMap::new();
+    for c in &sim.table.constants {
+        let Some(p) = prefixes.iter().find(|p| c.name.starts_with(**p)) else {
+            continue;
+        };
+        if let ConstValue::Int(v) = c.value {
+            out.entry(v as i32)
+                .or_insert_with(|| c.name[p.len()..].to_string());
+        }
+    }
+    out
+}
+
+/// A creature's properties (each with its name, base, current, modifier and total) and the
+/// effects on it.
+pub fn creature_stats(sim: &Sim, id: ObjectId) -> Option<Stats> {
+    let o = sim.world.get(id)?;
+    if o.kind != ObjectKind::Creature {
+        return None;
+    }
+    let names = constant_names(
+        sim,
+        &[
+            "PROPERTY_ATTRIBUTE_",
+            "PROPERTY_SIMPLE_",
+            "PROPERTY_DEPLETABLE_",
+            "PROPERTY_DERIVED_",
+        ],
+    );
+    let kinds = constant_names(sim, &["EFFECT_TYPE_"]);
+    let depletable = |p: i32| {
+        thedas_sim::engine::property_kind(sim, p) == thedas_sim::engine::PropertyKind::Depletable
+    };
+    let mut ids: Vec<i32> = o.properties.keys().copied().collect();
+    ids.extend(names.keys().filter(|p| !o.properties.contains_key(p)));
+    ids.sort();
+    ids.dedup();
+    let stats = ids
+        .into_iter()
+        .filter(|p| o.properties.contains_key(p) || names.contains_key(p))
+        .map(|p| {
+            let (base, current) = o.properties.get(&p).copied().unwrap_or((0.0, 0.0));
+            Stat {
+                id: p,
+                name: names
+                    .get(&p)
+                    .cloned()
+                    .unwrap_or_else(|| format!("property {p}")),
+                base,
+                current: depletable(p).then_some(current),
+                modifier: o.modifiers.get(&p).copied().unwrap_or(0.0),
+                total: sim.property_total(id, p),
+            }
+        })
+        .collect();
+    let now = sim.world.time_ms;
+    let effects = o
+        .effects
+        .iter()
+        .map(|e| EffectLine {
+            kind: kinds
+                .get(&e.ty)
+                .cloned()
+                .unwrap_or_else(|| format!("type {}", e.ty)),
+            ability: e.ability,
+            creator: e
+                .creator
+                .and_then(|c| sim.world.get(c))
+                .map(|c| c.tag.clone()),
+            left_s: e.expires.map(|t| t.saturating_sub(now) as f32 / 1000.0),
+            hostile: e.hostile,
+            numbers: e
+                .ints
+                .iter()
+                .map(|i| i.to_string())
+                .chain(e.floats.iter().map(|f| format!("{f}")))
+                .collect::<Vec<_>>()
+                .join(", "),
+        })
+        .collect();
+    Some(Stats { id, stats, effects })
+}
+
+/// The inspected creature's properties (filtered; each editable) and its effects.
+fn stats(
+    ui: &mut egui::Ui,
+    st: &Stats,
+    keep: &dyn Fn(&str) -> bool,
+    edit: &mut Option<(i32, f32, Option<f32>)>,
+    actions: &mut Vec<WorldAction>,
+) {
+    ui.label("Properties");
+    egui::ScrollArea::vertical()
+        .id_salt("stats")
+        .max_height(220.0)
+        .show(ui, |ui| {
+            egui::Grid::new("stats grid").striped(true).show(ui, |ui| {
+                ui.weak("property");
+                ui.weak("base");
+                ui.weak("current");
+                ui.weak("+ effects");
+                ui.weak("total");
+                ui.end_row();
+                for s in st.stats.iter().filter(|s| keep(&s.name)) {
+                    ui.monospace(&s.name);
+                    let here = edit.is_some_and(|(p, ..)| p == s.id);
+                    if here && let Some((_, b, c)) = edit.as_mut() {
+                        ui.add(egui::DragValue::new(b).speed(0.5));
+                        match c {
+                            Some(c) => {
+                                ui.add(egui::DragValue::new(c).speed(0.5));
+                            }
+                            None => {
+                                ui.weak("—");
+                            }
+                        }
+                        let (b, c) = (*b, *c);
+                        ui.horizontal(|ui| {
+                            if ui.small_button("Apply").clicked() {
+                                actions.push(WorldAction::SetStat {
+                                    target: st.id,
+                                    property: s.id,
+                                    base: (b != s.base).then_some(b),
+                                    current: c.filter(|c| Some(*c) != s.current),
+                                });
+                                *edit = None;
+                            }
+                            if ui.small_button("Cancel").clicked() {
+                                *edit = None;
+                            }
+                        });
+                    } else {
+                        ui.monospace(format!("{}", s.base));
+                        ui.monospace(s.current.map_or("—".into(), |c| format!("{c}")));
+                        ui.horizontal(|ui| {
+                            ui.monospace(format!("{:+}", s.modifier));
+                            if ui.small_button("edit").clicked() {
+                                *edit = Some((s.id, s.base, s.current));
+                            }
+                        });
+                    }
+                    ui.monospace(format!("{}", s.total));
+                    ui.end_row();
+                }
+            });
+        });
+    ui.label(format!("Effects ({})", st.effects.len()));
+    egui::ScrollArea::vertical()
+        .id_salt("effects")
+        .max_height(140.0)
+        .show(ui, |ui| {
+            for e in &st.effects {
+                let left = e
+                    .left_s
+                    .map_or("lasting".into(), |s| format!("{s:.1} s left"));
+                let by = e
+                    .creator
+                    .as_deref()
+                    .map_or(String::new(), |c| format!(", from {c}"));
+                let hostile = if e.hostile { ", hostile" } else { "" };
+                ui.monospace(format!(
+                    "{} (ability {}{by}{hostile}): {left}; {}",
+                    e.kind, e.ability, e.numbers
+                ));
+            }
+            if st.effects.is_empty() {
+                ui.weak("none");
+            }
+        });
 }
 
 /// The free camera moved to look at `target` (an object's feet) from 5 m off, keeping

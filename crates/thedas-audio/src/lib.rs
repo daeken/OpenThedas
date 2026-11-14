@@ -25,6 +25,6 @@ pub mod reverb;
 pub mod wav;
 
 pub use decode::{Pcm, decode};
-pub use engine::{AudioEngine, EventHandle, PlayOptions, Volumes};
+pub use engine::{AudioEngine, EventHandle, MusicCue, PlayOptions, Volumes};
 pub use library::Library;
 pub use mixer::{Bus, Mixer, VoiceId, VoiceParams};

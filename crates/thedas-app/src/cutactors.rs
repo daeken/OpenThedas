@@ -19,8 +19,9 @@
 //! surface under it; animations are laid over each other by the bones they move, not
 //! blended by weight; which animations play when, see
 //! [`thedas_sim::cuttracks::Actor::animations_at`]; one loops when the creature's own
-//! trees loop it (4027 0), else when it spans the whole cutscene; the cutscene's own
-//! creatures stand in their template's look (equipment from its items).
+//! trees loop it (4027 0), else when the cutscene's own tree loops its node or it spans
+//! the whole cutscene (see `live::cut_layer`); the cutscene's own creatures stand in their
+//! template's look (equipment from its items).
 
 use std::collections::HashMap;
 use std::sync::Arc;

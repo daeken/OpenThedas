@@ -19,10 +19,15 @@
 //!   mode the main game camera is moved (0x6c4b20 field of view, 0x6c45f0 position,
 //!   0x6c4ec0 orientation) rather than the paperdoll's own `SceneCamera`. See [`camera`].
 //!
-//! The move between presets blends over [`BLEND_MS`] (the executable's timer at +0x1c8 runs
-//! to 4.0 plus a value never set, 0x7b4cdf). Provisional: the blend is linear here (the
-//! exe's interpolation, 0x5b0db0, is not traced); the head height of the face preset is sampled when the
-//! preset is first framed for the creature's current look.
+//! The move between presets (0x7b4cc8-0x7b4e08): each frame the time gone (+0x1c8, plus the
+//! frame's seconds) over [`BLEND_MS`] (4.0, 0xaf0c88, plus a value never set, 0xc38aec) is
+//! the share by which the camera's position (+0x170) and orientation (+0x1a0) move toward
+//! the preset's (+0x180, +0x1b0): a plain lerp (0x5b0db0) from where the camera is now, so
+//! it covers most of the way in well under a second, slowing as it closes. Once the time
+//! is up, or the position is within 1e-6 (0xb217f0), the camera takes the preset's.
+//! Provisional: the frame time is taken to be in seconds; the orientation is lerped as yaw
+//! and pitch here (the exe's 0x4cbc10 is not traced); the head height of the face preset is
+//! sampled when the preset is first framed for the creature's current look.
 
 use glam::{Quat, Vec3};
 use thedas_render::Camera;
@@ -140,8 +145,21 @@ fn orientation() -> Quat {
 ///   (provisional).
 ///
 /// The field of view is [`FOV_DEGREES`], taken as vertical (provisional).
-/// How long the camera takes to move to a new preset (milliseconds).
+/// The time over which the camera's per-frame share toward a new preset grows to the whole
+/// way (milliseconds).
 pub const BLEND_MS: f64 = 4000.0;
+
+/// One frame of a move toward `target` (see the module's notes): from `at`, with `gone`
+/// milliseconds moved before and `dt` this frame. Returns the camera and the time gone, or
+/// `None` for the time once the move is over (the camera is then the target).
+pub fn step(at: &Camera, target: &Camera, gone: f64, dt: f64) -> (Camera, Option<f64>) {
+    let gone = gone + dt.max(0.0);
+    let t = gone / BLEND_MS;
+    if t >= 1.0 || at.position.distance(target.position) < 1e-6 {
+        return (*target, None);
+    }
+    (blend(at, target, t as f32), Some(gone))
+}
 
 /// The camera `t` (0 to 1) of the way from `a` to `b`: position and pitch straight, yaw the
 /// short way round.
@@ -198,6 +216,26 @@ mod tests {
         assert!(m.yaw > 3.0);
         assert_eq!(blend(&a, &b, 1.0).position, b.position);
         assert_eq!(blend(&a, &b, 7.0).position, b.position);
+    }
+
+    #[test]
+    fn a_preset_move_closes_most_of_the_way_in_under_a_second() {
+        let a = Camera::new(Vec3::ZERO, 0.0, 0.0);
+        let b = Camera::new(Vec3::new(10.0, 0.0, 0.0), 0.0, 0.0);
+        // At 60 frames a second, as the exe steps it.
+        let (mut at, mut gone, mut ms): (Camera, Option<f64>, f64) = (a, Some(0.0), 0.0);
+        while let Some(g) = gone {
+            ms += 1000.0 / 60.0;
+            (at, gone) = step(&at, &b, g, 1000.0 / 60.0);
+            if (ms - 500.0).abs() < 8.0 {
+                // Half a second in: well past halfway (a straight 4 s blend: an eighth).
+                assert!(at.position.x > 7.5, "{}", at.position.x);
+            }
+            assert!(ms <= BLEND_MS + 20.0);
+        }
+        assert_eq!(at.position, b.position);
+        // Over within a second and a half (the position comes within 1e-6).
+        assert!(ms < 1500.0, "{ms}");
     }
 
     #[test]

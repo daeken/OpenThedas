@@ -40,11 +40,17 @@ pub enum SimCommand {
         call_script: bool,
     },
     /// Starts a conversation between `initiator` and `target` (its owner); an empty
-    /// `dialog` is the target's own conversation.
+    /// `dialog` is the target's own conversation. `start` begins it at that line (an index
+    /// into the conversation's line list) instead of its first usable start, its condition
+    /// not asked: mod mode's testing out of order. Such a start opens on the dialog screen
+    /// unless the line is said in passing, and is refused while another conversation is
+    /// open.
     StartConversation {
         initiator: ObjectId,
         target: ObjectId,
         dialog: String,
+        #[serde(default)]
+        start: Option<usize>,
     },
     /// Sets one of an object's variables (`value`), or removes it (`None`). The module
     /// object's variables are the game's globals.
@@ -52,6 +58,15 @@ pub enum SimCommand {
         target: ObjectId,
         name: String,
         value: Option<LocalValue>,
+    },
+    /// Sets a creature's property (`properties.gda` id): its base, then its current value
+    /// (a depletable's: health, mana or stamina), each when given, as a script's
+    /// `SetCreatureProperty` does.
+    SetProperty {
+        target: ObjectId,
+        property: i32,
+        base: Option<f32>,
+        current: Option<f32>,
     },
     /// Puts an object at `position`, turned to `facing` (degrees), at once: no walking,
     /// nothing triggered on the way.
@@ -204,6 +219,7 @@ impl SimCommand {
             SimCommand::SetPlotFlag { .. }
                 | SimCommand::StartConversation { .. }
                 | SimCommand::SetLocal { .. }
+                | SimCommand::SetProperty { .. }
                 | SimCommand::MoveObject { .. }
                 | SimCommand::CreateObject { .. }
                 | SimCommand::DestroyObject { .. }
@@ -258,6 +274,9 @@ pub enum CommandOutcome {
     /// The variable was set (or removed). `replaced` is what it held, of the same type
     /// (`None`: it was not there): setting it back undoes it.
     LocalSet { replaced: Option<LocalValue> },
+    /// The property was set; `base` and `current` are what it held (setting them back
+    /// undoes it).
+    PropertySet { base: f32, current: f32 },
     /// The object was moved; `from` and `from_facing` are where it was (moving it back
     /// undoes it).
     ObjectMoved { from: [f32; 3], from_facing: f32 },
@@ -350,7 +369,8 @@ impl Sim {
                 initiator,
                 target,
                 dialog,
-            } => self.start_commanded_conversation(*initiator, *target, dialog),
+                start,
+            } => self.start_commanded_conversation(*initiator, *target, dialog, *start),
             SimCommand::SetLocal {
                 target,
                 name,
@@ -361,6 +381,12 @@ impl Sim {
                 position,
                 facing,
             } => self.move_commanded(*target, *position, *facing),
+            SimCommand::SetProperty {
+                target,
+                property,
+                base,
+                current,
+            } => self.set_property_commanded(*target, *property, *base, *current),
             SimCommand::CreateObject {
                 kind,
                 template,
@@ -389,7 +415,9 @@ impl Sim {
                 .iter()
                 .filter_map(|&id| self.object_ref(id))
                 .collect(),
-            SimCommand::SetLocal { target, .. } | SimCommand::MoveObject { target, .. } => {
+            SimCommand::SetLocal { target, .. }
+            | SimCommand::MoveObject { target, .. }
+            | SimCommand::SetProperty { target, .. } => {
                 self.object_ref(*target).into_iter().collect()
             }
             SimCommand::CreateObject { .. } => match &outcome {
@@ -469,6 +497,7 @@ impl Sim {
             C::SetPlotFlag { .. }
             | C::StartConversation { .. }
             | C::SetLocal { .. }
+            | C::SetProperty { .. }
             | C::MoveObject { .. }
             | C::CreateObject { .. }
             | C::DestroyObject { .. } => false,
@@ -620,6 +649,7 @@ impl Sim {
         initiator: ObjectId,
         target: ObjectId,
         dialog: &str,
+        start: Option<usize>,
     ) -> CommandOutcome {
         let refused = |reason: &str| CommandOutcome::Refused {
             reason: reason.to_string(),
@@ -637,6 +667,33 @@ impl Sim {
             return refused("no such initiator");
         }
         let was_open = self.talk.as_ref().is_some_and(|c| !c.ended);
+        if let Some(at) = start {
+            if was_open {
+                return refused("another conversation is open");
+            }
+            let Some(d) = self.load_conversation(initiator, target, dialog) else {
+                return refused("the conversation could not be read, or the owner has none");
+            };
+            match d.nodes.get(at) {
+                None => {
+                    return refused(&format!(
+                        "line {at} is past the conversation's {} lines",
+                        d.nodes.len()
+                    ));
+                }
+                Some(n) if n.reply => {
+                    return refused(&format!("line {at} is a reply of the player's"));
+                }
+                Some(_) => {}
+            }
+            let name = d.name.clone();
+            self.open_conversation(initiator, target, d, Some(at));
+            let opened = self.talk.as_ref().is_some_and(|c| !c.ended);
+            return CommandOutcome::ConversationStarted {
+                dialog: name,
+                opened,
+            };
+        }
         let waiting = self.world.pending_talks.len();
         if !self.start_conversation(initiator, target, dialog) {
             return refused("the conversation could not be read, or the owner has none");
@@ -665,6 +722,70 @@ impl Sim {
     }
 
     /// How an object can be found again in another session.
+    /// [`SimCommand::SetProperty`], through the scripts' own path
+    /// ([`Sim::set_creature_property`]): base first, so the current value is clamped to the
+    /// new total.
+    fn set_property_commanded(
+        &mut self,
+        target: ObjectId,
+        property: i32,
+        base: Option<f32>,
+        current: Option<f32>,
+    ) -> CommandOutcome {
+        let refused = |reason: &str| CommandOutcome::Refused {
+            reason: reason.to_string(),
+        };
+        let Some(o) = self.world.get(target) else {
+            return refused("no such object");
+        };
+        if o.kind != ObjectKind::Creature {
+            return refused("only creatures have properties");
+        }
+        if crate::engine::property_bounds(self, property).is_none() {
+            return refused(&format!("property {property} is not in properties.gda"));
+        }
+        if base.into_iter().chain(current).any(|v| !v.is_finite()) {
+            return refused("the value is not a number");
+        }
+        let kind = crate::engine::property_kind(self, property);
+        if current.is_some() && kind != crate::engine::PropertyKind::Depletable {
+            return refused(&format!(
+                "property {property} has no current value (it is not depletable)"
+            ));
+        }
+        let (was_base, was_current) = o.properties.get(&property).copied().unwrap_or((0.0, 0.0));
+        let table = self.table.clone();
+        let c = |n: &str| crate::sim::constant(&table, n);
+        if let Some(v) = base {
+            let vt = c("PROPERTY_VALUE_BASE");
+            self.set_creature_property(
+                OBJECT_INVALID,
+                "mod mode".into(),
+                target,
+                property,
+                v,
+                vt,
+                false,
+            );
+        }
+        if let Some(v) = current {
+            let vt = c("PROPERTY_VALUE_CURRENT");
+            self.set_creature_property(
+                OBJECT_INVALID,
+                "mod mode".into(),
+                target,
+                property,
+                v,
+                vt,
+                false,
+            );
+        }
+        CommandOutcome::PropertySet {
+            base: was_base,
+            current: was_current,
+        }
+    }
+
     /// [`SimCommand::MoveObject`].
     fn move_commanded(
         &mut self,
@@ -949,6 +1070,21 @@ mod tests {
     }
 
     #[test]
+    fn a_journal_from_before_start_lines_still_reads() {
+        let old = r#"{"command":"start_conversation","initiator":1,"target":2,"dialog":"x"}"#;
+        let c: SimCommand = serde_json::from_str(old).unwrap();
+        assert_eq!(
+            c,
+            SimCommand::StartConversation {
+                initiator: 1,
+                target: 2,
+                dialog: "x".into(),
+                start: None,
+            }
+        );
+    }
+
+    #[test]
     fn local_values_serialize_with_their_type() {
         let v = LocalValue::Float(1.5);
         let j = serde_json::to_string(&v).unwrap();
@@ -979,6 +1115,7 @@ mod tests {
                 initiator: hero,
                 target: gone,
                 dialog: String::new(),
+                start: None,
             },
         );
         assert_eq!(

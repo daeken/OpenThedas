@@ -1296,6 +1296,7 @@ impl Server {
                         initiator: hero,
                         target: id,
                         dialog: String::new(),
+                        start: None,
                     },
                 );
                 if let CommandOutcome::Refused { reason } = out {
