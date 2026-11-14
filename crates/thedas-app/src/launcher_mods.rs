@@ -35,14 +35,22 @@ enum State {
 
 pub struct ModReport {
     state: State,
-    /// The layer whose files are listed (an index into the report's `stats`).
-    shown: Option<usize>,
+    /// The install the report is of (the one being scanned while it runs).
+    root: Option<PathBuf>,
+    /// A change landed while a scan ran: its result describes an older list, so it is
+    /// dropped and the scan runs again.
+    stale: bool,
+    /// The layer whose files are listed (an index into the report's `stats`) and the
+    /// indices into `fights` that concern it, found once when it is chosen.
+    shown: Option<(usize, Vec<usize>)>,
 }
 
 impl ModReport {
     pub fn new() -> ModReport {
         ModReport {
             state: State::Idle,
+            root: None,
+            stale: false,
             shown: None,
         }
     }
@@ -52,9 +60,12 @@ impl ModReport {
         matches!(self.state, State::Running(_))
     }
 
-    /// Forgets a finished report: the list or the install changed under it.
+    /// The list or the install changed under the report: a finished one is forgotten, a
+    /// running scan is marked stale and starts over when it ends.
     pub fn forget(&mut self) {
-        if !self.running() {
+        if self.running() {
+            self.stale = true;
+        } else {
             self.state = State::Idle;
             self.shown = None;
         }
@@ -64,22 +75,44 @@ impl ModReport {
         let State::Running(rx) = &self.state else {
             return;
         };
-        match rx.try_recv() {
-            Ok(Ok(report)) => self.state = State::Done(report),
-            Ok(Err(e)) => self.state = State::Failed(e),
-            Err(TryRecvError::Empty) => {}
+        let done = match rx.try_recv() {
+            Ok(Ok(report)) => State::Done(report),
+            Ok(Err(e)) => State::Failed(e),
+            Err(TryRecvError::Empty) => return,
             Err(TryRecvError::Disconnected) => {
-                self.state = State::Failed("The scan stopped unexpectedly.".into())
+                State::Failed("The scan stopped unexpectedly.".into())
             }
+        };
+        self.state = done;
+        if std::mem::take(&mut self.stale) {
+            // What it read is out of date: read again.
+            match self.root.clone() {
+                Some(root) => self.start(root),
+                None => self.state = State::Idle,
+            }
+        }
+    }
+
+    /// The page is drawn for `root`: a report of another game is not this game's, so it is
+    /// forgotten (a running scan starts over for `root` when it ends).
+    fn follow(&mut self, root: &PathBuf) {
+        if self.root.as_ref() != Some(root) {
+            if !matches!(self.state, State::Idle) {
+                self.forget();
+            }
+            self.root = Some(root.clone());
         }
     }
 
     fn start(&mut self, root: PathBuf) {
         let (tx, rx) = channel();
+        let scanned = root.clone();
         std::thread::spawn(move || {
-            let _ = tx.send(scan(&root));
+            let _ = tx.send(scan(&scanned));
         });
         self.state = State::Running(rx);
+        self.root = Some(root);
+        self.stale = false;
         self.shown = None;
     }
 
@@ -96,6 +129,7 @@ impl ModReport {
             ui.label("Choose a game on the Play page to see how your mods change it.");
             return;
         };
+        self.follow(root);
         if dirty {
             ui.label(
                 RichText::new("This reads the saved list: save your changes first.").color(BAD),
@@ -146,12 +180,15 @@ impl ModReport {
                 }
             }
         }
-        if let Some(i) = show {
-            self.shown = if self.shown == Some(i) { None } else { Some(i) };
+        if let (Some(i), State::Done(r)) = (show, &self.state) {
+            self.shown = match &self.shown {
+                Some((open, _)) if *open == i => None,
+                _ => r.stats.get(i).map(|s| (i, concerning(r, &s.label))),
+            };
         }
-        if let (State::Done(r), Some(i)) = (&self.state, self.shown) {
-            if let Some(s) = r.stats.get(i) {
-                files(ui, r, &s.label);
+        if let (State::Done(r), Some((i, rows))) = (&self.state, &self.shown) {
+            if let Some(s) = r.stats.get(*i) {
+                files(ui, r, &s.label, rows);
             }
         }
     }
@@ -183,27 +220,30 @@ fn summary(s: &ModStats) -> String {
     parts.join(" · ")
 }
 
-/// The files `label` fights over: those it wins and those it loses.
-fn files(ui: &mut egui::Ui, r: &Report, label: &str) {
+/// The indices into the report's fights of the files `label` wins or loses, found once when
+/// a layer is chosen (a big texture pack has tens of thousands, and the list redraws often).
+fn concerning(r: &Report, label: &str) -> Vec<usize> {
+    r.fights
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| f.winner == label || f.beaten.iter().any(|b| b == label))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// The files the layer `label` fights over, `rows` being [`concerning`]'s answer: the first
+/// [`SHOWN`] of them, each as a win or a loss.
+fn files(ui: &mut egui::Ui, r: &Report, label: &str, rows: &[usize]) {
     ui.add_space(4.0);
-    let mut shown = 0usize;
-    let mut total = 0usize;
+    let total = rows.len();
+    let shown = total.min(SHOWN);
     egui::ScrollArea::vertical()
         .max_height(220.0)
         .id_salt("mod-fights")
         .show(ui, |ui| {
-            for f in &r.fights {
-                let wins = f.winner == label;
-                let loses = f.beaten.iter().any(|b| b == label);
-                if !wins && !loses {
-                    continue;
-                }
-                total += 1;
-                if shown >= SHOWN {
-                    continue;
-                }
-                shown += 1;
-                let text = if wins {
+            for &i in &rows[..shown] {
+                let f = &r.fights[i];
+                let text = if f.winner == label {
                     let over: Vec<String> = f.beaten.iter().take(3).map(|b| pretty(b)).collect();
                     let game = if f.in_game { " (a game file)" } else { "" };
                     format!("{}: wins over {}{game}", f.name, over.join(", "))
@@ -272,6 +312,91 @@ mod tests {
             replaces,
             hidden,
         }
+    }
+
+    fn report() -> Report {
+        Report {
+            stats: Vec::new(),
+            fights: Vec::new(),
+            cut: false,
+            problems: Vec::new(),
+        }
+    }
+
+    fn running(r: &mut ModReport, answer: Result<Report, String>) {
+        let (tx, rx) = channel();
+        tx.send(answer).unwrap();
+        r.state = State::Running(rx);
+    }
+
+    #[test]
+    fn a_change_during_a_scan_makes_it_start_over() {
+        let here = PathBuf::from("/nowhere/game");
+        let mut r = ModReport::new();
+        r.root = Some(here.clone());
+        running(&mut r, Ok(report()));
+        r.forget();
+        assert!(r.running() && r.stale, "forget only marks a running scan");
+        r.poll();
+        // Its answer described an older list: it scans again (and, with no install there,
+        // that fails at once).
+        assert!(r.running() && !r.stale);
+        for _ in 0..200 {
+            r.poll();
+            if !r.running() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(matches!(r.state, State::Failed(_)));
+    }
+
+    #[test]
+    fn a_report_belongs_to_its_game() {
+        let one = PathBuf::from("/nowhere/one");
+        let two = PathBuf::from("/nowhere/two");
+        let mut r = ModReport::new();
+        r.root = Some(one.clone());
+        r.state = State::Done(report());
+        r.shown = Some((0, vec![1]));
+        r.follow(&one);
+        assert!(matches!(r.state, State::Done(_)), "the same game keeps it");
+        r.follow(&two);
+        assert!(matches!(r.state, State::Idle) && r.shown.is_none());
+        assert_eq!(r.root, Some(two.clone()));
+        // A scan of the other game is dropped and run again for this one.
+        r.root = Some(one);
+        running(&mut r, Ok(report()));
+        r.follow(&two);
+        assert!(r.stale && r.root == Some(two));
+    }
+
+    #[test]
+    fn a_finished_report_is_forgotten_at_once() {
+        let mut r = ModReport::new();
+        r.state = State::Done(report());
+        r.shown = Some((0, Vec::new()));
+        r.forget();
+        assert!(matches!(r.state, State::Idle) && r.shown.is_none() && !r.stale);
+    }
+
+    #[test]
+    fn the_rows_of_a_layer_are_the_fights_it_is_in() {
+        let fight = |name: &str, winner: &str, beaten: &[&str]| Fight {
+            name: name.into(),
+            winner: winner.into(),
+            beaten: beaten.iter().map(|b| b.to_string()).collect(),
+            in_game: false,
+        };
+        let mut r = report();
+        r.fights = vec![
+            fight("a", "mod:x", &["mod:y"]),
+            fight("b", "mod:y", &["mod:x", "game"]),
+            fight("c", "mod:z", &["mod:y"]),
+        ];
+        assert_eq!(concerning(&r, "mod:x"), vec![0, 1]);
+        assert_eq!(concerning(&r, "mod:y"), vec![0, 1, 2]);
+        assert_eq!(concerning(&r, "mod:q"), Vec::<usize>::new());
     }
 
     #[test]
