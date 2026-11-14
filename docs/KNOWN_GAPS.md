@@ -34,7 +34,7 @@ so an untraced item starts with a trace, not with a guess.
 
 | Area | File | Inventory items |
 | --- | --- | --- |
-| Simulation and gameplay | [gaps/simulation.md](gaps/simulation.md) | 166 (`SIM-`), plus ability coverage by family |
+| Simulation and gameplay | [gaps/simulation.md](gaps/simulation.md) | 165 (`SIM-`), plus ability coverage by family |
 | Script VM and engine functions | [gaps/scripting.md](gaps/scripting.md) | 96 (`SCR-`), plus the measured lists of unimplemented functions, unraised events, idle commands and stored-only effects |
 | Rendering | [gaps/rendering.md](gaps/rendering.md) | 152 (`RND-`) |
 | Interface, input and controller | [gaps/ui.md](gaps/ui.md) | 180 (`UI-`), plus the movies never opened and the values no screen gets answered |
@@ -81,8 +81,8 @@ these, so they are the places where one person or stream can take a large, separ
 - **Cutscene tracks.** A handful of track kinds are read; effects, fades, props, time dilation
   and facial tracks are dropped, and `LinkToActor` cameras are not followed (`SIM-140`,
   `SIM-141`).
-- **Saves are our own format.** Original `.das` saves cannot be read or written, there is no
-  autosave, and character import is ignored (`SIM-160`, `SIM-161`, `SIM-112`, `FMT-019`).
+- **Saves are our own format.** Original `.das` saves cannot be read or written, and
+  character import is ignored (`SIM-160`, `SIM-112`, `FMT-019`).
 - **Beyond the prelude is largely unexercised.** All six origins play past their openings and
   the Human Noble chain reaches Lothering. The world map, party camp and later companions have
   only that one chain behind them; the Landsmeet, the final battle, the DLC campaigns, Awakening
