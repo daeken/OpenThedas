@@ -3265,6 +3265,15 @@ impl App {
                     log::info!("leading with {tag}");
                 }
             }
+            // `SwapWeaponSets` (keymap.gda binds it to /): the controlled party member's other
+            // weapon set, as the quickbar's weapon set button. Provisional: the key is fixed
+            // here, not read from the player's bindings.
+            KeyCode::Slash if self.live.is_some() => {
+                if let Some(live) = self.live.as_ref() {
+                    switch_weapon_set(live);
+                    log::info!("weapon set switched");
+                }
+            }
             // The quickbar's first ten slots: 1 to 9, then 0.
             c if self.live.is_some() && quickslot_key(c).is_some() => {
                 let slot = quickslot_key(c).unwrap_or(0);
@@ -3735,6 +3744,10 @@ impl App {
                     Some(ability) => format!("aiming ability {ability} (click a target)"),
                     None => format!("quickslot {}", slot + 1),
                 });
+            }
+            Step::SwapWeapons => {
+                self.key_down(KeyCode::Slash);
+                log.push("weapon set key".into());
             }
             Step::Pause => {
                 // As the Space key does (a training tutorial takes it as its unpause).
@@ -5357,6 +5370,8 @@ enum Step {
     Quickslot(i32),
     /// Space: the game pauses or carries on.
     Pause,
+    /// The weapon set key (/).
+    SwapWeapons,
     /// F10: mod mode's panels open or close (windowed only).
     ModMode,
     /// Mod mode's inspector picks the creature or placeable with this tag nearest the
@@ -5537,6 +5552,18 @@ fn set_client_option(ui: Option<&ui::UiLayer>, live: Option<&live::Live>, name: 
             },
         );
     }
+}
+
+/// The weapon set key: the controlled party member switches to its other set, as the
+/// quickbar's weapon set button does.
+fn switch_weapon_set(live: &live::Live) {
+    live.sim().input(
+        thedas_sim::commands::CommandSource::Player,
+        thedas_sim::commands::SimCommand::GuiMessage {
+            name: thedas_sim::inventory::MSG_SWITCH_WEAPON_SET.into(),
+            args: vec!["-1".into()],
+        },
+    );
 }
 
 /// Whether the screen up is one the game put up that the player leaves by its Close: a store,
@@ -5768,6 +5795,7 @@ fn parse_step(s: &str) -> Result<Step> {
             Step::Leader(arg[1..].parse::<usize>()? - 1)
         }
         "key" if arg.eq_ignore_ascii_case("space") => Step::Pause,
+        "key" if arg == "/" => Step::SwapWeapons,
         "key" if arg.eq_ignore_ascii_case("f10") => Step::ModMode,
         "modmode" => Step::ModMode,
         "modselect" if !arg.is_empty() => Step::ModSelect(arg.to_string()),
@@ -6548,6 +6576,10 @@ fn main() -> Result<()> {
                         Some(ability) => println!("aiming ability {ability}"),
                         None => println!("quickslot {}", slot + 1),
                     },
+                    Step::SwapWeapons => {
+                        switch_weapon_set(l);
+                        println!("weapon set switched");
+                    }
                     Step::Pause => {
                         // As the Space key does (a training tutorial takes it as its unpause).
                         l.toggle_pause();
