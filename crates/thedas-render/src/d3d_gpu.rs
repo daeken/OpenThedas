@@ -2343,11 +2343,6 @@ impl D3dPass {
         &self.pipelines[d.pipeline].program
     }
 
-    /// Scene draw `draw`'s model-to-world transform as it stands.
-    pub(crate) fn world(&self, draw: usize) -> Option<glam::Mat4> {
-        self.worlds.get(draw).map(|w| w.0)
-    }
-
     /// The scene's lights, then those added since ([`D3dPass::set_extra_lights`]).
     pub(crate) fn lights(&self) -> &[SceneLight] {
         &self.scene_lights

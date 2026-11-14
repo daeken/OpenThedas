@@ -11,25 +11,24 @@ struct Frame {
     eye: vec4<f32>,
     // x: 1 / width, y: 1 / height (the D3D9 half-pixel fix-up the translated shaders apply)
     fixup: vec4<f32>,
+    // x: the fog's intensity², y: 1 − its cap (mml_vFogParams[0].w, [1].x); z: 1 to leave
+    // the normal maps out (the `flat` debug view)
+    fog: vec4<f32>,
 };
 
-struct FrameDraw {
+struct Draw {
     mvp: mat4x4<f32>,
     world: mat4x4<f32>,
-};
-
-struct DrawData {
     // xy: lightmap atlas offset, zw: scale
     lightmap: vec4<f32>,
     // mml_vFalloffParams
     falloff: vec4<f32>,
-    // x: room index (0: none)
+    // x: room index (0: none), y: mml_fSpecularReflectionMult
     room: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> frame: Frame;
-@group(0) @binding(1) var<storage, read> frame_draws: array<FrameDraw>;
-@group(0) @binding(2) var<storage, read> draws: array<DrawData>;
+@group(0) @binding(1) var<uniform> draw: Draw;
 
 @group(1) @binding(0) var diffuse_tex: texture_2d<f32>;
 @group(1) @binding(1) var normal_tex: texture_2d<f32>;
@@ -37,6 +36,8 @@ struct DrawData {
 @group(1) @binding(3) var wrap_smp: sampler;
 @group(1) @binding(4) var lightmap_tex: texture_2d<f32>;
 @group(1) @binding(5) var clamp_smp: sampler;
+// The draw's light probe's cubemap (Static1's `aur_cmLightProbe0`).
+@group(1) @binding(6) var env_tex: texture_cube<f32>;
 
 struct VsIn {
     @location(0) position: vec3<f32>,
@@ -51,13 +52,11 @@ struct VsOut {
     @location(1) uv_lm: vec2<f32>,
     @location(2) normal: vec3<f32>,
     @location(3) world: vec3<f32>,
-    @location(4) @interpolate(flat) slot: u32,
 };
 
 @vertex
-fn vs_gbuffer(v: VsIn, @builtin(instance_index) slot: u32) -> VsOut {
-    let f = frame_draws[slot];
-    let d = draws[slot];
+fn vs_gbuffer(v: VsIn) -> VsOut {
+    let f = draw;
     var out: VsOut;
     // As Static1.vsh does it (`mul`, `mad`, `mad`, `add` by the matrix's columns), so the
     // depth matches what the original shaders write for the same surface.
@@ -67,10 +66,9 @@ fn vs_gbuffer(v: VsIn, @builtin(instance_index) slot: u32) -> VsOut {
     let p = r + f.mvp[3];
     out.clip = vec4<f32>(p.x + frame.fixup.x * p.w, p.y - frame.fixup.y * p.w, p.z, p.w);
     out.uv0 = v.uv0;
-    out.uv_lm = v.uv1 * d.lightmap.zw + d.lightmap.xy;
+    out.uv_lm = v.uv1 * f.lightmap.zw + f.lightmap.xy;
     out.normal = (f.world * vec4<f32>(v.normal, 0.0)).xyz;
     out.world = (f.world * vec4<f32>(v.position, 1.0)).xyz;
-    out.slot = slot;
     return out;
 }
 
@@ -79,6 +77,13 @@ struct GBuffer {
     @location(1) specular: vec4<f32>,
     @location(2) normal: vec4<f32>,
     @location(3) lightmap: vec4<f32>,
+};
+
+// The surface's normal (normal-mapped, world space), view direction and specular falloff.
+struct Surface {
+    n: vec3<f32>,
+    v: vec3<f32>,
+    falloff: f32,
 };
 
 // Octahedral encoding of a unit vector into [-1, 1]².
@@ -90,9 +95,8 @@ fn oct_encode(n: vec3<f32>) -> vec2<f32> {
     return (1.0 - abs(p.yx)) * select(vec2<f32>(-1.0), vec2<f32>(1.0), p >= vec2<f32>(0.0));
 }
 
-@fragment
-fn fs_gbuffer(in: VsOut) -> GBuffer {
-    let d = draws[in.slot];
+fn surface(in: VsOut) -> Surface {
+    let d = draw;
     // Tangent frame from the screen-space derivatives of position and texture coordinate
     // (provisional: the meshes' own tangents and binormals, which Static1 reads, are not in
     // the stand-in vertex format).
@@ -114,18 +118,46 @@ fn fs_gbuffer(in: VsOut) -> GBuffer {
     let z = sqrt(max(1.0 - dot(xy, xy), 0.0));
     var n = xy.x * t + xy.y * b + z * n_v;
     n = n * inverseSqrt(max(dot(n, n), 1e-20));
+    if (frame.fog.z > 0.5) {
+        n = normalize(n_v);
+    }
 
     // The specular falloff Static1.vsh works out per vertex from mml_vFalloffParams.
     let v = normalize(frame.eye.xyz - in.world);
     let x = (d.falloff.z - dot(n_v, v)) / d.falloff.z;
-    let falloff = (3.0 - 2.0 * x) * x * x * d.falloff.w;
+    var out: Surface;
+    out.n = n;
+    out.v = v;
+    out.falloff = (3.0 - 2.0 * x) * x * x * d.falloff.w;
+    return out;
+}
 
+@fragment
+fn fs_gbuffer(in: VsOut) -> GBuffer {
+    let s = surface(in);
     var out: GBuffer;
     out.albedo = vec4<f32>(textureSample(diffuse_tex, wrap_smp, in.uv0).rgb, 1.0);
     out.specular = textureSample(spec_tex, wrap_smp, in.uv0);
-    out.normal = vec4<f32>(oct_encode(n), d.room.x, falloff);
+    out.normal = vec4<f32>(oct_encode(s.n), draw.room.x, s.falloff);
     out.lightmap = textureSample(lightmap_tex, clamp_smp, in.uv_lm);
     return out;
+}
+
+// Static1's reflection, which no light changes, added over the lit frame by a second draw of
+// the same geometry (the G-buffer has no room left for it): the probe at R = 2(N·V)N − V, at
+// a mip level of (1 − power / 255) · 9, times mml_fSpecularReflectionMult, the specular mask
+// and the falloff.
+@fragment
+fn fs_env(in: VsOut) -> @location(0) vec4<f32> {
+    let s = surface(in);
+    let specular = textureSample(spec_tex, wrap_smp, in.uv0);
+    let r = 2.0 * dot(s.n, s.v) * s.n - s.v;
+    let power = specular.a * 255.0 + 1.0;
+    let env = textureSampleLevel(env_tex, wrap_smp, r, (1.0 - power / 255.0) * 9.0).rgb;
+    // Fogged as the rest of Static1's colour is: what is added comes through at the fog factor.
+    let to_eye = in.world - frame.eye.xyz;
+    let f = max(min(exp(-dot(to_eye, to_eye) * frame.fog.x), 1.0), frame.fog.y);
+    return vec4<f32>(env * draw.room.y * specular.rgb * s.falloff * f, 1.0);
 }
 
 // ---------------------------------------------------------------------------------------
@@ -140,7 +172,7 @@ struct Lighting {
     // mml_vFogParams: (colour, intensity²), (1 − cap, ...)
     fog0: vec4<f32>,
     fog1: vec4<f32>,
-    // x: lights
+    // x: lights, y: the debug view (`THEDAS_DEFERRED_VIEW`, see deferred.rs)
     counts: vec4<u32>,
     // xy: target size
     size: vec4<f32>,
@@ -156,13 +188,16 @@ struct Light {
 };
 
 @group(0) @binding(0) var<uniform> lighting: Lighting;
-@group(0) @binding(1) var<storage, read> lights: array<Light>;
+// As many as `MAX_LIGHTS` in deferred.rs: a uniform array, which every backend can read.
+@group(0) @binding(1) var<uniform> lights: array<Light, 256>;
 
 @group(1) @binding(0) var g_albedo: texture_2d<f32>;
 @group(1) @binding(1) var g_specular: texture_2d<f32>;
 @group(1) @binding(2) var g_normal: texture_2d<f32>;
 @group(1) @binding(3) var g_lightmap: texture_2d<f32>;
-@group(1) @binding(4) var g_depth: texture_depth_2d;
+// The depth buffer as plain numbers (the OpenGL backend cannot `textureLoad` a depth
+// texture; see cut_effects.rs).
+@group(1) @binding(4) var g_depth: texture_2d<f32>;
 
 @vertex
 fn vs_fullscreen(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
@@ -192,7 +227,7 @@ fn reaches(l: Light, room: u32) -> bool {
 @fragment
 fn fs_lighting(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     let px = vec2<i32>(frag.xy);
-    let depth = textureLoad(g_depth, px, 0);
+    let depth = textureLoad(g_depth, px, 0).x;
     if (depth >= 1.0) {
         discard;
     }
@@ -218,14 +253,17 @@ fn fs_lighting(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     var spec_d = vec3<f32>(0.0);
     for (var i = 0u; i < lighting.counts.x; i = i + 1u) {
         let l = lights[i];
-        if (!reaches(l, room)) {
+        if (lighting.counts.y != 7u && !reaches(l, room)) {
             continue;
         }
         let to = l.position.xyz - p;
         let d = max(length(to), 0.001);
-        // Static1's cos²(π/2 · d/R), which repeats past the radius: the original never
-        // gives a light to a surface out of its reach, so here it ends there.
-        if (d >= l.position.w) {
+        // Static1's cos²(π/2 · d/R), which repeats past the radius (rising back to full at
+        // 2R). The original gives a light to whole objects whose bounding sphere it reaches,
+        // so on a large mesh that rise shows; here it ends at the radius (the `wrap` debug
+        // view keeps it out to 2R).
+        let wrap = lighting.counts.y == 9u;
+        if (d >= l.position.w * select(1.0, 2.0, wrap)) {
             continue;
         }
         let c = cos(d / l.position.w * PI * 0.5);
@@ -261,6 +299,15 @@ fn fs_lighting(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     let diffuse = diff_s * lm.a + lm.rgb + diff_d;
     let specular = (spec_s * max(lm.a, 0.2) + spec_d) * 3.0;
     var colour = albedo * diffuse + spec.rgb * specular * falloff;
+    switch lighting.counts.y {
+        case 1u: { return vec4<f32>(albedo, 1.0); }
+        case 2u: { return vec4<f32>(n * 0.5 + 0.5, 1.0); }
+        case 3u: { return vec4<f32>(lm.rgb, 1.0); }
+        case 4u: { return vec4<f32>(vec3<f32>(lm.a), 1.0); }
+        case 5u: { return vec4<f32>(diffuse * 0.5, 1.0); }
+        case 6u: { return vec4<f32>(spec.rgb * specular * falloff, 1.0); }
+        default: {}
+    }
 
     // The level's fog, as Static1 applies it.
     let to_eye = p - lighting.eye.xyz;

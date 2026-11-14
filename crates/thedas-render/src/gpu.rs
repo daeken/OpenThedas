@@ -460,7 +460,7 @@ impl Default for StandInLight {
 
 #[derive(Clone)]
 pub(crate) struct GpuMesh {
-    vertices: wgpu::Buffer,
+    pub(crate) vertices: wgpu::Buffer,
     pub(crate) indices: wgpu::Buffer,
     pub(crate) count: u32,
 }
@@ -587,6 +587,11 @@ pub struct AreaRenderer {
     cut_away: Vec<usize>,
     /// The emitters of models with a `CutAway` mesh ([`SceneEmitter::cut_away`]).
     cut_away_emitters: Vec<usize>,
+    /// How the level is drawn (see [`crate::deferred`]). Only a renderer of the level's own
+    /// meshes draws deferred; any other draws faithfully whatever this says.
+    pub path: crate::deferred::RenderPath,
+    /// The deferred pass, for a renderer of the level's own meshes with draws it can take.
+    deferred: Option<crate::deferred::DeferredPass>,
 }
 
 /// The colour curve `da_hsvmatrix` reads: `name` (an area's curve, `<name>.dds`) or by
@@ -976,6 +981,10 @@ impl AreaRenderer {
         stats.textures_loaded = cache.loaded - loaded0;
         stats.textures_compressed = cache.compressed - compressed0;
         stats.textures_missing = cache.missing[missing0..].to_vec();
+        // What the deferred path would draw (no GPU objects until a frame is drawn so).
+        let deferred = (scene.static_draws > 0)
+            .then(|| crate::deferred::DeferredPass::plan(ctx, vfs, scene, &d3d, cache))
+            .flatten();
         if uniforms.is_empty() {
             uniforms.resize(DRAW_STRIDE as usize, 0);
         }
@@ -1070,7 +1079,15 @@ impl AreaRenderer {
                 .filter(|(_, e)| e.cut_away)
                 .map(|(i, _)| i)
                 .collect(),
+            path: crate::deferred::RenderPath::Faithful,
+            deferred,
         }
+    }
+
+    /// Whether this renderer can draw deferred: it is the level's, has draws the deferred
+    /// pass takes, and the GPU has not refused that pass.
+    pub fn can_defer(&self) -> bool {
+        self.deferred.as_ref().is_some_and(|d| !d.refused())
     }
 
     /// Grades the frame as area `grade` says: its colour curve and `da_hsvmatrix` values
@@ -1441,9 +1458,27 @@ impl AreaRenderer {
             Some(d) => d.clone(),
             None => self.depth_view(&ctx.device, width, height).clone(),
         };
+        // The deferred path draws its share first, clearing the frame; the rest goes over.
+        let deferred = over.is_none()
+            && self.only_draws.is_none()
+            && self.path == crate::deferred::RenderPath::Deferred
+            && self.deferred.as_mut().is_some_and(|p| {
+                p.encode(
+                    ctx,
+                    encoder,
+                    target,
+                    self.color_format,
+                    &depth,
+                    (width, height),
+                    camera,
+                    &self.d3d,
+                    &self.meshes,
+                    self.clear,
+                )
+            });
         let (color_load, depth_load) = match over {
-            Some(_) => (wgpu::LoadOp::Load, wgpu::LoadOp::Load),
-            None => (wgpu::LoadOp::Clear(self.clear), wgpu::LoadOp::Clear(1.0)),
+            None if !deferred => (wgpu::LoadOp::Clear(self.clear), wgpu::LoadOp::Clear(1.0)),
+            _ => (wgpu::LoadOp::Load, wgpu::LoadOp::Load),
         };
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("area"),
@@ -1485,7 +1520,9 @@ impl AreaRenderer {
             let d = match *r {
                 DrawRef::StandIn(i) => &self.stand_in[i],
                 DrawRef::D3d(i) => {
-                    if !self.d3d.in_view(i) {
+                    if !self.d3d.in_view(i)
+                        || (deferred && self.deferred.as_ref().is_some_and(|p| p.takes(i)))
+                    {
                         continue;
                     }
                     let d = &self.d3d.draws[i];

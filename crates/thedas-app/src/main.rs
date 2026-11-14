@@ -217,6 +217,11 @@ struct Args {
     /// video option: `on` or `off`.
     #[arg(long, default_value = "on", value_parser = ["on", "off"])]
     frame_effects: String,
+    /// How the level is drawn: `faithful` (every material through the original's own
+    /// shaders, the reference) or `deferred` (our renderer: the level's static geometry lit
+    /// per pixel by every light in reach; see docs/deferred.md). F11 flips between them.
+    #[arg(long, default_value = "faithful", value_parser = ["faithful", "deferred"])]
+    renderer: String,
     /// The original's "Graphics Detail" video option, which picks the materials' techniques
     /// and the bloom's blur: `low`, `medium` or `high` (High's materials draw as Medium's; its
     /// sun shadows are 1024 texels a side and reach further).
@@ -314,6 +319,8 @@ struct Loaded {
     shaders: String,
     /// Whether frames get the level's frame buffer effects (`--frame-effects`).
     frame_effects: bool,
+    /// How the level is drawn (`--renderer`, F11).
+    render_path: thedas_render::RenderPath,
 }
 
 impl Loaded {
@@ -384,6 +391,7 @@ fn load(
             scene: None,
             shaders: shaders.to_string(),
             frame_effects: true,
+            render_path: Default::default(),
         });
     }
     let level = match install.mount_level(&mut vfs, area) {
@@ -423,6 +431,7 @@ fn load(
         scene: Some(scene),
         shaders: shaders.to_string(),
         frame_effects: true,
+        render_path: Default::default(),
     })
 }
 
@@ -539,6 +548,7 @@ fn capture(
                     thedas_render::gpu::CAPTURE_FORMAT,
                 );
                 renderer.frame_effects = loaded.frame_effects;
+                renderer.path = loaded.render_path;
                 renderer.set_time(shader_time);
                 log_stats(&renderer);
                 renderer.capture(ctx, &camera, w, h)?
@@ -1228,6 +1238,7 @@ impl App {
                     config.format,
                 );
                 r.frame_effects = self.loaded.frame_effects;
+                r.path = self.loaded.render_path;
                 log_stats(&r);
                 println!("camera {}", self.camera.spec());
                 Some(r)
@@ -3270,6 +3281,32 @@ impl App {
         true
     }
 
+    /// Draws the level the way `path` says, or the other way than now for `None` (F11),
+    /// from the next frame; returns the way it is drawn now.
+    fn set_render_path(&mut self, path: Option<thedas_render::RenderPath>) -> thedas_render::RenderPath {
+        let path = path.unwrap_or(self.loaded.render_path.toggled());
+        self.loaded.render_path = path;
+        if let Some(l) = self.live.as_mut() {
+            l.render_path = path;
+        }
+        let renderer = match (self.live.as_ref(), self.gfx.as_mut()) {
+            (Some(l), _) => l.level.as_ref().map(|l| &l.renderer),
+            (None, Some(g)) => g.renderer.as_mut().map(|r| {
+                r.path = path;
+                &*r
+            }),
+            _ => None,
+        };
+        let can = renderer.is_some_and(|r| r.can_defer());
+        match path {
+            thedas_render::RenderPath::Deferred if !can => log::warn!(
+                "renderer: deferred chosen, but this level has nothing it can draw deferred (or the GPU refused it): drawn faithfully"
+            ),
+            p => log::info!("renderer: {}", p.name()),
+        }
+        path
+    }
+
     /// A key pressed (not a repeat). Returns whether the game should close.
     fn key_down(&mut self, code: KeyCode) -> bool {
         self.recorder.input(format!("key {code:?}"));
@@ -3376,6 +3413,10 @@ impl App {
                     live.toggle_pause();
                     println!("{}", if live.paused { "paused" } else { "running" });
                 }
+            }
+            // Ours: the faithful renderer and the deferred one, flipped at once.
+            KeyCode::F11 => {
+                self.set_render_path(None);
             }
             KeyCode::F12 => {
                 if let Err(e) = self.save_capture() {
@@ -3588,6 +3629,10 @@ impl App {
             Step::Report => {
                 self.key_down(KeyCode::F8);
                 log.push("key f8".into());
+            }
+            &Step::Renderer(path) => {
+                let now = self.set_render_path(path);
+                log.push(format!("renderer {}", now.name()));
             }
             &Step::Saves(mode) => {
                 if let (Some(g), Some(s)) = (self.gfx.as_mut(), self.screens.as_mut()) {
@@ -4370,6 +4415,7 @@ impl App {
     fn install_live(&mut self, mut l: live::Live) {
         if let Some(g) = self.gfx.as_mut() {
             l.frame_effects = self.loaded.frame_effects;
+            l.render_path = self.loaded.render_path;
             g.ui.close_all();
             g.ui.attach(&l.sim);
             seed_client_options(&l, &g.ui);
@@ -5405,6 +5451,9 @@ enum Step {
     /// The party picker opens as a script's `ShowPartyPickerGUI` opens it (for trying the
     /// picker headless).
     Picker,
+    /// `renderer faithful`, `renderer deferred` or `renderer toggle` (F11): how the level is
+    /// drawn.
+    Renderer(Option<thedas_render::RenderPath>),
     /// `key f5` or `key f9`: the save screen (1) or the load screen (2) opens (the keys
     /// themselves quick save and quick load, see `Quick`).
     Saves(i32),
@@ -5939,6 +5988,14 @@ fn parse_step(s: &str) -> Result<Step> {
         "use" if !arg.is_empty() => Step::Use(arg.to_string()),
         "rebuild" => Step::Rebuild,
         "picker" => Step::Picker,
+        "renderer" => Step::Renderer(match arg {
+            "toggle" => None,
+            a => Some(
+                thedas_render::RenderPath::parse(a)
+                    .context("renderer takes faithful, deferred or toggle")?,
+            ),
+        }),
+        "key" if arg.eq_ignore_ascii_case("f11") => Step::Renderer(None),
         "wipe" => Step::Wipe,
         "type" => Step::Type(arg.to_string()),
         "key" if text_key(arg).is_some() => {
@@ -6096,8 +6153,10 @@ fn main() -> Result<()> {
     let detail = thedas_render::scene::Detail::parse(&args.detail).unwrap_or_default();
     let mut loaded = load(&install, area, &args.shaders, &[], detail)?;
     loaded.frame_effects = args.frame_effects == "on";
+    loaded.render_path = thedas_render::RenderPath::parse(&args.renderer).unwrap_or_default();
     if let Some(l) = live.as_mut() {
         l.frame_effects = loaded.frame_effects;
+        l.render_path = loaded.render_path;
         l.detail = detail;
     }
     let hero = live.as_ref().and_then(|l| l.hero());
@@ -6203,6 +6262,10 @@ fn main() -> Result<()> {
                         Some(tag) => println!("leading with {tag}"),
                         None => println!("no party member {}", n + 1),
                     },
+                    &Step::Renderer(path) => {
+                        l.render_path = path.unwrap_or(l.render_path.toggled());
+                        println!("renderer {}", l.render_path.name());
+                    }
                     &Step::ClickAs(button, x, y) => {
                         if let Some((layer, _)) = played.as_mut() {
                             layer.click_as(button, x, y);
@@ -6938,6 +7001,7 @@ fn main() -> Result<()> {
             "shaders": args.shaders,
             "detail": args.detail,
             "frame_effects": args.frame_effects,
+            "renderer": args.renderer,
             "language": args.language,
             "module": args.module,
             "install": report::install_info(&install, &args.language),

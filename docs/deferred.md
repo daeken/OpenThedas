@@ -37,16 +37,33 @@ lightmaps. It is not parity work; where the two differ, the faithful path is rig
 3. **Lighting pass**, one full-screen triangle into the frame: Static1's sum per pixel
    (`frame-gamma-lightmap-trace.md`): `albedo · (lm.rgb + lm.a · Σ(sun, point lights)) +
    specular`, its `cos²(π/2 · d/R)` falloff and Blinn-Phong highlight, then the level's fog.
-   Point lights come from a storage buffer holding **every** level light (the scene's and
-   the added ones, i.e. cutscene lights), each with a bit set of the rooms it reaches
+   One deliberate difference: Static1's falloff wraps past the radius (it rises again to
+   full at 2R), and the original hands a light to whole objects whose bounding sphere it
+   reaches, so large floors catch light from beyond its radius. That is most of the
+   faithful Cousland hall floor's brightness; per pixel it draws hard rings, so the deferred
+   falloff ends at the radius (`THEDAS_DEFERRED_VIEW=wrap` shows the other choice).
+   Point lights come from a uniform array (256, which every backend can bind) holding the
+   level lights whose reach is in view (the scene's and the added ones, i.e. cutscene
+   lights; nearest first past 256), each with a bit set of the rooms it reaches
    (`AreaScene::light_rooms`), tested against the pixel's room: no 3-light cap, no leaking
-   through walls into rooms the original never lit.
+   through walls into rooms the original never lit. Tiled or clustered culling replaces
+   the per-pixel loop over all of them when light counts call for it.
 4. Everything not deferred draws forward with its original shaders over that colour and
    depth: blended and multi-pass materials, water, sky, terrain, trees, skinned meshes,
    cut-away meshes, particles. Then the frame effects as now.
 
-**Deferred draws** (first cut): the level's opaque and alpha-tested D3D draws whose material
-is `static.mat`, not skinned, not SpeedTree, not cut away. Terrain (`terrain.mat`), then
+Debug views in place of the lit frame: `THEDAS_DEFERRED_VIEW=albedo|normal|lightmap|
+visibility|diffuse|specular|no-rooms|flat|wrap` (see `deferred::debug_view`).
+
+The environment reflection Static1 adds (the probe cubemap times
+`mml_fSpecularReflectionMult`, the specular mask and falloff) has no room in the G-buffer
+(wgpu's 32 bytes a pixel): a second draw of the deferred meshes adds it over the lit frame.
+
+Left out of the first cut, to come: the material tint, and the meshes' own tangents (the G-buffer builds a tangent frame from screen derivatives).
+
+**Deferred draws** (first cut): the level's own opaque draws with Static1's shaders
+(`Static1.psh`, or `Static1_Fast.psh` at Low; no alpha test, no blending), not skinned, not
+SpeedTree, not cut away. In Castle Cousland that is 2,100 of 3,997. Terrain (`terrain.mat`), then
 characters and placeables, move over in later steps.
 
 ## Lights from areas and from effects
