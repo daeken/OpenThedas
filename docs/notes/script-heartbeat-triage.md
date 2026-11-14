@@ -49,6 +49,12 @@ sixteen scenarios it reproduces every story log, ordered plot trace and all
 35 complete saves from main exactly, with zero saved-field differences.
 No control instrumentation or game scripts are committed.
 
+A second private control suppresses only the new float payload. It reproduces
+every candidate story log and ordered plot trace across all sixteen scenarios.
+Thirty-four complete saves match; the only difference in the remaining save
+is the float-slot list on one queued heartbeat. Thus scheduling accounts for
+the gameplay differences in this sweep; none requires the payload change.
+
 Four repeat/save-reload checks and six origin saves plus 60 ticks pass.
 The fresh corpus passes 563,678 entries, 10,652 archives and 155,719 GFF
 round trips, with zero archive/read failures or encrypted skips. Its JSON
