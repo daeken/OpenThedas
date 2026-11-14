@@ -1,5 +1,5 @@
-//! Getting the game: links that hand the player to the store's own client or page. We never
-//! download game files ourselves.
+//! Getting the game through the store's own client or page. Downloading it inside the launcher
+//! with the player's own account is `thedas-store`'s.
 
 use crate::config::GameKind;
 use crate::detect::{GOG_ORIGINS, Os, STEAM_DA2, STEAM_ORIGINS_UE};

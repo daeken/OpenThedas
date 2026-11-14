@@ -85,12 +85,31 @@ struct Tee {
     started: Instant,
 }
 
+/// Libraries that may carry a sign-in token in what they log (a URL, a header): only their
+/// warnings and errors are ever logged, whatever `RUST_LOG` says, so neither the console nor
+/// a report's log can hold a credential (the launcher's downloads, `thedas-store`, which
+/// never logs one itself).
+const QUIET: [&str; 5] = ["reqwest", "hyper", "h2", "rustls", "steamroom"];
+
+fn quiet(m: &log::Metadata) -> bool {
+    m.level() > log::Level::Warn
+        && QUIET.iter().any(|q| {
+            m.target() == *q
+                || m.target()
+                    .strip_prefix(q)
+                    .is_some_and(|r| r.starts_with("::") || r.starts_with('_'))
+        })
+}
+
 impl log::Log for Tee {
     fn enabled(&self, m: &log::Metadata) -> bool {
-        self.inner.enabled(m)
+        !quiet(m) && self.inner.enabled(m)
     }
 
     fn log(&self, record: &log::Record) {
+        if quiet(record.metadata()) {
+            return;
+        }
         if self.inner.matches(record) {
             let line = format!(
                 "{:9.3} {:5} {}: {}",
@@ -698,6 +717,25 @@ pub fn preset_note(preset: Option<String>) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn network_libraries_log_only_warnings() {
+        let m = |level, target| {
+            log::MetadataBuilder::new()
+                .level(level)
+                .target(target)
+                .build()
+        };
+        assert!(super::quiet(&m(log::Level::Debug, "reqwest::connect")));
+        assert!(super::quiet(&m(log::Level::Info, "hyper_util::client")));
+        assert!(super::quiet(&m(
+            log::Level::Trace,
+            "steamroom_client::login"
+        )));
+        assert!(!super::quiet(&m(log::Level::Warn, "reqwest")));
+        assert!(!super::quiet(&m(log::Level::Info, "thedas_store::gog")));
+        assert!(!super::quiet(&m(log::Level::Debug, "h2o")));
+    }
+
     use super::*;
 
     fn snap(taken: Instant, time_ms: u64) -> Snapshot {
