@@ -152,6 +152,97 @@ pub struct Mounted {
     pub problems: Vec<String>,
 }
 
+/// What one mod layer does to the stack, counted over every name it provides.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModStats {
+    /// The layer's label (`mod:...`, `user:...`).
+    pub label: String,
+    /// Names the layer provides.
+    pub files: usize,
+    /// Of those, names it wins.
+    pub winning: usize,
+    /// Of the winning ones, names the game's own layers also provide: what it replaces.
+    pub replaces: usize,
+    /// Names a later layer of the overlay wins over it.
+    pub hidden: usize,
+}
+
+/// One name a mod wins that something else also provides.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Fight {
+    pub name: String,
+    /// The winning layer's label.
+    pub winner: String,
+    /// The layers it beats, in the order they would win next; labels of the game's own
+    /// layers are install paths, a mod's start with `mod:`.
+    pub beaten: Vec<String>,
+    /// Whether the game's own layers provide the name.
+    pub in_game: bool,
+}
+
+/// Per overlay layer of `vfs`, what it provides, wins, replaces and loses. `vfs` is a stack
+/// with the mods in its overlay ([`crate::install::DaoInstall::play_vfs`]); with no overlay
+/// there is nothing to count.
+pub fn mod_stats(vfs: &Vfs) -> Vec<ModStats> {
+    let Some(overlay) = vfs.overlay() else {
+        return Vec::new();
+    };
+    let base = vfs.layers().len();
+    let mut stats: Vec<ModStats> = overlay
+        .layers()
+        .iter()
+        .map(|l| ModStats {
+            label: l.label.clone(),
+            files: 0,
+            winning: 0,
+            replaces: 0,
+            hidden: 0,
+        })
+        .collect();
+    for name in overlay.names() {
+        let hits = vfs.hits(&name);
+        let in_game = hits.iter().any(|h| h.layer < base);
+        for (i, h) in hits.iter().enumerate().filter(|(_, h)| h.layer >= base) {
+            let Some(s) = stats.get_mut(h.layer - base) else {
+                continue;
+            };
+            s.files += 1;
+            if i == 0 {
+                s.winning += 1;
+                s.replaces += usize::from(in_game);
+            } else {
+                s.hidden += 1;
+            }
+        }
+    }
+    stats
+}
+
+/// Every name a mod layer wins that another layer also provides, sorted by name. Large
+/// texture packs give tens of thousands; show a page of them at a time.
+pub fn fights(vfs: &Vfs) -> Vec<Fight> {
+    let Some(overlay) = vfs.overlay() else {
+        return Vec::new();
+    };
+    let base = vfs.layers().len();
+    let mut out = Vec::new();
+    let mut names = overlay.names();
+    names.sort();
+    for name in names {
+        let hits = vfs.hits(&name);
+        if hits.len() < 2 || hits[0].layer < base {
+            continue;
+        }
+        out.push(Fight {
+            name,
+            winner: hits[0].layer_label.clone(),
+            in_game: hits.iter().any(|h| h.layer < base),
+            beaten: hits[1..].iter().map(|h| h.layer_label.clone()).collect(),
+        });
+    }
+    out
+}
+
 /// The player's own folder for saves, settings and the mod list. On Windows it is `OpenThedas`
 /// in the player's Documents (the known folder, which may be redirected), where the original
 /// keeps its own (`BioWare\Dragon Age`); elsewhere `.openthedas` in the home folder (`HOME`).
@@ -1372,6 +1463,39 @@ mod tests {
         assert_eq!(report[0].layers, 0);
         assert_eq!(report[0].problems.len(), 1, "{:?}", report[0].problems);
         assert_eq!(std::fs::read_dir(&cache).unwrap().count(), 1);
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn mod_stats_and_fights_count_what_mods_replace_and_hide() {
+        let base = scratch("stats");
+        write(&base, "game/a.dds", b"game a");
+        write(&base, "game/b.dds", b"game b");
+        write(&base, "one/a.dds", b"one a");
+        write(&base, "one/c.dds", b"one c");
+        write(&base, "two/a.dds", b"two a");
+        write(&base, "two/d.dds", b"two d");
+        let mut vfs = Vfs::new();
+        vfs.push_directory(base.join("game"), false, "game")
+            .unwrap();
+        let mut overlay = Vfs::new();
+        let list = ModList::parse("one\ntwo\n", &base);
+        let report = list.mount(&mut overlay);
+        assert_eq!(report.len(), 2);
+        vfs.set_overlay(overlay);
+        let stats = mod_stats(&vfs);
+        let row = |s: &ModStats| (s.files, s.winning, s.replaces, s.hidden);
+        assert_eq!(stats.len(), 2);
+        // `one` provides a and c, loses a to `two`; `two` provides a and d, wins both, and
+        // replaces the game's a.
+        assert_eq!(row(&stats[0]), (2, 1, 0, 1));
+        assert_eq!(row(&stats[1]), (2, 2, 1, 0));
+        let f = fights(&vfs);
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].name, "a.dds");
+        assert!(f[0].in_game && f[0].winner.contains("two"));
+        assert_eq!(f[0].beaten.len(), 2);
+        assert!(mod_stats(&Vfs::new()).is_empty() && fights(&Vfs::new()).is_empty());
         std::fs::remove_dir_all(&base).unwrap();
     }
 
