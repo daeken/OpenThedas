@@ -568,6 +568,10 @@ pub struct World {
     next_seq: u64,
     pub module: Option<ObjectId>,
     pub area: Option<ObjectId>,
+    /// DA2 encounter registrations. Area/id membership lives on each creature; this list
+    /// preserves order across reassignment and save/reload. Absent from Origins saves.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) da2_encounter_order: Vec<ObjectId>,
     pub hero: Option<ObjectId>,
     /// The party member the player controls, when not the hero (see
     /// [`World::controlled`]). Saved.
@@ -855,6 +859,7 @@ impl World {
             next_seq: 0,
             module: None,
             area: None,
+            da2_encounter_order: Vec::new(),
             hero: None,
             controlled: None,
             party: None,
@@ -1002,6 +1007,7 @@ impl World {
         for (_, id) in due {
             if Some(id) != self.hero {
                 self.objects.remove(&id);
+                self.da2_encounter_order.retain(|&c| c != id);
                 // A destroyed follower leaves the party (the list holds no dead ids).
                 if let Some(h) = self.hero.and_then(|h| self.objects.get_mut(&h)) {
                     h.followers.retain(|&f| f != id);
