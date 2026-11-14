@@ -6300,6 +6300,73 @@ mod tests {
             );
             assert_eq!(s.talk, before);
         }
+        s.end_conversation();
+        // A plot action may request a new NPC conversation from inside the
+        // current reply. Taking `talk` off Sim during that action must not let
+        // the request cut off the old conversation's remaining actions.
+        use crate::dialog::{Dlg, Node, PlotRef};
+        use thedas_script::ncs::Ncs;
+        let node = |text: &str| Node {
+            reply: false,
+            strref: None,
+            text: Some(text.into()),
+            speaker: "OWNER".into(),
+            listener: String::new(),
+            condition: PlotRef::default(),
+            action: PlotRef::default(),
+            children: Vec::new(),
+            show_once: 0,
+            cnv_flags: Some(1),
+            ambient: false,
+            cutscene: None,
+        };
+        let mut first = node("before request");
+        first.children = vec![1];
+        let mut reply = node("continue");
+        reply.reply = true;
+        reply.cnv_flags = None;
+        reply.children = vec![2];
+        reply.action.script = Some("request_next".into());
+        let mut last = node("after request");
+        last.action = PlotRef {
+            plot: Some("FINISHED".into()),
+            flag: 0,
+            value: true,
+            ..Default::default()
+        };
+        let resource = b"override.cnv";
+        let mut code = vec![0x04, 0x60];
+        code.extend((resource.len() as u16).to_be_bytes());
+        code.extend(resource);
+        code.extend([0x04, 0x06]);
+        code.extend(other.to_be_bytes());
+        code.extend([0x05, 0, 1, 0xb8, 2, 0x1b, 0]);
+        code.extend((-4_i32).to_be_bytes());
+        code.extend([0x20, 0]);
+        let mut bytes = b"NCS V1.0B".to_vec();
+        bytes.extend(((13 + code.len()) as u32).to_be_bytes());
+        bytes.extend(code);
+        s.add_script("request_next", Ncs::parse(&bytes).unwrap());
+        assert!(s.open_conversation(
+            hero,
+            hero,
+            Dlg {
+                name: "outer".into(),
+                starts: vec![0],
+                nodes: vec![first, reply, last],
+            },
+            None
+        ));
+        s.choose_reply(0);
+        assert_eq!(s.talk.as_ref().unwrap().dlg.name, "outer");
+        assert_eq!(s.dialog_state().unwrap().line, "after request");
+        assert!(s.get_plot_flag("FINISHED", 0, false, hero));
+        assert_eq!(s.world.pending_talks.len(), 1);
+        assert!(!s.dialog_advancing);
+        s.tick(0);
+        assert_eq!(s.talk.as_ref().unwrap().owner, other);
+        assert_eq!(s.talk.as_ref().unwrap().dlg.name, "override");
+        assert!(s.world.trace.script_errors.is_empty());
         std::fs::remove_dir_all(dir).unwrap();
     }
 

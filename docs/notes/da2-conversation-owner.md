@@ -17,8 +17,16 @@ oTarget as the object that owns the conversation.
 The simulation now uses the target as owner, its default conversation when no
 resource is supplied, and the hero as player. The existing active/living-owner
 checks therefore apply to the intended NPC rather than the script caller.
-Origins' three-argument command is unchanged. This does not implement every
-native conversation-manager admission rule or cinematic behavior.
+Origins' three-argument command is unchanged.
+
+The manager path `0x5a3300 -> 0x5a1350` submits an interactive request through
+the mode controller (`0x5a1593..0x5a15e5`, mode 4); it does not run it as a
+replacement inside the current line action. The DA2 walker now retains that
+ownership while temporarily taking its conversation off Sim to advance a reply
+or start a line. A script's new interactive request waits in the existing
+pending list, and the old conversation's remaining actions still run. Origins
+retains its previous action behavior. Complete ambient-class presentation and
+additional native admission rules remain outside this change.
 
 In Act 1, Lirene's last line sets Tranquility flag 2. Its shipped script falls
 through to a request to talk to Anders. Earlier builds allowed that request
