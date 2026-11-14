@@ -352,27 +352,36 @@ fn talk_line(sim: &Sim) -> Option<TalkLine> {
 
 /// The depth of field an open conversation runs
 /// ([`thedas_render::cut_effects::conversation_depth_of_field`]), from the game's tables 203
-/// and 204 (`conversation_dof_values`, `conversation_dof_parameters`). Provisional: taken
-/// to run whenever a conversation line is up, the conversation game mode's own start and
-/// end not being modelled.
+/// and 204 (`conversation_dof_values`, `conversation_dof_parameters`). Dragon Age II numbers
+/// its tables otherwise but ships both by name, with the same values row (focus distance
+/// −1: radius 8, far fade 20), so the names stand in when the numbers do not give them.
+/// Provisional: taken to run whenever a conversation line is up, the conversation game
+/// mode's own start and end not being modelled; that Dragon Age II reads these tables is
+/// inferred from their being there.
 fn conversation_depth_of_field(sim: &Sim) -> Option<thedas_render::cut_effects::DepthOfField> {
     use thedas_formats::gda::Cell;
     sim.conversation_line()?;
     let tables = sim.world.tables();
-    let values = tables.get(203, "");
-    let parameters = tables.get(204, "");
     let number = |c: Option<&Cell>| match c {
         Some(Cell::Float(v)) => Some(*v as f32),
         Some(Cell::Int(v)) => Some(*v as f32),
         _ => None,
     };
     // The first row whose focus distance is below zero holds the values.
-    let row = values.as_ref().and_then(|t| {
+    let values_row = |t: &thedas_sim::m2da::Table| {
         t.order
             .iter()
             .copied()
             .find(|&r| number(t.cell("FocusDistance", r)).is_some_and(|v| v < 0.0))
-    });
+    };
+    let (values, parameters) = match tables.get(203, "") {
+        Some(t) if values_row(&t).is_some() => (Some(t), tables.get(204, "")),
+        _ => (
+            tables.get(0, "conversation_dof_values"),
+            tables.get(0, "conversation_dof_parameters"),
+        ),
+    };
+    let row = values.as_ref().and_then(|t| values_row(t));
     let listed = |name: &str| {
         parameters.as_ref().is_some_and(|t| {
             t.order.iter().any(|&r| {
