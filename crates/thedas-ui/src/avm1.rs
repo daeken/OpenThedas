@@ -230,6 +230,66 @@ fn post_load_wrap_maker() -> Vec<u8> {
     function(&["o"], &outer)
 }
 
+/// Retains the container's current selection when a preselected child finishes
+/// loading after an early click. Observe the child after clearing its conflicting
+/// initial state, before the container's watcher can feed back into another child.
+fn selection_listener_wrap_maker() -> Vec<u8> {
+    let mut inner = Asm::default();
+    let c = &mut inner.code;
+    get_path(c, &["property"]);
+    push(c, &[Push::Str("SI_ItemSelected")]);
+    c.extend_from_slice(&[EQUALS2, NOT]);
+    inner.branch(IF, "original");
+    let c = &mut inner.code;
+    get_path(c, &["callback", "m_Function"]);
+    get_path(
+        c,
+        &[
+            "_global",
+            "Behaviour",
+            "SelectableItemContainer",
+            "prototype",
+            "SelectionChanged",
+        ],
+    );
+    c.extend_from_slice(&[EQUALS2, NOT]);
+    inner.branch(IF, "original");
+    get_path(&mut inner.code, &["child", "SI_ItemSelected"]);
+    inner.code.push(NOT);
+    inner.branch(IF, "original");
+    let c = &mut inner.code;
+    push(c, &[Push::Str("current")]);
+    get_path(c, &["callback", "m_TargetObject", "_currentObject"]);
+    c.push(DEFINE_LOCAL);
+    get_path(c, &["current"]);
+    c.push(NOT);
+    inner.branch(IF, "original");
+    let c = &mut inner.code;
+    get_path(c, &["current"]);
+    get_path(c, &["child"]);
+    c.push(EQUALS2);
+    inner.branch(IF, "original");
+    get_path(&mut inner.code, &["current", "SI_ItemSelected"]);
+    inner.code.push(NOT);
+    inner.branch(IF, "original");
+    let c = &mut inner.code;
+    push(c, &[Push::Int(0)]);
+    get_path(c, &["child"]);
+    push(c, &[Push::Str("Unselect")]);
+    c.extend_from_slice(&[CALL_METHOD, POP]);
+    inner.label("original");
+    let c = &mut inner.code;
+    get_path(c, &["arguments"]);
+    get_path(c, &["this"]);
+    push(c, &[Push::Int(2)]);
+    get_path(c, &["o"]);
+    push(c, &[Push::Str("apply")]);
+    c.extend_from_slice(&[CALL_METHOD, RETURN]);
+    let mut outer = function(&["child", "property", "callback", "data"], &inner.finish());
+    outer.push(RETURN);
+    function(&["o"], &outer)
+}
+
 /// `function () { var a = _global.thedas_after; while (a.length) { var f = a.shift(); f(); } }`
 /// (see [`POST_LOAD_RUN`]).
 fn run_after_function() -> Vec<u8> {
@@ -1045,6 +1105,36 @@ pub fn register_invoke() -> Vec<u8> {
     get_path(&mut install, &["_global"]);
     push(&mut install, &[Push::Str("thedas_text_wrap")]);
     install.extend_from_slice(&[CALL_METHOD, SET_MEMBER]);
+    // The listener registrar is shared by existing containers and children loaded later.
+    let registrar = ["_global", "DataType", "Observable", "RegisterListener"];
+    let mut selection = Vec::new();
+    get_path(&mut selection, &["_global", "DataType", "Observable"]);
+    push(&mut selection, &[Push::Str("RegisterListener")]);
+    get_path(&mut selection, &registrar);
+    push(&mut selection, &[Push::Int(1)]);
+    selection.extend(selection_listener_wrap_maker());
+    push(&mut selection, &[Push::Undefined]);
+    selection.extend_from_slice(&[CALL_METHOD, SET_MEMBER]);
+    get_path(&mut selection, &registrar);
+    push(&mut selection, &[Push::Str("thedas_w"), Push::Bool(true)]);
+    selection.push(SET_MEMBER);
+    let mut selection_install = Vec::new();
+    get_path(
+        &mut selection_install,
+        &[
+            "_global",
+            "DataType",
+            "Observable",
+            "RegisterListener",
+            "thedas_w",
+        ],
+    );
+    branch(&mut selection_install, IF, selection.len(), false);
+    selection_install.extend(selection);
+    get_path(&mut install, &registrar);
+    install.push(NOT);
+    branch(&mut install, IF, selection_install.len(), false);
+    install.extend(selection_install);
     get_path(&mut out, &["_global"]);
     push(&mut out, &[Push::Str("thedas_post_load_wrap")]);
     out.extend(post_load_wrap_maker());
@@ -1205,6 +1295,107 @@ mod tests {
                     ]
                 );
             }
+        }
+    }
+
+    #[test]
+    fn late_selected_children_preserve_the_containers_existing_selection() {
+        use thedas_gfx::avm1::value::Value;
+
+        let movie = b"FWS\x08\x12\0\0\0\x08\0\0\x1e\x01\0\x40\0\0\0";
+        let mut player = thedas_gfx::Player::new(
+            movie,
+            "selection-registration-test",
+            Box::new(Empty),
+            std::sync::Arc::new(Empty),
+            Some(register_invoke()),
+        )
+        .unwrap();
+        player.run_frame();
+        let data_type = Value::Object(player.vm.new_object());
+        let observable = Value::Object(player.vm.new_object());
+        player
+            .vm
+            .define(player.vm.global, "DataType", data_type.clone(), 0);
+        player.vm.set(&data_type, "Observable", observable.clone());
+        let original = player.vm.new_native(|vm, _, args| {
+            let selected = vm.get(&args[0], "SI_ItemSelected");
+            vm.set(&args[0], "selectedWhenRegistered", selected);
+            Value::Bool(true)
+        });
+        player
+            .vm
+            .set(&observable, "RegisterListener", Value::Object(original));
+        let behaviour = Value::Object(player.vm.new_object());
+        let class = Value::Object(player.vm.new_object());
+        let prototype = Value::Object(player.vm.new_object());
+        let selection_changed = player.vm.new_native(|_, _, _| Value::Undefined);
+        player
+            .vm
+            .define(player.vm.global, "Behaviour", behaviour.clone(), 0);
+        player
+            .vm
+            .set(&behaviour, "SelectableItemContainer", class.clone());
+        player.vm.set(&class, "prototype", prototype.clone());
+        player.vm.set(
+            &prototype,
+            "SelectionChanged",
+            Value::Object(selection_changed),
+        );
+        let current = Value::Object(player.vm.new_object());
+        player
+            .vm
+            .set(&current, "SI_ItemSelected", Value::Bool(true));
+        let container = Value::Object(player.vm.new_object());
+        let child = Value::Object(player.vm.new_object());
+        let unselect = player.vm.new_native(|vm, this, _| {
+            vm.set(&this, "SI_ItemSelected", Value::Bool(false));
+            Value::Undefined
+        });
+        player.vm.set(&child, "Unselect", Value::Object(unselect));
+        let callback = Value::Object(player.vm.new_object());
+        player
+            .vm
+            .set(&callback, "m_TargetObject", container.clone());
+        player.invoke(INSTALL, &[]);
+        let wrapped = player.vm.get(&observable, "RegisterListener");
+        player.invoke(INSTALL, &[]);
+        assert_eq!(player.vm.get(&observable, "RegisterListener"), wrapped);
+        for (selected, function, property, expected) in [
+            (current.clone(), selection_changed, "SI_ItemSelected", false),
+            (current.clone(), original, "SI_ItemSelected", true),
+            (Value::Null, selection_changed, "SI_ItemSelected", true),
+            (child.clone(), selection_changed, "SI_ItemSelected", true),
+            (current.clone(), selection_changed, "other", true),
+        ] {
+            player.vm.set(&container, "_currentObject", selected);
+            player
+                .vm
+                .set(&callback, "m_Function", Value::Object(function));
+            player.vm.set(&child, "SI_ItemSelected", Value::Bool(true));
+            let result = player.vm.call_method(
+                &observable,
+                "RegisterListener",
+                &[
+                    child.clone(),
+                    Value::from(property),
+                    callback.clone(),
+                    child.clone(),
+                ],
+            );
+            assert_eq!(result, Value::Bool(true));
+            assert_eq!(
+                player.vm.get(&current, "SI_ItemSelected"),
+                Value::Bool(true)
+            );
+            assert_eq!(
+                player.vm.get(&child, "SI_ItemSelected"),
+                Value::Bool(expected)
+            );
+            assert_eq!(
+                player.vm.get(&child, "selectedWhenRegistered"),
+                Value::Bool(expected)
+            );
         }
     }
 
