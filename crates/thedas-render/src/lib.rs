@@ -21,6 +21,7 @@ pub mod cut_effects;
 pub mod d3d;
 mod d3d_gpu;
 pub mod deferred;
+mod deferred_alpha;
 mod deferred_character;
 mod deferred_mesh;
 mod deferred_shadow;
