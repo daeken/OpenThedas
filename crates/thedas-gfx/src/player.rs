@@ -581,6 +581,20 @@ impl Player {
         self.run_queue();
     }
 
+    /// Selects all text in the focused editable or selectable field.
+    pub fn select_all(&mut self) {
+        if let Some(t) = self
+            .vm
+            .focus
+            .and_then(|f| self.vm.display.get_mut(f))
+            .and_then(|o| o.text_mut())
+            && (t.input || t.selectable)
+        {
+            t.set_selection(0, t.len());
+            self.vm.dirty = true;
+        }
+    }
+
     /// Types `text` into the focused text field.
     pub fn type_text(&mut self, text: &str) -> bool {
         let Some(f) = self.vm.focus else {
@@ -1472,12 +1486,13 @@ pub fn set_focus(vm: &mut Vm, d: Option<DisplayId>) {
         .and_then(|o| o.text_mut())
     {
         t.caret = None;
+        t.selection_anchor = 0;
     }
     if let Some(t) = d
         .and_then(|o| vm.display.get_mut(o))
         .and_then(|o| o.text_mut())
     {
-        t.caret = Some(t.len());
+        t.set_selection(t.len(), t.len());
     }
     let ov = old
         .map(|o| display_api::display_value(vm, o))
@@ -1520,33 +1535,66 @@ fn text_key(vm: &mut Vm, f: DisplayId, code: u32, ch: Option<char>) -> bool {
     }
     let mut text: Vec<char> = t.text().chars().collect();
     let mut caret = t.caret.unwrap_or(text.len()).min(text.len());
+    let (begin, end) = t.selection();
+    let shift = vm.keys_down.contains(&16);
+    let selecting_all = code == 65 && vm.keys_down.contains(&17);
+    let mut anchor = t.selection_anchor.min(text.len());
     let mut changed = false;
     match (code, ch) {
+        (65, _) if selecting_all => {
+            anchor = 0;
+            caret = text.len();
+        }
         (8, _) => {
-            if caret > 0 {
+            if begin != end {
+                text.drain(begin..end);
+                caret = begin;
+                changed = true;
+            } else if caret > 0 {
                 text.remove(caret - 1);
                 caret -= 1;
                 changed = true;
             }
         }
         (46, _) => {
-            if caret < text.len() {
+            if begin != end {
+                text.drain(begin..end);
+                caret = begin;
+                changed = true;
+            } else if caret < text.len() {
                 text.remove(caret);
                 changed = true;
             }
         }
-        (37, _) => caret = caret.saturating_sub(1),
-        (39, _) => caret = (caret + 1).min(text.len()),
+        (37, _) => {
+            caret = if !shift && begin != end {
+                begin
+            } else {
+                caret.saturating_sub(1)
+            }
+        }
+        (39, _) => {
+            caret = if !shift && begin != end {
+                end
+            } else {
+                (caret + 1).min(text.len())
+            }
+        }
         (36, _) => caret = 0,
         (35, _) => caret = text.len(),
         (13, _) if t.multiline => {
+            text.drain(begin..end);
+            caret = begin;
             text.insert(caret, '\r');
             caret += 1;
             changed = true;
         }
         (_, Some(c)) if !c.is_control() => {
             let allowed = t.restrict.as_deref().is_none_or(|r| restrict_allows(r, c));
-            if allowed && (t.max_chars == 0 || (text.len() as u32) < t.max_chars) {
+            if allowed && (t.max_chars == 0 || ((text.len() - (end - begin)) as u32) < t.max_chars)
+            {
+                text.drain(begin..end);
+                caret = begin;
                 text.insert(caret, c);
                 caret += 1;
                 changed = true;
@@ -1560,7 +1608,10 @@ fn text_key(vm: &mut Vm, f: DisplayId, code: u32, ch: Option<char>) -> bool {
     if changed {
         t.set_text(&s);
     }
-    t.caret = Some(caret);
+    if changed || (!shift && !selecting_all) {
+        anchor = caret;
+    }
+    t.set_selection(anchor, caret);
     let var = t.variable.clone();
     vm.dirty = true;
     if changed {
@@ -1943,6 +1994,166 @@ mod queue_tests {
         code.extend_from_slice(text.as_bytes());
         code.extend_from_slice(&[0, 0x26, 0]);
         Arc::from(code)
+    }
+
+    fn input_player() -> (Player, DisplayId) {
+        let movie = b"FWS\x08\x12\0\0\0\x08\0\0\x1e\x01\0\x40\0\0\0";
+        let mut p =
+            Player::new(movie, "selection", Box::new(Empty), Arc::new(Empty), None).unwrap();
+        let text = crate::text::TextField::new(Arc::new(crate::swf::EditText::default()), None);
+        let mut object = Object::new(Kind::Text(Box::new(text)));
+        object.parent = Some(p.vm.root);
+        let field = p.vm.display.add(object);
+        p.vm.display
+            .get_mut(p.vm.root)
+            .unwrap()
+            .children
+            .insert(1, field);
+        (p, field)
+    }
+
+    #[test]
+    fn select_all_replaces_text_and_keeps_restrictions_limits_and_notifications() {
+        let (mut p, field) = input_player();
+        let selection = Value::Object(p.vm.selection);
+        assert_eq!(
+            p.vm.call_method(&selection, "getBeginIndex", &[]),
+            Value::Number(-1.0)
+        );
+        set_focus(&mut p.vm, Some(field));
+        let text_value = p.vm.display_object(field);
+        let changed = p.vm.new_native(|vm, this, _| {
+            let text = vm.get(&this, "text");
+            let s = vm.to_str(&text);
+            vm.log.push(format!("changed: {s}"));
+            Value::Undefined
+        });
+        p.vm.set(&text_value, "onChanged", Value::Object(changed));
+        let t = p.vm.display.get_mut(field).unwrap().text_mut().unwrap();
+        t.variable = "name".into();
+        t.max_chars = 5;
+        t.restrict = Some("A-Za-z".into());
+        p.type_text("Rowan");
+        p.select_all();
+        assert_eq!(
+            p.vm.call_method(&selection, "getBeginIndex", &[]),
+            Value::Number(0.0)
+        );
+        assert_eq!(
+            p.vm.call_method(&selection, "getEndIndex", &[]),
+            Value::Number(5.0)
+        );
+        p.type_text("!");
+        assert_eq!(
+            p.vm.display.get(field).unwrap().text().unwrap().selection(),
+            (0, 5)
+        );
+        p.type_text("Sera");
+        let t = p.vm.display.get(field).unwrap().text().unwrap();
+        assert_eq!(t.text(), "Sera");
+        assert_eq!(t.selection(), (4, 4));
+        let root = p.vm.display_object(p.vm.root);
+        assert_eq!(p.vm.get(&root, "name"), Value::from("Sera"));
+        assert_eq!(p.drain_log().last().unwrap(), "changed: Sera");
+        p.key_down(17, None);
+        p.key_down(65, Some('a'));
+        p.key_up(65);
+        p.key_up(17);
+        p.key_down(8, None);
+        p.key_up(8);
+        assert_eq!(p.vm.display.get(field).unwrap().text().unwrap().text(), "");
+        assert_eq!(
+            p.vm.call_method(&selection, "getCaretIndex", &[]),
+            Value::Number(0.0)
+        );
+        set_focus(&mut p.vm, None);
+        assert_eq!(
+            p.vm.call_method(&selection, "getCaretIndex", &[]),
+            Value::Number(-1.0)
+        );
+    }
+
+    #[test]
+    fn selection_ranges_shift_navigation_and_utf16_indices() {
+        let (mut p, field) = input_player();
+        set_focus(&mut p.vm, Some(field));
+        p.type_text("Rowan");
+        p.key_down(36, None);
+        p.key_up(36);
+        p.key_down(16, None);
+        p.key_down(39, None);
+        p.key_down(39, None);
+        p.key_up(39);
+        p.key_up(16);
+        assert_eq!(
+            p.vm.display.get(field).unwrap().text().unwrap().selection(),
+            (0, 2)
+        );
+        p.type_text("Br");
+        assert_eq!(
+            p.vm.display.get(field).unwrap().text().unwrap().text(),
+            "Brwan"
+        );
+        let selection = Value::Object(p.vm.selection);
+        p.vm.call_method(
+            &selection,
+            "setSelection",
+            &[Value::Number(4.0), Value::Number(1.0)],
+        );
+        assert_eq!(
+            p.vm.call_method(&selection, "getBeginIndex", &[]),
+            Value::Number(1.0)
+        );
+        assert_eq!(
+            p.vm.call_method(&selection, "getCaretIndex", &[]),
+            Value::Number(1.0)
+        );
+        p.key_down(39, None);
+        p.key_up(39);
+        assert_eq!(
+            p.vm.call_method(&selection, "getCaretIndex", &[]),
+            Value::Number(4.0)
+        );
+        p.vm.call_method(
+            &selection,
+            "setSelection",
+            &[Value::Number(1.0), Value::Number(4.0)],
+        );
+        p.key_down(8, None);
+        p.key_up(8);
+        assert_eq!(
+            p.vm.display.get(field).unwrap().text().unwrap().text(),
+            "Bn"
+        );
+        p.vm.display
+            .get_mut(field)
+            .unwrap()
+            .text_mut()
+            .unwrap()
+            .set_text("A😀B");
+        p.vm.call_method(
+            &selection,
+            "setSelection",
+            &[Value::Number(1.0), Value::Number(3.0)],
+        );
+        assert_eq!(
+            p.vm.call_method(&selection, "getCaretIndex", &[]),
+            Value::Number(3.0)
+        );
+        p.type_text("X");
+        assert_eq!(
+            p.vm.display.get(field).unwrap().text().unwrap().text(),
+            "AXB"
+        );
+        p.vm.call_method(
+            &selection,
+            "setSelection",
+            &[Value::Number(-2.0), Value::Number(999.0)],
+        );
+        p.vm.call_method(&selection, "setSelection", &[]);
+        p.key_down(46, None);
+        p.key_up(46);
+        assert_eq!(p.vm.display.get(field).unwrap().text().unwrap().text(), "");
     }
 
     #[test]

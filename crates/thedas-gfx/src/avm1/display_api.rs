@@ -1240,6 +1240,59 @@ fn selection_get_focus(vm: &mut Vm, _: Value, _: &[Value]) -> Value {
     }
 }
 
+fn selection_index(vm: &Vm, which: u8) -> Value {
+    let Some(t) = vm
+        .focus
+        .and_then(|f| vm.display.get(f))
+        .and_then(|o| o.text())
+    else {
+        return Value::Number(-1.0);
+    };
+    let (begin, end) = t.selection();
+    let index = match which {
+        0 => begin,
+        1 => end,
+        _ => t.caret.unwrap_or(end).min(t.len()),
+    };
+    Value::Number(
+        t.text()
+            .chars()
+            .take(index)
+            .map(|c| c.len_utf16())
+            .sum::<usize>() as f64,
+    )
+}
+
+fn selection_set_range(vm: &mut Vm, _: Value, args: &[Value]) -> Value {
+    if args.is_empty() {
+        return Value::Undefined;
+    }
+    let begin = super::value::to_int32(vm.to_number(&arg(args, 0))).max(0) as usize;
+    let end = args
+        .get(1)
+        .map(|v| super::value::to_int32(vm.to_number(v)).max(0) as usize)
+        .unwrap_or(usize::MAX);
+    if let Some(t) = vm
+        .focus
+        .and_then(|f| vm.display.get_mut(f))
+        .and_then(|o| o.text_mut())
+    {
+        let text = t.text();
+        let char_index = |index| {
+            let mut units = 0;
+            text.chars()
+                .take_while(|c| {
+                    units += c.len_utf16();
+                    units <= index
+                })
+                .count()
+        };
+        t.set_selection(char_index(begin), char_index(end));
+        vm.dirty = true;
+    }
+    Value::Undefined
+}
+
 fn selection_set_focus(vm: &mut Vm, _: Value, args: &[Value]) -> Value {
     let a = arg(args, 0);
     let d = match &a {
@@ -1565,10 +1618,10 @@ pub fn install(vm: &mut Vm) {
     let sel = vm.selection;
     vm.define_native(sel, "getFocus", selection_get_focus);
     vm.define_native(sel, "setFocus", selection_set_focus);
-    vm.define_native(sel, "getBeginIndex", |_, _, _| Value::Number(-1.0));
-    vm.define_native(sel, "getEndIndex", |_, _, _| Value::Number(-1.0));
-    vm.define_native(sel, "getCaretIndex", |_, _, _| Value::Number(-1.0));
-    vm.define_native(sel, "setSelection", |_, _, _| Value::Undefined);
+    vm.define_native(sel, "getBeginIndex", |vm, _, _| selection_index(vm, 0));
+    vm.define_native(sel, "getEndIndex", |vm, _, _| selection_index(vm, 1));
+    vm.define_native(sel, "getCaretIndex", |vm, _, _| selection_index(vm, 2));
+    vm.define_native(sel, "setSelection", selection_set_range);
 
     let loader_proto = vm.new_object();
     class(vm, g, "MovieClipLoader", loader_new, loader_proto);
