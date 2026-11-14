@@ -1833,6 +1833,9 @@ impl Live {
         let kept = shown.kept;
         // A cutscene's weapon draws and hidden actors.
         let mut hidden = std::collections::HashSet::new();
+        // Party members the playing cutscene does not cast are not drawn while it plays
+        // (`Sim::cutscene_hidden_party`).
+        hidden.extend(sim.cutscene_hidden_party());
         for (id, show) in &posing {
             if show.hidden {
                 hidden.insert(*id);
