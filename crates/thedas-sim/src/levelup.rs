@@ -26,6 +26,133 @@ pub const MSG_SELECT_NAME: &str = "GUICharGen.CharGenSelectName";
 pub const MSG_CHAINS: &str = "GameModeController.FindAbilityChains";
 
 impl Sim {
+    /// Unspent attribute, skill and talent points in the current game's property layout.
+    /// DA2 has no skill pool; specialization points (40) are separate from its level-up mark.
+    pub fn level_up_points(&self, who: ObjectId) -> [f32; 3] {
+        let properties = if self.game == thedas_vfs::Game::DragonAge2 {
+            [38, 0, 39]
+        } else {
+            [34, 35, 36]
+        };
+        properties.map(|p| {
+            if p == 0 {
+                0.0
+            } else {
+                self.property_total(who, p)
+            }
+        })
+    }
+
+    /// DA2's SetCanLevelUp ignores its flag and recomputes this from properties 38 + 39
+    /// (0x4eaf30 -> 0x544580); Origins uses 34 + 35 + 36.
+    pub fn has_level_up_points(&self, who: ObjectId) -> bool {
+        self.level_up_points(who).iter().sum::<f32>() > 0.0
+    }
+
+    fn refresh_level_up_mark(&mut self, who: ObjectId) {
+        let can = self.has_level_up_points(who);
+        if let Some(o) = self.world.get_mut(who) {
+            o.fields.insert("CanLevelUp".into(), i32::from(can));
+        }
+    }
+
+    /// A manual attribute choice. DA2's creature BuyAttributeMessage handler (0x578c90)
+    /// changes the attribute base by the signed amount and subtracts it from pool 38.
+    /// Its sys_chargen deliberately has no CHARGEN_ASSIGN_ATTRIBUTES case.
+    pub fn assign_level_up_attribute(&mut self, who: ObjectId, attribute: i32, n: i32) -> bool {
+        if self.world.chargen != Some(who) {
+            return false;
+        }
+        if self.game != thedas_vfs::Game::DragonAge2 {
+            return self.chargen_event("CHARGEN_ASSIGN_ATTRIBUTES", vec![attribute, n], Vec::new());
+        }
+        if !(1..=6).contains(&attribute) || n == 0 {
+            return false;
+        }
+        let Some(o) = self.world.get(who) else {
+            return false;
+        };
+        let base = o.properties.get(&attribute).map_or(0.0, |p| p.0);
+        let points = self.property_total(who, 38);
+        // The movie normally validates its input before sending the creature message.
+        if points < n as f32 || base + (n as f32) < 0.0 {
+            return false;
+        }
+        let o = self.world.get_mut(who).unwrap();
+        o.properties.entry(attribute).or_default().0 = base + n as f32;
+        o.properties.entry(38).or_default().0 = points - n as f32;
+        self.refresh_level_up_mark(who);
+        true
+    }
+
+    /// A manual ability choice. DA2's BuyAbilityMessage (0x598ce0) uses the ability
+    /// registry's point pool and cost, adds/removes the learned ability, and updates the
+    /// quickbar. The registry loader (0x5cb490) maps types 1, 2, 5 to pool 39 and type 3
+    /// to pool 40; its cost is column 0x2058ed0b. The sign requests purchase or refund.
+    pub fn assign_level_up_ability(
+        &mut self,
+        who: ObjectId,
+        ability: i32,
+        specialization: bool,
+    ) -> bool {
+        if self.world.chargen != Some(who) {
+            return false;
+        }
+        if self.game != thedas_vfs::Game::DragonAge2 {
+            return self.chargen_event(
+                "CHARGEN_ASSIGN_ABILITIES",
+                vec![ability, i32::from(specialization)],
+                Vec::new(),
+            );
+        }
+        let Some(id) = ability.checked_abs().filter(|&id| id > 0) else {
+            return false;
+        };
+        let Some(table) = self.world.tables().get(1, "") else {
+            return false;
+        };
+        let int = |hash| match table.cell_by_hash(hash, i64::from(id)) {
+            Some(thedas_formats::gda::Cell::Int(n)) => i32::try_from(*n).ok(),
+            _ => None,
+        };
+        let pool = match int(0x100b_492a) {
+            Some(1 | 2 | 5) => 39,
+            Some(3) => 40,
+            _ => return false,
+        };
+        let Some(cost) = int(0x2058_ed0b).filter(|&cost| cost >= 0) else {
+            return false;
+        };
+        let Some(o) = self.world.get(who) else {
+            return false;
+        };
+        let buying = ability > 0;
+        if o.abilities.contains(&id) == buying {
+            return false;
+        }
+        let points = self.property_total(who, pool);
+        if buying && points < cost as f32 {
+            return false;
+        }
+        let o = self.world.get_mut(who).unwrap();
+        o.properties.entry(pool).or_default().0 =
+            points + if buying { -(cost as f32) } else { cost as f32 };
+        if buying {
+            o.abilities.insert(id);
+            // Native 0x5971d0 places usable abilities on the quickbar. Keep the existing
+            // quickbar placement policy; its exact slot selection is still provisional.
+            if matches!(self.ability_use_type(id), 2 | 4) {
+                self.set_quickslot(who, -1, id, "");
+            }
+        } else {
+            o.abilities.remove(&id);
+            o.quickslots
+                .retain(|_, q| q.ability != id || !q.item.is_empty());
+        }
+        self.refresh_level_up_mark(who);
+        true
+    }
+
     /// With [`World::pool_xp`](crate::world::World::pool_xp) on, the experience the hero
     /// just gained goes to the followers waiting in the pool (not in the active party) as
     /// well, up to the level cap's experience; one that reaches its next level may level up
@@ -80,6 +207,27 @@ impl Sim {
     /// (strength .. constitution) and columns 1-4 list abilities, earlier rows first; each is
     /// tried while points of its kind remain (skills spend skill points, the rest talent points).
     pub fn auto_level(&mut self, who: ObjectId) {
+        if self.game == thedas_vfs::Game::DragonAge2 {
+            // AutoLevelUpMessage (0x45ef20) sends event 56 to the module, with the
+            // creature in object 0. sys_chargen owns the authored allocation and talents.
+            if self.world.chargen == Some(who)
+                && let Some(module) = self.world.module
+            {
+                self.world.queue_event(
+                    0,
+                    module,
+                    crate::world::Event {
+                        ty: 56,
+                        creator: Some(module),
+                        objects: vec![who],
+                        ..Default::default()
+                    },
+                    None,
+                );
+                self.tick(0);
+            }
+            return;
+        }
         let sim = self;
         let prop = |sim: &Sim, p: i32| {
             sim.world
@@ -207,10 +355,9 @@ impl Sim {
         }
     }
 
-    /// The level-up screen's messages, as player input: each choice becomes the character
-    /// generation event sys_chargen handles (the same events [`Sim::level_up_auto`] and the
-    /// MCP's level-up tool send), for the creature in level-up only. Provisional, from
-    /// levelup.gfx and sys_chargen:
+    /// The level-up screen's messages, for the creature in level-up only. Origins sends
+    /// character generation events; DA2's manual choices use the native creature handlers.
+    /// Origins' layouts, from levelup.gfx and sys_chargen:
     /// - attributes: `CHARGEN_ASSIGN_ATTRIBUTES` (attribute, amount);
     /// - abilities: `CHARGEN_ASSIGN_ABILITIES` (ability, 0), and (ability, 1) for a
     ///   specialization; sys_chargen takes a negative ability back;
@@ -218,6 +365,15 @@ impl Sim {
     /// - the auto-level option: the points are spent as [`Sim::auto_level`] does, then the
     ///   screen closes.
     pub(crate) fn level_up_message(&mut self, name: &str, args: &[String]) -> bool {
+        // DA2 exposes these messages on its creature smart-data object. The bridge
+        // includes that object's creature token before the message's own arguments.
+        let name = if self.game == thedas_vfs::Game::DragonAge2 && name.ends_with(".BuyAttribute") {
+            MSG_ATTRIBUTE
+        } else if self.game == thedas_vfs::Game::DragonAge2 && name.ends_with(".BuyAbility") {
+            MSG_ABILITY
+        } else {
+            name
+        };
         let int = |i: usize| {
             args.get(i)
                 .and_then(|a| a.trim().parse::<f64>().ok())
@@ -256,17 +412,13 @@ impl Sim {
                 _ => false,
             },
             MSG_ATTRIBUTE => match (int(1), int(2)) {
-                (Some(attr), Some(n)) if n != 0 => {
-                    self.chargen_event("CHARGEN_ASSIGN_ATTRIBUTES", vec![attr, n], Vec::new())
-                }
+                (Some(attr), Some(n)) if n != 0 => self.assign_level_up_attribute(who, attr, n),
                 _ => false,
             },
             MSG_ABILITY | MSG_SPECIALIZATION => match int(1).filter(|&a| a != 0) {
-                Some(ability) => self.chargen_event(
-                    "CHARGEN_ASSIGN_ABILITIES",
-                    vec![ability, (name == MSG_SPECIALIZATION) as i32],
-                    Vec::new(),
-                ),
+                Some(ability) => {
+                    self.assign_level_up_ability(who, ability, name == MSG_SPECIALIZATION)
+                }
                 None => false,
             },
             _ => self.chargen_event("CHARGEN_END", vec![1, 0], Vec::new()),
@@ -302,6 +454,104 @@ mod tests {
     const LDF: &str = "int EVENT_TYPE_CHARGEN_ASSIGN_ATTRIBUTES = 50;\n\
         int EVENT_TYPE_CHARGEN_ASSIGN_ABILITIES = 51;\n\
         int EVENT_TYPE_CHARGEN_END = 59;\n";
+
+    fn da2() -> (Sim, ObjectId) {
+        use thedas_formats::gda::Cell;
+        let mut s = Sim::new(
+            Arc::new(Vfs::new()),
+            Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap()),
+            1,
+        );
+        s.game = thedas_vfs::Game::DragonAge2;
+        let who = s.world.spawn(ObjectKind::Creature, "hero");
+        let module = s.world.spawn(ObjectKind::Module, "module");
+        s.world.module = Some(module);
+        s.world.hero = Some(who);
+        s.world.chargen = Some(who);
+        s.world.trace.keep = true;
+        let o = s.world.get_mut(who).unwrap();
+        o.properties.extend([
+            (1, (10.0, 0.0)),
+            (7, (50.0, 17.0)),
+            (35, (1600.0, 0.0)),
+            (36, (2.0, 0.0)),
+            (38, (3.0, 0.0)),
+            (39, (1.0, 0.0)),
+            (40, (1.0, 0.0)),
+        ]);
+        s.world.tables.insert(
+            "#1",
+            &["#100b492a", "#2058ed0b"],
+            vec![
+                (102010, vec![Cell::Int(1), Cell::Int(1)]),
+                (102020, vec![Cell::Int(1), Cell::Int(2)]),
+                (100100, vec![Cell::Int(3), Cell::Int(1)]),
+                (3110, vec![Cell::Int(10), Cell::Int(0)]),
+            ],
+        );
+        (s, who)
+    }
+
+    #[test]
+    fn da2_manual_levelup_spends_its_own_pools_and_survives_reload() {
+        let (mut s, who) = da2();
+        let args = |a: &[i32]| a.iter().map(ToString::to_string).collect::<Vec<_>>();
+        assert!(s.gui_message("CharGenCreature.BuyAttribute", &args(&[who as i32, 1, 3])));
+        assert!(s.gui_message("CharGenCreature.BuyAbility", &args(&[who as i32, 102010])));
+        assert_eq!(s.level_up_points(who), [0.0; 3]);
+        assert!(
+            !s.has_level_up_points(who),
+            "specializations do not set the DA2 mark"
+        );
+        assert_eq!(s.world.get(who).unwrap().properties[&1].0, 13.0);
+        assert!(s.world.get(who).unwrap().abilities.contains(&102010));
+        assert!(
+            s.world.queue.is_empty(),
+            "DA2 scripts ignore Origins assignment events"
+        );
+        s.world = serde_json::from_slice(&serde_json::to_vec(&s.world).unwrap()).unwrap();
+        let o = s.world.get(who).unwrap();
+        assert_eq!(o.properties[&35].0, 1600.0, "XP is not a skill pool");
+        assert_eq!(o.properties[&36].0, 2.0, "level is not a talent pool");
+        assert_eq!(o.properties[&7].1, 17.0, "levelling does not heal");
+        assert_eq!(o.fields["CanLevelUp"], 0);
+        assert!(o.abilities.contains(&102010));
+    }
+
+    #[test]
+    fn da2_purchases_reject_invalid_or_unaffordable_choices_and_refund_once() {
+        let (mut s, who) = da2();
+        assert!(!s.assign_level_up_attribute(who, 35, 1));
+        assert!(!s.assign_level_up_attribute(who, 1, 4));
+        assert!(!s.assign_level_up_ability(who, 102020, false));
+        assert!(!s.assign_level_up_ability(who, 3110, false));
+        assert!(!s.assign_level_up_ability(who, i32::MIN, false));
+        assert!(!s.assign_level_up_ability(who, -102010, false));
+        assert!(s.assign_level_up_ability(who, 102010, false));
+        assert!(!s.assign_level_up_ability(who, 102010, false));
+        assert!(s.assign_level_up_ability(who, -102010, false));
+        assert!(!s.assign_level_up_ability(who, -102010, false));
+        assert_eq!(s.level_up_points(who), [3.0, 0.0, 1.0]);
+        assert!(s.assign_level_up_ability(who, 100100, true));
+        assert_eq!(s.world.get(who).unwrap().properties[&40].0, 0.0);
+        assert_eq!(s.level_up_points(who), [3.0, 0.0, 1.0]);
+        s.world.chargen = None;
+        assert!(!s.assign_level_up_attribute(who, 1, 1));
+        assert!(!s.assign_level_up_ability(who, 102010, false));
+    }
+
+    #[test]
+    fn da2_auto_level_uses_the_module_script_event() {
+        use crate::trace::TraceEntry;
+        let (mut s, who) = da2();
+        s.auto_level(who);
+        assert_eq!(
+            s.level_up_points(who),
+            [3.0, 0.0, 1.0],
+            "no invented fallback allocation without a script"
+        );
+        assert!(s.world.trace.entries.iter().any(|e| matches!(e, TraceEntry::EventQueued { ty: 56, target, .. } if Some(*target) == s.world.module)));
+    }
 
     #[test]
     fn the_level_up_screens_choices_become_chargen_events_for_its_creature() {

@@ -4394,12 +4394,9 @@ pub fn call(
         }
         "SetCanLevelUp" => {
             let who = obj(a, 0);
-            let points: f32 = [34, 35, 36]
-                .iter()
-                .map(|&p| h.sim.property_total(who, p))
-                .sum();
+            let can = h.sim.has_level_up_points(who);
             if let Some(o) = h.sim.world.get_mut(who) {
-                o.fields.insert("CanLevelUp".into(), (points > 0.0) as i32);
+                o.fields.insert("CanLevelUp".into(), i32::from(can));
             }
             void()
         }

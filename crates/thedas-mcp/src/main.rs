@@ -293,7 +293,8 @@ struct LevelUpArgs {
     /// Party member to level up (default: the hero).
     object: Option<String>,
     /// Attribute points to spend, as [attribute property id, points] pairs (1 strength,
-    /// 2 dexterity, 3 willpower, 4 magic, 5 cunning, 6 constitution).
+    /// 2 dexterity; Origins: 3 willpower, 4 magic, 5 cunning, 6 constitution;
+    /// DA2: 3 magic, 4 cunning, 5 willpower, 6 constitution).
     #[serde(default)]
     attributes: Vec<(i32, i32)>,
     /// Talents, spells or skills to learn (ability ids, e.g. from ABI_base).
@@ -1714,7 +1715,7 @@ impl Server {
     }
 
     #[tool(
-        description = "Level up a party member as the level-up screen does: open it (EVENT_TYPE_PLAYERLEVELUP), spend attribute points and learn abilities through the chargen events, and close it. Returns the creature's level, attributes, unspent points (34 attribute, 35 skill, 36 talent) and abilities. With screen=true it only opens it, for the levelup movie to drive."
+        description = "Level up a party member: open its level-up screen, spend attribute points and learn abilities using the current game's input handlers, then close it. Returns level, attributes, unspent points and abilities (DA2 has no skill points). With screen=true it only opens the screen."
     )]
     async fn level_up(&self, Parameters(a): Parameters<LevelUpArgs>) -> String {
         self.with_sim(|st| {
@@ -1723,8 +1724,10 @@ impl Server {
                 Some(o) => resolve(sim, o).ok_or("no such object")?,
                 None => sim.world.hero.ok_or("no hero")?,
             };
-            sim.request_level_up(who);
-            sim.tick(0);
+            if sim.world.chargen != Some(who) {
+                sim.request_level_up(who);
+                sim.tick(0);
+            }
             if sim.world.chargen != Some(who) {
                 return Err(
                     "the level-up screen did not open (in combat, or not a party member?)".into(),
@@ -1734,11 +1737,19 @@ impl Server {
                 return Ok(json!({ "object": who, "level_up_open": true }));
             }
             for (attr, n) in &a.attributes {
-                sim.chargen_event("CHARGEN_ASSIGN_ATTRIBUTES", vec![*attr, *n], Vec::new());
+                if !sim.assign_level_up_attribute(who, *attr, *n) {
+                    return Err(format!(
+                        "attribute choice {attr}, {n} was rejected; level-up remains open"
+                    ));
+                }
                 sim.tick(0);
             }
             for ab in &a.abilities {
-                sim.chargen_event("CHARGEN_ASSIGN_ABILITIES", vec![*ab, 0], Vec::new());
+                if !sim.assign_level_up_ability(who, *ab, false) {
+                    return Err(format!(
+                        "ability choice {ab} was rejected; level-up remains open"
+                    ));
+                }
                 sim.tick(0);
             }
             if a.auto {
@@ -1748,11 +1759,17 @@ impl Server {
             sim.tick(0);
             let o = sim.world.get(who).ok_or("gone")?;
             let prop = |p: i32| o.properties.get(&p).map(|v| v.0.max(v.1)).unwrap_or(0.0);
+            let [attribute, skill, talent] = sim.level_up_points(who);
+            let level = if sim.game == thedas_vfs::Game::DragonAge2 {
+                36
+            } else {
+                15
+            };
             Ok(json!({
                 "object": who,
-                "level": prop(15),
+                "level": prop(level),
                 "attributes": (1..=6).map(prop).collect::<Vec<_>>(),
-                "points": { "attribute": prop(34), "skill": prop(35), "talent": prop(36) },
+                "points": { "attribute": attribute, "skill": skill, "talent": talent },
                 "abilities": o.abilities,
             }))
         })
