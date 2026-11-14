@@ -75,7 +75,7 @@ impl RenderPath {
 /// array, at most 16 KiB, which every backend can bind.
 const MAX_LIGHTS: usize = 192;
 /// Dynamic uniform offsets must be multiples of this on every backend.
-const DRAW_STRIDE: usize = 768;
+const DRAW_STRIDE: usize = 1280;
 /// Room indices the lights' room sets can name; rooms past it are lit by every light.
 const MAX_ROOMS: u32 = 255;
 
@@ -116,9 +116,10 @@ struct DrawData {
     /// The assigned irradiance probe's twelve rows (RGB).
     probe: [[f32; 4]; 12],
     tint: [[f32; 4]; 10],
-    /// x: 0 level, 1 prop, 2 character; y: emissive; z: tint mode; w reserved.
+    /// x: 0 level, 1 prop, 2 character; y: emissive; z: tint; w: 1 face, 2 eye.
     material: [f32; 4],
     tint_color: [f32; 4],
+    character: crate::deferred_character::CharacterData,
 }
 
 #[repr(C)]
@@ -177,7 +178,7 @@ pub(crate) struct DeferredPass {
     draws: Vec<PlanDraw>,
     data: Vec<DrawData>,
     /// Diffuse, normal, specular, lightmap, cube, terrain masks, tint and emissive.
-    groups: Vec<[wgpu::TextureView; 10]>,
+    groups: Vec<[wgpu::TextureView; 12]>,
     vertices: HashMap<usize, Vec<DeferredVertex>>,
     skin_count: usize,
     /// Per faithful draw (index into [`D3dPass::draws`]): whether this pass draws it.
@@ -300,7 +301,7 @@ fn terrain(program: &crate::d3d::D3dProgram) -> bool {
 }
 
 /// Only these single-pass Origins material equations are represented in the G-buffer.
-/// Faces, hair, eyes, alpha-tested and remote-material variants stay forward.
+/// Hair, alpha-tested and remote-material variants stay forward.
 fn object_material(program: &crate::d3d::D3dProgram) -> bool {
     let mut names = program.name.split('+');
     matches!(
@@ -308,6 +309,8 @@ fn object_material(program: &crate::d3d::D3dProgram) -> bool {
         (Some("prop1.vsh"), Some("prop1.psh"))
             | (Some("weapon1.vsh"), Some("weapon1.psh"))
             | (Some("cloth1.vsh"), Some("cloth1.psh"))
+            | (Some("face1.vsh"), Some("face0.psh"))
+            | (Some("eye0.vsh"), Some("eye0.psh"))
             | (
                 Some("char1.vsh"),
                 Some(
@@ -357,6 +360,7 @@ impl DeferredPass {
         let mut skin_count = 1; // Slot zero is identity for rigid meshes.
         let objects_enabled = std::env::var("THEDAS_DEFERRED_OBJECTS").as_deref() != Ok("0");
         let terrain_enabled = std::env::var("THEDAS_DEFERRED_TERRAIN").as_deref() != Ok("0");
+        let faces_enabled = std::env::var("THEDAS_DEFERRED_FACES").as_deref() != Ok("0");
         for (k, d) in d3d.draws.iter().enumerate() {
             let program = d3d.program(d);
             let Some(item) = scene.draws.get(d.draw) else {
@@ -364,6 +368,8 @@ impl DeferredPass {
             };
             let taken = !d3d.is_blended(d)
                 && !d.multipass
+                && (faces_enabled
+                    || (!program.name.starts_with("face1.") && !program.name.starts_with("eye0.")))
                 && (objects_enabled || (d.draw < scene.static_draws && item.skin.is_none()))
                 && (static1(program)
                     || (terrain_enabled && terrain(program))
@@ -390,6 +396,8 @@ impl DeferredPass {
             }
             let lightmap = item.lightmap.as_ref().map(|l| l.texture.clone());
             let is_terrain = terrain(program);
+            let is_face = program.name.starts_with("face1.");
+            let is_eye = program.name.starts_with("eye0.");
             // The probe's cubemap as the faithful pass binds it (see `d3d::sampler_texture`).
             let cube = item.probe.and_then(|p| scene.probes.get(p)).map(|p| {
                 let name = p.name.to_ascii_lowercase();
@@ -423,22 +431,86 @@ impl DeferredPass {
                             tex2d,
                             [128, 128, 128, 128],
                         ),
-                        texture(&param("mml_tSpecularMask"), tex2d, [0, 0, 0, 0]),
                         texture(
-                            &[lightmap.clone(), Some("default_black.dds".into())],
+                            &param(if is_face {
+                                "mml_tAgeNormalMap"
+                            } else if is_eye {
+                                "mml_tCorneaNormalMap"
+                            } else {
+                                "mml_tSpecularMask"
+                            }),
                             tex2d,
-                            [0, 0, 0, 0],
+                            if is_face || is_eye { [128; 4] } else { [0; 4] },
                         ),
+                        if is_face {
+                            texture(&param("mml_tEmotionsNormal"), tex2d, [128; 4])
+                        } else {
+                            texture(
+                                &[lightmap.clone(), Some("default_black.dds".into())],
+                                tex2d,
+                                [0, 0, 0, 0],
+                            )
+                        },
                         texture(
                             &[cube, crate::d3d::texture_default(m, "aur_cmLightProbe0")],
                             TextureType::Cube,
                             [0, 0, 0, 255],
                         ),
-                        texture(&param("MaskV"), tex2d, [0, 0, 0, 255]),
-                        texture(&param("MaskA"), tex2d, [255, 0, 0, 0]),
-                        texture(&param("MaskA2"), tex2d, [0, 0, 0, 0]),
+                        texture(
+                            &param(if is_face {
+                                "mml_tAgeDiffuseMap"
+                            } else {
+                                "MaskV"
+                            }),
+                            tex2d,
+                            [0, 0, 0, 255],
+                        ),
+                        texture(
+                            &param(if is_face {
+                                "mml_tEmotionsMask0"
+                            } else {
+                                "MaskA"
+                            }),
+                            tex2d,
+                            if is_face { [0; 4] } else { [255, 0, 0, 0] },
+                        ),
+                        texture(
+                            &param(if is_face {
+                                "mml_tEmotionsMask1"
+                            } else {
+                                "MaskA2"
+                            }),
+                            tex2d,
+                            [0; 4],
+                        ),
                         texture(&param("mml_tTintMask"), tex2d, [0, 0, 0, 0]),
-                        texture(&param("mml_tEmissiveMask"), tex2d, [0, 0, 0, 0]),
+                        texture(
+                            &param(if is_face {
+                                "mml_tBrowStubble"
+                            } else {
+                                "mml_tEmissiveMask"
+                            }),
+                            tex2d,
+                            [0; 4],
+                        ),
+                        texture(
+                            &param(if is_face {
+                                "mml_tBrowStubbleNormal"
+                            } else {
+                                "palette"
+                            }),
+                            tex2d,
+                            if is_face {
+                                [128; 4]
+                            } else {
+                                [128, 128, 128, 255]
+                            },
+                        ),
+                        texture(
+                            &param(if is_face { "mml_tTattooMask" } else { "normal" }),
+                            tex2d,
+                            if is_face { [0; 4] } else { [128; 4] },
+                        ),
                     ]);
                     groups.len() - 1
                 });
@@ -559,9 +631,16 @@ impl DeferredPass {
                     } else {
                         1.0
                     },
-                    0.0,
+                    if is_face {
+                        1.0
+                    } else if is_eye {
+                        2.0
+                    } else {
+                        0.0
+                    },
                 ],
                 tint_color: crate::d3d::material_vector(m, "mml_vTintColor").unwrap_or([0.0; 4]),
+                character: crate::deferred_character::CharacterData::new(m),
             });
         }
         log::info!(
@@ -726,6 +805,7 @@ impl DeferredPass {
                 tex(12, true),
                 tex(13, true),
                 tex(14, true),
+                tex(15, true),
             ],
         });
         let lighting_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -985,7 +1065,7 @@ impl DeferredPass {
         let material_groups = self
             .groups
             .iter()
-            .map(|[d, n, s, l, e, mv, ma, ma2, tint, emissive]| {
+            .map(|[d, n, s, l, e, mv, ma, ma2, tint, emissive, td, tn]| {
                 device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("deferred material"),
                     layout: &material_layout,
@@ -1038,11 +1118,11 @@ impl DeferredPass {
                         // static textures wrap; terrain palette textures clamp.
                         wgpu::BindGroupEntry {
                             binding: 11,
-                            resource: wgpu::BindingResource::TextureView(d),
+                            resource: wgpu::BindingResource::TextureView(td),
                         },
                         wgpu::BindGroupEntry {
                             binding: 12,
-                            resource: wgpu::BindingResource::TextureView(n),
+                            resource: wgpu::BindingResource::TextureView(tn),
                         },
                         wgpu::BindGroupEntry {
                             binding: 13,
@@ -1051,6 +1131,12 @@ impl DeferredPass {
                         wgpu::BindGroupEntry {
                             binding: 14,
                             resource: wgpu::BindingResource::TextureView(emissive),
+                        },
+                        // Face age diffuse needs linear sampling; terrain's MaskV uses
+                        // a separate image binding with nearest sampling for portable GL.
+                        wgpu::BindGroupEntry {
+                            binding: 15,
+                            resource: wgpu::BindingResource::TextureView(mv),
                         },
                     ],
                 })
@@ -1924,6 +2010,28 @@ mod tests {
                 .sum::<u32>()
                 <= 32
         );
+        let module = naga::front::wgsl::parse_str(DEFERRED_WGSL).unwrap();
+        let info = naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        )
+        .validate(&module)
+        .unwrap();
+        for (i, entry) in module.entry_points.iter().enumerate() {
+            if entry.stage != naga::ShaderStage::Fragment {
+                continue;
+            }
+            let used = info.get_entry_point(i);
+            let textures = module
+                .global_variables
+                .iter()
+                .filter(|(handle, v)| {
+                    !used[*handle].is_empty()
+                        && matches!(module.types[v.ty].inner, naga::TypeInner::Image { .. })
+                })
+                .count();
+            assert!(textures <= 16, "{} uses {textures} textures", entry.name);
+        }
     }
 
     #[test]

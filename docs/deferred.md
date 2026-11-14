@@ -101,8 +101,20 @@ sun takes the sun mask. Static1's grazing-angle shadow floor is confined to leve
 Probe bounce does not take the level lightmap's sun mask. Character
 diffuse and specular tint opacities remain independent, including the separate skin channel.
 
+Opaque `Face1/Face0` heads and `Eye0` eyes also join this path. Faces retain morphs and
+the four-weight pose, independently blend aged diffuse and normals, add expression and
+brow/stubble normal detail, and compose skin tint, tattoos, facial hair and the other
+three diffuse tint channels. Regional face roughness and diffuse alpha control a single
+Blinn specular lobe; this approximates the original skin BRDF and Beckmann lookup.
+Face probe irradiance takes its authored ambient multiplier. Eyes retain iris tint,
+base and cornea normals and both authored specular powers/masks; the one-lobe G-buffer
+blends the normals/powers by their masks rather than evaluating two separate highlights.
+Neither family receives the ordinary cubemap reflection. They share character lights,
+room indices, SSAO depth and posed point-shadow geometry with the bodies.
+`THEDAS_DEFERRED_FACES=0` keeps both families forward for comparisons.
+
 This is our deferred material approximation, not shader parity: character rim lighting,
-gore/heraldry and remote-material effects are not represented yet. Faces, eyes, hair,
+skin scattering, gore/heraldry and remote-material effects are not represented yet. Hair,
 alpha-tested and blended materials, lower-detail Char2 and other unsupported families
 still draw forward; they also remain absent from deferred point-shadow casters. Tangent
 frames still come from derivatives. Probe assignments remain those made at scene load.
