@@ -16,6 +16,14 @@ struct Frame {
     fog: vec4<f32>,
 };
 
+struct Terrain {
+    dimensions: vec4<f32>,
+    parameters: vec4<f32>,
+    scales: array<vec4<f32>, 2>,
+    specular: array<vec4<f32>, 8>,
+    tint: vec4<f32>,
+};
+
 struct Draw {
     mvp: mat4x4<f32>,
     world: mat4x4<f32>,
@@ -26,6 +34,7 @@ struct Draw {
     // x: room index (0: none), y: mml_fSpecularReflectionMult
     room: vec4<f32>,
     probe: array<vec4<f32>, 12>,
+    terrain: Terrain,
 };
 
 @group(0) @binding(0) var<uniform> frame: Frame;
@@ -39,6 +48,12 @@ struct Draw {
 @group(1) @binding(5) var clamp_smp: sampler;
 // The draw's light probe's cubemap (Static1's `aur_cmLightProbe0`).
 @group(1) @binding(6) var env_tex: texture_cube<f32>;
+@group(1) @binding(7) var mask_v: texture_2d<f32>;
+@group(1) @binding(8) var mask_a: texture_2d<f32>;
+@group(1) @binding(9) var mask_a2: texture_2d<f32>;
+@group(1) @binding(10) var point_smp: sampler;
+@group(1) @binding(11) var terrain_diffuse: texture_2d<f32>;
+@group(1) @binding(12) var terrain_normal: texture_2d<f32>;
 
 struct VsIn {
     @location(0) position: vec3<f32>,
@@ -53,6 +68,7 @@ struct VsOut {
     @location(1) uv_lm: vec2<f32>,
     @location(2) normal: vec3<f32>,
     @location(3) world: vec3<f32>,
+    @location(4) terrain_falloff: f32,
 };
 
 @vertex
@@ -67,9 +83,10 @@ fn vs_gbuffer(v: VsIn) -> VsOut {
     let p = r + f.mvp[3];
     out.clip = vec4<f32>(p.x + frame.fixup.x * p.w, p.y - frame.fixup.y * p.w, p.z, p.w);
     out.uv0 = v.uv0;
-    out.uv_lm = v.uv1 * f.lightmap.zw + f.lightmap.xy;
+    out.uv_lm = select(v.uv1, v.uv0, f.room.z > 0.5) * f.lightmap.zw + f.lightmap.xy;
     out.normal = (f.world * vec4<f32>(v.normal, 0.0)).xyz;
     out.world = (f.world * vec4<f32>(v.position, 1.0)).xyz;
+    out.terrain_falloff = 2.0 - length(frame.eye.xyz - out.world) / 32.0;
     return out;
 }
 
@@ -96,7 +113,7 @@ fn oct_encode(n: vec3<f32>) -> vec2<f32> {
     return (1.0 - abs(p.yx)) * select(vec2<f32>(-1.0), vec2<f32>(1.0), p >= vec2<f32>(0.0));
 }
 
-fn surface(in: VsOut) -> Surface {
+fn surface_normal(in: VsOut, nm: vec4<f32>) -> Surface {
     let d = draw;
     // Tangent frame from the screen-space derivatives of position and texture coordinate
     // (provisional: the meshes' own tangents and binormals, which Static1 reads, are not in
@@ -114,12 +131,11 @@ fn surface(in: VsOut) -> Surface {
     t = t * scale;
     b = b * scale;
 
-    let nm = textureSample(normal_tex, wrap_smp, in.uv0);
     let xy = nm.wy * 2.0 - 1.0;
     let z = sqrt(max(1.0 - dot(xy, xy), 0.0));
     var n = xy.x * t + xy.y * b + z * n_v;
     n = n * inverseSqrt(max(dot(n, n), 1e-20));
-    if (frame.fog.z > 0.5) {
+    if (frame.fog.z > 0.5 || (draw.room.z > 0.5 && draw.room.w > 0.5)) {
         n = normalize(n_v);
     }
 
@@ -130,6 +146,10 @@ fn surface(in: VsOut) -> Surface {
     out.n = n;
     out.v = v;
     out.falloff = (3.0 - 2.0 * x) * x * x * d.falloff.w;
+    if (draw.room.z > 0.5) {
+        // Terrain2.vsh's specular distance factor, interpolated per vertex.
+        out.falloff = in.terrain_falloff;
+    }
     return out;
 }
 
@@ -146,11 +166,81 @@ fn probe_irradiance(normal: vec3<f32>) -> vec3<f32> {
     return result;
 }
 
+fn surface(in: VsOut) -> Surface {
+    return surface_normal(in, textureSample(normal_tex, wrap_smp, in.uv0));
+}
+
+struct TerrainMaterial {
+    albedo: vec4<f32>,
+    normal: vec4<f32>,
+    specular: vec4<f32>,
+};
+
+// MaskV picks three of eight layers, encoded at 0, 2/15, ..., 14/15.
+// MaskA/MaskA2 hold all eight weights. The palette's tile padding and each
+// layer's UV scale come from the material, never a fixed world-space tiling.
+fn terrain_material(uv: vec2<f32>) -> TerrainMaterial {
+    let t = draw.terrain;
+    let indices = textureSampleLevel(mask_v, point_smp, uv, 0.0).rgb;
+    let a = textureSample(mask_a, clamp_smp, uv);
+    let b = textureSample(mask_a2, clamp_smp, uv);
+    let weights = array<f32, 8>(a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w);
+    let dx = dpdx(uv) * t.parameters.zw;
+    let dy = dpdy(uv) * t.parameters.zw;
+    var result: TerrainMaterial;
+    result.albedo = vec4<f32>(0.0);
+    result.normal = vec4<f32>(0.0);
+    result.specular = vec4<f32>(0.0);
+    var total = 0.0;
+    for (var layer = 0u; layer < 8u; layer += 1u) {
+        result.specular += weights[layer] * t.specular[layer];
+    }
+    for (var k = 0u; k < 3u; k += 1u) {
+        let encoded = indices[k];
+        var weight = 0.0;
+        var scale = 0.0;
+        for (var layer = 0u; layer < 8u; layer += 1u) {
+            let selected = abs(encoded - f32(layer) * (2.0 / 15.0)) <= 0.0625;
+            weight += select(0.0, weights[layer], selected);
+            scale += select(0.0, t.scales[layer / 4u][layer % 4u], selected);
+        }
+        let column = floor(encoded * t.dimensions.z);
+        let row = floor(fract(encoded * t.dimensions.z) * t.dimensions.w);
+        let tile = vec2<f32>(column, row) * t.dimensions.xy + t.parameters.xy;
+        let coord = fract(uv * scale) * t.parameters.zw + tile;
+        result.albedo += weight * textureSampleGrad(terrain_diffuse, clamp_smp, coord, dx * scale, dy * scale);
+        if (draw.room.w < 0.5) {
+            result.normal += weight * textureSampleGrad(terrain_normal, clamp_smp, coord, dx * scale, dy * scale);
+        }
+        total += weight;
+    }
+    result.albedo /= max(total, 1e-6);
+    result.normal /= max(total, 1e-6);
+    result.specular = vec4<f32>(result.specular.rgb * result.albedo.a, result.specular.a);
+    if (draw.room.w > 0.5) {
+        result.specular = vec4<f32>(0.0);
+    }
+    return result;
+}
+
 @fragment
 fn fs_gbuffer(in: VsOut) -> GBuffer {
+    if (draw.room.z > 0.5) {
+        let m = terrain_material(in.uv0);
+        let s = surface_normal(in, m.normal);
+        var out: GBuffer;
+        out.albedo = vec4<f32>(m.albedo.rgb, select(1.0, 0.5, draw.room.w > 0.5));
+        out.specular = m.specular;
+        out.normal = vec4<f32>(oct_encode(s.n), draw.room.x, s.falloff);
+        out.lightmap = textureSample(lightmap_tex, clamp_smp, in.uv_lm);
+        if (frame.fog.w > 0.5) {
+            out.lightmap = vec4<f32>(probe_irradiance(s.n), 1.0);
+        }
+        return out;
+    }
     let s = surface(in);
     var out: GBuffer;
-    out.albedo = vec4<f32>(textureSample(diffuse_tex, wrap_smp, in.uv0).rgb, 1.0);
+    out.albedo = vec4<f32>(textureSample(diffuse_tex, wrap_smp, in.uv0).rgb, 0.0);
     out.specular = textureSample(spec_tex, wrap_smp, in.uv0);
     out.normal = vec4<f32>(oct_encode(s.n), draw.room.x, s.falloff);
     out.lightmap = textureSample(lightmap_tex, clamp_smp, in.uv_lm);
@@ -166,6 +256,19 @@ fn fs_gbuffer(in: VsOut) -> GBuffer {
 // and the falloff.
 @fragment
 fn fs_env(in: VsOut) -> @location(0) vec4<f32> {
+    if (draw.room.z > 0.5) {
+        let m = terrain_material(in.uv0);
+        let s = surface_normal(in, m.normal);
+        let r = 2.0 * dot(s.n, s.v) * s.n - s.v;
+        let power = m.specular.a * 255.0 + 1.0;
+        let env = textureSampleLevel(env_tex, wrap_smp, r, (1.0 - power / 255.0) * 9.0).rgb;
+        let baked_visibility = select(textureSample(lightmap_tex, clamp_smp, in.uv_lm).a, 1.0, frame.fog.w > 0.5);
+        let to_eye = in.world - frame.eye.xyz;
+        let fog = max(min(exp(-dot(to_eye, to_eye) * frame.fog.x), 1.0), frame.fog.y);
+        let shade = sun_visibility(in.world, s.n, draw.room.w < 0.5);
+        let reflection = env * m.specular.rgb * (0.75 * shade * baked_visibility + 0.25) * s.falloff;
+        return vec4<f32>((reflection + m.albedo.rgb * draw.terrain.tint.rgb) * fog, 1.0);
+    }
     let s = surface(in);
     let specular = textureSample(spec_tex, wrap_smp, in.uv0);
     let r = 2.0 * dot(s.n, s.v) * s.n - s.v;
@@ -194,7 +297,6 @@ struct Lighting {
     counts: vec4<u32>,
     // xy: target size
     size: vec4<f32>,
-    sun_shadow: array<vec4<f32>, 9>,
 };
 
 struct Light {
@@ -224,9 +326,15 @@ struct Light {
 @group(1) @binding(4) var g_depth: texture_2d<f32>;
 // The shadow slots' faces: distance from the light to the nearest caster.
 @group(1) @binding(5) var shadow_maps: texture_2d_array<f32>;
-@group(1) @binding(6) var sun_near: texture_2d<f32>;
-@group(1) @binding(7) var sun_far: texture_2d<f32>;
-@group(1) @binding(8) var sun_sampler: sampler;
+struct Sun {
+    data: array<vec4<f32>, 9>,
+    direction: vec4<f32>,
+    enabled: vec4<u32>,
+};
+@group(2) @binding(0) var<uniform> sun: Sun;
+@group(2) @binding(1) var sun_near: texture_2d<f32>;
+@group(2) @binding(2) var sun_far: texture_2d<f32>;
+@group(2) @binding(3) var sun_sampler: sampler;
 
 fn sun_sample(uv: vec2<f32>, near: bool) -> vec4<f32> {
     // The original uses a white border. Keep off-map taps lit on backends without
@@ -243,12 +351,12 @@ fn sun_sample(uv: vec2<f32>, near: bool) -> vec4<f32> {
 // Static1's original five-tap near filter (red depth, blurred green coverage),
 // four-tap far PCF, distance fade and grazing-angle floor. The faithful pass owns
 // both maps, their caster selection, quality, fitting and temporal smoothing.
-fn sun_visibility(p: vec3<f32>, n: vec3<f32>) -> f32 {
-    if (lighting.counts.z == 0u || lighting.sun_dir.w < 0.5) {
+fn sun_visibility(p: vec3<f32>, n: vec3<f32>, grazing_floor: bool) -> f32 {
+    if (sun.enabled.x == 0u || sun.direction.w < 0.5) {
         return 1.0;
     }
     let q = vec4<f32>(p, 1.0);
-    let sd = lighting.sun_shadow;
+    let sd = sun.data;
     let plane = dot(sd[8], q);
     let offsets = array<vec2<f32>, 4>(
         vec2<f32>(-0.00141302, -0.000598593),
@@ -280,7 +388,7 @@ fn sun_visibility(p: vec3<f32>, n: vec3<f32>) -> f32 {
             shade = mix(1.0, lit * 0.25, fade);
         }
     }
-    return clamp(max(shade, 1.0 - 10.0 * dot(n, -lighting.sun_dir.xyz)), 0.0, 1.0);
+    return clamp(select(shade, max(shade, 1.0 - 10.0 * dot(n, -sun.direction.xyz)), grazing_floor), 0.0, 1.0);
 }
 
 // How much of a point light at `lp` (shadow slot `slot`) reaches `p` (normal `n`): its
@@ -409,7 +517,10 @@ fn fs_lighting(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
         discard;
     }
 
-    let albedo = textureLoad(g_albedo, px, 0).rgb;
+    let ga = textureLoad(g_albedo, px, 0);
+    let albedo = ga.rgb;
+    let terrain = ga.a > 0.25;
+    let terrain_low = terrain && ga.a < 0.75;
     let spec = textureLoad(g_specular, px, 0);
     let gn = textureLoad(g_normal, px, 0);
     let lm = textureLoad(g_lightmap, px, 0);
@@ -476,7 +587,7 @@ fn fs_lighting(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
             spec_s = spec_s + pow(ndh, power) * lighting.sun_colour.rgb;
         }
     }
-    let sun_shade = sun_visibility(p, n);
+    let sun_shade = sun_visibility(p, n, !terrain_low);
     let plane_n = geometric * inverseSqrt(max(dot(geometric, geometric), 1e-20));
     let oriented_n = select(-plane_n, plane_n, dot(plane_n, n) >= 0.0);
     let ao = ambient_visibility(p, select(n, oriented_n, dot(geometric, geometric) > 1e-20));
@@ -484,8 +595,11 @@ fn fs_lighting(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     // dimmed by only 15% in a runtime shadow (exploration camera w = 0).
     // Dynamic lights have their own visibility and never take this sun mask.
     let ambient_shade = select(mix(1.0, sun_shade, 0.15), ao, lighting.counts.w > 0u);
-    let diffuse = diff_s * sun_shade * lm.a + lm.rgb * ambient_shade + diff_d;
-    let specular = (spec_s * sun_shade * max(lm.a, 0.2) + spec_d) * 3.0;
+    // Terrain1 masks static diffuse twice; Static1 and Low's Terrain3 only once.
+    let diffuse = diff_s * sun_shade * select(lm.a, lm.a * lm.a, terrain && !terrain_low)
+        + lm.rgb * ambient_shade + diff_d;
+    let specular = select((spec_s * sun_shade * max(lm.a, 0.2) + spec_d) * 3.0,
+        (spec_s * (0.75 * sun_shade * lm.a + 0.25) + spec_d) * 3.0, terrain);
     var colour = albedo * diffuse + spec.rgb * specular * falloff;
     switch lighting.counts.y {
         case 1u: { return vec4<f32>(albedo, 1.0); }
