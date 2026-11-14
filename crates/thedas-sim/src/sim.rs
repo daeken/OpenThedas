@@ -1381,8 +1381,6 @@ impl Sim {
         }
     }
 
-    /// Moves the party to another area (`DoAreaTransition`), loading it. Provisional: the
-    /// area left behind stays in the world, inactive, and is not reused on return.
     /// The party pool: recruited followers in or out of the active party (follower state
     /// ACTIVE, AVAILABLE, SUSPENDED or LOCKEDACTIVE). They travel with the party, those out
     /// of it staying inactive. Provisional.
@@ -1881,9 +1879,11 @@ impl Sim {
         true
     }
 
-    /// How long a command takes once it reaches the front of its queue. Provisional: there is
-    /// no animation or pathfinding, so moves go at 5 m/s in a straight line, waits take their
-    /// time, and anything else takes half a second. Every command takes at least a
+    /// How long a command takes once it reaches the front of its queue. Waits take their time,
+    /// weapon switches and jumps are done at once, and a move is timed by the straight-line
+    /// distance at its owner's walk or run speed ([`Sim::command_speed`]); the walk itself
+    /// follows the pathing grid ([`crate::nav`]). Provisional: anything else takes half a
+    /// second, not its animation's length. Every command takes at least a
     /// millisecond, so scripts that queue a new command when one completes cannot loop
     /// forever within one instant.
     fn command_duration(&self, id: ObjectId, cmd: &Command) -> u64 {
