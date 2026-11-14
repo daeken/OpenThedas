@@ -169,7 +169,12 @@ fn da2_ability_list(sim: &Sim, who: ObjectId, ty: i32, cooling: bool) -> Vec<i32
     }
     let tables = sim.world.tables();
     let abilities = tables.get(1, "");
-    let cell = |id| abilities.as_ref().and_then(|t| t.cell("AbilityType", id));
+    // DA2 uses this column, not DA:O's `AbilityType` column (0xe1a8f4ea).
+    let cell = |id| {
+        abilities
+            .as_ref()
+            .and_then(|t| t.cell_by_hash(0x100b_492a, id))
+    };
     let matches_type = |id| {
         let kind = cell_int(cell(id));
         kind != 4 && (ty == 0 || ty == kind)
@@ -5303,13 +5308,13 @@ mod tests {
         let tables = crate::m2da::Tables::empty();
         tables.insert(
             "#1",
-            &["AbilityType"],
+            &["#100b492a", "AbilityType"],
             vec![
-                (1, vec![Cell::Int(1)]),
-                (2, vec![Cell::Int(2)]),
-                (3, vec![Cell::Int(4)]),
-                (4, vec![Cell::Int(1)]),
-                (5, vec![Cell::Int(1)]),
+                (1, vec![Cell::Int(1), Cell::Int(4)]),
+                (2, vec![Cell::Int(2), Cell::Int(4)]),
+                (3, vec![Cell::Int(4), Cell::Int(1)]),
+                (4, vec![Cell::Int(1), Cell::Int(4)]),
+                (5, vec![Cell::Int(1), Cell::Int(4)]),
             ],
         );
         s.world.tables = Arc::new(tables);
