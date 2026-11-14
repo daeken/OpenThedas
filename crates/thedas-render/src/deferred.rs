@@ -175,6 +175,8 @@ struct PlanDraw {
 /// renderer is made, and its GPU objects, made the first time a frame is drawn deferred.
 pub(crate) struct DeferredPass {
     draws: Vec<PlanDraw>,
+    cutouts: Vec<crate::deferred_cutout::Draw>,
+    cutout_materials: Vec<crate::deferred_cutout::Material>,
     data: Vec<DrawData>,
     /// Diffuse, normal, specular, lightmap, cube, terrain masks, tint and emissive.
     groups: Vec<[wgpu::TextureView; 10]>,
@@ -564,6 +566,15 @@ impl DeferredPass {
                 tint_color: crate::d3d::material_vector(m, "mml_vTintColor").unwrap_or([0.0; 4]),
             });
         }
+        let (cutouts, cutout_materials) = crate::deferred_cutout::plan(
+            ctx,
+            vfs,
+            scene,
+            d3d,
+            cache,
+            &mut vertices,
+            &mut skin_count,
+        );
         log::info!(
             "deferred: {} of {} draws ({} terrain, {} props, {} character materials, {} skinned), planned in {:.1} ms ({} static draws)",
             draws.len(),
@@ -571,12 +582,14 @@ impl DeferredPass {
             data.iter().filter(|d| d.room[2] > 0.5).count(),
             data.iter().filter(|d| d.material[0] == 1.0).count(),
             data.iter().filter(|d| d.material[0] == 2.0).count(),
-            skin_count - 1,
+            draws.iter().filter(|d| d.skin_slot > 0).count(),
             started.elapsed().as_secs_f64() * 1000.0,
             scene.static_draws,
         );
-        (!draws.is_empty()).then(|| DeferredPass {
+        (!draws.is_empty() || !cutouts.is_empty()).then(|| DeferredPass {
             draws,
+            cutouts,
+            cutout_materials,
             data,
             groups,
             vertices,
@@ -1250,6 +1263,15 @@ impl DeferredPass {
                 );
             }
         }
+        for d in &self.cutouts {
+            if d.skin_slot > 0 {
+                let start = d.skin_slot * SKIN_STRIDE;
+                crate::deferred_mesh::write_palette(
+                    &mut skins[start..start + SKIN_STRIDE],
+                    d3d.bones(d.draw),
+                );
+            }
+        }
         if skins != gpu.skin_slots {
             ctx.queue.write_buffer(&gpu.skin_buffer, 0, &skins);
             gpu.skin_slots = skins;
@@ -1494,7 +1516,14 @@ impl DeferredPass {
         }
         if !faces.is_empty() {
             ctx.queue.write_buffer(&gpu.faces_buffer, 0, &faces);
-            let mut casters = casters(&self.draws, d3d, meshes, &gpu.vertices, &gpu.skin_buffer);
+            let mut casters = casters(
+                &self.draws,
+                &self.cutouts,
+                &self.cutout_materials,
+                d3d,
+                meshes,
+                (&gpu.vertices, &gpu.skin_buffer),
+            );
             for c in contributors.iter() {
                 if let Some(g) = c.pass.gpu.as_ref() {
                     casters.extend(casters_for_contributor(c, g));
@@ -1713,21 +1742,24 @@ fn casters_for_contributor<'a>(
 ) -> Vec<crate::deferred_shadow::Caster<'a>> {
     casters(
         &c.pass.draws,
+        &c.pass.cutouts,
+        &c.pass.cutout_materials,
         c.d3d,
         c.meshes,
-        &gpu.vertices,
-        &gpu.skin_buffer,
+        (&gpu.vertices, &gpu.skin_buffer),
     )
 }
 
 fn casters<'a>(
-    draws: &[PlanDraw],
+    draws: &'a [PlanDraw],
+    cutouts: &'a [crate::deferred_cutout::Draw],
+    materials: &'a [crate::deferred_cutout::Material],
     d3d: &D3dPass,
     meshes: &'a [GpuMesh],
-    vertices: &'a HashMap<usize, wgpu::Buffer>,
-    bones: &'a wgpu::Buffer,
+    streams: (&'a HashMap<usize, wgpu::Buffer>, &'a wgpu::Buffer),
 ) -> Vec<crate::deferred_shadow::Caster<'a>> {
-    draws
+    let (vertices, bones) = streams;
+    let mut result: Vec<_> = draws
         .iter()
         .filter(|d| d.casts && !d3d.is_faded(&d3d.draws[d.k]))
         .filter_map(|d| {
@@ -1738,9 +1770,31 @@ fn casters<'a>(
                 bone_offset: (d.skin_slot * SKIN_STRIDE) as u32,
                 world: d3d.world(d.draw).unwrap_or(Mat4::IDENTITY),
                 sphere: d3d.draw_sphere(&d3d.draws[d.k]).unwrap_or(d.sphere),
+                alpha: [0.0; 4],
+                clip: 0.0,
+                material: None,
             })
         })
-        .collect()
+        .collect();
+    result.extend(
+        cutouts
+            .iter()
+            .filter(|d| !d3d.is_faded(&d3d.draws[d.k]))
+            .filter_map(|d| {
+                Some(crate::deferred_shadow::Caster {
+                    mesh: meshes.get(d.mesh)?,
+                    vertices: vertices.get(&d.mesh)?,
+                    bones,
+                    bone_offset: (d.skin_slot * SKIN_STRIDE) as u32,
+                    world: d3d.world(d.draw).unwrap_or(Mat4::IDENTITY),
+                    sphere: d3d.draw_sphere(&d3d.draws[d.k]).unwrap_or(d.sphere),
+                    alpha: d.alpha,
+                    clip: d.clip,
+                    material: materials.get(d.material),
+                })
+            }),
+    );
+    result
 }
 
 /// Draws the deferred draws in view with `pipelines` (by cull mode).
