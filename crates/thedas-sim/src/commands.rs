@@ -40,11 +40,17 @@ pub enum SimCommand {
         call_script: bool,
     },
     /// Starts a conversation between `initiator` and `target` (its owner); an empty
-    /// `dialog` is the target's own conversation.
+    /// `dialog` is the target's own conversation. `start` begins it at that line (an index
+    /// into the conversation's line list) instead of its first usable start, its condition
+    /// not asked: mod mode's testing out of order. Such a start opens on the dialog screen
+    /// unless the line is said in passing, and is refused while another conversation is
+    /// open.
     StartConversation {
         initiator: ObjectId,
         target: ObjectId,
         dialog: String,
+        #[serde(default)]
+        start: Option<usize>,
     },
     /// Sets one of an object's variables (`value`), or removes it (`None`). The module
     /// object's variables are the game's globals.
@@ -350,7 +356,8 @@ impl Sim {
                 initiator,
                 target,
                 dialog,
-            } => self.start_commanded_conversation(*initiator, *target, dialog),
+                start,
+            } => self.start_commanded_conversation(*initiator, *target, dialog, *start),
             SimCommand::SetLocal {
                 target,
                 name,
@@ -620,6 +627,7 @@ impl Sim {
         initiator: ObjectId,
         target: ObjectId,
         dialog: &str,
+        start: Option<usize>,
     ) -> CommandOutcome {
         let refused = |reason: &str| CommandOutcome::Refused {
             reason: reason.to_string(),
@@ -637,6 +645,33 @@ impl Sim {
             return refused("no such initiator");
         }
         let was_open = self.talk.as_ref().is_some_and(|c| !c.ended);
+        if let Some(at) = start {
+            if was_open {
+                return refused("another conversation is open");
+            }
+            let Some(d) = self.load_conversation(initiator, target, dialog) else {
+                return refused("the conversation could not be read, or the owner has none");
+            };
+            match d.nodes.get(at) {
+                None => {
+                    return refused(&format!(
+                        "line {at} is past the conversation's {} lines",
+                        d.nodes.len()
+                    ));
+                }
+                Some(n) if n.reply => {
+                    return refused(&format!("line {at} is a reply of the player's"));
+                }
+                Some(_) => {}
+            }
+            let name = d.name.clone();
+            self.open_conversation(initiator, target, d, Some(at));
+            let opened = self.talk.as_ref().is_some_and(|c| !c.ended);
+            return CommandOutcome::ConversationStarted {
+                dialog: name,
+                opened,
+            };
+        }
         let waiting = self.world.pending_talks.len();
         if !self.start_conversation(initiator, target, dialog) {
             return refused("the conversation could not be read, or the owner has none");
@@ -949,6 +984,21 @@ mod tests {
     }
 
     #[test]
+    fn a_journal_from_before_start_lines_still_reads() {
+        let old = r#"{"command":"start_conversation","initiator":1,"target":2,"dialog":"x"}"#;
+        let c: SimCommand = serde_json::from_str(old).unwrap();
+        assert_eq!(
+            c,
+            SimCommand::StartConversation {
+                initiator: 1,
+                target: 2,
+                dialog: "x".into(),
+                start: None,
+            }
+        );
+    }
+
+    #[test]
     fn local_values_serialize_with_their_type() {
         let v = LocalValue::Float(1.5);
         let j = serde_json::to_string(&v).unwrap();
@@ -979,6 +1029,7 @@ mod tests {
                 initiator: hero,
                 target: gone,
                 dialog: String::new(),
+                start: None,
             },
         );
         assert_eq!(

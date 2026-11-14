@@ -134,6 +134,12 @@ and show your edits while the game runs:
    with them: reshaped, moved or re-skinned, it keeps the game's own vertex layout and
    bones. `.imported` in the export's folder says what was written, or why not.
 
+Materials: a texture painted in Blender (or any image the material is given instead of the
+export's PNG) is written as the game's texture it replaces. Give a mesh a new material (a
+name the game does not have) and it gets one: a copy of its old material with that name, the
+new image as its diffuse texture (`<name>_d.dds`), and the model drawing the mesh with it.
+Picking another material the export wrote switches the mesh to it.
+
 Moving or turning the object itself in Blender (its top node, named after it) moves it in
 the game, as mod mode's Move does: undo puts it back. A model that is only moved writes no
 mesh file. A tilt or a stretch of the whole object goes into its meshes instead.

@@ -534,9 +534,130 @@ impl MaterialDef {
     }
 }
 
+/// A material object in its XML form (as Dragon Age: Origins ships them) changed in place:
+/// renamed (`name`), and each `(parameter, resource)` of `textures` bound (the parameter's
+/// `Texture` element's `ResName` set, or a new `Texture` element added). Everything else
+/// keeps its bytes. The binary form (Dragon Age II's) is not written.
+pub fn rewrite_xml(
+    data: &[u8],
+    name: Option<&str>,
+    textures: &[(String, String)],
+) -> Result<Vec<u8>> {
+    if crate::gff4::is_gff4(data) {
+        return Err(MaterialError::Binary(
+            "a binary material object is not written".into(),
+        ));
+    }
+    let bom = String::from_utf8_lossy(data).starts_with('\u{feff}');
+    let text = document(data)?;
+    let doc = parse_doc(&text)?;
+    let root = doc.root_element();
+    if !is(&root, "MaterialObject") {
+        return Err(MaterialError::WrongRoot {
+            expected: "MaterialObject",
+            found: root.tag_name().name().to_string(),
+        });
+    }
+    // (where, how much is replaced, the new text), applied from the end backwards.
+    let mut edits: Vec<(usize, usize, String)> = Vec::new();
+    let value = |n: &roxmltree::Node, a: &str| {
+        n.attributes()
+            .find(|x| x.name().eq_ignore_ascii_case(a))
+            .map(|x| x.range_value())
+    };
+    if let Some(name) = name {
+        match value(&root, "Name") {
+            Some(r) => edits.push((r.start, r.len(), escape(name))),
+            None => {
+                // After the element's name: `<MaterialObject` and a space.
+                let at = root.range().start + 1 + root.tag_name().name().len();
+                edits.push((at, 0, format!(" Name=\"{}\"", escape(name))));
+            }
+        }
+    }
+    let mut added = String::new();
+    for (param, res) in textures {
+        let bound = root.children().find(|n| {
+            is(n, "Texture") && attr(n, "Name").is_some_and(|v| v.eq_ignore_ascii_case(param))
+        });
+        match bound.and_then(|n| value(&n, "ResName")) {
+            Some(r) => edits.push((r.start, r.len(), escape(res))),
+            None => added.push_str(&format!(
+                "\t<Texture Name=\"{}\" ResName=\"{}\" />\n",
+                escape(param),
+                escape(res)
+            )),
+        }
+    }
+    if !added.is_empty() {
+        // Before the root's closing tag.
+        let end = root.range().end;
+        let close = text[..end]
+            .rfind("</")
+            .ok_or_else(|| MaterialError::Xml("the material object has no closing tag".into()))?;
+        edits.push((close, 0, added));
+    }
+    edits.sort_by_key(|a| std::cmp::Reverse(a.0));
+    let mut out = text.clone();
+    for (at, len, new) in edits {
+        out.replace_range(at..at + len, &new);
+    }
+    let mut bytes = Vec::with_capacity(out.len() + 3);
+    if bom {
+        bytes.extend_from_slice("\u{feff}".as_bytes());
+    }
+    bytes.extend_from_slice(out.as_bytes());
+    Ok(bytes)
+}
+
+/// Text made safe for an XML attribute value.
+fn escape(s: &str) -> String {
+    let mut o = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => o.push_str("&amp;"),
+            '<' => o.push_str("&lt;"),
+            '>' => o.push_str("&gt;"),
+            '"' => o.push_str("&quot;"),
+            '\'' => o.push_str("&apos;"),
+            c => o.push(c),
+        }
+    }
+    o
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_material_object_is_renamed_and_rebound_in_place() {
+        let src = "\u{feff}<?xml version=\"1.0\"?>\n<MaterialObject Name=\"c_doga\">\n\t<Material Name=\"Character.mat\" />\n\t<Texture Name=\"mml_tDiffuse\" ResName=\"c_doga_0d.dds\" />\n\t<Float Name=\"x\" value=\"0.5\" />\n</MaterialObject>\n";
+        let out = rewrite_xml(
+            src.as_bytes(),
+            Some("my_dog"),
+            &[
+                ("MML_TDIFFUSE".into(), "my_dog_d.dds".into()),
+                ("mml_tNormalMap".into(), "a&b.dds".into()),
+            ],
+        )
+        .unwrap();
+        let m = MaterialObject::parse(&out).unwrap();
+        assert_eq!(m.name, "my_dog");
+        assert_eq!(m.material, "Character.mat");
+        assert_eq!(m.texture("mml_tDiffuse").unwrap().res_name, "my_dog_d.dds");
+        assert_eq!(m.texture("mml_tNormalMap").unwrap().res_name, "a&b.dds");
+        assert_eq!(m.floats, vec![("x".to_string(), 0.5)]);
+        // The rest keeps its bytes, the byte order mark included.
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.starts_with('\u{feff}'));
+        assert!(text.contains("<Float Name=\"x\" value=\"0.5\" />"));
+        // Nothing to change: the same bytes.
+        assert_eq!(
+            rewrite_xml(src.as_bytes(), None, &[]).unwrap(),
+            src.as_bytes()
+        );
+    }
 
     const MAO: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <!-- comment --><MaterialObject Name="Test">
