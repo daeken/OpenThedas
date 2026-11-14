@@ -4931,15 +4931,15 @@ pub fn call(
             }
             void()
         }
-        // DAOrigins.exe 0x6645a0: the template's `NoPermDeath` is 0 and the creature is not
-        // in the party (0x6316f0 on the party list). So the scripts that eat corpses (Death
-        // Magic's heartbeat) leave a fallen party member alone.
+        // Origins 0x6645a0 resolves a creature (0x5d58c0), then requires NoPermDeath == 0
+        // and absence from the party list (0x6316f0). DA2's object-kind behavior is untraced.
         "GetCanDiePermanently" => {
             let id = obj(a, 0);
             let in_party = party_of(h.sim).contains(&id);
             ok(b(!in_party
                 && h.object(id).is_some_and(|o| {
-                    o.fields.get("NoPermDeath").copied().unwrap_or(0) == 0
+                    (h.sim.game != thedas_vfs::Game::Origins || o.kind == ObjectKind::Creature)
+                        && o.fields.get("NoPermDeath").copied().unwrap_or(0) == 0
                 })))
         }
         // A placeable's treasure category and rank, as its instance sets them (`TreasureCategory`,
@@ -7217,6 +7217,62 @@ mod tests {
         s.world.queue_destroy(0, follower);
         s.world.destroy_due();
         assert!(s.world.get(hero).unwrap().followers.is_empty());
+    }
+
+    #[test]
+    fn permanent_death_query_requires_an_origins_creature() {
+        let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        for kind in [
+            ObjectKind::Module,
+            ObjectKind::Area,
+            ObjectKind::Creature,
+            ObjectKind::Placeable,
+            ObjectKind::Trigger,
+            ObjectKind::Waypoint,
+            ObjectKind::Store,
+            ObjectKind::Sound,
+            ObjectKind::Item,
+            ObjectKind::Stage,
+            ObjectKind::Party,
+            ObjectKind::Map,
+            ObjectKind::MapPin,
+            ObjectKind::Projectile,
+            ObjectKind::AreaOfEffect,
+        ] {
+            let id = s.world.spawn(kind, "target");
+            for game in [thedas_vfs::Game::Origins, thedas_vfs::Game::DragonAge2] {
+                s.game = game;
+                for no_perm_death in [None, Some(0), Some(1), Some(-1)] {
+                    let o = s.world.get_mut(id).unwrap();
+                    o.fields.remove("NoPermDeath");
+                    if let Some(flag) = no_perm_death {
+                        o.fields.insert("NoPermDeath".into(), flag);
+                    }
+                    // Immortality, active/dead state and health are not this predicate.
+                    o.immortal = true;
+                    o.active = false;
+                    o.dead = true;
+                    let expected = (game != thedas_vfs::Game::Origins
+                        || kind == ObjectKind::Creature)
+                        && no_perm_death.unwrap_or(0) == 0;
+                    assert_eq!(
+                        run(&mut s, id, "GetCanDiePermanently", &[Value::Object(id)]),
+                        Some(Value::Int(expected as i32)),
+                        "{game:?} {kind:?} {no_perm_death:?}"
+                    );
+                }
+            }
+        }
+        for game in [thedas_vfs::Game::Origins, thedas_vfs::Game::DragonAge2] {
+            s.game = game;
+            for id in [OBJECT_INVALID, u32::MAX] {
+                assert_eq!(
+                    run(&mut s, id, "GetCanDiePermanently", &[Value::Object(id)]),
+                    Some(Value::Int(0))
+                );
+            }
+        }
     }
 
     #[test]
