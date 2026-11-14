@@ -159,13 +159,14 @@ The player lives in `crates/thedas-gfx`:
   (disassemble ActionScript), `gfxshape` (print a character).
 - `cargo run --release -p thedas-ui --example movieaudit -- INSTALL MOVIE_DIRECTORY
   bench|fuzz [ITERATIONS] [SEED] [movie,...]` audits the non-font movies without a
-  window. `bench` warms both players, waits for GPU completion per frame, and reports
+  window. `bench` warms the player, waits for GPU completion per frame, and reports
   mean/median/p95/max tick+render time; movies closing without engine context are
-  explicitly skipped. Backend order alternates by movie and seed. `fuzz` exercises
-  own in a debug build with seeded clicks, drags, wheel, focus, text and key input,
+  explicitly skipped. `fuzz` exercises the player in a debug build with seeded
+  clicks, drags, wheel, focus, text and key input,
   targeting both discovered controls and random coordinates and rendering every 25
   events. Omit `--release` for this debug assertion sweep. It reports actual event
   counts and new warnings relative to startup, reopening a closed movie at most
-  three times. Use an external process/time/memory cap per movie when sweeping a
+  three times. Execution-limit and uncaught-throw warnings are counted separately
+  and cause a nonzero exit. Use an external process/time/memory cap per movie when sweeping a
   corpus. Bridge requests are recorded but never dispatched to the app: isolated
   success does not certify a populated gameplay flow.

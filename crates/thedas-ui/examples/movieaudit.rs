@@ -14,12 +14,7 @@ fn gpu() -> Gpu {
         pollster::block_on(instance.request_adapter(&Default::default())).expect("adapter");
     let (device, queue) =
         pollster::block_on(adapter.request_device(&Default::default())).expect("device");
-    Gpu {
-        instance,
-        adapter,
-        device,
-        queue,
-    }
+    Gpu { device, queue }
 }
 fn random(seed: &mut u64) -> u64 {
     *seed ^= *seed << 13;
@@ -84,153 +79,148 @@ fn main() {
     names.sort();
     assert!(!names.is_empty(), "no matching movies");
     let gpu = gpu();
-    for (index, name) in names.iter().enumerate() {
-        let backends = if !bench {
-            vec![true]
-        } else if seed.wrapping_add(index as u64) & 1 == 0 {
-            vec![false, true]
-        } else {
-            vec![true, false]
-        };
-        for own in backends {
-            // SAFETY: this tool opens players serially on the main thread.
-            unsafe {
-                std::env::set_var("THEDAS_UI_PLAYER", if own { "own" } else { "ruffle" });
+    let mut execution_failed = false;
+    for name in &names {
+        println!("BEGIN\town\t{name}\tseed={seed}");
+        let mut stage = Stage::new(gpu.clone(), &vfs, (1024, 768));
+        stage.open(&format!("{name}.gfx")).expect("open movie");
+        let mut startup = BTreeSet::new();
+        for _ in 0..60 {
+            stage.tick(1000.0 / 30.0);
+            if bench {
+                render(&mut stage, &gpu);
             }
-            println!(
-                "BEGIN\t{}\t{name}\tseed={seed}",
-                if own { "own" } else { "ruffle" }
-            );
-            let mut stage = Stage::new(gpu.clone(), &vfs, (1024, 768));
-            stage.open(&format!("{name}.gfx")).expect("open movie");
-            let mut startup = BTreeSet::new();
-            for _ in 0..60 {
-                stage.tick(1000.0 / 30.0);
-                if bench {
-                    render(&mut stage, &gpu);
-                }
-                warnings(&mut stage, &mut startup);
-            }
-            if bench && stage.movies.is_empty() {
-                println!(
-                    "SKIP\t{}\t{name}\tclosed without engine context",
-                    if own { "own" } else { "ruffle" }
-                );
-                continue;
-            }
-            let mut added = BTreeSet::new();
-            let mut times = Vec::new();
-            let mut state = seed;
-            let mut targets = stage.focus_targets();
-            let mut reopens = 0;
-            let mut processed = 0;
-            let mut closed = false;
-            for i in 0..count {
-                processed = i + 1;
-                let start = Instant::now();
-                if !bench {
-                    let r = random(&mut state);
-                    let (x, y) = if !targets.is_empty() && r & 1 == 0 {
-                        targets[(r as usize / 2) % targets.len()].center()
-                    } else {
-                        ((r % 1124) as f64 - 50.0, ((r >> 16) % 868) as f64 - 50.0)
-                    };
-                    stage.mouse_move(x, y);
-                    match r % 10 {
-                        0..=2 => {
-                            stage.mouse_button(x, y, true);
-                            stage.mouse_button(x, y, false);
-                        }
-                        3 => {
-                            stage.mouse_button(x, y, true);
-                            stage.mouse_move(x + 20.0, y + 20.0);
-                            stage.mouse_button(x + 20.0, y + 20.0, false);
-                        }
-                        4 => stage.mouse_wheel(x, y, if r & 16 == 0 { -3.0 } else { 3.0 }),
-                        5 => {
-                            stage.key(UiKey::Tab);
-                        }
-                        6 => {
-                            stage.key(UiKey::Enter);
-                        }
-                        7 => {
-                            stage.key(UiKey::Escape);
-                        }
-                        8 => {
-                            stage.key(UiKey::SelectAll);
-                            stage.type_text("Audit Ω 42");
-                        }
-                        _ => {
-                            stage.key(
-                                [
-                                    UiKey::Left,
-                                    UiKey::Right,
-                                    UiKey::Home,
-                                    UiKey::End,
-                                    UiKey::Backspace,
-                                    UiKey::Delete,
-                                ][r as usize % 6],
-                            );
-                        }
-                    }
-                }
-                stage.tick(if bench {
-                    1000.0 / 30.0
+            warnings(&mut stage, &mut startup);
+        }
+        if bench && stage.movies.is_empty() {
+            println!("SKIP\town\t{name}\tclosed without engine context");
+            continue;
+        }
+        let mut added = BTreeSet::new();
+        let mut times = Vec::new();
+        let mut state = seed;
+        let mut targets = stage.focus_targets();
+        let mut reopens = 0;
+        let mut processed = 0;
+        let mut closed = false;
+        for i in 0..count {
+            processed = i + 1;
+            let start = Instant::now();
+            if !bench {
+                let r = random(&mut state);
+                let (x, y) = if !targets.is_empty() && r & 1 == 0 {
+                    targets[(r as usize / 2) % targets.len()].center()
                 } else {
-                    [0.0, 10.0, 33.333333333, 100.0, 250.0][i as usize % 5]
-                });
-                if bench && stage.movies.is_empty() {
-                    closed = true;
-                    break;
-                }
-                if bench {
-                    render(&mut stage, &gpu);
-                    times.push(start.elapsed().as_secs_f64() * 1000.0);
-                }
-                warnings(&mut stage, &mut added);
-                if !bench && stage.movies.is_empty() {
-                    if reopens == 3 {
-                        break;
+                    ((r % 1124) as f64 - 50.0, ((r >> 16) % 868) as f64 - 50.0)
+                };
+                stage.mouse_move(x, y);
+                match r % 10 {
+                    0..=2 => {
+                        stage.mouse_button(x, y, true);
+                        stage.mouse_button(x, y, false);
                     }
-                    stage.open(&format!("{name}.gfx")).expect("reopen movie");
-                    reopens += 1;
+                    3 => {
+                        stage.mouse_button(x, y, true);
+                        stage.mouse_move(x + 20.0, y + 20.0);
+                        stage.mouse_button(x + 20.0, y + 20.0, false);
+                    }
+                    4 => stage.mouse_wheel(x, y, if r & 16 == 0 { -3.0 } else { 3.0 }),
+                    5 => {
+                        stage.key(UiKey::Tab);
+                    }
+                    6 => {
+                        stage.key(UiKey::Enter);
+                    }
+                    7 => {
+                        stage.key(UiKey::Escape);
+                    }
+                    8 => {
+                        stage.key(UiKey::SelectAll);
+                        stage.type_text("Audit Ω 42");
+                    }
+                    _ => {
+                        stage.key(
+                            [
+                                UiKey::Left,
+                                UiKey::Right,
+                                UiKey::Home,
+                                UiKey::End,
+                                UiKey::Backspace,
+                                UiKey::Delete,
+                            ][r as usize % 6],
+                        );
+                    }
                 }
-                if !bench && i % 25 == 0 {
-                    render(&mut stage, &gpu);
-                    targets = stage.focus_targets();
-                }
+            }
+            stage.tick(if bench {
+                1000.0 / 30.0
+            } else {
+                [0.0, 10.0, 33.333333333, 100.0, 250.0][i as usize % 5]
+            });
+            if bench && stage.movies.is_empty() {
+                closed = true;
+                break;
             }
             if bench {
-                if closed {
-                    println!(
-                        "SKIP\t{}\t{name}\tclosed during measurement",
-                        if own { "own" } else { "ruffle" }
-                    );
-                    continue;
-                }
-                times.sort_by(f64::total_cmp);
-                println!(
-                    "BENCH\t{}\t{name}\t{count}\tmean_ms={:.6}\tp50_ms={:.6}\tp95_ms={:.6}\tmax_ms={:.6}",
-                    if own { "own" } else { "ruffle" },
-                    times.iter().sum::<f64>() / f64::from(count),
-                    times[times.len() / 2],
-                    times[(times.len() * 95 / 100).min(times.len() - 1)],
-                    times[times.len() - 1]
-                );
-            } else {
-                let novel: Vec<_> = added.difference(&startup).collect();
-                println!(
-                    "FUZZ\t{name}\tseed={seed}\tevents={processed}\treopens={reopens}\tstartup_warnings={}\tnew_warnings={}",
-                    startup.len(),
-                    novel.len()
-                );
-                for warning in novel {
-                    println!("NEW\t{name}\t{warning}");
-                }
+                render(&mut stage, &gpu);
+                times.push(start.elapsed().as_secs_f64() * 1000.0);
             }
-            for warning in startup {
-                println!("STARTUP\t{name}\t{warning}");
+            warnings(&mut stage, &mut added);
+            if !bench && stage.movies.is_empty() {
+                if reopens == 3 {
+                    break;
+                }
+                stage.open(&format!("{name}.gfx")).expect("reopen movie");
+                reopens += 1;
+            }
+            if !bench && i % 25 == 0 {
+                render(&mut stage, &gpu);
+                targets = stage.focus_targets();
             }
         }
+        let execution_errors = startup
+            .union(&added)
+            .filter(|line| {
+                [
+                    "call stack overflow",
+                    "script ran too long; stopped",
+                    "action queue runaway",
+                    "uncaught throw:",
+                ]
+                .iter()
+                .any(|error| line.contains(error))
+            })
+            .count();
+        execution_failed |= execution_errors != 0;
+        if bench {
+            if closed {
+                println!("SKIP\town\t{name}\tclosed during measurement");
+                continue;
+            }
+            times.sort_by(f64::total_cmp);
+            println!(
+                "BENCH\town\t{name}\t{count}\tmean_ms={:.6}\tp50_ms={:.6}\tp95_ms={:.6}\tmax_ms={:.6}",
+                times.iter().sum::<f64>() / f64::from(count),
+                times[times.len() / 2],
+                times[(times.len() * 95 / 100).min(times.len() - 1)],
+                times[times.len() - 1]
+            );
+        } else {
+            let novel: Vec<_> = added.difference(&startup).collect();
+            println!(
+                "FUZZ\t{name}\tseed={seed}\tevents={processed}\treopens={reopens}\tstartup_warnings={}\tnew_warnings={}\texecution_errors={execution_errors}",
+                startup.len(),
+                novel.len()
+            );
+            for warning in novel {
+                println!("NEW\t{name}\t{warning}");
+            }
+        }
+        for warning in startup {
+            println!("STARTUP\t{name}\t{warning}");
+        }
+    }
+    if execution_failed {
+        std::process::exit(1);
     }
 }
