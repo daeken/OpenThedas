@@ -62,6 +62,15 @@ fn tree_resource(tree: &str) -> String {
     }
 }
 
+/// Each track's node on a skeleton (see [`crate::skeleton::Skeleton::track_nodes`]).
+type TrackNodes = Arc<[Option<usize>]>;
+
+/// A skeleton's rest pose and its pose (model space).
+type Posed = (Arc<Vec<Mat4>>, Vec<Mat4>);
+
+/// The most threads the props' posing is spread over.
+const POSE_THREADS: usize = 4;
+
 #[derive(Default)]
 pub struct Animator {
     trees: HashMap<String, Option<Arc<AnimTree>>>,
@@ -70,6 +79,12 @@ pub struct Animator {
     /// Dragon Age II animations whose bones were named for a skeleton already (see
     /// [`Animator::named_for`]): by animation and the skeleton's index.
     named: std::collections::HashSet<(String, usize)>,
+    /// Animations whose tracks name their bones (Dragon Age: Origins'), by resource: no
+    /// naming to do (see [`Animator::named_for`]).
+    unhashed: std::collections::HashSet<String>,
+    /// Each animation's track nodes on each skeleton (by the skeleton's index, then the
+    /// animation's resource): see [`crate::skeleton::Skeleton::track_nodes`].
+    track_nodes: HashMap<usize, HashMap<String, TrackNodes>>,
 }
 
 fn load<T>(
@@ -78,6 +93,12 @@ fn load<T>(
     name: &str,
     parse: impl Fn(&[u8]) -> Option<T>,
 ) -> Option<Arc<T>> {
+    // Read every frame: found without a copy of the name when it is lowercase already.
+    if !name.bytes().any(|b| b.is_ascii_uppercase())
+        && let Some(hit) = cache.get(name)
+    {
+        return hit.clone();
+    }
     let key = name.to_ascii_lowercase();
     cache
         .entry(key.clone())
@@ -101,6 +122,27 @@ impl Animator {
     pub fn forget_skeletons(&mut self) {
         self.rests.clear();
         self.named.clear();
+        self.track_nodes.clear();
+    }
+
+    /// Animation `anim`'s (resource `ani`) track nodes on skeleton `skeleton` (`s`), worked
+    /// out once.
+    fn track_nodes_for(
+        &mut self,
+        ani: &str,
+        anim: &Animation,
+        skeleton: usize,
+        s: &crate::skeleton::Skeleton,
+    ) -> Arc<[Option<usize>]> {
+        let by_ani = self.track_nodes.entry(skeleton).or_default();
+        match by_ani.get(ani) {
+            Some(n) if n.len() == anim.tracks.len() => n.clone(),
+            _ => {
+                let n: Arc<[Option<usize>]> = s.track_nodes(anim).into();
+                by_ani.insert(ani.to_string(), n.clone());
+                n
+            }
+        }
     }
 
     /// The `.ani` resource a clip plays (the first tree with one of its actions), and the
@@ -196,13 +238,20 @@ impl Animator {
         skeleton: usize,
         s: &crate::skeleton::Skeleton,
     ) -> Arc<Animation> {
+        if self.unhashed.contains(ani) {
+            return anim;
+        }
         let key = ani.to_ascii_lowercase();
         let hashed = |a: &Animation| {
             a.tracks
                 .iter()
                 .any(|t| thedas_formats::hash_of_hashed_name(&t.bone).is_some())
         };
-        if !hashed(&anim) || !self.named.insert((key.clone(), skeleton)) {
+        if !hashed(&anim) {
+            self.unhashed.insert(ani.to_string());
+            return anim;
+        }
+        if !self.named.insert((key.clone(), skeleton)) {
             return anim;
         }
         let mut named = (*anim).clone();
@@ -223,6 +272,19 @@ impl Animator {
         skeleton: usize,
         clip: &Clip,
     ) -> Option<(Arc<Vec<Mat4>>, Vec<Mat4>)> {
+        self.prepare(vfs, scene, skeleton, clip).map(Prepared::pose)
+    }
+
+    /// What posing a skeleton with a clip needs, looked up (the animations, their times
+    /// and track nodes, the rest pose); the posing itself ([`Prepared::pose`]) reads only
+    /// this, so many can run at once.
+    fn prepare(
+        &mut self,
+        vfs: &Vfs,
+        scene: &AreaScene,
+        skeleton: usize,
+        clip: &Clip,
+    ) -> Option<Prepared> {
         let s = scene.skeletons.get(skeleton)?.clone();
         let time = |c: &Clip, a: &Animation| {
             if let Some(phase) = c.phase {
@@ -234,14 +296,17 @@ impl Animator {
                 c.time.min(a.length)
             }
         };
-        let mut layers: Vec<(Arc<Animation>, f32, bool, f32)> = Vec::new();
+        let mut layers: Vec<PreparedLayer> = Vec::new();
         for c in std::iter::once(clip).chain(&clip.layers) {
             if let Some(anim) = &c.inline {
-                layers.push((anim.clone(), time(c, anim), c.absolute, c.weight));
+                // Made for this frame: its nodes are not kept.
+                let nodes: Arc<[Option<usize>]> = s.track_nodes(anim).into();
+                layers.push((anim.clone(), time(c, anim), c.absolute, c.weight, nodes));
             } else if let Some((ani, anim)) = self.animation_resource(vfs, c) {
                 let anim = self.named_for(&ani, anim, skeleton, &s);
+                let nodes = self.track_nodes_for(&ani, &anim, skeleton, &s);
                 let t = time(c, &anim);
-                layers.push((anim, t, c.absolute, c.weight));
+                layers.push((anim, t, c.absolute, c.weight, nodes));
             }
         }
         if layers.is_empty() {
@@ -252,11 +317,41 @@ impl Animator {
             .entry(skeleton)
             .or_insert_with(|| Arc::new(s.rest()))
             .clone();
-        let refs: Vec<(&Animation, f32, bool, f32)> = layers
+        Some(Prepared {
+            skeleton: s,
+            rest,
+            layers,
+        })
+    }
+}
+
+/// One layer of a [`Prepared`] posing: the animation, its time, whether it is measured
+/// against the first layer, its weight and its track nodes.
+type PreparedLayer = (Arc<Animation>, f32, bool, f32, Arc<[Option<usize>]>);
+
+/// A skeleton and the layers to pose it with (see [`Animator::prepare`]).
+struct Prepared {
+    skeleton: Arc<crate::skeleton::Skeleton>,
+    rest: Arc<Vec<Mat4>>,
+    layers: Vec<PreparedLayer>,
+}
+
+impl Prepared {
+    /// The rest pose and the posed one.
+    fn pose(self) -> (Arc<Vec<Mat4>>, Vec<Mat4>) {
+        let mapped: Vec<crate::skeleton::Layer<'_>> = self
+            .layers
             .iter()
-            .map(|(a, t, b, w)| (a.as_ref(), *t, *b, *w))
+            .map(|(a, t, b, w, n)| crate::skeleton::Layer {
+                anim: a,
+                time: *t,
+                against_base: *b,
+                weight: *w,
+                nodes: n,
+            })
             .collect();
-        Some((rest, s.pose_weighted(&refs)))
+        let pose = self.skeleton.pose_mapped(&mapped);
+        (self.rest, pose)
     }
 }
 
@@ -273,20 +368,60 @@ impl Animator {
         props: &[(Mat4, Option<Clip>)],
         advance: f32,
     ) {
-        for (i, (transform, clip)) in props.iter().enumerate() {
-            let mut poses = crate::skeleton::Poses::new();
+        // The lookups first, in order (they fill the caches); then the posing, which reads
+        // only what was looked up, spread over threads (a camp holds a hundred creatures,
+        // each with several skeletons).
+        let mut jobs: Vec<(usize, usize, Prepared)> = Vec::new();
+        for (i, (_, clip)) in props.iter().enumerate() {
             if let Some(clip) = clip {
                 let mut clip = clip.clone();
                 if clip.looping {
                     clip.time += advance;
                 }
                 for s in scene.prop_skeletons(i) {
-                    if let Some(p) = self.pose(vfs, scene, s, &clip) {
-                        poses.insert(s, p);
+                    if let Some(p) = self.prepare(vfs, scene, s, &clip) {
+                        jobs.push((i, s, p));
                     }
                 }
             }
-            renderer.pose_prop(ctx, scene, i, *transform, &poses);
+        }
+        let threads = std::thread::available_parallelism()
+            .map_or(1, |n| n.get())
+            .clamp(1, POSE_THREADS);
+        let mut posed: Vec<(usize, usize, Posed)> = Vec::with_capacity(jobs.len());
+        if threads <= 1 || jobs.len() < 8 {
+            posed.extend(jobs.into_iter().map(|(i, s, p)| (i, s, p.pose())));
+        } else {
+            let chunk = jobs.len().div_ceil(threads);
+            let mut chunks: Vec<Vec<(usize, usize, Prepared)>> = Vec::new();
+            let mut jobs = jobs.into_iter().peekable();
+            while jobs.peek().is_some() {
+                chunks.push(jobs.by_ref().take(chunk).collect());
+            }
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = chunks
+                    .into_iter()
+                    .map(|c| {
+                        scope.spawn(move || {
+                            c.into_iter()
+                                .map(|(i, s, p)| (i, s, p.pose()))
+                                .collect::<Vec<_>>()
+                        })
+                    })
+                    .collect();
+                for h in handles {
+                    if let Ok(done) = h.join() {
+                        posed.extend(done);
+                    }
+                }
+            });
+        }
+        let mut by_prop: Vec<crate::skeleton::Poses> = vec![Default::default(); props.len()];
+        for (i, s, p) in posed {
+            by_prop[i].insert(s, p);
+        }
+        for (i, ((transform, _), poses)) in props.iter().zip(&by_prop).enumerate() {
+            renderer.pose_prop(ctx, scene, i, *transform, poses);
         }
     }
 }
