@@ -130,6 +130,7 @@ const PUSH: u8 = 0x96;
 const DEFINE_FUNCTION: u8 = 0x9b;
 const NEW_OBJECT: u8 = 0x40;
 const ADD2: u8 = 0x47;
+const MODULO: u8 = 0x3f;
 const INIT_ARRAY: u8 = 0x42;
 
 enum Push<'a> {
@@ -226,6 +227,49 @@ fn post_load_wrap_maker() -> Vec<u8> {
     push(&mut inner, &[Push::Str("apply")]);
     inner.extend_from_slice(&[CALL_METHOD, RETURN]);
     let mut outer = function(&["f"], &inner);
+    outer.push(RETURN);
+    function(&["o"], &outer)
+}
+
+/// Keeps the credits' following text box at the leading box's bottom after each
+/// authored update. Independent fractional `_y` writes otherwise advance positive
+/// and negative positions at different rates as each truncates toward zero in twips.
+fn credits_scroll_wrap_maker() -> Vec<u8> {
+    let mut inner = Asm::default();
+    let c = &mut inner.code;
+    get_path(c, &["arguments"]);
+    get_path(c, &["this"]);
+    push(c, &[Push::Int(2)]);
+    get_path(c, &["o"]);
+    push(c, &[Push::Str("apply")]);
+    c.extend_from_slice(&[CALL_METHOD, POP]);
+    get_path(c, &["_global", "Credits", "m_nTextBoxesInUse"]);
+    push(c, &[Push::Int(2)]);
+    c.extend_from_slice(&[EQUALS2, NOT]);
+    inner.branch(IF, "done");
+    let c = &mut inner.code;
+    // var first = _root["TextBox" + Credits.m_nNextTextBox];
+    push(c, &[Push::Str("first")]);
+    get_path(c, &["_root"]);
+    push(c, &[Push::Str("TextBox")]);
+    get_path(c, &["_global", "Credits", "m_nNextTextBox"]);
+    c.extend_from_slice(&[ADD2, GET_MEMBER, DEFINE_LOCAL]);
+    // _root["TextBox" + ((Credits.m_nNextTextBox + 1) % 2)]._y = first._y + first._height;
+    get_path(c, &["_root"]);
+    push(c, &[Push::Str("TextBox")]);
+    get_path(c, &["_global", "Credits", "m_nNextTextBox"]);
+    push(c, &[Push::Int(1)]);
+    c.push(ADD2);
+    push(c, &[Push::Int(2)]);
+    c.extend_from_slice(&[MODULO, ADD2, GET_MEMBER]);
+    push(c, &[Push::Str("_y")]);
+    get_path(c, &["first", "_y"]);
+    get_path(c, &["first", "_height"]);
+    c.extend_from_slice(&[ADD2, SET_MEMBER]);
+    inner.label("done");
+    push(&mut inner.code, &[Push::Undefined]);
+    inner.code.push(RETURN);
+    let mut outer = function(&[], &inner.finish());
     outer.push(RETURN);
     function(&["o"], &outer)
 }
@@ -1045,6 +1089,29 @@ pub fn register_invoke() -> Vec<u8> {
     get_path(&mut install, &["_global"]);
     push(&mut install, &[Push::Str("thedas_text_wrap")]);
     install.extend_from_slice(&[CALL_METHOD, SET_MEMBER]);
+    // Wrap the credits' authored scroll update once, when that class is present.
+    let mut credits = Vec::new();
+    get_path(&mut credits, &["_global", "Credits"]);
+    push(&mut credits, &[Push::Str("UpdateBoxPositions")]);
+    get_path(&mut credits, &["_global", "Credits", "UpdateBoxPositions"]);
+    push(&mut credits, &[Push::Int(1)]);
+    credits.extend(credits_scroll_wrap_maker());
+    push(&mut credits, &[Push::Undefined]);
+    credits.extend_from_slice(&[CALL_METHOD, SET_MEMBER]);
+    get_path(&mut credits, &["_global", "Credits", "UpdateBoxPositions"]);
+    push(&mut credits, &[Push::Str("thedas_w"), Push::Bool(true)]);
+    credits.push(SET_MEMBER);
+    let mut credits_install = Vec::new();
+    get_path(
+        &mut credits_install,
+        &["_global", "Credits", "UpdateBoxPositions", "thedas_w"],
+    );
+    branch(&mut credits_install, IF, credits.len(), false);
+    credits_install.extend(credits);
+    get_path(&mut install, &["_global", "Credits", "UpdateBoxPositions"]);
+    install.push(NOT);
+    branch(&mut install, IF, credits_install.len(), false);
+    install.extend(credits_install);
     get_path(&mut out, &["_global"]);
     push(&mut out, &[Push::Str("thedas_post_load_wrap")]);
     out.extend(post_load_wrap_maker());
@@ -1206,6 +1273,96 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn credits_sections_stay_joined_across_zero_and_box_recycling() {
+        use thedas_gfx::avm1::value::Value;
+
+        let movie = b"FWS\x08\x12\0\0\0\x08\0\0\x1e\x01\0\x40\0\0\0";
+        let mut player = thedas_gfx::Player::new(
+            movie,
+            "credits-test",
+            Box::new(Empty),
+            std::sync::Arc::new(Empty),
+            Some(register_invoke()),
+        )
+        .unwrap();
+        player.run_frame();
+        let root = player.vm.display_object(player.vm.root);
+        let credits = Value::Object(player.vm.new_object());
+        player
+            .vm
+            .define(player.vm.global, "Credits", credits.clone(), 0);
+        player
+            .vm
+            .set(&credits, "m_nTextBoxesInUse", Value::Number(1.0));
+        player
+            .vm
+            .set(&credits, "m_nNextTextBox", Value::Number(0.0));
+        player.vm.set(&credits, "calls", Value::Number(0.0));
+        let boxes = [
+            Value::Object(player.vm.new_object()),
+            Value::Object(player.vm.new_object()),
+        ];
+        for (index, text_box) in boxes.iter().enumerate() {
+            player
+                .vm
+                .set(&root, &format!("TextBox{index}"), text_box.clone());
+            player.vm.set(text_box, "_y", Value::Number(500.0));
+            player.vm.set(text_box, "_height", Value::Number(1046.85));
+        }
+        let original = player.vm.new_native(|vm, this, _| {
+            let calls = vm.get(&this, "calls");
+            let calls = vm.to_number(&calls) + 1.0;
+            vm.set(&this, "calls", Value::Number(calls));
+            let root = vm.display_object(vm.root);
+            for name in ["TextBox0", "TextBox1"] {
+                let text_box = vm.get(&root, name);
+                let y = vm.get(&text_box, "_y");
+                let y = ((vm.to_number(&y) - 42.8688679245283 / 60.0) * 20.0).trunc() / 20.0;
+                vm.set(&text_box, "_y", Value::Number(y));
+            }
+            Value::Undefined
+        });
+        player
+            .vm
+            .set(&credits, "UpdateBoxPositions", Value::Object(original));
+        player.invoke(INSTALL, &[]);
+        let wrapped = player.vm.get(&credits, "UpdateBoxPositions");
+        player.invoke(INSTALL, &[]);
+        assert_eq!(player.vm.get(&credits, "UpdateBoxPositions"), wrapped);
+        player.vm.call_method(&credits, "UpdateBoxPositions", &[]);
+        assert_eq!(
+            player.vm.get(&boxes[0], "_y"),
+            player.vm.get(&boxes[1], "_y")
+        );
+        player
+            .vm
+            .set(&credits, "m_nTextBoxesInUse", Value::Number(2.0));
+        for step in 0..1800 {
+            let leading = (step / 450) % 2;
+            player
+                .vm
+                .set(&credits, "m_nNextTextBox", Value::Number(leading as f64));
+            if step % 450 == 0 {
+                player.vm.set(&boxes[leading], "_y", Value::Number(100.0));
+                player.vm.set(
+                    &boxes[leading],
+                    "_height",
+                    Value::Number(1046.85 + step as f64),
+                );
+            }
+            player.vm.call_method(&credits, "UpdateBoxPositions", &[]);
+            let y = player.vm.get(&boxes[leading], "_y");
+            let height = player.vm.get(&boxes[leading], "_height");
+            let following = player.vm.get(&boxes[1 - leading], "_y");
+            assert_eq!(
+                following,
+                Value::Number(player.vm.to_number(&y) + player.vm.to_number(&height))
+            );
+        }
+        assert_eq!(player.vm.get(&credits, "calls"), Value::Number(1801.0));
     }
 
     #[test]
