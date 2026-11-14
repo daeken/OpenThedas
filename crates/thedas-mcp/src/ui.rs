@@ -1,5 +1,5 @@
 //! The interface for MCP clients: Scaleform movies on a headless GPU, on their own thread
-//! (Ruffle players are not `Send`). Tools send closures to the thread and await the result.
+//! (UI rendering stays on that thread). Tools send closures to the thread and await the result.
 
 use std::io::Cursor;
 use std::sync::Arc;
@@ -69,8 +69,6 @@ impl UiWorld {
         if self.gpu.is_none() {
             let ctx = thedas_render::GpuContext::headless().map_err(|e| e.to_string())?;
             self.gpu = Some(Gpu {
-                instance: ctx.instance.clone(),
-                adapter: ctx.adapter.clone(),
                 device: ctx.device.clone(),
                 queue: ctx.queue.clone(),
             });

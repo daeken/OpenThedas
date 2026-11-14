@@ -1,8 +1,7 @@
 //! Scaleform GFx movies: an SWF container with a `GFX` (uncompressed) or `CFX` (zlib) signature
 //! and Scaleform-only tags numbered from 1000.
 //!
-//! Ruffle reads the container directly but ignores the Scaleform tags, so images the exporter
-//! moved out of the movie (`DefineExternalImage`) would be missing. [`rewrite`] turns a GFx movie
+//! The runtime player reads GFx directly. For offline tools and SWF consumers, [`rewrite`] turns a GFx movie
 //! into a plain SWF, inlining each external image as `DefineBitsLossless2` and dropping the other
 //! Scaleform tags; [`scan`] inventories a movie for reports.
 //!

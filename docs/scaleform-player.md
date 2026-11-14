@@ -1,17 +1,14 @@
 # Our own Scaleform player (`thedas-gfx`)
 
-Status: design, 2026-11-14. Ruffle stays the default until the new player matches it movie by
-movie.
+Status: active, 2026-11-14. `thedas-gfx` is the only UI player. Ruffle and the runtime
+backend selector have been removed.
 
 ## Why
 
-Ruffle costs about 15 ms of a 22 ms release frame. It redraws every movie every frame, runs a
-general Flash player (AVM1 and AVM2, every tag, browser semantics), and needs a layer of
-workarounds to behave like Scaleform (`thedas-ui/src/avm1.rs`: injected invoke callback,
-wrapped `fsc_retval` getters, empty-string marker, mouse-button global, put-off `onLoad`,
-put-off `HideMovie`, tooltip relayout, multiply pass, scale9 relayout, `Stage.width` via
-no-scale mode). A player written for these movies can do each of those the Scaleform way
-natively, and only redraw what changed.
+The player implements the ActionScript 2 and Scaleform features these movies use, shares
+the renderer's wgpu device, and redraws only changed movies. The engine bridge retains its
+callbacks, token observers, synchronous query replies and text layout helpers. Mouse button
+arguments, topmost-entity queries and release ordering now use the player's native behavior.
 
 ## What the movies use (inventory of all 68, patches applied)
 
@@ -56,7 +53,7 @@ Script: `OpenThedas-testdata/scaleform/scripts/inventory.py`; output `inventory.
 
 ## Shape of the player
 
-A new crate, `crates/thedas-gfx`, with no Ruffle dependency:
+The player lives in `crates/thedas-gfx`:
 
 1. **`swf`**: our own bounds-checked parser for exactly the tags above plus the GFX ones, into a
    character dictionary (shapes, sprites with per-frame command lists, edit texts, fonts,
@@ -101,7 +98,7 @@ A new crate, `crates/thedas-gfx`, with no Ruffle dependency:
 5. **`render`**: wgpu. Shapes are tessellated once per character (lyon) into cached vertex
    buffers; bitmaps (atlas DDS pages) uploaded once; scale9 drawn natively. Colour transform
    and blend mode per draw; multiply and the few other modes against the scene picture,
-   so the separate multiply pass goes away.
+   with host multiply passes retained for the existing scene composite.
 6. **Change tracking**: any change to a display property, frame, text, or the display list
    marks the movie dirty. A tick that changes nothing does no rendering and the texture is
    reused. Static subtrees can be cached to a texture later if profiling asks for it.
@@ -112,31 +109,20 @@ A new crate, `crates/thedas-gfx`, with no Ruffle dependency:
    in world coordinates, while respecting timeline and script masks. Transparent fills
    are still entities; decorative drawings do not gain button events or text focus.
 
-## Switch and parity
+## Runtime and validation
 
-- `thedas-ui`'s `UiMovie` keeps its API; inside it becomes a choice between the Ruffle player
-  and ours. `THEDAS_UI_PLAYER=ruffle` (default), `own`, or `own:mainmenu,quickbar` to take
-  over movie by movie. The app does not change.
-- Ruffle-only workarounds in `avm1.rs` stay with the Ruffle backend; ours implements the
-  behaviour they emulate directly.
-- Per movie: a headless capture of Ruffle and ours from the same state, side by side, and
-  a pixel diff, before that movie leaves the list. Order: mainmenu, startmenu2, HUD
-  (portraits, quickbar, minimap), conversation, then the book screens.
-- Unknown opcodes, tags or built-ins are logged once per movie, never panics.
-
-## Status and how to try it (2026-11-14)
-
-- `THEDAS_UI_PLAYER=own` plays every movie on `thedas-gfx`; `own:mainmenu,portraits` only
-  those. Unset (or `ruffle`) keeps Ruffle.
-- Matching Ruffle side by side, with no engine state: mainmenu, startmenu2 (its logo's multiply
-  now matches the original game, which Ruffle loses), portraits, quickbar, minimap,
-  optionsmenu, newgame. All 66 movies start and run headless without errors.
-- Release build, idle: 10 µs to 9 ms of script per frame per movie (quickbar 0.27 ms against
-  Ruffle's 2.1 ms); a movie that did not change is not drawn again.
+- Every movie opened by `thedas-ui::Stage` uses `thedas-gfx` directly from its GFx bytes.
+  There is no backend selector or fallback player.
+- Unknown opcodes, tags or built-ins are logged once per movie.
+- Compare hidden-window captures of the menu, chargen, HUD, inventory and conversation
+  against the previous own-player build. Exercise the dwarf commoner and human noble
+  chargen click-through as well as the simulation gates.
+- Historical comparisons under `OpenThedas-testdata/sf-compare` remain unchanged.
+- A movie that did not change is not drawn again.
 - Display objects stringify to their paths and unnamed timeline clips/text fields receive
   unique `instanceN` names. Host tree walks can now configure notification multiply passes
   (removing the black bands behind popups) and find menu buttons. Popup vertical placement
-  still differs from Ruffle by about 45 pixels in the choice/text comparison recipes.
+  retains the previous own-player layout in the choice/text comparison recipes.
 - Engine render targets (`paperdoll`) replace their external placeholder shapes at the
   authored bounds. Same-size frames update the existing GPU texture and cached bindings;
   clearing a target makes it transparent.
@@ -158,15 +144,16 @@ A new crate, `crates/thedas-gfx`, with no Ruffle dependency:
   with its authored red definition. Native text-layout `<img>` rendering remains separate.
 - `MovieClip.duplicateMovieClip` constructs a fresh instance of the registered class with
   the source's transform, colour, drawing and clip events. The host can now add its Mod Mode
-  button alongside Report Issue using the same menu setup on either backend.
+  button alongside Report Issue using the same menu setup on the player.
 - Clicking editable/selectable text places the caret at the nearest character boundary.
   Dragging extends the selection, including outside the field until release; Shift-click
   retains its anchor. Picking uses the field's inverse world transform and the layout's
   aligned, wrapped and scrolled character advances, including spaces and missing glyphs.
 - Remaining work includes complete text `shadowStyle`, native inline `<img>` layout,
   cached bitmap alpha masks, and broader interaction parity.
-- Tools: `cargo run -p thedas-ui --example sidebyside -- INSTALL OUT.png MOVIES [FRAMES]
-  [WxH] [ORIGINAL.png]` (Ruffle and ours, optionally after a shot of the original);
-  `thedas-gfx` examples `gfxscan` (parse), `gfxrun` (run headless; `GFX_RENDER=1` times
+- Tools: `cargo run -p thedas-ui --example capture -- INSTALL OUT.png MOVIES [FRAMES]
+  [WxH]` captures the player once and reports timings. `SF_CAPTURE_SETUP` supplies optional
+  `call`/`set` steps. This replaces the former `sidebyside` comparison example.
+  `thedas-gfx` examples: `gfxscan` (parse), `gfxrun` (headless run; `GFX_RENDER=1` times
   rendering, `GFX_TRACE_CALLS=1` logs calls, `GFX_SHOW=paths` prints values), `gfxdis`
   (disassemble ActionScript), `gfxshape` (print a character).
