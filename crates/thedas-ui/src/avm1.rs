@@ -1188,6 +1188,12 @@ mod tests {
             Value::Undefined
         });
         player.vm.set(&listener, "onMouseDown", Value::Object(down));
+        let up = player.vm.new_native(|vm, _, args| {
+            assert_eq!(args.len(), 2);
+            vm.log.push(format!("up {:?}", args.first()));
+            Value::Undefined
+        });
+        player.vm.set(&listener, "onMouseUp", Value::Object(up));
         let mouse = Value::Object(player.vm.mouse);
         player.vm.call_method(&mouse, "addListener", &[listener]);
         player.drain_log();
@@ -1196,16 +1202,32 @@ mod tests {
                 player.mouse_button(20.0, 20.0, button, true, double);
                 player.mouse_button(20.0, 20.0, button, false, double);
                 let code = f64::from(button + if double { 4 } else { 0 });
-                assert_eq!(
-                    player.drain_log(),
-                    [
-                        format!("down Some(Number({code:?}))"),
-                        format!("press Some(Number({code:?}))"),
-                        format!("release Some(Number({code:?}))"),
-                    ]
-                );
+                let physical = f64::from(button);
+                let mut expected = vec![format!("down Some(Number({physical:?}))")];
+                if button == thedas_gfx::player::MOUSE_LEFT {
+                    expected.push(format!("press Some(Number({code:?}))"));
+                    expected.push(format!("release Some(Number({code:?}))"));
+                }
+                expected.push(format!("up Some(Number({physical:?}))"));
+                assert_eq!(player.drain_log(), expected);
             }
         }
+        // A non-left release cannot consume an in-progress native left press.
+        player.mouse_button(20.0, 20.0, thedas_gfx::player::MOUSE_LEFT, true, false);
+        player.mouse_button(20.0, 20.0, thedas_gfx::player::MOUSE_RIGHT, true, false);
+        player.mouse_button(20.0, 20.0, thedas_gfx::player::MOUSE_RIGHT, false, false);
+        player.mouse_button(20.0, 20.0, thedas_gfx::player::MOUSE_LEFT, false, false);
+        assert_eq!(
+            player.drain_log(),
+            [
+                "down Some(Number(1.0))",
+                "press Some(Number(1.0))",
+                "down Some(Number(2.0))",
+                "up Some(Number(2.0))",
+                "release Some(Number(1.0))",
+                "up Some(Number(1.0))",
+            ]
+        );
     }
 
     #[test]

@@ -869,7 +869,7 @@ fn mc_clear(vm: &mut Vm, this: Value, _: &[Value]) -> Value {
 
 fn mc_start_drag(vm: &mut Vm, this: Value, args: &[Value]) -> Value {
     if let Some(d) = this_display(vm, &this) {
-        let lock = args.first().is_some_and(|v| vm.to_bool(v));
+        let lock = args.first().is_none_or(|v| vm.to_bool(v));
         crate::player::start_drag(vm, d, lock);
     }
     Value::Undefined
@@ -1607,7 +1607,10 @@ pub fn install(vm: &mut Vm) {
     vm.define_native(
         mouse,
         "getTopMostEntity",
-        |vm, _, _| match crate::player::topmost(vm) {
+        |vm, _, args| match crate::player::topmost_entity(
+            vm,
+            args.first().is_none_or(|v| vm.to_bool(v)),
+        ) {
             Some(d) => display_value(vm, d),
             None => Value::Undefined,
         },

@@ -532,8 +532,13 @@ impl Player {
         self.vm.mouse_pos = (x, y);
         self.vm.pick_dirty = true;
         self.update_hover();
-        let b = Value::Number((button + if double { 4 } else { 0 }) as f64);
-        let press_args = [b.clone()];
+        // Global listeners receive the physical button. DAO's button handlers
+        // separately use button + 4 for a double click. Encoding the global event
+        // too makes its non-left listener manually deliver a second left click.
+        let b = Value::Number(f64::from(button));
+        let press_args = [Value::Number(f64::from(
+            button + if double { 4 } else { 0 },
+        ))];
         let top = self
             .topmost_at(x, y)
             .map(|d| display_api::display_value(&mut self.vm, d))
@@ -541,10 +546,14 @@ impl Player {
         let mouse = self.vm.mouse;
         if down {
             display_api::broadcast(&mut self.vm, mouse, "onMouseDown", &[b.clone(), top]);
-            self.clip_mouse_event("onMouseDown", clip_event::MOUSE_DOWN, &[]);
-            if let Some(h) = self.hover {
-                self.pressed = Some((h, button));
-                button_event(&mut self.vm, h, "onPress", &press_args);
+            // Native Flash button/clip events are left-only. Movies implement
+            // right/middle actions through the extended global Mouse listener.
+            if button == MOUSE_LEFT {
+                self.clip_mouse_event("onMouseDown", clip_event::MOUSE_DOWN, &[]);
+                if let Some(h) = self.hover {
+                    self.pressed = Some((h, button));
+                    button_event(&mut self.vm, h, "onPress", &press_args);
+                }
             }
             // A click outside the focused text field takes its focus away.
             let under = pick_in(
@@ -578,16 +587,20 @@ impl Player {
                 }
             }
             // Scaleform releases the button under the mouse before the mouse-up handlers.
-            if let Some((p, _)) = self.pressed.take() {
-                if self.hover == Some(p) {
-                    button_event(&mut self.vm, p, "onRelease", &press_args);
-                } else {
-                    button_event(&mut self.vm, p, "onReleaseOutside", &press_args);
+            if button == MOUSE_LEFT {
+                if let Some((p, _)) = self.pressed.take() {
+                    if self.hover == Some(p) {
+                        button_event(&mut self.vm, p, "onRelease", &press_args);
+                    } else {
+                        button_event(&mut self.vm, p, "onReleaseOutside", &press_args);
+                    }
                 }
             }
             self.run_queue();
             display_api::broadcast(&mut self.vm, mouse, "onMouseUp", &[b, top]);
-            self.clip_mouse_event("onMouseUp", clip_event::MOUSE_UP, &[]);
+            if button == MOUSE_LEFT {
+                self.clip_mouse_event("onMouseUp", clip_event::MOUSE_UP, &[]);
+            }
         }
         self.run_queue();
         self.vm.pick_dirty = true;
@@ -1845,6 +1858,7 @@ enum PickMode {
     Button,
     Any,
     Focus,
+    Entity,
 }
 
 fn pick_in(vm: &Vm, d: DisplayId, x: f32, y: f32, mode: PickMode) -> Option<DisplayId> {
@@ -1878,9 +1892,9 @@ fn pick_in(vm: &Vm, d: DisplayId, x: f32, y: f32, mode: PickMode) -> Option<Disp
             continue;
         }
         let is_clip = vm.display.get(*c).is_some_and(|co| co.clip().is_some());
-        if matches!(mode, PickMode::Focus) {
-            // Decorative geometry (including a widget's transparent hit area) must
-            // not intercept a field. Another interactive widget still blocks it.
+        if matches!(mode, PickMode::Focus | PickMode::Entity) {
+            // Focus and entity queries search deepest first and skip decorations.
+            // Only focus queries also consider editable/selectable text fields.
             if is_clip {
                 if let Some(h) = pick_in(vm, *c, x, y, mode) {
                     return Some(h);
@@ -1888,11 +1902,12 @@ fn pick_in(vm: &Vm, d: DisplayId, x: f32, y: f32, mode: PickMode) -> Option<Disp
                 if takes_mouse(vm, *c) && enabled(vm, *c) && hit_shape(vm, *c, x, y) {
                     return Some(*c);
                 }
-            } else if vm
-                .display
-                .get(*c)
-                .and_then(|o| o.text())
-                .is_some_and(|t| t.input || t.selectable)
+            } else if matches!(mode, PickMode::Focus)
+                && vm
+                    .display
+                    .get(*c)
+                    .and_then(|o| o.text())
+                    .is_some_and(|t| t.input || t.selectable)
                 && hit_shape(vm, *c, x, y)
             {
                 return Some(*c);
@@ -2104,6 +2119,21 @@ pub fn topmost(vm: &Vm) -> Option<DisplayId> {
         vm.root,
         (vm.mouse_pos.0 * 20.0) as f32,
         (vm.mouse_pos.1 * 20.0) as f32,
+    )
+}
+
+/// `Mouse.getTopMostEntity(false)` considers clips with mouse handlers; `true`
+/// includes noninteractive geometry and text fields as well.
+pub(crate) fn topmost_entity(vm: &Vm, test_all: bool) -> Option<DisplayId> {
+    if test_all {
+        return topmost(vm);
+    }
+    pick_in(
+        vm,
+        vm.root,
+        (vm.mouse_pos.0 * 20.0) as f32,
+        (vm.mouse_pos.1 * 20.0) as f32,
+        PickMode::Entity,
     )
 }
 
@@ -2557,6 +2587,45 @@ mod queue_tests {
     }
 
     #[test]
+    fn topmost_entity_test_all_skips_decorations_and_searches_nested_handlers() {
+        let (mut p, _) = input_player();
+        let root = p.vm.root;
+        let parent = create_empty(&mut p.vm, root, "widget", 10).unwrap();
+        let child = create_empty(&mut p.vm, parent, "button", 1).unwrap();
+        let overlay = create_empty(&mut p.vm, root, "decoration", 20).unwrap();
+        for clip in [parent, child, overlay] {
+            draw_pick_rect(&mut p.vm, clip, 100.0, 100.0);
+        }
+        let label = create_text(&mut p.vm, root, "label", 30, [0.0, 0.0, 100.0, 100.0]).unwrap();
+        let handler = p.vm.new_native(|_, _, _| Value::Undefined);
+        let parent_value = p.vm.display_object(parent);
+        let child_value = p.vm.display_object(child);
+        p.vm.set(&parent_value, "onRelease", Value::Object(handler));
+        p.vm.set(&child_value, "onRelease", Value::Object(handler));
+        p.mouse_move(20.0, 20.0);
+        let mouse = Value::Object(p.vm.mouse);
+        let hit =
+            p.vm.call_method(&mouse, "getTopMostEntity", &[Value::Bool(false)]);
+        assert_eq!(p.vm.display_of(&hit), Some(child));
+        let hit = p.vm.call_method(&mouse, "getTopMostEntity", &[]);
+        assert_eq!(p.vm.display_of(&hit), Some(label));
+        let hit =
+            p.vm.call_method(&mouse, "getTopMostEntity", &[Value::Bool(true)]);
+        assert_eq!(p.vm.display_of(&hit), Some(label));
+        p.vm.set(&child_value, "enabled", Value::Bool(false));
+        let hit =
+            p.vm.call_method(&mouse, "getTopMostEntity", &[Value::Bool(false)]);
+        assert_eq!(p.vm.display_of(&hit), Some(parent));
+        p.vm.set(&parent_value, "onRelease", Value::Undefined);
+        let hit =
+            p.vm.call_method(&mouse, "getTopMostEntity", &[Value::Bool(false)]);
+        assert_eq!(hit, Value::Undefined);
+        let hit =
+            p.vm.call_method(&mouse, "getTopMostEntity", &[Value::Bool(true)]);
+        assert_eq!(p.vm.display_of(&hit), Some(label));
+    }
+
+    #[test]
     fn topmost_picks_a_clips_own_drawing_in_world_space() {
         let (mut p, _) = input_player();
         let root = p.vm.root;
@@ -2576,7 +2645,8 @@ mod queue_tests {
         assert_eq!(p.topmost_at(50.0, 80.0), None);
         p.mouse_move(80.0, 80.0);
         let mouse = Value::Object(p.vm.mouse);
-        let hit = p.vm.call_method(&mouse, "getTopMostEntity", &[]);
+        let hit =
+            p.vm.call_method(&mouse, "getTopMostEntity", &[Value::Bool(true)]);
         assert_eq!(p.vm.display_of(&hit), Some(clip));
         // Transparent decorative fills remain entities, without acquiring button events
         // or blocking text focus just because the native entity query sees them.

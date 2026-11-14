@@ -114,6 +114,13 @@ The player lives in `crates/thedas-gfx`:
 - Every movie opened by `thedas-ui::Stage` uses `thedas-gfx` directly from its GFx bytes.
   There is no backend selector or fallback player.
 - Unknown opcodes, tags or built-ins are logged once per movie.
+- `Mouse.getTopMostEntity(false)` finds the deepest enabled clip with mouse
+  handlers, skipping decorative labels above picker buttons. `true` and the
+  existing no-argument behavior include noninteractive geometry and text fields.
+- Global Mouse down/up listeners receive the physical button (1/2/3), even on
+  double clicks. Native button/clip press/release events are left-only; DAO's
+  button handlers receive 5 for a double left click. The movie's extended global
+  listener implements right/middle actions without a second native delivery.
 - Compare hidden-window captures of the menu, chargen, HUD, inventory and conversation
   against the previous own-player build. Exercise the dwarf commoner and human noble
   chargen click-through as well as the simulation gates.
