@@ -673,7 +673,14 @@ impl AudioEngine {
         let listener = self.listener.position;
         self.instances
             .iter()
-            .filter(|i| !i.stopping && i.options.occludable)
+            // Conversation and narration voice-over is never occluded (the event set-up
+            // clears the flag for the `VOconversation` and `VOnarration` categories,
+            // 0x5bab98..0x5babbc).
+            .filter(|i| {
+                !i.stopping
+                    && i.options.occludable
+                    && !matches!(i.category.as_str(), "voconversation" | "vonarration")
+            })
             .filter_map(|i| {
                 let p = i.options.position?;
                 let ev = i.event().filter(|e| e.is_3d())?;

@@ -32,6 +32,9 @@ pub fn modal(targets: Vec<FocusTarget>) -> Vec<FocusTarget> {
     let targets: Vec<FocusTarget> = targets
         .into_iter()
         .filter(|t| !t.path.contains("DropArea") && !t.path.contains("DropTarget"))
+        // Nor a list's scrollbar (its track, thumb and arrows): the right stick scrolls a
+        // list, and in the store the scrollbar took the step meant for the items beside it.
+        .filter(|t| !t.path.contains(".Scrollbar_mc."))
         // Nor is the inventory's paperdoll (an unnamed clip of the stage, dragged to turn
         // the figure): it sat between the two columns of equipment slots and took the
         // step from one to the other.
@@ -99,10 +102,17 @@ pub const TAB_BAR: &str = "navbar.gfx";
 /// the first of all when it has nothing else.
 pub fn first_content(targets: &[FocusTarget]) -> Option<usize> {
     // A list of items (the inventory's, a store's) is what the screen is for: the focus
-    // starts on its first entry, not on the sort picker or the tabs above it.
-    let entries: Vec<usize> = (0..targets.len())
-        .filter(|&i| targets[i].path.contains(".ItemEntry"))
-        .collect();
+    // starts on its first entry, not on the sort picker or the tabs above it. An open
+    // container's list comes first: the inventory screen was opened to loot it.
+    let listed = |name: &str| -> Vec<usize> {
+        (0..targets.len())
+            .filter(|&i| targets[i].path.contains(name))
+            .collect()
+    };
+    let mut entries = listed(".ContainerItemEntry");
+    if entries.is_empty() {
+        entries = listed(".ItemEntry");
+    }
     if !entries.is_empty() {
         let picked: Vec<FocusTarget> = entries.iter().map(|&i| targets[i].clone()).collect();
         return first(&picked).map(|j| entries[j]);
@@ -371,6 +381,65 @@ mod tests {
         assert_eq!(under(&ts, (50.0, 50.0)), Some(1));
         assert_eq!(under(&ts, (10.0, 10.0)), Some(0));
         assert_eq!(under(&ts, (500.0, 10.0)), None);
+    }
+
+    #[test]
+    fn an_open_containers_list_takes_the_first_focus() {
+        let ts = vec![
+            t(
+                "_level0.InventoryContents_mc.Scrollable_mc.ItemEntry90.HitArea_mc",
+                670.0,
+                165.0,
+                320.0,
+                35.0,
+            ),
+            t(
+                "_level0.Container_mc.ScrollingItemWindow_mc.Scrollable_mc.ContainerItemEntry234.HitArea_mc",
+                250.0,
+                100.0,
+                320.0,
+                35.0,
+            ),
+            t(
+                "_level0.Container_mc.instance69.TakeAll_mc",
+                245.0,
+                560.0,
+                350.0,
+                25.0,
+            ),
+        ];
+        assert_eq!(first_content(&ts), Some(1));
+        assert_eq!(first_content(&ts[..1]), Some(0));
+    }
+
+    #[test]
+    fn a_lists_scrollbar_is_not_a_focus_target() {
+        let targets = vec![
+            t(
+                "_level0.StorePage_mc.StoreItemWindow_mc.Scrollbar_mc.Slider_mc.Thumb_mc.HitArea_mc",
+                600.0,
+                200.0,
+                10.0,
+                40.0,
+            ),
+            t(
+                "_level0.StorePage_mc.StoreItemWindow_mc.Scrollbar_mc.UpArrow_mc.HitArea_mc",
+                600.0,
+                180.0,
+                10.0,
+                10.0,
+            ),
+            t(
+                "_level0.StorePage_mc.StoreItemWindow_mc.Scrollable_mc.StoreItemEntry1.HitArea_mc",
+                300.0,
+                200.0,
+                280.0,
+                40.0,
+            ),
+        ];
+        let kept = modal(targets);
+        assert_eq!(kept.len(), 1);
+        assert!(kept[0].path.ends_with("StoreItemEntry1.HitArea_mc"));
     }
 
     #[test]

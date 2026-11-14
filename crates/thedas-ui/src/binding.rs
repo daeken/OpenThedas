@@ -84,6 +84,13 @@ pub struct Presentation {
     /// The inventory screen's item category tab (`GUIInventory.SetItemListFilter`, see
     /// [`ItemCategory`]); 0 shows every item.
     pub item_filter: i32,
+    /// The store screen's category tab (`GUIStore.SetItemListFilter`): 0 every item, 1 to 5
+    /// as [`ItemCategory`], [`STORE_BUYBACK`] what was traded at this store while it is
+    /// open (see [`Presentation::store_traded`]).
+    pub store_filter: i32,
+    /// What the party sold to the open store (`Store.SellItem`) and bought from it
+    /// (`Store.BuyItem`) since it opened, for its buy-back and sell-back tabs.
+    pub store_traded: StoreTrades,
     /// The current level's minimap, read from its resources.
     pub minimap: Option<crate::minimap::MinimapInfo>,
     /// Party members' portraits: the image the stage serves for each (by creature id).
@@ -180,6 +187,17 @@ pub struct SaveListing {
     /// The picture of the game taken when it was saved, as the name saveload.gfx loads
     /// (`FILE:<name>`); empty for a save without one (the movie shows its default).
     pub screenshot: String,
+}
+
+/// The store's buy-back and sell-back tabs' filter (store.gfx sends 7 for both).
+pub const STORE_BUYBACK: i32 = 7;
+
+/// The items traded at the open store, for its buy-back (what the party sold, on the store's
+/// side) and sell-back (what it bought, on the party's side) tabs.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StoreTrades {
+    pub sold: Vec<u32>,
+    pub bought: Vec<u32>,
 }
 
 /// The inventory screen's item category tabs (inventory.gfx's `CATEGORY_*`).
@@ -670,7 +688,7 @@ pub fn sim_values_for(sim: &Sim, shown: &Presentation) -> BTreeMap<String, UiVal
         .count();
     set("Area.CreatureCount".into(), num(creatures as f64));
     inventory(sim, controlled.or(hero), shown.item_filter, &mut v);
-    store(sim, &mut v);
+    store(sim, shown, &mut v);
     party_picker(sim, shown, &mut v);
     saves(sim, shown, &mut v);
     journal(sim, shown, &mut v);
@@ -1301,9 +1319,11 @@ fn item(sim: &Sim, prefix: &str, id: u32, v: &mut BTreeMap<String, UiValue>) {
 /// The open store, as store.gfx reads it: its name, its mark-up and mark-down (percent; the
 /// movie prices items from their `Cost` with them), its stock (`GUIStore.StoreView.N.Item`)
 /// and what the party could sell (`GUIStore.PartyBackpackView`, the backpack without plot
-/// items). Provisional: the lists' layout is taken from inventory.gfx's, which store.gfx
-/// shares.
-fn store(sim: &Sim, v: &mut BTreeMap<String, UiValue>) {
+/// items), both as the category tab picked shows them (`store_filter`: a category, or the
+/// buy-back tab's items traded here since the store opened). Provisional: the lists' layout
+/// is taken from inventory.gfx's, which store.gfx shares; what the buy-back tab holds once
+/// the store is closed and opened again is not kept.
+fn store(sim: &Sim, shown: &Presentation, v: &mut BTreeMap<String, UiValue>) {
     let Some(st) = sim.world.store.and_then(|s| sim.world.get(s)) else {
         return;
     };
@@ -1312,11 +1332,24 @@ fn store(sim: &Sim, v: &mut BTreeMap<String, UiValue>) {
     v.insert("Store.MarkUp".into(), num(field("MarkUp", 100)));
     v.insert("Store.MarkDown".into(), num(field("MarkDown", 100)));
     v.insert("Party.BackpackSort".into(), num(0));
-    let stock = st.inventory.clone();
+    let filter = shown.store_filter;
+    let shows = |item: u32, traded: &[u32]| match filter {
+        STORE_BUYBACK => traded.contains(&item),
+        f if f > 0 => item_category(sim, item) as i32 == f,
+        _ => true,
+    };
+    let trades = &shown.store_traded;
+    let stock: Vec<u32> = st
+        .inventory
+        .iter()
+        .copied()
+        .filter(|&i| shows(i, &trades.sold))
+        .collect();
     let sellable: Vec<u32> = sim
         .party_backpack()
         .into_iter()
         .filter(|&i| !sim.world.get(i).is_some_and(|o| o.plot))
+        .filter(|&i| shows(i, &trades.bought))
         .collect();
     for (view, items) in [("StoreView", &stock), ("PartyBackpackView", &sellable)] {
         let ids: Vec<String> = items.iter().map(|i| i.to_string()).collect();

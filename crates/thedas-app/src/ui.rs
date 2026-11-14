@@ -2033,6 +2033,11 @@ impl UiLayer {
                 Some(Screen::SpellsTalents) => 1,
                 _ => 0,
             };
+            // The store opens on its All tab, with nothing traded yet.
+            if !screens.shown().contains(&Screen::Store) {
+                shown.store_filter = 0;
+                shown.store_traded = Default::default();
+            }
         }
         let (want, line) = {
             let sim = sim.lock().unwrap_or_else(|p| p.into_inner());

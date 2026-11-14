@@ -52,6 +52,8 @@ fn the_workspace_beats_every_layer_and_rescans() {
     assert_eq!(p.layer, 2);
     assert_eq!(vfs.hits("a.dds").len(), 3);
     assert_eq!(vfs.lookup("a.dds").unwrap().layer_label, WORKSPACE_LABEL);
+    // Beneath it, the layers' own.
+    assert_eq!(vfs.read_beneath_workspace("a.dds").unwrap().0, b"mod");
     // A changed file is read afresh without a scan.
     std::fs::write(ws.join("sub").join("A.DDS"), b"live 2").unwrap();
     assert_eq!(vfs.read("a.dds").unwrap().0, b"live 2");

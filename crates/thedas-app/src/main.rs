@@ -58,6 +58,7 @@ mod cutcam;
 mod focusnav;
 mod follow;
 mod glb;
+mod glb_in;
 mod icon;
 mod intro;
 mod journal;
@@ -1903,10 +1904,34 @@ impl App {
         }
         let overrides = workspace::override_dir();
         let changes = workspace::changes(&workspace::blender_dir(), &overrides);
-        if changes.is_empty() {
+        let glbs = workspace::glb_changes(&workspace::blender_dir());
+        if changes.is_empty() && glbs.is_empty() {
             return None;
         }
-        let (done, failed) = workspace::apply(&changes, &overrides);
+        let (mut done, mut failed) = workspace::apply(&changes, &overrides);
+        // Saved meshes: read against the game's own files, not earlier live edits.
+        if !glbs.is_empty() {
+            let vfs = self.live.as_ref().map(|l| l.sim().vfs.clone());
+            let read = |name: &str| {
+                let (data, p) = vfs.as_ref()?.read_beneath_workspace(name).ok()?;
+                Some(glb::Read {
+                    data,
+                    layer: p.layer_label,
+                    entry: p.entry,
+                })
+            };
+            for g in &glbs {
+                match workspace::import_glb(g, &overrides, &read) {
+                    Ok((written, notes)) => {
+                        for n in notes {
+                            log::info!("live edits: {}: {n}", g.display());
+                        }
+                        done.extend(written);
+                    }
+                    Err(e) => failed.push(format!("{}: {e}", g.display())),
+                }
+            }
+        }
         for f in &failed {
             log::warn!("live edits: {f}");
         }
@@ -3107,8 +3132,16 @@ impl App {
             }
             // An issue report (see [`report`]): ours, not the original's.
             KeyCode::F8 => self.report(None, None),
-            // Escape closes the screen up, else opens the game menu over a game; the viewer
-            // closes. The start menu stays (its Exit quits).
+            // Escape closes a store, container, job board or world map the game put up by
+            // its own Close (as the pad's B), else the player's screen up, else opens the game
+            // menu over a game; the viewer closes. The start menu stays (its Exit quits).
+            // Provisional: the exe's Escape on the game's screens is not traced.
+            KeyCode::Escape if self.screens.as_ref().is_some_and(game_screen_up) => {
+                match padplay::press_back(self) {
+                    Some(path) => log::info!("escape: {path}"),
+                    None => log::info!("escape: no close button on this screen"),
+                }
+            }
             KeyCode::Escape => match self.screens.as_mut() {
                 None => return true,
                 Some(s) if s.menu.is_some() => s.menu = None,
@@ -5340,6 +5373,18 @@ fn set_client_option(ui: Option<&ui::UiLayer>, live: Option<&live::Live>, name: 
             },
         );
     }
+}
+
+/// Whether the screen up is one the game put up that the player leaves by its Close: a store,
+/// a container (the inventory screen the player did not open), the job board or the world map.
+fn game_screen_up(s: &screens::Screens) -> bool {
+    use screens::Screen;
+    !s.front_end
+        && s.shown().iter().any(|m| match m {
+            Screen::Store | Screen::Chanters | Screen::WorldMap => true,
+            Screen::Inventory => s.menu != Some(Screen::Inventory),
+            _ => false,
+        })
 }
 
 /// A `key` step's text-field key, by name.
