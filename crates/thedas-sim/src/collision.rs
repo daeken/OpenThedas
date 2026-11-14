@@ -417,6 +417,8 @@ pub struct Collision {
     /// collision was built without shapes.
     tags: Vec<u32>,
     shapes: Vec<ShapeInfo>,
+    /// Per shape, the box around its primitives (low, high corners).
+    shape_bounds: Vec<(V, V)>,
 }
 
 /// A shape's outline, for queries that ask how deep inside it a ray passes.
@@ -483,6 +485,7 @@ impl Collision {
             prims: Vec::new(),
             nodes: Vec::new(),
             tags: Vec::new(),
+            shape_bounds: vec![([f32::MAX; 3], [f32::MIN; 3]); shapes.len()],
             shapes,
         };
         if prims.is_empty() {
@@ -557,6 +560,15 @@ impl Collision {
             .collect();
         if tags.len() == order.len() {
             c.tags = order.iter().map(|&i| tags[i]).collect();
+            for (p, &t) in c.prims.iter().zip(&c.tags) {
+                if let Some(b) = c.shape_bounds.get_mut(t as usize) {
+                    let (lo, hi) = p.bounds();
+                    for k in 0..3 {
+                        b.0[k] = b.0[k].min(lo[k]);
+                        b.1[k] = b.1[k].max(hi[k]);
+                    }
+                }
+            }
         }
         items.clear();
         c
@@ -579,6 +591,13 @@ impl Collision {
                 })
                 .collect(),
         )
+    }
+
+    /// Whether `p` lies within `margin` of the box around shape `i`'s primitives.
+    pub fn shape_box_contains(&self, i: usize, p: V, margin: f32) -> bool {
+        self.shape_bounds.get(i).is_some_and(|(lo, hi)| {
+            (0..3).all(|k| p[k] >= lo[k] - margin && p[k] <= hi[k] + margin)
+        })
     }
 
     /// A shape a [`RayHit`] names.

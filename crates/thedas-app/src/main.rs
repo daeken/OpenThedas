@@ -1909,7 +1909,13 @@ impl App {
         if changes.is_empty() && glbs.is_empty() {
             return None;
         }
-        let (mut done, mut failed) = workspace::apply(&changes, &overrides);
+        // Each texture written in its original's format.
+        let stack = self.live.as_ref().map(|l| l.sim().vfs.clone());
+        let format_of = |name: &str| {
+            let (data, _) = stack.as_ref()?.read_beneath_workspace(name).ok()?;
+            Some(thedas_formats::dds::Dds::parse(&data).ok()?.format)
+        };
+        let (mut done, mut failed) = workspace::apply(&changes, &overrides, &format_of);
         // Objects moved in a saved file, moved in the world after the meshes.
         let mut moves = Vec::new();
         // Saved meshes: read against the game's own files, not earlier live edits.
@@ -1924,7 +1930,7 @@ impl App {
                 })
             };
             for g in &glbs {
-                match workspace::import_glb(g, &overrides, &read) {
+                match workspace::import_glb(g, &overrides, &read, &format_of) {
                     Ok(r) => {
                         for n in &r.notes {
                             log::info!("live edits: {}: {n}", g.display());
@@ -5019,12 +5025,18 @@ fn audio_state(
                 .collect();
         }
     }
-    // Between the party leader and the camera (`sound_settings.gda` "Camera / player
-    // listener balance position": 0.17 of the way to the camera).
+    // Between the party leader's head and the camera (`sound_settings.gda` "Camera /
+    // player listener balance position": 0.17 of the way to the camera). DAOrigins.exe's
+    // listener update (0x5d6610) takes the controlled creature's position raised 1.8 m
+    // (0xb004d8) and moves it towards the camera (0x5b6390); sound occlusion casts its rays
+    // from there (0x5b731c). Without a creature to follow, the camera itself.
     let cam = camera.position;
-    let feet = live.leader_feet().unwrap_or(cam);
+    let head = live
+        .leader_feet()
+        .map(|f| f + glam::Vec3::new(0.0, 0.0, 1.8))
+        .unwrap_or(cam);
     state.leader = live.leader_feet().map(|f| f.to_array());
-    let p = feet + (cam - feet) * 0.17;
+    let p = head + (cam - head) * 0.17;
     let right = [camera.yaw.sin(), -camera.yaw.cos(), 0.0];
     state.listener = Some((p.to_array(), right));
     state

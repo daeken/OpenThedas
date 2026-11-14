@@ -194,7 +194,8 @@ impl Occluders {
     /// 0x5b7362).
     ///
     /// Hits within [`AT_SOURCE`] of the sound are left out: they are the surface the sound
-    /// stands on (a footstep on the floor) or the thing that makes it (a door's own leaf).
+    /// stands on (a footstep on the floor) or the thing that makes it (a door's own leaf);
+    /// so is a placeable whose box holds the sound (it makes it).
     pub fn between(&self, from: V, to: V) -> f32 {
         let d = sub(to, from);
         let len = dot(d, d).sqrt();
@@ -207,7 +208,9 @@ impl Occluders {
         let mut crossed: Vec<(f32, Crossed)> = Vec::new();
         if let Some(c) = &self.placeables {
             for h in c.ray_hits(from, to) {
-                if !before_source(h.distance) {
+                // A placeable does not occlude a sound that comes from within it (a door's
+                // own opening sound, played at its centre): its box holds the sound.
+                if !before_source(h.distance) || c.shape_box_contains(h.shape, to, AT_SOURCE) {
                     continue;
                 }
                 let v = c

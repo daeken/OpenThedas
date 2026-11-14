@@ -508,6 +508,9 @@ pub enum ModelEdit {
     /// A mesh node's palette (the node drawing this chunk): the bone index each blend
     /// index of its vertices names.
     Palette { chunk: String, bones: Vec<u32> },
+    /// The material object (`.mao`, without the extension) a mesh node draws its chunk
+    /// with.
+    Material { chunk: String, material: String },
     /// A new skeleton node under `parent`, with bone index `bone`, at `transform` from its
     /// parent. Made like the model's other bone nodes (a copy of one, its animation
     /// exports left out: a new bone has no animation of its own and keeps its rest place).
@@ -556,6 +559,20 @@ pub fn rewrite(data: &[u8], edits: &[ModelEdit]) -> TypedResult<Vec<u8>> {
                 bone,
                 transform,
             } => add_bone(&mut gff, parent, name, *bone, transform)?,
+            ModelEdit::Material { chunk, material } => {
+                let id = find_node(&gff, |g, s| {
+                    Doc::new(g, "mmh mesh")
+                        .opt_str(s, field::MESH_CHUNK)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|c| c.eq_ignore_ascii_case(chunk))
+                })
+                .ok_or_else(|| invalid(format!("mmh: no mesh node draws {chunk}")))?;
+                match value_mut(&mut gff, id, field::MESH_MATERIAL) {
+                    Some(crate::gff4::Value::String(s)) => *s = Some(format!("{material}\0")),
+                    _ => return Err(invalid(format!("mmh: {chunk} names no material to set"))),
+                }
+            }
         }
     }
     Ok(gff.write()?)
