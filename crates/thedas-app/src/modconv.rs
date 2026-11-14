@@ -28,6 +28,10 @@ pub enum ConvAction {
     Refresh,
     /// Start the picked conversation between the leader and the chosen owner.
     Start,
+    /// Start it at this line instead (out of order: its condition not asked).
+    StartAt(usize),
+    /// Offer every creature here as its speaker, not only those whose conversation it is.
+    AnySpeaker,
     /// Set (or clear) a plot flag.
     SetFlag {
         plot: String,
@@ -183,6 +187,13 @@ impl Convs {
             {
                 actions.push(ConvAction::Start);
             }
+            if ui
+                .button("Any speaker")
+                .on_hover_text("Offer every creature here as the one speaking")
+                .clicked()
+            {
+                actions.push(ConvAction::AnySpeaker);
+            }
             if ui.button("Check again").clicked() {
                 actions.push(ConvAction::Refresh);
             }
@@ -259,7 +270,17 @@ fn line_row(ui: &mut egui::Ui, l: &NodeCondition, flips: &mut Vec<ConvAction>) {
         text = "(no text)".into();
     }
     let head = egui::RichText::new(format!("{mark} {kind} {}: {text}", l.node));
-    ui.label(if l.usable { head } else { head.weak() });
+    ui.horizontal(|ui| {
+        ui.label(if l.usable { head } else { head.weak() });
+        if !l.reply
+            && ui
+                .small_button("Start here")
+                .on_hover_text("Begin the conversation at this line, whatever its condition")
+                .clicked()
+        {
+            flips.push(ConvAction::StartAt(l.node));
+        }
+    });
     for r in &l.reads {
         ui.horizontal(|ui| {
             ui.add_space(24.0);
@@ -304,7 +325,20 @@ pub fn carry_out(sim: &mut Sim, convs: &mut Convs, a: ConvAction, selected: Opti
             refresh(sim, convs);
         }
         ConvAction::Refresh => refresh(sim, convs),
-        ConvAction::Start => {
+        ConvAction::AnySpeaker => {
+            let any = every_creature(sim);
+            for o in any {
+                if !convs.owners.iter().any(|x| x.0 == o.0) {
+                    convs.owners.push(o);
+                }
+            }
+            convs.status = format!("{} possible speakers", convs.owners.len());
+        }
+        ConvAction::Start | ConvAction::StartAt(_) => {
+            let start = match a {
+                ConvAction::StartAt(n) => Some(n),
+                _ => None,
+            };
             let Some(dialog) = convs.dialog.clone() else {
                 return;
             };
@@ -319,11 +353,13 @@ pub fn carry_out(sim: &mut Sim, convs: &mut Convs, a: ConvAction, selected: Opti
                     initiator,
                     target,
                     dialog: dialog.clone(),
+                    start,
                 },
             );
             convs.status = describe(&outcome);
+            let at = start.map_or(String::new(), |n| format!(" at line {n}"));
             convs.history.push(Edit {
-                text: format!("start {dialog}: {}", convs.status),
+                text: format!("start {dialog}{at}: {}", convs.status),
                 undo: Vec::new(),
             });
         }
@@ -451,6 +487,53 @@ pub fn set_local(sim: &mut Sim, target: ObjectId, name: &str, value: Option<Loca
     }
 }
 
+/// Sets a creature's property as mod mode's command, with what undoes it (the base and
+/// current it held, set back).
+pub fn set_property(
+    sim: &mut Sim,
+    target: ObjectId,
+    property: i32,
+    base: Option<f32>,
+    current: Option<f32>,
+) -> Edit {
+    let tag = sim
+        .world
+        .get(target)
+        .map_or_else(|| target.to_string(), |o| o.tag.clone());
+    let mut what = format!("{tag} property {property}");
+    if let Some(b) = base {
+        what.push_str(&format!(" base {b}"));
+    }
+    if let Some(c) = current {
+        what.push_str(&format!(" current {c}"));
+    }
+    let outcome = sim.apply(
+        CommandSource::ModMode,
+        SimCommand::SetProperty {
+            target,
+            property,
+            base,
+            current,
+        },
+    );
+    let undo = match &outcome {
+        CommandOutcome::PropertySet {
+            base: b,
+            current: c,
+        } => vec![SimCommand::SetProperty {
+            target,
+            property,
+            base: base.map(|_| *b),
+            current: current.map(|_| *c),
+        }],
+        _ => Vec::new(),
+    };
+    Edit {
+        text: format!("{what}: {}", describe(&outcome)),
+        undo,
+    }
+}
+
 /// Moves, makes or removes an object as mod mode's command (`what` says which, for the
 /// history), with what undoes it: a move moves it back, a made object is removed; a
 /// removal cannot be undone.
@@ -508,6 +591,7 @@ pub fn describe(o: &CommandOutcome) -> String {
             Some(v) => format!("was {}", show_value(v)),
             None => "was not set".into(),
         },
+        CommandOutcome::PropertySet { base, current } => format!("was {base} (current {current})"),
         CommandOutcome::ObjectMoved { from, .. } => {
             format!("moved from {:.2}, {:.2}, {:.2}", from[0], from[1], from[2])
         }
@@ -536,6 +620,26 @@ fn dialog_names(sim: &Sim) -> Vec<String> {
 
 /// Who could own conversation `dialog` here: the creatures and placeables in the current
 /// area whose own conversation it is (living ones first), then `selected`.
+/// Every active, living creature in the current area but the hero, by tag.
+fn every_creature(sim: &Sim) -> Vec<(ObjectId, String)> {
+    let w = &sim.world;
+    let mut v: Vec<(ObjectId, String)> = w
+        .objects
+        .values()
+        .filter(|o| {
+            o.area.is_some()
+                && o.area == w.area
+                && o.kind == ObjectKind::Creature
+                && o.active
+                && !o.dead
+                && Some(o.id) != w.hero
+        })
+        .map(|o| (o.id, o.tag.clone()))
+        .collect();
+    v.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
+    v
+}
+
 fn owners(sim: &Sim, dialog: &str, selected: Option<ObjectId>) -> Vec<(ObjectId, String)> {
     let w = &sim.world;
     let mut v: Vec<(bool, ObjectId, String)> = w

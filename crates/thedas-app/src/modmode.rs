@@ -118,6 +118,10 @@ impl Scrub {
 pub enum Action {
     /// File an issue report with this note.
     Report(String),
+    /// List the actions of this creature's animation tree (into [`ModMode::actions`]).
+    ListActions(ObjectId),
+    /// Hold this creature on this action of its animation tree, playing.
+    PlayAnimation { id: ObjectId, action: String },
     /// The conversation panel's request (see [`crate::modconv`]).
     Conv(crate::modconv::ConvAction),
     /// The world-state browser's request (see [`crate::modworld`]).
@@ -184,6 +188,12 @@ pub struct ModMode {
     spawn_creature: bool,
     /// What the last move, spawn or removal did.
     pub placed: Option<String>,
+    /// The inspected creature's animation actions (with their `.ani`), once listed.
+    pub actions_list: Option<(ObjectId, Vec<(String, String)>)>,
+    /// The action list's filter.
+    action_filter: String,
+    /// Frames marked for one report, each a note.
+    pub marks: Vec<String>,
     actions: Vec<Action>,
 }
 
@@ -222,6 +232,9 @@ impl ModMode {
             spawn_template: String::new(),
             spawn_creature: true,
             placed: None,
+            actions_list: None,
+            action_filter: String::new(),
+            marks: Vec::new(),
             actions: Vec::new(),
         }
     }
@@ -250,14 +263,35 @@ impl ModMode {
                     && key.physical_key == PhysicalKey::Code(KeyCode::Escape)
                     && (self.picking || self.scrub.is_some())
                 {
-                    self.picking = false;
+                    // Escape ends picking, else lets go of a held animation.
+                    if self.picking {
+                        self.picking = false;
+                    } else {
+                        self.scrub = None;
+                    }
                     return Routed::Swallowed;
                 }
                 if self.ctx.egui_wants_keyboard_input() {
-                    Routed::Swallowed
-                } else {
-                    Routed::Game
+                    return Routed::Swallowed;
                 }
+                // , and . step a held animation a frame back and on.
+                if let (Some(s), winit::keyboard::Key::Character(c)) =
+                    (self.scrub.as_mut(), &key.logical_key)
+                {
+                    let step = match c.as_str() {
+                        "," => -1,
+                        "." => 1,
+                        _ => 0,
+                    };
+                    if step != 0 {
+                        if key.state == ElementState::Pressed {
+                            s.seek(s.frame() as i64 + step);
+                            s.playing = false;
+                        }
+                        return Routed::Swallowed;
+                    }
+                }
+                Routed::Game
             }
             WindowEvent::CursorMoved { .. } => {
                 if self.ctx.is_pointer_over_egui() || self.pressed_in_overlay {
@@ -612,7 +646,59 @@ impl ModMode {
         true
     }
 
+    /// The creature's animations to play instead: listed on demand, filtered by name.
+    fn animation_list(&mut self, ui: &mut egui::Ui, o: &Inspected) {
+        egui::CollapsingHeader::new("Play another animation")
+            .id_salt("anims")
+            .show(ui, |ui| {
+                let listed = self.actions_list.as_ref().filter(|(id, _)| *id == o.id);
+                let Some((_, list)) = listed else {
+                    if ui.button("List its animations").clicked() {
+                        self.actions.push(Action::ListActions(o.id));
+                    }
+                    return;
+                };
+                ui.horizontal(|ui| {
+                    ui.label("Find");
+                    ui.text_edit_singleline(&mut self.action_filter);
+                });
+                let needle = self.action_filter.to_ascii_lowercase();
+                let mut chosen = None;
+                egui::ScrollArea::vertical()
+                    .id_salt("anim list")
+                    .max_height(160.0)
+                    .show(ui, |ui| {
+                        let shown = list.iter().filter(|(a, ani)| {
+                            needle.is_empty()
+                                || a.to_ascii_lowercase().contains(&needle)
+                                || ani.to_ascii_lowercase().contains(&needle)
+                        });
+                        for (a, ani) in shown.take(400) {
+                            if ui
+                                .selectable_label(false, format!("{a}  ({ani})"))
+                                .clicked()
+                            {
+                                chosen = Some(a.clone());
+                            }
+                        }
+                    });
+                if let Some(action) = chosen {
+                    self.actions
+                        .push(Action::PlayAnimation { id: o.id, action });
+                    self.scrub = Some(Scrub {
+                        id: o.id,
+                        time: 0.0,
+                        length: 1.0,
+                        playing: true,
+                        speed: 1.0,
+                        range: None,
+                    });
+                }
+            });
+    }
+
     fn scrubber(&mut self, ui: &mut egui::Ui, o: &Inspected) {
+        self.animation_list(ui, o);
         let Some(own) = o.animations.first().filter(|a| a.length > 0.0) else {
             return;
         };
@@ -678,12 +764,40 @@ impl ModMode {
             }
         });
         let mut let_go = false;
+        let note = frame_note(o, s);
         ui.horizontal(|ui| {
             if ui.button("Report this frame").clicked() {
-                self.actions.push(Action::Report(frame_note(o, s)));
+                self.actions.push(Action::Report(note.clone()));
+            }
+            if ui
+                .button("Mark frame")
+                .on_hover_text("Keep this frame for one report of all marked frames")
+                .clicked()
+                && !self.marks.contains(&note)
+            {
+                self.marks.push(note.clone());
             }
             let_go = ui.button("Let go").clicked();
         });
+        ui.weak(", and . step a frame");
+        if !self.marks.is_empty() {
+            ui.horizontal(|ui| {
+                if ui
+                    .button(format!("Report {} marked frames", self.marks.len()))
+                    .clicked()
+                {
+                    let all = std::mem::take(&mut self.marks);
+                    self.actions.push(Action::Report(format!(
+                        "{} marked animation frames:\n{}",
+                        all.len(),
+                        all.join("\n")
+                    )));
+                }
+                if ui.button("Clear marks").clicked() {
+                    self.marks.clear();
+                }
+            });
+        }
         if let_go {
             self.scrub = None;
         }

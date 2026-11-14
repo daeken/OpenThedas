@@ -62,6 +62,31 @@ pub struct Gear {
     /// For a placeable: its type, the row of `placeable_types.gda` (worksheet 93, the
     /// placeable's +0x4f0) that names its sounds.
     pub placeable: Option<i64>,
+    /// Its appearance's height (`apr_base.gda` `HEIGHT`, `HEIGHT_F` for a female; none:
+    /// [`DEFAULT_HEIGHT`]), which places its sound emitters (see [`emitter_heights`]).
+    pub height: Option<f32>,
+}
+
+/// A creature's height when its appearance gives none (`CAppearance`'s default, 0x748a51).
+pub const DEFAULT_HEIGHT: f32 = 1.8;
+
+/// How high above a creature's feet its two sound emitters sit (DAOrigins.exe 0x6aa5fd..
+/// 0x6aa6d4, run each frame): the body's (+0x870) at half its appearance's height
+/// (0x6a1a30 -> +0x64, times 0.5 at 0xae70f8), or 0.9 m (0xaf91d0) without an appearance;
+/// the head's (+0x8d0) at its model's node in slot 3 (0xa66b40), else where the body's is.
+/// Provisional: the head's is taken as the appearance's full height.
+pub fn emitter_heights(height: Option<f32>) -> (f32, f32) {
+    let h = height.unwrap_or(DEFAULT_HEIGHT);
+    (h * 0.5, h)
+}
+
+/// Whether an animation event kind sounds from the creature's head emitter rather than
+/// its body's: the play switch after the request queue (0x6b6497, table 0x6b6850, indexed
+/// by the kind less one) sends kinds 1, 3-7, 9, 10, 19 and 21 to the head (+0x8d0,
+/// 0x6b64ae); the rest, footsteps (14), foley (17) and vegetation among them, to the body
+/// (+0x870).
+pub fn sounds_from_head(kind: u32) -> bool {
+    matches!(kind, 1 | 3..=7 | 9 | 10 | 19 | 21)
 }
 
 /// A sound set's lines (`sse_<set>.gda`: row -> strref) and each type's number of them
@@ -447,12 +472,15 @@ const PAUSED_VOICES: [&str; 3] = ["VOambient", "VOconversation", "VOnarration"];
 ///   0x5bb7d6).
 /// - Death cues `death` (0xafed2c), character creation `chargen` (0xafed1c).
 /// - The interface, loading and the rest leave the track as it is.
+///
+/// A sound event can cue a track too ([`MusicDirector::cue`]): the cutscenes'
+/// `music/cutscene/*_switch` events.
 #[derive(Clone, Debug, PartialEq)]
 struct MusicDirector {
     mode: i32,
     track: &'static str,
-    /// A combat cue waiting: seconds left.
-    delayed: Option<f32>,
+    /// A cue waiting: seconds left and the track.
+    delayed: Option<(f32, &'static str)>,
 }
 
 impl MusicDirector {
@@ -471,7 +499,7 @@ impl MusicDirector {
             self.delayed = None;
             match mode {
                 GM_COMBAT if matches!(old, GM_GUI | GM_DIALOG | GM_CUTSCENE) => {
-                    self.delayed = Some(6.0)
+                    self.delayed = Some((6.0, "combat"))
                 }
                 GM_COMBAT => self.track = "combat",
                 GM_CUTSCENE if old == GM_DIALOG => {}
@@ -481,15 +509,44 @@ impl MusicDirector {
                 GM_CHARGEN => self.track = "chargen",
                 _ => {}
             }
-        } else if let Some(left) = self.delayed.as_mut() {
+        } else if let Some((left, track)) = self.delayed.as_mut() {
             *left -= dt;
             if *left <= 0.0 {
+                self.track = track;
                 self.delayed = None;
-                self.track = "combat";
             }
         }
         self.track
     }
+
+    /// A sound event's music cue (see `thedas_audio::MusicCue`), as the director takes it
+    /// when the event starts (0x5bac80 -> 0x5b70c0): with no delay the track is cued at
+    /// once; otherwise the cue waits like the deferred combat cue, replacing any waiting
+    /// one, until a game mode change drops it.
+    fn cue(&mut self, track: &'static str, delay: f32) {
+        if delay > 0.0 {
+            self.delayed = Some((delay, track));
+        } else {
+            self.track = track;
+        }
+    }
+}
+
+/// A `&'static str` for a music track name (the director's tracks are few: the theme's
+/// own and the cutscenes' cues), kept once each.
+fn intern_track(name: &str) -> &'static str {
+    static NAMES: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<&'static str>>> =
+        std::sync::OnceLock::new();
+    let mut names = NAMES
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(n) = names.get(name) {
+        return n;
+    }
+    let n: &'static str = Box::leak(name.to_string().into_boxed_str());
+    names.insert(n);
+    n
 }
 
 const GM_EXPLORE: i32 = 0;
@@ -1116,7 +1173,8 @@ impl GameAudio {
                     self.engine.play(
                         event,
                         PlayOptions {
-                            position: Some(*pos),
+                            // Rustles sound from the body emitter (0x6b42b3).
+                            position: Some([pos[0], pos[1], pos[2] + emitter_heights(g.height).0]),
                             ..Default::default()
                         },
                     );
@@ -1130,8 +1188,11 @@ impl GameAudio {
             rustled.insert(*id, (*pos, reach));
         }
         self.rustles = rustled;
-        for (id, ani, t, length, pos) in clocks {
+        for (id, ani, t, length, feet) in clocks {
             let key = ani.to_ascii_lowercase();
+            let (body_up, head_up) = emitter_heights(gear.get(&id).and_then(|g| g.height));
+            let body = [feet[0], feet[1], feet[2] + body_up];
+            let head = [feet[0], feet[1], feet[2] + head_up];
             let prev = self.anim_clocks.get(&id).cloned();
             seen.insert(id, (key.clone(), t));
             let events = match self.anim_events.get(&key) {
@@ -1230,8 +1291,9 @@ impl GameAudio {
                     // material, the column of the target's (by label, 0x5b6f60). Kind 7
                     // (0x6a5b00) does the same for the attack's target when the event says
                     // `|PlayHit` (0x69e720), whatever the result.
-                    // Provisional: placeable targets (table 93) are not sounded, and the
-                    // sound plays where the target stands.
+                    // It sounds from the striker's head emitter (kind - 1 = 0 and 6 go to
+                    // 0x6b64ae, +0x8d0), not where the target stands.
+                    // Provisional: placeable targets (table 93) are not sounded.
                     (1 | 7, text) => {
                         let g = gear.get(&id).copied().unwrap_or_default();
                         let left = text.as_deref().is_some_and(|t| t.contains("|Left"));
@@ -1250,7 +1312,7 @@ impl GameAudio {
                         } else {
                             None
                         };
-                        if let Some((struck, at)) = target {
+                        if let Some((struck, _)) = target {
                             let w = if left { g.off } else { g.main };
                             let weapon = self.impacts.material(w).or(g.unarmed);
                             let event = self.weapon_hits.as_ref().and_then(|t| {
@@ -1261,7 +1323,7 @@ impl GameAudio {
                                 self.engine.play(
                                     &e,
                                     PlayOptions {
-                                        position: Some(at),
+                                        position: Some(head),
                                         ..Default::default()
                                     },
                                 );
@@ -1292,7 +1354,7 @@ impl GameAudio {
                             self.engine.play(
                                 &e,
                                 PlayOptions {
-                                    position: Some(pos),
+                                    position: Some(body),
                                     ..Default::default()
                                 },
                             );
@@ -1337,10 +1399,18 @@ impl GameAudio {
                         prev.as_ref().map(|p| p.1),
                         ev.time
                     );
+                    // A placeable sounds where it stands; a creature from its emitter.
+                    let at = if ev.kind == 27 {
+                        feet
+                    } else if sounds_from_head(ev.kind as u32) {
+                        head
+                    } else {
+                        body
+                    };
                     self.engine.play(
                         &event,
                         PlayOptions {
-                            position: Some(pos),
+                            position: Some(at),
                             ..Default::default()
                         },
                     );
@@ -2147,13 +2217,22 @@ impl GameAudio {
         }
         let mode = game_mode(&state);
         self.follow_mode(mode);
+        // Music cues of events started last frame (cutscenes' switch events).
+        for cue in self.engine.take_music_cues() {
+            log::info!(
+                "audio: music cue {} from {} (in {} s)",
+                cue.track,
+                cue.event,
+                cue.delay
+            );
+            self.director.cue(intern_track(&cue.track), cue.delay);
+        }
         let (was, before) = (self.director.mode, self.director.track);
         let track = self.director.update(mode, dt);
         if mode != was || track != before {
-            let waiting = if self.director.delayed.is_some() {
-                " (combat cue in 6 s)"
-            } else {
-                ""
+            let waiting = match self.director.delayed {
+                Some((left, t)) => format!(" ({t} cue in {left:.1} s)"),
+                None => String::new(),
             };
             log::info!("audio: game mode {was} -> {mode}: music track {track}{waiting}");
         }
@@ -2347,6 +2426,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn footsteps_sound_from_the_body_and_swings_from_the_head() {
+        assert_eq!(emitter_heights(Some(1.6)), (0.8, 1.6));
+        assert_eq!(emitter_heights(None), (0.9, 1.8));
+        for kind in [1, 3, 4, 5, 6, 7, 9, 10, 19, 21] {
+            assert!(sounds_from_head(kind), "kind {kind}");
+        }
+        for kind in [2, 8, 11, 14, 17, 18, 20, 27] {
+            assert!(!sounds_from_head(kind), "kind {kind}");
+        }
+    }
+
+    #[test]
     fn music_changes_wait_for_the_next_marker() {
         let bars = [0.0, 4.0, 8.0, 12.0, 16.0, 40.0];
         // The next marker more than 0.4 s ahead.
@@ -2452,6 +2543,23 @@ mod tests {
         // Death and the rest: at once.
         assert!(music_cuts("main", "Death", GM_DEAD));
         assert!(music_cuts("Death", "main", GM_EXPLORE));
+    }
+
+    #[test]
+    fn a_sound_event_cues_a_track_at_once_or_after_its_delay() {
+        let mut d = MusicDirector::new();
+        d.update(GM_CUTSCENE, 0.1);
+        d.cue("pre400_ogre", 0.0);
+        assert_eq!(d.update(GM_CUTSCENE, 0.1), "pre400_ogre");
+        d.cue("tower", 1.0);
+        assert_eq!(d.update(GM_CUTSCENE, 0.5), "pre400_ogre");
+        assert_eq!(d.update(GM_CUTSCENE, 0.6), "tower");
+        // A mode change drops a waiting cue.
+        d.cue("other", 1.0);
+        assert_eq!(d.update(GM_EXPLORE, 0.1), "main");
+        assert_eq!(d.update(GM_EXPLORE, 2.0), "main");
+        assert_eq!(intern_track("pre400_ogre"), "pre400_ogre");
+        assert!(std::ptr::eq(intern_track("x1"), intern_track("x1")));
     }
 
     #[test]

@@ -55,8 +55,10 @@ mod control;
 mod cursor;
 mod cutactors;
 mod cutcam;
+mod faces;
 mod focusnav;
 mod follow;
+mod framestats;
 mod glb;
 mod glb_in;
 mod icon;
@@ -594,6 +596,9 @@ struct Gfx {
     renderer: Option<AreaRenderer>,
     ui: ui::UiLayer,
     reticle: reticle::ReticlePass,
+    /// The window's own title, before the frame-rate figures (see [`framestats`]).
+    title: String,
+    frames: framestats::FrameStats,
 }
 
 struct App {
@@ -1190,17 +1195,18 @@ const DOUBLE_CLICK_PIXELS: f64 = 6.0;
 
 impl App {
     fn init(&mut self, event_loop: &ActiveEventLoop) -> Result<()> {
+        let title = match &self.loaded.scene {
+            Some(s) => format!(
+                "OpenThedas - {} ({})",
+                s.name.as_deref().unwrap_or(""),
+                s.level
+            ),
+            None => "OpenThedas".to_string(),
+        };
         let window = Arc::new(
             event_loop.create_window(
                 Window::default_attributes()
-                    .with_title(match &self.loaded.scene {
-                        Some(s) => format!(
-                            "OpenThedas - {} ({})",
-                            s.name.as_deref().unwrap_or(""),
-                            s.level
-                        ),
-                        None => "OpenThedas".to_string(),
-                    })
+                    .with_title(title.clone())
                     .with_inner_size(LogicalSize::new(self.size.0, self.size.1))
                     .with_window_icon(icon::window_icon())
                     .with_visible(std::env::var_os("THEDAS_HIDDEN_WINDOW").is_none()),
@@ -1268,6 +1274,8 @@ impl App {
             renderer,
             ui,
             reticle,
+            title,
+            frames: framestats::FrameStats::default(),
         });
         Ok(())
     }
@@ -1454,6 +1462,14 @@ impl App {
     }
 
     fn redraw(&mut self) -> Result<()> {
+        if let Some(g) = self.gfx.as_mut() {
+            if let Some(stats) = g.frames.frame(Instant::now()) {
+                g.window.set_title(&format!("{} | {stats}", g.title));
+                if g.frames.log_due() {
+                    log::info!("frame rate: {stats}");
+                }
+            }
+        }
         self.audio_frame();
         if self.intro.is_some() {
             return self.intro_frame();
@@ -2049,6 +2065,25 @@ impl App {
         for a in actions {
             match a {
                 modmode::Action::Report(note) => self.report(Some(note), None),
+                modmode::Action::ListActions(id) => {
+                    let list = self
+                        .live
+                        .as_mut()
+                        .map(|l| l.creature_actions(id))
+                        .unwrap_or_default();
+                    if let Some(m) = self.mod_mode.as_mut() {
+                        m.actions_list = Some((id, list));
+                    }
+                }
+                modmode::Action::PlayAnimation { id, action } => {
+                    let played = self
+                        .live
+                        .as_mut()
+                        .is_some_and(|l| l.play_action(id, &action));
+                    if !played && let Some(m) = self.mod_mode.as_mut() {
+                        m.scrub = None;
+                    }
+                }
                 modmode::Action::Conv(a) => self.mod_mode_conv(a),
                 modmode::Action::World(a) => self.mod_mode_world(a),
                 modmode::Action::Fly(on) => self.set_fly(on),
@@ -3971,6 +4006,80 @@ impl App {
                     None => "modspawn: the view meets no ground".into(),
                 });
             }
+            Step::ModAnims => {
+                let id = self.mod_mode.as_ref().and_then(|m| m.selected);
+                log.push(match (id, self.live.as_mut()) {
+                    (Some(id), Some(l)) => {
+                        let list = l.creature_actions(id);
+                        let first: Vec<&str> = list.iter().take(5).map(|a| a.0.as_str()).collect();
+                        format!("modanims: {} actions ({} …)", list.len(), first.join(", "))
+                    }
+                    _ => "modanims: nothing inspected".into(),
+                });
+            }
+            Step::ModAnim(action) => {
+                let id = self.mod_mode.as_ref().and_then(|m| m.selected);
+                let played = match (id, self.live.as_mut()) {
+                    (Some(id), Some(l)) => l.play_action(id, action).then_some(id),
+                    _ => None,
+                };
+                if let (Some(id), Some(m)) = (played, self.mod_mode.as_mut()) {
+                    m.scrub = Some(modmode::Scrub {
+                        id,
+                        time: 0.0,
+                        length: 1.0,
+                        playing: true,
+                        speed: 1.0,
+                        range: None,
+                    });
+                }
+                log.push(format!(
+                    "modanim {action}: {}",
+                    if played.is_some() {
+                        "playing"
+                    } else {
+                        "not drawn with a tree"
+                    }
+                ));
+            }
+            &Step::ModConvAt(n) => log.push(self.mod_mode_command(modconv::ConvAction::StartAt(n))),
+            Step::ModStat(name, current, value) => {
+                let id = self.mod_mode.as_ref().and_then(|m| m.selected);
+                let found = match (id, self.live.as_ref()) {
+                    (Some(id), Some(l)) => {
+                        let sim = l.sim();
+                        modworld::creature_stats(&sim, id).and_then(|st| {
+                            st.stats
+                                .iter()
+                                .find(|s| {
+                                    s.name.eq_ignore_ascii_case(name) || s.id.to_string() == *name
+                                })
+                                .map(|s| (id, s.id))
+                        })
+                    }
+                    _ => None,
+                };
+                log.push(match found {
+                    Some((id, p)) => {
+                        let (base, cur) = if *current {
+                            (None, Some(*value))
+                        } else {
+                            (Some(*value), None)
+                        };
+                        self.mod_mode_world(modworld::WorldAction::SetStat {
+                            target: id,
+                            property: p,
+                            base,
+                            current: cur,
+                        });
+                        self.mod_mode
+                            .as_ref()
+                            .map(|m| m.convs.status.clone())
+                            .unwrap_or_default()
+                    }
+                    None => format!("modstat: no property {name} on the inspected creature"),
+                });
+            }
             Step::ModRemove => log.push(match self.mod_mode.as_ref().and_then(|m| m.selected) {
                 Some(id) => self.mod_mode_place(
                     thedas_sim::commands::SimCommand::DestroyObject { target: id },
@@ -4929,6 +5038,7 @@ fn audio_state(
                         }),
                     placeable: (o.kind == thedas_sim::world::ObjectKind::Placeable)
                         .then_some(o.appearance as i64),
+                    height: Some(live::appearance_height(&sim, *id)),
                 },
             );
         }
@@ -5526,6 +5636,15 @@ enum Step {
     ModSpawn(bool, String),
     /// The inspected object is removed (`modremove`).
     ModRemove,
+    /// The inspected creature's animation actions are listed (`modanims`).
+    ModAnims,
+    /// The inspected creature plays this action of its tree, held (`modanim ACTION`).
+    ModAnim(String),
+    /// The picked conversation starts at this line (`modconvat N`).
+    ModConvAt(usize),
+    /// The inspected creature's property (by its `PROPERTY_*` name or id) set: its base or
+    /// current value (`modstat STRENGTH base 30`).
+    ModStat(String, bool, f32),
     /// A variable set from the world-state browser (`modlocal WHO NAME TYPE VALUE`, WHO
     /// `module`, `area` or an object's tag; TYPE `int`, `float`, `string`, `object` or
     /// `resource`, or `remove` with no value).
@@ -5953,6 +6072,22 @@ fn parse_step(s: &str) -> Result<Step> {
             _ => bail!("modspawn takes creature|placeable TEMPLATE"),
         },
         "modremove" => Step::ModRemove,
+        "modanims" => Step::ModAnims,
+        "modanim" if !arg.is_empty() => Step::ModAnim(arg.to_string()),
+        "modconvat" => Step::ModConvAt(arg.parse().context("modconvat takes a line number")?),
+        "modstat" => {
+            let mut w = arg.split_whitespace();
+            let (Some(name), Some(which), Some(v), None) = (w.next(), w.next(), w.next(), w.next())
+            else {
+                bail!("modstat takes NAME base|current VALUE");
+            };
+            let current = match which {
+                "base" => false,
+                "current" => true,
+                _ => bail!("modstat sets base or current"),
+            };
+            Step::ModStat(name.into(), current, v.parse().context("modstat's value")?)
+        }
         "modlocal" => {
             let mut w = arg.splitn(4, ' ');
             let (Some(who), Some(name), Some(kind)) = (w.next(), w.next(), w.next()) else {
@@ -6035,6 +6170,7 @@ fn main() -> Result<()> {
         env_logger::Env::default().default_filter_or("info,wgpu=warn,naga=warn"),
     ));
     let mut args = Args::parse();
+    faces::set_language(&args.language);
     // A client's or a test's run sends and fetches nothing (see `upload::online`).
     if args.control.is_some() || std::env::var_os("THEDAS_HIDDEN_WINDOW").is_some() {
         upload::set_automated();
@@ -6305,6 +6441,10 @@ fn main() -> Result<()> {
                     | Step::ModMoveView
                     | Step::ModSpawn(..)
                     | Step::ModRemove
+                    | Step::ModAnims
+                    | Step::ModAnim(_)
+                    | Step::ModConvAt(_)
+                    | Step::ModStat(..)
                     | Step::ModLocal(..) => {
                         println!("mod mode: windowed only")
                     }

@@ -287,6 +287,10 @@ pub struct Live {
     /// The creatures' head trackers, and the shaders' clock when they were last advanced.
     looks: crate::looks::Looks,
     looks_clock: Option<f64>,
+    /// The speaker's lip sync (see [`crate::faces`]).
+    faces: crate::faces::Faces,
+    /// The campaign's module (`single player`), for the lip sync's archives.
+    module: String,
     /// The shaders' clock (`ApplicationTime`), in seconds: real time, running while the
     /// world is stopped too.
     pub shader_time: f64,
@@ -301,7 +305,9 @@ pub struct Live {
     /// The stage camera last shown and its preset, the move to a new preset under way (the
     /// camera it left, when it left on the presentation clock), and that clock (ms).
     stage_shown: Option<(i32, thedas_render::Camera)>,
-    stage_blend: Option<(thedas_render::Camera, f64)>,
+    /// A move between presets: where the camera is, how long it has moved (ms) and the
+    /// stage clock when it last stepped.
+    stage_blend: Option<(thedas_render::Camera, f64, f64)>,
     stage_clock_ms: f64,
     /// The playing cutscene's movies (see [`crate::intro::CutsceneMovies`]).
     cutscene_movies: crate::intro::CutsceneMovies,
@@ -645,6 +651,7 @@ impl Live {
             front_end: matches!(start, Start::Menu),
             paused: false,
             install: install.to_path_buf(),
+            module: module.to_string(),
             shaders: shaders.to_string(),
             level: None,
             objects: None,
@@ -686,6 +693,7 @@ impl Live {
             cut_light_model: None,
             looks: Default::default(),
             looks_clock: None,
+            faces: Default::default(),
             shader_time: 0.0,
             stage: None,
             staged: None,
@@ -1262,7 +1270,7 @@ fn body_models(scene: &AreaScene, prop: usize, own: &[String]) -> Vec<String> {
 
 /// A creature's height from its appearance (see [`Live::creature_height`]), with the
 /// simulation already in hand.
-fn appearance_height(sim: &Sim, id: ObjectId) -> f32 {
+pub(crate) fn appearance_height(sim: &Sim, id: ObjectId) -> f32 {
     {
         let w = &sim.world;
         let height = w.get(id).and_then(|o| {
@@ -1427,17 +1435,16 @@ impl Live {
         if let Some((p, shown)) = self.stage_shown
             && p != preset
         {
-            self.stage_blend = Some((shown, self.stage_clock_ms));
+            self.stage_blend = Some((shown, 0.0, self.stage_clock_ms));
         }
+        // Each frame the camera moves from where it is toward the preset by the share of
+        // the blend time gone so far (see `crate::chargen_stage::BLEND_MS`).
         let c = match self.stage_blend {
-            Some((from, start)) => {
-                let t = (self.stage_clock_ms - start) / crate::chargen_stage::BLEND_MS;
-                if t >= 1.0 {
-                    self.stage_blend = None;
-                    target
-                } else {
-                    crate::chargen_stage::blend(&from, &target, t.max(0.0) as f32)
-                }
+            Some((at, gone, last)) => {
+                let dt = self.stage_clock_ms - last;
+                let (now, gone) = crate::chargen_stage::step(&at, &target, gone, dt);
+                self.stage_blend = gone.map(|g| (now, g, self.stage_clock_ms));
+                now
             }
             None => target,
         };
@@ -1552,6 +1559,49 @@ impl Live {
             self.frozen = None;
         }
         self.scrub = scrub;
+    }
+
+    /// The actions creature `id`'s animation tree plays (each with its `.ani`), for mod
+    /// mode's animation list.
+    pub fn creature_actions(&mut self, id: ObjectId) -> Vec<(String, String)> {
+        let (Some(level), Some(tree)) = (
+            self.level.as_ref(),
+            self.posed
+                .iter()
+                .find(|p| p.0 == id)
+                .and_then(|p| p.2.as_ref())
+                .and_then(|c| c.trees.first().cloned()),
+        ) else {
+            return Vec::new();
+        };
+        self.animator.actions(&level.vfs, &tree)
+    }
+
+    /// Mod mode's scrubber holds creature `id` on action `action` of its own animation tree
+    /// from its start (drawing only). False when it is not drawn with a tree.
+    pub fn play_action(&mut self, id: ObjectId, action: &str) -> bool {
+        let Some(trees) = self
+            .posed
+            .iter()
+            .find(|p| p.0 == id)
+            .and_then(|p| p.2.as_ref())
+            .map(|c| c.trees.clone())
+            .filter(|t| !t.is_empty())
+        else {
+            return false;
+        };
+        self.frozen = Some((
+            id,
+            Clip {
+                trees,
+                actions: vec![action.to_string()],
+                time: 0.0,
+                looping: true,
+                ..Default::default()
+            },
+        ));
+        self.scrub = Some((id, 0.0));
+        true
     }
 
     /// What mod mode's inspector shows of object `id`: what it is, and what it was animating
@@ -1757,6 +1807,16 @@ impl Live {
             && sim.world.chargen.is_none()
             && sim.conversation_line().is_none();
         let hero = sim.world.controlled().or(sim.world.hero);
+        // The voiced conversation line's speaker, for its lip sync.
+        let spoken = crate::talkcam::line_speaker_and_listener(&sim)
+            .zip(crate::voice_line(&sim))
+            .filter(|(_, l)| !l.ambient)
+            .map(|((speaker, _), l)| crate::faces::SpokenLine {
+                speaker,
+                dialog: l.dialog,
+                strref: l.strref,
+                female: l.female,
+            });
         let glancers: Vec<ObjectId> = match (exploring, hero, self.looks.glance_reach()) {
             (true, Some(hero), Some(_)) => models
                 .iter()
@@ -1775,6 +1835,8 @@ impl Live {
             .looks_clock
             .map_or(0.0, |was| (self.shader_time - was).clamp(0.0, 0.25) as f32);
         self.looks_clock = Some(self.shader_time);
+        self.faces
+            .step(&self.install, &self.module, spoken, look_dt);
         // A cutscene's actors look where its head tracking actions say; the others as the
         // conversation has them.
         let mut wants: Vec<(ObjectId, Option<ObjectId>, f32)> = pairs
@@ -1926,6 +1988,14 @@ impl Live {
                         .is_some()
                 });
                 c.layers.extend(layers);
+            }
+            // Lip sync: the speaker's face, over everything else.
+            if let Some(c) = c.as_mut()
+                && let Some(face) =
+                    self.faces
+                        .layer(&level.vfs, m.id, m.morph.iter().chain(&m.models))
+            {
+                c.layers.push(face);
             }
             if let Some((held, t)) = self.scrub
                 && held == m.id
@@ -2970,11 +3040,12 @@ impl Live {
     }
 
     /// Each party member's portrait: its head drawn from the camera `portraits.gda` gives it
-    /// (by tag, else the `default` row), `size` pixels square, RGBA8. Members not drawn are
-    /// left out. Provisional: the camera orbits the face by `CameraRotation` (degrees about
-    /// the facing) and `CameraPitch`, `CameraDistance` away, looking at the eyes (or head)
-    /// mesh, else 0.25 m below the top of the member's drawn bounds; other columns are
-    /// unused.
+    /// (by tag, else the `default` row; the hero's from character creation's Portrait
+    /// sliders: [`Sim::portrait`]), `size` pixels square, RGBA8. Members not drawn are left
+    /// out. Provisional: the camera orbits the face by its turn (degrees about the facing)
+    /// and pitch, its distance away, looking at the eyes (or head) mesh, else 0.25 m below
+    /// the top of the member's drawn bounds, then moves along its right and up; the
+    /// background and light columns are unused.
     pub fn portraits(&mut self, ctx: &GpuContext, size: u32) -> Vec<(ObjectId, Vec<u8>)> {
         let staged = self.staged;
         let (Some(objects), Some(level)) = (self.objects.as_mut(), self.level.as_ref()) else {
@@ -3004,23 +3075,6 @@ impl Live {
         };
         let shared = self.sim.clone();
         let sim = shared.lock().unwrap_or_else(|p| p.into_inner());
-        let tables = sim.world.tables();
-        let table = tables.get(0, "portraits");
-        let row = |tag: &str| {
-            let t = table.as_ref()?;
-            t.order.iter().copied().find(|&r| {
-                matches!(t.cell("Tag", r), Some(thedas_formats::gda::Cell::String(s))
-                    if s.trim_end_matches('\0').trim().eq_ignore_ascii_case(tag))
-            })
-        };
-        let num = |r: Option<i64>, c: &str, d: f32| {
-            let t = table.as_ref();
-            match r.and_then(|r| t?.cell(c, r).cloned()) {
-                Some(thedas_formats::gda::Cell::Float(v)) => v as f32,
-                Some(thedas_formats::gda::Cell::Int(v)) => v as f32,
-                _ => d,
-            }
-        };
         let mut out = Vec::new();
         for id in portrait_subjects(&sim) {
             let Some(o) = sim.world.get(id) else { continue };
@@ -3031,10 +3085,11 @@ impl Live {
                 continue;
             };
             let face = objects.faces.get(&id).copied();
-            let r = row(&o.tag).or_else(|| row("default"));
-            let rotation = num(r, "CameraRotation", 0.0).to_radians();
-            let pitch = num(r, "CameraPitch", 0.0).to_radians();
-            let distance = num(r, "CameraDistance", 0.7).max(0.2);
+            // portraits.gda's framing, with the face screen's Portrait choices over it.
+            let framing = sim.portrait(id);
+            let rotation = framing.turn.to_radians();
+            let pitch = framing.pitch.to_radians();
+            let distance = framing.distance.max(0.2);
             // On character creation's stage the creature stands at the stage's mark.
             let on_stage = staged.filter(|s| s.0 == id);
             let (position, facing) = on_stage.map_or((o.position, o.facing), |s| (s.1, s.2));
@@ -3060,6 +3115,10 @@ impl Live {
                     pitch.sin(),
                 ) * distance;
             let to = head - eye;
+            // Moved along its own right and up (the Move sliders), still looking the same way.
+            let right = to.cross(glam::Vec3::Z).normalize_or_zero();
+            let up = right.cross(to).normalize_or_zero();
+            let eye = eye + right * framing.shift.0 + up * framing.shift.1;
             let mut camera = thedas_render::Camera::new(
                 eye,
                 to.y.atan2(to.x),
@@ -3309,8 +3368,18 @@ pub fn prop(m: &ObjectModel) -> Prop {
 
 /// A creature's motion as an animation clip.
 /// A cutscene animation as a layer over a creature's own motion (whose trees are `trees`):
-/// it loops when those trees loop its animation, else when its track spans the whole
-/// cutscene (see [`crate::cutactors`]).
+/// it loops when those trees loop its animation; when they do not have it as a plain
+/// animation (`humanoid.anb` plays `mov.walkf.ani` only inside its movement blends), when
+/// the cutscene's own tree loops its node (field 4027; a `.cub` has 0, loop, throughout),
+/// or its track spans the whole cutscene (see [`crate::cutactors`]). A passer-by whose
+/// track plays a walk cycle for ten seconds while a position track moves it so keeps
+/// walking, where it stood frozen in the cycle's last frame and slid.
+///
+/// Provisional: the executable sets a track's animation to the track's time each frame
+/// (0x7db400 through 0x7ce1b0, a virtual call on the creature's animation), and what that
+/// call does with a time past the animation's end is not traced. That the time wraps is
+/// inferred from 0x7db400 holding the time 0.001 s (0xae7118) short of the track's end,
+/// which only matters to a player that wraps, and from the trees' loop flag.
 fn cut_layer(
     animator: &mut Animator,
     vfs: &Vfs,
@@ -3319,7 +3388,12 @@ fn cut_layer(
 ) -> Clip {
     let once = animator
         .action_animation(vfs, &a.tree, &a.node)
-        .and_then(|ani| animator.plays_once(vfs, trees, &ani));
+        .and_then(|ani| animator.plays_once(vfs, trees, &ani))
+        .or_else(|| {
+            animator
+                .action_once(vfs, &a.tree, &a.node)
+                .map(|once| once && !a.unbounded)
+        });
     Clip {
         trees: vec![a.tree.clone()],
         actions: vec![a.node.clone()],

@@ -1041,6 +1041,23 @@ pub fn call(
                 handle: Some(hd),
             })
         }
+        // DAOrigins.exe 0x65b0d0: the location moved to a safe spot by the safe-location
+        // search (see [`Sim::safe_location`]); an invalid location comes back as it is.
+        "GetSafeLocation" => {
+            let l = match h.sim.world.handle(handle(a, 0)) {
+                Some(EngineData::Location(l)) => h.sim.safe_location(*l),
+                _ => Location {
+                    area: OBJECT_INVALID,
+                    position: [0.0; 3],
+                    facing: 0.0,
+                },
+            };
+            let hd = h.sim.world.store(EngineData::Location(l));
+            ok(Value::Engine {
+                ty: ty.location,
+                handle: Some(hd),
+            })
+        }
         "GetPositionFromLocation"
         | "GetAreaFromLocation"
         | "GetFacingFromLocation"
@@ -1124,6 +1141,17 @@ pub fn call(
                 })
                 .unwrap_or(0),
         )),
+        // DAOrigins.exe 0x66be50 (function 813): the creature's answer to a restriction
+        // script's question (+0xc70), read by [`Sim::can_use_item`].
+        "SetCanUseItem" => {
+            h.sim.can_use_answers.insert(obj(a, 0), int(a, 1));
+            void()
+        }
+        // DAOrigins.exe 0x665710: 0x6ae8b0 on the creature and item ([`Sim::can_use_item`]).
+        "CanUseItem" => {
+            let ok_ = h.sim.can_use_item(obj(a, 0), obj(a, 1));
+            ok(Value::Int(ok_ as i32))
+        }
         "SetLocalInt" => {
             let k = local_name(h.sim, obj(a, 0), a, 1);
             if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
@@ -1386,6 +1414,21 @@ pub fn call(
                 _ => Value::Resource(cell_string(c)),
             })
         }
+        // Dragon Age II: a number from ability `a[2]`'s row of the abilities table (M2DA 1,
+        // `ABI_*`), in the column whose name hashes to `a[1]`, for creature `a[0]`.
+        // Provisional: DA2's script.ldf declares it; how an upgrade the creature has to the
+        // ability changes the number is not traced, so the ability's own row answers.
+        "GetUpgradableAbilityHashedM2DAInt" | "GetUpgradableAbilityHashedM2DAFloat" => {
+            let table = h.sim.world.tables.get(1, "");
+            let c = table
+                .as_ref()
+                .and_then(|t| t.cell_by_hash(int(a, 1) as u32, int(a, 2) as i64));
+            ok(if name.ends_with("Float") {
+                Value::Float(cell_float(c))
+            } else {
+                Value::Int(cell_int(c))
+            })
+        }
         "GetM2DARows" => ok(Value::Int(
             h.sim
                 .world
@@ -1482,87 +1525,9 @@ pub fn call(
         "SetCreatureProperty" | "UpdateCreatureProperty" => {
             let (id, p, value, vt) = (obj(a, 0), int(a, 1), float(a, 2), int(a, 3));
             let update = name == "UpdateCreatureProperty";
-            let base_type = constant(&h.sim.table, "PROPERTY_VALUE_BASE");
-            let total_type = constant(&h.sim.table, "PROPERTY_VALUE_TOTAL");
-            let current = constant(&h.sim.table, "PROPERTY_VALUE_CURRENT");
-            let modifier = constant(&h.sim.table, "PROPERTY_VALUE_MODIFIER");
-            let kind = property_kind(h.sim, p);
-            // Health before, to record what a hit takes.
-            let health = constant(&h.sim.table, "PROPERTY_DEPLETABLE_HEALTH");
-            let health_before = (p == health && vt == current)
-                .then(|| {
-                    h.object(id)
-                        .filter(|o| !o.dead)
-                        .and_then(|o| o.properties.get(&health))
-                        .map(|v| v.1)
-                })
-                .flatten();
-            // The hero's experience before, for followers waiting in the pool.
-            let xp = constant(&h.sim.table, "PROPERTY_SIMPLE_EXPERIENCE");
-            let hero_xp_before = (p == xp && Some(id) == h.sim.world.hero).then(|| {
-                h.object(id)
-                    .and_then(|o| o.properties.get(&xp))
-                    .map_or(0.0, |v| v.0)
-            });
-            if (vt == base_type || vt == total_type) && !update {
-                if let Some(o) = h.sim.world.get_mut(id) {
-                    o.properties.entry(p).or_insert((0.0, 0.0)).0 = value;
-                }
-            } else if vt == current && kind == PropertyKind::Depletable {
-                let max = h.sim.property_total(id, p);
-                if let Some(o) = h.sim.world.get_mut(id) {
-                    let e = o.properties.entry(p).or_insert((0.0, 0.0));
-                    let v = if update { e.1 + value } else { value };
-                    e.1 = v.clamp(0.0, max.max(0.0));
-                }
-            } else if vt == modifier && kind != PropertyKind::Simple {
-                let gear = h.sim.equipment_bonus(id, p);
-                if let Some(o) = h.sim.world.get_mut(id) {
-                    let m = o.modifiers.entry(p).or_insert(0.0);
-                    *m = if update { *m + value } else { value - gear };
-                }
-            }
-            if kind == PropertyKind::Depletable && vt != current {
-                h.sim.clamp_current(id, p);
-            }
-            // Scripts bring the dead back by giving them health (module_core's
-            // HandleEvent_Resurrection applies no effect). Provisional.
-            if let Some(o) = h.sim.world.get_mut(id) {
-                if p == health
-                    && vt == current
-                    && o.dead
-                    && o.properties.get(&health).is_some_and(|v| v.1 > 0.0)
-                {
-                    o.dead = false;
-                    o.died_at = None;
-                    // One placed dead is no longer (DAOrigins.exe 0x6bc5fb-0x6bc631: health
-                    // rising above 0 sets a CREATURE_SPAWN_DEAD of 1 to 0).
-                    if let Some(v) = o.locals.ints.get_mut("CREATURE_SPAWN_DEAD")
-                        && *v == 1
-                    {
-                        *v = 0;
-                    }
-                }
-            }
-            if let Some(before) = health_before {
-                let after = h
-                    .object(obj(a, 0))
-                    .and_then(|o| o.properties.get(&health))
-                    .map_or(before, |v| v.1);
-                h.sim
-                    .record_health_loss(caller, obj(a, 0), before - after.max(0.0));
-            }
-            if let Some(before) = hero_xp_before {
-                let after = h
-                    .object(obj(a, 0))
-                    .and_then(|o| o.properties.get(&xp))
-                    .map_or(0.0, |v| v.0);
-                if after > before {
-                    let by = h.script.clone();
-                    *h.sim.world.trace.hero_xp.entry(by).or_default() += (after - before) as u64;
-                }
-                h.sim.share_pool_xp(after - before);
-            }
+            let by = h.script.clone();
+            h.sim
+                .set_creature_property(caller, by, id, p, value, vt, update);
             void()
         }
 
@@ -4186,6 +4151,12 @@ pub fn call(
         "max" => ok(Value::Int(int(a, 0).max(int(a, 1)))),
         "minf" => ok(Value::Float(float(a, 0).min(float(a, 1)))),
         "maxf" => ok(Value::Float(float(a, 0).max(float(a, 1)))),
+        // Dragon Age II: whether `nInt` has every bit of `nFlag`. Provisional: from its
+        // script.ldf name and its callers' single-bit flags.
+        "hasflag" => ok(b((int(a, 0) & int(a, 1)) == int(a, 1))),
+        // Dragon Age II presentation calls (a sound parameter, blood decals on the ground):
+        // nothing in the simulation changes.
+        "SetAudioGameParameter" | "SpawnRandomDecals" => void(),
         // The player's profile unlocks, the cross-game vault and the GUI attribute tree are
         // not kept: none is set.
         "GetGlobalUnlock" | "GetVaultInt" | "GetAttributeBool" => ok(Value::Int(0)),
@@ -4766,6 +4737,110 @@ pub(crate) fn placeable_default_action(sim: &Sim, id: ObjectId) -> Option<i32> {
     }
 }
 
+impl Sim {
+    /// `SetCreatureProperty` (or, with `update`, `UpdateCreatureProperty`): property
+    /// `property` of creature `id` set to (or moved by) `value` as `value_type` says (base,
+    /// total, current, modifier), within `properties.gda`'s bounds; a depletable's current
+    /// clamped to its total, a hit's health loss recorded for `caller`, and the hero's
+    /// experience shared with the followers waiting in the pool (`by`: the script doing it,
+    /// for the trace).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn set_creature_property(
+        &mut self,
+        caller: ObjectId,
+        by: String,
+        id: ObjectId,
+        p: i32,
+        value: f32,
+        vt: i32,
+        update: bool,
+    ) {
+        let base_type = constant(&self.table, "PROPERTY_VALUE_BASE");
+        let total_type = constant(&self.table, "PROPERTY_VALUE_TOTAL");
+        let current = constant(&self.table, "PROPERTY_VALUE_CURRENT");
+        let modifier = constant(&self.table, "PROPERTY_VALUE_MODIFIER");
+        let kind = property_kind(self, p);
+        // Health before, to record what a hit takes.
+        let health = constant(&self.table, "PROPERTY_DEPLETABLE_HEALTH");
+        let health_before = (p == health && vt == current)
+            .then(|| {
+                self.world
+                    .get(id)
+                    .filter(|o| !o.dead)
+                    .and_then(|o| o.properties.get(&health))
+                    .map(|v| v.1)
+            })
+            .flatten();
+        // The hero's experience before, for followers waiting in the pool.
+        let xp = constant(&self.table, "PROPERTY_SIMPLE_EXPERIENCE");
+        let hero_xp_before = (p == xp && Some(id) == self.world.hero).then(|| {
+            self.world
+                .get(id)
+                .and_then(|o| o.properties.get(&xp))
+                .map_or(0.0, |v| v.0)
+        });
+        if (vt == base_type || vt == total_type) && !update {
+            if let Some(o) = self.world.get_mut(id) {
+                o.properties.entry(p).or_insert((0.0, 0.0)).0 = value;
+            }
+        } else if vt == current && kind == PropertyKind::Depletable {
+            let max = self.property_total(id, p);
+            if let Some(o) = self.world.get_mut(id) {
+                let e = o.properties.entry(p).or_insert((0.0, 0.0));
+                let v = if update { e.1 + value } else { value };
+                e.1 = v.clamp(0.0, max.max(0.0));
+            }
+        } else if vt == modifier && kind != PropertyKind::Simple {
+            let gear = self.equipment_bonus(id, p);
+            if let Some(o) = self.world.get_mut(id) {
+                let m = o.modifiers.entry(p).or_insert(0.0);
+                *m = if update { *m + value } else { value - gear };
+            }
+        }
+        if kind == PropertyKind::Depletable && vt != current {
+            self.clamp_current(id, p);
+        }
+        // Scripts bring the dead back by giving them health (module_core's
+        // HandleEvent_Resurrection applies no effect). Provisional.
+        if let Some(o) = self.world.get_mut(id) {
+            if p == health
+                && vt == current
+                && o.dead
+                && o.properties.get(&health).is_some_and(|v| v.1 > 0.0)
+            {
+                o.dead = false;
+                o.died_at = None;
+                // One placed dead is no longer (DAOrigins.exe 0x6bc5fb-0x6bc631: health
+                // rising above 0 sets a CREATURE_SPAWN_DEAD of 1 to 0).
+                if let Some(v) = o.locals.ints.get_mut("CREATURE_SPAWN_DEAD")
+                    && *v == 1
+                {
+                    *v = 0;
+                }
+            }
+        }
+        if let Some(before) = health_before {
+            let after = self
+                .world
+                .get(id)
+                .and_then(|o| o.properties.get(&health))
+                .map_or(before, |v| v.1);
+            self.record_health_loss(caller, id, before - after.max(0.0));
+        }
+        if let Some(before) = hero_xp_before {
+            let after = self
+                .world
+                .get(id)
+                .and_then(|o| o.properties.get(&xp))
+                .map_or(0.0, |v| v.0);
+            if after > before {
+                *self.world.trace.hero_xp.entry(by).or_default() += (after - before) as u64;
+            }
+            self.share_pool_xp(after - before);
+        }
+    }
+}
+
 /// A property's type (as `GetCreaturePropertyType`), Min and Max from `properties.gda`.
 /// A property's kind (`properties.gda`'s Type), which decides which of its values exist.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -4914,7 +4989,10 @@ mod tests {
         string GetLocalString(object o, int n) = 991;\n\
         void SetLocalInt(object o, int n, int v) = 992;\n\
         int GetLocalInt(object o, int n) = 993;\n\
-        void PlayCutscene(resource r) = 994;\n";
+        void PlayCutscene(resource r) = 994;\n\
+        int hasflag(int nInt, int nFlag) = 420;\n\
+        int GetUpgradableAbilityHashedM2DAInt(object o, int nColumnHash, int nAbilityId) = 875;\n\
+        float GetUpgradableAbilityHashedM2DAFloat(object o, int nColumnHash, int nAbilityId) = 876;\n";
 
     #[test]
     fn dragon_age_2_functions_read_and_set_template_fields() {
@@ -4964,6 +5042,24 @@ mod tests {
         assert_eq!(
             run(&mut s, 1, "minf", &[Value::Float(2.5), Value::Float(1.5)]),
             Some(Value::Float(1.5))
+        );
+        assert_eq!(
+            run(
+                &mut s,
+                1,
+                "hasflag",
+                &[Value::Int(0b1010), Value::Int(0b1000)]
+            ),
+            Some(Value::Int(1))
+        );
+        assert_eq!(
+            run(
+                &mut s,
+                1,
+                "hasflag",
+                &[Value::Int(0b1010), Value::Int(0b0100)]
+            ),
+            Some(Value::Int(0))
         );
     }
 
@@ -5084,6 +5180,47 @@ mod tests {
         assert_eq!(
             read(&mut s, "GetHashedM2DAString", "Nope", 3),
             Some(Value::String(String::new()))
+        );
+    }
+
+    #[test]
+    fn dragon_age_2_upgradable_ability_numbers_come_from_the_ability_row() {
+        let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        s.world.tables().insert(
+            "#1",
+            &["Range", "Charges"],
+            vec![(307001, vec![Cell::Float(2.5), Cell::Int(3)])],
+        );
+        let npc = s.world.spawn(ObjectKind::Creature, "npc");
+        let col = |name: &str| Value::Int(thedas_formats::gda::column_hash(name) as i32);
+        let o = Value::Object(npc);
+        assert_eq!(
+            run(
+                &mut s,
+                1,
+                "GetUpgradableAbilityHashedM2DAFloat",
+                &[o.clone(), col("Range"), Value::Int(307001)]
+            ),
+            Some(Value::Float(2.5))
+        );
+        assert_eq!(
+            run(
+                &mut s,
+                1,
+                "GetUpgradableAbilityHashedM2DAInt",
+                &[o.clone(), col("Charges"), Value::Int(307001)]
+            ),
+            Some(Value::Int(3))
+        );
+        assert_eq!(
+            run(
+                &mut s,
+                1,
+                "GetUpgradableAbilityHashedM2DAInt",
+                &[o, col("Charges"), Value::Int(1)]
+            ),
+            Some(Value::Int(0))
         );
     }
 
@@ -6216,6 +6353,75 @@ mod tests {
             run(&mut s, c, "GetTacticCommandItemTag", &slot(1)),
             Some(Value::String(String::new()))
         );
+    }
+
+    #[test]
+    fn mod_mode_sets_properties_as_scripts_do() {
+        use crate::commands::{CommandOutcome, CommandSource, SimCommand};
+        let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        let t = crate::m2da::Tables::empty();
+        let row = |id: i64, ty: &str, min: f64, max: f64| {
+            (
+                id,
+                vec![
+                    Cell::Int(id),
+                    Cell::String(ty.into()),
+                    Cell::Float(min),
+                    Cell::Float(max),
+                ],
+            )
+        };
+        t.insert(
+            "properties",
+            &["ID", "Type", "Min", "Max"],
+            vec![
+                row(7, "DEPLETABLE", 1.0, 9999.0),
+                row(40, "SIMPLE", -1000.0, 1000.0),
+            ],
+        );
+        s.world.tables = Arc::new(t);
+        let c = s.world.spawn(ObjectKind::Creature, "c");
+        let set = |s: &mut Sim, property: i32, base: Option<f32>, current: Option<f32>| {
+            s.apply(
+                CommandSource::ModMode,
+                SimCommand::SetProperty {
+                    target: c,
+                    property,
+                    base,
+                    current,
+                },
+            )
+        };
+        // A depletable: the base first, then the current value, clamped to the new total.
+        let out = set(&mut s, 7, Some(50.0), Some(80.0));
+        assert_eq!(
+            out,
+            CommandOutcome::PropertySet {
+                base: 0.0,
+                current: 0.0
+            }
+        );
+        assert_eq!(s.world.get(c).unwrap().properties[&7], (50.0, 50.0));
+        let out = set(&mut s, 7, None, Some(20.0));
+        assert_eq!(
+            out,
+            CommandOutcome::PropertySet {
+                base: 50.0,
+                current: 50.0
+            }
+        );
+        assert_eq!(s.world.get(c).unwrap().properties[&7], (50.0, 20.0));
+        // Undo: what it held, set back.
+        set(&mut s, 7, Some(50.0), Some(50.0));
+        assert_eq!(s.world.get(c).unwrap().properties[&7], (50.0, 50.0));
+        assert_eq!(s.world.command_journal.len(), 3);
+        // A simple property has no current value; unknown properties and NaN are refused.
+        let refused = |o: CommandOutcome| matches!(o, CommandOutcome::Refused { .. });
+        assert!(refused(set(&mut s, 40, None, Some(1.0))));
+        assert!(refused(set(&mut s, 99, Some(1.0), None)));
+        assert!(refused(set(&mut s, 7, Some(f32::NAN), None)));
+        assert!(!refused(set(&mut s, 40, Some(-3.0), None)));
     }
 
     #[test]

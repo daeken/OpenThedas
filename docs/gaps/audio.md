@@ -21,6 +21,8 @@ Updated 2026-11-12 by the audio thread. Each item gives what the original does, 
    - Done: the game mode's ducking (0x5bd220): dialog and cutscenes play `OnCutscene` (music −3 dB, ambience and effects lower), death `OnDeath`, loading `OnGameLoading` (world sounds −60 dB; music and voice untouched).
    - Also done: `OnExploreMusic` while `main` plays and `OnCombatMusic` while `combat` does, while the music volume is above 0 (0x5bccd0, 0x5bc6f6); and a theme change during a load waits for the load to end, the old music playing on (0x5bfdf0, 0x5b7070 -> 0x5c4060).
    - Also done: the music director's cues per game mode (0x5bb630): explore `main`, combat `combat` (6 s late when it follows the interface, dialog or a cutscene), dialog and cutscenes `main` (except one after the other), death `Death`, the interface and loading keep the track.
+   - Also done: sound events that cue a track (`#music:<track>,<delay>[,combat]`, the cutscene `music/cutscene/*_switch` events; parsed at 0x5b9750, cued on event start 0x5bac80 -> 0x5b70c0): a delay of 0 or less cues the track of the current theme at once, a longer one waits like the deferred combat cue, and a game-mode change drops it.
+   - Not needed: the `combat` token on a cue (event+0xb4) is read but not acted on. In the exe it marks the cued track (music +0x15d, then +0x15c once it plays, 0x5c2f0e), and a cutscene that passes its last time mark (0x7cf2e0) cues `main` at once if the playing track is marked (0x5b73f0). None of the 77 `#music:` cues in the shipped banks carries it.
    - Provisional: our combat and interface modes come from the party's fighting and the menus up, not from game modes the simulation keeps.
    - Medium.
 5. **Death and party-wipe music.** Done: the music director cues `Death` when the game mode becomes dead (0x5bb84e), and the change is immediate (0x5c4c69). Provisional: our dead mode is the simulation's game-over flag.
@@ -66,6 +68,7 @@ Updated 2026-11-12 by the audio thread. Each item gives what the original does, 
 ### Combat and animation sounds
 
 18. **Blows at the hit frame** are done (#297).
+    - Where animation sounds play: a creature has two sound emitters (0x6aa5fd..0x6aa6d4): the body's at half its appearance's height above its feet (0.9 m without an appearance), and the head's at its model's node in slot 3, else with the body's. Footsteps, foley, rustles, bodyfalls and named events (kinds 14, 17, 18, 20 and others) sound from the body; swings, (un)sheathing and blows (kinds 1, 3-7, 9, 10, 19, 21) from the head (play switch 0x6b6497). So a blow sounds from the striker, not the target. Provisional: ours puts the head emitter at the appearance's full height.
     - Not done: placeable targets (worksheet 93, placeable +0x4f0).
     - The armour material is taken from the chest item's base material; the exe goes through worksheet 89 "Material Types" (column 0xbb8ad13b) and an override (0x7485d0).
     - Small.
@@ -211,7 +214,7 @@ Found by reading the code at main on 2026-11-12: provisional markers, stubs, ign
 ### Voice-over
 
 - **AUD-051** **Voice-over is not positioned.** Original: voice-over positioning. Ours: conversation and ambient lines play 2D (`speak` sets no position). Evidence: `crates/thedas-app/src/audio.rs:14`, `crates/thedas-app/src/audio.rs:1513`. Size: M. Depends: none. Kind: missing.
-- **AUD-052** **Lip sync.** Original: lip sync data. Ours: no code found (no FaceFX or lip reader). Evidence: `crates/thedas-formats/src/lib.rs:1`. Size: L. Depends: FMT-027. Kind: missing.
+- **AUD-052** **Lip sync partly followed.** Original: each voiced line's FaceFX animation moves its speaker's face. Ours: the speaker of a voiced conversation line plays the line's `.fxe` through its race's rig (the face graph's evaluation traced, 0xa19b60); the bone poses' blend is inferred, the animation runs on the frame clock from when the line comes up rather than with the voice, its blend in and out are not applied, the rig is found from the race prefix of the head morph rather than as the original does, and lines said in passing and cutscene lines are not animated. Evidence: `crates/thedas-app/src/faces.rs:1`, `crates/thedas-formats/src/facefx.rs:1`. Size: M. Depends: FMT-027. Kind: provisional.
 - **AUD-053** **VO language is a flag, not the game's locale.** Original: localisation of VO. Ours: `--language` (default `en-us`) picks `audio/vo/<language>/vo`; the options' `Locale` is not consulted; talk tables stay English (FMT-017). Evidence: `crates/thedas-app/src/main.rs:219`, `crates/thedas-audio/src/library.rs:95`. Size: S. Depends: FMT-017. Kind: missing.
 - **AUD-054** **Sound-set details guessed.** Original: per-creature probability multiplier (table 0x119) and creature flag +0x969 (per comment). Ours: bag draw order random; the multiplier and flag are not modelled; event-vs-sample choice inferred from data. Evidence: `crates/thedas-app/src/audio.rs:653`. Size: S. Depends: none. Kind: provisional.
 

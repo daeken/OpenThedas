@@ -605,6 +605,20 @@ impl Sim {
     /// Starts a conversation between `initiator` and `target` (the owner); an empty `dlg`
     /// uses the target's own conversation. Returns whether it started.
     pub fn start_conversation(&mut self, initiator: ObjectId, target: ObjectId, dlg: &str) -> bool {
+        match self.load_conversation(initiator, target, dlg) {
+            Some(d) => self.open_conversation(initiator, target, d, None),
+            None => false,
+        }
+    }
+
+    /// The conversation `dlg` names (empty: `target`'s own), read; `None` (traced as
+    /// missing) when there is none.
+    pub(crate) fn load_conversation(
+        &mut self,
+        initiator: ObjectId,
+        target: ObjectId,
+        dlg: &str,
+    ) -> Option<Dlg> {
         let name = if dlg.is_empty() {
             match self.world.get(target).and_then(|o| o.dialog.clone()) {
                 Some(d) => d,
@@ -616,7 +630,7 @@ impl Sim {
                             "conversation: {initiator} -> {target} names no dialog and the target has none"
                         ),
                     });
-                    return false;
+                    return None;
                 }
             }
         } else {
@@ -644,14 +658,23 @@ impl Sim {
                 t,
                 what: format!("conversation {name}"),
             });
-            return false;
+            return None;
         };
-        self.open_conversation(initiator, target, d)
+        Some(d)
     }
 
     /// Starts conversation `d` (read when it was asked for, as DAOrigins.exe loads it with
-    /// the request, 0x68cee0 -> 0x7ef310) between `initiator` and `target`.
-    fn open_conversation(&mut self, initiator: ObjectId, target: ObjectId, d: Dlg) -> bool {
+    /// the request, 0x68cee0 -> 0x7ef310) between `initiator` and `target`. `at` starts it
+    /// at that line instead of the first usable start (mod mode's out-of-order testing):
+    /// its condition is not asked, and it opens on the dialog screen unless the line itself
+    /// is said in passing.
+    pub(crate) fn open_conversation(
+        &mut self,
+        initiator: ObjectId,
+        target: ObjectId,
+        d: Dlg,
+        at: Option<usize>,
+    ) -> bool {
         let player = if Some(initiator) == self.world.hero || target == OBJECT_INVALID {
             initiator
         } else {
@@ -672,11 +695,18 @@ impl Sim {
             staged_at: None,
             ambient_run: false,
         };
-        let start = d.starts.iter().copied().find(|&s| self.usable(&c, s));
+        let start = match at {
+            Some(s) => Some(s),
+            None => d.starts.iter().copied().find(|&s| self.usable(&c, s)),
+        };
         // Between creatures outside the party it is an ambient conversation: it plays out
         // around the player without waiting for them. Provisional: all at once.
-        let ambient_start = start.is_some_and(|s| d.nodes[s].ambient);
+        let ambient_start = start.is_some_and(|s| d.nodes.get(s).is_some_and(|n| n.ambient));
         let ambient = |sim: &Self| {
+            if at.is_some() {
+                // A chosen line plays as it is: in passing only if it is said so.
+                return ambient_start;
+            }
             let party = crate::engine::party_of(sim);
             ambient_start || (!party.contains(&initiator) && !party.contains(&target))
         };
@@ -783,7 +813,7 @@ impl Sim {
                     o.kind == crate::world::ObjectKind::Creature && o.active && !o.dead
                 });
             if there {
-                self.open_conversation(initiator, target, d);
+                self.open_conversation(initiator, target, d, None);
             }
         }
         let Some(before) = self.world.mode_before_talk else {
@@ -1171,9 +1201,9 @@ mod tests {
         let mut spawn = |tag: &str| sim.world.spawn(crate::world::ObjectKind::Creature, tag);
         let (hero, vaughan, valora) = (spawn("player"), spawn("vaughan"), spawn("valora"));
         sim.world.hero = Some(hero);
-        assert!(sim.open_conversation(hero, vaughan, named("vaughan")));
+        assert!(sim.open_conversation(hero, vaughan, named("vaughan"), None));
         assert!(
-            sim.open_conversation(hero, valora, named("valora")),
+            sim.open_conversation(hero, valora, named("valora"), None),
             "asked for"
         );
         let talk = sim.talk.as_ref().unwrap();
@@ -1192,8 +1222,8 @@ mod tests {
         // scene) does not start.
         assert!(sim.choose_reply(0).unwrap().ended);
         sim.tick(0);
-        assert!(sim.open_conversation(hero, vaughan, named("vaughan")));
-        assert!(sim.open_conversation(hero, valora, named("valora")));
+        assert!(sim.open_conversation(hero, vaughan, named("vaughan"), None));
+        assert!(sim.open_conversation(hero, valora, named("valora"), None));
         sim.world.get_mut(valora).unwrap().active = false;
         assert!(sim.choose_reply(0).unwrap().ended);
         sim.tick(0);
@@ -1411,7 +1441,12 @@ mod tests {
         // presentation.
         for direct in [false, true] {
             let (mut sim, hero, npc) = passers_by();
-            assert!(sim.open_conversation(hero, npc, remarks("guard", &["one", "two"], direct)));
+            assert!(sim.open_conversation(
+                hero,
+                npc,
+                remarks("guard", &["one", "two"], direct),
+                None
+            ));
             // No dialog screen: the game goes on, and the presentation is told the line.
             assert!(sim.talk.is_none());
             assert_eq!(said(&sim), ["one"]);
@@ -1435,24 +1470,42 @@ mod tests {
         let d = remarks("guard", &["one", "two"], false);
         // Asked again while saying it, the speaker goes on rather than starting over (the
         // sweep's click on Alistair restarted his exchange with the mage every time).
-        assert!(sim.open_conversation(hero, npc, d.clone()));
+        assert!(sim.open_conversation(hero, npc, d.clone(), None));
         sim.tick(1000);
-        assert!(sim.open_conversation(hero, npc, d.clone()));
+        assert!(sim.open_conversation(hero, npc, d.clone(), None));
         assert_eq!(sim.ambient.len(), 1);
         sim.tick(6500);
         assert_eq!(said(&sim), ["one", "two"]);
         sim.tick(8000);
         // `ClearAmbientDialogs` stops what was still to be said; so does the speaker's death.
-        assert!(sim.open_conversation(hero, npc, d.clone()));
+        assert!(sim.open_conversation(hero, npc, d.clone(), None));
         sim.clear_ambient(npc);
         sim.tick(8000);
         assert_eq!(said(&sim).len(), 3);
-        assert!(sim.open_conversation(hero, npc, d));
+        assert!(sim.open_conversation(hero, npc, d, None));
         sim.world.get_mut(npc).unwrap().dead = true;
         sim.tick(8000);
         assert_eq!(said(&sim).len(), 4);
         assert!(sim.ambient.is_empty());
     }
+    #[test]
+    fn a_conversation_starts_at_a_chosen_line() {
+        // Said in passing, a chosen line is said that way, and the walk goes on from it.
+        let (mut sim, hero, npc) = passers_by();
+        let mut d = remarks("guard", &["one", "two", "three"], false);
+        assert!(sim.open_conversation(hero, npc, d.clone(), Some(2)));
+        sim.tick(20000);
+        assert_eq!(said(&sim), ["two", "three"]);
+        // Not said in passing, it opens on the dialog screen at that line, though neither
+        // speaker is in the party.
+        let (mut sim, hero, npc) = passers_by();
+        d.nodes[2].ambient = false;
+        assert!(sim.open_conversation(hero, npc, d, Some(2)));
+        let st = sim.dialog_state().expect("the dialog is open");
+        assert_eq!(st.line, "two");
+        assert!(said(&sim).is_empty());
+    }
+
     #[test]
     fn a_conversations_conditions_report_the_flags_they_read() {
         let (mut sim, _hero, npc) = passers_by();
@@ -1485,7 +1538,7 @@ mod tests {
         let mut d = remarks("alistair", &["one", "two", "three"], false);
         // "three" is said to the player, not in passing.
         d.nodes[4].ambient = false;
-        assert!(sim.open_conversation(hero, npc, d.clone()));
+        assert!(sim.open_conversation(hero, npc, d.clone(), None));
         sim.tick(20000);
         assert_eq!(said(&sim), ["one", "two"]);
         assert!(sim.ambient.is_empty());
@@ -1493,7 +1546,7 @@ mod tests {
         let (mut sim, hero, npc) = passers_by();
         let mut d = remarks("alistair", &["one", "two"], false);
         d.nodes[1].text = Some("A choice".into());
-        assert!(sim.open_conversation(hero, npc, d));
+        assert!(sim.open_conversation(hero, npc, d, None));
         sim.tick(20000);
         assert_eq!(said(&sim), ["one"]);
         assert!(sim.ambient.is_empty());

@@ -73,24 +73,22 @@ adds inferred signatures for three of them, and the sim session loads them with 
 4088 of 4158 scripts finish. The rest fail as follows: 58 exhaust the instruction budget of 2,000,000 (looping test/debug scripts such as zz_*), 4 call
 unknown ids, 2 IsInTrigger with 0 args, 2 SetFacingPosition with 1 arg, 2 division by zero, 1 bad stack offset.
 
-### Unimplemented functions scripts call (all 71, by static call count)
+### Unimplemented functions scripts call (all 69, by static call count)
 
 Static call sites / distinct scripts. The debug and console ones (DEBUG_ConsoleCommand, GetDebugHelpersEnabled,
-SetCheatUsedFlag, Screenshot, SendOnlineTelemetry) matter less. InteractWithObject, ShowAsAllyOnMap, GetSafeLocation,
-SetPartyLeader, CloseQuestGroup, SetCanUseItem, the trap-difficulty getters and the item functions affect gameplay.
+SetCheatUsedFlag, Screenshot, SendOnlineTelemetry) matter less. InteractWithObject, ShowAsAllyOnMap,
+SetPartyLeader, CloseQuestGroup, the trap-difficulty getters and the item functions affect gameplay.
 
 | function | id | calls | scripts |
 | --- | --- | --- | --- |
 | DEBUG_ConsoleCommand | 704 | 649 | 57 |
 | GetDebugHelpersEnabled | 331 | 421 | 421 |
-| SetCanUseItem | 813 | 140 | 65 |
 | InteractWithObject | 587 | 108 | 108 |
 | CloseQuestGroup | 846 | 65 | 5 |
 | ShowAsAllyOnMap | 364 | 62 | 26 |
 | GetPlaceablePopupText | 356 | 53 | 51 |
 | SetMusicVolumeStateByTag | 488 | 52 | 36 |
 | SetPhysicsController | 839 | 52 | 39 |
-| GetSafeLocation | 659 | 50 | 22 |
 | SetCheatUsedFlag | 627 | 48 | 44 |
 | GetEffectID | 614 | 38 | 13 |
 | SetPartyLeader | 625 | 36 | 18 |

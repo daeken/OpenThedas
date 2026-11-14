@@ -266,6 +266,8 @@ pub struct AudioEngine {
     ducking: HashMap<String, (f32, f32, f32)>,
     /// Each ducked category's target last update (for the debug log of changes).
     duck_targets: HashMap<String, f32>,
+    /// Music cues of events started since [`AudioEngine::take_music_cues`] was last called.
+    music_cues: Vec<MusicCue>,
     /// Paused categories (lowercase); those under them are paused too.
     paused: std::collections::HashSet<String>,
     pub volumes: Volumes,
@@ -364,6 +366,7 @@ impl AudioEngine {
             parents,
             ducking: HashMap::new(),
             duck_targets: HashMap::new(),
+            music_cues: Vec::new(),
             paused: Default::default(),
             volumes: Volumes::default(),
             listener: Listener {
@@ -443,6 +446,11 @@ impl AudioEngine {
                 .iter()
                 .filter_map(|p| Duck::parse(&p.name))
                 .collect();
+            self.music_cues.extend(
+                parameters
+                    .iter()
+                    .filter_map(|p| MusicCue::parse(&p.name, path)),
+            );
             for p in parameters {
                 params.insert(p.name.to_ascii_lowercase(), p.min);
             }
@@ -627,6 +635,11 @@ impl AudioEngine {
             c = self.parents.get(name).map(String::as_str);
         }
         false
+    }
+
+    /// The music cues of the events started since the last call (see [`MusicCue`]).
+    pub fn take_music_cues(&mut self) -> Vec<MusicCue> {
+        std::mem::take(&mut self.music_cues)
     }
 
     pub fn stop_all(&mut self) {
@@ -1278,6 +1291,47 @@ fn event_variation(pitch: f32, r: f32, v: f32, flags: u32, (u1, u2): (f32, f32))
     (rate, gain)
 }
 
+/// A music cue an event carries: a parameter named `#music:<track>,<delay>[,combat]`, as
+/// DAOrigins.exe reads it when it sets an event up (0x5bab72 -> 0x5b9750, 0x5b9d20..
+/// 0x5b9fdf): the track (a track of the playing theme, such as `prelude_boss`'s
+/// `pre400_ogre`), the delay in seconds before it is cued, and the `combat` token. The
+/// cutscenes' `music/cutscene/*_switch` events are such cues and play nothing else.
+///
+/// The `combat` token is read but not acted on. In the exe it marks the cued track (music
+/// +0x15d, copied to +0x15c when the track starts, 0x5c2f0e); when a cutscene passes its last
+/// time mark (CCutscene 0x7cf2e0) and the playing track is so marked, `main` is cued at once
+/// (0x5b73f0). None of the 77 `#music:` cues in the shipped banks carries the token.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MusicCue {
+    pub event: String,
+    pub track: String,
+    pub delay: f32,
+    pub combat: bool,
+}
+
+impl MusicCue {
+    pub fn parse(param: &str, event: &str) -> Option<MusicCue> {
+        let rest = param.strip_prefix("#music:")?;
+        let mut parts = rest.split(',').map(str::trim);
+        let track = parts.next().filter(|t| !t.is_empty())?.to_string();
+        let mut delay = 0.0;
+        let mut combat = false;
+        for p in parts {
+            if p.eq_ignore_ascii_case("combat") {
+                combat = true;
+            } else if let Ok(v) = p.parse::<f32>() {
+                delay = v;
+            }
+        }
+        Some(MusicCue {
+            event: event.to_string(),
+            track,
+            delay,
+            combat,
+        })
+    }
+}
+
 /// The low-pass cutoff (Hz) of an event occluded by `occlusion`, none when it is clear.
 ///
 /// DAOrigins.exe starts FMOD with `FMOD_INIT_SOFTWARE_OCCLUSION` (the event system's init
@@ -1517,6 +1571,23 @@ mod tests {
         let b = e.play("test/grp/loop", PlayOptions::default()).unwrap();
         run(&mut e, &m, 0.3);
         assert!(!e.is_playing(a) && e.is_playing(b));
+    }
+
+    #[test]
+    fn music_cues_read_their_track_delay_and_combat_token() {
+        assert_eq!(
+            MusicCue::parse("#music:pre400_ogre,1", "music/cutscene/pre400_ogre_switch"),
+            Some(MusicCue {
+                event: "music/cutscene/pre400_ogre_switch".into(),
+                track: "pre400_ogre".into(),
+                delay: 1.0,
+                combat: false,
+            })
+        );
+        let c = MusicCue::parse("#music:tower,0,combat", "e").unwrap();
+        assert_eq!((c.track.as_str(), c.delay, c.combat), ("tower", 0.0, true));
+        assert_eq!(MusicCue::parse("#duck:music,1,0,1,-3", "e"), None);
+        assert_eq!(MusicCue::parse("#music:", "e"), None);
     }
 
     #[test]
