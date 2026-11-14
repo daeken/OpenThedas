@@ -65,6 +65,10 @@ impl ObjectKind {
 /// Local variables (`VarTable` in templates and instances, `SetLocal*` from scripts).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Locals {
+    /// The names of the template's and instance's `VarTable` entries, in their order (see
+    /// `local_name` in `engine.rs`: Dragon Age II numbers some objects' variables by it).
+    #[serde(default)]
+    pub order: Vec<String>,
     pub ints: BTreeMap<String, i32>,
     pub floats: BTreeMap<String, f32>,
     pub strings: BTreeMap<String, String>,
