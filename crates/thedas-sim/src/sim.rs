@@ -3769,6 +3769,7 @@ impl Sim {
     }
 
     fn created(&mut self, id: ObjectId) {
+        self.init_da2_race(id);
         self.lay_out_if_spawned_dead(id);
         self.register_da2_encounter(id);
         if let Some(o) = self.world.get(id) {
