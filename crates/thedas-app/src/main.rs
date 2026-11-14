@@ -57,6 +57,7 @@ mod cutactors;
 mod cutcam;
 mod focusnav;
 mod follow;
+mod framestats;
 mod glb;
 mod glb_in;
 mod icon;
@@ -584,6 +585,9 @@ struct Gfx {
     renderer: Option<AreaRenderer>,
     ui: ui::UiLayer,
     reticle: reticle::ReticlePass,
+    /// The window's own title, before the frame-rate figures (see [`framestats`]).
+    title: String,
+    frames: framestats::FrameStats,
 }
 
 struct App {
@@ -1175,17 +1179,18 @@ const DOUBLE_CLICK_PIXELS: f64 = 6.0;
 
 impl App {
     fn init(&mut self, event_loop: &ActiveEventLoop) -> Result<()> {
+        let title = match &self.loaded.scene {
+            Some(s) => format!(
+                "OpenThedas - {} ({})",
+                s.name.as_deref().unwrap_or(""),
+                s.level
+            ),
+            None => "OpenThedas".to_string(),
+        };
         let window = Arc::new(
             event_loop.create_window(
                 Window::default_attributes()
-                    .with_title(match &self.loaded.scene {
-                        Some(s) => format!(
-                            "OpenThedas - {} ({})",
-                            s.name.as_deref().unwrap_or(""),
-                            s.level
-                        ),
-                        None => "OpenThedas".to_string(),
-                    })
+                    .with_title(title.clone())
                     .with_inner_size(LogicalSize::new(self.size.0, self.size.1))
                     .with_window_icon(icon::window_icon())
                     .with_visible(std::env::var_os("THEDAS_HIDDEN_WINDOW").is_none()),
@@ -1252,6 +1257,8 @@ impl App {
             renderer,
             ui,
             reticle,
+            title,
+            frames: framestats::FrameStats::default(),
         });
         Ok(())
     }
@@ -1438,6 +1445,11 @@ impl App {
     }
 
     fn redraw(&mut self) -> Result<()> {
+        if let Some(g) = self.gfx.as_mut() {
+            if let Some(stats) = g.frames.frame(Instant::now()) {
+                g.window.set_title(&format!("{} | {stats}", g.title));
+            }
+        }
         self.audio_frame();
         if self.intro.is_some() {
             return self.intro_frame();
