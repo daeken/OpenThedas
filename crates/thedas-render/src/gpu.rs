@@ -7,6 +7,10 @@ use thedas_formats::dds::{Dds, DdsFormat, DdsKind};
 use thedas_vfs::Vfs;
 use wgpu::util::DeviceExt;
 
+#[cfg(test)]
+#[path = "forward_transparency_tests.rs"]
+mod forward_transparency_tests;
+
 use crate::camera::Camera;
 use crate::material::{BlendMode, MaterialProgram, Program, ProgramRegistry, Resolved};
 use crate::scene::{AreaScene, Vertex};
@@ -72,8 +76,11 @@ impl GpuContext {
             .contains(wgpu::Features::TEXTURE_COMPRESSION_BC);
         // Clamping to a border colour (D3D's `TEXADD_BORDER`: the sky's celestial body) when
         // the adapter can; samplers fall back to clamping to the edge otherwise.
-        let wanted =
+        let mut wanted =
             wgpu::Features::TEXTURE_COMPRESSION_BC | wgpu::Features::ADDRESS_MODE_CLAMP_TO_BORDER;
+        if crate::profile::enabled() {
+            wanted |= wgpu::Features::TIMESTAMP_QUERY;
+        }
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("thedas"),
@@ -608,7 +615,14 @@ pub struct AreaRenderer {
     deferred_planned: bool,
     /// Its eligible geometry was already drawn into another renderer's G-buffer.
     deferred_in_frame: bool,
+    /// A shared deferred frame finishes every renderer's opaque overlays before blending.
+    late_transparency: bool,
+    deferred_frame: bool,
+    ground_mask: Option<crate::deferred_ground::GroundMask>,
 }
+
+/// Ground marks recorded between the main frame and its forward object overlays.
+pub type GroundUnderlay<'a> = &'a mut dyn FnMut(&mut wgpu::CommandEncoder, &wgpu::TextureView);
 
 /// The colour curve `da_hsvmatrix` reads: `name` (an area's curve, `<name>.dds`) or by
 /// default `da_defaultcc` (DAOrigins.exe loads it at 0x458cda, and binds it when no area curve
@@ -1138,6 +1152,9 @@ impl AreaRenderer {
             deferred,
             deferred_planned,
             deferred_in_frame: false,
+            late_transparency: false,
+            deferred_frame: false,
+            ground_mask: None,
         }
     }
 
@@ -1188,10 +1205,32 @@ impl AreaRenderer {
         }
     }
 
+    /// Diagnostic override `[tiled lights, cube-face culling]` for paired frame-cost
+    /// comparisons. `None` restores the environment switches; the faithful path ignores it.
+    pub fn set_deferred_culling(&mut self, culling: Option<[bool; 2]>) {
+        if let Some(d) = self.deferred.as_mut() {
+            d.set_culling(culling);
+        }
+    }
+
     /// Whether this renderer can draw deferred: it has draws the deferred
     /// pass takes, and the GPU has not refused that pass.
     pub fn can_defer(&self) -> bool {
         self.deferred.as_ref().is_some_and(|d| !d.refused())
+    }
+
+    /// Per-renderer benchmark override; `None` restores the configured shadow policy.
+    pub fn set_deferred_shadow_reuse(&mut self, enabled: Option<bool>) {
+        if let Some(d) = &mut self.deferred {
+            d.set_shadow_reuse(enabled);
+        }
+    }
+
+    /// Per-frame benchmark override; `None` restores the configured reflection policy.
+    pub fn set_deferred_fused_reflections(&mut self, enabled: Option<bool>) {
+        if let Some(d) = &mut self.deferred {
+            d.set_fused_reflections(enabled);
+        }
     }
 
     /// Grades the frame as area `grade` says: its colour curve and `da_hsvmatrix` values
@@ -1526,6 +1565,45 @@ impl AreaRenderer {
         self.msaa.as_ref()
     }
 
+    /// Draws depth-disabled ground marks, retaining the colour over G-buffer characters.
+    /// Call this before the forward object overlays. Faithful frames draw directly.
+    pub fn render_ground(
+        &mut self,
+        ctx: &GpuContext,
+        encoder: &mut wgpu::CommandEncoder,
+        frame: &wgpu::TextureView,
+        draw: impl FnOnce(&mut wgpu::CommandEncoder),
+    ) {
+        let material = self.deferred.as_ref().and_then(|d| d.material_mask());
+        let usage = if frame.texture().sample_count() > 1 {
+            wgpu::TextureUsages::TEXTURE_BINDING
+        } else {
+            wgpu::TextureUsages::COPY_SRC
+        };
+        if self.deferred_frame
+            && crate::config::CONFIG.ground_mask
+            && frame.texture().usage().contains(usage)
+            && let Some(material) = material
+        {
+            if !self
+                .ground_mask
+                .as_ref()
+                .is_some_and(|g| g.fits(frame, material))
+            {
+                self.ground_mask = checked(&ctx.device, "deferred ground mask", || {
+                    crate::deferred_ground::GroundMask::new(&ctx.device, frame, material)
+                });
+            }
+            if let Some(mask) = &self.ground_mask {
+                mask.save(&ctx.device, encoder, frame);
+                draw(encoder);
+                mask.restore(&ctx.device, encoder, frame);
+                return;
+            }
+        }
+        draw(encoder);
+    }
+
     /// Records the area pass into `encoder`, drawing into `target` of the given size.
     pub fn render(
         &mut self,
@@ -1558,7 +1636,8 @@ impl AreaRenderer {
     }
 
     /// Shares the level's G-buffer and point shadows with eligible object renderers.
-    /// Their remaining materials are drawn later by `render_over`, as usual.
+    /// Draw their opaque remainder with `render_over`, then call `finish_transparency`
+    /// on this renderer and each overlay before resolving the shared frame.
     #[allow(clippy::too_many_arguments)]
     pub fn render_main_with(
         &mut self,
@@ -1570,7 +1649,9 @@ impl AreaRenderer {
         camera: &Camera,
         objects: &mut [&mut AreaRenderer],
     ) {
-        self.render_pass_with(ctx, encoder, target, width, height, camera, None, objects);
+        self.render_pass_with(
+            ctx, encoder, target, width, height, camera, None, objects, None,
+        );
     }
 
     /// Fills this frame's constants: placing the shadow partitions (a renderer of the
@@ -1625,7 +1706,17 @@ impl AreaRenderer {
         camera: &Camera,
         over: Option<&wgpu::TextureView>,
     ) {
-        self.render_pass_with(ctx, encoder, target, width, height, camera, over, &mut []);
+        self.render_pass_with(
+            ctx,
+            encoder,
+            target,
+            width,
+            height,
+            camera,
+            over,
+            &mut [],
+            None,
+        );
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1639,10 +1730,15 @@ impl AreaRenderer {
         camera: &Camera,
         over: Option<&wgpu::TextureView>,
         objects: &mut [&mut AreaRenderer],
+        mut profile: Option<&mut crate::profile::CaptureProfile>,
     ) {
         let contributed = std::mem::take(&mut self.deferred_in_frame);
+        if over.is_none() {
+            self.late_transparency = false;
+        }
         for o in objects.iter_mut() {
             o.deferred_in_frame = false;
+            o.late_transparency = false;
         }
         // For the effects that read the depth buffer back (see `finish_frame_with`).
         self.frame_projection = Some(camera.projection(width as f32 / height.max(1) as f32));
@@ -1707,6 +1803,9 @@ impl AreaRenderer {
                 })
             })
             .collect();
+        if let Some(p) = profile.as_deref_mut() {
+            p.mark("frame_prepare");
+        }
         let deferred = deferred_now
             && self.deferred.as_mut().is_some_and(|p| {
                 p.set_own_lights(own);
@@ -1722,10 +1821,17 @@ impl AreaRenderer {
                     &self.meshes,
                     self.clear,
                     &mut contributors,
+                    profile.as_deref_mut(),
                 )
             });
         drop(contributors);
+        let late = deferred && !objects.is_empty() && crate::config::CONFIG.late_transparency;
+        if over.is_none() {
+            self.late_transparency = late;
+        }
+        self.deferred_frame = deferred;
         for o in objects.iter_mut() {
+            o.late_transparency = late;
             o.deferred_in_frame = deferred
                 && o.path == crate::deferred::RenderPath::Deferred
                 && o.only_draws.is_none()
@@ -1758,17 +1864,74 @@ impl AreaRenderer {
                 }),
                 stencil_ops: None,
             }),
+            timestamp_writes: profile.as_deref_mut().and_then(|p| p.pass("level_forward")),
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        self.draw_forward(
+            &mut pass,
+            true,
+            !self.late_transparency,
+            deferred || contributed,
+        );
+        drop(pass);
+        if let Some(p) = profile {
+            p.mark("level_forward");
+        }
+    }
+
+    /// Completes this renderer's delayed blended/faded draws and particles over a shared
+    /// deferred frame, after every opaque overlay. A faithful frame has nothing pending.
+    pub fn finish_transparency(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &wgpu::TextureView,
+        depth: &wgpu::TextureView,
+    ) {
+        if !std::mem::take(&mut self.late_transparency) {
+            return;
+        }
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("deferred forward transparency"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: target,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: depth,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
             timestamp_writes: None,
             occlusion_query_set: None,
             multiview_mask: None,
         });
+        self.draw_forward(&mut pass, false, true, false);
+    }
+
+    fn draw_forward(
+        &self,
+        pass: &mut wgpu::RenderPass<'_>,
+        opaque: bool,
+        transparent: bool,
+        deferred: bool,
+    ) {
         // Faded objects' opaque draws go after the other opaque ones, so what lies behind
         // them is there to show through.
         let faded =
             |r: &DrawRef| matches!(*r, DrawRef::D3d(i) if self.d3d.is_faded(&self.d3d.draws[i]));
-        let opaque = self.opaque.iter().filter(|(_, r)| !faded(r));
-        let faded_opaque = self.opaque.iter().filter(|(_, r)| faded(r));
-        for (di, r) in opaque.chain(faded_opaque).chain(&self.blended) {
+        let solid = self.opaque.iter().filter(|(_, r)| opaque && !faded(r));
+        let faded_opaque = self.opaque.iter().filter(|(_, r)| transparent && faded(r));
+        let blended = self.blended.iter().filter(|_| transparent);
+        for (di, r) in solid.chain(faded_opaque).chain(blended) {
             if self
                 .only_draws
                 .as_ref()
@@ -1780,7 +1943,7 @@ impl AreaRenderer {
                 DrawRef::StandIn(i) => &self.stand_in[i],
                 DrawRef::D3d(i) => {
                     if !self.d3d.in_view(i)
-                        || ((deferred || contributed)
+                        || (deferred
                             && !self.d3d.is_faded(&self.d3d.draws[i])
                             && self.deferred.as_ref().is_some_and(|p| p.takes(i)))
                     {
@@ -1788,7 +1951,7 @@ impl AreaRenderer {
                     }
                     let d = &self.d3d.draws[i];
                     let mesh = &self.meshes[d.mesh];
-                    self.d3d.draw(&mut pass, d, &mesh.indices, mesh.count);
+                    self.d3d.draw(pass, d, &mesh.indices, mesh.count);
                     continue;
                 }
             };
@@ -1804,8 +1967,8 @@ impl AreaRenderer {
         }
         // Particles last, over everything else (the emitters' render classes are
         // transparent).
-        if self.only_draws.is_none() {
-            self.d3d.draw_particles(&mut pass, false);
+        if transparent && self.only_draws.is_none() {
+            self.d3d.draw_particles(pass, false);
         }
     }
 
@@ -1966,7 +2129,7 @@ impl AreaRenderer {
         width: u32,
         height: u32,
     ) -> Result<Vec<u8>, GpuError> {
-        self.capture_with(ctx, camera, width, height, &mut [], &mut |_, _| {})
+        self.capture_with(ctx, camera, width, height, &mut [], None)
     }
 
     /// [`AreaRenderer::capture`] with `overlays` drawn over this renderer's pass (see
@@ -1979,8 +2142,9 @@ impl AreaRenderer {
         width: u32,
         height: u32,
         overlays: &mut [&mut AreaRenderer],
-        under: &mut dyn FnMut(&mut wgpu::CommandEncoder, &wgpu::TextureView),
+        under: Option<GroundUnderlay<'_>>,
     ) -> Result<Vec<u8>, GpuError> {
+        let mut profile = crate::profile::CaptureProfile::new(ctx);
         let target = ctx.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("capture"),
             size: wgpu::Extent3d {
@@ -2008,15 +2172,24 @@ impl AreaRenderer {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("capture"),
             });
+        if let Some(p) = &mut profile {
+            p.mark("allocate");
+        }
         self.prepare_shadows(ctx, camera, width, height);
         for o in overlays.iter_mut() {
             o.prepare_shadows(ctx, camera, width, height);
+        }
+        if let Some(p) = &mut profile {
+            p.mark("sun_prepare");
         }
         self.encode_shadows(&mut encoder, true);
         for o in overlays.iter_mut() {
             o.encode_shadows(&mut encoder, false);
         }
         self.finish_shadows(&mut encoder);
+        if let Some(p) = &mut profile {
+            p.mark("sun_shadows");
+        }
         self.render_pass_with(
             ctx,
             &mut encoder,
@@ -2026,19 +2199,37 @@ impl AreaRenderer {
             camera,
             None,
             overlays,
+            profile.as_mut(),
         );
         let frame = self.frame_view(&ctx.device, &view, width, height);
-        under(&mut encoder, &frame);
+        if let Some(under) = under {
+            self.render_ground(ctx, &mut encoder, &frame, |encoder| {
+                under(encoder, &frame);
+            });
+        }
+        if let Some(p) = &mut profile {
+            p.mark("ground");
+        }
         if !overlays.is_empty() {
             let depth = self.depth(&ctx.device, width, height);
             for o in overlays.iter_mut() {
                 o.render_over(ctx, &mut encoder, &frame, width, height, camera, &depth);
             }
+            self.finish_transparency(&mut encoder, &frame, &depth);
+            for o in overlays.iter_mut() {
+                o.finish_transparency(&mut encoder, &frame, &depth);
+            }
+        }
+        if let Some(p) = &mut profile {
+            p.mark("object_transparency");
         }
         self.resolve(&ctx.device, &mut encoder, &view, width, height);
         {
             let over: Vec<&AreaRenderer> = overlays.iter().map(|o| &**o).collect();
             self.finish_frame_with(ctx, &mut encoder, &target, width, height, &over);
+        }
+        if let Some(p) = &mut profile {
+            p.mark("resolve_post");
         }
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
@@ -2061,6 +2252,10 @@ impl AreaRenderer {
                 depth_or_array_layers: 1,
             },
         );
+        if let Some(p) = &mut profile {
+            p.mark("copy_pixels");
+            p.resolve(&mut encoder);
+        }
         ctx.queue.submit([encoder.finish()]);
         let (tx, rx) = std::sync::mpsc::channel();
         readback.slice(..).map_async(wgpu::MapMode::Read, move |r| {
@@ -2094,6 +2289,9 @@ impl AreaRenderer {
         // Captures are opaque images.
         for px in out.chunks_exact_mut(4) {
             px[3] = 255;
+        }
+        if let Some(p) = profile {
+            p.finish(ctx, self.path)?;
         }
         Ok(out)
     }
