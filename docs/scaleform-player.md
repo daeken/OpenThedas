@@ -146,6 +146,10 @@ A new crate, `crates/thedas-gfx`, with no Ruffle dependency:
 - `MovieClip.duplicateMovieClip` constructs a fresh instance of the registered class with
   the source's transform, colour, drawing and clip events. The host can now add its Mod Mode
   button alongside Report Issue using the same menu setup on either backend.
+- Clicking editable/selectable text places the caret at the nearest character boundary.
+  Dragging extends the selection, including outside the field until release; Shift-click
+  retains its anchor. Picking uses the field's inverse world transform and the layout's
+  aligned, wrapped and scrolled character advances, including spaces and missing glyphs.
 - Remaining work includes complete text `shadowStyle`, native inline `<img>` layout,
   cached bitmap alpha masks, and broader interaction parity.
 - Tools: `cargo run -p thedas-ui --example sidebyside -- INSTALL OUT.png MOVIES [FRAMES]

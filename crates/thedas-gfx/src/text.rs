@@ -492,6 +492,31 @@ impl TextField {
         self.layout.as_ref().unwrap_or_else(|| unreachable!())
     }
 
+    /// The nearest insertion boundary at a point in the field's local pixel space.
+    pub fn index_at(&mut self, fonts: &dyn Fonts, x: f32, y: f32) -> usize {
+        let (bx, by, _, _) = self.bounds;
+        let scroll = self.scroll.max(1) as usize - 1;
+        let layout = self.layout(fonts);
+        let top_skip = layout.lines.get(scroll).map(|l| l.top).unwrap_or(GUTTER) - GUTTER;
+        let y = y - by + top_skip;
+        let Some(line) = layout
+            .lines
+            .iter()
+            .skip(scroll)
+            .find(|l| y < l.top + l.height)
+            .or_else(|| layout.lines.last())
+        else {
+            return 0;
+        };
+        let x = x - bx;
+        for c in &line.characters {
+            if x < c.x + c.advance * 0.5 {
+                return c.index;
+            }
+        }
+        line.end
+    }
+
     /// `maxscroll`: the last line that can be the first visible one.
     pub fn max_scroll(&mut self, fonts: &dyn Fonts) -> u32 {
         let h = self.bounds.3 - 2.0 * GUTTER;
@@ -1236,6 +1261,31 @@ mod tests {
         // Each char 5 px wide without fonts: "aaaa " is 25 px; a 60 px line fits two words.
         let l = layout(&t, &NoFonts);
         assert_eq!(l.lines.len(), 2);
+    }
+
+    #[test]
+    fn mouse_boundaries_include_alignment_spaces_empty_lines_and_scroll() {
+        let mut t = TextField::new(
+            Arc::new(EditText {
+                height: 200,
+                multiline: true,
+                ..Default::default()
+            }),
+            None,
+        );
+        t.bounds = (7.0, 9.0, 34.0, 14.0);
+        t.default_format.align = TextAlign::Center;
+        t.set_text("a Ω\r\rb");
+        assert_eq!(t.index_at(&NoFonts, 0.0, 12.0), 0);
+        assert_eq!(t.index_at(&NoFonts, 7.0 + 9.5 + 5.0, 12.0), 1);
+        assert_eq!(t.index_at(&NoFonts, 100.0, 12.0), 3);
+        assert_eq!(t.index_at(&NoFonts, 15.0, 22.0), 4);
+        t.scroll = 3;
+        assert_eq!(t.index_at(&NoFonts, 0.0, 12.0), 5);
+        assert_eq!(t.index_at(&NoFonts, 100.0, 100.0), 6);
+        t.set_text("");
+        t.scroll = 1;
+        assert_eq!(t.index_at(&NoFonts, 100.0, 12.0), 0);
     }
 
     #[test]
