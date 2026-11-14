@@ -208,8 +208,8 @@ pub fn display_get(vm: &mut Vm, d: DisplayId, name: &str) -> Option<Value> {
         "htmlText" => Value::from(t.html_text()),
         "html" => Value::Bool(t.html),
         "length" => Value::Number(t.len() as f64),
-        "textWidth" => Value::Number(t.layout(&*fonts).width.round() as f64),
-        "textHeight" => Value::Number(t.layout(&*fonts).height.round() as f64),
+        "textWidth" => Value::Number(t.layout(&*fonts).width.trunc() as f64),
+        "textHeight" => Value::Number(t.layout(&*fonts).height.trunc() as f64),
         "autoSize" => match t.auto_size {
             AutoSize::None => Value::from("none"),
             AutoSize::Left => Value::from("left"),

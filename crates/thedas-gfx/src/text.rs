@@ -849,16 +849,8 @@ pub fn parse_html(html: &str, base: &Format, _multiline: bool) -> Vec<Span> {
             }
         }
     }
-    // Flash drops the paragraph break a final `</p>` leaves.
-    if let Some(Span {
-        piece: Piece::Text(t),
-        ..
-    }) = out.last_mut()
-    {
-        if t.ends_with('\r') {
-            t.pop();
-        }
-    }
+    // Closing a paragraph retains its delimiter even at the end of the HTML.
+    // Empty authored paragraphs still occupy a line (e.g. upward-growing titles).
     out.retain(|s| !matches!(&s.piece, Piece::Text(t) if t.is_empty()));
     out
 }
@@ -868,7 +860,7 @@ struct Word {
     chars: Vec<(char, usize, usize)>,
     image: Option<(Image, usize, usize)>,
     /// Ends the paragraph.
-    newline: Option<usize>,
+    newline: Option<(usize, usize)>,
     space_after: bool,
 }
 
@@ -889,7 +881,8 @@ fn advance(font: Option<&Arc<Font>>, f: &Format, c: char) -> f32 {
         .map(|g| g.advance)
         .or_else(|| font.glyph(' ').map(|g| g.advance))
         .unwrap_or(font.em * 0.5);
-    adv * scale + f.letter_spacing
+    // AVM1's layout cursor advances in whole twips, including letter spacing.
+    (adv * scale * 20.0).trunc() / 20.0 + (f.letter_spacing * 20.0).trunc() / 20.0
 }
 
 /// Lays out `t`'s spans into lines. Provisional: follows Flash's rules as Ruffle documents
@@ -906,22 +899,23 @@ pub fn layout(t: &TextField, fonts: &dyn Fonts) -> Layout {
         newline: None,
         space_after: false,
     };
-    let flush = |cur: &mut Word, words: &mut Vec<Word>, newline: Option<usize>, space: bool| {
-        let w = std::mem::replace(
-            cur,
-            Word {
-                chars: Vec::new(),
-                image: None,
-                newline: None,
-                space_after: false,
-            },
-        );
-        words.push(Word {
-            newline,
-            space_after: space,
-            ..w
-        });
-    };
+    let flush =
+        |cur: &mut Word, words: &mut Vec<Word>, newline: Option<(usize, usize)>, space: bool| {
+            let w = std::mem::replace(
+                cur,
+                Word {
+                    chars: Vec::new(),
+                    image: None,
+                    newline: None,
+                    space_after: false,
+                },
+            );
+            words.push(Word {
+                newline,
+                space_after: space,
+                ..w
+            });
+        };
     let mut index = 0;
     for (fi, sp) in t.spans.iter().enumerate() {
         match &sp.piece {
@@ -938,7 +932,7 @@ pub fn layout(t: &TextField, fonts: &dyn Fonts) -> Layout {
                     let c = if t.password && c != '\r' { '*' } else { c };
                     match c {
                         '\r' | '\n' if t.multiline || t.html => {
-                            flush(&mut cur, &mut words, Some(index), false)
+                            flush(&mut cur, &mut words, Some((index, fi)), false)
                         }
                         '\r' | '\n' => {}
                         ' ' | '\t' => {
@@ -971,61 +965,77 @@ pub fn layout(t: &TextField, fonts: &dyn Fonts) -> Layout {
             .map(|&(c, fi, _)| advance(resolved[fi].as_ref(), &formats[fi], c))
             .sum()
     };
-    let emit = |words: &[&Word], first_in_para: bool, y: &mut f32, lines: &mut Vec<Line>| {
-        let fmt0 = words
-            .iter()
-            .find_map(|w| {
-                w.chars
-                    .first()
-                    .map(|c| c.1)
-                    .or(w.image.as_ref().map(|i| i.1))
-            })
-            .map(|i| formats[i].clone())
-            .unwrap_or_else(|| {
-                formats
-                    .last()
-                    .cloned()
-                    .unwrap_or_else(|| t.default_format.clone())
-            });
-        let mut ascent: f32 = 0.0;
-        let mut descent: f32 = 0.0;
+    let metrics = |f: &Format| {
+        if let Some(font) = font_for(fonts, f) {
+            let s = (f.size * 20.0).trunc() / font.em;
+            (
+                (font.ascent * s).trunc() / 20.0,
+                (font.descent * s).trunc() / 20.0,
+            )
+        } else {
+            (f.size * 0.8, f.size * 0.2)
+        }
+    };
+    let format_metrics: Vec<_> = formats.iter().map(&metrics).collect();
+    let mut last_span = None;
+    let mut line_format = t.default_format.clone();
+    let mut measured_height: f32 = 0.0;
+    let mut emit = |words: &[&Word], first_in_para: bool, y: &mut f32, lines: &mut Vec<Line>| {
+        // A newline within a span carries the first span's line metrics forward.
+        // A new span at the start of a line replaces them. In particular, text
+        // after a large HTML heading can still share that heading's line height.
+        let mut fmt0 = line_format.clone();
+        let (mut ascent, mut descent) = metrics(&fmt0);
         let mut leading: f32 = fmt0.leading;
         let mut any = false;
+        let mut content_descent: f32 = 0.0;
         for w in words {
-            for &(_, fi, _) in &w.chars {
-                any = true;
+            for fi in w.chars.iter().map(|c| c.1) {
+                content_descent = content_descent.max(format_metrics[fi].1);
+            }
+            for fi in w
+                .chars
+                .iter()
+                .map(|c| c.1)
+                .chain(w.image.as_ref().map(|i| i.1))
+                .chain(w.newline.map(|n| n.1))
+            {
                 let f = &formats[fi];
-                if let Some(font) = &resolved[fi] {
-                    let s = f.size / font.em;
-                    ascent = ascent.max(font.ascent * s);
-                    descent = descent.max(font.descent * s);
-                } else {
-                    ascent = ascent.max(f.size * 0.8);
-                    descent = descent.max(f.size * 0.2);
+                if last_span != Some(fi) {
+                    let (a, d) = format_metrics[fi];
+                    if !any {
+                        fmt0 = f.clone();
+                        ascent = a;
+                        descent = d;
+                        leading = f.leading;
+                    } else {
+                        ascent = ascent.max(a);
+                        descent = descent.max(d);
+                        leading = leading.max(f.leading);
+                    }
+                    last_span = Some(fi);
                 }
-                leading = leading.max(f.leading);
+                any = true;
             }
             if let Some((img, _, _)) = &w.image {
                 any = true;
                 ascent = ascent.max(img.height + img.vspace);
             }
         }
-        if !any {
-            let f = &fmt0;
-            let fi = resolved
-                .iter()
-                .zip(formats.iter())
-                .find(|(_, ff)| *ff == f)
-                .and_then(|(r, _)| r.clone())
-                .or_else(|| font_for(fonts, f));
-            if let Some(font) = fi {
-                let s = f.size / font.em;
-                ascent = font.ascent * s;
-                descent = font.descent * s;
-            } else {
-                ascent = f.size * 0.8;
-                descent = f.size * 0.2;
+        line_format = fmt0.clone();
+        if content_descent == 0.0 {
+            if let Some((_, fi)) = words.iter().find_map(|w| w.newline) {
+                content_descent = format_metrics[fi].1;
             }
+        }
+        if !any && t.input {
+            content_descent = descent;
+        }
+        if any || t.input {
+            measured_height = measured_height.max(
+                *y + ascent + content_descent - GUTTER
+                    + if lines.is_empty() { leading } else { 0.0 },
+            );
         }
         let indent = if first_in_para { fmt0.indent } else { 0.0 };
         let left = GUTTER + fmt0.left_margin + indent;
@@ -1059,7 +1069,7 @@ pub fn layout(t: &TextField, fonts: &dyn Fonts) -> Layout {
                         .first()
                         .map(|c| c.2)
                         .or(w.image.as_ref().map(|i| i.2))
-                        .or(w.newline)
+                        .or(w.newline.map(|n| n.0))
                 })
                 .unwrap_or(t.len()),
             end: words
@@ -1067,6 +1077,7 @@ pub fn layout(t: &TextField, fonts: &dyn Fonts) -> Layout {
                 .rev()
                 .find_map(|w| {
                     w.newline
+                        .map(|n| n.0)
                         .or(w.chars.last().map(|c| c.2 + 1))
                         .or(w.image.as_ref().map(|i| i.2 + 1))
                 })
@@ -1175,16 +1186,13 @@ pub fn layout(t: &TextField, fonts: &dyn Fonts) -> Layout {
     {
         emit(&line_words, para_start, &mut y, &mut lines);
     }
-    // Flash does not count the last line's leading in textHeight.
+    // Leading contributes once even for a single line. A trailing empty line
+    // remains available for caret placement but adds no measured height.
     let width = lines.iter().map(|l| l.width).fold(0.0, f32::max);
-    let height = lines
-        .last()
-        .map(|l| l.top + l.ascent + (l.height - l.ascent) - GUTTER)
-        .unwrap_or(0.0);
     Layout {
         lines,
         width,
-        height,
+        height: measured_height,
     }
 }
 
@@ -1223,7 +1231,7 @@ mod tests {
                 Piece::Image(_) => "",
             })
             .collect();
-        assert_eq!(text, "Hi & bye\rx");
+        assert_eq!(text, "Hi & bye\rx\r");
         assert_eq!(s[0].piece, Piece::Text("Hi & ".into()));
         assert_eq!(s[0].format.color, [255, 0, 0]);
         assert_eq!(s[0].format.size, 20.0);
@@ -1231,7 +1239,7 @@ mod tests {
         assert!(s[1].format.bold);
         assert_eq!(s[1].piece, Piece::Text("bye".into()));
         let last = s.last().unwrap_or_else(|| unreachable!());
-        assert_eq!(last.piece, Piece::Text("x".into()));
+        assert_eq!(last.piece, Piece::Text("x\r".into()));
         assert!(!last.format.bold);
     }
 
@@ -1240,6 +1248,83 @@ mod tests {
         fn font(&self, _: &str, _: bool, _: bool) -> Option<Arc<Font>> {
             None
         }
+    }
+
+    #[test]
+    fn measured_height_keeps_empty_caret_lines_without_counting_them() {
+        let mut t = TextField::new(
+            Arc::new(EditText {
+                height: 200,
+                multiline: true,
+                read_only: true,
+                ..Default::default()
+            }),
+            None,
+        );
+        t.default_format.leading = 2.0;
+        for (text, height, count) in [
+            ("", 0.0, 1),
+            ("a", 12.0, 1),
+            ("a\rb", 22.0, 2),
+            ("a\r\rb", 34.0, 3),
+            ("a\r", 12.0, 2),
+        ] {
+            t.set_text(text);
+            let l = t.layout(&NoFonts);
+            assert_eq!(l.height, height, "{text:?}");
+            assert_eq!(l.lines.len(), count, "{text:?}");
+        }
+        t.input = true;
+        for (text, height) in [("", 12.0), ("a\r", 22.0)] {
+            t.set_text(text);
+            assert_eq!(t.layout(&NoFonts).height, height);
+        }
+    }
+
+    #[test]
+    fn empty_html_paragraphs_keep_their_height_and_trailing_delimiter() {
+        let mut t = TextField::new(
+            Arc::new(EditText {
+                height: 200,
+                multiline: true,
+                read_only: true,
+                ..Default::default()
+            }),
+            None,
+        );
+        for (html, text, height) in [
+            ("<p></p>", "\r", 10.0),
+            ("<p>x</p>", "x\r", 10.0),
+            ("<p>x</p><p></p>", "x\r\r", 20.0),
+        ] {
+            t.set_html(html);
+            assert_eq!(t.text(), text);
+            assert_eq!(t.layout(&NoFonts).height, height);
+        }
+    }
+
+    #[test]
+    fn heading_metrics_carry_within_a_span_but_reset_at_a_new_span() {
+        let mut t = TextField::new(
+            Arc::new(EditText {
+                height: 200,
+                multiline: true,
+                ..Default::default()
+            }),
+            None,
+        );
+        t.set_html("<font size='20'>A</font>\rB");
+        let l = t.layout(&NoFonts);
+        assert_eq!(
+            l.lines.iter().map(|l| l.height).collect::<Vec<_>>(),
+            [20.0, 20.0]
+        );
+        t.set_html("<font size='20'>A</font>\r<font size='12'>B</font>");
+        let l = t.layout(&NoFonts);
+        assert_eq!(
+            l.lines.iter().map(|l| l.height).collect::<Vec<_>>(),
+            [20.0, 12.0]
+        );
     }
 
     #[test]
