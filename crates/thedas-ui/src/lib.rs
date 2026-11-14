@@ -536,6 +536,10 @@ pub struct UiMovie {
     multiply_texture: Option<wgpu::Texture>,
     above_texture: Option<wgpu::Texture>,
     own_texture: Option<wgpu::Texture>,
+    /// The mouse is in the window (see [`UiMovie::mouse_move`]).
+    mouse_in: bool,
+    /// The mouse moved, or a button or the wheel was used, since the last tick.
+    mouse_stirred: bool,
 }
 
 /// Clips a movie draws with the `multiply` blend onto what is under the interface (the
@@ -743,6 +747,8 @@ impl UiMovie {
             multiply_texture: None,
             above_texture: None,
             own_texture: None,
+            mouse_in: false,
+            mouse_stirred: false,
         })
     }
 
@@ -1000,7 +1006,11 @@ impl UiMovie {
     /// Advances the movie by `dt_ms` of wall time and runs pending loads.
     pub fn tick(&mut self, dt_ms: f64) {
         self.executor.run();
-        self.with_player(|p| p.tick(FloatDuration::from_millis(dt_ms)));
+        let pick = self.picks();
+        self.with_player(|p| {
+            p.set_mouse_in_stage(pick);
+            p.tick(FloatDuration::from_millis(dt_ms));
+        });
         self.after_step();
         self.executor.run();
     }
@@ -1008,9 +1018,25 @@ impl UiMovie {
     /// Runs exactly one movie frame, independent of time.
     pub fn run_frame(&mut self) {
         self.executor.run();
-        self.with_player(|p| p.run_frame());
+        let pick = self.picks();
+        self.with_player(|p| {
+            p.set_mouse_in_stage(pick);
+            p.run_frame();
+        });
         self.after_step();
         self.executor.run();
+    }
+
+    /// Whether the player should look for what the mouse is over as it runs frames: it
+    /// does after every frame (Ruffle's `update_mouse_state`, a walk of every clip, most of
+    /// a HUD movie's time), but with the mouse outside the window there is nothing to find,
+    /// and with the mouse still since the last tick, while something is hovered, the player
+    /// keeps that hover without looking (it skips hover changes then; a hovered clip that
+    /// is hidden still loses it). So it looks only on a tick after the mouse stirred.
+    /// Provisional: a clip that comes under a still mouse, with nothing hovered before, is
+    /// hovered only once the mouse moves (Flash would hover it on its next frame).
+    fn picks(&mut self) -> bool {
+        self.mouse_in && std::mem::take(&mut self.mouse_stirred)
     }
 
     /// Renders the current frame into the texture.
@@ -1227,12 +1253,13 @@ impl UiMovie {
 
     pub fn mouse_move(&mut self, x: f64, y: f64) {
         self.with_player(|p| {
-            // The player looks for what the mouse is over after every frame it runs, a walk
-            // of every clip (most of a HUD movie's time a frame); while the mouse is outside
-            // the window there is nothing to find.
+            // In the window: the player looks for what the mouse is over (see
+            // `UiMovie::picks`).
             p.set_mouse_in_stage(true);
             p.handle_event(PlayerEvent::MouseMove { x, y })
         });
+        self.mouse_in = true;
+        self.mouse_stirred = true;
     }
 
     /// The mouse left the window: what it was over hears it leave (`onRollOut`), and the
@@ -1242,11 +1269,14 @@ impl UiMovie {
             p.handle_event(PlayerEvent::MouseLeave);
             p.set_mouse_in_stage(false);
         });
+        self.mouse_in = false;
     }
 
     /// The mouse wheel turned `lines` (up positive) with the mouse at (`x`, `y`): the movie's
     /// `onMouseWheel` listeners and the scrollable under the mouse hear it.
     pub fn mouse_wheel(&mut self, x: f64, y: f64, lines: f64) {
+        self.mouse_in = true;
+        self.mouse_stirred = true;
         self.with_player(|p| {
             p.set_mouse_in_stage(true);
             p.handle_event(PlayerEvent::MouseMove { x, y });
@@ -1283,6 +1313,8 @@ impl UiMovie {
 
     pub fn mouse_button(&mut self, x: f64, y: f64, down: bool) {
         let button = MouseButton::Left;
+        self.mouse_in = true;
+        self.mouse_stirred = true;
         if down {
             let ev = PlayerEvent::MouseDown {
                 x,
