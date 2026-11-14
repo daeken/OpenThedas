@@ -126,7 +126,7 @@ room indices, SSAO depth and posed point-shadow geometry with the bodies.
 
 This is our deferred material approximation, not shader parity: character rim lighting,
 skin scattering, gore/heraldry and remote-material effects are not represented yet. Hair,
-alpha-tested and blended materials, lower-detail Char2 and other unsupported families
+unsupported alpha-tested and blended materials, lower-detail Char2 and other unsupported families
 still draw forward; they also remain absent from deferred point-shadow casters. Tangent
 frames still come from derivatives. Probe assignments remain those made at scene load.
 The float lightmap target may change baked-image rounding slightly.
