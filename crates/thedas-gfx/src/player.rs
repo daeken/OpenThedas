@@ -117,6 +117,8 @@ impl Player {
             pick_dirty: true,
             budget: 0,
             call_depth: 0,
+            script_depth: 0,
+            script_stopped: false,
             fonts,
             warned: HashSet::new(),
             dragging: None,
@@ -2151,6 +2153,100 @@ mod queue_tests {
         (p, field)
     }
 
+    fn script_function(p: &mut Player, name: &str, code: crate::swf::Actions) -> Value {
+        use crate::avm1::object::{CodeFn, Func};
+        use crate::avm1::{Scope, ScopeKind};
+        use std::rc::Rc;
+        let end = code.len();
+        let function = p.vm.make_function_object(Func::Code(Rc::new(CodeFn {
+            name: Str::from(name),
+            code,
+            start: 0,
+            end,
+            params: vec![],
+            v2: None,
+            pool: Rc::new(vec![]),
+            scope: Rc::new(Scope {
+                object: p.vm.global,
+                kind: ScopeKind::Global,
+                parent: None,
+            }),
+            target: Some(p.vm.root),
+        })));
+        let value = Value::Object(function);
+        p.vm.define(p.vm.global, name, value.clone(), 0);
+        value
+    }
+
+    fn call_then_trace(name: &str, message: &str) -> crate::swf::Actions {
+        // Push the argument count and function name, call, discard the result, trace.
+        let mut code = vec![0x96];
+        code.extend_from_slice(&((name.len() + 7) as u16).to_le_bytes());
+        code.extend_from_slice(&[7, 0, 0, 0, 0, 0]);
+        code.extend_from_slice(name.as_bytes());
+        code.extend_from_slice(&[0, 0x3d, 0x17]);
+        code.extend_from_slice(&trace(message));
+        Arc::from(code)
+    }
+
+    fn with_script_stack(test: impl FnOnce() + Send + 'static) {
+        // Exercise the VM recursion guard rather than the test worker's small stack.
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(test)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn recursion_limit_unwinds_the_action_list_and_later_calls_recover() {
+        with_script_stack(|| {
+            let (mut p, _) = input_player();
+            let recursive =
+                script_function(&mut p, "recursive", call_then_trace("recursive", "after"));
+            p.vm.call(&recursive, Value::Undefined, &[]);
+            assert_eq!(p.drain_log(), ["warning: call stack overflow"]);
+            assert_eq!(p.vm.call_depth, 0);
+            assert_eq!(p.vm.script_depth, 0);
+            let recovery = script_function(&mut p, "recovery", trace("recovered"));
+            p.vm.call(&recovery, Value::Undefined, &[]);
+            assert_eq!(p.drain_log(), ["trace: recovered"]);
+        });
+    }
+
+    #[test]
+    fn nested_timeline_actions_share_the_budget_and_later_frames_recover() {
+        let (mut p, _) = input_player();
+        let nested = p.vm.new_native(|vm, _, _| {
+            vm.budget = crate::avm1::OP_BUDGET;
+            interp::run_actions(vm, &trace("nested"), vm.root);
+            Value::Undefined
+        });
+        p.vm.define(p.vm.global, "nested", Value::Object(nested), 0);
+        let outer = script_function(&mut p, "outer", call_then_trace("nested", "after"));
+        p.vm.call(&outer, Value::Undefined, &[]);
+        assert_eq!(p.drain_log(), ["warning: script ran too long; stopped"]);
+        assert_eq!(p.vm.script_depth, 0);
+        let root = p.vm.root;
+        interp::run_actions(&mut p.vm, &trace("next frame"), root);
+        assert_eq!(p.drain_log(), ["trace: next frame"]);
+    }
+
+    #[test]
+    fn a_watcher_limit_preserves_the_assigned_value() {
+        with_script_stack(|| {
+            let (mut p, _) = input_player();
+            let recursive =
+                script_function(&mut p, "recursive", call_then_trace("recursive", "after"));
+            let object = Value::Object(p.vm.new_object());
+            p.vm.call_method(&object, "watch", &[Value::from("value"), recursive]);
+            p.vm.set(&object, "value", Value::Number(42.0));
+            assert_eq!(p.vm.get(&object, "value"), Value::Number(42.0));
+            assert_eq!(p.drain_log(), ["warning: call stack overflow"]);
+        });
+    }
+
     #[test]
     fn display_positions_truncate_twips_and_preserve_repeated_scroll_steps() {
         let (mut p, field) = input_player();
@@ -2997,6 +3093,54 @@ mod queue_tests {
         p.vm.call_method(&target, "attachBitmap", &[bitmap, Value::Number(1.0)]);
         assert!(p.vm.display.get(old).is_none());
         assert_eq!(p.vm.display.get(root).unwrap().children.len(), 1);
+    }
+
+    #[test]
+    fn array_sort_ties_follow_flash_partition_order_and_descending_reversal() {
+        let (mut p, _) = input_player();
+        for (sort_on, descending, expected) in [
+            (false, false, vec![3, 1, 0, 2, 4]),
+            (false, true, vec![4, 2, 0, 1, 3]),
+            (true, false, vec![3, 1, 0, 2, 4]),
+        ] {
+            let mut rows = Vec::new();
+            for (id, rank) in [1, 0, 1, 0, 1].into_iter().enumerate() {
+                let row = Value::Object(p.vm.new_object());
+                p.vm.set(&row, "id", Value::Number(id as f64));
+                p.vm.set(&row, "rank", Value::Number(rank as f64));
+                rows.push(row);
+            }
+            let array = Value::Object(p.vm.new_array(rows));
+            if sort_on {
+                p.vm.call_method(
+                    &array,
+                    "sortOn",
+                    &[Value::from("rank"), Value::Number(16.0)],
+                );
+            } else {
+                let comparator = p.vm.new_native(|vm, _, args| {
+                    let a = vm.get(&args[0], "rank");
+                    let b = vm.get(&args[1], "rank");
+                    Value::Number(vm.to_number(&a) - vm.to_number(&b))
+                });
+                p.vm.call_method(
+                    &array,
+                    "sort",
+                    &[
+                        Value::Object(comparator),
+                        Value::Number(if descending { 2.0 } else { 0.0 }),
+                    ],
+                );
+            }
+            let ids: Vec<_> = (0..5)
+                .map(|i| {
+                    let row = p.vm.get(&array, &i.to_string());
+                    let id = p.vm.get(&row, "id");
+                    p.vm.to_number(&id) as i32
+                })
+                .collect();
+            assert_eq!(ids, expected);
+        }
     }
 
     #[test]

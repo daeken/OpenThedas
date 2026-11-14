@@ -141,6 +141,9 @@ pub struct Vm {
     pub budget: u64,
     /// Depth of nested calls, to stop runaway recursion.
     pub call_depth: u32,
+    /// Nested bytecode/native/timeline entries sharing one action list's limits.
+    pub(crate) script_depth: u32,
+    pub(crate) script_stopped: bool,
     pub fonts: Arc<dyn crate::text::Fonts>,
     /// Images loaded into clips, by clip.
     pub warned: HashSet<String>,
@@ -155,6 +158,26 @@ pub struct Vm {
 pub const OP_BUDGET: u64 = 20_000_000;
 
 impl Vm {
+    pub(crate) fn enter_script(&mut self) -> bool {
+        if self.script_depth == 0 {
+            self.budget = 0;
+            self.script_stopped = false;
+        } else if self.script_stopped {
+            return false;
+        }
+        self.script_depth += 1;
+        true
+    }
+
+    pub(crate) fn leave_script(&mut self) {
+        self.script_depth -= 1;
+    }
+
+    pub(crate) fn stop_script(&mut self, reason: &str) {
+        self.script_stopped = true;
+        self.warn_once(reason.into());
+    }
+
     pub fn warn_once(&mut self, msg: String) {
         if self.warned.insert(msg.clone()) {
             log::debug!("gfx {}: {msg}", self.name);
@@ -497,7 +520,12 @@ impl Vm {
         });
         if let Some((f, data)) = watch {
             let old = self.get(v, name);
-            val = self.call(&f, v.clone(), &[Value::from(name), old, val, data]);
+            let result = self.call(&f, v.clone(), &[Value::from(name), old, val.clone(), data]);
+            // Execution-limit errors leave the incoming assignment in place, as Flash
+            // does when a watcher fails, rather than treating the error as its return.
+            if !self.script_stopped {
+                val = result;
+            }
         }
         // An accessor anywhere up the chain takes the write.
         if let Some((_, p)) = self.lookup(o, name) {
@@ -615,8 +643,12 @@ impl Vm {
             Some(Kind::Function(func)) => func.clone(),
             _ => return Value::Undefined,
         };
+        if !self.enter_script() {
+            return Value::Undefined;
+        }
         if self.call_depth > 250 {
-            self.warn_once("call stack overflow".into());
+            self.stop_script("call stack overflow");
+            self.leave_script();
             return Value::Undefined;
         }
         self.call_depth += 1;
@@ -625,6 +657,7 @@ impl Vm {
             Func::Code(code) => interp::call_code(self, *fo, &code, this, args, base),
         };
         self.call_depth -= 1;
+        self.leave_script();
         r
     }
 
