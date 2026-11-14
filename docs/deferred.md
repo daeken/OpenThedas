@@ -116,7 +116,7 @@ room indices, SSAO depth and posed point-shadow geometry with the bodies.
 This is our deferred material approximation, not shader parity: character rim lighting,
 skin scattering, gore/heraldry and remote-material effects are not represented yet. Hair,
 alpha-tested and blended materials, lower-detail Char2 and other unsupported families
-still draw forward; they also remain absent from deferred point-shadow casters. Tangent
+still draw forward; the known cutouts described below can supply point-shadow coverage. Tangent
 frames still come from derivatives. Probe assignments remain those made at scene load.
 The float lightmap target may change baked-image rounding slightly.
 
@@ -179,7 +179,7 @@ debug views now include the ground. Terrain also joins the point-shadow caster l
   visibility. At most 24 face passes per frame.
   `THEDAS_DEFERRED_POINT_SHADOWS=0` disables both rendering and sampling these maps for
   captures and cost comparisons; it does not change the faithful path.
-- Forward cutouts: known Origins `Static1_Punch`, `Eye0/Eyelash0`, and the
+- Forward cutouts: known Origins `Static1_Punch`, `Prop1_Punch`, `Eye0/Eyelash0`, and the
   colour-disabled `Hair0_Pass1` depth core also cast into point-light cubes, independently
   of G-buffer coverage and `THEDAS_DEFERRED_OBJECTS`. Geometry retains UVs, morphs and the
   current four-weight pose. The opacity map, sampler address/filter/mip states, opacity
@@ -187,6 +187,13 @@ debug views now include the ground. Terrain also joins the point-shadow caster l
   clips diffuse alpha times opacity below 0.3; hair takes opacity from the packed
   texture's blue channel and admits only its depth core's `>= 255` coverage. All visible
   hair passes remain forward and are not suppressed. Eyelashes take diffuse alpha.
+  Authored prop punch and eyelash passes also blend colour while writing tested depth.
+  Their ordinary source-alpha blend is accepted for point-shadow coverage, while their
+  colour passes stay forward. Prop punch retains its additional 0.3 shader clip; eyelash
+  coverage retains the authored reference (normally 20). Other blend equations, missing
+  tests, disabled depth/write, and unknown material families do not qualify. The cube
+  stores binary occlusion after the tests, not fractional transmission through surviving
+  texels. `THEDAS_DEFERRED_BLENDED_CUTOUTS=0` restores the earlier exclusion of blends.
   Casts are deduplicated per scene draw; explicit no-cast flags, current posed bounds,
   fade-outs and cutaway exclusions still apply. Missing opacity maps do not become
   rectangular casters. `THEDAS_DEFERRED_CUTOUT_SHADOWS=0` disables just these additions
