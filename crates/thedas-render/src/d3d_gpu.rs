@@ -2413,6 +2413,113 @@ impl D3dPass {
         ]
     }
 
+    /// Tree geometry at the viewing camera's LOD, independent of its frustum and
+    /// instance groups. Offscreen placements can still shadow an on-screen receiver.
+    pub(crate) fn tree_shadow_geometry<'a>(
+        &'a self,
+        d: &'a D3dDraw,
+        count: u32,
+        camera: &Camera,
+    ) -> Option<DrawGeometry<'a>> {
+        if self.is_faded(d) || d.lod.is_some_and(|l| !l.shown(camera.position)) {
+            return None;
+        }
+        let indices = match self.tree_lods.get(d.draw).and_then(Option::as_ref) {
+            Some(lod) => {
+                let (first, n, _) = lod.frame(camera.position)?;
+                first..first.saturating_add(n).min(count)
+            }
+            None => 0..count,
+        };
+        (!indices.is_empty()).then_some(DrawGeometry {
+            vertices: &d.vertices,
+            constants: &d.consts,
+            textures: &d.textures,
+            indices,
+            instances: 0..1,
+        })
+    }
+
+    /// A snapshot of the already-stepped winds; reading it never advances simulation.
+    pub(crate) fn tree_shadow_winds(&self) -> Vec<crate::d3d::WindFrame> {
+        self.winds
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|wind| crate::d3d::WindFrame {
+                matrices: wind.matrices(),
+                leaf_angles: wind
+                    .leaf_angles()
+                    .map(|(rock, rustle)| [rock.to_radians(), rustle.to_radians()]),
+            })
+            .collect()
+    }
+
+    /// Fill an independent tree vertex stream with an identity view-projection.
+    /// Keep the viewing direction for leaf cards, and the same placement/wind data
+    /// even when the faithful pass did not upload this offscreen draw's constants.
+    pub(crate) fn tree_shadow_constants(
+        &self,
+        d: &D3dDraw,
+        camera: &Camera,
+        winds: &[crate::d3d::WindFrame],
+    ) -> Option<(StageConstants, f32)> {
+        let tree = self.trees.get(d.draw)?.as_ref()?;
+        let (world, lightmap, material) = self.worlds.get(d.draw)?;
+        let lights = DrawLights::default();
+        let view = camera.view();
+        let context = ConstantContext {
+            view,
+            projection: view.inverse(),
+            world: *world,
+            camera: camera.position,
+            material: self.materials.get(*material)?,
+            lightmap: lightmap.as_ref(),
+            lights: &lights,
+            ambient: Vec3::ZERO,
+            bones: &[],
+            irradiance: None,
+            sun: self.sun,
+            fog: self.fog,
+            sky: self.sky.as_ref(),
+            clouds: self.clouds,
+            time: *self.wind_time.lock().unwrap_or_else(|e| e.into_inner()),
+            shadow: crate::d3d::NO_SHADOW_DATA,
+            partition: None,
+            tree: Some(tree),
+            winds,
+        };
+        let program = self.program(d);
+        let mut constants = context.fill(program.vs.ctab.as_ref());
+        // Avoid camera-dependent roundoff in inverse(view) * view. This also
+        // keeps a stationary cube reusable when only the camera position moves.
+        for constant in program.vs.ctab.as_ref()?.constants.iter() {
+            if crate::d3d::parameters(context.material).any(|parameter| {
+                parameter.name.eq_ignore_ascii_case(&constant.name)
+                    && parameter.usage.as_deref() == Some("ViewProjection")
+            }) {
+                let first = constant.register as usize;
+                constants
+                    .floats
+                    .get_mut(first..first + 4)?
+                    .copy_from_slice(&glam::Mat4::IDENTITY.to_cols_array_2d());
+            }
+        }
+        for &(register, value) in &program.vs.interface.float_defs {
+            if let Some(slot) = constants.floats.get_mut(register as usize) {
+                *slot = value;
+            }
+        }
+        let reference = match self.tree_lods.get(d.draw).and_then(Option::as_ref) {
+            Some(lod) => lod.frame(camera.position)?.2,
+            None => program
+                .pass
+                .alpha_test
+                .map_or(0.0, |(_, reference)| reference as f32),
+        };
+        Some((constants, reference))
+    }
+
     pub(crate) fn geometry<'a>(&'a self, d: &'a D3dDraw, count: u32) -> Option<DrawGeometry<'a>> {
         let (constants, indices, instances) = if d.instanced {
             let inst = self.instancing.lock().unwrap_or_else(|e| e.into_inner());

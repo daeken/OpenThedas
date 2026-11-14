@@ -95,6 +95,14 @@ The player lives in `crates/thedas-gfx`:
    insertion caret. Focused ranges draw white text over black highlights; an input caret
    blinks at 500 ms intervals, resets on edits/navigation, and disappears on focus loss.
    Blink boundaries invalidate the picture without discarding the cached text layout.
+   AVM1 text measurements truncate to pixels after laying out in twips. Empty fields
+   with dynamic text measure zero while retaining a caret line; a trailing empty
+   dynamic line adds no measured height. Input fields retain that line's height.
+   Closing multiline HTML paragraphs retain their delimiters, including empty
+   paragraphs; single-line fields ignore paragraph and break tags.
+   Leading is included once for a single line, and between subsequent lines.
+   A newline within an HTML span carries the first span's line metrics forward until
+   another span begins at a line boundary, matching the credits' mixed-size headings.
 5. **`render`**: wgpu. Shapes are tessellated once per character (lyon) into cached vertex
    buffers; bitmaps (atlas DDS pages) uploaded once; scale9 drawn natively. Colour transform
    and blend mode per draw; multiply and the few other modes against the scene picture,
@@ -114,6 +122,13 @@ The player lives in `crates/thedas-gfx`:
 - Every movie opened by `thedas-ui::Stage` uses `thedas-gfx` directly from its GFx bytes.
   There is no backend selector or fallback player.
 - Unknown opcodes, tags or built-ins are logged once per movie.
+- `Mouse.getTopMostEntity(false)` finds the deepest enabled clip with mouse
+  handlers, skipping decorative labels above picker buttons. `true` and the
+  existing no-argument behavior include noninteractive geometry and text fields.
+- Global Mouse down/up listeners receive the physical button (1/2/3), even on
+  double clicks. Native button/clip press/release events are left-only; DAO's
+  button handlers receive 5 for a double left click. The movie's extended global
+  listener implements right/middle actions without a second native delivery.
 - Execution limits stop the remaining bytecode and nested calls in the current
   action list. Later independent calls and timeline actions start with fresh limits;
   nested timeline actions share their caller's operation budget. A failed watcher
