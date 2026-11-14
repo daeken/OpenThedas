@@ -5,13 +5,13 @@
 //! `packages/core/override` in the player's documents folder (0) and in the install (1), add-ins
 //! (9000 and below), the player's own copies of the campaign and core folders (20000 to
 //! 20007), the campaign (50000s), core (100000s). The order inside one package (loose files,
-//! archives, patch, override) is still xoreos's and provisional, as is the order between
-//! add-ins (by the `Priority` attribute in their manifests).
+//! archives, patch, override) follows the Origins source priorities below; Dragon Age II
+//! retains xoreos's order. Add-ins follow their registry's order (see `sort_addins`).
 
 use std::path::{Path, PathBuf};
 
 use crate::path::{join_ci, resolve_ci};
-use crate::vfs::{Vfs, collect_files, is_archive};
+use crate::vfs::{Vfs, collect_files, container_key, is_archive};
 use crate::{Error, Result};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -564,12 +564,17 @@ fn push_package(
 /// higher rank at the same priority, and of two sources of one priority the lower rank wins:
 /// a loose file beats an archive of the same folder, and archives of one folder go by path,
 /// the greater path winning. So here: audio, then `data` (its archives, then its loose
-/// files, and the loose `abilities`, `movies`, `talktables` and `cursors` folders with them),
+/// files, including every subfolder's loose files in source-path order),
 /// then `textures`, then `patch`.
 ///
-/// Provisional: that the loose `data` subfolders sit at `data`'s priority (the original
-/// registers other folders for them that were not traced), and that `.rim` archives sort
-/// with the `.erf` ones (the original hands a `.rim` to another registry, 0x4c7b00).
+/// The `data` source is the rank-1 directory factory (0x4d0150). Its scan registers each
+/// child directory with the parent's priority (0x4cf89c..0x4cf977), recursively; the greater
+/// UTF-16 folder path wins, just as in an override folder. The separate final flag controls
+/// change notifications (0x4cfdd0), not whether subfolders are scanned.
+///
+/// Provisional: `.rim` archives here are still eagerly mounted; the original records their
+/// names for explicit loading instead (0x4c7b00). Nested `.erf` discovery and the original's
+/// `toolset`/`resmetrics` scan exclusions are not yet reproduced by this package loader.
 fn push_origins_package(
     vfs: &mut Vfs,
     dir: &Path,
@@ -593,14 +598,22 @@ fn push_origins_package(
     loose(vfs, "audio", true)?;
     archives(vfs, "data")?;
     archives(vfs, "data/abilities")?;
-    for sub in [
-        "data",
-        "data/abilities",
-        "data/movies",
-        "data/talktables",
-        "data/cursors",
-    ] {
-        loose(vfs, sub, false)?;
+    let data = join_ci(dir, "data");
+    if data.is_dir() {
+        let mut files = Vec::new();
+        collect_files(&data, true, &mut files)?;
+        let mut folders: Vec<PathBuf> = files
+            .iter()
+            .filter_map(|p| p.parent().map(Path::to_path_buf))
+            .chain([data.clone()])
+            .collect();
+        folders.sort_by_cached_key(|p| container_key(&data, p, true));
+        folders.dedup();
+        // Keep each folder a separate source, so GDA worksheet listing also follows the
+        // folder precedence, including when two differently named worksheets share row ids.
+        for folder in folders {
+            vfs.push_directory(&folder, false, label(&folder))?;
+        }
     }
     archives(vfs, &format!("textures/{}", quality.dir()))?;
     loose(vfs, "textures", true)?;
@@ -1231,6 +1244,33 @@ mod tests {
             "patch beats data; loose beats archive"
         );
         assert_eq!(read("d.gda"), "patch p0");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn data_subfolders_share_the_data_priority_and_use_source_path_order() {
+        let root = std::env::temp_dir().join(format!("thedas-data-folders-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let data = root.join("packages/core/data");
+        for sub in ["", "cursors", "talktables", "Z", "a/deep"] {
+            std::fs::create_dir_all(data.join(sub)).unwrap();
+            std::fs::write(data.join(sub).join("shared.txt"), sub.as_bytes()).unwrap();
+        }
+        std::fs::write(data.join("a/deep/only_deep.txt"), b"nested").unwrap();
+        let textures = root.join("packages/core/textures");
+        std::fs::create_dir_all(&textures).unwrap();
+        std::fs::write(textures.join("only_deep.txt"), b"textures").unwrap();
+        let vfs = DaoInstall::open(&root)
+            .unwrap()
+            .global_vfs(TextureQuality::High)
+            .unwrap();
+        assert_eq!(vfs.read("shared.txt").unwrap().0, b"talktables");
+        assert_eq!(vfs.read("only_deep.txt").unwrap().0, b"textures");
+        assert!(
+            vfs.hits("only_deep.txt")
+                .iter()
+                .any(|p| p.file.ends_with("a/deep/only_deep.txt"))
+        );
         std::fs::remove_dir_all(&root).unwrap();
     }
 
