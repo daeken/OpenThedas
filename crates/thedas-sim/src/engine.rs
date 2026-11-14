@@ -3216,7 +3216,7 @@ pub fn call(
             h.sim.world.autosave_requested = true;
             void()
         }
-        "TakeScreenshot" | "SetCreatureGoreLevel" => {
+        "TakeScreenshot" => {
             h.sim.world.trace.push(TraceEntry::Log {
                 t,
                 channel: -3,
@@ -3332,18 +3332,10 @@ pub fn call(
                 "GetCombatantType" => "Combatant",
                 _ => "Appearance",
             };
-            // The hero is in the active party without ever being given a state (creature_core
-            // rewards XP only to party members whose state is set). Provisional: ACTIVE.
-            let hero_default = if name == "GetFollowerState" && Some(obj(a, 0)) == h.sim.world.hero
-            {
-                constant(&h.sim.table, "FOLLOWER_STATE_ACTIVE")
-            } else {
-                0
-            };
             ok(Value::Int(
                 h.object(obj(a, 0))
                     .and_then(|o| o.fields.get(field).copied())
-                    .unwrap_or(hero_default),
+                    .unwrap_or(0),
             ))
         }
         "GetCreatureGender" => ok(Value::Int(
@@ -4515,18 +4507,10 @@ pub fn call(
             } else {
                 "MaterialProgress"
             };
-            // The hero is in the active party without ever being given a state (creature_core
-            // rewards XP only to party members whose state is set). Provisional: ACTIVE.
-            let hero_default = if name == "GetFollowerState" && Some(obj(a, 0)) == h.sim.world.hero
-            {
-                constant(&h.sim.table, "FOLLOWER_STATE_ACTIVE")
-            } else {
-                0
-            };
             ok(Value::Int(
                 h.object(obj(a, 0))
                     .and_then(|o| o.fields.get(field).copied())
-                    .unwrap_or(hero_default),
+                    .unwrap_or(0),
             ))
         }
         "SetAimLoopDuration" => {
