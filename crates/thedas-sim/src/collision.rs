@@ -562,6 +562,25 @@ impl Collision {
         c
     }
 
+    /// Collision of triangles, each its own static mesh shape of sound material
+    /// `material` (for other crates' tests).
+    #[doc(hidden)]
+    pub fn from_shapes_for_tests(tris: Vec<[V; 3]>, material: u8) -> Self {
+        let n = tris.len();
+        Self::build_shapes(
+            tris.into_iter().map(Prim::Tri).collect(),
+            (0..n as u32).collect(),
+            (0..n)
+                .map(|_| ShapeInfo {
+                    mask: thedas_formats::phy::mask::STATIC,
+                    material,
+                    object: None,
+                    outline: Outline::Mesh,
+                })
+                .collect(),
+        )
+    }
+
     /// A shape a [`RayHit`] names.
     pub fn shape(&self, i: usize) -> Option<&ShapeInfo> {
         self.shapes.get(i)

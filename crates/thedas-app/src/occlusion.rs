@@ -127,6 +127,13 @@ pub fn edge_angle(outline: &Outline, from: V, to: V, hit: V) -> Option<f32> {
     }
 }
 
+/// How close to a sound a hit may be and still count as between it and the listener
+/// (metres). Provisional, not traced: a sound placed on a surface (footsteps at the feet, on
+/// the floor) or inside the thing that makes it (a door's opening sound at the door's
+/// centre) would otherwise be occluded by that surface, and by a hair's breadth either way
+/// from frame to frame (QA saw footsteps at a doorway flip between clear and blocked).
+pub const AT_SOURCE: f32 = 0.3;
+
 /// What a ray crossed, for [`occlusion`].
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Crossed {
@@ -185,16 +192,24 @@ pub struct Occluders {
 impl Occluders {
     /// The occlusion of a sound at `to` heard from `from` (0 when they are within 0.05 m,
     /// 0x5b7362).
+    ///
+    /// Hits within [`AT_SOURCE`] of the sound are left out: they are the surface the sound
+    /// stands on (a footstep on the floor) or the thing that makes it (a door's own leaf).
     pub fn between(&self, from: V, to: V) -> f32 {
         let d = sub(to, from);
-        if dot(d, d).sqrt() <= 0.05 {
+        let len = dot(d, d).sqrt();
+        if len <= 0.05 {
             return 0.0;
         }
+        let before_source = |distance: f32| distance < len - AT_SOURCE;
         use thedas_formats::phy::mask;
         // (distance, what) from both collisions, nearest first.
         let mut crossed: Vec<(f32, Crossed)> = Vec::new();
         if let Some(c) = &self.placeables {
             for h in c.ray_hits(from, to) {
+                if !before_source(h.distance) {
+                    continue;
+                }
                 let v = c
                     .shape(h.shape)
                     .and_then(|s| s.object)
@@ -206,7 +221,7 @@ impl Occluders {
         if let Some(c) = &self.layout {
             for h in c.ray_hits(from, to) {
                 let Some(s) = c.shape(h.shape) else { continue };
-                if s.mask & mask::STATIC == 0 {
+                if s.mask & mask::STATIC == 0 || !before_source(h.distance) {
                     continue;
                 }
                 crossed.push((
@@ -275,6 +290,28 @@ mod tests {
         };
         let a = edge_angle(&b, from, [20.0, 1.0, 1.0], [9.0, 0.5, 1.0]).unwrap();
         assert!(a > 0.5 && a < 6.0, "{a}");
+    }
+
+    #[test]
+    fn what_the_sound_stands_on_does_not_occlude_it() {
+        // A floor triangle under a footstep at the origin, and a wall between.
+        let floor = thedas_sim::collision::Collision::from_shapes_for_tests(
+            vec![
+                [[-5.0, -5.0, 0.0], [5.0, -5.0, 0.0], [0.0, 5.0, 0.0]],
+                [[5.0, -2.0, -2.0], [5.0, 2.0, -2.0], [5.0, 0.0, 4.0]],
+                [[5.3, -2.0, -2.0], [5.3, 2.0, -2.0], [5.3, 0.0, 4.0]],
+            ],
+            5,
+        );
+        let mut o = Occluders {
+            layout: Some(std::sync::Arc::new(floor)),
+            ..Default::default()
+        };
+        o.percent.insert(5, 100.0);
+        // Heard from above: the floor it stands on is left out.
+        assert_eq!(o.between([0.0, 0.0, 2.0], [0.0, 0.0, 0.0]), 0.0);
+        // Heard from beyond the wall (two meshes 0.3 m apart): blocked.
+        assert_eq!(o.between([10.0, 0.0, 1.0], [0.0, 0.0, 1.0]), 1.0);
     }
 
     #[test]
