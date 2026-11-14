@@ -34,3 +34,25 @@ so no additional saved field is needed. It uses the existing merged tables
 and row order without changing precedence, table data or row positions.
 Queries leave the saved world and RNG unchanged, including after reload.
 The installed Origins tables yield level 25; the previous answer was 20.
+
+## Installed table contributors
+
+The validated Origins install merges the table lists `m2da_base_val.gda`
+(`dao_prc_cp_3`), `m2da_base_vala.gda` (`dao_prc_cp_7`),
+`m2da_base_drk.gda` (`dao_prc_drk`), `m2da_base_gib.gda` (`dao_prc_gib`),
+`m2da_base_lel.gda` (`dao_prc_lel`), `m2da_base_gwb.gda` (`dao_prc_nrx_1`),
+`m2da_base_str.gda` (`dao_prc_str`), `m2da_base.gda`
+(`packages/core/patch/patch003.erf`) and `m2da_base_drko.gda`
+(`Offers/dao_prc_drk_o`), in that precedence order. Both table IDs 98 and
+164 receive their worksheet prefixes from `m2da_base.gda`.
+
+The complete worksheet contributor set for those two tables on this install
+is `properties.gda` and `exptable.gda`, both from
+`packages/core/data/2da.erf`. Property row 19 has `Max = 186001`.
+The experience table has 26 rows, and position 25 (row ID 25) has
+`XP = 186001`, yielding a cap of 25. The DLC/add-in table-list worksheets
+above contribute additional table IDs alongside these base mappings.
+
+A different install, for example one with Awakening worksheets, can
+legitimately produce a higher cap. Such a result is expected
+install-dependent behavior.
