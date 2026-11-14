@@ -850,6 +850,28 @@ impl UiLayer {
         }
     }
 
+    /// The sample counts the device draws the world with (see
+    /// `thedas_render::msaa::supported_samples`): the anti-aliasing slider's list.
+    pub fn set_antialias_samples(&self, samples: Vec<u32>, default_on: bool) {
+        if let Ok(mut shown) = self.shown.lock() {
+            shown.antialias_samples = samples;
+            shown.antialias_default_on = default_on;
+        }
+    }
+
+    /// The samples a pixel the player's settings choose for the world (1: off); `None`
+    /// before the device's counts are known (headless runs).
+    pub fn antialiasing(&self) -> Option<u32> {
+        let shown = self.shown.lock().ok()?;
+        (!shown.antialias_samples.is_empty()).then(|| {
+            thedas_ui::options::antialiasing(
+                &shown.options,
+                &shown.antialias_samples,
+                shown.antialias_default_on,
+            )
+        })
+    }
+
     /// A player setting (`AudioOptions.MusicVolume`) as the options screen keeps it.
     pub fn client_option(&self, name: &str) -> Option<f64> {
         self.shown.lock().ok()?.options.get(name).copied()

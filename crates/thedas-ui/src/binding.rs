@@ -112,6 +112,12 @@ pub struct Presentation {
     pub journal_focus: Option<JournalFocus>,
     /// The player's settings changed from their defaults (see [`crate::options`]).
     pub options: BTreeMap<String, f64>,
+    /// The sample counts the device draws the world with (1 and every larger one it
+    /// supports; empty when not known: headless runs), for the anti-aliasing slider's list.
+    pub antialias_samples: Vec<u32>,
+    /// A player's window: the slider starts at 4x, not off (see
+    /// [`crate::options::default_antialias_index`]).
+    pub antialias_default_on: bool,
     /// The size the game draws at, the options screen's resolution.
     pub resolution: (u32, u32),
     /// How far the player has turned the paperdoll from facing them (radians; the
@@ -693,7 +699,12 @@ pub fn sim_values_for(sim: &Sim, shown: &Presentation) -> BTreeMap<String, UiVal
     saves(sim, shown, &mut v);
     journal(sim, shown, &mut v);
     alerts(sim, shown, &mut v);
-    crate::options::values(&shown.options, shown.resolution, &mut v);
+    crate::options::values(
+        &shown.options,
+        shown.resolution,
+        (&shown.antialias_samples, shown.antialias_default_on),
+        &mut v,
+    );
     if let Some(e) = &shown.examine {
         v.insert(
             "GUIItemExamine.ItemToken".into(),

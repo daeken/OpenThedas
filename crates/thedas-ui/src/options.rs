@@ -70,7 +70,50 @@ pub const DEFAULTS: &[(&str, f64)] = &[
     ("OnlineOptions.AutoUploadScreenshot", 0.0),
     ("OnlineOptions.AutoUploadProfile", 1.0),
     ("ScreenResIndex", 0.0),
+    // The place of the anti-aliasing choice in `AntialiasList`; its default depends on the
+    // list (see [`default_antialias_index`]), so this 0 (off) is only the list's first.
+    (ANTIALIAS_INDEX, 0.0),
 ];
+
+/// The anti-aliasing slider's setting (`ClientOptions.AntialiasIndex`, no group), and its list
+/// (`ClientOptions.AntialiasList`).
+pub const ANTIALIAS_INDEX: &str = "AntialiasIndex";
+/// The settings file's section for [`ANTIALIAS_INDEX`] (the original keeps the choice as
+/// `AntialiasingLevel` among its video settings, exe 0xb0100c).
+const ANTIALIAS_SECTION: &str = "VideoOptions";
+
+/// `AntialiasList`: 0 (shown "Off") then each sample count the device draws with but 1. The
+/// movie shows a member of 0 as its zero label and any other as "<n>x", and the setting is
+/// the member's place (optionsmenu.gfx `SliderPickerLabelsChanged`; the exe's entries,
+/// 0x5def4f, are the device's multisample types and qualities).
+pub fn antialias_list(samples: &[u32]) -> Vec<u32> {
+    let mut list = vec![0];
+    list.extend(samples.iter().copied().filter(|&n| n > 1));
+    list
+}
+
+/// The place in `list` ([`antialias_list`]) the setting starts at: with `on` (a player's
+/// window) the highest count up to 4x, else off. Not the exe's default (untraced): 4x smooths
+/// the jagged edges the original's post-process smoothing leaves. Automated runs (tests, QA's
+/// captures) start off, as before, so their pictures and timings stay as they were.
+pub fn default_antialias_index(list: &[u32], on: bool) -> usize {
+    if !on {
+        return 0;
+    }
+    list.iter()
+        .rposition(|&n| (2..=4).contains(&n))
+        .unwrap_or(0)
+}
+
+/// The sample count the settings choose (1: off) among those the device draws with.
+pub fn antialiasing(options: &BTreeMap<String, f64>, samples: &[u32], default_on: bool) -> u32 {
+    let list = antialias_list(samples);
+    let at = options.get(ANTIALIAS_INDEX).map_or_else(
+        || default_antialias_index(&list, default_on),
+        |v| v.max(0.0) as usize,
+    );
+    list.get(at).copied().unwrap_or(0).max(1)
+}
 
 /// Takes a settings message into `options` (the settings changed from their defaults);
 /// returns whether it was one. The difficulty is left to the simulation.
@@ -112,11 +155,27 @@ pub fn option_message(options: &mut BTreeMap<String, f64>, name: &str, args: &[S
 pub fn to_text(options: &BTreeMap<String, f64>) -> String {
     let mut out = String::new();
     let mut group = "";
-    for (k, v) in options {
+    // The anti-aliasing choice is the one setting with no group; it is kept with the video
+    // settings.
+    let grouped: BTreeMap<String, f64> = options
+        .iter()
+        .map(|(k, v)| {
+            let key = if k == ANTIALIAS_INDEX {
+                format!("{ANTIALIAS_SECTION}.{k}")
+            } else {
+                k.clone()
+            };
+            (key, *v)
+        })
+        .collect();
+    for (k, v) in &grouped {
         let Some((g, name)) = k.split_once('.') else {
             continue;
         };
-        if k == DIFFICULTY || !DEFAULTS.iter().any(|(d, _)| d == k) || !v.is_finite() {
+        let known = DEFAULTS.iter().any(|(d, _)| {
+            d == k || format!("{ANTIALIAS_SECTION}.{d}") == *k && *d == ANTIALIAS_INDEX
+        });
+        if k == DIFFICULTY || !known || !v.is_finite() {
             continue;
         }
         if g != group {
@@ -141,7 +200,10 @@ pub fn from_text(text: &str) -> BTreeMap<String, f64> {
         let Some((name, v)) = line.split_once('=') else {
             continue;
         };
-        let key = format!("{group}.{}", name.trim());
+        let mut key = format!("{group}.{}", name.trim());
+        if key == format!("{ANTIALIAS_SECTION}.{ANTIALIAS_INDEX}") {
+            key = ANTIALIAS_INDEX.to_string();
+        }
         let Ok(v) = v.trim().parse::<f64>() else {
             continue;
         };
@@ -159,12 +221,38 @@ pub fn from_text(text: &str) -> BTreeMap<String, f64> {
 pub fn values(
     options: &BTreeMap<String, f64>,
     resolution: (u32, u32),
+    (samples, default_on): (&[u32], bool),
     v: &mut BTreeMap<String, UiValue>,
 ) {
     for (k, d) in DEFAULTS {
         let x = options.get(*k).copied().unwrap_or(*d);
         v.insert(format!("ClientOptions.{k}"), UiValue::Number(x));
     }
+    let list = antialias_list(samples);
+    // The list's own value, which the movie's observer (`OptionLabels_`) hears to write the
+    // slider's labels.
+    v.insert(
+        "ClientOptions.AntialiasList".into(),
+        UiValue::List(
+            list.iter()
+                .map(|&n| UiValue::Number(f64::from(n)))
+                .collect(),
+        ),
+    );
+    for (i, n) in list.iter().enumerate() {
+        v.insert(
+            format!("ClientOptions.AntialiasList.{i}"),
+            UiValue::Number(f64::from(*n)),
+        );
+    }
+    let at = options
+        .get(ANTIALIAS_INDEX)
+        .copied()
+        .unwrap_or_else(|| default_antialias_index(&list, default_on) as f64);
+    v.insert(
+        format!("ClientOptions.{ANTIALIAS_INDEX}"),
+        UiValue::Number(at),
+    );
     v.insert(
         "ClientOptions.VideoOptions.ResolutionWidth".into(),
         UiValue::Number(resolution.0 as f64),
@@ -204,6 +292,41 @@ mod tests {
     }
 
     #[test]
+    fn anti_aliasing_lists_the_device_counts_and_defaults_to_four() {
+        // Off, then each count the device draws with.
+        assert_eq!(antialias_list(&[1, 2, 4, 8]), vec![0, 2, 4, 8]);
+        assert_eq!(antialias_list(&[1]), vec![0]);
+        let mut o = BTreeMap::new();
+        // Unset: the highest count up to 4x; a device with only 2x gets 2x; none, off.
+        assert_eq!(antialiasing(&o, &[1, 2, 4, 8], true), 4);
+        assert_eq!(antialiasing(&o, &[1, 2], true), 2);
+        assert_eq!(antialiasing(&o, &[1], true), 1);
+        // Automated runs start off.
+        assert_eq!(antialiasing(&o, &[1, 2, 4, 8], false), 1);
+        // A choice wins, Off included; one past the list is off.
+        o.insert(ANTIALIAS_INDEX.to_string(), 0.0);
+        assert_eq!(antialiasing(&o, &[1, 2, 4], true), 1);
+        o.insert(ANTIALIAS_INDEX.to_string(), 3.0);
+        assert_eq!(antialiasing(&o, &[1, 2, 4, 8], true), 8);
+        o.insert(ANTIALIAS_INDEX.to_string(), 9.0);
+        assert_eq!(antialiasing(&o, &[1, 2, 4], true), 1);
+        // The screen reads the list and the place; the settings file keeps the place with
+        // the video settings.
+        let mut v = BTreeMap::new();
+        o.insert(ANTIALIAS_INDEX.to_string(), 1.0);
+        values(&o, (1280, 720), (&[1, 2, 4], true), &mut v);
+        assert_eq!(v["ClientOptions.AntialiasList.0"], UiValue::Number(0.0));
+        assert_eq!(v["ClientOptions.AntialiasList.2"], UiValue::Number(4.0));
+        assert_eq!(v["ClientOptions.AntialiasIndex"], UiValue::Number(1.0));
+        let text = to_text(&o);
+        assert_eq!(text, "[VideoOptions]\nAntialiasIndex=1\n");
+        assert_eq!(from_text(&text)[ANTIALIAS_INDEX], 1.0);
+        let mut v = BTreeMap::new();
+        values(&BTreeMap::new(), (1280, 720), (&[1, 2, 4], true), &mut v);
+        assert_eq!(v["ClientOptions.AntialiasIndex"], UiValue::Number(2.0));
+    }
+
+    #[test]
     fn settings_change_restore_and_leave_the_difficulty_to_the_game() {
         let mut o = BTreeMap::new();
         let a = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
@@ -224,7 +347,7 @@ mod tests {
             &a(&["Nonsense.Option", "1"])
         ));
         let mut v = BTreeMap::new();
-        values(&o, (1280, 720), &mut v);
+        values(&o, (1280, 720), (&[1, 2, 4], true), &mut v);
         assert_eq!(
             v["ClientOptions.GameOptions.ShowGore"],
             UiValue::Number(0.0)
@@ -244,7 +367,7 @@ mod tests {
         assert!(!v.contains_key(&format!("ClientOptions.{DIFFICULTY}")));
         assert!(option_message(&mut o, MSG_RESTORE_DEFAULTS, &[]));
         let mut v = BTreeMap::new();
-        values(&o, (1280, 720), &mut v);
+        values(&o, (1280, 720), (&[1, 2, 4], true), &mut v);
         assert_eq!(
             v["ClientOptions.GameOptions.ShowGore"],
             UiValue::Number(1.0)

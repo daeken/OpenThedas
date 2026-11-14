@@ -428,6 +428,9 @@ enum Building {
 /// The samples a pixel new games draw with (the `--antialiasing` flag; see
 /// [`Live::antialiasing`]).
 pub static ANTIALIASING: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+/// `--antialiasing` was given: the Options screen's choice does not change the samples.
+pub static ANTIALIASING_FORCED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// The most samples a pixel at or under `wanted` that the adapter supports for `format`.
 fn supported_samples(ctx: &GpuContext, format: wgpu::TextureFormat, wanted: u32) -> u32 {

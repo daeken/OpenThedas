@@ -134,6 +134,14 @@ pub struct Options {
     /// of a program must agree; draws that share a mesh and textures can then go as one
     /// instanced draw.
     pub instanced: bool,
+    /// Pixel shaders with an alpha test that passes above its reference (`>`, `>=`): for a
+    /// multisampled target with alpha-to-coverage on, the test's edge becomes coverage. The
+    /// pixel's alpha is replaced by how far past the reference it is, measured in its own
+    /// screen-space change (`fwidth`) and centred on the reference, so a cut-out's edge
+    /// covers part of a pixel's samples instead of all or none; a pixel with no coverage
+    /// is still discarded. A modern extra, not the original's (D3D9 had no standard
+    /// alpha-to-coverage). Other tests are left as they are.
+    pub alpha_to_coverage: bool,
 }
 
 pub struct Translation {
@@ -1467,7 +1475,20 @@ fn pixel_interface(g: &mut Gen) -> Result<(String, String, String, String)> {
         } else {
             flit((reference * 255.0).round())
         };
-        let _ = writeln!(epi, "    if (!({a} {o} {reference})) {{ discard; }}");
+        let coverage = g.opts.alpha_to_coverage
+            && matches!(cmp, Comparison::Gt | Comparison::Ge)
+            && g.color_outputs.contains(&0);
+        if coverage {
+            let _ = writeln!(epi, "    let cov_a = saturate(oc0.w) * 255.0;");
+            let _ = writeln!(
+                epi,
+                "    let cov = saturate((cov_a - {reference}) / max(fwidth(cov_a), 1.0) + 0.5);"
+            );
+            let _ = writeln!(epi, "    if (cov <= 0.0) {{ discard; }}");
+            let _ = writeln!(epi, "    oc0.w = cov;");
+        } else {
+            let _ = writeln!(epi, "    if (!({a} {o} {reference})) {{ discard; }}");
+        }
     }
     epi.push_str("    var out: StageOut;\n");
     for c in &locations {

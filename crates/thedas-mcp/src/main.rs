@@ -233,6 +233,9 @@ struct LoadArgs {
     /// Character generation when a new game starts it: "quick" (default: the chargen
     /// script's pre-made character and origin) or "manual" (send events with chargen_event).
     chargen: Option<String>,
+    /// Cutscenes: "skip" (default: each ends at once, as if it had played) or "play" (it
+    /// runs its length on the simulation's ticks, holding the world still, as in the game).
+    cutscenes: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -456,6 +459,18 @@ struct SlotArgs {
     /// load_state: reseed the simulation's random generator after loading (for repeating a
     /// scenario over different seeds).
     seed: Option<u64>,
+    /// load_state: from now on, "skip" cutscenes (end each at once) or "play" them (run
+    /// their length on the simulation's ticks). Unchanged when not given.
+    cutscenes: Option<String>,
+}
+
+/// A `cutscenes` argument: "play" or "skip"; `None` when absent or unknown.
+fn cutscene_policy(arg: Option<&str>) -> Option<thedas_sim::sim::CutscenePolicy> {
+    match arg.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+        Some("play") => Some(thedas_sim::sim::CutscenePolicy::Play),
+        Some("skip") => Some(thedas_sim::sim::CutscenePolicy::Skip),
+        _ => None,
+    }
 }
 
 fn kind_name(k: ObjectKind) -> String {
@@ -994,7 +1009,7 @@ impl Server {
             waypoint: a.waypoint,
             seed: a.seed.unwrap_or(1),
             keep_trace: true,
-            cutscenes: Default::default(),
+            cutscenes: cutscene_policy(a.cutscenes.as_deref()).unwrap_or_default(),
             // Before the module loads: a new game starts character creation then.
             chargen: if a.chargen.as_deref() == Some("manual") {
                 thedas_sim::sim::ChargenPolicy::Manual
@@ -2266,6 +2281,9 @@ impl Server {
                 if let Some(seed) = a.seed {
                     sim.world.rng = thedas_sim::world::Rng::new(seed);
                 }
+                if let Some(p) = cutscene_policy(a.cutscenes.as_deref()) {
+                    sim.cutscene_policy = p;
+                }
                 st.trace_cursor = 0;
                 // Damage an older build left in the save (see thedas_sim::save::SaveIssue).
                 let issues: Vec<String> = sim.save_issues.iter().map(|i| i.to_string()).collect();
@@ -2281,6 +2299,9 @@ impl Server {
             sim.restore(snap);
             if let Some(seed) = a.seed {
                 sim.world.rng = thedas_sim::world::Rng::new(seed);
+            }
+            if let Some(p) = cutscene_policy(a.cutscenes.as_deref()) {
+                sim.cutscene_policy = p;
             }
             Ok(json!({ "restored": slot, "time_ms": sim.world.time_ms }))
         })

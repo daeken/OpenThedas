@@ -129,6 +129,10 @@ pub struct LauncherConfig {
 impl LauncherConfig {
     /// `launcher.json` in the player's data folder.
     pub fn default_path() -> PathBuf {
+        // A scripted run points this at a scratch file so it never touches the player's.
+        if let Some(p) = std::env::var_os("THEDAS_LAUNCHER_CONFIG").filter(|p| !p.is_empty()) {
+            return PathBuf::from(p);
+        }
         thedas_vfs::mods::user_data_dir().join(FILE_NAME)
     }
 
