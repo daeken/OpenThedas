@@ -1,0 +1,66 @@
+# Keyboard only: Tab order and focus on the wizard's pages. Fresh scratch home, one stand-in
+# install. `key Tab` moves focus the way a person's Tab does; `expect focus` reads which
+# control has it (the control a screen reader would announce).
+
+mkinstall ${HOME}/Games/Dragon Age Origins
+run 300
+
+# Welcome: the page's controls in reading order, nothing before them
+expect page Welcome
+key Tab
+expect focus Search this computer
+key Tab
+expect focus Pick the game's folder
+key Tab
+expect focus Don't have the game
+key Shift+Tab
+expect focus Pick the game's folder
+key Shift+Tab
+expect focus Search this computer
+
+# Enter on a focused button presses it; focus follows the page
+key Enter
+wait
+expect page Search
+expect heading Found 1 install
+# focus goes to the results when the search ends
+expect focus Keep
+key Tab
+expect focus Pick a folder
+key Tab
+expect focus Search again
+key Tab
+expect focus Back
+key Tab
+expect focus Continue
+
+# Continue by keyboard lands on the keys page with focus inside it
+key Enter
+run 300
+expect page Keys
+expect heading Downloadable content
+expect focus Choose a keys file
+key Tab
+expect focus Back
+key Tab
+expect focus Finish
+key Enter
+run 300
+expect page Play
+expect focus Dragon Age
+
+# The tabs sit before the page, in reading order Play, Games, Mods, Settings
+key Shift+Tab
+expect focus Settings
+key Shift+Tab
+expect focus Mods
+key Shift+Tab
+expect focus Games
+key Shift+Tab
+expect focus Play
+key Tab
+expect focus Games
+key Enter
+run 300
+expect page Games
+quit

@@ -248,6 +248,15 @@ impl FaceAnim {
         })
     }
 
+    /// When its last key falls (seconds into the line; 0 without keys).
+    pub fn length(&self) -> f32 {
+        self.curves
+            .iter()
+            .filter_map(|c| c.keys.last())
+            .map(|k| k.time)
+            .fold(0.0, f32::max)
+    }
+
     /// The curve of a node, if the animation has one.
     pub fn curve(&self, node: &str) -> Option<&FaceCurve> {
         self.curves.iter().find(|c| c.name == node)

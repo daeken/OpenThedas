@@ -16,6 +16,7 @@ use std::sync::mpsc::{Receiver, TryRecvError, channel};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use egui::accesskit::Live;
 use egui::{Color32, RichText};
 use thedas_launcher::config::{GameKind, Install, LauncherConfig};
 use thedas_launcher::detect::{self, Found, Inspected, Os};
@@ -24,6 +25,7 @@ use thedas_store::Store;
 
 use crate::launcher_control::{Host, Need, Script};
 use crate::launcher_download::{Download, Want};
+use crate::launcher_mods::ModReport;
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::WindowEvent;
@@ -33,6 +35,8 @@ use winit::window::{Window, WindowId};
 /// The emblem's gold and the dark red behind it.
 pub(crate) const GOLD: Color32 = Color32::from_rgb(0xe8, 0xa8, 0x4c);
 pub(crate) const GOLD_DIM: Color32 = Color32::from_rgb(0xb8, 0x80, 0x3c);
+/// Height of the bottom bar (Back, status, primary button).
+const FOOTER_HEIGHT: f32 = 56.0;
 const BG: Color32 = Color32::from_rgb(0x26, 0x0d, 0x0b);
 const BG_DEEP: Color32 = Color32::from_rgb(0x17, 0x07, 0x06);
 pub(crate) const BAD: Color32 = Color32::from_rgb(0xff, 0x7a, 0x5c);
@@ -286,6 +290,8 @@ struct Ui {
     candidates: Vec<Candidate>,
     inspected: HashMap<PathBuf, Option<Inspected>>,
     mods: ModFile,
+    /// What the saved mod list does to the chosen game (the Mods page's second half).
+    mod_report: ModReport,
     status: Option<(String, bool)>,
     actions: Vec<Action>,
     launch: Option<Launch>,
@@ -299,6 +305,17 @@ struct Ui {
     demo: bool,
     /// What the next file or folder dialog answers, from a script (`choose`).
     chosen: Option<PathBuf>,
+    /// The page drawn last frame, to see a page change (and move keyboard focus into the new
+    /// page unless a navigation tab made it).
+    drawn_page: Option<Page>,
+    /// A navigation tab changed the page this frame: focus stays on the tab.
+    nav_changed: bool,
+    /// A search just ended: keyboard focus moves to the results (or what to do instead).
+    refocus: bool,
+    /// `THEDAS_LAUNCHER_DRY_RUN`: Play records what it would start and the launcher stays open
+    /// (regression scripts check the command line).
+    dry_run: bool,
+    dry_launch: Option<Launch>,
 }
 
 const SIZES: &[&str] = &[
@@ -331,6 +348,7 @@ impl Ui {
             candidates: Vec::new(),
             inspected: HashMap::new(),
             mods,
+            mod_report: ModReport::new(),
             status: None,
             actions: Vec::new(),
             launch: None,
@@ -340,6 +358,11 @@ impl Ui {
             before_download: Page::Welcome,
             demo: false,
             chosen: None,
+            drawn_page: None,
+            nav_changed: false,
+            refocus: false,
+            dry_run: std::env::var_os("THEDAS_LAUNCHER_DRY_RUN").is_some(),
+            dry_launch: None,
         }
     }
 
@@ -406,6 +429,7 @@ impl Ui {
                     })
                     .collect();
                 self.search = None;
+                self.refocus = true;
             }
             Err(TryRecvError::Empty) => {}
             Err(TryRecvError::Disconnected) => {
@@ -427,6 +451,20 @@ impl Ui {
             self.cfg.selected = Some(i);
         }
         Some(i)
+    }
+
+    /// Adds the search results the player left ticked.
+    fn keep_candidates(&mut self) {
+        let kept: Vec<Found> = self
+            .candidates
+            .iter()
+            .filter(|c| c.keep && !c.known)
+            .map(|c| c.found.clone())
+            .collect();
+        for f in kept {
+            let label = format!("{}, {}", f.source.label(), f.place);
+            self.add_root(f.root, label);
+        }
     }
 
     /// Whether any kept install would want a keys file.
@@ -467,13 +505,27 @@ impl Ui {
                     .inner_margin(egui::Margin::symmetric(16, 10)),
             )
             .show(ui, |ui| self.header(ui));
-        egui::Panel::bottom("footer")
-            .frame(
-                egui::Frame::new()
-                    .fill(BG_DEEP)
-                    .inner_margin(egui::Margin::symmetric(16, 10)),
-            )
-            .show(ui, |ui| self.footer(ui));
+        // The footer's room is set aside here, but its controls are made after the page's, so
+        // Tab and screen readers go header, page, footer. (Panels must come before the
+        // central panel to take their space.)
+        let footer = egui::Panel::bottom("footer")
+            .exact_size(FOOTER_HEIGHT)
+            .resizable(false)
+            .frame(egui::Frame::new().fill(BG_DEEP))
+            .show(ui, |_| {});
+        // A page change that wasn't a click on a navigation tab (the wizard's steps, a
+        // finished download) moves keyboard focus to the new page's first control.
+        let page_changed = self.drawn_page.is_some_and(|p| p != self.page);
+        let from_nav = std::mem::take(&mut self.nav_changed);
+        self.drawn_page = Some(self.page);
+        if (page_changed && !from_nav) || std::mem::take(&mut self.refocus) {
+            ui.memory_mut(|m| {
+                if let Some(id) = m.focused() {
+                    m.surrender_focus(id);
+                }
+                m.move_focus(egui::FocusDirection::Next);
+            });
+        }
         egui::CentralPanel::default_margins()
             .frame(
                 egui::Frame::new()
@@ -499,42 +551,71 @@ impl Ui {
                         }
                     });
             });
+        let rect = footer.response.rect.shrink2(egui::vec2(16.0, 10.0));
+        ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| self.footer(ui));
     }
 
     fn header(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             if let Some(t) = &self.emblem {
-                ui.add(egui::Image::new(egui::load::SizedTexture::new(
-                    t.id(),
-                    [56.0, 56.0],
-                )));
+                ui.add(
+                    egui::Image::new(egui::load::SizedTexture::new(t.id(), [56.0, 56.0]))
+                        .alt_text("OpenThedas emblem"),
+                );
             }
             ui.vertical(|ui| {
                 ui.label(RichText::new("OpenThedas").size(28.0).strong().color(GOLD));
                 ui.label(RichText::new("Dragon Age on an open engine").color(GOLD_DIM));
             });
             if !self.page.wizard() {
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                // Right-aligned but made left to right, so Tab and screen readers go Play,
+                // Games, Mods, Settings as they read. The row's width is what the last
+                // frame measured.
+                let id = egui::Id::unique("nav-width");
+                let width: f32 = ui.data(|d| d.get_temp(id)).unwrap_or(0.0);
+                ui.add_space((ui.available_width() - width).max(0.0));
+                let row = ui.horizontal(|ui| {
                     for (page, name) in [
-                        (Page::Settings, "Settings"),
-                        (Page::Mods, "Mods"),
-                        (Page::Games, "Games"),
                         (Page::Play, "Play"),
+                        (Page::Games, "Games"),
+                        (Page::Mods, "Mods"),
+                        (Page::Settings, "Settings"),
                     ] {
                         let text = RichText::new(name).size(18.0);
                         if ui.selectable_label(self.page == page, text).clicked() {
                             self.page = page;
+                            self.nav_changed = true;
                         }
                     }
                 });
+                let measured = row.response.rect.width();
+                if (measured - width).abs() > 0.5 {
+                    ui.data_mut(|d| d.insert_temp(id, measured));
+                    ui.ctx().request_repaint();
+                }
             }
         });
     }
 
     fn footer(&mut self, ui: &mut egui::Ui) {
+        // Back first (left), then the message, then the page's main button at the right: Tab
+        // goes Back, then forward.
+        let back = match self.page {
+            Page::Search if self.cfg.wizard_done => Some(self.after_search),
+            Page::Search => Some(Page::Welcome),
+            Page::Keys => Some(Page::Search),
+            Page::Download => Some(self.before_download),
+            _ => None,
+        };
         ui.horizontal(|ui| {
+            if let Some(to) = back {
+                if ui.button("Back").clicked() {
+                    self.page = to;
+                }
+            }
             if let Some((msg, bad)) = &self.status {
-                ui.label(RichText::new(msg).color(if *bad { BAD } else { GOLD_DIM }));
+                let r = ui.label(RichText::new(msg).color(if *bad { BAD } else { GOLD_DIM }));
+                live(&r, if *bad { Live::Assertive } else { Live::Polite });
             }
             ui.with_layout(
                 egui::Layout::right_to_left(egui::Align::Center),
@@ -551,16 +632,7 @@ impl Ui {
                             .add_enabled(any && self.search.is_none(), big_button("Continue"))
                             .clicked()
                         {
-                            let kept: Vec<Found> = self
-                                .candidates
-                                .iter()
-                                .filter(|c| c.keep && !c.known)
-                                .map(|c| c.found.clone())
-                                .collect();
-                            for f in kept {
-                                let label = format!("{}, {}", f.source.label(), f.place);
-                                self.add_root(f.root, label);
-                            }
+                            self.keep_candidates();
                             if self.cfg.wizard_done {
                                 self.page = self.after_search;
                             } else if self.keys_step_wanted() {
@@ -569,27 +641,13 @@ impl Ui {
                                 self.finish_wizard();
                             }
                         }
-                        if ui.button("Back").clicked() {
-                            self.page = if self.cfg.wizard_done {
-                                self.after_search
-                            } else {
-                                Page::Welcome
-                            };
-                        }
-                    }
-                    Page::Download => {
-                        if ui.button("Back").clicked() {
-                            self.page = self.before_download;
-                        }
                     }
                     Page::Keys => {
                         if ui.add(big_button("Finish")).clicked() {
                             self.finish_wizard();
                         }
-                        if ui.button("Back").clicked() {
-                            self.page = Page::Search;
-                        }
                     }
+                    Page::Download => {}
                     _ => {
                         let label = match self.cfg.selected_install() {
                             Some(i) => format!("Play {}", i.game.name()),
@@ -609,7 +667,7 @@ impl Ui {
 
     fn welcome(&mut self, ui: &mut egui::Ui) {
         ui.add_space(12.0);
-        ui.label(RichText::new("Welcome").size(26.0).color(GOLD));
+        heading(ui, "Welcome", 26.0);
         ui.add_space(8.0);
         ui.label(
             "OpenThedas plays Dragon Age: Origins with your own copy of the game. It reads \
@@ -657,30 +715,27 @@ impl Ui {
         if self.search.is_some() {
             ui.horizontal(|ui| {
                 ui.spinner();
-                ui.label(RichText::new("Searching…").size(20.0));
+                let r = ui.label(RichText::new("Searching…").size(20.0));
+                live(&r, Live::Polite);
             });
             return;
         }
         if self.candidates.is_empty() {
-            ui.label(
-                RichText::new("No copy of Dragon Age was found.")
-                    .size(22.0)
-                    .color(GOLD),
-            );
+            heading(ui, "No copy of Dragon Age was found.", 22.0);
             ui.add_space(6.0);
             ui.label(
                 "If you have the game somewhere the search doesn't look, pick its folder. \
                  Otherwise, get it from a store below, then search again.",
             );
         } else {
-            ui.label(
-                RichText::new(format!(
+            heading(
+                ui,
+                &format!(
                     "Found {} install{}",
                     self.candidates.len(),
                     if self.candidates.len() == 1 { "" } else { "s" }
-                ))
-                .size(22.0)
-                .color(GOLD),
+                ),
+                22.0,
             );
             ui.label("Tick the ones to keep. You can add or remove them later under Games.");
             ui.add_space(8.0);
@@ -689,7 +744,21 @@ impl Ui {
                     ui.set_width(ui.available_width());
                     ui.horizontal(|ui| {
                         ui.add_enabled_ui(!c.known, |ui| {
-                            ui.checkbox(&mut c.keep, "Keep");
+                            let name = format!(
+                                "Keep {}, {}",
+                                GameKind::from(c.found.game).name(),
+                                tilde(&c.found.root)
+                            );
+                            let r = ui.checkbox(&mut c.keep, "Keep");
+                            let (enabled, keep) = (r.enabled(), c.keep);
+                            r.widget_info(|| {
+                                egui::WidgetInfo::selected(
+                                    egui::accesskit::Role::CheckBox,
+                                    enabled,
+                                    keep,
+                                    &name,
+                                )
+                            });
                         });
                         ui.vertical(|ui| {
                             let game: GameKind = c.found.game.into();
@@ -726,7 +795,7 @@ impl Ui {
 
     fn keys_page(&mut self, ui: &mut egui::Ui) {
         ui.add_space(8.0);
-        ui.label(RichText::new("Downloadable content").size(22.0).color(GOLD));
+        heading(ui, "Downloadable content", 22.0);
         ui.label(
             "Some DLC archives are encrypted. Origins' passwords come from your own \
              DAOrigins.exe. Dragon Age II needs a keys file (the erfpasswords.txt format). \
@@ -838,13 +907,13 @@ impl Ui {
     fn play_page(&mut self, ui: &mut egui::Ui) {
         ui.add_space(8.0);
         if self.cfg.installs.is_empty() {
-            ui.label(RichText::new("No game added yet.").size(22.0).color(GOLD));
+            heading(ui, "No game added yet.", 22.0);
             if ui.add(big_button("Set up")).clicked() {
                 self.page = Page::Welcome;
             }
             return;
         }
-        ui.label(RichText::new("Choose a game").size(22.0).color(GOLD));
+        heading(ui, "Choose a game", 22.0);
         ui.add_space(6.0);
         for idx in 0..self.cfg.installs.len() {
             let inst = self.cfg.installs[idx].clone();
@@ -936,7 +1005,7 @@ impl Ui {
 
     fn games_page(&mut self, ui: &mut egui::Ui) {
         ui.add_space(8.0);
-        ui.label(RichText::new("Your games").size(22.0).color(GOLD));
+        heading(ui, "Your games", 22.0);
         ui.add_space(6.0);
         if self.cfg.installs.is_empty() {
             ui.label("None yet.");
@@ -957,7 +1026,7 @@ impl Ui {
 
     fn mods_page(&mut self, ui: &mut egui::Ui) {
         ui.add_space(8.0);
-        ui.label(RichText::new("Mods").size(22.0).color(GOLD));
+        heading(ui, "Mods", 22.0);
         if let Some(v) = std::env::var_os(thedas_vfs::mods::ENV_VAR) {
             ui.label(
                 RichText::new(format!(
@@ -1047,6 +1116,9 @@ impl Ui {
             Some((i, 4)) => self.mods.remove(i),
             _ => {}
         }
+        if change.is_some() {
+            self.mod_report.forget();
+        }
         ui.add_space(8.0);
         ui.horizontal(|ui| {
             if ui.button("Add a folder…").clicked() {
@@ -1061,7 +1133,10 @@ impl Ui {
             let dirty = self.mods.dirty();
             if ui.add_enabled(dirty, big_button("Save")).clicked() {
                 match self.mods.save() {
-                    Ok(()) => self.status = Some(("Mod list saved.".into(), false)),
+                    Ok(()) => {
+                        self.mod_report.forget();
+                        self.status = Some(("Mod list saved.".into(), false))
+                    }
                     Err(e) => {
                         self.status = Some((format!("Could not save the mod list: {e}"), true))
                     }
@@ -1072,16 +1147,20 @@ impl Ui {
                 .clicked()
             {
                 self.mods.revert();
+                self.mod_report.forget();
             }
             if dirty {
                 ui.label(RichText::new("Not saved yet").color(BAD));
             }
         });
+        let root = self.cfg.selected_install().map(|i| i.root.clone());
+        let dirty = self.mods.dirty();
+        self.mod_report.draw(ui, root.as_ref(), dirty);
     }
 
     fn settings_page(&mut self, ui: &mut egui::Ui) {
         ui.add_space(8.0);
-        ui.label(RichText::new("Settings").size(22.0).color(GOLD));
+        heading(ui, "Settings", 22.0);
         ui.add_space(6.0);
         let languages = self
             .cfg
@@ -1095,7 +1174,7 @@ impl Ui {
             .num_columns(2)
             .spacing([16.0, 10.0])
             .show(ui, |ui| {
-                ui.label("Window size");
+                let label = ui.label("Window size");
                 ui.horizontal(|ui| {
                     egui::ComboBox::from_id_salt("size")
                         .selected_text(play.size.clone())
@@ -1106,10 +1185,12 @@ impl Ui {
                                     self.custom_size = play.size.clone();
                                 }
                             }
-                        });
-                    let r = ui.add(
-                        egui::TextEdit::singleline(&mut self.custom_size).desired_width(110.0),
-                    );
+                        })
+                        .response
+                        .labelled_by(label.id);
+                    let r = ui
+                        .add(egui::TextEdit::singleline(&mut self.custom_size).desired_width(110.0))
+                        .labelled_by(label.id);
                     if r.lost_focus() {
                         if valid_size(&self.custom_size) {
                             play.size = self.custom_size.trim().to_string();
@@ -1152,7 +1233,7 @@ impl Ui {
                 ui.checkbox(&mut play.audio, "On");
                 ui.end_row();
 
-                ui.label("Voice language");
+                let label = ui.label("Voice language");
                 egui::ComboBox::from_id_salt("language")
                     .selected_text(play.language.clone())
                     .show_ui(ui, |ui| {
@@ -1165,7 +1246,9 @@ impl Ui {
                                 play.language = l;
                             }
                         }
-                    });
+                    })
+                    .response
+                    .labelled_by(label.id);
                 ui.end_row();
             });
         ui.add_space(12.0);
@@ -1182,7 +1265,12 @@ impl Ui {
         let data = thedas_vfs::mods::user_data_dir();
         ui.horizontal(|ui| {
             ui.label(format!("Saves, settings and mods list: {}", tilde(&data)));
-            if ui.small_button("Open").clicked() {
+            if named(
+                ui.small_button("Open"),
+                "Open the saves and settings folder",
+            )
+            .clicked()
+            {
                 self.actions.push(Action::OpenFolder(data.clone()));
             }
         });
@@ -1275,7 +1363,7 @@ impl Ui {
 
     /// Whether the window should keep redrawing: a search or a download is running.
     fn busy(&self) -> bool {
-        self.search.is_some() || self.dl.running()
+        self.search.is_some() || self.dl.running() || self.mod_report.running()
     }
 
     // ---- actions ----
@@ -1316,6 +1404,10 @@ impl Ui {
                                 Some(g) => g.into(),
                                 None => continue,
                             };
+                            // Picking a folder in the wizard must not drop what the search found.
+                            if self.page == Page::Search {
+                                self.keep_candidates();
+                            }
                             self.add_root(root, "Added by hand".into());
                             self.status = Some((format!("Added {}.", game.name()), false));
                             if self.page.wizard() {
@@ -1361,6 +1453,7 @@ impl Ui {
                         true,
                     ) {
                         self.mods.add(&d.to_string_lossy());
+                        self.mod_report.forget();
                     }
                 }
                 Action::AddModArchive => {
@@ -1374,6 +1467,7 @@ impl Ui {
                         false,
                     ) {
                         self.mods.add(&f.to_string_lossy());
+                        self.mod_report.forget();
                     }
                 }
                 Action::OpenUrl(url) => {
@@ -1413,7 +1507,17 @@ impl Ui {
                         ));
                         continue;
                     }
-                    self.launch = Some(Launch::of(&self.cfg, &inst));
+                    let launch = Launch::of(&self.cfg, &inst);
+                    if self.dry_run {
+                        // For scripts: say what would start, and stay open.
+                        self.status = Some((
+                            format!("Would start the game from {}.", inst.root.display()),
+                            false,
+                        ));
+                        self.dry_launch = Some(launch);
+                    } else {
+                        self.launch = Some(launch);
+                    }
                 }
             }
         }
@@ -1462,10 +1566,22 @@ pub(crate) fn tilde(p: &Path) -> String {
 
 /// Gives a button the name screen readers and scripts use, where its text alone is ambiguous
 /// ("Remove" on every install's card).
-fn named(r: egui::Response, name: &str) -> egui::Response {
+pub(crate) fn named(r: egui::Response, name: &str) -> egui::Response {
     let enabled = r.enabled();
     r.widget_info(|| egui::WidgetInfo::labeled(egui::accesskit::Role::Button, enabled, name));
     r
+}
+
+/// A page title that screen readers announce as a heading.
+pub(crate) fn heading(ui: &mut egui::Ui, text: &str, size: f32) -> egui::Response {
+    let r = ui.label(RichText::new(text.to_string()).size(size).color(GOLD));
+    r.widget_info(|| egui::WidgetInfo::labeled(egui::accesskit::Role::Heading, true, text));
+    r
+}
+
+/// Marks a label as a live region: screen readers announce when its text changes.
+pub(crate) fn live(r: &egui::Response, l: Live) {
+    r.ctx.accesskit_node_builder(r.id, |b| b.set_live(l));
 }
 
 pub(crate) fn big_button(text: &str) -> egui::Button<'static> {
@@ -1566,7 +1682,7 @@ impl Host for Ui {
                 "keys_file": i.keys_file,
             })).collect::<Vec<_>>(),
             "selected": self.cfg.selected,
-            "launch": self.launch.as_ref().map(|l| serde_json::json!({
+            "launch": self.launch.as_ref().or(self.dry_launch.as_ref()).map(|l| serde_json::json!({
                 "install": l.install,
                 "args": l.args,
             })),
@@ -1661,6 +1777,7 @@ impl LauncherApp {
     fn redraw(&mut self, event_loop: &ActiveEventLoop) {
         let Some(g) = self.gfx.as_mut() else { return };
         self.ui.poll_search();
+        self.ui.mod_report.poll();
         if let Some(w) = self.ui.dl.poll() {
             self.ui.download_wants(w);
         }

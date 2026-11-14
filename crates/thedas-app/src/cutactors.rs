@@ -123,6 +123,9 @@ pub struct Shown {
     pub kept: HashMap<ObjectId, Vec<CutAnimation>>,
     /// The cutscene's light actors.
     pub lights: Vec<CutLight>,
+    /// The object drawn for the actor saying the playing cutscene's line now, when the line
+    /// has its own voice-over (for its lip sync).
+    pub speaker: Option<ObjectId>,
 }
 
 /// A cutscene's light actor now: where its model (`base_light`, see
@@ -199,6 +202,15 @@ impl CutsceneActors {
             };
             self.pose_bound(&tracks, &at, &mut out);
             out.lights = lights(&tracks, &at);
+            out.speaker =
+                c.line_now()
+                    .filter(|l| l.vo_mode == 0)
+                    .and_then(|l| {
+                        tracks.actors.iter().position(|a| {
+                            a.name.eq_ignore_ascii_case(l.actor.trim_end_matches('\0'))
+                        })
+                    })
+                    .and_then(|i| drawn_object(&tracks, &c.bound, i));
             // Actors no object plays: the cutscene's own creatures.
             let name = c.name.clone();
             if self.own.as_ref().is_none_or(|(n, _)| *n != name) {
