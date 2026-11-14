@@ -101,7 +101,8 @@ A new crate, `crates/thedas-gfx`, with no Ruffle dependency:
    AVM1 text measurements truncate to pixels after laying out in twips. Empty fields
    with dynamic text measure zero while retaining a caret line; a trailing empty
    dynamic line adds no measured height. Input fields retain that line's height.
-   Closing HTML paragraphs retain their delimiters, including empty paragraphs.
+   Closing multiline HTML paragraphs retain their delimiters, including empty
+   paragraphs; single-line fields ignore paragraph and break tags.
    Leading is included once for a single line, and between subsequent lines.
    A newline within an HTML span carries the first span's line metrics forward until
    another span begins at a line boundary, matching the credits' mixed-size headings.

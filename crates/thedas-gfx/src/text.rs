@@ -283,7 +283,7 @@ impl TextField {
     }
 
     pub fn set_html(&mut self, html: &str) {
-        self.spans = parse_html(html, &self.default_format, self.multiline || true);
+        self.spans = parse_html(html, &self.default_format, self.multiline);
         self.invalidate();
     }
 
@@ -706,7 +706,7 @@ fn parse_color(s: &str) -> Option<[u8; 3]> {
 }
 
 /// Parses the HTML subset Flash's text fields read into spans.
-pub fn parse_html(html: &str, base: &Format, _multiline: bool) -> Vec<Span> {
+pub fn parse_html(html: &str, base: &Format, multiline: bool) -> Vec<Span> {
     let mut out: Vec<Span> = Vec::new();
     let mut stack: Vec<(String, Format)> = Vec::new();
     let mut fmt = base.clone();
@@ -755,7 +755,9 @@ pub fn parse_html(html: &str, base: &Format, _multiline: bool) -> Vec<Span> {
             .to_ascii_lowercase();
         if closing {
             if name == "p" || name == "li" {
-                push_text(&mut out, "\r", &fmt);
+                if multiline {
+                    push_text(&mut out, "\r", &fmt);
+                }
                 para_open = false;
             }
             if let Some(i) = stack.iter().rposition(|(n, _)| *n == name) {
@@ -767,7 +769,11 @@ pub fn parse_html(html: &str, base: &Format, _multiline: bool) -> Vec<Span> {
         let a = attrs(body);
         let get = |k: &str| a.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
         match name.as_str() {
-            "br" | "sbr" => push_text(&mut out, "\r", &fmt),
+            "br" | "sbr" => {
+                if multiline {
+                    push_text(&mut out, "\r", &fmt);
+                }
+            }
             "img" => {
                 let n = |k| get(k).and_then(|v| v.parse::<f32>().ok());
                 out.push(Span {
@@ -788,7 +794,7 @@ pub fn parse_html(html: &str, base: &Format, _multiline: bool) -> Vec<Span> {
                 }
                 match name.as_str() {
                     "p" | "li" => {
-                        if para_open {
+                        if para_open && multiline {
                             push_text(&mut out, "\r", &fmt);
                         }
                         para_open = true;
@@ -849,7 +855,7 @@ pub fn parse_html(html: &str, base: &Format, _multiline: bool) -> Vec<Span> {
             }
         }
     }
-    // Closing a paragraph retains its delimiter even at the end of the HTML.
+    // Closing a multiline paragraph retains its delimiter even at the end of the HTML.
     // Empty authored paragraphs still occupy a line (e.g. upward-growing titles).
     out.retain(|s| !matches!(&s.piece, Piece::Text(t) if t.is_empty()));
     out
@@ -1301,6 +1307,11 @@ mod tests {
             assert_eq!(t.text(), text);
             assert_eq!(t.layout(&NoFonts).height, height);
         }
+        t.multiline = false;
+        t.set_html("<p>$LOC_JOURNAL</p>");
+        assert_eq!(t.text(), "$LOC_JOURNAL");
+        t.set_html("<p>A<br>B</p><p>C</p>");
+        assert_eq!(t.text(), "ABC");
     }
 
     #[test]
