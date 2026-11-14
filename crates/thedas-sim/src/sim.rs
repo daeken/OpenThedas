@@ -4436,6 +4436,9 @@ fn read_vars(doc: &Gff3, s: &Struct, locals: &mut crate::world::Locals) {
         let Some(name) = text(v, "Name") else {
             continue;
         };
+        if !locals.order.contains(&name) {
+            locals.order.push(name.clone());
+        }
         match int(v, "Type") {
             Some(1) => {
                 locals.ints.insert(name, int(v, "Value").unwrap_or(0));
