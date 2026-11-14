@@ -379,7 +379,13 @@ impl AnimationTrack {
         {
             return None;
         }
-        let at = self.time_at(t);
+        // At the track's end (within 1e-5 s, the double at 0xb23430) the last keys are taken
+        // whatever the time (0x7db400 calls 0x7d9450 there), not the keys a hair short of it.
+        let at = if t >= self.end - 1e-5 {
+            f32::MAX
+        } else {
+            self.time_at(t)
+        };
         // The keys either side of `at` and how far between them it is.
         fn span<const N: usize>(keys: &[[f32; N]], at: f32) -> Option<(usize, usize, f32)> {
             let last = keys.len().checked_sub(1)?;
