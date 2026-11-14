@@ -17,7 +17,8 @@ struct Out {
 };
 
 @vertex
-fn vs_shadow(@location(0) position: vec3<f32>) -> Out {
+fn vs_shadow(@location(0) rest: vec3<f32>, @location(4) weights: vec4<f32>, @location(5) indices: vec4<f32>) -> Out {
+    let position = skin_vector(vec4<f32>(rest, 1.0), weights, indices);
     var out: Out;
     out.clip = d.mvp * vec4<f32>(position, 1.0);
     out.world = (d.world * vec4<f32>(position, 1.0)).xyz;

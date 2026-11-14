@@ -12,14 +12,22 @@ lightmaps. It is not parity work; where the two differ, the faithful path is rig
 
 ## Switching
 
-- `thedas_render::RenderPath` (`Faithful` | `Deferred`) on `AreaRenderer::path`. Only the
-  renderer of the level's own meshes acts on it; objects, rings and effects still draw
-  forward over its depth, as they do now.
+- `thedas_render::RenderPath` (`Faithful` | `Deferred`) on `AreaRenderer::path`. The level
+  and its eligible objects share a G-buffer; remaining materials, rings and effects draw
+  forward over its depth.
 - `thedas-app --renderer faithful|deferred` (default `faithful`), the launcher's
   "Renderer" choice, **F11** in game to flip between them at once, and the step
   `renderer faithful|deferred|toggle` for `--steps` and `--control` runs.
 - When the GPU refuses the deferred pipelines (`gpu::checked`), the level stays faithful
   and says so in the log once.
+
+Faithful loads skip deferred planning entirely, including stream conversion and texture
+lookups. Renderers constructed for deferred prepare it at load; the first F11 switch from
+faithful prepares the existing object scene and reloads only the level's CPU scene to plan
+its draws. That first switch can pause for scene loading and GPU setup; subsequent switches
+reuse the plan. Forward-only rings and effects, portraits and paperdolls do not request one.
+API callers use `AreaRenderer::new_cached_with_path`, or call `prepare_deferred` with the
+original scene before selecting `path = RenderPath::Deferred`.
 
 ## Frame (deferred path)
 
@@ -28,12 +36,13 @@ lightmaps. It is not parity work; where the two differ, the faithful path is rig
 
    | target | format | contents |
    |---|---|---|
-   | 0 | `Rgba8Unorm` | albedo rgb; alpha: Static1 (0), Low terrain (0.5), other terrain (1) |
+   | 0 | `Rgba8Unorm` | albedo rgb; alpha material code: Static1 (0), prop (64/255), Low terrain (128/255), character (192/255), other terrain (1) |
    | 1 | `Rgba8Unorm` | specular mask rgb (`mml_tSpecularMask`), specular power code (its alpha) |
    | 2 | `Rgba16Float` | normal (octahedral xy, world space, from `mml_tNormalMap` through a derivative-built tangent frame), room index, specular falloff (`mml_vFalloffParams`, as Static1's vertex shader works it out) |
-   | 3 | `Rgba8Unorm` | lightmap texel (rgb baked light, a: the baked visibility Static1 multiplies the sun and lights by) |
+   | 3 | `Rgba16Float` | lightmap RGB and baked visibility, or object probe irradiance and visibility 1; floats preserve HDR probes |
 
-   Position comes back from depth. 20 bytes a pixel, under every backend's limit.
+   Position comes back from depth. 24 bytes a pixel (32 under wgpu's attachment accounting),
+   within the portable limit.
 3. **Lighting pass**, one full-screen triangle into the frame: Static1's sum per pixel
    (`frame-gamma-lightmap-trace.md`): `albedo · (lm.rgb + lm.a · Σ(sun, point lights)) +
    specular`, its `cos²(π/2 · d/R)` falloff and Blinn-Phong highlight, then the level's fog.
@@ -44,13 +53,13 @@ lightmaps. It is not parity work; where the two differ, the faithful path is rig
    falloff ends at the radius (`THEDAS_DEFERRED_VIEW=wrap` shows the other choice).
    Point lights come from a uniform array (192, which every backend can bind) holding the
    level lights whose reach is in view (the scene's and the added ones, i.e. cutscene
-   lights; nearest first past 256), each with a bit set of the rooms it reaches
+   lights; nearest first past 192), each with a bit set of the rooms it reaches
    (`AreaScene::light_rooms`), tested against the pixel's room: no 3-light cap, no leaking
    through walls into rooms the original never lit. Tiled or clustered culling replaces
    the per-pixel loop over all of them when light counts call for it.
 4. Everything not deferred draws forward with its original shaders over that colour and
-   depth: blended and multi-pass materials, water, sky, trees, skinned meshes,
-   cut-away meshes, particles. Then the frame effects as now.
+   depth: blended, alpha-tested and multi-pass materials, water, sky, trees,
+   unsupported character materials, cut-away meshes and particles. Then frame effects as now.
 
 Debug views in place of the lit frame: `THEDAS_DEFERRED_VIEW=albedo|normal|lightmap|
 visibility|diffuse|specular|no-rooms|flat|wrap|shadows|sun-shadows|ao` (see `deferred::debug_view`).
@@ -59,12 +68,57 @@ The environment reflection Static1 adds (the probe cubemap times
 `mml_fSpecularReflectionMult`, the specular mask and falloff) has no room in the G-buffer
 (wgpu's 32 bytes a pixel): a second draw of the deferred meshes adds it over the lit frame.
 
-Left out of the first cut, to come: the material tint, and the meshes' own tangents (the G-buffer builds a tangent frame from screen derivatives).
+Static1's material tint and the meshes' own tangents remain to come (the G-buffer builds
+a tangent frame from screen derivatives).
 
 **Deferred draws**: the level's own opaque draws with Static1's shaders
-(`Static1.psh`, or `Static1_Fast.psh` at Low; no alpha test, no blending), not skinned, not
-SpeedTree, not cut away; and Origins terrain (`Terrain2.vsh` + `Terrain1.psh`, or
-`Terrain3` at Low detail). Characters and placeables move over in later steps.
+(`Static1.psh`, or `Static1_Fast.psh` at Low; no alpha test, no blending), not
+SpeedTree or cut away; and Origins terrain (`Terrain2.vsh` + `Terrain1.psh`, or
+`Terrain3` at Low detail).
+
+**Objects and characters**: opaque, single-pass `Prop1`, `Weapon1`, `Cloth1`, and
+`Char1` with `Ch1`, its NoTint, MulTint and ArmourTint variants, and their emissive
+variants. Static1 draws in object renderers also qualify. `THEDAS_DEFERRED_OBJECTS=0`
+keeps the new coverage forward for comparison. Portrait and paperdoll renderers keep
+their original path. Fade-outs return to the faithful blended draw for that frame.
+
+The deferred vertex stream retains morph positions and carries all four blend weights
+and indices. A vertex uniform palette (up to Origins' 67 affine bones) poses positions
+and normals on the GPU; point shadows use exactly the same stream, palette and transforms.
+Missing palette rows stay at identity. Malformed streams and oversized palettes stay
+forward. Posed bounds select point-shadow casters, including objects outside the camera;
+meshes explicitly marked not to cast shadows and faded objects do not enter those maps.
+The faithful renderer exposes only read-only palette and bound accessors to this path.
+
+The level and object renderers contribute before a single lighting pass, sharing room
+indices, depth, sun visibility and the four point-shadow slots. Their environment and
+emissive terms are added afterwards. Objects interpolate their assigned SH probe's light
+from posed vertex normals; normal maps affect direct lighting. Placeables also
+take the brightest ambient node, while characters take no ambient nodes. Character-domain
+point lights affect character materials, level-domain lights affect the others, and emitter
+lights affect both. Object point lights use their own visibility; only their directional
+sun takes the sun mask. Static1's grazing-angle shadow floor is confined to level materials.
+Probe bounce does not take the level lightmap's sun mask. Character
+diffuse and specular tint opacities remain independent, including the separate skin channel.
+
+Opaque `Face1/Face0` heads and `Eye0` eyes also join this path. Faces retain morphs and
+the four-weight pose, independently blend aged diffuse and normals, add expression and
+brow/stubble normal detail, and compose skin tint, tattoos, facial hair and the other
+three diffuse tint channels. Regional face roughness and diffuse alpha control a single
+Blinn specular lobe; this approximates the original skin BRDF and Beckmann lookup.
+Face probe irradiance takes its authored ambient multiplier. Eyes retain iris tint,
+base and cornea normals and both authored specular powers/masks; the one-lobe G-buffer
+blends the normals/powers by their masks rather than evaluating two separate highlights.
+Neither family receives the ordinary cubemap reflection. They share character lights,
+room indices, SSAO depth and posed point-shadow geometry with the bodies.
+`THEDAS_DEFERRED_FACES=0` keeps both families forward for comparisons.
+
+This is our deferred material approximation, not shader parity: character rim lighting,
+skin scattering, gore/heraldry and remote-material effects are not represented yet. Hair,
+alpha-tested and blended materials, lower-detail Char2 and other unsupported families
+still draw forward; they also remain absent from deferred point-shadow casters. Tangent
+frames still come from derivatives. Probe assignments remain those made at scene load.
+The float lightmap target may change baked-image rounding slightly.
 
 Terrain's G-buffer material decodes MaskV's three layer indices with point sampling and
 blends their palette texels using MaskA/MaskA2's eight weights. The material supplies atlas
@@ -118,10 +172,10 @@ debug views now include the ground. Terrain also joins the point-shadow caster l
 - Point and VFX lights: four cube shadow slots, allocated to dynamic lights by brightness
   times radius over distance from the camera. Each is six 512-square `R32Float` distance
   maps with a 0.35 m near plane to leave the flame's enclosing torch bowl out. Opaque
-  deferred static meshes cast from both faces, including geometry outside the camera's
+  eligible deferred meshes cast from both faces, including geometry outside the camera's
   view. The lighting pass compares distances with a bilinear 2-by-2 filter, a 4 cm normal
-  offset and 2 cm distance bias. Creatures and trees do not cast point shadows
-  yet; static lights keep their baked visibility. At most 24 face passes per frame.
+  offset and 2 cm distance bias. Supported skinned objects and terrain cast too; forward
+  materials and trees do not. Static lights keep baked visibility. At most 24 face passes per frame.
   `THEDAS_DEFERRED_POINT_SHADOWS=0` disables both rendering and sampling these maps for
   captures and cost comparisons; it does not change the faithful path.
 - With baked lighting on, static lights and static geometry still depend on `lm.a`.
@@ -154,12 +208,13 @@ switch. Choose it before loading an area. F11 still switches between faithful an
 
 This is a first comparison mode, not a complete replacement for baked lighting. Probes are
 the original baked irradiance and may contain direct illumination; they are not a new GI
-solution. Only deferred surfaces contribute to AO and point shadows, so forward
-characters, placeables and trees are missing from those occluders. Terrain contributes
+solution. Only deferred surfaces contribute to AO and point shadows, so unsupported
+forward materials and trees are missing from those occluders. Eligible characters,
+placeables and terrain contribute
 to both, and its reflections also stop using baked visibility in this mode. The small point-shadow
 budget, missing occluders, screen edges and coarse room probes can cause light leaks or
 ambient discontinuities. The original baked image remains the default while those are
-addressed. Moving the remaining materials and skinned objects into the G-buffer is still
+addressed. Moving the remaining material families into the G-buffer is still
 the next coverage step.
 
 ## Order of work
@@ -167,6 +222,7 @@ the next coverage step.
 1. Switch plus G-buffer and lighting for static level geometry (this document's first PR).
 2. Sun shadows in the lighting pass; terrain into the G-buffer.
 3. VFX and spell lights; point light shadow pool.
-4. Characters and placeables into the G-buffer (skinned vertex path).
+4. Characters and placeables: the shared G-buffer and skinned vertex path are in place;
+   extend the remaining material families and cutout casters next.
 5. Lightmaps off: the Static1 probe/SSAO comparison mode is in place; extend coverage and
    visibility before making it a player-facing option. Then TAA and other post work.

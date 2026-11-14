@@ -561,15 +561,16 @@ fn capture(
     } else {
         match &loaded.scene {
             Some(scene) => {
-                let mut renderer = AreaRenderer::new(
+                let mut renderer = AreaRenderer::new_cached_with_path(
                     ctx,
                     &loaded.vfs,
                     scene,
                     &loaded.programs(scene)?,
                     thedas_render::gpu::CAPTURE_FORMAT,
+                    &mut thedas_render::RenderCache::default(),
+                    loaded.render_path,
                 );
                 renderer.frame_effects = loaded.frame_effects;
-                renderer.path = loaded.render_path;
                 renderer.set_time(shader_time);
                 log_stats(&renderer);
                 renderer.capture(ctx, &camera, w, h)?
@@ -1259,15 +1260,16 @@ impl App {
         surface.configure(&ctx.device, &config);
         let renderer = match &self.loaded.scene {
             Some(scene) => {
-                let mut r = AreaRenderer::new(
+                let mut r = AreaRenderer::new_cached_with_path(
                     &ctx,
                     &self.loaded.vfs,
                     scene,
                     &self.loaded.programs(scene)?,
                     config.format,
+                    &mut thedas_render::RenderCache::default(),
+                    self.loaded.render_path,
                 );
                 r.frame_effects = self.loaded.frame_effects;
-                r.path = self.loaded.render_path;
                 log_stats(&r);
                 println!("camera {}", self.camera.spec());
                 Some(r)
@@ -3395,14 +3397,24 @@ impl App {
         let renderer = match (self.live.as_ref(), self.gfx.as_mut()) {
             (Some(l), _) => l.level.as_ref().map(|l| &l.renderer),
             (None, Some(g)) => g.renderer.as_mut().map(|r| {
+                if path == thedas_render::RenderPath::Deferred
+                    && let Some(scene) = self.loaded.scene.as_ref()
+                {
+                    r.prepare_deferred(
+                        &g.ctx,
+                        &self.loaded.vfs,
+                        scene,
+                        &mut thedas_render::RenderCache::default(),
+                    );
+                }
                 r.path = path;
                 &*r
             }),
             _ => None,
         };
-        let can = renderer.is_some_and(|r| r.can_defer());
+        let unavailable = renderer.is_some_and(|r| r.deferred_planned() && !r.can_defer());
         match path {
-            thedas_render::RenderPath::Deferred if !can => log::warn!(
+            thedas_render::RenderPath::Deferred if unavailable => log::warn!(
                 "renderer: deferred chosen, but this level has nothing it can draw deferred (or the GPU refused it): drawn faithfully"
             ),
             p => log::info!("renderer: {}", p.name()),

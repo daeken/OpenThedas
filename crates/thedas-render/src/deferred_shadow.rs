@@ -6,15 +6,18 @@
 //! the nearest caster (`R32Float`); the lighting pass picks a point's face by the major axis
 //! of its direction from the light and compares distances with a bilinear 2×2 filter.
 //!
-//! Casters are the deferred draws (the level's static meshes); creatures, trees and terrain
-//! do not cast these shadows yet.
+//! Casters are eligible deferred level, terrain and object draws, including skinned ones.
+//! Forward materials and trees do not cast these shadows yet.
 
 use glam::{Mat4, Vec3};
 
+use crate::deferred_mesh::{DeferredVertex, ROWS};
 use crate::gpu::{DEPTH_FORMAT, GpuMesh};
-use crate::scene::Vertex;
 
-pub const SHADOW_WGSL: &str = include_str!("deferred_shadow.wgsl");
+pub const SHADOW_WGSL: &str = concat!(
+    include_str!("deferred_skin.wgsl"),
+    include_str!("deferred_shadow.wgsl")
+);
 
 /// Shadowed lights per frame.
 pub(crate) const SLOTS: usize = 4;
@@ -59,8 +62,11 @@ struct DrawUniforms {
 }
 
 /// One caster: its mesh, model-to-world and world bounding sphere.
-pub(crate) struct Caster {
-    pub mesh: usize,
+pub(crate) struct Caster<'a> {
+    pub mesh: &'a GpuMesh,
+    pub vertices: &'a wgpu::Buffer,
+    pub bones: &'a wgpu::Buffer,
+    pub bone_offset: u32,
     pub world: Mat4,
     pub sphere: (Vec3, f32),
 }
@@ -69,7 +75,6 @@ pub(crate) struct ShadowPool {
     pipeline: wgpu::RenderPipeline,
     layout: wgpu::BindGroupLayout,
     buffer: wgpu::Buffer,
-    group: wgpu::BindGroup,
     /// Slots of [`STRIDE`] the buffer holds.
     capacity: usize,
     /// Per layer (slot · 6 + face), the colour and depth views drawn into.
@@ -86,16 +91,28 @@ impl ShadowPool {
         });
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("deferred shadows"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: true,
-                    min_binding_size: None,
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: true,
+                        min_binding_size: None,
+                    },
+                    count: None,
                 },
-                count: None,
-            }],
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: true,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("deferred shadows"),
@@ -110,9 +127,25 @@ impl ShadowPool {
                 entry_point: Some("vs_shadow"),
                 compilation_options: Default::default(),
                 buffers: &[Some(wgpu::VertexBufferLayout {
-                    array_stride: std::mem::size_of::<Vertex>() as u64,
+                    array_stride: std::mem::size_of::<DeferredVertex>() as u64,
                     step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &wgpu::vertex_attr_array![0 => Float32x3],
+                    attributes: &[
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x3,
+                            offset: 0,
+                            shader_location: 0,
+                        },
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x4,
+                            offset: 40,
+                            shader_location: 4,
+                        },
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x4,
+                            offset: 56,
+                            shader_location: 5,
+                        },
+                    ],
                 })],
             },
             // Both faces cast: walls seen from behind still block.
@@ -179,42 +212,49 @@ impl ShadowPool {
             dimension: Some(wgpu::TextureViewDimension::D2Array),
             ..Default::default()
         });
-        let (buffer, group) = Self::slots(device, &layout, 1);
+        let buffer = Self::slots(device, 1);
         ShadowPool {
             pipeline,
             layout,
             buffer,
-            group,
             capacity: 1,
             layers,
             view,
         }
     }
 
-    fn slots(
-        device: &wgpu::Device,
-        layout: &wgpu::BindGroupLayout,
-        capacity: usize,
-    ) -> (wgpu::Buffer, wgpu::BindGroup) {
-        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+    fn slots(device: &wgpu::Device, capacity: usize) -> wgpu::Buffer {
+        device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("deferred shadow draws"),
             size: (STRIDE * capacity) as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
-        });
-        let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        })
+    }
+
+    fn group(&self, device: &wgpu::Device, bones: &wgpu::Buffer) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("deferred shadow draws"),
-            layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                    buffer: &buffer,
-                    offset: 0,
-                    size: wgpu::BufferSize::new(std::mem::size_of::<DrawUniforms>() as u64),
-                }),
-            }],
-        });
-        (buffer, group)
+            layout: &self.layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &self.buffer,
+                        offset: 0,
+                        size: wgpu::BufferSize::new(std::mem::size_of::<DrawUniforms>() as u64),
+                    }),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: bones,
+                        offset: 0,
+                        size: wgpu::BufferSize::new((ROWS * 16) as u64),
+                    }),
+                },
+            ],
+        })
     }
 
     /// Records the shadow maps of `lights` (position, radius; one slot each, at most
@@ -225,8 +265,7 @@ impl ShadowPool {
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
         lights: &[(Vec3, f32)],
-        casters: &[Caster],
-        meshes: &[GpuMesh],
+        casters: &[Caster<'_>],
     ) {
         // Per layer, its draws: (caster, slot in the buffer).
         let mut data: Vec<u8> = Vec::new();
@@ -258,11 +297,22 @@ impl ShadowPool {
             let need = data.len() / STRIDE;
             if need > self.capacity {
                 let capacity = need.next_power_of_two();
-                (self.buffer, self.group) = Self::slots(device, &self.layout, capacity);
+                self.buffer = Self::slots(device, capacity);
                 self.capacity = capacity;
             }
             queue.write_buffer(&self.buffer, 0, &data);
         }
+        let mut groups = Vec::<(&wgpu::Buffer, wgpu::BindGroup)>::new();
+        let caster_groups: Vec<usize> = casters
+            .iter()
+            .map(|c| {
+                if let Some(i) = groups.iter().position(|(b, _)| *b == c.bones) {
+                    return i;
+                }
+                groups.push((c.bones, self.group(device, c.bones)));
+                groups.len() - 1
+            })
+            .collect();
         for (layer, draws) in layers.iter().enumerate() {
             let Some((colour, depth)) = self.layers.get(layer) else {
                 continue;
@@ -298,11 +348,14 @@ impl ShadowPool {
             });
             pass.set_pipeline(&self.pipeline);
             for &(i, slot) in draws {
-                let Some(mesh) = meshes.get(casters[i].mesh) else {
-                    continue;
-                };
-                pass.set_bind_group(0, &self.group, &[slot * STRIDE as u32]);
-                pass.set_vertex_buffer(0, mesh.vertices.slice(..));
+                let c = &casters[i];
+                let mesh = c.mesh;
+                pass.set_bind_group(
+                    0,
+                    &groups[caster_groups[i]].1,
+                    &[slot * STRIDE as u32, c.bone_offset],
+                );
+                pass.set_vertex_buffer(0, c.vertices.slice(..));
                 pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..mesh.count, 0, 0..1);
             }

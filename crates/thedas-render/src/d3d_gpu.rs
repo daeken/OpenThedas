@@ -2242,6 +2242,16 @@ impl D3dPass {
         self.worlds.get(draw).map(|w| w.0)
     }
 
+    /// The current palette, shared read-only with the deferred vertex path.
+    pub(crate) fn bones(&self, draw: usize) -> &[[f32; 4]] {
+        self.bones.get(draw).map_or(&[], Vec::as_slice)
+    }
+
+    /// The current posed world bound, shared read-only for deferred point shadows.
+    pub(crate) fn draw_sphere(&self, draw: &D3dDraw) -> Option<(Vec3, f32)> {
+        self.world_sphere(draw)
+    }
+
     pub fn set_world(&mut self, draw: usize, world: glam::Mat4) {
         if let Some(w) = self.worlds.get_mut(draw) {
             w.0 = world;
