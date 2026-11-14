@@ -331,10 +331,12 @@ impl Sim {
         }
     }
 
-    /// Runs a line's action, with `DialogIsAmbient` telling whether the line is ambient.
-    fn node_action(&mut self, node: &Node, owner: ObjectId) {
-        self.dialog_ambient = node.ambient;
-        self.action(&node.action, owner);
+    /// Actions use the conversation's ambient mode (0x7eedc0), whereas conditions
+    /// use the node's flag (0x7f04ca). A newly ambient line enters that mode before acting.
+    fn node_action(&mut self, node: &Node, c: &Conversation) {
+        self.dialog_ambient =
+            node.ambient || (self.game == thedas_vfs::Game::Origins && c.ambient_run);
+        self.action(&node.action, c.owner);
     }
 
     fn action(&mut self, a: &PlotRef, owner: ObjectId) {
@@ -361,7 +363,7 @@ impl Sim {
         self.end_line_staging(&mut c);
         let node = c.dlg.nodes[line].clone();
         self.mark_shown(&mut c, line);
-        self.node_action(&node, c.owner);
+        self.node_action(&node, &c);
         if !c.ambient_run && !node.ambient {
             self.begin_line_staging(&mut c, line);
         }
@@ -441,7 +443,7 @@ impl Sim {
             c.cut_lines_left -= 1;
             let reply = c.dlg.nodes[r].clone();
             self.mark_shown(&mut c, r);
-            self.node_action(&reply, c.owner);
+            self.node_action(&reply, &c);
             let next = reply.children.iter().copied().find(|&n| self.usable(&c, n));
             if let Some(next) = next.filter(|&n| !c.dlg.nodes[n].reply && n != line) {
                 return self.speak(c, next);
@@ -1001,7 +1003,7 @@ impl Sim {
         let next = if c.dlg.nodes[r].reply {
             let node = c.dlg.nodes[r].clone();
             self.mark_shown(&mut c, r);
-            self.node_action(&node, c.owner);
+            self.node_action(&node, &c);
             let n = node
                 .children
                 .iter()
@@ -1051,7 +1053,7 @@ impl Sim {
         self.end_line_staging(&mut c);
         let node = c.dlg.nodes[reply].clone();
         self.mark_shown(&mut c, reply);
-        self.node_action(&node, c.owner);
+        self.node_action(&node, &c);
         // The action started another conversation (a plot script's UT_Talk): it replaces
         // this one, as in the game.
         if self.talk.is_some() {
@@ -1398,8 +1400,42 @@ mod tests {
         assert!(sim.usable(&c, 1) && !sim.dialog_ambient);
         let c = sim.speak(c, 0);
         assert!(sim.dialog_ambient, "the ambient line's action ran");
-        sim.speak(c, 1);
+        let mut c = sim.speak(c, 1);
         assert!(!sim.dialog_ambient);
+        // An unflagged reply in an ambient run still acts in ambient context. Its
+        // condition uses the reply flag, as in an ordinary conversation.
+        c.ambient_run = true;
+        c.dlg.nodes[1].reply = true;
+        assert!(sim.usable(&c, 1) && !sim.dialog_ambient);
+        sim.node_action(&c.dlg.nodes[1], &c);
+        let getter = thedas_script::EngineTable::parse(b"int DialogIsAmbient() = 223;")
+            .unwrap()
+            .function_by_name("DialogIsAmbient")
+            .cloned()
+            .unwrap();
+        let query = |s: &mut Sim| {
+            crate::engine::call(
+                &mut crate::sim::ScriptHost {
+                    sim: s,
+                    event: None,
+                    script: "ambient_test".into(),
+                },
+                c.owner,
+                &getter,
+                &[],
+            )
+            .unwrap()
+            .unwrap()
+        };
+        assert_eq!(query(&mut sim), Some(V::Int(1)));
+        c.ambient_run = false;
+        sim.node_action(&c.dlg.nodes[1], &c);
+        assert_eq!(query(&mut sim), Some(V::Int(0)));
+        // DA2 retains its line-only context pending its own trace.
+        c.ambient_run = true;
+        sim.game = thedas_vfs::Game::DragonAge2;
+        sim.node_action(&c.dlg.nodes[1], &c);
+        assert_eq!(query(&mut sim), Some(V::Int(0)));
     }
 
     #[test]

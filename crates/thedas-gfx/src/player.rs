@@ -92,6 +92,7 @@ impl Player {
             global,
             protos,
             root,
+            native_target: None,
             movie: movie.clone(),
             name: name.to_string(),
             classes: HashMap::new(),
@@ -578,6 +579,20 @@ impl Player {
         display_api::broadcast(&mut self.vm, key, "onKeyUp", &[]);
         self.clip_mouse_event("onKeyUp", clip_event::KEY_UP, &[]);
         self.run_queue();
+    }
+
+    /// Selects all text in the focused editable or selectable field.
+    pub fn select_all(&mut self) {
+        if let Some(t) = self
+            .vm
+            .focus
+            .and_then(|f| self.vm.display.get_mut(f))
+            .and_then(|o| o.text_mut())
+            && (t.input || t.selectable)
+        {
+            t.set_selection(0, t.len());
+            self.vm.dirty = true;
+        }
     }
 
     /// Types `text` into the focused text field.
@@ -1471,12 +1486,13 @@ pub fn set_focus(vm: &mut Vm, d: Option<DisplayId>) {
         .and_then(|o| o.text_mut())
     {
         t.caret = None;
+        t.selection_anchor = 0;
     }
     if let Some(t) = d
         .and_then(|o| vm.display.get_mut(o))
         .and_then(|o| o.text_mut())
     {
-        t.caret = Some(t.len());
+        t.set_selection(t.len(), t.len());
     }
     let ov = old
         .map(|o| display_api::display_value(vm, o))
@@ -1519,33 +1535,66 @@ fn text_key(vm: &mut Vm, f: DisplayId, code: u32, ch: Option<char>) -> bool {
     }
     let mut text: Vec<char> = t.text().chars().collect();
     let mut caret = t.caret.unwrap_or(text.len()).min(text.len());
+    let (begin, end) = t.selection();
+    let shift = vm.keys_down.contains(&16);
+    let selecting_all = code == 65 && vm.keys_down.contains(&17);
+    let mut anchor = t.selection_anchor.min(text.len());
     let mut changed = false;
     match (code, ch) {
+        (65, _) if selecting_all => {
+            anchor = 0;
+            caret = text.len();
+        }
         (8, _) => {
-            if caret > 0 {
+            if begin != end {
+                text.drain(begin..end);
+                caret = begin;
+                changed = true;
+            } else if caret > 0 {
                 text.remove(caret - 1);
                 caret -= 1;
                 changed = true;
             }
         }
         (46, _) => {
-            if caret < text.len() {
+            if begin != end {
+                text.drain(begin..end);
+                caret = begin;
+                changed = true;
+            } else if caret < text.len() {
                 text.remove(caret);
                 changed = true;
             }
         }
-        (37, _) => caret = caret.saturating_sub(1),
-        (39, _) => caret = (caret + 1).min(text.len()),
+        (37, _) => {
+            caret = if !shift && begin != end {
+                begin
+            } else {
+                caret.saturating_sub(1)
+            }
+        }
+        (39, _) => {
+            caret = if !shift && begin != end {
+                end
+            } else {
+                (caret + 1).min(text.len())
+            }
+        }
         (36, _) => caret = 0,
         (35, _) => caret = text.len(),
         (13, _) if t.multiline => {
+            text.drain(begin..end);
+            caret = begin;
             text.insert(caret, '\r');
             caret += 1;
             changed = true;
         }
         (_, Some(c)) if !c.is_control() => {
             let allowed = t.restrict.as_deref().is_none_or(|r| restrict_allows(r, c));
-            if allowed && (t.max_chars == 0 || (text.len() as u32) < t.max_chars) {
+            if allowed && (t.max_chars == 0 || ((text.len() - (end - begin)) as u32) < t.max_chars)
+            {
+                text.drain(begin..end);
+                caret = begin;
                 text.insert(caret, c);
                 caret += 1;
                 changed = true;
@@ -1559,7 +1608,10 @@ fn text_key(vm: &mut Vm, f: DisplayId, code: u32, ch: Option<char>) -> bool {
     if changed {
         t.set_text(&s);
     }
-    t.caret = Some(caret);
+    if changed || (!shift && !selecting_all) {
+        anchor = caret;
+    }
+    t.set_selection(anchor, caret);
     let var = t.variable.clone();
     vm.dirty = true;
     if changed {
@@ -1693,7 +1745,11 @@ fn pick_any(vm: &Vm, d: DisplayId, x: f32, y: f32) -> Option<DisplayId> {
 
 fn pick_in(vm: &Vm, d: DisplayId, x: f32, y: f32, buttons: bool) -> Option<DisplayId> {
     let o = vm.display.get(d)?;
-    if !o.visible || o.hit_test_disable {
+    if !o.visible
+        || o.hit_test_disable
+        || o.mask_for.is_some()
+        || o.mask.is_some_and(|m| !hit_shape_impl(vm, m, x, y, true))
+    {
         return None;
     }
     // Children, topmost first; masks hide what is outside them.
@@ -1711,10 +1767,11 @@ fn pick_in(vm: &Vm, d: DisplayId, x: f32, y: f32, buttons: bool) -> Option<Displ
         if vm.display.get(*c).is_some_and(|co| co.clip_depth.is_some()) {
             continue;
         }
-        if let Some((_, _, m)) = masks.iter().find(|(md, cd, _)| depth > md && depth <= cd) {
-            if !hit_shape(vm, *m, x, y) {
-                continue;
-            }
+        if masks
+            .iter()
+            .any(|(md, cd, m)| depth > md && depth <= cd && !hit_shape_impl(vm, *m, x, y, true))
+        {
+            continue;
         }
         let is_clip = vm.display.get(*c).is_some_and(|co| co.clip().is_some());
         if buttons {
@@ -1748,10 +1805,19 @@ fn pick_in(vm: &Vm, d: DisplayId, x: f32, y: f32, buttons: bool) -> Option<Displ
 
 /// Whether the point (twips, stage space) is on `d`'s drawn content.
 pub fn hit_shape(vm: &Vm, d: DisplayId, x: f32, y: f32) -> bool {
+    hit_shape_impl(vm, d, x, y, false)
+}
+
+fn hit_shape_impl(vm: &Vm, d: DisplayId, x: f32, y: f32, masking: bool) -> bool {
     let Some(o) = vm.display.get(d) else {
         return false;
     };
-    if !o.visible || o.hit_test_disable {
+    if !masking
+        && (!o.visible
+            || o.hit_test_disable
+            || o.mask_for.is_some()
+            || o.mask.is_some_and(|m| !hit_shape_impl(vm, m, x, y, true)))
+    {
         return false;
     }
     let Some(inv) = vm.display.world_matrix(d).invert() else {
@@ -1796,7 +1862,7 @@ pub fn hit_shape(vm: &Vm, d: DisplayId, x: f32, y: f32) -> bool {
             let kids: Vec<DisplayId> = o.children.values().copied().collect();
             kids.iter().any(|k| {
                 vm.display.get(*k).is_some_and(|ko| ko.clip_depth.is_none())
-                    && hit_shape(vm, *k, x, y)
+                    && hit_shape_impl(vm, *k, x, y, masking)
             })
         }
     }
@@ -1928,6 +1994,270 @@ mod queue_tests {
         code.extend_from_slice(text.as_bytes());
         code.extend_from_slice(&[0, 0x26, 0]);
         Arc::from(code)
+    }
+
+    fn input_player() -> (Player, DisplayId) {
+        let movie = b"FWS\x08\x12\0\0\0\x08\0\0\x1e\x01\0\x40\0\0\0";
+        let mut p =
+            Player::new(movie, "selection", Box::new(Empty), Arc::new(Empty), None).unwrap();
+        let text = crate::text::TextField::new(Arc::new(crate::swf::EditText::default()), None);
+        let mut object = Object::new(Kind::Text(Box::new(text)));
+        object.parent = Some(p.vm.root);
+        let field = p.vm.display.add(object);
+        p.vm.display
+            .get_mut(p.vm.root)
+            .unwrap()
+            .children
+            .insert(1, field);
+        (p, field)
+    }
+
+    #[test]
+    fn select_all_replaces_text_and_keeps_restrictions_limits_and_notifications() {
+        let (mut p, field) = input_player();
+        let selection = Value::Object(p.vm.selection);
+        assert_eq!(
+            p.vm.call_method(&selection, "getBeginIndex", &[]),
+            Value::Number(-1.0)
+        );
+        set_focus(&mut p.vm, Some(field));
+        let text_value = p.vm.display_object(field);
+        let changed = p.vm.new_native(|vm, this, _| {
+            let text = vm.get(&this, "text");
+            let s = vm.to_str(&text);
+            vm.log.push(format!("changed: {s}"));
+            Value::Undefined
+        });
+        p.vm.set(&text_value, "onChanged", Value::Object(changed));
+        let t = p.vm.display.get_mut(field).unwrap().text_mut().unwrap();
+        t.variable = "name".into();
+        t.max_chars = 5;
+        t.restrict = Some("A-Za-z".into());
+        p.type_text("Rowan");
+        p.select_all();
+        assert_eq!(
+            p.vm.call_method(&selection, "getBeginIndex", &[]),
+            Value::Number(0.0)
+        );
+        assert_eq!(
+            p.vm.call_method(&selection, "getEndIndex", &[]),
+            Value::Number(5.0)
+        );
+        p.type_text("!");
+        assert_eq!(
+            p.vm.display.get(field).unwrap().text().unwrap().selection(),
+            (0, 5)
+        );
+        p.type_text("Sera");
+        let t = p.vm.display.get(field).unwrap().text().unwrap();
+        assert_eq!(t.text(), "Sera");
+        assert_eq!(t.selection(), (4, 4));
+        let root = p.vm.display_object(p.vm.root);
+        assert_eq!(p.vm.get(&root, "name"), Value::from("Sera"));
+        assert_eq!(p.drain_log().last().unwrap(), "changed: Sera");
+        p.key_down(17, None);
+        p.key_down(65, Some('a'));
+        p.key_up(65);
+        p.key_up(17);
+        p.key_down(8, None);
+        p.key_up(8);
+        assert_eq!(p.vm.display.get(field).unwrap().text().unwrap().text(), "");
+        assert_eq!(
+            p.vm.call_method(&selection, "getCaretIndex", &[]),
+            Value::Number(0.0)
+        );
+        set_focus(&mut p.vm, None);
+        assert_eq!(
+            p.vm.call_method(&selection, "getCaretIndex", &[]),
+            Value::Number(-1.0)
+        );
+    }
+
+    #[test]
+    fn selection_ranges_shift_navigation_and_utf16_indices() {
+        let (mut p, field) = input_player();
+        set_focus(&mut p.vm, Some(field));
+        p.type_text("Rowan");
+        p.key_down(36, None);
+        p.key_up(36);
+        p.key_down(16, None);
+        p.key_down(39, None);
+        p.key_down(39, None);
+        p.key_up(39);
+        p.key_up(16);
+        assert_eq!(
+            p.vm.display.get(field).unwrap().text().unwrap().selection(),
+            (0, 2)
+        );
+        p.type_text("Br");
+        assert_eq!(
+            p.vm.display.get(field).unwrap().text().unwrap().text(),
+            "Brwan"
+        );
+        let selection = Value::Object(p.vm.selection);
+        p.vm.call_method(
+            &selection,
+            "setSelection",
+            &[Value::Number(4.0), Value::Number(1.0)],
+        );
+        assert_eq!(
+            p.vm.call_method(&selection, "getBeginIndex", &[]),
+            Value::Number(1.0)
+        );
+        assert_eq!(
+            p.vm.call_method(&selection, "getCaretIndex", &[]),
+            Value::Number(1.0)
+        );
+        p.key_down(39, None);
+        p.key_up(39);
+        assert_eq!(
+            p.vm.call_method(&selection, "getCaretIndex", &[]),
+            Value::Number(4.0)
+        );
+        p.vm.call_method(
+            &selection,
+            "setSelection",
+            &[Value::Number(1.0), Value::Number(4.0)],
+        );
+        p.key_down(8, None);
+        p.key_up(8);
+        assert_eq!(
+            p.vm.display.get(field).unwrap().text().unwrap().text(),
+            "Bn"
+        );
+        p.vm.display
+            .get_mut(field)
+            .unwrap()
+            .text_mut()
+            .unwrap()
+            .set_text("A😀B");
+        p.vm.call_method(
+            &selection,
+            "setSelection",
+            &[Value::Number(1.0), Value::Number(3.0)],
+        );
+        assert_eq!(
+            p.vm.call_method(&selection, "getCaretIndex", &[]),
+            Value::Number(3.0)
+        );
+        p.type_text("X");
+        assert_eq!(
+            p.vm.display.get(field).unwrap().text().unwrap().text(),
+            "AXB"
+        );
+        p.vm.call_method(
+            &selection,
+            "setSelection",
+            &[Value::Number(-2.0), Value::Number(999.0)],
+        );
+        p.vm.call_method(&selection, "setSelection", &[]);
+        p.key_down(46, None);
+        p.key_up(46);
+        assert_eq!(p.vm.display.get(field).unwrap().text().unwrap().text(), "");
+    }
+
+    #[test]
+    fn script_masks_reassign_clear_and_detach_on_removal() {
+        let movie = b"FWS\x08\x12\0\0\0\x08\0\0\x1e\x01\0\x40\0\0\0";
+        let mut p = Player::new(movie, "masks", Box::new(Empty), Arc::new(Empty), None).unwrap();
+        let root = p.vm.root;
+        let a = create_empty(&mut p.vm, root, "a", 1).unwrap();
+        let b = create_empty(&mut p.vm, root, "b", 2).unwrap();
+        let mask = create_empty(&mut p.vm, root, "mask", 3).unwrap();
+        let av = p.vm.display_object(a);
+        let bv = p.vm.display_object(b);
+        let mv = p.vm.display_object(mask);
+        assert_eq!(
+            p.vm.call_method(&av, "setMask", std::slice::from_ref(&mv)),
+            Value::Bool(true)
+        );
+        assert_eq!(p.vm.display.get(a).unwrap().mask, Some(mask));
+        assert_eq!(p.vm.display.get(mask).unwrap().mask_for, Some(a));
+        assert_eq!(
+            p.vm.call_method(&bv, "setMask", std::slice::from_ref(&mv)),
+            Value::Bool(true)
+        );
+        assert_eq!(p.vm.display.get(a).unwrap().mask, None);
+        assert_eq!(p.vm.display.get(mask).unwrap().mask_for, Some(b));
+        assert_eq!(
+            p.vm.call_method(&bv, "setMask", &[Value::from("missing")]),
+            Value::Bool(false)
+        );
+        assert_eq!(p.vm.call_method(&bv, "setMask", &[]), Value::Undefined);
+        assert_eq!(p.vm.display.get(b).unwrap().mask, Some(mask));
+        assert_eq!(
+            p.vm.call_method(&bv, "setMask", std::slice::from_ref(&bv)),
+            Value::Bool(false)
+        );
+        assert_eq!(
+            p.vm.call_method(&bv, "setMask", &[Value::Null]),
+            Value::Bool(true)
+        );
+        assert_eq!(p.vm.display.get(mask).unwrap().mask_for, None);
+        p.vm.call_method(&av, "setMask", std::slice::from_ref(&mv));
+        remove_clip(&mut p.vm, mask);
+        assert_eq!(p.vm.display.get(a).unwrap().mask, None);
+        let reused = create_empty(&mut p.vm, root, "newMask", 3).unwrap();
+        assert_ne!(reused, mask);
+        assert!(p.vm.display.set_mask(a, Some(reused)));
+        remove_clip(&mut p.vm, a);
+        assert_eq!(p.vm.display.get(reused).unwrap().mask_for, None);
+    }
+
+    #[test]
+    fn script_mask_paths_use_the_activation_and_masks_clip_mouse_picking() {
+        let movie = b"FWS\x08\x12\0\0\0\x08\0\0\x1e\x01\0\x40\0\0\0";
+        let mut p = Player::new(movie, "masks", Box::new(Empty), Arc::new(Empty), None).unwrap();
+        let root = p.vm.root;
+        let container = create_empty(&mut p.vm, root, "container", 1).unwrap();
+        let target = create_empty(&mut p.vm, container, "target", 0).unwrap();
+        let mask = create_empty(&mut p.vm, container, "mask", 1).unwrap();
+        let rect = |width| crate::display::Drawing {
+            fills: vec![(
+                [255; 4],
+                vec![(0.0, 0.0), (width, 0.0), (width, 400.0), (0.0, 400.0)],
+            )],
+            ..Default::default()
+        };
+        p.vm.display
+            .get_mut(target)
+            .unwrap()
+            .clip_mut()
+            .unwrap()
+            .drawing = Some(rect(400.0));
+        let o = p.vm.display.get_mut(mask).unwrap();
+        o.clip_mut().unwrap().drawing = Some(rect(100.0));
+        o.matrix.tx = 100.0;
+        o.visible = false;
+        o.color.mul[3] = 0.0;
+        let tv = p.vm.display_object(target);
+        let press = p.vm.new_native(|_, _, _| Value::Undefined);
+        p.vm.set(&tv, "onPress", Value::Object(press));
+        // target.setMask("mask"), evaluated on container's timeline.
+        let mut code = Vec::new();
+        let string = |code: &mut Vec<u8>, value: &str| {
+            code.push(0x96);
+            code.extend_from_slice(&((value.len() + 2) as u16).to_le_bytes());
+            code.push(0);
+            code.extend_from_slice(value.as_bytes());
+            code.push(0);
+        };
+        string(&mut code, "mask");
+        code.extend_from_slice(&[0x96, 5, 0, 7, 1, 0, 0, 0]);
+        string(&mut code, "target");
+        code.push(0x1c);
+        string(&mut code, "setMask");
+        code.extend_from_slice(&[0x52, 0x17, 0]);
+        interp::run_actions(&mut p.vm, &Arc::from(code), container);
+        assert_eq!(p.vm.native_target, None);
+        assert_eq!(p.vm.display.get(target).unwrap().mask, Some(mask));
+        assert_eq!(pick(&p.vm, 150.0, 200.0), Some(target));
+        assert_eq!(pick(&p.vm, 50.0, 200.0), None);
+        assert_eq!(pick(&p.vm, 250.0, 200.0), None);
+        p.vm.display.get_mut(mask).unwrap().matrix.tx = 200.0;
+        assert_eq!(pick(&p.vm, 150.0, 200.0), None);
+        assert_eq!(pick(&p.vm, 250.0, 200.0), Some(target));
+        assert!(!hit_shape(&p.vm, mask, 250.0, 200.0));
     }
 
     #[test]

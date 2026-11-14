@@ -21,6 +21,7 @@ pub mod erf;
 mod gog_dlc;
 pub mod install;
 pub mod keys_file;
+pub mod manifest;
 pub mod mods;
 pub mod path;
 pub mod vfs;

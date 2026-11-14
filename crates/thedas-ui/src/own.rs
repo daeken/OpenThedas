@@ -353,6 +353,10 @@ impl OwnMovie {
     }
 
     pub fn key(&mut self, key: UiKey) {
+        if key == UiKey::SelectAll {
+            self.player.select_all();
+            return;
+        }
         let (code, ch) = match key {
             UiKey::Char(c) => (c.to_ascii_uppercase() as u32, Some(c)),
             UiKey::Backspace => (8, None),
