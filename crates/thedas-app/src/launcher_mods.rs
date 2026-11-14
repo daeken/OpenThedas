@@ -71,7 +71,8 @@ impl ModReport {
         }
     }
 
-    pub fn poll(&mut self) {
+    pub fn poll(&mut self, root: Option<&PathBuf>) {
+        self.follow(root);
         let State::Running(rx) = &self.state else {
             return;
         };
@@ -93,14 +94,14 @@ impl ModReport {
         }
     }
 
-    /// The page is drawn for `root`: a report of another game is not this game's, so it is
-    /// forgotten (a running scan starts over for `root` when it ends).
-    fn follow(&mut self, root: &PathBuf) {
-        if self.root.as_ref() != Some(root) {
+    /// Follows the chosen install even while another page is open. A running scan starts
+    /// over for the chosen install when it ends, or is dropped if no install is chosen.
+    fn follow(&mut self, root: Option<&PathBuf>) {
+        if self.root.as_ref() != root {
             if !matches!(self.state, State::Idle) {
                 self.forget();
             }
-            self.root = Some(root.clone());
+            self.root = root.cloned();
         }
     }
 
@@ -121,11 +122,11 @@ impl ModReport {
     pub fn draw(&mut self, ui: &mut egui::Ui, root: Option<&PathBuf>, dirty: bool) {
         ui.add_space(12.0);
         heading(ui, "What your mods do", 18.0);
+        self.follow(root);
         let Some(root) = root else {
             ui.label("Choose a game on the Play page to see how your mods change it.");
             return;
         };
-        self.follow(root);
         if dirty {
             ui.label(
                 RichText::new("This reads the saved list: save your changes first.").color(BAD),
@@ -334,12 +335,12 @@ mod tests {
         running(&mut r, Ok(report()));
         r.forget();
         assert!(r.running() && r.stale, "forget only marks a running scan");
-        r.poll();
+        r.poll(Some(&here));
         // Its answer described an older list: it scans again (and, with no install there,
         // that fails at once).
         assert!(r.running() && !r.stale);
         for _ in 0..200 {
-            r.poll();
+            r.poll(Some(&here));
             if !r.running() {
                 break;
             }
@@ -356,16 +357,38 @@ mod tests {
         r.root = Some(one.clone());
         r.state = State::Done(report());
         r.shown = Some((0, vec![1]));
-        r.follow(&one);
+        r.follow(Some(&one));
         assert!(matches!(r.state, State::Done(_)), "the same game keeps it");
-        r.follow(&two);
+        r.follow(Some(&two));
         assert!(matches!(r.state, State::Idle) && r.shown.is_none());
         assert_eq!(r.root, Some(two.clone()));
         // A scan of the other game is dropped and run again for this one.
         r.root = Some(one);
         running(&mut r, Ok(report()));
-        r.follow(&two);
-        assert!(r.stale && r.root == Some(two));
+        r.poll(Some(&two));
+        assert!(r.running() && !r.stale);
+        assert_eq!(r.root, Some(two));
+    }
+
+    #[test]
+    fn removing_the_chosen_game_drops_a_running_scan() {
+        let mut r = ModReport::new();
+        r.root = Some(PathBuf::from("/nowhere/game"));
+        running(&mut r, Ok(report()));
+        r.poll(None);
+        assert!(matches!(r.state, State::Idle));
+        assert!(r.root.is_none() && !r.stale);
+    }
+
+    #[test]
+    fn removing_the_chosen_game_forgets_a_finished_report() {
+        let mut r = ModReport::new();
+        r.root = Some(PathBuf::from("/nowhere/game"));
+        r.state = State::Done(report());
+        r.shown = Some((0, vec![1]));
+        r.poll(None);
+        assert!(matches!(r.state, State::Idle));
+        assert!(r.root.is_none() && r.shown.is_none());
     }
 
     #[test]
