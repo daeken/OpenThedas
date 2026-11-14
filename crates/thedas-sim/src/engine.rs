@@ -103,6 +103,12 @@ fn void() -> Option<VmResult<Option<Value>>> {
     Some(Ok(None))
 }
 
+/// Dragon Age II creature fields its scripts set and read (`SetCreatureAmbientActivityPattern`
+/// and the rest); DA2's templates do not carry them.
+const DA2_AMBIENT_ACTIVITY: &str = "AmbientActivityPattern";
+const DA2_AMBIENT_MOVEMENT: &str = "AmbientMovementPattern";
+const DA2_ENCOUNTER: &str = "EncounterId";
+
 /// The party's inventory slots before any backpack (provisional).
 pub const DEFAULT_INVENTORY_SIZE: i32 = 70;
 
@@ -4056,6 +4062,60 @@ pub fn call(
             void()
         }
 
+        // Dragon Age II's additions (none is in DA:O's script.ldf). Provisional: read from
+        // their script.ldf declarations and the fields DA2's templates carry, not traced in
+        // DragonAge2.exe.
+        "GetItemLevel"
+        | "GetItemVariation"
+        | "GetPlaceableStateController"
+        | "GetCreatureAmbientActivityPattern"
+        | "GetCreatureAmbientMovementPattern"
+        | "GetEncounterId" => {
+            let field = match name {
+                "GetItemLevel" => "Level",
+                "GetItemVariation" => "ModelVariation",
+                // A placeable template's state controller: a row of
+                // placeable_statecontrollers.gda (4 informational, 2 area transition, ...).
+                "GetPlaceableStateController" => "StateController",
+                "GetCreatureAmbientActivityPattern" => DA2_AMBIENT_ACTIVITY,
+                "GetCreatureAmbientMovementPattern" => DA2_AMBIENT_MOVEMENT,
+                _ => DA2_ENCOUNTER,
+            };
+            ok(Value::Int(
+                h.object(obj(a, 0))
+                    .and_then(|o| o.fields.get(field).copied())
+                    .unwrap_or(0),
+            ))
+        }
+        "SetItemLevel"
+        | "SetCreatureAmbientActivityPattern"
+        | "SetCreatureAmbientMovementPattern"
+        | "SetEncounterId" => {
+            let field = match name {
+                "SetItemLevel" => "Level",
+                "SetCreatureAmbientActivityPattern" => DA2_AMBIENT_ACTIVITY,
+                "SetCreatureAmbientMovementPattern" => DA2_AMBIENT_MOVEMENT,
+                _ => DA2_ENCOUNTER,
+            };
+            if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
+                o.fields.insert(field.to_string(), int(a, 1));
+            }
+            void()
+        }
+        "min" => ok(Value::Int(int(a, 0).min(int(a, 1)))),
+        "max" => ok(Value::Int(int(a, 0).max(int(a, 1)))),
+        "minf" => ok(Value::Float(float(a, 0).min(float(a, 1)))),
+        "maxf" => ok(Value::Float(float(a, 0).max(float(a, 1)))),
+        // The player's profile unlocks, the cross-game vault and the GUI attribute tree are
+        // not kept: none is set.
+        "GetGlobalUnlock" | "GetVaultInt" | "GetAttributeBool" => ok(Value::Int(0)),
+        // Presentation only.
+        "PreloadCreatureForConversation"
+        | "SetGUIElementEnabled"
+        | "SetPartyMailArea"
+        | "SetNextLoadScreenMovie"
+        | "ShowHelmetInPortrait"
+        | "SetAudioGlobalGameParameter" => void(),
         "GetItemStackSize" => ok(Value::Int(
             h.object(obj(a, 0))
                 .and_then(|o| o.fields.get("StackSize").copied())
@@ -4761,7 +4821,65 @@ mod tests {
         int GetHashedM2DABool(int n2DA, int nColumnHash, int nRow) = 883;\n\
         float GetHashedM2DAFloat(int n2DA, int nColumnHash, int nRow) = 864;\n\
         string GetHashedM2DAString(int n2DA, int nColumnHash, int nRow) = 865;\n\
-        resource GetHashedM2DAResource(int n2DA, int nColumnHash, int nRow) = 866;\n";
+        resource GetHashedM2DAResource(int n2DA, int nColumnHash, int nRow) = 866;\n\
+        int GetItemLevel( object oItem ) = 701;\n\
+        void SetItemLevel( object oItem, int nLevel ) = 880;\n\
+        int GetPlaceableStateController( object oPlaceable ) = 134;\n\
+        int GetCreatureAmbientActivityPattern(object oCreature) = 670;\n\
+        void SetCreatureAmbientActivityPattern(object oCreature, int n) = 671;\n\
+        int max(int a, int b) = 422;\n\
+        float minf(float a, float b) = 423;\n";
+
+    #[test]
+    fn dragon_age_2_functions_read_and_set_template_fields() {
+        let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        let item = s.world.spawn(ObjectKind::Item, "sword");
+        s.world
+            .get_mut(item)
+            .unwrap()
+            .fields
+            .insert("Level".into(), 7);
+        let door = s.world.spawn(ObjectKind::Placeable, "door");
+        s.world
+            .get_mut(door)
+            .unwrap()
+            .fields
+            .insert("StateController".into(), 1);
+        let npc = s.world.spawn(ObjectKind::Creature, "npc");
+        let o = |id| Value::Object(id);
+        assert_eq!(
+            run(&mut s, 1, "GetItemLevel", &[o(item)]),
+            Some(Value::Int(7))
+        );
+        run(&mut s, 1, "SetItemLevel", &[o(item), Value::Int(9)]);
+        assert_eq!(
+            run(&mut s, 1, "GetItemLevel", &[o(item)]),
+            Some(Value::Int(9))
+        );
+        assert_eq!(
+            run(&mut s, 1, "GetPlaceableStateController", &[o(door)]),
+            Some(Value::Int(1))
+        );
+        run(
+            &mut s,
+            1,
+            "SetCreatureAmbientActivityPattern",
+            &[o(npc), Value::Int(3)],
+        );
+        assert_eq!(
+            run(&mut s, 1, "GetCreatureAmbientActivityPattern", &[o(npc)]),
+            Some(Value::Int(3))
+        );
+        assert_eq!(
+            run(&mut s, 1, "max", &[Value::Int(2), Value::Int(5)]),
+            Some(Value::Int(5))
+        );
+        assert_eq!(
+            run(&mut s, 1, "minf", &[Value::Float(2.5), Value::Float(1.5)]),
+            Some(Value::Float(1.5))
+        );
+    }
 
     #[test]
     fn hashed_table_reads_find_columns_by_hash() {

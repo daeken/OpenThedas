@@ -449,6 +449,10 @@ impl Rng {
     pub fn new(seed: u64) -> Self {
         Rng(seed.max(1))
     }
+    /// The generator's state, for [`crate::replay::world_hash`].
+    pub fn state(&self) -> u64 {
+        self.0
+    }
     pub fn next_u64(&mut self) -> u64 {
         let mut x = self.0;
         x ^= x >> 12;

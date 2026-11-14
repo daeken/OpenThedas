@@ -59,6 +59,7 @@ mod focusnav;
 mod follow;
 mod glb;
 mod intro;
+mod journal;
 mod live;
 mod looks;
 mod modconv;
@@ -142,6 +143,14 @@ struct Args {
     /// in its current area; `--area` is then ignored and the camera starts behind the hero.
     #[arg(long)]
     save: Option<PathBuf>,
+    /// Resume the game from the journal (the data folder's `journal/`: the last checkpoint,
+    /// and every input since it replayed), as it was when it stopped.
+    #[arg(long)]
+    resume: bool,
+    /// Keep the journal even in a run with `--capture`, `--steps` or `--control` (which
+    /// keep none otherwise, so tests never replace the player's journal).
+    #[arg(long)]
+    journal: bool,
     /// Draw the creatures and placeables an area starts with (runs the simulation for the
     /// area resource given as `--area`).
     #[arg(long)]
@@ -2235,9 +2244,11 @@ impl App {
         );
         let mut now_save = None;
         let mut trace = None;
+        let mut journal = None;
         let mut pause = false;
         if let Some(live) = self.live.as_mut() {
             if !live.front_end {
+                journal = live.journal.as_mut().and_then(|j| j.files());
                 let sim = live.sim();
                 info["game"]["training_mode"] = json!(sim.world.training.mode);
                 info["game"]["hero"] = json!(sim.world.hero.map(|h| sim.display_name(h)));
@@ -2252,7 +2263,7 @@ impl App {
                 pause = !live.paused;
             }
         }
-        let dir = self.recorder.start(now_save, trace, info);
+        let dir = self.recorder.start(now_save, trace, journal, info);
         log::info!("report: started in {}", dir.display());
         // The frame as presented, read back as the next one is drawn; drawn again
         // offscreen where the surface cannot be read back.
@@ -4125,7 +4136,12 @@ impl ApplicationHandler for App {
             }
         }
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                if let Some(l) = self.live.as_mut() {
+                    l.close_journal();
+                }
+                event_loop.exit()
+            }
             WindowEvent::Resized(size) => {
                 if let Some(g) = self.gfx.as_mut() {
                     if size.width > 0 && size.height > 0 {
@@ -5529,7 +5545,15 @@ fn main() -> Result<()> {
         .saves
         .clone()
         .unwrap_or_else(saves::SaveStore::default_dir);
-    let start = if let Some(save) = &args.save {
+    let journal_dir = journal::default_dir();
+    journal::set_enabled(
+        args.journal
+            || args.resume
+            || (args.capture.is_none() && args.steps.is_empty() && args.control.is_none()),
+    );
+    let start = if args.resume {
+        Some(live::Start::Resume(&journal_dir))
+    } else if let Some(save) = &args.save {
         Some(live::Start::Save(save))
     } else if args.new_game && args.quick_start {
         Some(live::Start::NewGameQuick)

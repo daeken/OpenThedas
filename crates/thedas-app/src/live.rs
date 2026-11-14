@@ -211,6 +211,10 @@ pub struct LiveRings {
 pub struct Live {
     /// Shared with the interface, whose movies act on it as they send messages.
     pub sim: Arc<Mutex<Sim>>,
+    /// The journal of the game being played (see [`crate::journal`]): started with the
+    /// first step of a game, off with `THEDAS_NO_JOURNAL` set or when it cannot be written.
+    pub journal: Option<crate::journal::GameJournal>,
+    journal_off: bool,
     /// The start menu's, before a game is chosen: nothing is loaded and nothing runs.
     pub front_end: bool,
     pub paused: bool,
@@ -534,6 +538,10 @@ pub enum Start<'a> {
     Menu,
     /// A saved game's bytes (`Sim::save_json`), as the load screen picked it.
     SaveBytes(&'a [u8]),
+    /// The game kept in a journal folder (see [`crate::journal`]): its checkpoint, and the
+    /// inputs since it replayed. An error when there is none, or its log cannot be
+    /// replayed by this build.
+    Resume(&'a Path),
 }
 
 /// Who gets a portrait drawn: the party, and the followers picked in an open party picker
@@ -584,6 +592,11 @@ impl Live {
                 path.display().to_string(),
             )),
             Start::SaveBytes(b) => Some((b.to_vec(), "picked on the load screen".to_string())),
+            Start::Resume(dir) => Some((
+                crate::journal::checkpoint(dir)
+                    .with_context(|| format!("no journal to resume in {}", dir.display()))?,
+                format!("the journal in {}", dir.display()),
+            )),
             _ => None,
         };
         if let Some((bytes, path)) = save {
@@ -611,6 +624,20 @@ impl Live {
                 policy: thedas_sim::sim::PartyPickerPolicy::Player,
             },
         );
+        if let Start::Resume(dir) = start {
+            let report = crate::journal::replay(&mut sim, dir);
+            if let Some(why) = report.refused {
+                anyhow::bail!("the journal cannot be resumed: {why}");
+            }
+            match report.mismatch {
+                Some((at, _, _)) => log::warn!(
+                    "resume: the replay went its own way at input {at}; the game is as it was there ({} of {} inputs)",
+                    report.applied,
+                    report.inputs
+                ),
+                None => log::info!("resume: {} inputs replayed", report.applied),
+            }
+        }
         Ok(Self {
             sim: Arc::new(Mutex::new(sim)),
             front_end: matches!(start, Start::Menu),
@@ -666,7 +693,37 @@ impl Live {
             cutscene_movies: Default::default(),
             movies_wait: false,
             format: None,
+            journal: None,
+            journal_off: false,
         })
+    }
+
+    /// Keeps the journal: starts it at the game's first quiet step, then writes the inputs
+    /// given since the last call (see [`crate::journal`]).
+    pub fn keep_journal(&mut self) {
+        if self.journal_off || self.front_end || !crate::journal::enabled() {
+            return;
+        }
+        let sim = self.sim.clone();
+        let mut sim = sim.lock().unwrap_or_else(|p| p.into_inner());
+        let done = match self.journal.as_mut() {
+            Some(j) => j.after_frame(&mut sim),
+            None => crate::journal::GameJournal::start(&mut sim, &crate::journal::default_dir())
+                .map(|j| self.journal = j),
+        };
+        if let Err(e) = done {
+            log::warn!("journal: {e}; not kept from here");
+            self.journal = None;
+            self.journal_off = true;
+            sim.input_log = None;
+        }
+    }
+
+    /// The game is being quit: the journal writes what is left and is marked closed.
+    pub fn close_journal(&mut self) {
+        if let Some(j) = self.journal.as_mut() {
+            j.close(&mut self.sim.lock().unwrap_or_else(|p| p.into_inner()));
+        }
     }
 
     /// The simulation, locked. Not held across the interface's tick, which locks it too.
@@ -677,7 +734,13 @@ impl Live {
     /// Advances the simulation by `dt_ms` of real time (at most [`MAX_STEP_MS`]), unless
     /// paused.
     pub fn step(&mut self, dt_ms: f64) {
-        if self.paused || self.front_end || self.loading() {
+        if self.front_end || self.loading() {
+            return;
+        }
+        // What the player and the interface gave since the last step goes to the journal
+        // first, in the order given.
+        self.keep_journal();
+        if self.paused {
             return;
         }
         // A training tutorial holds the game's time until its mode ends, but its script
