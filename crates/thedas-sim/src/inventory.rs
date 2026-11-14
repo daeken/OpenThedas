@@ -21,8 +21,9 @@ pub const MSG_UNEQUIP: &str = "GUI.SelectedChar.UnequipItem";
 pub const MSG_NEXT_CHARACTER: &str = "GUI.SelectNextCharacterMessage";
 /// The quickbar's weapon set button (quickbar.gfx's `WeaponSetToggleButton_mc`, which sends
 /// `1 - ActiveWeaponSet`): the set the selected party member switches to; -1 (the key) the
-/// other one. Provisional: the switch is made at once, as the script's `SwitchWeaponSet`; the
-/// exe's route (its `SwitchWeaponSetMessage`, 0x6e0e86, 0x793777) is not followed.
+/// other one. As DAOrigins.exe's handler (0x6d5db0) does: it reads the message's integer and
+/// calls the creature switch (0x6a8fa0) on the controlled creature (0x5d5ca0) at once, with
+/// no command queued, when a game is running.
 pub const MSG_SWITCH_WEAPON_SET: &str = "GUI.SelectedChar.SwitchWeaponSet";
 pub const MSG_PREVIOUS_CHARACTER: &str = "GUI.SelectPreviousCharacterMessage";
 
