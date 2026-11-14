@@ -14,7 +14,7 @@ use std::io::Read as _;
 use std::sync::Arc;
 
 use read::{Reader, Result};
-pub use shape::{Fill, Gradient, Line, MorphShape, Record, Shape, Spread};
+pub use shape::{Fill, Gradient, Line, LineCap, LineJoin, MorphShape, Record, Shape, Spread};
 pub use text::{EditText, Font, TextAlign};
 pub use types::{Color, ColorTransform, Matrix, Rect};
 
