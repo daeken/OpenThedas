@@ -12,7 +12,7 @@ struct Frame {
     // x: 1 / width, y: 1 / height (the D3D9 half-pixel fix-up the translated shaders apply)
     fixup: vec4<f32>,
     // x: the fog's intensity², y: 1 − its cap (mml_vFogParams[0].w, [1].x); z: 1 to leave
-    // the normal maps out (the `flat` debug view)
+    // the normal maps out (the `flat` debug view); w: 1 to replace lightmaps with probes
     fog: vec4<f32>,
 };
 
@@ -169,6 +169,19 @@ fn surface_normal(in: VsOut, nm: vec4<f32>) -> Surface {
     return out;
 }
 
+// n^T M n, using rows rather than WGSL's column-major matrix constructors.
+fn probe_irradiance(normal: vec3<f32>) -> vec3<f32> {
+    let n = vec4<f32>(normal, 1.0);
+    var result: vec3<f32>;
+    for (var c = 0u; c < 3u; c += 1u) {
+        let i = c * 4u;
+        let mn = vec4<f32>(dot(draw.probe[i], n), dot(draw.probe[i + 1u], n),
+            dot(draw.probe[i + 2u], n), dot(draw.probe[i + 3u], n));
+        result[c] = max(dot(n, mn), 0.0);
+    }
+    return result;
+}
+
 fn surface(in: VsOut) -> Surface {
     return surface_normal(in, textureSample(normal_tex, wrap_smp, in.uv0));
 }
@@ -273,6 +286,9 @@ fn fs_gbuffer(in: VsOut) -> GBuffer {
         out.specular = m.specular;
         out.normal = vec4<f32>(oct_encode(s.n), draw.room.x, s.falloff);
         out.lightmap = textureSample(lightmap_tex, clamp_smp, in.uv_lm);
+        if (frame.fog.w > 0.5) {
+            out.lightmap = vec4<f32>(probe_irradiance(s.n), 1.0);
+        }
         return out;
     }
     let s = surface(in);
@@ -290,6 +306,8 @@ fn fs_gbuffer(in: VsOut) -> GBuffer {
             out.specular = vec4<f32>(object_tint(out.specular.rgb, mask, true), out.specular.a);
         }
         out.albedo = vec4<f32>(mix(out.albedo.rgb, draw.tint_color.rgb, draw.tint_color.a), out.albedo.a);
+    } else if (frame.fog.w > 0.5) {
+        out.lightmap = vec4<f32>(probe_irradiance(s.n), 1.0);
     }
     return out;
 }
@@ -306,11 +324,11 @@ fn fs_env(in: VsOut) -> @location(0) vec4<f32> {
         let r = 2.0 * dot(s.n, s.v) * s.n - s.v;
         let power = m.specular.a * 255.0 + 1.0;
         let env = textureSampleLevel(env_tex, wrap_smp, r, (1.0 - power / 255.0) * 9.0).rgb;
-        let lm = textureSample(lightmap_tex, clamp_smp, in.uv_lm);
+        let baked_visibility = select(textureSample(lightmap_tex, clamp_smp, in.uv_lm).a, 1.0, frame.fog.w > 0.5);
         let to_eye = in.world - frame.eye.xyz;
         let fog = max(min(exp(-dot(to_eye, to_eye) * frame.fog.x), 1.0), frame.fog.y);
         let shade = sun_visibility(in.world, s.n, draw.room.w < 0.5);
-        let reflection = env * m.specular.rgb * (0.75 * shade * lm.a + 0.25) * s.falloff;
+        let reflection = env * m.specular.rgb * (0.75 * shade * baked_visibility + 0.25) * s.falloff;
         return vec4<f32>((reflection + m.albedo.rgb * draw.terrain.tint.rgb) * fog, 1.0);
     }
     let s = surface(in);
@@ -333,6 +351,7 @@ fn fs_env(in: VsOut) -> @location(0) vec4<f32> {
 
 struct Lighting {
     inv_view_proj: mat4x4<f32>,
+    view_proj: mat4x4<f32>,
     eye: vec4<f32>,
     // xyz: the direction the sun's light travels, w: 1 when there is a sun
     sun_dir: vec4<f32>,
@@ -340,7 +359,7 @@ struct Lighting {
     // mml_vFogParams: (colour, intensity²), (1 − cap, ...)
     fog0: vec4<f32>,
     fog1: vec4<f32>,
-    // x: lights, y: the debug view (`THEDAS_DEFERRED_VIEW`, see deferred.rs)
+    // x: lights, y: debug view, z: sun shadows, w: 0 baked, 1 probes, 2 probes + SSAO
     counts: vec4<u32>,
     // xy: target size
     size: vec4<f32>,
@@ -503,18 +522,71 @@ fn point_uses_baked_mask(is_static: bool, material: u32) -> bool {
     return is_static && material != 64u && material != 192u;
 }
 
+fn world_at(pixel: vec2<i32>, depth: f32) -> vec3<f32> {
+    // Pixel centres minus the half-pixel fix-up are integer pixel coordinates.
+    let ndc = vec2<f32>(f32(pixel.x) / lighting.size.x * 2.0 - 1.0,
+        1.0 - f32(pixel.y) / lighting.size.y * 2.0);
+    let w = lighting.inv_view_proj * vec4<f32>(ndc, depth, 1.0);
+    return w.xyz / w.w;
+}
+
+// A deterministic hemisphere kernel, in world metres. Only the probe's diffuse term
+// takes this visibility; direct lights keep their shadow maps and reflections stay sharp.
+// No noise texture or frame-dependent rotation, to avoid temporal sparkle before TAA.
+fn ambient_visibility(p: vec3<f32>, n: vec3<f32>) -> f32 {
+    if (lighting.counts.w != 2u) {
+        return 1.0;
+    }
+    let radius = 0.8;
+    let axis = select(vec3<f32>(0.0, 0.0, 1.0), vec3<f32>(0.0, 1.0, 0.0), abs(n.z) > 0.95);
+    let t = normalize(cross(axis, n));
+    let b = cross(n, t);
+    var blocked = 0.0;
+    for (var i = 0u; i < 12u; i += 1u) {
+        let f = (f32(i) + 0.5) / 12.0;
+        let angle = f32(i) * 2.39996323;
+        let z = 0.15 + 0.85 * f;
+        let xy = sqrt(1.0 - z * z);
+        let direction = t * (cos(angle) * xy) + b * (sin(angle) * xy) + n * z;
+        let sample = p + n * 0.03 + direction * radius * (0.2 + 0.8 * f);
+        let clip = lighting.view_proj * vec4<f32>(sample, 1.0);
+        if (clip.w <= 0.0 || clip.z < 0.0 || clip.z >= clip.w) {
+            continue;
+        }
+        let ndc = clip.xy / clip.w;
+        // Project back to the same pixel centres used by the G-buffer vertex shader.
+        let pixel = vec2<i32>(floor(vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5) * lighting.size.xy + 0.5));
+        if (any(pixel < vec2<i32>(0)) || any(pixel >= vec2<i32>(lighting.size.xy))) {
+            continue;
+        }
+        let depth = textureLoad(g_depth, pixel, 0).x;
+        if (depth >= 1.0) {
+            continue;
+        }
+        let hit = world_at(pixel, depth);
+        // Reject distant foreground silhouettes, and give a flat surface a metric bias.
+        let separation = length(hit - p);
+        let closer = length(lighting.eye.xyz - sample) - length(lighting.eye.xyz - hit);
+        if (closer > 0.04 && dot(hit - p, n) > 0.025) {
+            blocked += 1.0 - smoothstep(radius * 0.5, radius, separation);
+        }
+    }
+    // Missing/offscreen samples are open. Cap darkening until temporal filtering exists.
+    return clamp(1.0 - blocked / 12.0, 0.25, 1.0);
+}
+
 @fragment
 fn fs_lighting(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     let px = vec2<i32>(frag.xy);
     let depth = textureLoad(g_depth, px, 0).x;
+    let p = world_at(px, depth);
+    // Depth derivatives describe geometry, rather than normal-map bumps that would
+    // falsely occlude a flat wall. Evaluate before the background discard so helper
+    // invocations remain available at silhouettes.
+    let geometric = cross(dpdx(p), dpdy(p));
     if (depth >= 1.0) {
         discard;
     }
-    // Undo the D3D9 half-pixel fix-up used by vs_gbuffer before reconstructing
-    // world position, so shadow comparisons refer to the actual surface.
-    let ndc = vec2<f32>((frag.x - 0.5) / lighting.size.x * 2.0 - 1.0, 1.0 - (frag.y - 0.5) / lighting.size.y * 2.0);
-    let w = lighting.inv_view_proj * vec4<f32>(ndc, depth, 1.0);
-    let p = w.xyz / w.w;
 
     let ga = textureLoad(g_albedo, px, 0);
     let albedo = ga.rgb;
@@ -595,12 +667,16 @@ fn fs_lighting(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
         }
     }
     let sun_shade = sun_visibility(p, n, !terrain_low && !object);
+    let plane_n = geometric * inverseSqrt(max(dot(geometric, geometric), 1e-20));
+    let oriented_n = select(-plane_n, plane_n, dot(plane_n, n) >= 0.0);
+    let ao = ambient_visibility(p, select(n, oriented_n, dot(geometric, geometric) > 1e-20));
     // Static1: alpha masks baked direct visibility once; RGB is baked bounce,
     // dimmed by only 15% in a runtime shadow (exploration camera w = 0).
     // Dynamic lights have their own visibility and never take this sun mask.
+    let ambient_shade = select(select(mix(1.0, sun_shade, 0.15), 1.0, object), ao, lighting.counts.w > 0u);
     // Terrain1 masks static diffuse twice; Static1 and Low's Terrain3 only once.
     let diffuse = diff_s * sun_shade * select(lm.a, lm.a * lm.a, terrain && !terrain_low)
-        + lm.rgb * select(mix(1.0, sun_shade, 0.15), 1.0, object) + diff_d;
+        + lm.rgb * ambient_shade + diff_d;
     let specular = select((spec_s * sun_shade * max(lm.a, 0.2) + spec_d) * 3.0,
         (spec_s * (0.75 * sun_shade * lm.a + 0.25) + spec_d) * 3.0, terrain);
     var colour = albedo * diffuse + spec.rgb * specular * falloff;
@@ -612,6 +688,7 @@ fn fs_lighting(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
         case 5u: { return vec4<f32>(diffuse * 0.5, 1.0); }
         case 6u: { return vec4<f32>(spec.rgb * specular * falloff, 1.0); }
         case 11u: { return vec4<f32>(vec3<f32>(sun_shade), 1.0); }
+        case 12u: { return vec4<f32>(vec3<f32>(ao), 1.0); }
         default: {}
     }
 

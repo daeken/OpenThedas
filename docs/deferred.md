@@ -21,6 +21,14 @@ lightmaps. It is not parity work; where the two differ, the faithful path is rig
 - When the GPU refuses the deferred pipelines (`gpu::checked`), the level stays faithful
   and says so in the log once.
 
+Faithful loads skip deferred planning entirely, including stream conversion and texture
+lookups. Renderers constructed for deferred prepare it at load; the first F11 switch from
+faithful prepares the existing object scene and reloads only the level's CPU scene to plan
+its draws. That first switch can pause for scene loading and GPU setup; subsequent switches
+reuse the plan. Forward-only rings and effects, portraits and paperdolls do not request one.
+API callers use `AreaRenderer::new_cached_with_path`, or call `prepare_deferred` with the
+original scene before selecting `path = RenderPath::Deferred`.
+
 ## Frame (deferred path)
 
 1. Shadows exactly as now (the faithful pass places and draws the sun partitions).
@@ -54,7 +62,7 @@ lightmaps. It is not parity work; where the two differ, the faithful path is rig
    unsupported character materials, cut-away meshes and particles. Then frame effects as now.
 
 Debug views in place of the lit frame: `THEDAS_DEFERRED_VIEW=albedo|normal|lightmap|
-visibility|diffuse|specular|no-rooms|flat|wrap|shadows|sun-shadows` (see `deferred::debug_view`).
+visibility|diffuse|specular|no-rooms|flat|wrap|shadows|sun-shadows|ao` (see `deferred::debug_view`).
 
 The environment reflection Static1 adds (the probe cubemap times
 `mml_fSpecularReflectionMult`, the specular mask and falloff) has no room in the G-buffer
@@ -158,15 +166,44 @@ debug views now include the ground. Terrain also joins the point-shadow caster l
   materials and trees do not. Static lights keep baked visibility. At most 24 face passes per frame.
   `THEDAS_DEFERRED_POINT_SHADOWS=0` disables both rendering and sampling these maps for
   captures and cost comparisons; it does not change the faithful path.
-- These maps do not replace baked visibility yet: static lights and static geometry still
-  depend on `lm.a`; removing it requires the later lightmaps-off work below.
+- With baked lighting on, static lights and static geometry still depend on `lm.a`.
+  The experimental lightmaps-off mode below lets static lights use the point-shadow pool.
 
-## Real-time lighting in place of lightmaps (later steps)
+## Real-time lighting in place of lightmaps (experimental)
 
 Lightmap rgb is the baked bounce and the baked-only lights; `lm.a` the baked visibility.
-A "baked lighting" switch under the deferred path turns lightmaps off: visibility then comes
-from the shadow maps, the bounce from the level's irradiance probes (`AreaScene::probes`) and
-screen-space ambient occlusion. Lightmaps stay the default until that looks at least as good.
+`THEDAS_DEFERRED_BAKED_LIGHTING=0` replaces lightmaps on opaque level Static1 and terrain
+surfaces. Baked lighting stays on by default; the faithful path ignores the
+switch. Choose it before loading an area. F11 still switches between faithful and deferred.
+
+- Ambient RGB comes from each draw's assigned irradiance probe (`AreaScene::probes`),
+  evaluating its three quadratic forms at the world-space mapped normal. The level's
+  existing room-probe assignment is retained. Missing probes use the same provisional
+  `[0.35, 0.35, 0.35]` irradiance fallback as the faithful objects. Negative SH lobes clamp
+  to zero. The fourth G-buffer target uses `Rgba16Float` in this mode so bright probes
+  survive above one; the four targets still meet the portable 32-byte attachment budget.
+- Baked visibility becomes one. The sun uses the existing partitions; each point light
+  uses its own cube shadow if it wins one of the four slots. Static point lights now
+  compete with dynamic ones for those slots, and no point light takes the sun's mask.
+  Other point lights remain unshadowed, with the existing room reach and radius cutoff.
+- A deterministic twelve-sample world-space hemisphere provides screen-space ambient
+  occlusion over a 0.8 m radius. It uses depth-derived geometric normals and affects only
+  probe diffuse, with metric bias and range rejection to avoid flat-surface acne and
+  distant foreground halos. Sky and offscreen samples are open. There is no noise rotation,
+  temporal filter or extra render target.
+  `THEDAS_DEFERRED_SSAO=0` disables it for comparison; `THEDAS_DEFERRED_VIEW=ao` shows it.
+  In this mode `lightmap` shows probe irradiance and `visibility` shows white.
+
+This is a first comparison mode, not a complete replacement for baked lighting. Probes are
+the original baked irradiance and may contain direct illumination; they are not a new GI
+solution. Only deferred surfaces contribute to AO and point shadows, so unsupported
+forward materials and trees are missing from those occluders. Eligible characters,
+placeables and terrain contribute
+to both, and its reflections also stop using baked visibility in this mode. The small point-shadow
+budget, missing occluders, screen edges and coarse room probes can cause light leaks or
+ambient discontinuities. The original baked image remains the default while those are
+addressed. Moving the remaining material families into the G-buffer is still
+the next coverage step.
 
 ## Order of work
 
@@ -175,4 +212,5 @@ screen-space ambient occlusion. Lightmaps stay the default until that looks at l
 3. VFX and spell lights; point light shadow pool.
 4. Characters and placeables: the shared G-buffer and skinned vertex path are in place;
    extend the remaining material families and cutout casters next.
-5. Lightmaps off: probes and SSAO; then TAA and other post work.
+5. Lightmaps off: the Static1 probe/SSAO comparison mode is in place; extend coverage and
+   visibility before making it a player-facing option. Then TAA and other post work.

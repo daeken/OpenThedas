@@ -604,6 +604,8 @@ pub struct AreaRenderer {
     pub path: crate::deferred::RenderPath,
     /// This renderer's eligible deferred geometry, including objects.
     deferred: Option<crate::deferred::DeferredPass>,
+    /// Planning is opt-in; even a scene with no eligible draws is planned only once.
+    deferred_planned: bool,
     /// Its eligible geometry was already drawn into another renderer's G-buffer.
     deferred_in_frame: bool,
 }
@@ -681,6 +683,29 @@ impl AreaRenderer {
         programs: &ProgramRegistry,
         color_format: wgpu::TextureFormat,
         render_cache: &mut RenderCache,
+    ) -> Self {
+        Self::new_cached_with_path(
+            ctx,
+            vfs,
+            scene,
+            programs,
+            color_format,
+            render_cache,
+            crate::deferred::RenderPath::Faithful,
+        )
+    }
+
+    /// Builds for `path`, preparing deferred geometry only when selected. To switch a
+    /// faithful renderer later, call [`Self::prepare_deferred`] before setting [`Self::path`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_cached_with_path(
+        ctx: &GpuContext,
+        vfs: &Vfs,
+        scene: &AreaScene,
+        programs: &ProgramRegistry,
+        color_format: wgpu::TextureFormat,
+        render_cache: &mut RenderCache,
+        path: crate::deferred::RenderPath,
     ) -> Self {
         let device = &ctx.device;
         let mut stats = RenderStats::default();
@@ -1004,8 +1029,12 @@ impl AreaRenderer {
         stats.textures_loaded = cache.loaded - loaded0;
         stats.textures_compressed = cache.compressed - compressed0;
         stats.textures_missing = cache.missing[missing0..].to_vec();
-        // What the deferred path would draw (no GPU objects until a frame is drawn so).
-        let deferred = crate::deferred::DeferredPass::plan(ctx, vfs, scene, &d3d, cache);
+        // CPU stream conversion and texture lookup also cost time: faithful loads skip
+        // the entire plan, not just GPU pipeline creation.
+        let deferred_planned = path == crate::deferred::RenderPath::Deferred;
+        let deferred = deferred_planned
+            .then(|| crate::deferred::DeferredPass::plan(ctx, vfs, scene, &d3d, cache))
+            .flatten();
         if uniforms.is_empty() {
             uniforms.resize(DRAW_STRIDE as usize, 0);
         }
@@ -1105,9 +1134,37 @@ impl AreaRenderer {
                 .filter(|(_, e)| e.cut_away)
                 .map(|(i, _)| i)
                 .collect(),
-            path: crate::deferred::RenderPath::Faithful,
+            path,
             deferred,
+            deferred_planned,
             deferred_in_frame: false,
+        }
+    }
+
+    /// Whether deferred planning has been attempted, including a scene with no eligible
+    /// draws. This stays true across faithful/deferred toggles.
+    pub fn deferred_planned(&self) -> bool {
+        self.deferred_planned
+    }
+
+    /// Prepares this renderer's deferred draws on first selection. `scene` must be the
+    /// scene used to build this renderer; poses and placements come from its current D3D pass.
+    pub fn prepare_deferred(
+        &mut self,
+        ctx: &GpuContext,
+        vfs: &Vfs,
+        scene: &AreaScene,
+        cache: &mut RenderCache,
+    ) {
+        if !self.deferred_planned {
+            self.deferred = crate::deferred::DeferredPass::plan(
+                ctx,
+                vfs,
+                scene,
+                &self.d3d,
+                &mut cache.textures,
+            );
+            self.deferred_planned = true;
         }
     }
 
@@ -2196,6 +2253,10 @@ mod tests {
             CAPTURE_FORMAT,
         );
         assert_eq!(r.stats.draws, 1);
+        assert!(
+            !r.deferred_planned(),
+            "faithful construction skips planning"
+        );
         let camera = Camera::new(Vec3::ZERO, 0.0, 0.0);
         let px = r.capture(&ctx, &camera, 32, 32).unwrap();
         let at = |x: usize, y: usize| &px[(y * 32 + x) * 4..(y * 32 + x) * 4 + 4];
@@ -2203,5 +2264,9 @@ mod tests {
         let centre = at(16, 16);
         assert!((120..=136).contains(&centre[0]), "centre {centre:?}");
         assert_eq!(at(1, 1), &[0, 0, 0, 255], "corner is the clear colour");
+        assert!(!r.deferred_planned(), "faithful frames skip planning too");
+        r.prepare_deferred(&ctx, &Vfs::new(), &scene, &mut RenderCache::default());
+        assert!(r.deferred_planned());
+        assert!(!r.can_defer(), "stand-in materials stay forward");
     }
 }

@@ -30,6 +30,10 @@ pub const DEFERRED_WGSL: &str = concat!(
 
 #[cfg(test)]
 #[path = "deferred_object_tests.rs"]
+mod object_gpu_tests;
+
+#[cfg(test)]
+#[path = "deferred_gpu_tests.rs"]
 mod gpu_tests;
 
 /// How the level is drawn.
@@ -109,6 +113,7 @@ struct DrawData {
     falloff: [f32; 4],
     room: [f32; 4],
     terrain: crate::deferred_terrain::TerrainData,
+    /// The assigned irradiance probe's twelve rows (RGB).
     probe: [[f32; 4]; 12],
     tint: [[f32; 4]; 10],
     /// x: 0 level, 1 prop, 2 character; y: emissive; z: tint mode; w reserved.
@@ -120,6 +125,7 @@ struct DrawData {
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct LightingUniforms {
     inv_view_proj: [[f32; 4]; 4],
+    view_proj: [[f32; 4]; 4],
     eye: [f32; 4],
     sun_dir: [f32; 4],
     sun_colour: [f32; 4],
@@ -187,6 +193,9 @@ pub(crate) struct DeferredPass {
     own_lights: Vec<SceneLight>,
     /// The GPU refused the pass: the level stays faithful.
     refused: bool,
+    /// Experimental probe + runtime visibility mode. Fixed when this renderer is built.
+    baked_lighting: bool,
+    ssao: bool,
 }
 
 pub(crate) struct Contributor<'a> {
@@ -329,6 +338,7 @@ impl DeferredPass {
         d3d: &D3dPass,
         cache: &mut TextureCache,
     ) -> Option<DeferredPass> {
+        let started = std::time::Instant::now();
         let mut texture = |names: &[Option<String>], ty: TextureType, fallback: [u8; 4]| {
             names
                 .iter()
@@ -555,13 +565,15 @@ impl DeferredPass {
             });
         }
         log::info!(
-            "deferred: {} of {} draws ({} terrain, {} props, {} character materials, {} skinned)",
+            "deferred: {} of {} draws ({} terrain, {} props, {} character materials, {} skinned), planned in {:.1} ms ({} static draws)",
             draws.len(),
             d3d.draws.len(),
             data.iter().filter(|d| d.room[2] > 0.5).count(),
             data.iter().filter(|d| d.material[0] == 1.0).count(),
             data.iter().filter(|d| d.material[0] == 2.0).count(),
             skin_count - 1,
+            started.elapsed().as_secs_f64() * 1000.0,
+            scene.static_draws,
         );
         (!draws.is_empty()).then(|| DeferredPass {
             draws,
@@ -576,6 +588,8 @@ impl DeferredPass {
             effect_lights: Vec::new(),
             own_lights: Vec::new(),
             refused: false,
+            baked_lighting: std::env::var("THEDAS_DEFERRED_BAKED_LIGHTING").as_deref() != Ok("0"),
+            ssao: std::env::var("THEDAS_DEFERRED_SSAO").as_deref() != Ok("0"),
         })
     }
 
@@ -1220,7 +1234,7 @@ impl DeferredPass {
                 fog[0][3],
                 fog[1][0],
                 if debug_view() == 8 { 1.0 } else { 0.0 },
-                0.0,
+                if self.baked_lighting { 0.0 } else { 1.0 },
             ],
         };
         ctx.queue
@@ -1306,6 +1320,13 @@ impl DeferredPass {
             self.gpu.as_mut().expect("prepared GPU").shadows = pool;
         }
         let mut lights = self.lights(camera, width, height, d3d, characters);
+        if !self.baked_lighting {
+            // Without baked alpha every point light uses its own runtime visibility.
+            // The sun alone keeps the directional visibility term in the lighting pass.
+            for light in &mut lights {
+                light.colour[3] = 0.0;
+            }
+        }
         // Keep a capture/benchmark switch for comparing only the shadow contribution.
         let shadowed = if std::env::var("THEDAS_DEFERRED_POINT_SHADOWS").as_deref() == Ok("0") {
             Vec::new()
@@ -1424,12 +1445,24 @@ impl DeferredPass {
         };
         let lighting = LightingUniforms {
             inv_view_proj: (projection * view).inverse().to_cols_array_2d(),
+            view_proj: (projection * view).to_cols_array_2d(),
             eye: camera.position.extend(1.0).to_array(),
             sun_dir: sun_dir.to_array(),
             sun_colour: sun_colour.to_array(),
             fog0: fog[0],
             fog1: fog[1],
-            counts: [gpu.lights.len() as u32, debug_view(), 0, 0],
+            counts: [
+                gpu.lights.len() as u32,
+                debug_view(),
+                0,
+                if self.baked_lighting {
+                    0
+                } else if self.ssao {
+                    2
+                } else {
+                    1
+                },
+            ],
             size: [width as f32, height as f32, 0.0, 0.0],
         };
         let sun = SunUniforms {
@@ -1748,8 +1781,8 @@ fn draw_all(
     }
 }
 
-/// Gives the shadow slots to the dynamic lights (those the lightmaps' visibility does not
-/// already mask: the emitters' and other moving lights) that matter most from `eye`: their
+/// Gives the shadow slots to lights without baked visibility (emitters, moving lights,
+/// and all point lights in probe mode) that matter most from `eye`: their
 /// brightness times reach over their distance. Returns each slot's light (position,
 /// radius).
 fn shadow_slots(lights: &mut [GpuLight], eye: Vec3) -> Vec<(Vec3, f32)> {
@@ -1797,6 +1830,7 @@ fn debug_view() -> u32 {
             "wrap" => 9,
             "shadows" => 10,
             "sun-shadows" => 11,
+            "ao" => 12,
             _ => 0,
         }
     })
