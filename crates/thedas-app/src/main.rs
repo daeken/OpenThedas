@@ -110,6 +110,10 @@ struct Args {
     /// Install root (the folder holding packages/ and modules/). Defaults to $THEDAS_INSTALL.
     #[arg(long)]
     install: Option<PathBuf>,
+    /// The DLC keys file (the format of the commonly shared `erfpasswords.txt`). Defaults to
+    /// $THEDAS_KEYS, then `keys.txt` in the player's data folder.
+    #[arg(long)]
+    keys: Option<PathBuf>,
     /// Environment level (e.g. lgt101d), area resource (e.g. cir110ar_inn), or `none`, for
     /// the viewer (lgt101d when not given). Giving it opens the viewer.
     #[arg(long)]
@@ -5666,6 +5670,9 @@ fn main() -> Result<()> {
     if let Some(secs) = args.pad_probe {
         paddev::probe(secs);
         return Ok(());
+    }
+    if let Some(keys) = &args.keys {
+        thedas_vfs::keys_file::set_path(keys);
     }
     let install = args
         .install
