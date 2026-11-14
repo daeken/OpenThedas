@@ -5712,6 +5712,8 @@ mod tests {
         let store = s.world.spawn(ObjectKind::Store, "store");
         let hero = s.world.spawn(ObjectKind::Creature, "hero");
         s.world.hero = Some(hero);
+        let module = s.world.spawn(ObjectKind::Module, "module");
+        s.world.module = Some(module);
         run(
             &mut s,
             door,
@@ -5724,13 +5726,15 @@ mod tests {
         );
         assert!(s.answer_popup(1));
         assert!(s.world.popup.is_none());
+        // The answer goes to the module, the popup's owner as object 0 (DAOrigins.exe
+        // 0x7098ef, 0x70993b).
         let q: Vec<_> = s
             .world
             .queue
             .values()
-            .map(|q| (q.target, q.event.ints.clone()))
+            .map(|q| (q.target, q.event.ints.clone(), q.event.objects.clone()))
             .collect();
-        assert_eq!(q, vec![(door, vec![1, 1])]);
+        assert_eq!(q, vec![(module, vec![1, 1], vec![door])]);
         // Text typed into the box rides along as string 0.
         assert!(
             s.world
