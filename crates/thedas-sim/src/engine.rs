@@ -3887,8 +3887,12 @@ pub fn call(
                     .get("EVENT_TARGET")
                     .copied()
                     .unwrap_or(caller);
-                let ms = p.fields.get("FlightMs").copied().unwrap_or(0).max(0) as u64;
-                h.sim.world.queue_event(ms, target, ev, None);
+                if h.sim.game == thedas_vfs::Game::DragonAge2 {
+                    h.sim.world.set_projectile_impact_event(proj, target, ev);
+                } else {
+                    let ms = p.fields.get("FlightMs").copied().unwrap_or(0).max(0) as u64;
+                    h.sim.world.queue_event(ms, target, ev, None);
+                }
             }
             void()
         }
@@ -6493,6 +6497,107 @@ mod tests {
             script: "test".into(),
         };
         call(&mut h, caller, &f, a).unwrap().unwrap()
+    }
+
+    #[test]
+    fn da2_projectile_payload_changes_do_not_restart_flight_or_add_hits() {
+        let table = Arc::new(
+            EngineTable::parse(
+                br#"
+            #define ENGINE_STRUCTURE_0 event
+            event Event(int type) = 1;
+            object FireProjectile(int type, vector source, vector target, int crust,
+                int wide, object receiver) = 193;
+            void SetProjectileImpactEvent(object projectile, event payload) = 371;
+        "#,
+            )
+            .unwrap(),
+        );
+        for game in [thedas_vfs::Game::DragonAge2, thedas_vfs::Game::Origins] {
+            let mut s = Sim::new(Arc::new(Vfs::new()), table.clone(), 1);
+            s.game = game;
+            let caller = s.world.spawn(ObjectKind::Creature, "caster");
+            let receiver = s.world.spawn(ObjectKind::Creature, "receiver");
+            // The deadline must remain a u64, including in worlds older than i32 ms.
+            let launch = i32::MAX as u64 + 100;
+            s.world.time_ms = launch;
+            let projectile = run(
+                &mut s,
+                caller,
+                "FireProjectile",
+                &[
+                    Value::Int(17),
+                    Value::Vector([0.0; 3]),
+                    Value::Vector([20.0, 0.0, 0.0]),
+                    Value::Int(0),
+                    Value::Int(0),
+                    Value::Object(receiver),
+                ],
+            )
+            .unwrap();
+            let first = run(&mut s, caller, "Event", &[Value::Int(100)]).unwrap();
+            let second = run(&mut s, caller, "Event", &[Value::Int(200)]).unwrap();
+            s.world.time_ms = launch + 250;
+            run(
+                &mut s,
+                caller,
+                "SetProjectileImpactEvent",
+                &[projectile.clone(), first],
+            );
+            // Save with a custom impact pending, then change it after reloading.
+            s.world = serde_json::from_slice(&serde_json::to_vec(&s.world).unwrap()).unwrap();
+            s.world.time_ms = launch + 500;
+            run(
+                &mut s,
+                caller,
+                "SetProjectileImpactEvent",
+                &[projectile.clone(), second],
+            );
+            if game == thedas_vfs::Game::DragonAge2 {
+                // An unrelated event for the same receiver is not replaced.
+                s.world.queue_event(
+                    500,
+                    receiver,
+                    Event {
+                        ty: 300,
+                        ..Default::default()
+                    },
+                    None,
+                );
+                assert!(s.world.pop_due(launch + 999).is_none());
+                let (due, hit) = s.world.pop_due(launch + 1000).unwrap();
+                assert_eq!(due, launch + 1000);
+                assert_eq!(hit.target, receiver);
+                assert_eq!(hit.event.ty, 200);
+                assert_eq!(hit.event.creator, Some(caller));
+                assert_eq!(s.world.pop_due(launch + 1000).unwrap().1.event.ty, 300);
+                assert!(s.world.pop_due(u64::MAX).is_none());
+                s.world.time_ms = launch + 1000;
+                s.world.destroy_due();
+                assert!(
+                    !s.world
+                        .objects
+                        .values()
+                        .any(|o| o.kind == ObjectKind::Projectile)
+                );
+                // Non-projectiles cannot acquire an impact event.
+                let event = run(&mut s, caller, "Event", &[Value::Int(400)]).unwrap();
+                run(
+                    &mut s,
+                    caller,
+                    "SetProjectileImpactEvent",
+                    &[Value::Object(caller), event],
+                );
+                assert!(s.world.pop_due(u64::MAX).is_none());
+            } else {
+                // Origins keeps its prior scheduling behavior in this DA2-only fix.
+                let (due, hit) = s.world.pop_due(u64::MAX).unwrap();
+                assert_eq!((due, hit.event.ty), (launch + 1250, 100));
+                let (due, hit) = s.world.pop_due(u64::MAX).unwrap();
+                assert_eq!((due, hit.event.ty), (launch + 1500, 200));
+                assert!(s.world.pop_due(u64::MAX).is_none());
+            }
+        }
     }
 
     #[test]
