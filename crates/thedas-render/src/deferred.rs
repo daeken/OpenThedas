@@ -190,7 +190,7 @@ struct GpuLight {
 #[derive(Clone, Debug)]
 struct PlanDraw {
     alpha_test: bool,
-    /// 0: general material, 1: Static1, 2: terrain.
+    /// 0: general material, 1: Static1, 2: terrain, 3: unlit Black.
     kind: usize,
     /// Its index in [`D3dPass::draws`].
     k: usize,
@@ -266,6 +266,7 @@ struct Gpu {
     gbuffer_opaque: [wgpu::RenderPipeline; 3],
     gbuffer_static: Option<[[wgpu::RenderPipeline; 3]; 2]>,
     gbuffer_terrain: Option<[wgpu::RenderPipeline; 3]>,
+    gbuffer_black: Option<[wgpu::RenderPipeline; 3]>,
     /// Separate reflection for probe/AO and diagnostic modes (by cull mode).
     env: [wgpu::RenderPipeline; 3],
     lighting: wgpu::RenderPipeline,
@@ -369,6 +370,20 @@ fn terrain(program: &crate::d3d::D3dProgram) -> bool {
         && p.z_write
 }
 
+// Black writes constant opaque black, without fog, textures or lighting. Its vertex
+// shader only projects the rigid position; it must not inherit object skinning.
+fn black(program: &crate::d3d::D3dProgram) -> bool {
+    let p = &program.pass;
+    program.name.starts_with("black.vsh+black.psh+")
+        && !program.instanced
+        && p.blend.is_none()
+        && p.alpha_test.is_none()
+        && p.z_enable
+        && p.z_write
+        && p.z_func == thedas_formats::state::CompareFunc::LessEqual
+        && p.color_write == 15
+}
+
 /// Only these single-pass Origins material equations are represented in the G-buffer.
 /// Hair, alpha-tested and remote-material variants stay forward.
 fn object_material(program: &crate::d3d::D3dProgram) -> bool {
@@ -447,6 +462,8 @@ impl DeferredPass {
         let objects_enabled = crate::config::CONFIG.objects;
         let terrain_enabled = crate::config::CONFIG.terrain;
         let faces_enabled = crate::config::CONFIG.faces;
+        let cutaway_enabled = crate::config::CONFIG.cutaway;
+        let black_enabled = crate::config::CONFIG.black;
         for (k, d) in d3d.draws.iter().enumerate() {
             let program = d3d.program(d);
             let Some(item) = scene.draws.get(d.draw) else {
@@ -461,6 +478,7 @@ impl DeferredPass {
                     || (!program.name.starts_with("face1.") && !program.name.starts_with("eye0.")))
                 && (objects_enabled || (d.draw < scene.static_draws && item.skin.is_none()))
                 && (static1(program)
+                    || (black_enabled && item.skin.is_none() && black(program))
                     || (terrain_enabled && terrain(program))
                     || (objects_enabled && object_material(program))
                     || alpha.is_some())
@@ -469,7 +487,9 @@ impl DeferredPass {
                     .as_ref()
                     .is_none_or(|s| s.palette.len() <= crate::deferred_mesh::BONES)
                 && item.lod.is_none()
-                && !scene.cut_away.contains(&d.draw)
+                // Fully opaque cutaways share the G-buffer. Runtime fades already
+                // return to the faithful colour pass and leave the point-caster set.
+                && (cutaway_enabled || !scene.cut_away.contains(&d.draw))
                 && item.lightmap.as_ref().is_none_or(|l| l.planes().is_none());
             let Some(m) = taken.then(|| scene.materials.get(item.material)).flatten() else {
                 continue;
@@ -486,6 +506,7 @@ impl DeferredPass {
             }
             let lightmap = item.lightmap.as_ref().map(|l| l.texture.clone());
             let is_terrain = terrain(program);
+            let is_black = black(program);
             let is_face = program.name.starts_with("face1.");
             let is_eye = program.name.starts_with("eye0.");
             let is_object =
@@ -634,7 +655,9 @@ impl DeferredPass {
             takes[k] = true;
             draws.push(PlanDraw {
                 alpha_test: alpha.is_some(),
-                kind: if is_terrain {
+                kind: if is_black {
+                    3
+                } else if is_terrain {
                     2
                 } else if is_object {
                     0
@@ -712,7 +735,9 @@ impl DeferredPass {
                     })
                 },
                 material: [
-                    if is_object {
+                    if is_black {
+                        -1.0
+                    } else if is_object {
                         if crate::d3d::LightClass::of(m.render_class.as_deref())
                             == crate::d3d::LightClass::Character
                         {
@@ -801,7 +826,11 @@ impl DeferredPass {
                     "instance-material"
                 } else if item.is_some_and(|i| i.lod.is_some()) {
                     "lod-material"
-                } else if static1(program) || terrain(program) || object_material(program) {
+                } else if static1(program)
+                    || terrain(program)
+                    || object_material(program)
+                    || black(program)
+                {
                     "geometry-or-control"
                 } else {
                     "material"
@@ -1187,6 +1216,11 @@ impl DeferredPass {
             .iter()
             .any(|d| d.kind == 2)
             .then(|| make_gbuffer("fs_gbuffer_terrain", true));
+        let gbuffer_black = self
+            .draws
+            .iter()
+            .any(|d| d.kind == 3)
+            .then(|| make_gbuffer("fs_gbuffer_black", true));
         let env = [None, Some(wgpu::Face::Back), Some(wgpu::Face::Front)].map(|cull| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some("deferred reflection"),
@@ -1493,6 +1527,7 @@ impl DeferredPass {
             gbuffer_opaque,
             gbuffer_static,
             gbuffer_terrain,
+            gbuffer_black,
             env,
             lighting,
             mask_buffer,
@@ -1517,7 +1552,7 @@ impl DeferredPass {
                 .collect(),
             skin_buffer,
             skin_slots: Vec::new(),
-            slots: Vec::new(),
+            slots: vec![0; DRAW_STRIDE * self.draws.len()],
             material_groups,
             lighting_buffer,
             light_buffer,
@@ -1613,22 +1648,27 @@ impl DeferredPass {
         let gpu = self.gpu.as_mut().expect("prepared GPU");
         let aspect = width as f32 / height.max(1) as f32;
         let (view, projection) = (camera.view(), camera.projection(aspect));
-        // One write of every slot (many small writes are slow), when anything changed.
-        let mut slots = vec![0u8; DRAW_STRIDE * self.draws.len()];
+        // Keep the uniform stream's allocation. Only visible, unfaded draws consume
+        // these slots; point shadows use their own world/skin streams. Re-entry into
+        // view or opacity one refreshes the slot before it can be drawn again.
+        let mut dirty = false;
+        let prop_ambient = crate::d3d::ambient_of(d3d.lights(), crate::d3d::LightClass::Prop);
         for ((d, data), slot) in self
             .draws
             .iter()
             .zip(&self.data)
-            .zip(slots.chunks_exact_mut(DRAW_STRIDE))
+            .zip(gpu.slots.chunks_exact_mut(DRAW_STRIDE))
         {
+            if !d3d.in_view(d.k) || d3d.is_faded(&d3d.draws[d.k]) {
+                continue;
+            }
             let world = d3d.world(d.draw).unwrap_or(Mat4::IDENTITY);
             let world_view = view * world;
             let mut data = *data;
             data.room[0] = d.room.and_then(|r| rooms.get(&r)).copied().unwrap_or(0) as f32;
             if data.material[0] == 1.0 {
-                let ambient = crate::d3d::ambient_of(d3d.lights(), crate::d3d::LightClass::Prop);
                 for c in 0..3 {
-                    data.probe[c * 4 + 3][3] += ambient[c];
+                    data.probe[c * 4 + 3][3] += prop_ambient[c];
                 }
             }
             let u = DrawUniforms {
@@ -1636,11 +1676,15 @@ impl DeferredPass {
                 world: world.to_cols_array_2d(),
                 data,
             };
-            slot[..std::mem::size_of::<DrawUniforms>()].copy_from_slice(bytemuck::bytes_of(&u));
+            let bytes = bytemuck::bytes_of(&u);
+            if slot[..bytes.len()] != *bytes {
+                slot[..bytes.len()].copy_from_slice(bytes);
+                dirty = true;
+            }
         }
-        if slots != gpu.slots {
-            ctx.queue.write_buffer(&gpu.draw_buffer, 0, &slots);
-            gpu.slots = slots;
+        if dirty {
+            // One upload, since many small buffer writes are slow.
+            ctx.queue.write_buffer(&gpu.draw_buffer, 0, &gpu.slots);
         }
         let fog = d3d.fog();
         let frame = FrameUniforms {
@@ -2103,6 +2147,7 @@ impl DeferredPass {
                 &gpu.gbuffer,
                 opaque.then_some(&gpu.gbuffer_opaque),
                 specialized,
+                true,
                 d3d,
                 meshes,
             );
@@ -2115,6 +2160,7 @@ impl DeferredPass {
                         &g.gbuffer,
                         opaque.then_some(&g.gbuffer_opaque),
                         specialized,
+                        true,
                         c.d3d,
                         c.meshes,
                     );
@@ -2193,6 +2239,7 @@ impl DeferredPass {
             &gpu.env,
             None,
             false,
+            false,
             d3d,
             meshes,
         );
@@ -2204,6 +2251,7 @@ impl DeferredPass {
                     g,
                     &g.env,
                     None,
+                    false,
                     false,
                     c.d3d,
                     c.meshes,
@@ -2401,13 +2449,14 @@ fn draw_all(
     pipelines: &[wgpu::RenderPipeline; 3],
     opaque_pipelines: Option<&[wgpu::RenderPipeline; 3]>,
     specialized: bool,
+    gbuffer: bool,
     d3d: &D3dPass,
     meshes: &[GpuMesh],
 ) {
     let (mut pipeline, mut group) = (usize::MAX, usize::MAX);
     for &i in &gpu.order {
         let d = &draws[i];
-        if !d3d.in_view(d.k) || d3d.is_faded(&d3d.draws[d.k]) {
+        if !d3d.in_view(d.k) || d3d.is_faded(&d3d.draws[d.k]) || (!gbuffer && d.kind == 3) {
             continue;
         }
         let Some(mesh) = meshes.get(d.mesh) else {
@@ -2415,7 +2464,7 @@ fn draw_all(
         };
         let p = cull_index(d.cull);
         let opaque = opaque_pipelines.filter(|_| !d.alpha_test);
-        let family = if specialized && d.skin_slot == 0 {
+        let family = if d.kind == 3 || (specialized && d.skin_slot == 0) {
             d.kind
         } else {
             0
@@ -2424,6 +2473,7 @@ fn draw_all(
             1 => &gpu.gbuffer_static.as_ref().expect("static pipelines")
                 [usize::from(opaque.is_some())],
             2 => gpu.gbuffer_terrain.as_ref().expect("terrain pipelines"),
+            3 => gpu.gbuffer_black.as_ref().expect("black pipelines"),
             _ => opaque.unwrap_or(pipelines),
         };
         let key = family * 6 + p + if opaque.is_some() { 3 } else { 0 };
@@ -2630,7 +2680,10 @@ mod tests {
             }
             if matches!(
                 entry.name.as_str(),
-                "fs_gbuffer_opaque" | "fs_gbuffer_static_opaque" | "fs_gbuffer_terrain"
+                "fs_gbuffer_opaque"
+                    | "fs_gbuffer_static_opaque"
+                    | "fs_gbuffer_terrain"
+                    | "fs_gbuffer_black"
             ) {
                 assert!(
                     !used.may_kill,
@@ -2648,6 +2701,9 @@ mod tests {
                 })
                 .count();
             assert!(textures <= 16, "{} uses {textures} textures", entry.name);
+            if entry.name == "fs_gbuffer_black" {
+                assert_eq!(textures, 0, "Black has no texture inputs");
+            }
         }
     }
 
