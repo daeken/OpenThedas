@@ -48,6 +48,25 @@ pub struct Line {
     pub fill: Option<Fill>,
     /// Hairline/no-scale flags of `LineStyle2`: (no horizontal scale, no vertical scale).
     pub no_scale: (bool, bool),
+    pub start_cap: LineCap,
+    pub end_cap: LineCap,
+    pub join: LineJoin,
+    /// Keep a stroke open even when its final point meets its first.
+    pub no_close: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LineCap {
+    Round,
+    None,
+    Square,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum LineJoin {
+    Round,
+    Bevel,
+    Miter(f32),
 }
 
 /// One edge record, with coordinates already made absolute (twips).
@@ -155,20 +174,31 @@ fn read_line(r: &mut Reader, ver: u8) -> Result<Line> {
             color,
             fill: None,
             no_scale: (false, false),
+            start_cap: LineCap::Round,
+            end_cap: LineCap::Round,
+            join: LineJoin::Round,
+            no_close: false,
         });
     }
-    let _start_cap = r.ub(2)?;
+    let cap = |bits| match bits {
+        1 => LineCap::None,
+        2 => LineCap::Square,
+        _ => LineCap::Round,
+    };
+    let start_cap = cap(r.ub(2)?);
     let join = r.ub(2)?;
     let has_fill = r.flag()?;
     let no_h = r.flag()?;
     let no_v = r.flag()?;
     let _pixel_hinting = r.flag()?;
     let _reserved = r.ub(5)?;
-    let _no_close = r.flag()?;
-    let _end_cap = r.ub(2)?;
-    if join == 2 {
-        let _miter = r.u16()?;
-    }
+    let no_close = r.flag()?;
+    let end_cap = cap(r.ub(2)?);
+    let join = match join {
+        1 => LineJoin::Bevel,
+        2 => LineJoin::Miter(r.u16()? as f32 / 256.0),
+        _ => LineJoin::Round,
+    };
     let (color, fill) = if has_fill {
         (Color::default(), Some(read_fill(r, ver)?))
     } else {
@@ -179,6 +209,10 @@ fn read_line(r: &mut Reader, ver: u8) -> Result<Line> {
         color,
         fill,
         no_scale: (no_h, no_v),
+        start_cap,
+        end_cap,
+        join,
+        no_close,
     })
 }
 
@@ -385,6 +419,10 @@ pub fn read_morph(r: &mut Reader) -> Result<MorphShape> {
             color,
             fill: None,
             no_scale: (false, false),
+            start_cap: LineCap::Round,
+            end_cap: LineCap::Round,
+            join: LineJoin::Round,
+            no_close: false,
         };
         lines.push((l(w0, c0), l(w1, c1)));
     }
@@ -461,5 +499,34 @@ mod tests {
     #[test]
     fn truncated_shape_is_an_error() {
         assert!(read_shape(&mut Reader::new(&[0x50, 0, 0]), 1).is_err());
+    }
+
+    #[test]
+    fn stroke_styles_keep_caps_join_limit_and_closure() {
+        // Shape4: square start, miter join (2.5), no horizontal scale, no close,
+        // flat end. The following colour also proves the flags/limit stay aligned.
+        let bytes = [230, 0, 0xa4, 0x05, 0x80, 0x02, 0x12, 0x34, 0x56, 0x78];
+        let line = read_line(&mut Reader::new(&bytes), 4).unwrap();
+        assert_eq!(line.width, 230);
+        assert_eq!(line.start_cap, LineCap::Square);
+        assert_eq!(line.end_cap, LineCap::None);
+        assert_eq!(line.join, LineJoin::Miter(2.5));
+        assert!(line.no_close);
+        assert_eq!(line.no_scale, (true, false));
+        assert_eq!(
+            line.color,
+            Color {
+                r: 0x12,
+                g: 0x34,
+                b: 0x56,
+                a: 0x78
+            }
+        );
+
+        let legacy = read_line(&mut Reader::new(&[100, 0, 10, 20, 30]), 1).unwrap();
+        assert_eq!(legacy.start_cap, LineCap::Round);
+        assert_eq!(legacy.end_cap, LineCap::Round);
+        assert_eq!(legacy.join, LineJoin::Round);
+        assert!(!legacy.no_close);
     }
 }

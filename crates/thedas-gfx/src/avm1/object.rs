@@ -129,6 +129,12 @@ pub enum Kind {
     /// A `String`, `Number` or `Boolean` wrapper.
     Boxed(Value),
     Date(f64),
+    /// An exported bitmap backed by the renderer's external image cache.
+    BitmapData {
+        url: String,
+        width: u16,
+        height: u16,
+    },
     /// A display object's script object.
     Display(DisplayId),
     /// `super` inside a method: `this`, and the prototype lookups start from.
