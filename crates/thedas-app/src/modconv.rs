@@ -487,6 +487,53 @@ pub fn set_local(sim: &mut Sim, target: ObjectId, name: &str, value: Option<Loca
     }
 }
 
+/// Sets a creature's property as mod mode's command, with what undoes it (the base and
+/// current it held, set back).
+pub fn set_property(
+    sim: &mut Sim,
+    target: ObjectId,
+    property: i32,
+    base: Option<f32>,
+    current: Option<f32>,
+) -> Edit {
+    let tag = sim
+        .world
+        .get(target)
+        .map_or_else(|| target.to_string(), |o| o.tag.clone());
+    let mut what = format!("{tag} property {property}");
+    if let Some(b) = base {
+        what.push_str(&format!(" base {b}"));
+    }
+    if let Some(c) = current {
+        what.push_str(&format!(" current {c}"));
+    }
+    let outcome = sim.apply(
+        CommandSource::ModMode,
+        SimCommand::SetProperty {
+            target,
+            property,
+            base,
+            current,
+        },
+    );
+    let undo = match &outcome {
+        CommandOutcome::PropertySet {
+            base: b,
+            current: c,
+        } => vec![SimCommand::SetProperty {
+            target,
+            property,
+            base: base.map(|_| *b),
+            current: current.map(|_| *c),
+        }],
+        _ => Vec::new(),
+    };
+    Edit {
+        text: format!("{what}: {}", describe(&outcome)),
+        undo,
+    }
+}
+
 /// Moves, makes or removes an object as mod mode's command (`what` says which, for the
 /// history), with what undoes it: a move moves it back, a made object is removed; a
 /// removal cannot be undone.
@@ -544,6 +591,7 @@ pub fn describe(o: &CommandOutcome) -> String {
             Some(v) => format!("was {}", show_value(v)),
             None => "was not set".into(),
         },
+        CommandOutcome::PropertySet { base, current } => format!("was {base} (current {current})"),
         CommandOutcome::ObjectMoved { from, .. } => {
             format!("moved from {:.2}, {:.2}, {:.2}", from[0], from[1], from[2])
         }
