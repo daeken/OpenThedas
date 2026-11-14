@@ -608,7 +608,12 @@ pub struct AreaRenderer {
     deferred_planned: bool,
     /// Its eligible geometry was already drawn into another renderer's G-buffer.
     deferred_in_frame: bool,
+    deferred_frame: bool,
+    ground_mask: Option<crate::deferred_ground::GroundMask>,
 }
+
+/// Ground marks recorded between the main frame and its forward object overlays.
+pub type GroundUnderlay<'a> = &'a mut dyn FnMut(&mut wgpu::CommandEncoder, &wgpu::TextureView);
 
 /// The colour curve `da_hsvmatrix` reads: `name` (an area's curve, `<name>.dds`) or by
 /// default `da_defaultcc` (DAOrigins.exe loads it at 0x458cda, and binds it when no area curve
@@ -1138,6 +1143,8 @@ impl AreaRenderer {
             deferred,
             deferred_planned,
             deferred_in_frame: false,
+            deferred_frame: false,
+            ground_mask: None,
         }
     }
 
@@ -1526,6 +1533,45 @@ impl AreaRenderer {
         self.msaa.as_ref()
     }
 
+    /// Draws depth-disabled ground marks, retaining the colour over G-buffer characters.
+    /// Call this before the forward object overlays. Faithful frames draw directly.
+    pub fn render_ground(
+        &mut self,
+        ctx: &GpuContext,
+        encoder: &mut wgpu::CommandEncoder,
+        frame: &wgpu::TextureView,
+        draw: impl FnOnce(&mut wgpu::CommandEncoder),
+    ) {
+        let material = self.deferred.as_ref().and_then(|d| d.material_mask());
+        let usage = if frame.texture().sample_count() > 1 {
+            wgpu::TextureUsages::TEXTURE_BINDING
+        } else {
+            wgpu::TextureUsages::COPY_SRC
+        };
+        if self.deferred_frame
+            && std::env::var("THEDAS_DEFERRED_GROUND_MASK").as_deref() != Ok("0")
+            && frame.texture().usage().contains(usage)
+            && let Some(material) = material
+        {
+            if !self
+                .ground_mask
+                .as_ref()
+                .is_some_and(|g| g.fits(frame, material))
+            {
+                self.ground_mask = checked(&ctx.device, "deferred ground mask", || {
+                    crate::deferred_ground::GroundMask::new(&ctx.device, frame, material)
+                });
+            }
+            if let Some(mask) = &self.ground_mask {
+                mask.save(&ctx.device, encoder, frame);
+                draw(encoder);
+                mask.restore(&ctx.device, encoder, frame);
+                return;
+            }
+        }
+        draw(encoder);
+    }
+
     /// Records the area pass into `encoder`, drawing into `target` of the given size.
     pub fn render(
         &mut self,
@@ -1725,6 +1771,7 @@ impl AreaRenderer {
                 )
             });
         drop(contributors);
+        self.deferred_frame = deferred;
         for o in objects.iter_mut() {
             o.deferred_in_frame = deferred
                 && o.path == crate::deferred::RenderPath::Deferred
@@ -1966,7 +2013,7 @@ impl AreaRenderer {
         width: u32,
         height: u32,
     ) -> Result<Vec<u8>, GpuError> {
-        self.capture_with(ctx, camera, width, height, &mut [], &mut |_, _| {})
+        self.capture_with(ctx, camera, width, height, &mut [], None)
     }
 
     /// [`AreaRenderer::capture`] with `overlays` drawn over this renderer's pass (see
@@ -1979,7 +2026,7 @@ impl AreaRenderer {
         width: u32,
         height: u32,
         overlays: &mut [&mut AreaRenderer],
-        under: &mut dyn FnMut(&mut wgpu::CommandEncoder, &wgpu::TextureView),
+        under: Option<GroundUnderlay<'_>>,
     ) -> Result<Vec<u8>, GpuError> {
         let target = ctx.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("capture"),
@@ -2028,7 +2075,11 @@ impl AreaRenderer {
             overlays,
         );
         let frame = self.frame_view(&ctx.device, &view, width, height);
-        under(&mut encoder, &frame);
+        if let Some(under) = under {
+            self.render_ground(ctx, &mut encoder, &frame, |encoder| {
+                under(encoder, &frame);
+            });
+        }
         if !overlays.is_empty() {
             let depth = self.depth(&ctx.device, width, height);
             for o in overlays.iter_mut() {

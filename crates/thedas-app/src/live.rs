@@ -2486,11 +2486,17 @@ impl Live {
             .renderer
             .frame_view(&ctx.device, target, width, height);
         // An aimed ability's reticle lies on the ground: under the creatures, as the rings.
-        reticle.draw(&ctx.device, encoder, &frame, (width, height), &aim);
-        if let Some(r) = self.rings.as_mut() {
+        if !aim.is_empty() || self.rings.is_some() {
             let depth = level.renderer.depth(&ctx.device, width, height);
-            r.renderer
-                .render_over(ctx, encoder, &frame, width, height, camera, &depth);
+            level
+                .renderer
+                .render_ground(ctx, encoder, &frame, |encoder| {
+                    reticle.draw(&ctx.device, encoder, &frame, (width, height), &aim);
+                    if let Some(r) = self.rings.as_mut() {
+                        r.renderer
+                            .render_over(ctx, encoder, &frame, width, height, camera, &depth);
+                    }
+                });
         }
         if let Some(o) = self.objects.as_mut() {
             let depth = level.renderer.depth(&ctx.device, width, height);
@@ -2601,11 +2607,13 @@ impl Live {
             return Ok(None);
         };
         level.renderer.cut_effects = cut_effects;
+        let depth = level.renderer.depth(&ctx.device, width, height);
+        let ground = !aim.is_empty() || self.rings.is_some();
+        let rings = &mut self.rings;
         let mut overlays: Vec<&mut AreaRenderer> = self
-            .rings
+            .objects
             .iter_mut()
-            .map(|r| &mut r.renderer)
-            .chain(self.objects.iter_mut().map(|o| &mut o.renderer))
+            .map(|o| &mut o.renderer)
             .chain(self.effects.iter_mut().map(|e| &mut e.renderer))
             .collect();
         Ok(Some(level.renderer.capture_with(
@@ -2614,7 +2622,13 @@ impl Live {
             width,
             height,
             &mut overlays,
-            &mut |encoder, view| reticle.draw(&ctx.device, encoder, view, (width, height), &aim),
+            ground.then_some(&mut |encoder, view: &wgpu::TextureView| {
+                reticle.draw(&ctx.device, encoder, view, (width, height), &aim);
+                if let Some(r) = rings.as_mut() {
+                    r.renderer
+                        .render_over(ctx, encoder, view, width, height, camera, &depth);
+                }
+            }),
         )?))
     }
 

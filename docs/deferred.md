@@ -15,6 +15,13 @@ lightmaps. It is not parity work; where the two differ, the faithful path is rig
 - `thedas_render::RenderPath` (`Faithful` | `Deferred`) on `AreaRenderer::path`. The level
   and its eligible objects share a G-buffer; remaining materials, rings and effects draw
   forward over its depth.
+- Depth-disabled selection rings and the aiming reticle retain their ground-overlay
+  blending over terrain. In deferred frames, the colour before these marks is restored
+  over the G-buffer's character material code. This includes any nearer forward occluder
+  and preserves each MSAA sample. Forward-only characters still draw after the marks.
+  `THEDAS_DEFERRED_GROUND_MASK=0` disables this restoration for comparisons. Single-sample
+  targets need `COPY_SRC` usage; targets without it retain the unmasked overlay. The
+  mask follows the G-buffer's single-sample character coverage, including under MSAA.
 - `thedas-app --renderer faithful|deferred` (default `faithful`), the launcher's
   "Renderer" choice, **F11** in game to flip between them at once, and the step
   `renderer faithful|deferred|toggle` for `--steps` and `--control` runs.
