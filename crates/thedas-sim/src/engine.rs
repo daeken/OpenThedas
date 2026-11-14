@@ -322,6 +322,14 @@ fn format_float(f: f32, width: i32, decimals: i32) -> String {
     format!("{s:>w$}", w = width.clamp(0, 18) as usize)
 }
 
+fn origins_trim_number_space(s: &str) -> &str {
+    // The low-byte C-locale table accepts space, 9..13 and NBSP. Above U+00ff,
+    // retain our Unicode-space approximation of the native OS classification.
+    s.trim_start_matches(|c: char| {
+        matches!(c, ' ' | '\t'..='\r' | '\u{a0}') || (c as u32 >= 0x100 && c.is_whitespace())
+    })
+}
+
 /// Origins' shared StringToInt/HexStringToInt handler uses signed wide strtol,
 /// base zero (0x64f510 -> 0x4c0950 -> 0x8e835f). See notes/script-integer-parsing.md.
 fn origins_string_to_int(s: &str) -> i32 {
@@ -338,14 +346,7 @@ fn origins_string_to_int(s: &str) -> i32 {
                 .then(|| c as u32 - start)
         })
     };
-    // The low-byte C-locale table accepts space, 9..13 and NBSP. Above U+00ff,
-    // retain our Unicode-space approximation of the native OS classification.
-    let mut chars = s
-        .trim_start_matches(|c: char| {
-            matches!(c, ' ' | '\t'..='\r' | '\u{a0}') || (c as u32 >= 0x100 && c.is_whitespace())
-        })
-        .chars()
-        .peekable();
+    let mut chars = origins_trim_number_space(s).chars().peekable();
     let negative = chars.peek() == Some(&'-');
     if matches!(chars.peek(), Some('+' | '-')) {
         chars.next();
@@ -375,6 +376,48 @@ fn origins_string_to_int(s: &str) -> i32 {
         value = (value * i64::from(radix) + i64::from(d)).min(limit);
     }
     (if negative { -value } else { value }) as i32
+}
+
+/// Origins' wide strtod grammar (0x8effcf); see notes/script-float-parsing.md.
+/// The old CRT's intermediate decimal-to-binary rounding remains unverified.
+fn origins_string_to_float(s: &str) -> f32 {
+    let s = origins_trim_number_space(s);
+    let bytes = s.as_bytes();
+    let mut end = usize::from(matches!(bytes.first(), Some(b'+' | b'-')));
+    let mut digits = 0;
+    while bytes.get(end).is_some_and(u8::is_ascii_digit) {
+        end += 1;
+        digits += 1;
+    }
+    if bytes.get(end) == Some(&b'.') {
+        end += 1;
+        while bytes.get(end).is_some_and(u8::is_ascii_digit) {
+            end += 1;
+            digits += 1;
+        }
+    }
+    if digits == 0 {
+        return 0.0;
+    }
+    if matches!(bytes.get(end), Some(b'd' | b'D' | b'e' | b'E')) {
+        let mut exponent = end + 1;
+        if matches!(bytes.get(exponent), Some(b'+' | b'-')) {
+            exponent += 1;
+        }
+        let start = exponent;
+        while bytes.get(exponent).is_some_and(u8::is_ascii_digit) {
+            exponent += 1;
+        }
+        if exponent > start {
+            end = exponent;
+        }
+    }
+    // The native member narrows a double to a float; it does not parse directly
+    // to single precision. Normalize the CRT's alternate exponent spelling.
+    s[..end]
+        .replace(['d', 'D'], "e")
+        .parse::<f64>()
+        .unwrap_or(0.0) as f32
 }
 
 /// Functions that only drive presentation; accepted as no-ops.
@@ -771,6 +814,9 @@ pub fn call(
             ok(Value::Int(origins_string_to_int(&string(a, 0))))
         }
         "StringToInt" => ok(Value::Int(string(a, 0).trim().parse().unwrap_or(0))),
+        "StringToFloat" if h.sim.game == thedas_vfs::Game::Origins => {
+            ok(Value::Float(origins_string_to_float(&string(a, 0))))
+        }
         "StringToFloat" => ok(Value::Float(string(a, 0).trim().parse().unwrap_or(0.0))),
         "ResourceToString" => ok(Value::String(string(a, 0))),
         "StringToResource" => ok(Value::Resource(string(a, 0))),
@@ -4676,7 +4722,11 @@ pub fn call(
                 .collect();
             ok(objects(list))
         }
-        "ObjectToString" => ok(Value::String(format!("{}", obj(a, 0)))),
+        // Origins formats the raw id as signed decimal, without resolving it (0x64f890).
+        "ObjectToString" if h.sim.game == thedas_vfs::Game::Origins => {
+            ok(Value::String((obj(a, 0) as i32).to_string()))
+        }
+        "ObjectToString" => ok(Value::String(obj(a, 0).to_string())),
         "GetNameStrref" => ok(Value::Int(
             h.object(obj(a, 0))
                 .and_then(|o| o.name_strref)
@@ -5970,6 +6020,119 @@ mod tests {
             script: "test".into(),
         };
         assert!(call(&mut host, 1, &f, &[Value::String("0x2a".into())]).is_none());
+    }
+
+    #[test]
+    fn origins_float_conversion_consumes_the_native_decimal_prefix() {
+        let table = Arc::new(EngineTable::parse(b"float StringToFloat(string s) = 57;").unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        let convert = |s: &mut Sim, text: &str| {
+            let Some(Value::Float(value)) =
+                run(s, 1, "StringToFloat", &[Value::String(text.into())])
+            else {
+                panic!("StringToFloat must return a float");
+            };
+            value
+        };
+        for (text, expected) in [
+            ("", 0.0f32),
+            ("text", 0.0),
+            ("+", 0.0),
+            ("-text", 0.0),
+            (".", 0.0),
+            ("-.e2", 0.0),
+            ("- 1", 0.0),
+            (" \t\n\u{b}\u{c}\r\u{a0}-1.25tail", -1.25),
+            ("\u{85}1.25", 0.0),
+            ("+12.5suffix", 12.5),
+            (".25rest", 0.25),
+            ("1.", 1.0),
+            ("1.2.3", 1.2),
+            ("0779", 779.0),
+            ("0x1p2", 0.0),
+            ("1,5", 1.0),
+            ("1_234", 1.0),
+            ("12\0.5", 12.0),
+            ("2e3tail", 2000.0),
+            ("2E-2!", 0.02),
+            ("2d+2!", 200.0),
+            ("2D-2", 0.02),
+            ("1.e2", 100.0),
+            ("12e", 12.0),
+            ("12e+tail", 12.0),
+            ("12d-", 12.0),
+            ("12-3", 12.0),
+            ("12e 3", 12.0),
+            ("12e000tail", 12.0),
+            ("\u{ff11}.5", 0.0),
+            ("1.\u{ff15}", 1.0),
+            ("1e\u{661}", 1.0),
+            ("inf", 0.0),
+            ("-Infinity", 0.0),
+            ("NaN", 0.0),
+            ("-0tail", -0.0),
+            ("-.0e+2", -0.0),
+            ("1e9999", f32::INFINITY),
+            ("-1e9999", f32::NEG_INFINITY),
+            ("-1e-9999", -0.0),
+            // Double rounding distinguishes this from directly parsing to f32.
+            ("1.0000000596046448", 1.0),
+        ] {
+            assert_eq!(
+                convert(&mut s, text).to_bits(),
+                expected.to_bits(),
+                "{text:?}"
+            );
+        }
+        // DA2 retains its whole-string parser, including its special values.
+        s.game = thedas_vfs::Game::DragonAge2;
+        for (text, expected) in [
+            ("1.5tail", 0.0),
+            ("2D2", 0.0),
+            ("\u{85}1.5", 1.5),
+            ("inf", f32::INFINITY),
+            ("1.0000000596046448", f32::from_bits(1.0f32.to_bits() + 1)),
+        ] {
+            assert_eq!(
+                convert(&mut s, text).to_bits(),
+                expected.to_bits(),
+                "{text:?}"
+            );
+        }
+        assert!(convert(&mut s, "NaN").is_nan());
+    }
+
+    #[test]
+    fn origins_object_to_string_formats_raw_ids_as_signed_decimal() {
+        let table = Arc::new(EngineTable::parse(b"string ObjectToString(object o) = 54;").unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        let live = s.world.spawn(ObjectKind::Creature, "not_the_id");
+        s.world.get_mut(live).unwrap().template = "not_the_template".into();
+        let removed = s.world.spawn(ObjectKind::Placeable, "removed");
+        s.world.objects.remove(&removed);
+        let convert = |s: &mut Sim, id| run(s, live, "ObjectToString", &[Value::Object(id)]);
+        for (id, expected) in [
+            (0, "0"),
+            (live, "1"),
+            (removed, "2"),
+            (OBJECT_INVALID, "2130706432"),
+            (0x7fff_ffff, "2147483647"),
+            (0x8000_0000, "-2147483648"),
+            (0xffff_fffe, "-2"),
+            (0xffff_ffff, "-1"),
+        ] {
+            assert_eq!(convert(&mut s, id), Some(Value::String(expected.into())));
+        }
+        // DA2's formatting is untraced and retains its earlier unsigned result.
+        s.game = thedas_vfs::Game::DragonAge2;
+        for (id, expected) in [
+            (live, "1"),
+            (OBJECT_INVALID, "2130706432"),
+            (0x8000_0000, "2147483648"),
+            (0xffff_ffff, "4294967295"),
+        ] {
+            assert_eq!(convert(&mut s, id), Some(Value::String(expected.into())));
+        }
     }
 
     /// Calls engine function `name` as `caller`.
