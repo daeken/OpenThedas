@@ -1460,18 +1460,22 @@ impl Sim {
 
     /// [`Sim::answer_popup`] with the text typed into the box: DAOrigins.exe's
     /// `POPUP_RESULT` (built at 0x709950) carries it as string 0 (0x709971), empty when the
-    /// box has no input field.
+    /// box has no input field. It goes to the module (0x7098ef: the target is the object
+    /// 0x5d4fc0 answers, as for `GUI_OPENED`), with the popup's owner as object 0
+    /// (0x70993b); sp_module answers the dog-naming box from it with `SetName`. Sent to the
+    /// owner instead, the dog kept its name.
     pub fn answer_popup_with_text(&mut self, button: i32, text: &str) -> bool {
         let Some(p) = self.world.popup.take() else {
             return false;
         };
-        let target = if self.world.get(p.owner).is_some() {
-            p.owner
-        } else {
-            match self.world.module {
-                Some(m) => m,
-                None => return false,
-            }
+        // Without a module (tests, a bare simulation) the owner hears it.
+        let Some(target) = self
+            .world
+            .module
+            .or(Some(p.owner))
+            .filter(|&t| self.world.get(t).is_some())
+        else {
+            return false;
         };
         let mut ev = self.new_event("POPUP_RESULT", self.world.hero);
         ev.objects = vec![p.owner];
