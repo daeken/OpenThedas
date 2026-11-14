@@ -102,6 +102,7 @@ impl Player {
             intervals: Vec::new(),
             next_interval: 0,
             time_ms: 0.0,
+            timer_time_ms: 0.0,
             host,
             callbacks: HashMap::new(),
             key,
@@ -154,6 +155,7 @@ impl Player {
     pub fn tick(&mut self, dt_ms: f64) {
         let dt = dt_ms.clamp(0.0, 1000.0);
         self.vm.time_ms += dt;
+        self.vm.timer_time_ms += dt;
         if let Some(t) = self
             .vm
             .focus
@@ -178,20 +180,25 @@ impl Player {
     }
 
     fn run_intervals(&mut self) {
-        let now = self.vm.time_ms;
-        let due: Vec<u32> = self
-            .vm
-            .intervals
-            .iter()
-            .filter(|i| i.next <= now)
-            .map(|i| i.id)
-            .collect();
-        for id in due {
+        let now = self.vm.timer_time_ms;
+        // Catch up in deadline order, preserving each interval's phase. Bounding the
+        // callbacks also bounds work when a frame stalls or callbacks create timers.
+        for _ in 0..10 {
+            let Some(id) = self
+                .vm
+                .intervals
+                .iter()
+                .filter(|i| i.next < now)
+                .min_by(|a, b| a.next.total_cmp(&b.next).then(a.id.cmp(&b.id)))
+                .map(|i| i.id)
+            else {
+                return;
+            };
             let Some(i) = self.vm.intervals.iter_mut().find(|i| i.id == id) else {
                 continue;
             };
             let once = i.every < 0.0;
-            i.next = now + i.every.abs();
+            i.next += i.every.abs();
             let (this, func, method, args) = (
                 i.this.clone(),
                 i.func.clone(),
@@ -200,6 +207,14 @@ impl Player {
             );
             if once {
                 self.vm.intervals.retain(|x| x.id != id);
+            }
+            if method.is_some()
+                && this.as_object().and_then(|o| self.vm.heap.get(o)).is_some_and(|o| {
+                    matches!(&o.kind, crate::avm1::object::Kind::Display(d) if self.vm.display.get(*d).is_none())
+                })
+            {
+                self.vm.intervals.retain(|x| x.id != id);
+                continue;
             }
             self.vm.budget = 0;
             match method {
@@ -211,6 +226,18 @@ impl Player {
                 }
             }
             self.run_queue();
+        }
+        if let Some(next) = self
+            .vm
+            .intervals
+            .iter()
+            .map(|i| i.next)
+            .min_by(f64::total_cmp)
+            && next < now
+        {
+            // Resume just before the next deadline on the following update. Keep this
+            // scheduler clock separate from the movie's actual elapsed time/getTimer.
+            self.vm.timer_time_ms = next - 0.1;
         }
     }
 
@@ -2086,6 +2113,110 @@ mod queue_tests {
             .children
             .insert(1, field);
         (p, field)
+    }
+
+    #[test]
+    fn interval_callbacks_catch_up_in_deadline_order_without_drift() {
+        let (mut p, _) = input_player();
+        let trace = p.vm.new_native(|vm, _, args| {
+            let text = vm.to_str(args.first().unwrap());
+            vm.log.push(text.to_string());
+            Value::Undefined
+        });
+        let global = Value::Object(p.vm.global);
+        for (delay, name) in [(20.0, "a"), (35.0, "b")] {
+            p.vm.call_method(
+                &global,
+                "setInterval",
+                &[
+                    Value::Object(trace),
+                    Value::Number(delay),
+                    Value::from(name),
+                ],
+            );
+        }
+        p.tick(81.0);
+        assert_eq!(p.drain_log(), ["a", "b", "a", "a", "b", "a"]);
+        // Keep the original deadline rather than postponing it after each update.
+        p.tick(19.0);
+        assert!(p.drain_log().is_empty());
+        p.tick(1.0);
+        assert_eq!(p.drain_log(), ["a"]);
+    }
+
+    #[test]
+    fn interval_catchup_is_bounded_without_rewinding_get_timer() {
+        let (mut p, _) = input_player();
+        let trace = p.vm.new_native(|vm, _, _| {
+            vm.log.push("tick".into());
+            Value::Undefined
+        });
+        let global = Value::Object(p.vm.global);
+        p.vm.call_method(
+            &global,
+            "setInterval",
+            &[Value::Object(trace), Value::Number(1.0)],
+        );
+        assert_eq!(p.vm.intervals[0].every, 10.0);
+        p.tick(10.0);
+        assert!(p.drain_log().is_empty());
+        p.tick(990.0);
+        assert_eq!(p.drain_log().len(), 10);
+        assert_eq!(
+            p.vm.call_method(&global, "getTimer", &[]),
+            Value::Number(1000.0)
+        );
+        p.tick(20.0);
+        assert_eq!(p.drain_log().len(), 2);
+        assert_eq!(
+            p.vm.call_method(&global, "getTimer", &[]),
+            Value::Number(1020.0)
+        );
+    }
+
+    #[test]
+    fn interval_callbacks_can_cancel_and_removed_clip_methods_stop() {
+        let (mut p, _) = input_player();
+        let global = Value::Object(p.vm.global);
+        let trace = p.vm.new_native(|vm, _, _| {
+            vm.log.push("repeat".into());
+            Value::Undefined
+        });
+        let id = p.vm.call_method(
+            &global,
+            "setInterval",
+            &[Value::Object(trace), Value::Number(20.0)],
+        );
+        p.vm.set(&global, "cancelId", id);
+        let cancel = p.vm.new_native(|vm, _, _| {
+            vm.log.push("timeout".into());
+            let global = Value::Object(vm.global);
+            let id = vm.get(&global, "cancelId");
+            vm.call_method(&global, "clearInterval", &[id]);
+            Value::Undefined
+        });
+        p.vm.call_method(
+            &global,
+            "setTimeout",
+            &[Value::Object(cancel), Value::Number(55.0)],
+        );
+        p.tick(81.0);
+        assert_eq!(p.drain_log(), ["repeat", "repeat", "timeout"]);
+        assert!(p.vm.intervals.is_empty());
+        let root = p.vm.root;
+        let clip = create_empty(&mut p.vm, root, "timer", 2).unwrap();
+        let receiver = p.vm.display_object(clip);
+        p.vm.set(&receiver, "onTick", Value::Object(trace));
+        p.vm.call_method(
+            &global,
+            "setInterval",
+            &[receiver, Value::from("onTick"), Value::Number(16.9)],
+        );
+        assert_eq!(p.vm.intervals[0].every, 16.0);
+        remove_clip(&mut p.vm, clip);
+        p.tick(100.0);
+        assert!(p.drain_log().is_empty());
+        assert!(p.vm.intervals.is_empty());
     }
 
     #[test]
