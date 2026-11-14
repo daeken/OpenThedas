@@ -208,8 +208,8 @@ pub fn display_get(vm: &mut Vm, d: DisplayId, name: &str) -> Option<Value> {
         "htmlText" => Value::from(t.html_text()),
         "html" => Value::Bool(t.html),
         "length" => Value::Number(t.len() as f64),
-        "textWidth" => Value::Number(t.layout(&*fonts).width.round() as f64),
-        "textHeight" => Value::Number(t.layout(&*fonts).height.round() as f64),
+        "textWidth" => Value::Number(t.layout(&*fonts).width.trunc() as f64),
+        "textHeight" => Value::Number(t.layout(&*fonts).height.trunc() as f64),
         "autoSize" => match t.auto_size {
             AutoSize::None => Value::from("none"),
             AutoSize::Left => Value::from("left"),
@@ -872,7 +872,7 @@ fn mc_clear(vm: &mut Vm, this: Value, _: &[Value]) -> Value {
 
 fn mc_start_drag(vm: &mut Vm, this: Value, args: &[Value]) -> Value {
     if let Some(d) = this_display(vm, &this) {
-        let lock = args.first().is_some_and(|v| vm.to_bool(v));
+        let lock = args.first().is_none_or(|v| vm.to_bool(v));
         crate::player::start_drag(vm, d, lock);
     }
     Value::Undefined
@@ -1610,7 +1610,10 @@ pub fn install(vm: &mut Vm) {
     vm.define_native(
         mouse,
         "getTopMostEntity",
-        |vm, _, _| match crate::player::topmost(vm) {
+        |vm, _, args| match crate::player::topmost_entity(
+            vm,
+            args.first().is_none_or(|v| vm.to_bool(v)),
+        ) {
             Some(d) => display_value(vm, d),
             None => Value::Undefined,
         },

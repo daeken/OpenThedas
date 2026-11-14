@@ -978,7 +978,7 @@ fn parse_floats(s: &str) -> Vec<f32> {
 
 /// The parameters a material's draws see: those its technique's passes declare, then its
 /// definition's parameter sets.
-fn parameters(m: &SceneMaterial) -> impl Iterator<Item = &Parameter> {
+pub(crate) fn parameters(m: &SceneMaterial) -> impl Iterator<Item = &Parameter> {
     let passes = m
         .technique
         .iter()

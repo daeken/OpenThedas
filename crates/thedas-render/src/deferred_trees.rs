@@ -16,7 +16,7 @@ struct Variant {
 
 #[cfg(test)]
 #[path = "deferred_tree_tests.rs"]
-mod tests;
+pub(super) mod tests;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Family {
@@ -29,7 +29,7 @@ pub(super) enum Family {
 impl Family {
     pub(super) const NEW: [Self; 3] = [Self::Branches, Self::MeshLeaves, Self::LeafCards];
 
-    fn of(program: &D3dProgram) -> Option<Self> {
+    pub(super) fn of(program: &D3dProgram) -> Option<Self> {
         let mut names = program.name.split('+');
         match (names.next()?, names.next()?) {
             ("spt_fronds.vsh", "spt_fronds.psh") => Some(Self::Fronds),
@@ -70,7 +70,7 @@ pub(super) struct Gpu {
     frame: wgpu::BindGroup,
 }
 
-fn source(program: &D3dProgram) -> Option<String> {
+pub(super) fn source(program: &D3dProgram) -> Option<String> {
     let family = Family::of(program)?;
     let p = &program.pass;
     let alpha_supported = match family {
