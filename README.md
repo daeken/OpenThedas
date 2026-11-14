@@ -8,9 +8,27 @@ parity.
 You need your own copy of the game. Nothing from the original game is, or will ever be, in this
 repository.
 
+## Getting it
+
+- **Test builds** (Windows x64, Windows on ARM, macOS on Apple silicon) are shared with the test
+  group in the project's Discord. Unzip one anywhere, then start `Play OpenThedas` (Windows) or
+  run `thedas-app` with `--install` pointing at your game folder (see [Playing](#playing)). A
+  test build updates itself: when a fix for something you reported is published, the game
+  offers the new build at start (see [Issue reports](#issue-reports-and-updates)).
+- **From source**: install Rust, then `cargo build --release -p thedas-app` and run
+  `target/release/thedas-app --install "$GAME"`.
+
+Movies (the logos, the opening, each origin's intro film) need `ffmpeg`, which is not included.
+Without it they are skipped and nothing else changes. Put `ffmpeg` (`ffmpeg.exe` on Windows) in
+your OpenThedas data folder, next to the program, or on your `PATH`; on macOS Homebrew's is
+found too.
+
+Your saves, settings, reports and the journal live in your data folder: `Documents\OpenThedas`
+on Windows, `~/.openthedas` elsewhere.
+
 ## Status
 
-Last updated 2026-11-13 16:45 UTC, main b48ed11
+Last updated 2026-11-14 00:30 UTC, main 55ed7d7
 
 For everything that is wrong or missing, in detail and split into items that can be picked up in
 parallel, see [docs/KNOWN_GAPS.md](docs/KNOWN_GAPS.md).
@@ -114,12 +132,14 @@ Legend: ✅ done, 🟡 partial, ⬜ not started. QA notes come from QA runs 8–
   - Sound is off with `--control` (unless `--audio`) and in headless captures.
 - 🟡 **Controller**: Xbox 360-style layout; menus and in-game screens use focus navigation, and A dismisses tutorial popups, then opens the screen a paused training lesson waits for (level-up, inventory, tactics). The PC right-click radial menu doesn't exist as a movie in the game data, so LT opens a quickbar picker instead. In the inventory A equips and unequips and Y puts a usable item in the first free quickbar slot; on Tactics the pad reaches the Presets and Behaviour pickers; B in an open dropdown closes only the list.
 - ✅ **Saves**: F5/F9 quick save and load, save/load screens with a picture of the game for each save made in a window, typed names. Revision 7 fills older saves' empty containers.
+- 🟡 **Journal saves and resume**: while you play, the game keeps a checkpoint (an ordinary save) and a log of every input since it in the data folder's `journal/`, with a new checkpoint on each area change, after a load and every few game minutes. If a session ends unexpectedly (a crash, a killed process), the start menu offers to resume it, replaying the log so the game comes back as it was; `--resume` does the same from the command line. Only interactive play keeps a journal (not `--capture`, `--steps` or `--control` runs, unless `--journal`).
 - 🟡 **Keyboard and mouse**: W, S, Q and E walk the leader relative to the camera and A and D turn the camera, as the game's key map binds them; click to move, hover names, and name and health floaties shown as the original shows them (hovered, targeted, or with Tab held). Selection rings are drawn under party members and fighting enemies (when an enemy shows its ring is provisional).
 - ✅ **Performance**: frustum culling, shadow caching and skinned-draw culling (Lothering about 8 ms, the chapel about 1.5 ms offscreen). Model node trees are read with a heap stack, so small worker-thread stacks are safe.
 - 🟡 **DLC and add-ins**: encrypted DLC archives are read (passwords recovered from the player's own GOG Ultimate Edition executable; nothing is shipped). Every enabled add-in's `core` folder is mounted, and its `module` folder only when it extends the base campaign, so stand-alone campaigns cannot replace base-game files. Add-ins are found from the original's `AddIns.xml` registry as well as from manifests, which brings in the promotional items' add-ins. The add-ins' area-list scripts run as in the original, so a new game hands out the first DLC item; DLC map pins and camp additions do not appear yet (`FMT-047`). Install paths are matched without regard to case, so the game runs from a case-sensitive file system.
-- 🟡 **Issue reports**: F8, both sticks clicked or the menu's Report Issue entry saves a screenshot, the current save, a save from about a minute earlier, the log, recent input and settings to the user's data folder (`Documents\OpenThedas` on Windows), and can send it to the project's report server.
+- 🟡 **Issue reports**: F8, both sticks clicked or the menu's Report Issue entry saves a report to the data folder and, in test builds, sends it to the project. You can mark spots on the screen first, each with its own note. Fixes come back as updates; see [Issue reports and updates](#issue-reports-and-updates).
 - 🟡 **Mods**: an ordered list of mod layers sits above the whole resource stack (later entries win; nothing is extracted over the game's files), `.dazip` packages in the list are unpacked into a cache and join as add-ins, and the original's folders in the player's Documents are read in the original's places. `.7z` archives are unpacked into the same cache. `THEDAS_MODS=none` turns all of it off; `thedas mods <install>` lists the layers. How to use it: [docs/mods.md](docs/mods.md).
-- 🟡 **DA2**: scoping. Archives whose entries carry only name hashes (ERF V3.0) resolve by name; patch talk tables and material files are read; nothing of the game runs yet.
+- 🟡 **Mod mode**: tools over the running game, opened with F10 or the game menu's Mod Mode entry; the game keeps running under them. An inspector (Ctrl+click a creature or placeable) shows what it is and what it is animating; an animation scrubber holds, steps, slows and loops the picked creature's animation and can file a report for one frame; a conversation launcher starts any conversation out of order and shows and sets the plot flags its lines read; a world-state browser shows and edits variables and plot flags, with undo. Every change goes through the simulation's commands, so it is in the journal. An object can be exported to Blender as glTF (`.glb`, its textures as PNGs, and a manifest of where each part came from), and with "Live edits" on (or `--mod-workspace`) a texture PNG saved from that export becomes the game's texture in the data folder's `workspace/override/` straight away.
+- 🟡 **DA2**: early. Point `--install` at a Dragon Age II install and the game path runs the campaign's own start script into the Gallows. Levels draw with DA2's own shaders, normal maps and baked lightmaps, props take their per-vertex lighting, and the sky has its clouds (Lowtown, Hightown, the Gallows, the alienage). Characters are dressed, with their own heads, hair and beards from their head morphs, and Hawke plays his idle. DA2's own engine functions are being added. Not playable yet: no fog verified against the original, no shadows or water reflections, and most of the interface is missing.
 
 ### Known blockers
 
@@ -187,12 +207,36 @@ Planned crates follow the architecture doc: `thedas-video` (movies currently go 
 ./target/release/thedas-app --install "$GAME"
 ```
 
+`$GAME` is the folder holding `packages/` and `modules/` (for example a Steam or GOG install of
+the Ultimate Edition); `THEDAS_INSTALL` can stand in for `--install`.
+
 With nothing else, the game boots to its start menu (startmenu2.gfx): New Game goes through
 character creation, Load Game lists the saves in `~/.openthedas/saves` (`--saves` for another
 folder), Options and Quit work. In a game, Escape (Start on a pad) opens the game menu: save,
 load, options, and Exit Game back to the start menu. The logo and intro movies the original
 plays before the menu are shown when `ffmpeg` is installed (`--no-intro` skips them). `--new-game` (with `--quick-start`)
 and `--save <file>` still start a game directly.
+
+## Issue reports and updates
+
+Press F8 (or click both controller sticks in, or choose Report Issue in the game menu) when
+something looks wrong. The game pauses and asks whether you want to mark spots: drag a box around
+each thing (with a controller: the left stick moves a pointer, A at each corner) and say what is
+wrong there, then press F8 or Enter (B or Start on a controller). Then type what you expected and
+what happened.
+
+The report is a folder in the data folder's `reports/`: the screenshot (and a copy with your
+numbered boxes), the game now and about a minute earlier, the journal, the game's log, your
+recent input and the simulation's recent trace, the build, GPU and settings, and your note.
+Test builds send it to the project, where it shows up in the Discord and as a GitHub issue
+labelled `player-report`; your user name and home folder are left out. "Keep here" keeps a
+report on your computer only. Development builds and runs driven by `--control` never send
+anything.
+
+When a fix lands (a pull request that closes the report's issue) and a build with it is
+published, a test build offers it at start: it saves your game, downloads the new build into a
+folder of its own, restarts where you are or where you reported the problem, and asks whether it
+is fixed. Your answer goes back to the report.
 
 ## Walking through an area
 
