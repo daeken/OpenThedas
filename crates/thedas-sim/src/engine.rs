@@ -1130,11 +1130,13 @@ pub fn call(
                 .unwrap_or_default(),
         )),
         "GetName" => ok(Value::String(h.sim.display_name(obj(a, 0)))),
-        // An empty name gives the template's back. Provisional.
         "SetName" => {
             let name = string(a, 1);
+            // Origins explicitly assigns even an empty localized name (0x66ba00 ->
+            // 0x4d1bb0). DA2's empty-name behavior has not been traced.
+            let assigned = h.sim.game == thedas_vfs::Game::Origins || !name.is_empty();
             if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
-                o.name = (!name.is_empty()).then_some(name);
+                o.name = assigned.then_some(name);
             }
             void()
         }
@@ -6777,6 +6779,63 @@ mod tests {
                 run(&mut s, 0, "ToString", &[value]),
                 Some(Value::String(expected.into()))
             );
+        }
+    }
+
+    #[test]
+    fn origins_keeps_explicitly_empty_object_names_through_save_reload() {
+        let table = Arc::new(
+            EngineTable::parse(
+                b"void SetName(object o, string s) = 1; string GetName(object o) = 2;",
+            )
+            .unwrap(),
+        );
+        for game in [thedas_vfs::Game::Origins, thedas_vfs::Game::DragonAge2] {
+            let mut s = Sim::new(Arc::new(Vfs::new()), table.clone(), 7);
+            s.game = game;
+            let id = s.world.spawn(ObjectKind::Creature, "fallback_name");
+            assert_eq!(
+                run(&mut s, id, "GetName", &[Value::Object(id)]),
+                Some(Value::String("fallback_name".into()))
+            );
+            // Replacing a name must not turn a later empty assignment into a reset.
+            for name in ["Renamed", "", "Named again", ""] {
+                run(
+                    &mut s,
+                    id,
+                    "SetName",
+                    &[Value::Object(id), Value::String(name.into())],
+                );
+                let expected = if game == thedas_vfs::Game::DragonAge2 && name.is_empty() {
+                    "fallback_name"
+                } else {
+                    name
+                };
+                assert_eq!(
+                    run(&mut s, id, "GetName", &[Value::Object(id)]),
+                    Some(Value::String(expected.into()))
+                );
+            }
+            let save = s.save_json().unwrap();
+            s.world.get_mut(id).unwrap().name = Some("Overwritten".into());
+            s.load_json(&save).unwrap();
+            let expected = if game == thedas_vfs::Game::Origins {
+                ""
+            } else {
+                "fallback_name"
+            };
+            assert_eq!(
+                run(&mut s, id, "GetName", &[Value::Object(id)]),
+                Some(Value::String(expected.into()))
+            );
+            let before = s.save_json().unwrap();
+            run(
+                &mut s,
+                id,
+                "SetName",
+                &[Value::Object(OBJECT_INVALID), Value::String(String::new())],
+            );
+            assert_eq!(s.save_json().unwrap(), before);
         }
     }
 
