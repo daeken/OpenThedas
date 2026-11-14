@@ -1366,6 +1366,23 @@ impl Sim {
         let Some(module) = self.world.module else {
             return;
         };
+        // DA2's cutscene names its own completion script (CUT field 5001). The
+        // voyage's script runs the common cleanup and requests the Gallows transition;
+        // consuming only the cleanup locals here silently loses that continuation.
+        // Provisional context: run on the module, as the shared cleanup does. The loader
+        // is traced, but the native completion caller/context is not yet established.
+        if self.game == thedas_vfs::Game::DragonAge2 {
+            let script = self
+                .vfs
+                .read(&crate::cutscene::Cutscene::resource(name))
+                .ok()
+                .and_then(|(data, _)| thedas_formats::Gff4::parse(&data).ok())
+                .and_then(|g| crate::cutscene::end_script(&g));
+            if let Some(script) = script {
+                self.run_script(&script, module, None);
+                return;
+            }
+        }
         let (plot, flag, speaker) = match self.world.get_mut(module) {
             Some(m) => {
                 let l = &mut m.locals;
@@ -1895,6 +1912,23 @@ impl Sim {
         let Some(module) = self.world.module else {
             return;
         };
+        if self.game == thedas_vfs::Game::DragonAge2 {
+            // DA2's GoToLevelUpMessage (0x647fe0) selects the creature in object 0
+            // and notifies the module with event 24. That script notification handles
+            // tutorials; unlike Origins it never calls StartCharGen. The native UI's
+            // level-up scope must therefore be opened here for the requested member.
+            if !self.in_party(creature)
+                || !self.has_level_up_points(creature)
+                || self
+                    .world
+                    .get(creature)
+                    .is_none_or(|o| o.dead || o.combat.in_combat)
+            {
+                return;
+            }
+            self.world.chargen = Some(creature);
+            self.world.chargen_mode = 1;
+        }
         let mut ev = self.new_event("PLAYERLEVELUP", Some(creature));
         ev.objects = vec![creature];
         self.world.queue_event(0, module, ev, None);
@@ -2888,7 +2922,9 @@ impl Sim {
                 Some(t) if cmd.name == "CommandAttack" => (self.attack_reach(id)
                     <= crate::combat::MELEE_REACH)
                     .then(|| self.reach_to(id, t)),
-                Some(t) if self.abi_int(cmd.ints.first().copied().unwrap_or(0), "range") == 0 => {
+                Some(t)
+                    if self.ability_range_class(cmd.ints.first().copied().unwrap_or(0)) == 0 =>
+                {
                     Some(self.body_radius(id) + self.body_radius(t) + MELEE_TALENT_REACH)
                 }
                 _ => None,
@@ -3057,7 +3093,7 @@ impl Sim {
         let Some(me) = self.world.get(id) else {
             return Approach::InReach;
         };
-        if self.abi_int(ability, "range") == 0 {
+        if self.ability_range_class(ability) == 0 {
             let target = cmd
                 .target
                 .filter(|&t| t != id && t != OBJECT_INVALID)
@@ -3085,6 +3121,13 @@ impl Sim {
         }
         let Some(range) = self.ability_range(ability) else {
             return Approach::InReach;
+        };
+        // DA2's native cast check includes the caster's personal space as
+        // well as the target bound (0x64111b..0x641153).
+        let range = if self.game == thedas_vfs::Game::DragonAge2 {
+            range + self.body_radius(id)
+        } else {
+            range
         };
         let (to, reach) = match cmd.target.filter(|&t| t != id && t != OBJECT_INVALID) {
             Some(t) => match self.world.get(t) {
@@ -5115,6 +5158,84 @@ mod tests {
     }
 
     #[test]
+    fn da2_cutscene_completion_runs_its_script_for_skip_play_and_reload() {
+        use thedas_formats::gff4::{
+            FieldDef, FourCC, Gff4, StructData, StructId, StructTemplate, Version,
+        };
+        let dir = std::env::temp_dir().join(format!("thedas-cut-end-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("intro.cut");
+        let g = Gff4 {
+            version: Version::V40,
+            platform: FourCC::new(b"PC  "),
+            file_type: FourCC::new(b"CUT "),
+            file_version: FourCC::new(b"V1.0"),
+            templates: vec![StructTemplate {
+                label: FourCC::new(b"CUT "),
+                fields: vec![
+                    FieldDef {
+                        label: 5000,
+                        type_code: 8,
+                        flags: 0,
+                        offset: 0,
+                    },
+                    FieldDef {
+                        label: 5001,
+                        type_code: 14,
+                        flags: 0,
+                        offset: 4,
+                    },
+                ],
+                size: 8,
+            }],
+            structs: vec![StructData {
+                template: 0,
+                values: vec![
+                    thedas_formats::gff4::Value::F32(1.0),
+                    thedas_formats::gff4::Value::String(Some("counter\0".into())),
+                ],
+            }],
+            root: StructId(0),
+            shared_strings: None,
+        };
+        std::fs::write(&file, g.write().unwrap()).unwrap();
+        for mode in 0..4 {
+            let mut s = sim();
+            let mut vfs = Vfs::new();
+            vfs.push_files(std::slice::from_ref(&file), "test");
+            s.vfs = Arc::new(vfs);
+            s.game = thedas_vfs::Game::DragonAge2;
+            let m = with_module(&mut s);
+            if mode == 0 {
+                // The headless policy completes a queued cutscene immediately.
+                s.world.cutscenes.push("intro".into());
+                s.tick(0);
+            } else {
+                s.cutscene_policy = CutscenePolicy::Play;
+                s.world.cutscenes.push("intro".into());
+                s.tick(0);
+                assert!(s.world.cutscene.is_some());
+                assert!(!s.world.get(m).unwrap().locals.ints.contains_key("n"));
+                if mode == 3 {
+                    let saved = serde_json::to_string(&s.world).unwrap();
+                    s.world = serde_json::from_str(&saved).unwrap();
+                }
+                if mode == 1 {
+                    s.skip_cutscene();
+                } else {
+                    s.tick(1000);
+                }
+            }
+            assert_eq!(s.world.get(m).unwrap().locals.ints.get("n"), Some(&1));
+            s.tick(2000);
+            s.skip_cutscene();
+            assert_eq!(s.world.get(m).unwrap().locals.ints.get("n"), Some(&1));
+            assert!(s.world.cutscene.is_none() && s.world.cutscenes.is_empty());
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn a_played_cutscene_holds_the_world_for_its_length() {
         let mut s = sim();
         s.cutscene_policy = CutscenePolicy::Play;
@@ -6221,6 +6342,79 @@ mod tests {
                 .first()
                 .is_some_and(|c| c.approach.is_none() && c.due.is_some())
         );
+    }
+
+    #[test]
+    fn da2_ranged_abilities_keep_their_native_range_during_approach() {
+        use thedas_formats::gda::Cell;
+        let mut s = sim();
+        let tables = crate::m2da::Tables::empty();
+        tables.insert(
+            "#1",
+            &["#a7fa7789"],
+            vec![
+                (5510, vec![Cell::Int(6)]),
+                (3110, vec![Cell::Int(1)]),
+                (7000, vec![Cell::Int(0)]),
+                (7001, vec![Cell::Int(8)]),
+                (7002, vec![Cell::Int(99)]),
+            ],
+        );
+        tables.insert(
+            "#301",
+            &["#814f8b88"],
+            vec![
+                (1, vec![Cell::Float(1.5)]),
+                (6, vec![Cell::Float(35.)]),
+                (8, vec![Cell::Float(f64::NAN)]),
+            ],
+        );
+        // The unrelated Origins worksheet must not turn the DA2 staff shot
+        // into a touch-range cast.
+        tables.insert("ABI_base", &["Range"], vec![(5510, vec![Cell::Int(1)])]);
+        tables.insert(
+            "#134",
+            &["PrimaryRange"],
+            vec![(1, vec![Cell::Float(2.25)])],
+        );
+        s.world.tables = Arc::new(tables);
+        let area = s.world.spawn(ObjectKind::Area, "arena");
+        let caster = s.world.spawn(ObjectKind::Creature, "mage");
+        let target = s.world.spawn(ObjectKind::Creature, "target");
+        s.world.get_mut(caster).unwrap().area = Some(area);
+        s.world.get_mut(target).unwrap().area = Some(area);
+        s.world.get_mut(target).unwrap().position = [20., 0., 0.];
+        s.order_ability(caster, 5510, target, "");
+        let cmd = s.world.get(caster).unwrap().commands[0].clone();
+        assert_eq!(s.ability_range(5510), Some(2.25));
+        assert!(matches!(
+            s.ability_approach(caster, &cmd),
+            Approach::Walk(..)
+        ));
+        s.game = thedas_vfs::Game::DragonAge2;
+        assert_eq!(s.ability_range_class(5510), 6);
+        assert_eq!(s.ability_range(5510), Some(35.));
+        assert!(matches!(
+            s.ability_approach(caster, &cmd),
+            Approach::InReach
+        ));
+        for ability in [7000, 7001, 7002, 9999] {
+            assert_eq!(s.ability_range(ability), None);
+        }
+        s.world.get_mut(target).unwrap().position = [40., 0., 0.];
+        assert!(matches!(
+            s.ability_approach(caster, &cmd),
+            Approach::Walk(..)
+        ));
+        s.world.get_mut(target).unwrap().position = [2.5, 0., 0.];
+        let mut melee = cmd;
+        melee.ints[0] = 3110;
+        // 1.5 m plus two fallback 0.6 m personal spaces. Counting only the
+        // target's radius would keep replanning an already valid melee cast.
+        assert!(matches!(
+            s.ability_approach(caster, &melee),
+            Approach::InReach
+        ));
     }
 
     #[test]

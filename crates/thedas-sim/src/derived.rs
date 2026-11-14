@@ -87,10 +87,27 @@ impl Sim {
         }
     }
 
+    /// DA2's current setter (0x5bd800) reserves a percentage of the nominal total:
+    /// health's reservation is property 8, stamina's is 11 (0x5d7e2c).
+    /// The total query itself still reports the nominal maximum.
+    pub(crate) fn depletable_current_ceiling(&self, id: ObjectId, property: i32) -> f32 {
+        let max = self.property_total(id, property).max(0.0);
+        if self.game == thedas_vfs::Game::DragonAge2 {
+            let reserved = match property {
+                7 => 8,
+                10 => 11,
+                _ => return max,
+            };
+            max * (1.0 - self.property_total(id, reserved).clamp(0.0, 100.0) * 0.01)
+        } else {
+            max
+        }
+    }
+
     /// Keeps a depletable's current value within its total (as the executable does when
     /// its base or modifiers change, 0x79c860, 0x79c890).
     pub fn clamp_current(&mut self, id: ObjectId, property: i32) {
-        let max = self.property_total(id, property).max(0.0);
+        let max = self.depletable_current_ceiling(id, property);
         if let Some(v) = self
             .world
             .get_mut(id)

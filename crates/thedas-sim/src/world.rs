@@ -571,6 +571,10 @@ pub struct World {
     #[serde(with = "pairs")]
     pub queue: BTreeMap<(u64, u64), QueuedEvent>,
     next_seq: u64,
+    /// DA2 projectiles' replaceable custom impact events, by event-queue key. Keeping
+    /// the key also preserves the original landing time when the payload changes.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    projectile_impact_events: BTreeMap<ObjectId, (u64, u64)>,
     pub module: Option<ObjectId>,
     pub area: Option<ObjectId>,
     /// DA2 encounter registrations. Area/id membership lives on each creature; this list
@@ -862,6 +866,7 @@ impl World {
             next_handle: 1,
             queue: BTreeMap::new(),
             next_seq: 0,
+            projectile_impact_events: BTreeMap::new(),
             module: None,
             area: None,
             da2_encounter_order: Vec::new(),
@@ -1011,6 +1016,9 @@ impl World {
         self.destroy_at = keep;
         for (_, id) in due {
             if Some(id) != self.hero {
+                if let Some(key) = self.projectile_impact_events.remove(&id) {
+                    self.queue.remove(&key);
+                }
                 self.objects.remove(&id);
                 self.da2_encounter_order.retain(|&c| c != id);
                 // A destroyed follower leaves the party (the list holds no dead ids).
@@ -1019,6 +1027,39 @@ impl World {
                 }
             }
         }
+    }
+
+    /// Replaces one DA2 projectile's custom impact, retaining its launch deadline.
+    /// Native SetProjectileImpactEvent (0x4dbf10) stores one event on the projectile;
+    /// it neither adds an independent hit nor restarts the projectile's flight.
+    pub(crate) fn set_projectile_impact_event(
+        &mut self,
+        projectile: ObjectId,
+        target: ObjectId,
+        event: Event,
+    ) {
+        if !self
+            .get(projectile)
+            .is_some_and(|p| p.kind == ObjectKind::Projectile)
+        {
+            return;
+        }
+        // FireProjectile records its arrival when launched, before any later request
+        // to destroy it. This also supplies a deadline for an older snapshot.
+        let Some(due) = self
+            .destroy_at
+            .iter()
+            .find_map(|&(at, id)| (id == projectile).then_some(at))
+        else {
+            return;
+        };
+        if let Some(key) = self.projectile_impact_events.remove(&projectile) {
+            self.queue.remove(&key);
+        }
+        let due = due.max(self.time_ms);
+        let key = (due, self.next_seq);
+        self.queue_event(due - self.time_ms, target, event, None);
+        self.projectile_impact_events.insert(projectile, key);
     }
 
     /// Queues an event `delay_ms` from now.
