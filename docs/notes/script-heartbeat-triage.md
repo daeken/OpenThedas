@@ -72,6 +72,46 @@ A fresh full triage after merging interface PRs #851/#859 uses exact main
 earlier counterparts exactly. The same classifications and controls apply.
 Final workspace checks pass 1,164 tests, zero failures and 16 ignored.
 
+## Final plot state at every scenario boundary
+
+The final save immediately precedes `stop()` in each scenario; comparing its
+complete `world.plots` map includes inherited flags, rather than just that
+scenario's writes. Missing flags read false. Against exact main `0b42da74`:
+
+| Step | Stored entries main/candidate | Final flag values |
+| --- | ---: | --- |
+| s01 | 41/41 | All equal |
+| s02 | 65/65 | All equal |
+| s03 | 74/74 | All equal |
+| s04 | 83/83 | All equal |
+| s05 | 108/109 | All equal; entrance-hall flag 16 is absent/explicit false |
+| s06 | 109/109 | All equal |
+| s07 | 129/129 | All equal |
+| s08 | 149/149 | All equal |
+| s09 | 158/158 | All equal |
+| s10 | 175/175 | All equal |
+| s11 | 189/189 | All equal |
+| s12 | 232/232 | All equal |
+| s13 | 263/263 | Only injury/salve tutorial flags differ, as below |
+| s14 | 300/300 | Same two inherited tutorial differences |
+| s15 | 306/306 | Same two inherited tutorial differences |
+| s16 | 332/332 | Same two inherited tutorial differences |
+
+The entrance-hall trigger (`10F6329C8E6F4072A1C94BF067D18035`, flag 16)
+toggles true then false in s05 on the candidate and s06 on main. The s13
+Alistair banter flags 0/15 toggle true/false on both sides, with one fewer
+pair on the candidate. Basic-combat tutorial flag 0 repeats seven fewer
+times, retaining the same final value.
+
+Two **persistent** tutorial differences remain from s13 through s16:
+injury (`296ED10DDE484602B19F9C6C3FC30611`, flag 0) is true/absent;
+salve (`8FEFF43CF6B846B8BD33150E0A2AB34C`, flag 0) is absent/true.
+These are not toggle/repeat-only differences. They follow the changed fights
+described above and disappear under the old-scheduler control. All remaining
+plot values agree, including every story-progress flag. Thus the review
+condition requiring final equality except toggle/repeat flags is **not yet
+met**; accepting these two tutorial exceptions requires further review.
+
 Evidence is private under `codex-mods-target/gaps/scr068-heartbeat-scheduling/`
 and `gaps/scr068-heartbeat-scheduling-after859/`; the respective exact main
 binaries are under `gaps/main-9d53c12f/bin/` and `gaps/main-0b42da74/bin/`.
