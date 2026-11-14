@@ -1094,6 +1094,15 @@ impl Ui {
                 );
                 ui.end_row();
 
+                ui.label("Renderer");
+                ui.horizontal(|ui| {
+                    ui.radio_value(&mut play.renderer, "faithful".to_string(), "Original")
+                        .on_hover_text("The game's own shaders and lighting (the reference)");
+                    ui.radio_value(&mut play.renderer, "deferred".to_string(), "Deferred")
+                        .on_hover_text("OpenThedas's own per-pixel lighting; F11 switches in game");
+                });
+                ui.end_row();
+
                 ui.label("Intro movies");
                 ui.checkbox(&mut play.intro, "Play the logos and intro before the menu");
                 ui.end_row();

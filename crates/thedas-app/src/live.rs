@@ -271,6 +271,8 @@ pub struct Live {
     owed_ms: f64,
     /// Whether frames get the level's frame buffer effects.
     pub frame_effects: bool,
+    /// How the level is drawn: the original's shaders or our deferred renderer (F11).
+    pub render_path: thedas_render::RenderPath,
     /// The graphics detail level scenes are loaded at.
     pub detail: thedas_render::scene::Detail,
     /// The conversation camera's resources and current shot.
@@ -698,6 +700,7 @@ impl Live {
             cut_held: None,
             owed_ms: 0.0,
             frame_effects: true,
+            render_path: Default::default(),
             detail: Default::default(),
             talk_camera: Default::default(),
             cutscene_camera: Default::default(),
@@ -2344,6 +2347,7 @@ impl Live {
         let Some(level) = self.level.as_mut() else {
             return false;
         };
+        level.renderer.path = self.render_path;
         // Every renderer's shadow casters go into the partitions before anything is drawn.
         level.renderer.prepare_shadows(ctx, camera, width, height);
         if let Some(o) = self.objects.as_mut() {
@@ -2468,6 +2472,7 @@ impl Live {
             return Ok(None);
         };
         level.renderer.cut_effects = cut_effects;
+        level.renderer.path = self.render_path;
         let mut overlays: Vec<&mut AreaRenderer> = self
             .rings
             .iter_mut()
