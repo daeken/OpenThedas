@@ -2042,7 +2042,12 @@ impl D3dPass {
             programs,
             shadows,
             places_partitions: scene.static_draws > 0,
-            reach: crate::shadow::partition_reach(scene.detail),
+            // A Dragon Age II level (its layout holds its own fog) reads one partition.
+            reach: if scene.layout_fog.is_some() {
+                crate::shadow::SINGLE_PARTITION_REACH
+            } else {
+                crate::shadow::partition_reach(scene.detail)
+            },
             blur_shadows: scene.detail != crate::scene::Detail::Low,
             caster_pipelines,
             caster_visible: std::sync::Mutex::new(Vec::new()),
