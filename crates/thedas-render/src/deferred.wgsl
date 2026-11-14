@@ -378,8 +378,15 @@ fn compose_eye(base: vec4<f32>, tint: vec4<f32>, normal: vec4<f32>, cornea: vec4
     return out;
 }
 
-@fragment
-fn fs_gbuffer(in: VsOut) -> GBuffer {
+struct GBufferSample {
+    data: GBuffer,
+    alpha: f32,
+    surface: Surface,
+};
+
+// Shared material work has no discard, so opaque pipelines can reject hidden fragments
+// before evaluating textures. Cutout pipelines keep their authored alpha test below.
+fn gbuffer_material(in: VsOut) -> GBufferSample {
     if (draw.material.w > 0.5) {
         var m: TerrainMaterial;
         if (draw.material.w < 1.5) {
@@ -394,7 +401,7 @@ fn fs_gbuffer(in: VsOut) -> GBuffer {
         out.normal = vec4<f32>(oct_encode(s.n), draw.room.x, 1.0);
         let ambient = select(vec3<f32>(1.0), draw.character.ambient.rgb, draw.material.w < 1.5);
         out.lightmap = vec4<f32>(in.irradiance * ambient, 1.0);
-        return baked_base(in, out, s);
+        return GBufferSample(out, 1.0, s);
     }
     if (draw.room.z > 0.5) {
         let m = terrain_material(in.uv0);
@@ -407,7 +414,7 @@ fn fs_gbuffer(in: VsOut) -> GBuffer {
         if (frame.fog.w > 0.5) {
             out.lightmap = vec4<f32>(probe_irradiance(s.n), 1.0);
         }
-        return baked_base(in, out, s);
+        return GBufferSample(out, 1.0, s);
     }
     let s = surface(in);
     var out: GBuffer;
@@ -428,8 +435,20 @@ fn fs_gbuffer(in: VsOut) -> GBuffer {
     } else if (frame.fog.w > 0.5) {
         out.lightmap = vec4<f32>(probe_irradiance(s.n), 1.0);
     }
-    if (!alpha_kept(diffuse.a)) { discard; }
-    return baked_base(in, out, s);
+    return GBufferSample(out, diffuse.a, s);
+}
+
+@fragment
+fn fs_gbuffer(in: VsOut) -> GBuffer {
+    let sampled = gbuffer_material(in);
+    if (draw.material.w <= 0.5 && draw.room.z <= 0.5 && !alpha_kept(sampled.alpha)) { discard; }
+    return baked_base(in, sampled.data, sampled.surface);
+}
+
+@fragment
+fn fs_gbuffer_opaque(in: VsOut) -> GBuffer {
+    let sampled = gbuffer_material(in);
+    return baked_base(in, sampled.data, sampled.surface);
 }
 
 // Match the translated D3D9 shader's extra clip and rounded saturated 8-bit alpha test.
@@ -547,7 +566,7 @@ struct Lighting {
     // mml_vFogParams: (colour, intensity²), (1 − cap, ...)
     fog0: vec4<f32>,
     fog1: vec4<f32>,
-    // x: lights, y: debug view, z: sun shadows, w: 0 baked, 1 probes, 2 probes + SSAO
+    // x: lights, y: debug view, z: membership masks, w: 0 baked, 1 probes, 2 probes + SSAO
     counts: vec4<u32>,
     // xy: target size
     size: vec4<f32>,
@@ -572,6 +591,11 @@ struct Light {
 @group(0) @binding(2) var<uniform> shadow_faces: array<mat4x4<f32>, 24>;
 // 16 x 9 screen tiles, two vec4s each: six ascending 32-bit light masks plus padding.
 @group(0) @binding(3) var<uniform> tile_lights: array<vec4<u32>, 288>;
+struct LightMasks {
+    rooms: array<vec4<u32>, 512>,
+    domains: array<vec4<u32>, 4>,
+};
+@group(0) @binding(4) var<uniform> light_masks: LightMasks;
 
 @group(1) @binding(0) var g_albedo: texture_2d<f32>;
 @group(1) @binding(1) var g_specular: texture_2d<f32>;
@@ -803,18 +827,26 @@ fn fs_lighting(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     let tile_x = min(u32(frag.x * 16.0 / lighting.size.x), 15u);
     let tile_y = min(u32(frag.y * 9.0 / lighting.size.y), 8u);
     let tile_base = (tile_y * 16u + tile_x) * 2u;
+    let mask_room = select(room, 0u, room > 255u || lighting.counts.y == 7u);
+    let domain_base = select(0u, 2u, character);
     for (var word = 0u; word < 6u; word = word + 1u) {
       var bits = tile_lights[tile_base + word / 4u][word % 4u];
+      if (lighting.counts.z != 0u) {
+          bits &= light_masks.rooms[mask_room * 2u + word / 4u][word % 4u]
+              & light_masks.domains[domain_base + word / 4u][word % 4u];
+      }
       while (bits != 0u) {
         let i = word * 32u + firstTrailingBit(bits);
         bits = bits & (bits - 1u);
         if (i >= lighting.counts.x) { continue; }
         let l = lights[i];
-        if ((character && l.shadow.y < 1.5) || (!character && l.shadow.y > 1.5 && l.shadow.y < 2.5)) {
-            continue;
-        }
-        if (lighting.counts.y != 7u && !reaches(l, room)) {
-            continue;
+        if (lighting.counts.z == 0u) {
+            if ((character && l.shadow.y < 1.5) || (!character && l.shadow.y > 1.5 && l.shadow.y < 2.5)) {
+                continue;
+            }
+            if (lighting.counts.y != 7u && !reaches(l, room)) {
+                continue;
+            }
         }
         let to = l.position.xyz - p;
         let d = max(length(to), 0.001);
