@@ -1098,6 +1098,7 @@ impl Sim {
                 if at <= until && first.is_none_or(|f| at <= f) {
                     self.world.time_ms = self.world.time_ms.max(at);
                     self.advance_movers();
+                    self.advance_da2_projectiles();
                     continue;
                 }
             }
@@ -1108,6 +1109,7 @@ impl Sim {
                 if w <= until && first.is_none_or(|f| w < f) {
                     self.world.time_ms = w;
                     self.advance_movers();
+                    self.advance_da2_projectiles();
                     self.close_approaches();
                     continue;
                 }
@@ -1123,6 +1125,7 @@ impl Sim {
                             continue;
                         }
                         self.advance_movers();
+                        self.advance_da2_projectiles();
                         let (target, ty) = (q.target, q.event.ty);
                         self.deliver(q.target, q.event, q.script);
                         self.next_heartbeat(target, ty);
@@ -1131,6 +1134,7 @@ impl Sim {
                 (_, Some((due, id))) if due <= until => {
                     self.world.time_ms = self.world.time_ms.max(due);
                     self.advance_movers();
+                    self.advance_da2_projectiles();
                     let da2 = self.game == thedas_vfs::Game::DragonAge2;
                     let cancellable = self
                         .world
@@ -1192,7 +1196,18 @@ impl Sim {
                         (None, None) => self.finish_command(id),
                     }
                 }
-                _ => break,
+                _ => {
+                    if self.world.da2_projectiles.is_empty() {
+                        break;
+                    }
+                    self.world.time_ms = until;
+                    self.advance_movers();
+                    self.advance_da2_projectiles();
+                    if self.world.queue.keys().next().is_some_and(|k| k.0 <= until) {
+                        continue;
+                    }
+                    break;
+                }
             }
         }
         // The add-ins' scripts for an area list just loaded run after the update's events.
@@ -1200,6 +1215,7 @@ impl Sim {
         let elapsed = until.saturating_sub(start);
         self.world.time_ms = until;
         self.advance_movers();
+        self.advance_da2_projectiles();
         self.regenerate(elapsed);
         self.decay_corpses(elapsed);
         self.update_threat(elapsed);
