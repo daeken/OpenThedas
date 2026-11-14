@@ -89,6 +89,7 @@ pub(crate) struct ShadowPool {
     buffer: wgpu::Buffer,
     /// Slots of [`STRIDE`] the buffer holds.
     capacity: usize,
+    culling: Option<bool>,
     /// Per layer (slot · 6 + face), the colour and depth views drawn into.
     layers: Vec<(wgpu::TextureView, wgpu::TextureView)>,
     /// Every layer, for the lighting pass.
@@ -230,6 +231,7 @@ impl ShadowPool {
             layout,
             buffer,
             capacity: 1,
+            culling: None,
             layers,
             view,
         }
@@ -242,6 +244,10 @@ impl ShadowPool {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         })
+    }
+
+    pub(crate) fn set_culling(&mut self, culling: Option<bool>) {
+        self.culling = culling;
     }
 
     fn group(&self, device: &wgpu::Device, bones: &wgpu::Buffer) -> wgpu::BindGroup {
@@ -282,7 +288,9 @@ impl ShadowPool {
         // Per layer, its draws: (caster, slot in the buffer).
         let mut data: Vec<u8> = Vec::new();
         let mut layers: Vec<Vec<(usize, u32)>> = Vec::new();
-        let cull = std::env::var("THEDAS_DEFERRED_SHADOW_CULL").as_deref() != Ok("0");
+        let cull = self
+            .culling
+            .unwrap_or_else(|| std::env::var("THEDAS_DEFERRED_SHADOW_CULL").as_deref() != Ok("0"));
         let mut before = 0;
         for &(position, radius) in lights.iter().take(SLOTS) {
             let near: Vec<usize> = casters

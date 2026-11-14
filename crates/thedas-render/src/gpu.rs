@@ -1188,6 +1188,14 @@ impl AreaRenderer {
         }
     }
 
+    /// Diagnostic override `[tiled lights, cube-face culling]` for paired frame-cost
+    /// comparisons. `None` restores the environment switches; the faithful path ignores it.
+    pub fn set_deferred_culling(&mut self, culling: Option<[bool; 2]>) {
+        if let Some(d) = self.deferred.as_mut() {
+            d.set_culling(culling);
+        }
+    }
+
     /// Whether this renderer can draw deferred: it has draws the deferred
     /// pass takes, and the GPU has not refused that pass.
     pub fn can_defer(&self) -> bool {

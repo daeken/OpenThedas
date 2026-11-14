@@ -227,6 +227,20 @@ ambient discontinuities. The original baked image remains the default while thos
 addressed. Moving the remaining material families into the G-buffer is still
 the next coverage step.
 
+## Measuring frame cost
+
+For fixed-scene frame-cost comparisons, `THEDAS_BENCH_FRAMES=120 THEDAS_BENCH_DUMP=1`
+reports the headless capture loop's CPU/submission/GPU-wait/readback cost, excluding
+scene load and PNG encoding. `THEDAS_BENCH_DEFERRED_COMPARE=all` alternates full-candidate
+and optimized frames in ABBA order within one loaded scene. `tiles` or `shadows` isolates
+one optimization; `faithful` alternates the faithful path with optimized deferred.
+Start with `--renderer deferred` so planning is already complete, keep `--time`, camera,
+resolution and AA fixed, and discard the first twenty frames before comparing adjacent
+pairs. `bench comparison modes` labels control frames 0 and test frames 1. Overrides
+are per renderer, without mutating environment variables while other threads run, and
+are cleared after the benchmark. These measurements are not isolated GPU timings or
+whole-gameplay FPS; shared-machine load can still affect absolute values.
+
 ## Order of work
 
 1. Switch plus G-buffer and lighting for static level geometry (this document's first PR).

@@ -197,6 +197,8 @@ pub(crate) struct DeferredPass {
     /// Experimental probe + runtime visibility mode. Fixed when this renderer is built.
     baked_lighting: bool,
     ssao: bool,
+    /// Diagnostic override: tiled lighting and cube-face culling, respectively.
+    culling: Option<[bool; 2]>,
 }
 
 pub(crate) struct Contributor<'a> {
@@ -671,6 +673,7 @@ impl DeferredPass {
             refused: false,
             baked_lighting: std::env::var("THEDAS_DEFERRED_BAKED_LIGHTING").as_deref() != Ok("0"),
             ssao: std::env::var("THEDAS_DEFERRED_SSAO").as_deref() != Ok("0"),
+            culling: None,
         })
     }
 
@@ -708,6 +711,10 @@ impl DeferredPass {
     /// Sets the lights its own renderer's glowing emitters give this frame.
     pub(crate) fn set_own_lights(&mut self, lights: Vec<SceneLight>) {
         self.own_lights = lights;
+    }
+
+    pub(crate) fn set_culling(&mut self, culling: Option<[bool; 2]>) {
+        self.culling = culling;
     }
 
     /// Whether the GPU refused the pass.
@@ -1545,7 +1552,9 @@ impl DeferredPass {
             (width, height),
             gpu.lights.iter().map(|l| l.position),
             if debug_view() == 9 { 2.0 } else { 1.0 },
-            std::env::var("THEDAS_DEFERRED_TILED_LIGHTS").as_deref() != Ok("0"),
+            self.culling.map(|c| c[0]).unwrap_or_else(|| {
+                std::env::var("THEDAS_DEFERRED_TILED_LIGHTS").as_deref() != Ok("0")
+            }),
         );
         if gpu.tiles.as_slice() != tiles {
             ctx.queue
@@ -1628,10 +1637,9 @@ impl DeferredPass {
                     casters.extend(casters_for_contributor(c, g));
                 }
             }
-            gpu.shadows
-                .as_mut()
-                .expect("point shadows")
-                .encode(device, &ctx.queue, encoder, &shadowed, &casters);
+            let pool = gpu.shadows.as_mut().expect("point shadows");
+            pool.set_culling(self.culling.map(|c| c[1]));
+            pool.encode(device, &ctx.queue, encoder, &shadowed, &casters);
         }
 
         let Some(targets) = gpu.targets.as_ref() else {
