@@ -494,9 +494,14 @@ impl Sim {
     /// The current value stays within 0 and the property's maximum.
     /// A creature's current mana or stamina (`PROPERTY_DEPLETABLE_MANA_STAMINA`).
     pub(crate) fn mana_now(&self, id: ObjectId) -> f32 {
+        let mana = if self.game == thedas_vfs::Game::DragonAge2 {
+            10
+        } else {
+            8
+        };
         self.world
             .get(id)
-            .and_then(|o| o.properties.get(&8))
+            .and_then(|o| o.properties.get(&mana))
             .map_or(0.0, |v| v.1)
     }
 
@@ -520,6 +525,10 @@ impl Sim {
 
     pub fn regenerate(&mut self, ms: u64) {
         if ms == 0 {
+            return;
+        }
+        if self.game == thedas_vfs::Game::DragonAge2 {
+            self.regenerate_da2(ms);
             return;
         }
         let (health, mana) = (
@@ -596,6 +605,75 @@ impl Sim {
                         self.note_mana_change(id, before);
                     }
                 }
+            }
+        }
+    }
+
+    /// DA2's stats update (0x56d7a0) consumes strict >2000 ms passes in either state.
+    /// The depletable update (0x5bd8a0 -> 0x5aa7f0) adds 40% of nominal maximum
+    /// outside combat; in combat it adds 2% times the regeneration property's total.
+    /// Loader 0x5d7e2c wires health to rate 9 and stamina to rate 12. The native
+    /// per-property regeneration-disable flag is not yet represented in the simulation.
+    fn regenerate_da2(&mut self, ms: u64) {
+        let living: Vec<_> = self
+            .world
+            .objects
+            .values()
+            .filter(|o| o.kind == ObjectKind::Creature && !o.dead)
+            .map(|o| o.id)
+            .collect();
+        for id in living {
+            let o = self.world.get_mut(id).unwrap();
+            let combat = o.combat.in_combat;
+            o.combat.regen_ms += ms;
+            let mut passes = 0;
+            while o.combat.regen_ms > 2000 {
+                o.combat.regen_ms -= 2000;
+                passes += 1;
+            }
+            let mana_before = self.mana_now(id);
+            let health_before = self
+                .world
+                .get(id)
+                .and_then(|o| o.properties.get(&7))
+                .map_or(0.0, |v| v.1);
+            for _ in 0..passes {
+                if self
+                    .world
+                    .get(id)
+                    .and_then(|o| o.properties.get(&7))
+                    .is_none_or(|v| v.1 <= 0.0)
+                {
+                    break;
+                }
+                for (property, rate) in [(7, 9), (10, 12)] {
+                    let fraction = if combat {
+                        self.property_total(id, rate) * 0.02
+                    } else {
+                        0.4
+                    };
+                    let amount = self.property_total(id, property) * fraction;
+                    let max = self.depletable_current_ceiling(id, property);
+                    if let Some(v) = self
+                        .world
+                        .get_mut(id)
+                        .and_then(|o| o.properties.get_mut(&property))
+                    {
+                        v.1 = (v.1 + amount).clamp(0.0, max);
+                    }
+                }
+            }
+            self.note_mana_change(id, mana_before);
+            if health_before > 0.0
+                && self
+                    .world
+                    .get(id)
+                    .and_then(|o| o.properties.get(&7))
+                    .is_some_and(|v| v.1 <= 0.0)
+                && !self.world.get(id).unwrap().immortal
+                && !self.world.get(id).unwrap().plot
+            {
+                self.kill(id, OBJECT_INVALID);
             }
         }
     }
@@ -2438,6 +2516,75 @@ mod tests {
         o.position = [3.0, 4.0, 0.0];
         s.da2_ability_event(&mut start, "ABILITY_CAST_START", who, &cmd);
         assert_eq!(start.vectors, [[1.0, 0.0, 0.0]]);
+    }
+
+    #[test]
+    fn da2_recovery_uses_two_second_percentage_passes_and_reserved_caps() {
+        let mut s = sim();
+        s.game = thedas_vfs::Game::DragonAge2;
+        let id = s.world.spawn(ObjectKind::Creature, "party_member");
+        s.world.get_mut(id).unwrap().properties.extend([
+            (7, (100.0, 10.0)),
+            (8, (25.0, 0.0)),
+            (9, (2.0, 0.0)),
+            (10, (200.0, 20.0)),
+            (11, (30.0, 0.0)),
+            (12, (5.0, 0.0)),
+        ]);
+        s.regenerate(2000);
+        assert_eq!(
+            s.world.get(id).unwrap().properties[&7].1,
+            10.0,
+            "strict >2000 threshold"
+        );
+        s.regenerate(1);
+        assert_eq!(s.world.get(id).unwrap().properties[&7].1, 50.0);
+        assert_eq!(s.world.get(id).unwrap().properties[&10].1, 100.0);
+        s.regenerate(2000);
+        assert_eq!(s.world.get(id).unwrap().properties[&7].1, 75.0);
+        assert!((s.world.get(id).unwrap().properties[&10].1 - 140.0).abs() < 0.0001);
+        assert_eq!(
+            s.property_total(id, 7),
+            100.0,
+            "nominal maximum is unchanged"
+        );
+        let o = s.world.get_mut(id).unwrap();
+        o.combat.in_combat = true;
+        o.properties.get_mut(&7).unwrap().1 = 10.0;
+        o.properties.get_mut(&10).unwrap().1 = 20.0;
+        s.regenerate(2000);
+        assert_eq!(s.world.get(id).unwrap().properties[&7].1, 14.0);
+        assert_eq!(s.world.get(id).unwrap().properties[&10].1, 40.0);
+    }
+
+    #[test]
+    fn da2_recovery_keeps_its_clock_across_reload_and_does_not_resurrect() {
+        let mut s = sim();
+        s.game = thedas_vfs::Game::DragonAge2;
+        let id = s.world.spawn(ObjectKind::Creature, "party_member");
+        s.world
+            .get_mut(id)
+            .unwrap()
+            .properties
+            .insert(7, (100.0, 1.0));
+        s.regenerate(1500);
+        let tables = s.world.tables.clone();
+        s.world = serde_json::from_slice(&serde_json::to_vec(&s.world).unwrap()).unwrap();
+        s.world.tables = tables;
+        s.regenerate(501);
+        assert_eq!(s.world.get(id).unwrap().properties[&7].1, 41.0);
+        let o = s.world.get_mut(id).unwrap();
+        o.properties.get_mut(&7).unwrap().1 = 0.0;
+        s.regenerate(10_000);
+        assert_eq!(s.world.get(id).unwrap().properties[&7].1, 0.0);
+        assert!(
+            !s.world.get(id).unwrap().dead,
+            "zero health alone did not cross the death boundary"
+        );
+        s.world.get_mut(id).unwrap().dead = true;
+        s.regenerate(10_000);
+        assert!(s.world.get(id).unwrap().dead);
+        assert_eq!(s.world.get(id).unwrap().properties[&7].1, 0.0);
     }
 
     #[test]
