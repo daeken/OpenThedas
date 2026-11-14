@@ -3889,6 +3889,12 @@ impl App {
                 self.cursor_to(x, y);
                 log.push(format!("hover {x},{y}"));
             }
+            &Step::Shift(down) => {
+                if let Some(g) = self.gfx.as_mut() {
+                    g.ui.stage.set_shift(down);
+                }
+                log.push(format!("shift {}", if down { "down" } else { "up" }));
+            }
             Step::Picker => {
                 if let Some(l) = self.live.as_ref() {
                     l.sim().input(
@@ -5016,6 +5022,11 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::CursorMoved { position, .. } => self.cursor_to(position.x, position.y),
+            WindowEvent::ModifiersChanged(modifiers) => {
+                if let Some(g) = self.gfx.as_mut() {
+                    g.ui.stage.set_shift(modifiers.state().shift_key());
+                }
+            }
             WindowEvent::CursorLeft { .. } => {
                 if let Some(g) = self.gfx.as_mut() {
                     g.ui.mouse_leave();
@@ -5041,6 +5052,9 @@ impl ApplicationHandler for App {
             WindowEvent::Focused(false) => {
                 self.keys.clear();
                 self.looking = false;
+                if let Some(g) = self.gfx.as_mut() {
+                    g.ui.stage.set_shift(false);
+                }
             }
             WindowEvent::RedrawRequested => {
                 if let Err(e) = self.redraw() {
@@ -5842,6 +5856,8 @@ enum Step {
     ClickAs(f64, f64, f64),
     /// The mouse rests at a pixel (where an aimed ability's reticle shows).
     Hover(f64, f64),
+    /// Hold or release Shift for pointer input (`shift down`, `shift up`).
+    Shift(bool),
     /// F1-F4: party member n leads.
     Leader(usize),
     /// 1-9, 0: the quickbar's slot n is used.
@@ -6422,6 +6438,11 @@ fn parse_step(s: &str) -> Result<Step> {
             let (x, y) = arg.split_once(',').context("hover takes x,y")?;
             Step::Hover(x.trim().parse()?, y.trim().parse()?)
         }
+        "shift" => Step::Shift(match arg {
+            "down" => true,
+            "up" => false,
+            _ => bail!("shift takes down or up"),
+        }),
         "rpress" | "rrelease" => {
             let (x, y) = arg.split_once(',').context("rpress takes x,y")?;
             Step::RightAt(x.trim().parse()?, y.trim().parse()?, verb == "rpress")
@@ -6693,6 +6714,12 @@ fn main() -> Result<()> {
                         if let Some((layer, _)) = played.as_mut() {
                             layer.mouse_move(x, y);
                         }
+                    }
+                    &Step::Shift(down) => {
+                        if let Some((layer, _)) = played.as_mut() {
+                            layer.stage.set_shift(down);
+                        }
+                        println!("shift {}", if down { "down" } else { "up" });
                     }
                     &Step::Press(x, y) | &Step::Release(x, y) => {
                         let down = matches!(step, Step::Press(..));
@@ -7720,9 +7747,15 @@ mod tests {
         );
         assert!(parse_steps("zoom far").is_err());
         assert_eq!(
-            parse_steps("press 1,2; release 3,4").unwrap(),
-            vec![Step::Press(1.0, 2.0), Step::Release(3.0, 4.0)]
+            parse_steps("shift down; press 1,2; release 3,4; shift up").unwrap(),
+            vec![
+                Step::Shift(true),
+                Step::Press(1.0, 2.0),
+                Step::Release(3.0, 4.0),
+                Step::Shift(false)
+            ]
         );
+        assert!(parse_steps("shift maybe").is_err());
         assert_eq!(
             parse_steps("pad a; pad press RT; pad release rt; pad stick-left 0,1.5 500").unwrap(),
             vec![
