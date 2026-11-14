@@ -148,6 +148,8 @@ pub struct Vfs {
     overlay: Option<Box<Vfs>>,
     /// The game plays from this stack: the workspace, when mounted, beats its layers.
     plays: bool,
+    /// The UIDs of the add-ins mounted in this stack (see [`Vfs::addin_enabled`]).
+    addins: Vec<String>,
 }
 
 /// Whether a workspace is mounted: the fast path every read checks first. Set after the
@@ -521,6 +523,19 @@ impl Vfs {
     /// Marks this stack as one the game plays from, so a mounted workspace beats its layers.
     pub fn play_from(&mut self) {
         self.plays = true;
+    }
+
+    /// Records the UIDs of the add-ins this stack mounts.
+    pub fn set_addins(&mut self, uids: Vec<String>) {
+        self.addins = uids;
+    }
+
+    /// Whether the add-in `uid` is mounted in this stack (ASCII case ignored): what the
+    /// script function `GetPRCEnabled` answers.
+    pub fn addin_enabled(&self, uid: &str) -> bool {
+        self.addins
+            .iter()
+            .any(|a| a.eq_ignore_ascii_case(uid.trim()))
     }
 
     /// Whether the game plays from this stack (see [`Vfs::play_from`]).
