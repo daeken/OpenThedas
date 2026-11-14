@@ -91,6 +91,8 @@ The player lives in `crates/thedas-gfx`:
    Programmatic `Selection.setFocus` selects all existing text, including refocusing the
    same field, so typing replaces a prefilled save name. Invalid targets preserve focus;
    null/undefined clear it. Mouse focus still places the caret from the pointer.
+   The app retains modifier presses while a field is focused and forwards Shift with
+   Left/Right/Home/End, so keyboard selection and Ctrl/Cmd+A also work after gaining focus.
    Layout retains character advances, including spaces, for selection highlighting and the
    insertion caret. Focused ranges draw white text over black highlights; an input caret
    blinks at 500 ms intervals, resets on edits/navigation, and disappears on focus loss.

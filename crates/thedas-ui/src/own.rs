@@ -330,25 +330,7 @@ impl OwnMovie {
     }
 
     pub fn key(&mut self, key: UiKey) {
-        if key == UiKey::SelectAll {
-            self.player.select_all();
-            return;
-        }
-        let (code, ch) = match key {
-            UiKey::Char(c) => (c.to_ascii_uppercase() as u32, Some(c)),
-            UiKey::Backspace => (8, None),
-            UiKey::Delete => (46, None),
-            UiKey::Enter => (13, None),
-            UiKey::Escape => (27, None),
-            UiKey::Tab => (9, None),
-            UiKey::Left => (37, None),
-            UiKey::Right => (39, None),
-            UiKey::Home => (36, None),
-            UiKey::End => (35, None),
-            UiKey::SelectAll => (65, None),
-        };
-        self.player.key_down(code, ch);
-        self.player.key_up(code);
+        press_key(&mut self.player, key);
     }
 
     pub fn invoke(&mut self, name: &str, args: &[UiValue]) -> UiValue {
@@ -367,5 +349,108 @@ impl OwnMovie {
     /// Draw calls in the last render (for profiling).
     pub fn draws(&self) -> usize {
         self.renderer.draws
+    }
+}
+
+/// Forwards a host text edit to the player, including the lifetime of Shift for
+/// selection edits. Kept independent of the renderer so input can be checked headlessly.
+fn press_key(player: &mut Player, key: UiKey) {
+    if key == UiKey::SelectAll {
+        player.select_all();
+        return;
+    }
+    let shift = matches!(
+        key,
+        UiKey::SelectLeft | UiKey::SelectRight | UiKey::SelectHome | UiKey::SelectEnd
+    );
+    let (code, ch) = match key {
+        UiKey::Char(c) => (c.to_ascii_uppercase() as u32, Some(c)),
+        UiKey::Backspace => (8, None),
+        UiKey::Delete => (46, None),
+        UiKey::Enter => (13, None),
+        UiKey::Escape => (27, None),
+        UiKey::Tab => (9, None),
+        UiKey::Left | UiKey::SelectLeft => (37, None),
+        UiKey::Right | UiKey::SelectRight => (39, None),
+        UiKey::Home | UiKey::SelectHome => (36, None),
+        UiKey::End | UiKey::SelectEnd => (35, None),
+        UiKey::SelectAll => (65, None),
+    };
+    if shift {
+        player.key_down(16, None);
+    }
+    player.key_down(code, ch);
+    player.key_up(code);
+    if shift {
+        player.key_up(16);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use thedas_gfx::avm1::value::Value;
+    use thedas_gfx::display::{Kind, Object};
+
+    struct Empty;
+    impl Host for Empty {
+        fn fscommand(&mut self, _: &str, _: &str) {}
+        fn external_call(&mut self, _: &str, _: &[HostValue]) -> HostValue {
+            HostValue::Undefined
+        }
+    }
+    impl thedas_gfx::text::Fonts for Empty {
+        fn font(&self, _: &str, _: bool, _: bool) -> Option<Arc<Font>> {
+            None
+        }
+    }
+
+    #[test]
+    fn host_shift_edits_extend_replace_and_release_the_modifier() {
+        let movie = b"FWS\x08\x12\0\0\0\x08\0\0\x1e\x01\0\x40\0\0\0";
+        let mut player =
+            Player::new(movie, "input", Box::new(Empty), Arc::new(Empty), None).unwrap();
+        let text = thedas_gfx::text::TextField::new(Arc::new(Default::default()), None);
+        let mut object = Object::new(Kind::Text(Box::new(text)));
+        object.parent = Some(player.vm.root);
+        let field = player.vm.display.add(object);
+        player
+            .vm
+            .display
+            .get_mut(player.vm.root)
+            .unwrap()
+            .children
+            .insert(1, field);
+        let value = player.vm.display_object(field);
+        player.vm.set(&value, "text", Value::from("Rowan"));
+        let selection = Value::Object(player.vm.selection);
+        player
+            .vm
+            .call_method(&selection, "setFocus", std::slice::from_ref(&value));
+
+        let range = |p: &Player| p.vm.display.get(field).unwrap().text().unwrap().selection();
+        press_key(&mut player, UiKey::End);
+        press_key(&mut player, UiKey::Left.with_shift());
+        press_key(&mut player, UiKey::Left.with_shift());
+        assert_eq!(range(&player), (3, 5));
+        press_key(&mut player, UiKey::Right.with_shift());
+        assert_eq!(range(&player), (4, 5));
+        press_key(&mut player, UiKey::Char('X'));
+        assert_eq!(player.vm.get(&value, "text"), Value::from("RowaX"));
+        assert_eq!(range(&player), (5, 5));
+        assert!(player.vm.keys_down.is_empty());
+
+        press_key(&mut player, UiKey::Home);
+        press_key(&mut player, UiKey::End.with_shift());
+        assert_eq!(range(&player), (0, 5));
+        // An ordinary arrow collapses the selection after the Shift edit.
+        press_key(&mut player, UiKey::Left);
+        assert_eq!(range(&player), (0, 0));
+        press_key(&mut player, UiKey::End);
+        press_key(&mut player, UiKey::Home.with_shift());
+        assert_eq!(range(&player), (0, 5));
+        press_key(&mut player, UiKey::Backspace);
+        assert_eq!(player.vm.get(&value, "text"), Value::from(""));
+        assert!(player.vm.keys_down.is_empty());
     }
 }
