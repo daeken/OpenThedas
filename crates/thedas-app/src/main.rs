@@ -962,6 +962,10 @@ fn play_interface(
                 log::info!("aiming ability {} (click a target)", aim.ability);
                 live.aiming = Some(aim);
             }
+            let field = screens.shown().iter().all(|s| *s == screens::Screen::Hud);
+            if let Some(ability) = live.drop_stale_aim(field) {
+                log::info!("ability {ability} not aimed (nothing can aim it now)");
+            }
             // A script's DoAutoSave, made between frames as every save is.
             let autosave = live.sim().take_autosave_request();
             if autosave {
@@ -6635,6 +6639,10 @@ fn main() -> Result<()> {
                                 if let Some(aim) = layer.play(s, &l.sim, dt).pop() {
                                     println!("aiming ability {}", aim.ability);
                                     l.aiming = Some(aim);
+                                }
+                                let field = s.shown().iter().all(|x| *x == screens::Screen::Hud);
+                                if let Some(ability) = l.drop_stale_aim(field) {
+                                    println!("ability {ability} not aimed");
                                 }
                                 // No picture is taken for a save made headless.
                                 layer.take_saved_slots();
