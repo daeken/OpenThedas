@@ -14,7 +14,8 @@
 //!   error naming what the page has instead.
 //! - `type <name>=<text>` (`{"cmd":"type","name":...,"text":...}`): focuses the text field
 //!   with that name (its label or its hint) and types the text. No name: the focused field.
-//! - `key <name>`: presses a key (`Enter`, `Tab`, `Escape`, ...).
+//! - `key <name>`: presses a key (`Enter`, `Tab`, `Escape`, ...), with modifiers if given
+//!   (`Shift+Tab`, `Ctrl+A`).
 //! - `choose <path>`: the next file or folder dialog answers `path` instead of opening (native
 //!   dialogs can't be driven), e.g. `choose C:\Games\DAO; click Pick a folder…`.
 //! - `wait [seconds]`: until no search or download is running (default 300 s).
@@ -23,7 +24,20 @@
 //! - `status`: the page, the footer's message, the installs, whether a search or download runs.
 //! - `screenshot` (`shot <file.png>` as a step): the window as drawn, a PNG (base64 under
 //!   `"png"` in a reply).
+//! - `expect <what>`: fails the step unless the page is as said (it retries for a few seconds,
+//!   so a search or a page change that is still settling is waited for): `page <Name>`,
+//!   `heading <text>`, `text <text>` / `no text <text>` (any control or label whose name
+//!   contains it), `focus <text>` (the focused control's name), `enabled <name>` /
+//!   `disabled <name>`, `installs <n>`, `message <text>` (the footer), `launch <text>` (what
+//!   Play would run) / `no launch`. Matching ignores case.
+//! - `mkinstall <folder> [da2]`: makes a stand-in game install (just the folders the launcher
+//!   recognises one by, no game data) for a script to find or pick.
 //! - `quit`: closes the launcher.
+//!
+//! In steps (and script files), `${NAME}` is replaced by that environment variable, so a
+//! script can name its scratch folder. A script file (`--launcher-script`) is the same steps,
+//! one or more per line, with `#` comment lines. With `THEDAS_LAUNCHER_DRY_RUN` set, Play
+//! reports the command it would run (`launch` in `status`) and the launcher stays open.
 //!
 //! Clicking "Play" hands off to the game as a player's click does (a new process), and the
 //! reply carries the command line it ran.
@@ -51,6 +65,8 @@ pub enum Cmd {
     Tree,
     Status,
     Screenshot(Option<PathBuf>),
+    Expect(String),
+    MkInstall { path: PathBuf, da2: bool },
     Quit,
 }
 
@@ -70,11 +86,45 @@ impl Cmd {
 
 /// Parses `--launcher-steps`: commands separated by `;`.
 pub fn parse_steps(s: &str) -> Result<Vec<Cmd>> {
-    s.split(';')
+    expand_env(s)?
+        .split(';')
         .map(str::trim)
         .filter(|t| !t.is_empty())
         .map(parse_step)
         .collect()
+}
+
+/// Parses a script file: steps like `--launcher-steps`, one or more to a line, `#` lines
+/// ignored.
+pub fn parse_script(text: &str) -> Result<Vec<Cmd>> {
+    let steps: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .collect();
+    parse_steps(&steps.join(";"))
+}
+
+/// Replaces each `${NAME}` with the environment variable (an unset one is an error).
+fn expand_env(s: &str) -> Result<String> {
+    let mut out = String::new();
+    let mut rest = s;
+    while let Some(i) = rest.find("${") {
+        out.push_str(&rest[..i]);
+        let after = &rest[i + 2..];
+        let Some(end) = after.find('}') else {
+            out.push_str(&rest[i..]);
+            return Ok(out);
+        };
+        let name = &after[..end];
+        match std::env::var(name) {
+            Ok(v) => out.push_str(&v),
+            Err(_) => bail!("${{{name}}} is not set"),
+        }
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    Ok(out)
 }
 
 fn parse_step(t: &str) -> Result<Cmd> {
@@ -109,6 +159,20 @@ fn parse_step(t: &str) -> Result<Cmd> {
         "tree" => Cmd::Tree,
         "status" => Cmd::Status,
         "shot" | "screenshot" => Cmd::Screenshot((!rest.is_empty()).then(|| PathBuf::from(rest))),
+        "expect" => Cmd::Expect(need("what to expect")?),
+        "mkinstall" => {
+            let (path, da2) = match rest.rsplit_once(char::is_whitespace) {
+                Some((p, "da2")) => (p.trim(), true),
+                _ => (rest, false),
+            };
+            if path.is_empty() {
+                bail!("step {t:?} needs a folder");
+            }
+            Cmd::MkInstall {
+                path: PathBuf::from(path),
+                da2,
+            }
+        }
         "quit" => Cmd::Quit,
         _ => bail!("unknown launcher step {t:?}"),
     })
@@ -146,6 +210,11 @@ pub fn parse_request(body: &J) -> Result<Cmd> {
         "tree" => Cmd::Tree,
         "status" => Cmd::Status,
         "screenshot" => Cmd::Screenshot(None),
+        "expect" => Cmd::Expect(s("what").unwrap_or_default()),
+        "mkinstall" => Cmd::MkInstall {
+            path: PathBuf::from(s("path").unwrap_or_default()),
+            da2: s("game").is_some_and(|g| g == "da2"),
+        },
         "quit" => Cmd::Quit,
         other => bail!("unknown launcher command {other:?}"),
     })
@@ -408,7 +477,12 @@ impl Script {
             };
             let reads_page = matches!(
                 p.cmd,
-                Cmd::Click(_) | Cmd::Type { .. } | Cmd::Tree | Cmd::Status | Cmd::Screenshot(_)
+                Cmd::Click(_)
+                    | Cmd::Type { .. }
+                    | Cmd::Tree
+                    | Cmd::Status
+                    | Cmd::Screenshot(_)
+                    | Cmd::Expect(_)
             );
             if reads_page && self.frames < 2 {
                 return Need::Nothing;
@@ -450,20 +524,20 @@ impl Script {
                         json!({ "typed": text.chars().count() })
                     })
                 }),
-                Cmd::Key(k) => Some(match egui::Key::from_name(k) {
-                    Some(key) => {
+                Cmd::Key(k) => Some(match parse_key(k) {
+                    Ok((key, modifiers)) => {
                         for pressed in [true, false] {
                             events.push(egui::Event::Key {
                                 key,
                                 physical_key: None,
                                 pressed,
                                 repeat: false,
-                                modifiers: Default::default(),
+                                modifiers,
                             });
                         }
-                        Ok(json!({ "key": key.name() }))
+                        Ok(json!({ "key": k }))
                     }
-                    None => Err(format!("no key named {k:?}")),
+                    Err(e) => Err(e),
                 }),
                 Cmd::Choose(path) => {
                     host.choose(path.clone());
@@ -482,8 +556,32 @@ impl Script {
                 }
                 Cmd::Run(d) => (since.elapsed() >= *d).then(|| Ok(json!({}))),
                 Cmd::Tree => Some(Ok(json!({ "widgets": widgets_json(&widgets) }))),
-                Cmd::Status => Some(Ok(host.status())),
+                Cmd::Status => Some(Ok({
+                    let mut v = host.status();
+                    // The control with keyboard focus, as a screen reader would announce it.
+                    let focused = self
+                        .tree
+                        .focus
+                        .and_then(|f| widgets.iter().find(|w| w.id == f))
+                        .map(|w| json!({ "role": format!("{:?}", w.role), "name": w.name }));
+                    v["focused"] = focused.unwrap_or(J::Null);
+                    v
+                })),
                 Cmd::Screenshot(_) => return Need::Screenshot,
+                Cmd::Expect(what) => {
+                    let status = host.status();
+                    match expect(what, &widgets, self.tree.focus, &status) {
+                        Ok(()) => Some(Ok(json!({}))),
+                        // A page still settling gets a few seconds.
+                        Err(e) if since.elapsed() > Duration::from_secs(4) => Some(Err(e)),
+                        Err(_) => None,
+                    }
+                }
+                Cmd::MkInstall { path, da2 } => Some(
+                    make_install(path, *da2)
+                        .map(|_| json!({ "made": path }))
+                        .map_err(|e| format!("could not make {}: {e}", path.display())),
+                ),
                 Cmd::Quit => {
                     let p = self.queue.pop_front();
                     if let Some(p) = p {
@@ -573,6 +671,169 @@ impl Script {
     }
 }
 
+/// A key step: a key name, with modifiers before it joined by `+` (`Shift+Tab`, `Ctrl+A`).
+fn parse_key(k: &str) -> std::result::Result<(egui::Key, egui::Modifiers), String> {
+    let mut parts: Vec<&str> = k.split('+').map(str::trim).collect();
+    let name = parts.pop().unwrap_or_default();
+    let mut m = egui::Modifiers::default();
+    for p in parts {
+        match p.to_lowercase().as_str() {
+            "shift" => m.shift = true,
+            "ctrl" | "control" => m.ctrl = true,
+            "alt" | "option" => m.alt = true,
+            "cmd" | "command" => m.mac_cmd = true,
+            _ => return Err(format!("no modifier named {p:?}")),
+        }
+    }
+    egui::Key::from_name(name)
+        .map(|key| (key, m))
+        .ok_or_else(|| format!("no key named {name:?}"))
+}
+
+/// A stand-in install: the folders the launcher recognises a game by, with no game data.
+fn make_install(root: &std::path::Path, da2: bool) -> std::io::Result<()> {
+    std::fs::create_dir_all(root.join("packages/core/data"))?;
+    std::fs::create_dir_all(root.join("packages/core/audio/vo/en-us"))?;
+    std::fs::create_dir_all(root.join("bin_ship"))?;
+    if da2 {
+        std::fs::create_dir_all(root.join("modules/campaign_base"))?;
+    }
+    Ok(())
+}
+
+/// Checks one `expect` against the page (see the module docs). The error says what the page
+/// has instead.
+fn expect(
+    what: &str,
+    widgets: &[Widget],
+    focus: Option<NodeId>,
+    status: &J,
+) -> std::result::Result<(), String> {
+    let what = what.trim();
+    let (kind, value) = what.split_once(char::is_whitespace).unwrap_or((what, ""));
+    let value = value.trim();
+    let lower = value.to_lowercase();
+    let has = |role: Option<Role>| {
+        widgets
+            .iter()
+            .any(|w| role.is_none_or(|r| w.role == r) && w.name.to_lowercase().contains(&lower))
+    };
+    let names = |role: Option<Role>| -> String {
+        widgets
+            .iter()
+            .filter(|w| role.is_none_or(|r| w.role == r) && !w.name.is_empty())
+            .map(|w| format!("{:?}", w.name))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let status_str = |k: &str| {
+        status
+            .get(k)
+            .and_then(J::as_str)
+            .unwrap_or("")
+            .to_lowercase()
+    };
+    let fail = |m: String| Err(format!("expected {what}: {m}"));
+    match kind {
+        "page" => {
+            let page = status_str("page");
+            if page == lower {
+                Ok(())
+            } else {
+                fail(format!("the page is {page:?}"))
+            }
+        }
+        "heading" => {
+            if has(Some(Role::Heading)) {
+                Ok(())
+            } else {
+                fail(format!("headings are {}", names(Some(Role::Heading))))
+            }
+        }
+        "text" => {
+            if has(None) {
+                Ok(())
+            } else {
+                fail(format!("the page has {}", names(None)))
+            }
+        }
+        "no" => match lower.split_once(char::is_whitespace) {
+            Some(("text", t)) => {
+                if widgets
+                    .iter()
+                    .any(|w| w.name.to_lowercase().contains(t.trim()))
+                {
+                    fail("it is on the page".into())
+                } else {
+                    Ok(())
+                }
+            }
+            None if lower == "launch" => {
+                if status.get("launch").is_some_and(|l| !l.is_null()) {
+                    fail(format!("Play would run {}", status["launch"]))
+                } else {
+                    Ok(())
+                }
+            }
+            _ => Err(format!("unknown expectation {what:?}")),
+        },
+        "focus" => {
+            let name = focus
+                .and_then(|f| widgets.iter().find(|w| w.id == f))
+                .map(|w| w.name.clone());
+            match name {
+                Some(n) if n.to_lowercase().contains(&lower) => Ok(()),
+                Some(n) => fail(format!("focus is on {n:?}")),
+                None => fail("nothing has focus".into()),
+            }
+        }
+        "enabled" | "disabled" => {
+            let want = kind == "enabled";
+            match widgets
+                .iter()
+                .find(|w| w.name.to_lowercase() == lower)
+                .or_else(|| {
+                    widgets
+                        .iter()
+                        .find(|w| w.name.to_lowercase().contains(&lower))
+                }) {
+                Some(w) if w.enabled == want => Ok(()),
+                Some(w) => fail(format!(
+                    "{:?} is {}",
+                    w.name,
+                    if w.enabled { "enabled" } else { "disabled" }
+                )),
+                None => fail(format!("the page has {}", names(None))),
+            }
+        }
+        "installs" => {
+            let n = status["installs"].as_array().map_or(0, Vec::len);
+            if value.parse::<usize>().ok() == Some(n) {
+                Ok(())
+            } else {
+                fail(format!("there are {n}"))
+            }
+        }
+        "message" => {
+            let m = status_str("message");
+            if m.contains(&lower) {
+                Ok(())
+            } else {
+                fail(format!("the message is {m:?}"))
+            }
+        }
+        "launch" => {
+            let l = status["launch"].to_string().to_lowercase();
+            if !status["launch"].is_null() && l.contains(&lower) {
+                Ok(())
+            } else {
+                fail(format!("Play would run {l}"))
+            }
+        }
+        _ => Err(format!("unknown expectation {what:?}")),
+    }
+}
+
 fn action(action: Action, target: NodeId) -> egui::Event {
     egui::Event::AccessKitActionRequest(accesskit::ActionRequest {
         action,
@@ -634,6 +895,67 @@ mod tests {
         assert_eq!(s[11], Cmd::Quit);
         for bad in ["click", "dance", "run x", "wait -1", "choose"] {
             assert!(parse_steps(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn scripts_expand_and_skip_comments() {
+        // SAFETY: the test names a variable nothing else reads.
+        unsafe { std::env::set_var("THEDAS_TEST_SCRATCH", "/s") };
+        let c = parse_script(
+            "# a comment\n\nmkinstall ${THEDAS_TEST_SCRATCH}/DA2 da2\nexpect page Welcome\n\
+             key Shift+Tab\n",
+        )
+        .unwrap();
+        assert_eq!(
+            c[0],
+            Cmd::MkInstall {
+                path: "/s/DA2".into(),
+                da2: true
+            }
+        );
+        assert_eq!(c[1], Cmd::Expect("page Welcome".into()));
+        assert_eq!(c[2], Cmd::Key("Shift+Tab".into()));
+        assert_eq!(c.len(), 3);
+        assert!(parse_steps("click ${THEDAS_TEST_NOT_SET}").is_err());
+        let (k, m) = parse_key("Shift+Tab").unwrap();
+        assert_eq!((k, m.shift), (egui::Key::Tab, true));
+        assert!(parse_key("Hyper+Tab").is_err());
+    }
+
+    #[test]
+    fn expectations_read_the_page() {
+        let ws = vec![
+            Widget {
+                role: Role::Heading,
+                ..w("Found 1 install", true)
+            },
+            Widget {
+                enabled: false,
+                ..w("Continue", true)
+            },
+        ];
+        let status = json!({"page": "Search", "installs": [{}], "launch": null, "message": "Hi"});
+        let ok = |what| expect(what, &ws, Some(ws[1].id), &status);
+        assert!(ok("page search").is_ok());
+        assert!(ok("heading found 1").is_ok());
+        assert!(ok("text continue").is_ok());
+        assert!(ok("no text welcome").is_ok());
+        assert!(ok("disabled Continue").is_ok());
+        assert!(ok("installs 1").is_ok());
+        assert!(ok("message hi").is_ok());
+        assert!(ok("no launch").is_ok());
+        assert!(ok("focus continue").is_ok());
+        for bad in [
+            "page Play",
+            "heading Welcome",
+            "enabled Continue",
+            "installs 2",
+            "launch x",
+            "no text Continue",
+            "dance",
+        ] {
+            assert!(ok(bad).is_err(), "{bad}");
         }
     }
 
