@@ -103,9 +103,8 @@ A new crate, `crates/thedas-gfx`, with no Ruffle dependency:
   authored bounds. Same-size frames update the existing GPU texture and cached bindings;
   clearing a target makes it transparent.
 - Not yet: Glow and DropShadow filters (3 uses), text `shadowStyle`, overlay / hard light /
-  difference / invert / erase blends (drawn normal), `setMask`, inline `<img>` in text, the
-  and movies checked with real engine state (book screens,
-  popups, conversation).
+  difference / invert / erase blends (drawn normal), `setMask`, inline `<img>` in text,
+  and complete parity on engine-state screens (book screens, popups, conversation).
 - Tools: `cargo run -p thedas-ui --example sidebyside -- INSTALL OUT.png MOVIES [FRAMES]
   [WxH] [ORIGINAL.png]` (Ruffle and ours, optionally after a shot of the original);
   `thedas-gfx` examples `gfxscan` (parse), `gfxrun` (run headless; `GFX_RENDER=1` times
