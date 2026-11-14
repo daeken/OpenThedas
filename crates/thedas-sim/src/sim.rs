@@ -91,6 +91,14 @@ pub struct Sim {
     pub game: thedas_vfs::Game,
     pub cutscene_policy: CutscenePolicy,
     pub party_picker_policy: PartyPickerPolicy,
+    /// Each creature's answer to the restriction scripts' question, set with
+    /// `SetCanUseItem` (DAOrigins.exe keeps it at creature +0xc70; see
+    /// [`Sim::can_use_item`]). Only read during that check, so not saved.
+    pub can_use_answers: HashMap<ObjectId, i32>,
+    /// Whether each party member may use each item the party carries, by
+    /// [`Sim::can_use_item`], worked out when a screen opens ([`Sim::gui_opened`]) for the
+    /// inventory screen's dimmed rows to read without running scripts. Not saved.
+    pub item_usable: HashMap<(ObjectId, ObjectId), bool>,
     /// The player's "auto-pause when combat starts" option (`GetAutoPauseCombatStatus`);
     /// off, as the game's options start.
     pub auto_pause_combat: bool,
@@ -589,6 +597,8 @@ impl Sim {
             game: thedas_vfs::Game::Origins,
             cutscene_policy: CutscenePolicy::default(),
             party_picker_policy: PartyPickerPolicy::default(),
+            can_use_answers: Default::default(),
+            item_usable: Default::default(),
             auto_pause_combat: false,
             show_tutorials: true,
             training_done: 0,
@@ -1489,12 +1499,37 @@ impl Sim {
     /// sends it (0x60afa3-0x60b065). Provisional: target and creator are taken to be the
     /// module (0x5d4fc0 is not fully traced).
     pub fn gui_opened(&mut self, gui: i32) {
+        self.refresh_item_usable();
         let Some(module) = self.world.module else {
             return;
         };
         let mut ev = self.new_event("GUI_OPENED", Some(module));
         ev.ints = vec![gui];
         self.world.queue_event(0, module, ev, None);
+    }
+
+    /// Works out [`Sim::item_usable`] for every party member and every item the party
+    /// carries. DAOrigins.exe answers the inventory screen's `CreatureCanUseItem` (0x715180,
+    /// registered at 0x7166e6) by running its check, restriction scripts included, as the
+    /// screen asks; the screen cannot run scripts here (it only reads the simulation), so the
+    /// answers are worked out when a screen opens. Provisional: an item picked up while the
+    /// screen is open has no answer and shows as usable.
+    pub fn refresh_item_usable(&mut self) {
+        let party = crate::engine::party_of(self);
+        let mut items: Vec<ObjectId> = party
+            .iter()
+            .filter_map(|&m| self.world.get(m))
+            .flat_map(|o| o.inventory.iter().chain(o.equipment.values()).copied())
+            .collect();
+        items.sort_unstable();
+        items.dedup();
+        self.item_usable.clear();
+        for &m in &party {
+            for &item in &items {
+                let ok = self.can_use_item(m, item);
+                self.item_usable.insert((m, item), ok);
+            }
+        }
     }
 
     /// Tells the module a creature joined or left the active party

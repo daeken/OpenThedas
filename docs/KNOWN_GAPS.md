@@ -68,7 +68,7 @@ these, so they are the places where one person or stream can take a large, separ
   [gaps/scripting.md](gaps/scripting.md)).
 - **Missing engine functions fail silently.** A function with no implementation returns a
   default and the script carries on down the "nothing there" branch (`SCR-001`). Measured against
-  a real install, 70 functions that game scripts call are unhandled, at 2,012 call sites; the
+  a real install, 69 functions that game scripts call are unhandled, at 1,872 call sites; the
   full list by call count is in [gaps/scripting.md](gaps/scripting.md).
 - **Movement is a timed path, not the original's physics controller.** No step offset, slope
   limit or wall sliding, and the pathfinder is an untraced grid search (`SIM-011` to `SIM-013`).
