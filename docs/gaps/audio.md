@@ -68,6 +68,7 @@ Updated 2026-11-12 by the audio thread. Each item gives what the original does, 
 ### Combat and animation sounds
 
 18. **Blows at the hit frame** are done (#297).
+    - Where animation sounds play: a creature has two sound emitters (0x6aa5fd..0x6aa6d4): the body's at half its appearance's height above its feet (0.9 m without an appearance), and the head's at its model's node in slot 3, else with the body's. Footsteps, foley, rustles, bodyfalls and named events (kinds 14, 17, 18, 20 and others) sound from the body; swings, (un)sheathing and blows (kinds 1, 3-7, 9, 10, 19, 21) from the head (play switch 0x6b6497). So a blow sounds from the striker, not the target. Provisional: ours puts the head emitter at the appearance's full height.
     - Not done: placeable targets (worksheet 93, placeable +0x4f0).
     - The armour material is taken from the chest item's base material; the exe goes through worksheet 89 "Material Types" (column 0xbb8ad13b) and an override (0x7485d0).
     - Small.

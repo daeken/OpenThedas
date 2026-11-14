@@ -1261,7 +1261,7 @@ fn body_models(scene: &AreaScene, prop: usize, own: &[String]) -> Vec<String> {
 
 /// A creature's height from its appearance (see [`Live::creature_height`]), with the
 /// simulation already in hand.
-fn appearance_height(sim: &Sim, id: ObjectId) -> f32 {
+pub(crate) fn appearance_height(sim: &Sim, id: ObjectId) -> f32 {
     {
         let w = &sim.world;
         let height = w.get(id).and_then(|o| {
