@@ -102,6 +102,7 @@ impl Player {
             intervals: Vec::new(),
             next_interval: 0,
             time_ms: 0.0,
+            timer_time_ms: 0.0,
             host,
             callbacks: HashMap::new(),
             key,
@@ -154,6 +155,7 @@ impl Player {
     pub fn tick(&mut self, dt_ms: f64) {
         let dt = dt_ms.clamp(0.0, 1000.0);
         self.vm.time_ms += dt;
+        self.vm.timer_time_ms += dt;
         if let Some(t) = self
             .vm
             .focus
@@ -178,20 +180,25 @@ impl Player {
     }
 
     fn run_intervals(&mut self) {
-        let now = self.vm.time_ms;
-        let due: Vec<u32> = self
-            .vm
-            .intervals
-            .iter()
-            .filter(|i| i.next <= now)
-            .map(|i| i.id)
-            .collect();
-        for id in due {
+        let now = self.vm.timer_time_ms;
+        // Catch up in deadline order, preserving each interval's phase. Bounding the
+        // callbacks also bounds work when a frame stalls or callbacks create timers.
+        for _ in 0..10 {
+            let Some(id) = self
+                .vm
+                .intervals
+                .iter()
+                .filter(|i| i.next < now)
+                .min_by(|a, b| a.next.total_cmp(&b.next).then(a.id.cmp(&b.id)))
+                .map(|i| i.id)
+            else {
+                return;
+            };
             let Some(i) = self.vm.intervals.iter_mut().find(|i| i.id == id) else {
                 continue;
             };
             let once = i.every < 0.0;
-            i.next = now + i.every.abs();
+            i.next += i.every.abs();
             let (this, func, method, args) = (
                 i.this.clone(),
                 i.func.clone(),
@@ -200,6 +207,14 @@ impl Player {
             );
             if once {
                 self.vm.intervals.retain(|x| x.id != id);
+            }
+            if method.is_some()
+                && this.as_object().and_then(|o| self.vm.heap.get(o)).is_some_and(|o| {
+                    matches!(&o.kind, crate::avm1::object::Kind::Display(d) if self.vm.display.get(*d).is_none())
+                })
+            {
+                self.vm.intervals.retain(|x| x.id != id);
+                continue;
             }
             self.vm.budget = 0;
             match method {
@@ -211,6 +226,18 @@ impl Player {
                 }
             }
             self.run_queue();
+        }
+        if let Some(next) = self
+            .vm
+            .intervals
+            .iter()
+            .map(|i| i.next)
+            .min_by(f64::total_cmp)
+            && next < now
+        {
+            // Resume just before the next deadline on the following update. Keep this
+            // scheduler clock separate from the movie's actual elapsed time/getTimer.
+            self.vm.timer_time_ms = next - 0.1;
         }
     }
 
@@ -1064,6 +1091,29 @@ pub fn goto(vm: &mut Vm, d: DisplayId, frame: u16, play: bool) {
         Some(cur) if frame > cur => cur + 1,
         _ => 0,
     };
+    // On a rewind, retain an instance only when the target uses its original placement.
+    // Reusing a symbol after RemoveObject starts a new lifetime even at the same depth.
+    let mut origins = HashMap::new();
+    if forward_from == 0 {
+        for (fi, f) in tl
+            .frames
+            .iter()
+            .enumerate()
+            .take(cur.map_or(0, |f| f as usize + 1))
+        {
+            for cmd in &f.commands {
+                match cmd {
+                    Command::Remove { depth } => {
+                        origins.remove(&(*depth as i32 + DEPTH_OFFSET));
+                    }
+                    Command::Place(p) if !p.is_move => {
+                        origins.insert(p.depth as i32 + DEPTH_OFFSET, fi as u16);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
     // Replay the commands from `forward_from` to `frame` into one final state per depth.
     let mut state: HashMap<i32, Option<Place>> = HashMap::new();
     if forward_from == 0 {
@@ -1106,7 +1156,11 @@ pub fn goto(vm: &mut Vm, d: DisplayId, frame: u16, play: bool) {
                         }
                         (false, _) => {
                             *entry = Some((**p).clone());
-                            replaced.insert(depth);
+                            if forward_from != 0 || origins.get(&depth) != Some(&fi) {
+                                replaced.insert(depth);
+                            } else {
+                                replaced.remove(&depth);
+                            }
                         }
                     }
                 }
@@ -1145,7 +1199,7 @@ pub fn goto(vm: &mut Vm, d: DisplayId, frame: u16, play: bool) {
                     })
                 });
                 if let Some(e) = existing {
-                    if p.is_move || (same_char && !replaced.contains(&depth)) || same_char {
+                    if p.is_move || (same_char && !replaced.contains(&depth)) {
                         let mut q = p.clone();
                         q.is_move = true;
                         place(vm, d, &q);
@@ -1876,6 +1930,22 @@ fn pick_in(vm: &Vm, d: DisplayId, x: f32, y: f32, mode: PickMode) -> Option<Disp
             }
         }
     }
+    // A clip's dynamic fills are painted behind every child, including negative depths.
+    // Test only its own geometry: hit_shape would also include children rejected above
+    // by their timeline masks, making masked-out content pick the parent instead.
+    if matches!(mode, PickMode::Any)
+        && let Some(drawing) = o.clip().and_then(|c| c.drawing.as_ref())
+        && let Some(inverse) = vm.display.world_matrix(d).invert()
+    {
+        let (lx, ly) = inverse.apply(x, y);
+        if drawing
+            .fills
+            .iter()
+            .any(|(_, points)| polygon_contains(points, lx, ly))
+        {
+            return Some(d);
+        }
+    }
     None
 }
 
@@ -2089,6 +2159,80 @@ mod queue_tests {
     }
 
     #[test]
+    fn programmatic_focus_selects_prefilled_text_and_reselects_the_same_field() {
+        let (mut p, field) = input_player();
+        p.vm.display.get_mut(field).unwrap().name = Str::from("NameField");
+        let value = p.vm.display_object(field);
+        p.vm.set(&value, "text", Value::from("Orzammar Commons"));
+        let focus = p.vm.new_native(|vm, _, _| {
+            vm.log.push("focus".into());
+            Value::Undefined
+        });
+        p.vm.set(&value, "onSetFocus", Value::Object(focus));
+        let selection = Value::Object(p.vm.selection);
+        assert_eq!(
+            p.vm.call_method(&selection, "setFocus", std::slice::from_ref(&value)),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            p.vm.call_method(&selection, "getBeginIndex", &[]),
+            Value::Number(0.0)
+        );
+        assert_eq!(
+            p.vm.call_method(&selection, "getEndIndex", &[]),
+            Value::Number(16.0)
+        );
+        p.type_text("Audit");
+        assert_eq!(
+            p.vm.display.get(field).unwrap().text().unwrap().text(),
+            "Audit"
+        );
+        assert_eq!(p.drain_log(), ["focus"]);
+        p.vm.set(&value, "text", Value::from("A😀B"));
+        p.vm.call_method(
+            &selection,
+            "setSelection",
+            &[Value::Number(1.0), Value::Number(1.0)],
+        );
+        p.vm.call_method(&selection, "setFocus", &[Value::from("_root.NameField")]);
+        assert_eq!(
+            p.vm.call_method(&selection, "getBeginIndex", &[]),
+            Value::Number(0.0)
+        );
+        assert_eq!(
+            p.vm.call_method(&selection, "getEndIndex", &[]),
+            Value::Number(4.0)
+        );
+        assert!(
+            p.drain_log().is_empty(),
+            "same-field focus must not fire a second focus event"
+        );
+        // Missing/invalid targets leave focus and selection alone; null clears them.
+        assert_eq!(
+            p.vm.call_method(&selection, "setFocus", &[]),
+            Value::Bool(false)
+        );
+        assert_eq!(
+            p.vm.call_method(&selection, "setFocus", &[Value::from("missing")]),
+            Value::Bool(false)
+        );
+        assert_eq!(p.vm.focus, Some(field));
+        assert_eq!(
+            p.vm.call_method(&selection, "getEndIndex", &[]),
+            Value::Number(4.0)
+        );
+        assert_eq!(
+            p.vm.call_method(&selection, "setFocus", &[Value::Null]),
+            Value::Bool(true)
+        );
+        assert_eq!(p.vm.focus, None);
+        assert_eq!(
+            p.vm.call_method(&selection, "getBeginIndex", &[]),
+            Value::Number(-1.0)
+        );
+    }
+
+    #[test]
     fn mouse_caret_and_drag_selection_use_transformed_text_coordinates() {
         let (mut p, field) = input_player();
         let o = p.vm.display.get_mut(field).unwrap();
@@ -2235,6 +2379,110 @@ mod queue_tests {
     }
 
     #[test]
+    fn interval_callbacks_catch_up_in_deadline_order_without_drift() {
+        let (mut p, _) = input_player();
+        let trace = p.vm.new_native(|vm, _, args| {
+            let text = vm.to_str(args.first().unwrap());
+            vm.log.push(text.to_string());
+            Value::Undefined
+        });
+        let global = Value::Object(p.vm.global);
+        for (delay, name) in [(20.0, "a"), (35.0, "b")] {
+            p.vm.call_method(
+                &global,
+                "setInterval",
+                &[
+                    Value::Object(trace),
+                    Value::Number(delay),
+                    Value::from(name),
+                ],
+            );
+        }
+        p.tick(81.0);
+        assert_eq!(p.drain_log(), ["a", "b", "a", "a", "b", "a"]);
+        // Keep the original deadline rather than postponing it after each update.
+        p.tick(19.0);
+        assert!(p.drain_log().is_empty());
+        p.tick(1.0);
+        assert_eq!(p.drain_log(), ["a"]);
+    }
+
+    #[test]
+    fn interval_catchup_is_bounded_without_rewinding_get_timer() {
+        let (mut p, _) = input_player();
+        let trace = p.vm.new_native(|vm, _, _| {
+            vm.log.push("tick".into());
+            Value::Undefined
+        });
+        let global = Value::Object(p.vm.global);
+        p.vm.call_method(
+            &global,
+            "setInterval",
+            &[Value::Object(trace), Value::Number(1.0)],
+        );
+        assert_eq!(p.vm.intervals[0].every, 10.0);
+        p.tick(10.0);
+        assert!(p.drain_log().is_empty());
+        p.tick(990.0);
+        assert_eq!(p.drain_log().len(), 10);
+        assert_eq!(
+            p.vm.call_method(&global, "getTimer", &[]),
+            Value::Number(1000.0)
+        );
+        p.tick(20.0);
+        assert_eq!(p.drain_log().len(), 2);
+        assert_eq!(
+            p.vm.call_method(&global, "getTimer", &[]),
+            Value::Number(1020.0)
+        );
+    }
+
+    #[test]
+    fn interval_callbacks_can_cancel_and_removed_clip_methods_stop() {
+        let (mut p, _) = input_player();
+        let global = Value::Object(p.vm.global);
+        let trace = p.vm.new_native(|vm, _, _| {
+            vm.log.push("repeat".into());
+            Value::Undefined
+        });
+        let id = p.vm.call_method(
+            &global,
+            "setInterval",
+            &[Value::Object(trace), Value::Number(20.0)],
+        );
+        p.vm.set(&global, "cancelId", id);
+        let cancel = p.vm.new_native(|vm, _, _| {
+            vm.log.push("timeout".into());
+            let global = Value::Object(vm.global);
+            let id = vm.get(&global, "cancelId");
+            vm.call_method(&global, "clearInterval", &[id]);
+            Value::Undefined
+        });
+        p.vm.call_method(
+            &global,
+            "setTimeout",
+            &[Value::Object(cancel), Value::Number(55.0)],
+        );
+        p.tick(81.0);
+        assert_eq!(p.drain_log(), ["repeat", "repeat", "timeout"]);
+        assert!(p.vm.intervals.is_empty());
+        let root = p.vm.root;
+        let clip = create_empty(&mut p.vm, root, "timer", 2).unwrap();
+        let receiver = p.vm.display_object(clip);
+        p.vm.set(&receiver, "onTick", Value::Object(trace));
+        p.vm.call_method(
+            &global,
+            "setInterval",
+            &[receiver, Value::from("onTick"), Value::Number(16.9)],
+        );
+        assert_eq!(p.vm.intervals[0].every, 16.0);
+        remove_clip(&mut p.vm, clip);
+        p.tick(100.0);
+        assert!(p.drain_log().is_empty());
+        assert!(p.vm.intervals.is_empty());
+    }
+
+    #[test]
     fn stationary_hover_refreshes_after_geometry_visibility_and_wheel_changes() {
         fn over(vm: &mut Vm, this: Value, _: &[Value]) -> Value {
             let name = vm.get(&this, "_name");
@@ -2295,6 +2543,108 @@ mod queue_tests {
         p.vm.set(&bv, "_visible", Value::Bool(true));
         p.mouse_wheel(10.0, 10.0, 1.0);
         assert_eq!(p.drain_log(), ["a out", "b over"]);
+    }
+
+    fn draw_pick_rect(vm: &mut Vm, clip: DisplayId, width: f64, height: f64) {
+        let value = vm.display_object(clip);
+        vm.call_method(
+            &value,
+            "beginFill",
+            &[Value::Number(0.0), Value::Number(0.0)],
+        );
+        for (method, x, y) in [
+            ("moveTo", 0.0, 0.0),
+            ("lineTo", width, 0.0),
+            ("lineTo", width, height),
+            ("lineTo", 0.0, height),
+        ] {
+            vm.call_method(&value, method, &[Value::Number(x), Value::Number(y)]);
+        }
+        vm.call_method(&value, "endFill", &[]);
+    }
+
+    #[test]
+    fn topmost_picks_a_clips_own_drawing_in_world_space() {
+        let (mut p, _) = input_player();
+        let root = p.vm.root;
+        let parent = create_empty(&mut p.vm, root, "parent", 2).unwrap();
+        let clip = create_empty(&mut p.vm, parent, "drawing", 1).unwrap();
+        draw_pick_rect(&mut p.vm, clip, 40.0, 20.0);
+        p.vm.display.get_mut(parent).unwrap().matrix = crate::swf::Matrix {
+            a: 0.0,
+            b: 2.0,
+            c: -2.0,
+            d: 0.0,
+            tx: 2000.0,
+            ty: 400.0,
+        };
+        p.vm.display.get_mut(clip).unwrap().matrix.tx = 200.0;
+        assert_eq!(p.topmost_at(80.0, 80.0), Some(clip));
+        assert_eq!(p.topmost_at(50.0, 80.0), None);
+        p.mouse_move(80.0, 80.0);
+        let mouse = Value::Object(p.vm.mouse);
+        let hit = p.vm.call_method(&mouse, "getTopMostEntity", &[]);
+        assert_eq!(p.vm.display_of(&hit), Some(clip));
+        // Transparent decorative fills remain entities, without acquiring button events
+        // or blocking text focus just because the native entity query sees them.
+        assert_eq!(pick(&p.vm, 1600.0, 1600.0), None);
+        assert_eq!(pick_in(&p.vm, root, 1600.0, 1600.0, PickMode::Focus), None);
+        let value = p.vm.display_object(clip);
+        for property in ["_visible", "hitTestDisable"] {
+            let hidden = property == "hitTestDisable";
+            p.vm.set(&value, property, Value::Bool(hidden));
+            assert_eq!(p.topmost_at(80.0, 80.0), None);
+            p.vm.set(&value, property, Value::Bool(!hidden));
+            assert_eq!(p.topmost_at(80.0, 80.0), Some(clip));
+        }
+        p.vm.display.get_mut(parent).unwrap().matrix.a = 0.0;
+        p.vm.display.get_mut(parent).unwrap().matrix.b = 0.0;
+        assert_eq!(p.topmost_at(80.0, 80.0), None);
+        p.vm.display.get_mut(parent).unwrap().matrix.b = 2.0;
+        assert_eq!(p.topmost_at(80.0, 80.0), Some(clip));
+        p.vm.call_method(&value, "clear", &[]);
+        assert_eq!(p.topmost_at(80.0, 80.0), None);
+    }
+
+    #[test]
+    fn topmost_drawing_stays_below_children_and_respects_both_mask_kinds() {
+        let (mut p, field) = input_player();
+        let root = p.vm.root;
+        let behind = create_empty(&mut p.vm, root, "behind", 0).unwrap();
+        let front = create_empty(&mut p.vm, root, "front", 2).unwrap();
+        draw_pick_rect(&mut p.vm, behind, 100.0, 100.0);
+        draw_pick_rect(&mut p.vm, front, 40.0, 40.0);
+        assert_eq!(p.topmost_at(20.0, 20.0), Some(front));
+        assert_eq!(p.topmost_at(60.0, 20.0), Some(behind));
+        // Even a negative-depth child is painted above its parent's own drawing.
+        p.vm.display.get_mut(root).unwrap().children.remove(&1);
+        let text = p.vm.display.get_mut(field).unwrap();
+        text.parent = Some(front);
+        text.text_mut().unwrap().bounds = (0.0, 0.0, 10.0, 10.0);
+        p.vm.display
+            .get_mut(front)
+            .unwrap()
+            .children
+            .insert(-5, field);
+        assert_eq!(p.topmost_at(5.0, 5.0), Some(field));
+        let child = create_empty(&mut p.vm, front, "child", 1).unwrap();
+        draw_pick_rect(&mut p.vm, child, 80.0, 80.0);
+        let mask = create_empty(&mut p.vm, front, "timelineMask", 0).unwrap();
+        draw_pick_rect(&mut p.vm, mask, 10.0, 10.0);
+        p.vm.display.get_mut(mask).unwrap().clip_depth = Some(1);
+        assert_eq!(p.topmost_at(5.0, 5.0), Some(child));
+        assert_eq!(p.topmost_at(20.0, 20.0), Some(front));
+        // A rejected masked child must not leak into its parent's drawing fallback.
+        assert_eq!(p.topmost_at(60.0, 20.0), Some(behind));
+        let dynamic_mask = create_empty(&mut p.vm, root, "dynamicMask", 3).unwrap();
+        draw_pick_rect(&mut p.vm, dynamic_mask, 10.0, 10.0);
+        assert!(p.vm.display.set_mask(front, Some(dynamic_mask)));
+        p.vm.display.get_mut(dynamic_mask).unwrap().visible = false;
+        assert_eq!(p.topmost_at(5.0, 5.0), Some(child));
+        assert_eq!(p.topmost_at(20.0, 20.0), Some(behind));
+        assert!(p.vm.display.set_mask(front, None));
+        p.vm.display.get_mut(dynamic_mask).unwrap().visible = true;
+        assert_eq!(p.topmost_at(5.0, 5.0), Some(dynamic_mask));
     }
 
     #[test]
@@ -2624,6 +2974,95 @@ mod queue_tests {
         p.vm.call_method(&target, "attachBitmap", &[bitmap, Value::Number(1.0)]);
         assert!(p.vm.display.get(old).is_none());
         assert_eq!(p.vm.display.get(root).unwrap().children.len(), 1);
+    }
+
+    #[test]
+    fn goto_recreates_replaced_symbols_but_preserves_continuous_instances() {
+        let (mut p, _) = input_player();
+        let root = p.vm.root;
+        let mut movie = Movie::default();
+        movie.characters.insert(
+            1,
+            Character::Sprite(Arc::new(crate::swf::Timeline {
+                frames: vec![Default::default()],
+                labels: vec![],
+            })),
+        );
+        p.vm.movie = Arc::new(movie);
+        let placement = |depth, name: &str| {
+            Command::Place(Box::new(Place {
+                depth,
+                character: Some(1),
+                name: Some(name.into()),
+                ..Default::default()
+            }))
+        };
+        let timeline = Arc::new(crate::swf::Timeline {
+            frames: vec![
+                crate::swf::Frame {
+                    commands: vec![placement(2, "race_nav"), placement(3, "continuous")],
+                    ..Default::default()
+                },
+                crate::swf::Frame {
+                    commands: vec![Command::Remove { depth: 2 }],
+                    ..Default::default()
+                },
+                crate::swf::Frame {
+                    commands: vec![placement(2, "appearance_nav")],
+                    ..Default::default()
+                },
+                Default::default(),
+            ],
+            labels: vec![],
+        });
+        p.vm.display
+            .get_mut(root)
+            .unwrap()
+            .clip_mut()
+            .unwrap()
+            .timeline = timeline;
+        enter_frame_of(&mut p.vm, root, 0);
+        p.run_queue();
+        let first = p.vm.display.child_named(root, "race_nav").unwrap();
+        let continuous = p.vm.display.child_named(root, "continuous").unwrap();
+        let first_value = p.vm.display_object(first);
+        p.vm.set(&first_value, "callback", Value::from("race"));
+        let continuous_value = p.vm.display_object(continuous);
+        p.vm.set(&continuous_value, "callback", Value::from("retained"));
+        goto(&mut p.vm, root, 3, false);
+        p.run_queue();
+        let second = p.vm.display.child_named(root, "appearance_nav").unwrap();
+        assert_ne!(first, second);
+        assert!(p.vm.display.get(first).is_none());
+        assert!(p.vm.display.child_named(root, "race_nav").is_none());
+        let second_value = p.vm.display_object(second);
+        assert_eq!(p.vm.get(&second_value, "callback"), Value::Undefined);
+        p.vm.set(&second_value, "callback", Value::from("appearance"));
+        // Rewinding within the new instance's lifetime preserves its script state.
+        goto(&mut p.vm, root, 2, false);
+        assert_eq!(
+            p.vm.display.child_named(root, "appearance_nav"),
+            Some(second)
+        );
+        assert_eq!(
+            p.vm.get(&second_value, "callback"),
+            Value::from("appearance")
+        );
+        // Rewinding past the removal restores a fresh original instance.
+        goto(&mut p.vm, root, 0, false);
+        p.run_queue();
+        let restored = p.vm.display.child_named(root, "race_nav").unwrap();
+        assert_ne!(restored, first);
+        assert_ne!(restored, second);
+        assert!(p.vm.display.get(second).is_none());
+        assert_eq!(
+            p.vm.display.child_named(root, "continuous"),
+            Some(continuous)
+        );
+        assert_eq!(
+            p.vm.get(&continuous_value, "callback"),
+            Value::from("retained")
+        );
     }
 
     #[test]
