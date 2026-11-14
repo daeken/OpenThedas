@@ -303,11 +303,34 @@ pub struct Imported {
 /// What an import made.
 pub struct Import {
     pub meshes: Vec<Imported>,
+    /// The object's new place, when the file moved or turned it (see [`import`]).
+    pub moved: Option<Placed>,
     pub warnings: Vec<String>,
 }
 
-/// The export's placement: game axes to glTF's, then the object's position and facing.
-fn placement(manifest: &J) -> Mat4 {
+/// An object's place: where it stands and its facing (degrees about Z).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Placed {
+    pub position: [f32; 3],
+    pub facing: f32,
+}
+
+/// The game's Z-up to glTF's Y-up, as the export's root turns it.
+fn axes() -> Mat4 {
+    let h = std::f32::consts::FRAC_1_SQRT_2;
+    Mat4::from_quat(Quat::from_xyzw(-h, 0.0, 0.0, h))
+}
+
+/// A place as a matrix in the game's space.
+fn placed(p: Placed) -> Mat4 {
+    Mat4::from_rotation_translation(
+        Quat::from_rotation_z(p.facing.to_radians()),
+        Vec3::from_array(p.position),
+    )
+}
+
+/// The export's place for the object.
+fn exported_place(manifest: &J) -> Placed {
     let o = &manifest["object"];
     let p: Vec<f32> = o["position"]
         .as_array()
@@ -315,20 +338,57 @@ fn placement(manifest: &J) -> Mat4 {
         .flatten()
         .map(|x| x.as_f64().unwrap_or(0.0) as f32)
         .collect();
-    let at = if p.len() == 3 {
-        Vec3::from_slice(&p)
-    } else {
-        Vec3::ZERO
-    };
-    let facing = o["facing"].as_f64().unwrap_or(0.0) as f32;
-    let h = std::f32::consts::FRAC_1_SQRT_2;
-    Mat4::from_quat(Quat::from_xyzw(-h, 0.0, 0.0, h))
-        * Mat4::from_rotation_translation(Quat::from_rotation_z(facing.to_radians()), at)
+    Placed {
+        position: if p.len() == 3 {
+            [p[0], p[1], p[2]]
+        } else {
+            [0.0; 3]
+        },
+        facing: o["facing"].as_f64().unwrap_or(0.0) as f32,
+    }
+}
+
+/// The object's place as the file has it: its node (by the export's extras, else by the
+/// object's tag) in the game's space, taken apart into a position and a turn about Z.
+/// Whatever else the node does (a tilt, a scale) is left for the meshes.
+fn file_place(g: &Gltf, worlds: &[Mat4], manifest: &J) -> Option<Placed> {
+    let o = &manifest["object"];
+    let tag = o["tag"].as_str().unwrap_or("");
+    let id = o["id"].as_u64();
+    let nodes = g.arr("nodes");
+    let i = nodes
+        .iter()
+        .position(|n| id.is_some() && n["extras"]["thedas"]["object"].as_u64() == id)
+        .or_else(|| {
+            nodes.iter().position(|n| {
+                n["name"]
+                    .as_str()
+                    .is_some_and(|nm| !tag.is_empty() && base_name(nm).eq_ignore_ascii_case(tag))
+            })
+        })?;
+    let m = axes().inverse() * worlds.get(i)?;
+    let at = m.w_axis.truncate();
+    let x = m.x_axis.truncate();
+    let facing = x.y.atan2(x.x).to_degrees().rem_euclid(360.0);
+    Some(Placed {
+        position: at.to_array(),
+        facing,
+    })
+}
+
+/// Whether two places differ by more than a millimetre or a twentieth of a degree.
+fn moved(a: Placed, b: Placed) -> bool {
+    let d = Vec3::from_array(a.position).distance(Vec3::from_array(b.position));
+    let turn = (a.facing - b.facing + 540.0).rem_euclid(360.0) - 180.0;
+    d > 1e-3 || turn.abs() > 0.05
 }
 
 /// The chunks the manifest's models hold, with where the export put them.
-fn targets(manifest: &J, read: &dyn Fn(&str) -> Option<Read>) -> Result<Vec<Target>, String> {
-    let place = placement(manifest);
+fn targets(
+    manifest: &J,
+    read: &dyn Fn(&str) -> Option<Read>,
+    place: Mat4,
+) -> Result<Vec<Target>, String> {
     let mut out = Vec::new();
     for m in manifest["models"].as_array().into_iter().flatten() {
         let (Some(mmh), Some(msh)) = (m["mmh"]["resource"].as_str(), m["msh"]["resource"].as_str())
@@ -587,6 +647,7 @@ pub fn import(
     glb: &[u8],
     manifest: &J,
     read: &dyn Fn(&str) -> Option<Read>,
+    keep_unchanged: bool,
 ) -> Result<Import, String> {
     if manifest["format"].as_str() != Some("openthedas-export") {
         return Err("manifest.json is not an OpenThedas export's".into());
@@ -595,8 +656,13 @@ pub fn import(
         return Err("manifest.json is from a newer OpenThedas".into());
     }
     let g = Gltf::parse(glb)?;
-    let targets = targets(manifest, read)?;
     let (worlds, parents) = g.worlds();
+    // The object moved or turned in the file: a move of the object, and the meshes taken
+    // relative to its new place (so they do not move twice).
+    let was = exported_place(manifest);
+    let now = file_place(&g, &worlds, manifest).unwrap_or(was);
+    let moved = moved(now, was).then_some(now);
+    let targets = targets(manifest, read, axes() * placed(now))?;
     let nodes = g.arr("nodes");
     let meshes = g.arr("meshes");
     let skins = g.arr("skins");
@@ -853,6 +919,18 @@ pub fn import(
         }
         let new =
             thedas_formats::mesh::rewrite(data, &chunks).map_err(|e| format!("{msh_name}: {e}"))?;
+        // A mesh file that comes back saying the same is not written (moving the object
+        // alone changes no mesh).
+        if !keep_unchanged && emptied.is_empty() {
+            let after = Msh::parse(&new).map_err(|e| format!("{msh_name}: {e}"))?;
+            let same = done.iter().all(|c| match (msh.chunk(c), after.chunk(c)) {
+                (Some(a), Some(b)) => chunk_difference(msh, a, &after, b).is_none(),
+                _ => false,
+            });
+            if same {
+                continue;
+            }
+        }
         out.push(Imported {
             msh: msh_name.clone(),
             data: new,
@@ -862,8 +940,80 @@ pub fn import(
     }
     Ok(Import {
         meshes: out,
+        moved,
         warnings,
     })
+}
+
+/// How a rewritten chunk differs from the original beyond what its types keep (`None`: it
+/// says the same): its triangles, or a vertex attribute (directions within about a
+/// degree, weights after summing to one, blend indices not compared).
+pub(crate) fn chunk_difference(
+    orig: &Msh,
+    a: &MeshChunk,
+    new: &Msh,
+    b: &MeshChunk,
+) -> Option<String> {
+    use thedas_formats::mesh::DeclType as T;
+    if orig.indices(a).ok()? != new.indices(b).ok()? {
+        return Some("indices differ".into());
+    }
+    let usages = [
+        DeclUsage::Position,
+        DeclUsage::Normal,
+        DeclUsage::Tangent,
+        DeclUsage::Binormal,
+        DeclUsage::TexCoord,
+        DeclUsage::Color,
+        DeclUsage::BlendWeight,
+    ];
+    for e in a.elements.iter().filter(|e| usages.contains(&e.usage)) {
+        let x = orig.attribute(a, e.usage, e.usage_index).ok()??;
+        let Some(y) = new.attribute(b, e.usage, e.usage_index).ok()? else {
+            return Some(format!("{:?}{} is gone", e.usage, e.usage_index));
+        };
+        if x.len() != y.len() {
+            return Some("vertex counts differ".into());
+        }
+        let n = crate::glb::components(e.ty);
+        let unit = matches!(
+            e.usage,
+            DeclUsage::Normal | DeclUsage::Tangent | DeclUsage::Binormal
+        );
+        // What the type keeps, relative to the values' size.
+        let tol = |v: f32| match e.ty {
+            T::Float16x2 | T::Float16x4 => 2e-3 * v.abs().max(1.0),
+            T::Float1 | T::Float2 | T::Float3 | T::Float4 => 1e-3 * v.abs().max(1.0),
+            _ => 2.5e-2,
+        };
+        let off = x.iter().zip(&y).position(|(p, q)| {
+            if unit {
+                // Directions: the same way (lengths are made 1; a zero one stays zero).
+                let (a, b) = (Vec3::new(p[0], p[1], p[2]), Vec3::new(q[0], q[1], q[2]));
+                match (a.try_normalize(), b.try_normalize()) {
+                    (Some(a), Some(b)) => a.dot(b) < 0.9998,
+                    (None, None) => false,
+                    _ => a.length() > 1e-3,
+                }
+            } else {
+                (0..n).any(|k| {
+                    let t = if e.usage == DeclUsage::BlendWeight {
+                        3e-2
+                    } else {
+                        tol(p[k])
+                    };
+                    (p[k] - q[k]).abs() > t
+                })
+            }
+        });
+        if let Some(i) = off {
+            return Some(format!(
+                "{:?}{} ({:?}): vertex {i}: {:?} became {:?}",
+                e.usage, e.usage_index, e.ty, x[i], y[i]
+            ));
+        }
+    }
+    None
 }
 
 /// Each vertex's influences as (palette slot, weight), strongest first, at most as many as
@@ -1117,22 +1267,13 @@ mod tests {
             .filter_map(|n| n.strip_suffix(".mmh").map(str::to_string))
             .collect();
         let (mut chunks, mut bad) = (0usize, Vec::new());
-        let usages = [
-            DeclUsage::Position,
-            DeclUsage::Normal,
-            DeclUsage::Tangent,
-            DeclUsage::Binormal,
-            DeclUsage::TexCoord,
-            DeclUsage::Color,
-            DeclUsage::BlendIndices,
-            DeclUsage::BlendWeight,
-        ];
+
         for m in &models {
             let e = crate::glb::export(&read, &s, std::slice::from_ref(m));
             if e.manifest["models"].as_array().is_none_or(|a| a.is_empty()) {
                 continue;
             }
-            let imp = match import(&e.glb, &e.manifest, &read) {
+            let imp = match import(&e.glb, &e.manifest, &read, true) {
                 Ok(i) => i,
                 Err(err) => {
                     bad.push(format!("{m}: {err}"));
@@ -1158,59 +1299,8 @@ mod tests {
                 for name in &im.chunks {
                     chunks += 1;
                     let (a, b) = (orig.chunk(name).unwrap(), new.chunk(name).unwrap());
-                    if orig.indices(a).unwrap() != new.indices(b).unwrap() {
-                        bad.push(format!("{m}: {name}: indices differ"));
-                        continue;
-                    }
-                    for e in a.elements.iter().filter(|e| usages.contains(&e.usage)) {
-                        let x = orig.attribute(a, e.usage, e.usage_index).unwrap().unwrap();
-                        let y = new.attribute(b, e.usage, e.usage_index).unwrap().unwrap();
-                        let n = crate::glb::components(e.ty);
-                        let unit = matches!(
-                            e.usage,
-                            DeclUsage::Normal | DeclUsage::Tangent | DeclUsage::Binormal
-                        );
-                        // What the type keeps, relative to the values' size.
-                        let tol = |v: f32| match e.ty {
-                            thedas_formats::mesh::DeclType::Float16x2
-                            | thedas_formats::mesh::DeclType::Float16x4 => 2e-3 * v.abs().max(1.0),
-                            thedas_formats::mesh::DeclType::Float1
-                            | thedas_formats::mesh::DeclType::Float2
-                            | thedas_formats::mesh::DeclType::Float3
-                            | thedas_formats::mesh::DeclType::Float4 => 1e-3 * v.abs().max(1.0),
-                            _ => 2.5e-2,
-                        };
-                        let off = x.iter().zip(&y).enumerate().find_map(|(i, (p, q))| {
-                            let wrong = if unit {
-                                // Directions: the same way, within a degree (lengths are
-                                // made 1; a zero one stays zero).
-                                let (a, b) =
-                                    (Vec3::new(p[0], p[1], p[2]), Vec3::new(q[0], q[1], q[2]));
-                                match (a.try_normalize(), b.try_normalize()) {
-                                    (Some(a), Some(b)) => a.dot(b) < 0.9998,
-                                    (None, None) => false,
-                                    _ => a.length() > 1e-3,
-                                }
-                            } else if e.usage == DeclUsage::BlendIndices {
-                                false
-                            } else {
-                                (0..n).any(|k| {
-                                    let t = if e.usage == DeclUsage::BlendWeight {
-                                        3e-2
-                                    } else {
-                                        tol(p[k])
-                                    };
-                                    (p[k] - q[k]).abs() > t
-                                })
-                            };
-                            wrong.then_some(i)
-                        });
-                        if let Some(i) = off {
-                            bad.push(format!(
-                                "{m}: {name}: {:?}{} ({:?}): vertex {i}: {:?} became {:?}",
-                                e.usage, e.usage_index, e.ty, x[i], y[i]
-                            ));
-                        }
+                    if let Some(d) = chunk_difference(&orig, a, &new, b) {
+                        bad.push(format!("{m}: {name}: {d}"));
                     }
                 }
             }
@@ -1249,12 +1339,13 @@ mod tests {
         out
     }
 
-    /// Against a real install: moving the whole object 1 m up in the file moves every
-    /// vertex 1 m (in its own space), rigid or skinned, and dropping the export's extras
-    /// (as an editor may) still finds every chunk by name.
+    /// Against a real install, with the export's extras stripped (as an editor may):
+    /// moving and turning the object in the file is a move of the object and changes no
+    /// mesh; stretching it reshapes every mesh and moves nothing; and every chunk is found
+    /// by name.
     #[test]
     #[ignore]
-    fn a_moved_object_moves_its_vertices_and_names_suffice() {
+    fn a_moved_object_is_a_move_and_a_stretch_reshapes() {
         let root = std::env::var_os("THEDAS_INSTALL").expect("THEDAS_INSTALL");
         let install = thedas_vfs::DaoInstall::open(root).unwrap();
         let vfs = install
@@ -1276,44 +1367,47 @@ mod tests {
             area: None,
             template: "t".into(),
             position: [3.0, 4.0, 5.0],
-            facing: 0.0,
+            facing: 30.0,
+        };
+        let strip = |j: &mut J| {
+            for m in j["meshes"].as_array_mut().unwrap() {
+                m.as_object_mut().unwrap().remove("extras");
+            }
+            for sk in j["skins"].as_array_mut().into_iter().flatten() {
+                sk.as_object_mut().unwrap().remove("extras");
+            }
+            for n in j["nodes"].as_array_mut().unwrap() {
+                n.as_object_mut().unwrap().remove("extras");
+            }
         };
         for model in ["c_doga_0", "blk_01_0", "c_berkbeara_0"] {
             let e = crate::glb::export(&read, &s, &[model.to_string()]);
+            // Up 1 m and turned to 120 degrees.
+            let q = Quat::from_rotation_z(120f32.to_radians()).to_array();
             let moved = with_json(&e.glb, |j| {
                 j["nodes"][1]["translation"] = serde_json::json!([3.0, 4.0, 6.0]);
-                // An editor that keeps no extras.
-                for m in j["meshes"].as_array_mut().unwrap() {
-                    m.as_object_mut().unwrap().remove("extras");
-                }
-                for sk in j["skins"].as_array_mut().into_iter().flatten() {
-                    sk.as_object_mut().unwrap().remove("extras");
-                }
+                j["nodes"][1]["rotation"] = serde_json::json!(q);
+                strip(j);
             });
-            let imp = import(&moved, &e.manifest, &read).unwrap();
+            let imp = import(&moved, &e.manifest, &read, false).unwrap();
+            let p = imp.moved.expect(model);
+            assert!((Vec3::from_array(p.position) - Vec3::new(3.0, 4.0, 6.0)).length() < 1e-4);
+            assert!((p.facing - 120.0).abs() < 1e-3, "{model}: {}", p.facing);
+            assert!(imp.meshes.is_empty(), "{model}: a move rewrote meshes");
+
+            let stretched = with_json(&e.glb, |j| {
+                j["nodes"][1]["scale"] = serde_json::json!([1.0, 1.0, 2.0]);
+                strip(j);
+            });
+            let imp = import(&stretched, &e.manifest, &read, false).unwrap();
+            assert!(imp.moved.is_none(), "{model}");
             assert!(!imp.meshes.is_empty(), "{model}");
             for im in &imp.meshes {
                 assert!(im.emptied.is_empty(), "{model}: {:?}", im.emptied);
-                let orig = Msh::parse(&read(&im.msh).unwrap().data).unwrap();
-                let new = Msh::parse(&im.data).unwrap();
-                for c in &im.chunks {
-                    let a = orig
-                        .attribute(orig.chunk(c).unwrap(), DeclUsage::Position, 0)
-                        .unwrap()
-                        .unwrap();
-                    let b = new
-                        .attribute(new.chunk(c).unwrap(), DeclUsage::Position, 0)
-                        .unwrap()
-                        .unwrap();
-                    for (p, q) in a.iter().zip(&b) {
-                        let d = Vec3::new(q[0] - p[0], q[1] - p[1], q[2] - p[2]).length();
-                        assert!((d - 1.0).abs() < 0.02, "{model}: {c}: moved {d}");
-                    }
-                }
+                assert!(!im.chunks.is_empty());
             }
             println!(
-                "{model}: {} mesh files, warnings {:?}",
-                imp.meshes.len(),
+                "{model}: moved, then stretched; warnings {:?}",
                 imp.warnings
             );
         }
@@ -1346,6 +1440,6 @@ mod tests {
     fn a_glb_that_is_not_one_is_refused() {
         assert!(Gltf::parse(b"nope").is_err());
         let m = serde_json::json!({"format": "something else"});
-        assert!(import(b"", &m, &|_| None).is_err());
+        assert!(import(b"", &m, &|_| None, false).is_err());
     }
 }

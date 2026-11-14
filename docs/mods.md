@@ -134,6 +134,10 @@ and show your edits while the game runs:
    with them: reshaped, moved or re-skinned, it keeps the game's own vertex layout and
    bones. `.imported` in the export's folder says what was written, or why not.
 
+Moving or turning the object itself in Blender (its top node, named after it) moves it in
+the game, as mod mode's Move does: undo puts it back. A model that is only moved writes no
+mesh file. A tilt or a stretch of the whole object goes into its meshes instead.
+
 Meshes: keep each mesh's name (the export names them after the game's chunks), and its
 armature's bone names; a vertex can only follow bones its mesh already used (new bones need
 the model file, which is not written yet). A mesh deleted in Blender is written empty.
