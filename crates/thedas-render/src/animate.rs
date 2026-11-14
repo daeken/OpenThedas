@@ -70,6 +70,12 @@ pub struct Animator {
     /// Dragon Age II animations whose bones were named for a skeleton already (see
     /// [`Animator::named_for`]): by animation and the skeleton's index.
     named: std::collections::HashSet<(String, usize)>,
+    /// Animations whose tracks name their bones (Dragon Age: Origins'), by resource: no
+    /// naming to do (see [`Animator::named_for`]).
+    unhashed: std::collections::HashSet<String>,
+    /// Each animation's track nodes on each skeleton (by the skeleton's index, then the
+    /// animation's resource): see [`crate::skeleton::Skeleton::track_nodes`].
+    track_nodes: HashMap<usize, HashMap<String, Arc<[Option<usize>]>>>,
 }
 
 fn load<T>(
@@ -78,6 +84,12 @@ fn load<T>(
     name: &str,
     parse: impl Fn(&[u8]) -> Option<T>,
 ) -> Option<Arc<T>> {
+    // Read every frame: found without a copy of the name when it is lowercase already.
+    if !name.bytes().any(|b| b.is_ascii_uppercase())
+        && let Some(hit) = cache.get(name)
+    {
+        return hit.clone();
+    }
     let key = name.to_ascii_lowercase();
     cache
         .entry(key.clone())
@@ -101,6 +113,27 @@ impl Animator {
     pub fn forget_skeletons(&mut self) {
         self.rests.clear();
         self.named.clear();
+        self.track_nodes.clear();
+    }
+
+    /// Animation `anim`'s (resource `ani`) track nodes on skeleton `skeleton` (`s`), worked
+    /// out once.
+    fn track_nodes_for(
+        &mut self,
+        ani: &str,
+        anim: &Animation,
+        skeleton: usize,
+        s: &crate::skeleton::Skeleton,
+    ) -> Arc<[Option<usize>]> {
+        let by_ani = self.track_nodes.entry(skeleton).or_default();
+        match by_ani.get(ani) {
+            Some(n) if n.len() == anim.tracks.len() => n.clone(),
+            _ => {
+                let n: Arc<[Option<usize>]> = s.track_nodes(anim).into();
+                by_ani.insert(ani.to_string(), n.clone());
+                n
+            }
+        }
     }
 
     /// The `.ani` resource a clip plays (the first tree with one of its actions), and the
@@ -196,13 +229,20 @@ impl Animator {
         skeleton: usize,
         s: &crate::skeleton::Skeleton,
     ) -> Arc<Animation> {
+        if self.unhashed.contains(ani) {
+            return anim;
+        }
         let key = ani.to_ascii_lowercase();
         let hashed = |a: &Animation| {
             a.tracks
                 .iter()
                 .any(|t| thedas_formats::hash_of_hashed_name(&t.bone).is_some())
         };
-        if !hashed(&anim) || !self.named.insert((key.clone(), skeleton)) {
+        if !hashed(&anim) {
+            self.unhashed.insert(ani.to_string());
+            return anim;
+        }
+        if !self.named.insert((key.clone(), skeleton)) {
             return anim;
         }
         let mut named = (*anim).clone();
@@ -234,14 +274,18 @@ impl Animator {
                 c.time.min(a.length)
             }
         };
-        let mut layers: Vec<(Arc<Animation>, f32, bool, f32)> = Vec::new();
+        type Posed = (Arc<Animation>, f32, bool, f32, Arc<[Option<usize>]>);
+        let mut layers: Vec<Posed> = Vec::new();
         for c in std::iter::once(clip).chain(&clip.layers) {
             if let Some(anim) = &c.inline {
-                layers.push((anim.clone(), time(c, anim), c.absolute, c.weight));
+                // Made for this frame: its nodes are not kept.
+                let nodes: Arc<[Option<usize>]> = s.track_nodes(anim).into();
+                layers.push((anim.clone(), time(c, anim), c.absolute, c.weight, nodes));
             } else if let Some((ani, anim)) = self.animation_resource(vfs, c) {
                 let anim = self.named_for(&ani, anim, skeleton, &s);
+                let nodes = self.track_nodes_for(&ani, &anim, skeleton, &s);
                 let t = time(c, &anim);
-                layers.push((anim, t, c.absolute, c.weight));
+                layers.push((anim, t, c.absolute, c.weight, nodes));
             }
         }
         if layers.is_empty() {
@@ -252,11 +296,17 @@ impl Animator {
             .entry(skeleton)
             .or_insert_with(|| Arc::new(s.rest()))
             .clone();
-        let refs: Vec<(&Animation, f32, bool, f32)> = layers
+        let mapped: Vec<crate::skeleton::Layer<'_>> = layers
             .iter()
-            .map(|(a, t, b, w)| (a.as_ref(), *t, *b, *w))
+            .map(|(a, t, b, w, n)| crate::skeleton::Layer {
+                anim: a,
+                time: *t,
+                against_base: *b,
+                weight: *w,
+                nodes: n,
+            })
             .collect();
-        Some((rest, s.pose_weighted(&refs)))
+        Some((rest, s.pose_mapped(&mapped)))
     }
 }
 
