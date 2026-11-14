@@ -68,11 +68,18 @@ A new crate, `crates/thedas-gfx`, with no Ruffle dependency:
    `Set/GetVariable(path)` from the host; `fscommand` answered synchronously so
    `fsc_retval` is set before the call returns; mouse button passed to press handlers;
    `onLoad` after the frame's code; `Stage.width/height` report the visible area.
+   Intervals preserve their scheduled phase and catch up in deadline order. Delays use
+   integer milliseconds with a 10 ms minimum; a bounded scheduler clock limits catch-up
+   work without rewinding `getTimer`. Removed clips stop receiving method timers.
 3. **`display`**: the display list (MovieClip, Shape, EditText, Morph), timelines, depth
    rules, mouse picking (with `hitTestDisable`), focus and keyboard routing, input text.
    Timeline-placed registered classes construct parents before descendants. This preserves
    the GUI framework's last-created element and associates post-load callbacks with the
    intended child, including popup centring before the text resizes its box.
+   Timeline jumps rebuild a symbol removed and placed afresh at the same depth, including
+   its name, constructor and callbacks. Rewinds preserve script state only while the
+   instance's original placement remains in the target frame. This keeps chargen's
+   appearance navigation and load-screen headers from retaining the previous scene.
    `MovieClip.setMask` accepts clip objects and activation-relative paths, transfers a mask
    from its previous owner, and clears with null/undefined. Removal detaches both links.
    Dynamic masks use filled geometry in stage space, ignore visibility/alpha and filters,
@@ -84,6 +91,9 @@ A new crate, `crates/thedas-gfx`, with no Ruffle dependency:
    Focused fields track a selection anchor and caret. Ctrl+A and `Selection.setSelection`
    replace/delete the selected range; Shift navigation extends it. Selection getters and
    setters translate script UTF-16 indices to the text storage's character boundaries.
+   Programmatic `Selection.setFocus` selects all existing text, including refocusing the
+   same field, so typing replaces a prefilled save name. Invalid targets preserve focus;
+   null/undefined clear it. Mouse focus still places the caret from the pointer.
    Layout retains character advances, including spaces, for selection highlighting and the
    insertion caret. Focused ranges draw white text over black highlights; an input caret
    blinks at 500 ms intervals, resets on edits/navigation, and disappears on focus loss.
@@ -98,6 +108,9 @@ A new crate, `crates/thedas-gfx`, with no Ruffle dependency:
    Dirty mouse picking is refreshed after frame/interval actions and wheel listeners, so
    clips moved or hidden beneath a stationary pointer receive the corresponding rollover
    changes. Unchanged display lists skip the pick walk.
+   Native topmost-entity queries include a clip's own dynamic fills beneath its children,
+   in world coordinates, while respecting timeline and script masks. Transparent fills
+   are still entities; decorative drawings do not gain button events or text focus.
 
 ## Switch and parity
 
