@@ -3081,11 +3081,20 @@ pub fn call(
         }
         "GetHealth" => {
             let health = constant(&h.sim.table, "PROPERTY_DEPLETABLE_HEALTH");
-            ok(Value::Int(
-                h.object(obj(a, 0))
-                    .and_then(|o| o.properties.get(&health))
-                    .map_or(0, |p| p.1.round() as i32),
-            ))
+            let current = h.object(obj(a, 0)).map_or(0, |o| {
+                if let Some(p) = o.properties.get(&health) {
+                    // Retain explicit currents from our older saves.
+                    p.1.round() as i32
+                } else if h.sim.game == thedas_vfs::Game::Origins && o.kind == ObjectKind::Placeable
+                {
+                    // 0x750370 loads Health independently of MaxHealth, after
+                    // signed-short narrowing; 0x750f50 reads that current.
+                    i32::from(o.fields.get("Health").copied().unwrap_or(0) as i16)
+                } else {
+                    0
+                }
+            });
+            ok(Value::Int(current))
         }
         "MoveItem" => {
             let (from, to, item) = (obj(a, 0), obj(a, 1), obj(a, 2));
@@ -3436,6 +3445,19 @@ pub fn call(
             } else {
                 void()
             }
+        }
+        "SetMaxHealth"
+            if h.sim.game == thedas_vfs::Game::Origins
+                && h.object(obj(a, 0))
+                    .is_some_and(|o| o.kind == ObjectKind::Placeable) =>
+        {
+            // 0x65a330 -> 0x750f70: store the sign-extended short in the
+            // placeable's separate maximum member. Current health stays put.
+            if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
+                o.fields
+                    .insert("MaxHealth".into(), i32::from(int(a, 1) as i16));
+            }
+            void()
         }
         "SetMaxHealth" => {
             // PROPERTY_DEPLETABLE_HEALTH: base is the maximum, current is clamped to it.
@@ -7599,6 +7621,116 @@ mod tests {
         );
         // The native int reader reinterprets the float cell's bits, rather than converting 1.0.
         assert_eq!(run(&mut s, 0, "GetMaxLevel", &[]), Some(Value::Int(1)));
+    }
+
+    #[test]
+    fn origins_placeable_max_health_does_not_assign_current_health() {
+        let table = Arc::new(
+            EngineTable::parse(
+                b"int PROPERTY_DEPLETABLE_HEALTH = 7;\n\
+                  void SetMaxHealth(object o, int n) = 1;\n\
+                  int Deprecated_GetMaxHealth(object o) = 2;\n\
+                  int GetHealth(object o) = 3;",
+            )
+            .unwrap(),
+        );
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        let id = s.world.spawn(ObjectKind::Placeable, "chest");
+        let o = s.world.get_mut(id).unwrap();
+        o.fields.insert("Health".into(), 16);
+        o.dead = true;
+        o.active = false;
+        o.immortal = true;
+        o.plot = true;
+        o.modifiers.insert(7, 13.5);
+        for health in [None, Some(0.0), Some(80.0)] {
+            let o = s.world.get_mut(id).unwrap();
+            o.properties.remove(&7);
+            if let Some(current) = health {
+                o.properties.insert(7, (100.0, current));
+            }
+            let properties = o.properties.clone();
+            for value in [
+                i32::MIN,
+                -65537,
+                -32769,
+                -32768,
+                -1,
+                0,
+                1,
+                30,
+                32767,
+                32768,
+                65535,
+                65536,
+                i32::MAX,
+            ] {
+                let queued = s.world.queue.len();
+                run(
+                    &mut s,
+                    id,
+                    "SetMaxHealth",
+                    &[Value::Object(id), Value::Int(value)],
+                );
+                let o = s.world.get(id).unwrap();
+                assert_eq!(o.properties, properties);
+                assert_eq!(o.fields["MaxHealth"], i32::from(value as i16));
+                assert_eq!(o.fields["Health"], 16);
+                assert_eq!(o.modifiers[&7], 13.5);
+                assert!(o.dead && o.immortal && o.plot && !o.active);
+                assert_eq!(s.world.queue.len(), queued);
+                assert_eq!(
+                    run(&mut s, id, "Deprecated_GetMaxHealth", &[Value::Object(id)]),
+                    Some(Value::Int(i32::from(value as i16)))
+                );
+                assert_eq!(
+                    run(&mut s, id, "GetHealth", &[Value::Object(id)]),
+                    Some(Value::Int(health.unwrap_or(16.0) as i32))
+                );
+                s.load_json(&s.save_json().unwrap()).unwrap();
+                assert_eq!(s.world.get(id).unwrap().properties, properties);
+                assert_eq!(
+                    s.world.get(id).unwrap().clone().fields["MaxHealth"],
+                    i32::from(value as i16)
+                );
+            }
+        }
+        s.world.get_mut(id).unwrap().properties.remove(&7);
+        for current in [i32::MIN, -65537, 0, 32768, 65535, i32::MAX] {
+            s.world
+                .get_mut(id)
+                .unwrap()
+                .fields
+                .insert("Health".into(), current);
+            assert_eq!(
+                run(&mut s, id, "GetHealth", &[Value::Object(id)]),
+                Some(Value::Int(i32::from(current as i16)))
+            );
+        }
+        s.game = thedas_vfs::Game::DragonAge2;
+        s.world
+            .get_mut(id)
+            .unwrap()
+            .properties
+            .insert(7, (100.0, 0.0));
+        run(
+            &mut s,
+            id,
+            "SetMaxHealth",
+            &[Value::Object(id), Value::Int(65535)],
+        );
+        assert_eq!(s.world.get(id).unwrap().properties[&7], (65535.0, 65535.0));
+        s.world.get_mut(id).unwrap().properties.remove(&7);
+        assert_eq!(
+            run(&mut s, id, "GetHealth", &[Value::Object(id)]),
+            Some(Value::Int(0))
+        );
+        s.game = thedas_vfs::Game::Origins;
+        s.world.get_mut(id).unwrap().kind = ObjectKind::Creature;
+        assert_eq!(
+            run(&mut s, id, "GetHealth", &[Value::Object(id)]),
+            Some(Value::Int(0))
+        );
     }
 
     #[test]
