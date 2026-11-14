@@ -5357,7 +5357,7 @@ impl Sim {
                 o.properties.entry(p).or_insert((0.0, 0.0)).0 = value;
             }
         } else if vt == current && kind == PropertyKind::Depletable {
-            let max = self.property_total(id, p);
+            let max = self.depletable_current_ceiling(id, p);
             if let Some(o) = self.world.get_mut(id) {
                 let e = o.properties.entry(p).or_insert((0.0, 0.0));
                 let v = if update { e.1 + value } else { value };
