@@ -617,21 +617,22 @@ fn command_constant(name: &str) -> String {
     out
 }
 
-/// Constructors whose command type script.ldf does not name; scripts only check that a
-/// command's type is not 0 (`COMMAND_TYPE_INVALID`: rules_core warns "Something is trying to
-/// add an invalid command"), so these get types of their own above the named ones.
-/// Provisional: the engine's own numbers for them are not recovered.
-const UNNAMED_COMMANDS: &[&str] = &[
-    "CommandMoveAwayFromObject",
-    "CommandMoveToMultiLocations",
-    "CommandSheatheWeapons",
-    "CommandUnsheatheWeapons",
-    "CommandTurn",
+/// Origins constructors whose runtime type script.ldf does not name. Traced assignments
+/// go through 0x742090 and are read back by GetCommandType (0x66eba0). Different
+/// constructors may share a type; their payload and executor still distinguish them.
+const UNNAMED_COMMANDS: &[(&str, i32)] = &[
+    ("CommandMoveAwayFromObject", 21),   // 0x66f564
+    ("CommandMoveToMultiLocations", 22), // 0x673383
+    ("CommandSheatheWeapons", 39),       // 0x66fbb9
+    ("CommandUnsheatheWeapons", 39),     // same handler, different payload
+    ("CommandTurn", 41),                 // 0x66eabe
 ];
 
 /// A command constructor's `COMMAND_TYPE_*` value (see [`UNNAMED_COMMANDS`]).
-fn command_type(table: &thedas_script::EngineTable, name: &str) -> i32 {
-    match UNNAMED_COMMANDS.iter().position(|n| *n == name) {
+fn command_type(table: &thedas_script::EngineTable, name: &str, game: thedas_vfs::Game) -> i32 {
+    match UNNAMED_COMMANDS.iter().position(|(n, _)| *n == name) {
+        Some(i) if game == thedas_vfs::Game::Origins => UNNAMED_COMMANDS[i].1,
+        // DA2's assignments have not been traced; keep its existing placeholders.
         Some(i) => 1000 + i as i32,
         None => constant(table, &command_constant(name)),
     }
@@ -2370,7 +2371,7 @@ pub fn call(
         // --- Commands ---------------------------------------------------------------------
         n if n.starts_with("Command") && f.ret == Type::Engine(ty.command) => {
             let mut c = Command {
-                ty: command_type(&h.sim.table, n),
+                ty: command_type(&h.sim.table, n, h.sim.game),
                 name: n.to_string(),
                 target: None,
                 location: None,
@@ -3547,10 +3548,22 @@ pub fn call(
                 .unwrap_or(0),
         )),
         "GetTeam" => {
-            let (team, mask) = (int(a, 0), int(a, 1));
-            let mask = if mask == 0 { 32 } else { mask };
-            // Only the loaded area's objects (active or not): areas left behind keep
-            // their teams, and those must not keep a team here alive.
+            let team = int(a, 0);
+            let mask = if a.len() > 1 { int(a, 1) } else { 32 };
+            // Origins 0x66e570 obtains the current area's team registry (0x5d4fc0,
+            // 0x5fe470). Its type argument selects one bucket, log2(type) + 1,
+            // rather than combining the bits. -1 is the invalid team id.
+            let mask = if h.sim.game == thedas_vfs::Game::Origins {
+                if team == -1 || mask <= 0 || h.sim.world.area.is_none() {
+                    return ok(objects(Vec::new()));
+                }
+                1 << (mask as u32).ilog2()
+            } else if mask == 0 {
+                32
+            } else {
+                mask
+            };
+            // Inactive and dead members remain in the registry; other areas do not.
             let here = h.sim.world.area;
             let v: Vec<ObjectId> = h
                 .sim
@@ -5814,6 +5827,46 @@ mod tests {
     }
 
     #[test]
+    fn unnamed_constructor_types_are_observable_through_the_script_accessor() {
+        let table = Arc::new(
+            EngineTable::parse(
+                br#"
+          #define ENGINE_STRUCTURE_2 command
+          command CommandMoveAwayFromObject() = 1;
+          command CommandMoveToMultiLocations() = 2;
+          command CommandSheatheWeapons() = 3;
+          command CommandUnsheatheWeapons() = 4;
+          command CommandTurn() = 5;
+          int GetCommandType(command c) = 6;
+        "#,
+            )
+            .unwrap(),
+        );
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        let creature = s.world.spawn(ObjectKind::Creature, "creature");
+        for (name, expected) in [
+            ("CommandMoveAwayFromObject", 21),
+            ("CommandMoveToMultiLocations", 22),
+            ("CommandSheatheWeapons", 39),
+            ("CommandUnsheatheWeapons", 39),
+            ("CommandTurn", 41),
+        ] {
+            let command = run(&mut s, creature, name, &[]).unwrap();
+            assert_eq!(
+                run(&mut s, creature, "GetCommandType", &[command]),
+                Some(Value::Int(expected)),
+                "{name}"
+            );
+        }
+        s.game = thedas_vfs::Game::DragonAge2;
+        let command = run(&mut s, creature, "CommandTurn", &[]).unwrap();
+        assert_eq!(
+            run(&mut s, creature, "GetCommandType", &[command]),
+            Some(Value::Int(1004))
+        );
+    }
+
+    #[test]
     fn treasure_rank_reads_only_a_placeables_rank() {
         let table =
             Arc::new(EngineTable::parse(b"int GetPlaceableTreasureRank(object o) = 818;").unwrap());
@@ -6714,6 +6767,48 @@ mod tests {
             Some(objects(vec![team[0], team[1]])),
             "inactive members count, other areas' do not"
         );
+        s.world.get_mut(team[0]).unwrap().dead = true;
+        assert_eq!(
+            run(&mut s, there, "GetTeam", &[Value::Int(16)]),
+            Some(objects(vec![team[0], team[1]])),
+            "the default includes dead creatures and uses the loaded area, not the caller"
+        );
+        let chest = s.world.spawn(ObjectKind::Placeable, "chest");
+        let o = s.world.get_mut(chest).unwrap();
+        o.team = 16;
+        o.area = Some(here);
+        // A multi-bit type selects its highest bit's bucket, rather than a union.
+        for mask in [512, 512 | 32, 1023] {
+            assert_eq!(
+                run(&mut s, here, "GetTeam", &[Value::Int(16), Value::Int(mask)]),
+                Some(objects(vec![chest]))
+            );
+        }
+        s.world.get_mut(team[1]).unwrap().team = -1;
+        for (id, mask) in [(-1, 32), (99, 32), (16, 0), (16, -1)] {
+            assert_eq!(
+                run(&mut s, here, "GetTeam", &[Value::Int(id), Value::Int(mask)]),
+                Some(objects(vec![]))
+            );
+        }
+        s.world.area = Some(there);
+        assert_eq!(
+            run(&mut s, here, "GetTeam", &[Value::Int(16)]),
+            Some(objects(vec![team[2]]))
+        );
+        // With no loaded area, area-less objects are not a substitute registry.
+        s.world.get_mut(team[2]).unwrap().area = None;
+        s.world.area = None;
+        assert_eq!(
+            run(&mut s, here, "GetTeam", &[Value::Int(16)]),
+            Some(objects(vec![]))
+        );
+        // DA2 retains its earlier provisional mask and area-less behavior.
+        s.game = thedas_vfs::Game::DragonAge2;
+        assert_eq!(
+            run(&mut s, here, "GetTeam", &[Value::Int(16), Value::Int(0)]),
+            Some(objects(vec![team[2]]))
+        );
     }
 
     #[test]
@@ -7506,11 +7601,11 @@ mod tests {
             "COMMAND_TYPE_SWITCH_WEAPON_SETS"
         );
         let table = thedas_script::EngineTable::default();
-        assert!(
-            UNNAMED_COMMANDS
-                .iter()
-                .all(|n| command_type(&table, n) >= 1000)
-        );
+        assert!(UNNAMED_COMMANDS.iter().all(|(n, _)| command_type(
+            &table,
+            n,
+            thedas_vfs::Game::DragonAge2
+        ) >= 1000));
         assert_eq!(format_float(1.5, 0, 6), "1.500000");
         assert_eq!(format_float(2.0, 6, 1), "   2.0");
         let square = [
