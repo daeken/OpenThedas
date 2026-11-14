@@ -86,6 +86,9 @@ pub struct Sim {
     /// Instructions a single script run may take.
     pub script_budget: u64,
     pub chargen_policy: ChargenPolicy,
+    /// Which game the install holds (set when a session opens it). Dragon Age II's
+    /// character creation has no quick start of its own (see [`Sim::start_chargen`]).
+    pub game: thedas_vfs::Game,
     pub cutscene_policy: CutscenePolicy,
     pub party_picker_policy: PartyPickerPolicy,
     /// The player's "auto-pause when combat starts" option (`GetAutoPauseCombatStatus`);
@@ -160,6 +163,9 @@ pub struct Sim {
     /// Every command given through [`Sim::apply`] since it was turned on (`Some`), for
     /// journal-style saves to write out. Off (`None`) by default.
     pub input_log: Option<Vec<crate::commands::InputEntry>>,
+    /// How many games have been loaded into this simulation (journal-style saves start a
+    /// new checkpoint after each).
+    pub loads: u64,
     pub(crate) plots: crate::plot::Plots,
     /// The talk tables' strings, read once (tests set them).
     pub(crate) strings: std::sync::OnceLock<std::collections::BTreeMap<u32, String>>,
@@ -580,6 +586,7 @@ impl Sim {
             depth: 0,
             script_budget: 5_000_000,
             chargen_policy: ChargenPolicy::default(),
+            game: thedas_vfs::Game::Origins,
             cutscene_policy: CutscenePolicy::default(),
             party_picker_policy: PartyPickerPolicy::default(),
             auto_pause_combat: false,
@@ -595,6 +602,7 @@ impl Sim {
             ambient: Vec::new(),
             voices: crate::voice::Voices::new(),
             input_log: None,
+            loads: 0,
             install_root: None,
             area_layouts: HashMap::new(),
             nav_grids: HashMap::new(),
@@ -777,6 +785,15 @@ impl Sim {
     pub fn deliver(&mut self, target: ObjectId, mut event: Event, script: Option<String>) {
         if event.target.is_none() {
             event.target = Some(target);
+        }
+        if self.path_action_stale(target, &event) {
+            let t = self.world.time_ms;
+            self.world.trace.push(TraceEntry::Log {
+                t,
+                channel: -2,
+                text: format!("path action for {target} dropped: a newer order"),
+            });
+            return;
         }
         let Some(obj) = self.world.get(target) else {
             self.world.trace.push(TraceEntry::Missing {
@@ -1443,18 +1460,22 @@ impl Sim {
 
     /// [`Sim::answer_popup`] with the text typed into the box: DAOrigins.exe's
     /// `POPUP_RESULT` (built at 0x709950) carries it as string 0 (0x709971), empty when the
-    /// box has no input field.
+    /// box has no input field. It goes to the module (0x7098ef: the target is the object
+    /// 0x5d4fc0 answers, as for `GUI_OPENED`), with the popup's owner as object 0
+    /// (0x70993b); sp_module answers the dog-naming box from it with `SetName`. Sent to the
+    /// owner instead, the dog kept its name.
     pub fn answer_popup_with_text(&mut self, button: i32, text: &str) -> bool {
         let Some(p) = self.world.popup.take() else {
             return false;
         };
-        let target = if self.world.get(p.owner).is_some() {
-            p.owner
-        } else {
-            match self.world.module {
-                Some(m) => m,
-                None => return false,
-            }
+        // Without a module (tests, a bare simulation) the owner hears it.
+        let Some(target) = self
+            .world
+            .module
+            .or(Some(p.owner))
+            .filter(|&t| self.world.get(t).is_some())
+        else {
+            return false;
         };
         let mut ev = self.new_event("POPUP_RESULT", self.world.hero);
         ev.objects = vec![p.owner];
@@ -1815,6 +1836,15 @@ impl Sim {
         // Level-up (mode 1) only starts when someone asked for it (`request_level_up`), so
         // it is left for them to finish.
         if self.chargen_policy == ChargenPolicy::QuickStart && mode == 0 {
+            // Dragon Age II's `sys_chargen` gives the hero no class when creation simply
+            // ends, and its prologue reads the class from the class abilities that choosing
+            // one grants. So the quick start chooses as a player would: male (gender 1),
+            // then warrior (class 1), each as the old and the new choice the screen sends.
+            // Provisional: the events' integers are read from DA2's `sys_chargen`.
+            if self.game == thedas_vfs::Game::DragonAge2 {
+                self.chargen_event("CHARGEN_SELECT_GENDER", vec![1, 1], Vec::new());
+                self.chargen_event("CHARGEN_SELECT_CLASS", vec![0, 1], Vec::new());
+            }
             self.chargen_event("CHARGEN_END", vec![mode, 0], Vec::new());
         }
     }
@@ -1889,6 +1919,39 @@ impl Sim {
 
     /// Moves an object and sends trigger ENTER/EXIT events for creatures that cross a
     /// trigger's outline. Movement is a teleport: only the destination is tested.
+    /// `DestroyObject`: an area of effect ends; anything else but the hero is removed, an
+    /// item first leaving whoever holds it: taken off if worn (its effects end and the
+    /// wearer hears UNEQUIP), then out of the inventory, so no dangling ids stay behind (the
+    /// City Elf house script destroys the hero's starting clothes). Provisional: the exe's
+    /// container removal on destruction is not traced.
+    pub(crate) fn destroy_object(&mut self, id: ObjectId) {
+        if self
+            .world
+            .get(id)
+            .is_some_and(|o| o.kind == ObjectKind::AreaOfEffect)
+        {
+            self.destroy_aoe(id);
+            return;
+        }
+        if Some(id) == self.world.hero {
+            return;
+        }
+        let holders: Vec<ObjectId> = self
+            .world
+            .objects
+            .values()
+            .filter(|o| o.inventory.contains(&id))
+            .map(|o| o.id)
+            .collect();
+        for holder in holders {
+            self.unequip(holder, id);
+            if let Some(o) = self.world.get_mut(holder) {
+                o.inventory.retain(|&i| i != id);
+            }
+        }
+        self.world.objects.remove(&id);
+    }
+
     pub fn move_object(&mut self, id: ObjectId, position: [f32; 3], area: Option<ObjectId>) {
         if let Some(o) = self.world.get_mut(id) {
             o.position = position;
@@ -2934,8 +2997,51 @@ impl Sim {
     /// the script hears of it), and a held stick orders a new move about ten times a
     /// second, each replacing the mover's commands, so the use command runs only when it
     /// gets in before the next order: on some pushes the hero stands at the door instead.
+    ///
+    /// A failure the player has overtaken is not told: when the event falls due, the player
+    /// has given the creature another order since and is no longer walking into that door (a
+    /// let-go stick's stop, a click elsewhere), the script does not hear of it, so the door
+    /// does not open after the player has stopped (it did, 1.5 s after a released stick).
+    /// Still pushing into the same door, it is told, and the door opens. Provisional:
+    /// whether DAOrigins.exe drops a stale path action, or ties it to its command, is not
+    /// traced; its executor answers in the update the command fails, before a newer order
+    /// can come, which this delay stands in for.
     pub(crate) fn fail_blocked(&mut self, id: ObjectId, door: ObjectId) {
+        if let Some(o) = self.world.get_mut(id) {
+            o.combat.path_action_at = Some(o.combat.player_orders);
+        }
         self.fail_front_command_with(id, "COMMAND_FAILED_PATH_ACTION_REQUIRED", Some(door));
+    }
+
+    /// Whether a path action that fell due for `id` is stale (see [`Sim::fail_blocked`]).
+    fn path_action_stale(&mut self, id: ObjectId, event: &Event) -> bool {
+        let path_action = constant(&self.table, "COMMAND_FAILED_PATH_ACTION_REQUIRED");
+        if event.ty != self.event_type("COMMAND_COMPLETE")
+            || event.ints.get(1).copied() != Some(path_action)
+        {
+            return false;
+        }
+        let Some((at, now)) = self
+            .world
+            .get_mut(id)
+            .and_then(|o| Some((o.combat.path_action_at.take()?, o.combat.player_orders)))
+        else {
+            return false;
+        };
+        if at == now {
+            return false;
+        }
+        let door = event.objects.get(2).copied().unwrap_or(OBJECT_INVALID);
+        let pushing = self
+            .world
+            .get(id)
+            .and_then(|o| o.commands.first())
+            .filter(|c| c.name == "CommandMoveToLocation")
+            .and_then(|c| c.location.as_ref().map(|l| l.position));
+        match pushing {
+            Some(to) => self.route_to(id, to) != crate::nav::Routed::Door(door),
+            None => true,
+        }
     }
 
     pub(crate) fn fail_front_command(&mut self, id: ObjectId, result: &str) {
@@ -4315,6 +4421,21 @@ pub struct ScriptHost<'a> {
     pub script: String,
 }
 
+/// An engine function's integer or float result in the numeric type the engine table
+/// declares. The engine arms follow Dragon Age: Origins' signatures, and Dragon Age II's
+/// `script.ldf` declares some of the same functions with the other numeric type
+/// (`float GetItemPropertyPower(...)`, `int` in DA:O); a script compiled against it expects
+/// that type on the stack. A float becomes an integer by truncation. Other values are left
+/// as they are.
+fn numeric_as_declared(v: Value, ret: &thedas_script::ldf::Type) -> Value {
+    use thedas_script::ldf::Type;
+    match (v, ret) {
+        (Value::Int(i), Type::Float) => Value::Float(i as f32),
+        (Value::Float(x), Type::Int) => Value::Int(x as i32),
+        (v, _) => v,
+    }
+}
+
 impl Host for ScriptHost<'_> {
     fn action(
         &mut self,
@@ -4343,7 +4464,26 @@ impl Host for ScriptHost<'_> {
             _ => None,
         });
         let mana_before = mana_target.map(|id| (id, self.sim.mana_now(id)));
-        let result = crate::engine::call(self, caller, f, &args);
+        let mut result = crate::engine::call(self, caller, f, &args);
+        if let Some(Ok(Some(v))) = &mut result {
+            let declared = numeric_as_declared(v.clone(), &f.ret);
+            if declared != *v {
+                // Traced, so an arm answering in the wrong type shows up: on Dragon Age:
+                // Origins there should be none (each would be an arm to fix); Dragon Age II's
+                // retyped functions are expected here.
+                let t = self.sim.world.time_ms;
+                self.sim.world.trace.push(TraceEntry::Missing {
+                    t,
+                    what: format!(
+                        "engine function {} answered {}, declared {}",
+                        f.name,
+                        v.kind(),
+                        f.ret
+                    ),
+                });
+                *v = declared;
+            }
+        }
         if let Some((id, before)) = mana_before {
             self.sim.note_mana_change(id, before);
         }

@@ -159,6 +159,9 @@ pub enum FrontEnd {
     /// The game menu's "Mod Mode" (a button the interface adds): mod mode's panels open or
     /// close, as F10 does.
     ModMode,
+    /// The start menu's offer to resume a session that ended unexpectedly, taken: the game
+    /// kept in the journal (see `crate::journal`).
+    Resume,
 }
 
 impl std::fmt::Debug for FrontEnd {
@@ -170,6 +173,7 @@ impl std::fmt::Debug for FrontEnd {
             FrontEnd::Quit => write!(f, "Quit"),
             FrontEnd::Report => write!(f, "Report"),
             FrontEnd::ModMode => write!(f, "ModMode"),
+            FrontEnd::Resume => write!(f, "Resume"),
         }
     }
 }
@@ -2029,6 +2033,11 @@ impl UiLayer {
                 Some(Screen::SpellsTalents) => 1,
                 _ => 0,
             };
+            // The store opens on its All tab, with nothing traded yet.
+            if !screens.shown().contains(&Screen::Store) {
+                shown.store_filter = 0;
+                shown.store_traded = Default::default();
+            }
         }
         let (want, line) = {
             let sim = sim.lock().unwrap_or_else(|p| p.into_inner());

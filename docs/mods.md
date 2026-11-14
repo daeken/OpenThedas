@@ -116,6 +116,45 @@ thedas mod-cache --prune
 deletes the ones it no longer uses. It only ever deletes its own folders inside `mod-cache`,
 never a mod of yours.
 
+## Mod mode's live edits
+
+Mod mode (F10, or Mod Mode in the game menu) can export a creature or object for Blender
+and show your edits while the game runs:
+
+1. Pick the object (Ctrl+click) and press **Export to Blender**. Its models go to
+   `workspace/blender/<tag>/` in your data folder: a `.glb` Blender opens, its textures as
+   PNGs, and `manifest.json` saying where each came from.
+2. Tick **Live edits** (or start the game with `--mod-workspace`). This mounts
+   `workspace/override/` in your data folder above everything else, your last mod included.
+3. Save over one of the export's PNGs, from Blender or any paint program. Within half a
+   second it is written to `workspace/override/` under the game's own texture name, and the
+   object is drawn with it.
+4. Or edit the model in Blender and export it over the `.glb` (glTF Binary). Its meshes are
+   written back as the game's `.msh` files in `workspace/override/` and the object is drawn
+   with them: reshaped, moved or re-skinned, it keeps the game's own vertex layout and
+   bones. `.imported` in the export's folder says what was written, or why not.
+
+Moving or turning the object itself in Blender (its top node, named after it) moves it in
+the game, as mod mode's Move does: undo puts it back. A model that is only moved writes no
+mesh file. A tilt or a stretch of the whole object goes into its meshes instead.
+
+Meshes: keep each mesh's name (the export names them after the game's chunks), and its
+armature's bone names. Weighting a mesh to another bone of the model, or to a bone you add
+in Blender, works: a new bone is added to the model under its parent (it has no animation
+of its own and follows its parent), and the mesh's bone list grows (to at most 67 bones, the
+widest the game uses). The model file is then written to `workspace/override/` too. Moving
+the game's own bones in Blender is not written back (Blender may turn bones on import, and
+the game's animations depend on them). A mesh deleted in Blender is written empty.
+
+`workspace/override/` is an ordinary mod folder: put it in `mods.txt` (or copy its files
+anywhere a mod goes) to keep your edits. Live edits are never mounted unless you ask, and
+not at all with `THEDAS_MODS=none`; while they are, reports name the `workspace:override`
+layer, so a report from an edited game is not taken for a bug in the original's behaviour.
+
+Textures are written uncompressed for now (bigger files, same look). What was already
+loaded from an old file stays until it is read again: creatures and objects are redrawn at
+once; the level's own textures and meshes change on its next load.
+
 ## What does not work yet
 
 - `.rar` archives, and encrypted `.7z` archives.

@@ -60,6 +60,15 @@ pub trait Host {
     fn text_key(&mut self, key: thedas_ui::UiKey) -> bool;
     /// A value read from a movie (a call of `path`, as the headless `call` step makes).
     fn movie_value(&mut self, movie: &str, path: &str) -> Option<thedas_ui::UiValue>;
+    /// Whether spots are being marked for an issue report, and if so whether a box is
+    /// being drawn (`Some(true)`); `None` when not marking, or while a spot's note is asked.
+    fn marking(&mut self) -> Option<bool> {
+        None
+    }
+    /// Marking is done: the report's note is asked.
+    fn end_marking(&mut self) {}
+    /// The box being drawn is dropped (no note is asked for it).
+    fn drop_mark(&mut self) {}
 }
 
 /// The letters the D-pad steps through when typing on the pad, in order.
@@ -149,6 +158,12 @@ pub struct PadPlay {
     pub highlight: bool,
     /// An issue report was asked for (both sticks); the app makes it and clears this.
     pub report: bool,
+    /// Spots are being marked for an issue report (see `PadPlay::mark`): the pointer shows.
+    marking: bool,
+    /// A, B and Start as they were held last frame while marking (their presses act).
+    mark_held: (bool, bool, bool),
+    /// The D-pad directions held while marking (each press nudges once).
+    mark_dpad: Vec<crate::pad::Button>,
 }
 
 /// How often the focused button is looked for again (milliseconds).
@@ -203,12 +218,102 @@ impl PadPlay {
             self.show_reply(host);
         }
         let mut log = Vec::new();
+        // Marking spots for an issue report: the pad has a pointer of its own.
+        let marking = if popup { None } else { host.marking() };
+        // A, B and Start as held now and last frame, every frame: the A press that answers
+        // "Mark spots" is still held when marking starts, and must not start a box.
+        use crate::pad::Button;
+        let now = (
+            state.held(Button::A),
+            state.held(Button::B),
+            state.held(Button::Start),
+        );
+        let was = std::mem::replace(&mut self.mark_held, now);
+        self.marking = false;
+        if let Some(drawing) = marking {
+            self.mark(state, host, drawing, (was, now), dt_ms, &mut log);
+            return log;
+        }
         for order in self.controller.update(state, ctx, dt_ms) {
             if let Some(m) = self.apply(order, host) {
                 log.push(m);
             }
         }
         log
+    }
+
+    /// Marking spots for an issue report with the pad (ours, as reports are): the left stick
+    /// moves the pointer (the D-pad nudges it), A starts a box where it is and a second A
+    /// ends it there (the box's note is then asked, as after a mouse drag); B drops a box
+    /// being drawn, or with none ends marking, as Start does; the report's note follows.
+    fn mark(
+        &mut self,
+        state: &PadState,
+        host: &mut dyn Host,
+        drawing: bool,
+        (was, now): ((bool, bool, bool), (bool, bool, bool)),
+        dt_ms: f64,
+        log: &mut Vec<String>,
+    ) {
+        use crate::pad::Button;
+        self.marking = true;
+        self.snapped = false;
+        self.focused = None;
+        let (w, h) = host.size();
+        let v = crate::pad::dead_zone(state.left);
+        let mut step = Vec2::new(v.x, -v.y)
+            * ((dt_ms / 1000.0) as f32 * crate::pad::POINTER_SPEED * v.length());
+        // The D-pad nudges by a step a press.
+        for (b, d) in [
+            (Button::Left, Vec2::new(-1.0, 0.0)),
+            (Button::Right, Vec2::new(1.0, 0.0)),
+            (Button::Up, Vec2::new(0.0, -1.0)),
+            (Button::Down, Vec2::new(0.0, 1.0)),
+        ] {
+            let held = state.held(b);
+            let before = self.mark_dpad.contains(&b);
+            if held && !before {
+                step += d * POINTER_STEP as f32 / 4.0;
+                self.mark_dpad.push(b);
+            } else if !held && before {
+                self.mark_dpad.retain(|&x| x != b);
+            }
+        }
+        if step != Vec2::ZERO {
+            let (x, y) = host.cursor();
+            pointer_to(
+                host,
+                (x + step.x as f64).clamp(0.0, w as f64 - 1.0),
+                (y + step.y as f64).clamp(0.0, h as f64 - 1.0),
+            );
+        }
+        let pressed = |n: bool, o: bool| n && !o;
+        if pressed(now.0, was.0) {
+            host.left_button(!drawing);
+            log.push(
+                if drawing {
+                    "mark: box ended"
+                } else {
+                    "mark: box started"
+                }
+                .into(),
+            );
+        } else if pressed(now.1, was.1) {
+            if drawing {
+                host.drop_mark();
+                log.push("mark: box dropped".into());
+            } else {
+                host.end_marking();
+                log.push("mark: done".into());
+            }
+        } else if pressed(now.2, was.2) {
+            // A box half drawn is dropped, not kept without its note.
+            if drawing {
+                host.drop_mark();
+            }
+            host.end_marking();
+            log.push("mark: done".into());
+        }
     }
 
     /// A dialog box that shows while the pad is in use opens with its first button focused,
@@ -420,6 +525,10 @@ impl PadPlay {
                 self.held = self.target.is_some();
                 self.target_message(host)
             }
+            Action::SwapWeapons => {
+                host.live()?.switch_weapon_set();
+                "weapon set switched".into()
+            }
             Action::ClearTarget => {
                 self.target = None;
                 self.held = false;
@@ -620,29 +729,12 @@ impl PadPlay {
                         .screens()
                         .is_some_and(|s| s.menu.is_some_and(|m| s.shown().contains(&m)));
                 if !menu {
-                    // A dialog box, the start menu, character creation: its own Back,
-                    // Previous, Cancel, Close or No button; in a dialog box whose buttons
-                    // are not named so, its last (Cancel, after OK; or its only one).
                     // Provisional: the 360 version's B is not traced.
-                    let popup = host.popup();
-                    let targets = host.focus_targets();
-                    // A way out (Close, Cancel, No) before a step back (Back, Previous).
-                    let named = targets
-                        .iter()
-                        .rev()
-                        .filter_map(|t| crate::focusnav::back_rank(t).map(|r| (r, t)))
-                        .min_by_key(|(r, _)| *r)
-                        .map(|(_, t)| t);
-                    let last = || crate::focusnav::last(&targets).map(|i| &targets[i]);
-                    let Some(t) = named.or_else(|| if popup { last() } else { None }) else {
+                    let Some(path) = press_back(host) else {
                         return Some("no back button on this screen".into());
                     };
-                    let (x, y) = crate::focusnav::rest(t);
-                    pointer_to(host, x, y);
-                    host.left_button(true);
-                    host.left_button(false);
                     self.snapped = true;
-                    return Some(format!("back: {}", t.path));
+                    return Some(format!("back: {path}"));
                 }
                 let m = host.screens()?.menu.take()?;
                 format!("{m:?} closed")
@@ -875,11 +967,12 @@ impl PadPlay {
     /// Whether the pointer is drawn: the pad drives it (on a screen or in the picker).
     pub fn pointer_shown(&self, ctx: Context) -> bool {
         self.used
-            && match ctx {
-                Context::Picker => true,
-                Context::Screen => !self.snapped,
-                _ => false,
-            }
+            && (self.marking
+                || match ctx {
+                    Context::Picker => true,
+                    Context::Screen => !self.snapped,
+                    _ => false,
+                })
     }
 
     /// The usable item under the pointer in the inventory's list goes on the controlled
@@ -1101,6 +1194,22 @@ fn walk(host: &mut dyn Host, v: Vec2, group: bool) -> Option<String> {
             );
             continue;
         }
+        // Walked into a closed door: the game's script answers the blocked walk by giving
+        // the walker the door to open (rules_core, see `Sim::fail_blocked`). That use goes
+        // ahead before the next walk order, which would otherwise replace it (the stick and
+        // the keys order a walk several times a second): pushed into a shut door, the hero
+        // opens it, every time rather than now and then. Letting go still stops the walker,
+        // dropping a use not begun, so a door is not opened after the stick is let go.
+        let opening = sim
+            .world
+            .get(who)
+            .and_then(|o| o.commands.first())
+            .is_some_and(|c| {
+                c.name == "CommandUseObject" && c.target.is_some_and(|t| sim.is_door(t))
+            });
+        if opening {
+            continue;
+        }
         // A point a little ahead, on the ground there when it can be found; else at the
         // leader's own height, as a click on the far side of a rock would be: the walk's
         // route finds the way round (the ground under a point ahead is often a tree's or a
@@ -1293,6 +1402,28 @@ fn best_in_front(host: &mut dyn Host, hostile: bool) -> Option<ObjectId> {
 fn cycle_target(host: &mut dyn Host, current: Option<ObjectId>, step: i32) -> Option<ObjectId> {
     let (from, facing, cands) = viewpoint(host)?;
     cycle(&cands, from, facing, current, step)
+}
+
+/// Leaves the screen up by its own way out: a dialog box, the start menu, character
+/// creation, a store or a container's Close, Cancel or No button before its Back or Previous;
+/// in a dialog box whose buttons are not named so, its last (Cancel, after OK; or its only
+/// one). The pointer is left on the button pressed, whose path is returned.
+pub fn press_back(host: &mut dyn Host) -> Option<String> {
+    let popup = host.popup();
+    let targets = host.focus_targets();
+    let named = targets
+        .iter()
+        .rev()
+        .filter_map(|t| crate::focusnav::back_rank(t).map(|r| (r, t)))
+        .min_by_key(|(r, _)| *r)
+        .map(|(_, t)| t);
+    let last = || crate::focusnav::last(&targets).map(|i| &targets[i]);
+    let t = named.or_else(|| if popup { last() } else { None })?;
+    let (x, y) = crate::focusnav::rest(t);
+    pointer_to(host, x, y);
+    host.left_button(true);
+    host.left_button(false);
+    Some(t.path.clone())
 }
 
 #[cfg(test)]

@@ -1,19 +1,21 @@
 //! Containers the player loots: a placeable's `OpenInventory` opens its inventory on the
 //! inventory screen (inventory.gfx's container panel, `GUIInventory.ShowContainer`), where
-//! the player takes items one at a time (`Container.AcquireItem <item>`) or all of them
-//! (`SelectedChar.AcquireAllItems <container>`) and closes it
+//! the player takes items one at a time (`GUI.SelectedChar.AcquireItem <item>`: a double
+//! click or the take action on the container's entry, or a drop on the party's list) or all
+//! of them (`SelectedChar.AcquireAllItems <container>`) and closes it
 //! (`Container.InventoryClosedMessage`).
 //!
 //! Provisional, from inventory.gfx's container panel: the messages' arguments are read from
 //! the movie; taken items go to the hero (the party shares one backpack); the container
-//! takes nothing back.
+//! takes nothing back (its `Container.AcquireItem`, sent only while
+//! `GUIInventory.CanAddItemsToContainer` is set, which it never is).
 
 use thedas_script::vm::ObjectId;
 
 use crate::sim::Sim;
 
-/// Take one item (its id) from the open container.
-pub const MSG_ACQUIRE: &str = "Container.AcquireItem";
+/// Take one item (its id) from the open container: the selected character acquires it.
+pub const MSG_ACQUIRE: &str = "GUI.SelectedChar.AcquireItem";
 /// Take everything from a container (its id).
 pub const MSG_ACQUIRE_ALL: &str = "SelectedChar.AcquireAllItems";
 /// The container panel closed.

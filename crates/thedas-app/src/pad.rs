@@ -254,6 +254,9 @@ pub enum Action {
     ClearTarget,
     /// Swing the camera behind the leader.
     CenterCamera,
+    /// The controlled party member's other weapon set (the exe's `SwapWeaponSets`, the
+    /// quickbar's weapon set button).
+    SwapWeapons,
     /// The player's screens (inventory first; LB/RB move between them).
     Hub,
     /// Pause or carry on (as Space).
@@ -388,6 +391,9 @@ pub const BINDINGS: &[Binding] = &[
     chord(Field, RT, X, Do::Quickslot(3), "ActivateQuickslot4"),
     chord(Field, RT, Y, Do::Quickslot(4), "ActivateQuickslot5"),
     chord(Field, RT, B, Do::Quickslot(5), "ActivateQuickslot6"),
+    // Every D-pad direction and both stick clicks are taken in the field; A is free with RT.
+    // Provisional: the 360 version's button for it is not traced.
+    chord(Field, RT, A, Do::SwapWeapons, "SwapWeaponSets"),
     tap(Field, LB, Do::PrevMember, "SelectPreviousCharacterMessage"),
     tap(Field, RB, Do::NextMember, "SelectNextCharacterMessage"),
     chord(Field, RB, LB, Do::WholeParty, "ToggleFullPartySelect"),
@@ -886,6 +892,11 @@ mod tests {
             s.set(b, false);
             c.update(&s, Field, 16.0);
         }
+        // With RT, A switches weapon sets instead of acting on what is in front.
+        assert_eq!(
+            acts(&c.update(&press(&mut s, A), Field, 16.0)),
+            vec![Action::SwapWeapons]
+        );
     }
 
     #[test]

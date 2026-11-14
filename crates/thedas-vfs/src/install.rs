@@ -258,6 +258,10 @@ impl DaoInstall {
         let mut vfs = self.stack(quality, user.as_deref(), packaged)?;
         crate::mods::mount_default(&mut vfs, user.as_deref());
         crate::mods::log_player_layers(&vfs);
+        // Mod mode's live edits (the workspace) apply to Origins' play stacks only.
+        if self.game() == Game::Origins {
+            vfs.play_from();
+        }
         Ok(vfs)
     }
 

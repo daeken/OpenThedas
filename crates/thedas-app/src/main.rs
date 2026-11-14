@@ -1,7 +1,7 @@
 //! `thedas-app`: play Dragon Age: Origins, or walk through an area.
 //!
 //! With only `--install`, the game boots as the original does: the EA logo and intro movies
-//! (decoded by `ffmpeg`, silent for now; a key, a click or the pad's A, B or Start skips
+//! (decoded by `thedas-video`, with their sound; a key, a click or the pad's A, B or Start skips
 //! one; `--no-intro` skips them), then its start menu (startmenu2.gfx: New Game, Load,
 //! Options, Quit); in a game Escape (or the pad's Start) opens the game menu (mainmenu.gfx),
 //! whose Exit Game returns to the start menu.
@@ -57,7 +57,13 @@ mod cutactors;
 mod cutcam;
 mod focusnav;
 mod follow;
+mod glb;
+mod glb_in;
+mod icon;
 mod intro;
+mod journal;
+mod launcher;
+mod launcher_download;
 mod live;
 mod looks;
 mod modconv;
@@ -76,6 +82,7 @@ mod talkcam;
 mod ui;
 mod update;
 mod upload;
+mod workspace;
 
 use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -107,6 +114,10 @@ struct Args {
     /// Install root (the folder holding packages/ and modules/). Defaults to $THEDAS_INSTALL.
     #[arg(long)]
     install: Option<PathBuf>,
+    /// The DLC keys file (the format of the commonly shared `erfpasswords.txt`). Defaults to
+    /// $THEDAS_KEYS, then `keys.txt` in the player's data folder.
+    #[arg(long)]
+    keys: Option<PathBuf>,
     /// Environment level (e.g. lgt101d), area resource (e.g. cir110ar_inn), or `none`, for
     /// the viewer (lgt101d when not given). Giving it opens the viewer.
     #[arg(long)]
@@ -140,6 +151,14 @@ struct Args {
     /// in its current area; `--area` is then ignored and the camera starts behind the hero.
     #[arg(long)]
     save: Option<PathBuf>,
+    /// Resume the game from the journal (the data folder's `journal/`: the last checkpoint,
+    /// and every input since it replayed), as it was when it stopped.
+    #[arg(long)]
+    resume: bool,
+    /// Keep the journal even in a run with `--capture`, `--steps` or `--control` (which
+    /// keep none otherwise, so tests never replace the player's journal).
+    #[arg(long)]
+    journal: bool,
     /// Draw the creatures and placeables an area starts with (runs the simulation for the
     /// area resource given as `--area`).
     #[arg(long)]
@@ -221,6 +240,10 @@ struct Args {
     /// print their events for this many seconds, then exit. No window, no install needed.
     #[arg(long)]
     pad_probe: Option<f64>,
+    /// Mod mode's live edits from the start: the workspace folder (`workspace/override` in
+    /// the player's data folder) mounted above every mod (see `workspace`).
+    #[arg(long)]
+    mod_workspace: bool,
     /// Booting to the start menu: skip the logo and intro movies the game plays first.
     #[arg(long)]
     no_intro: bool,
@@ -242,6 +265,20 @@ struct Args {
     /// The voice-over language folder (`audio/vo/<language>`).
     #[arg(long, default_value = "en-us")]
     language: String,
+    /// Show the launcher (installs, mods, play options) even when an install is given or the
+    /// player chose to skip it. Started with no install and none of the headless options, the
+    /// game shows it anyway.
+    #[arg(long)]
+    launcher: bool,
+    /// Draw a launcher page (`welcome`, `search`, `keys`, `play`, `games`, `mods`,
+    /// `settings`; see `--launcher-page`) to this PNG offscreen at `--size`, then exit.
+    #[arg(long, hide = true)]
+    launcher_capture: Option<PathBuf>,
+    #[arg(long, hide = true, default_value = "play")]
+    launcher_page: String,
+    /// Pixels per point for `--launcher-capture`.
+    #[arg(long, hide = true, default_value_t = 1.0)]
+    launcher_scale: f32,
 }
 
 /// Behind and above a hero at `pos` with the game's `facing`, looking the same way (as the
@@ -642,8 +679,13 @@ struct App {
     update_answers: Vec<ui::TextAnswer>,
     /// Answers about marking spots for a report, acted on next frame.
     mark_answers: Vec<ui::TextAnswer>,
+    /// The start menu's offer to resume a session that ended unexpectedly (see
+    /// [`App::resume_frame`]).
+    resume_offer: ResumeOffer,
     /// Mod mode's panels over the game (see [`modmode`]), made the first time it opens.
     mod_mode: Option<modmode::ModMode>,
+    /// Mod mode's live edits: when the exports were last looked at for saved textures.
+    live_edits: LiveEdits,
     /// The last input came from a game controller (not the mouse or keyboard): a report
     /// then skips marking spots, which needs the mouse.
     pad_last: bool,
@@ -764,13 +806,64 @@ enum Marking {
     },
 }
 
+/// The start menu's offer to resume a session that ended unexpectedly: made at most once a
+/// run, when the start menu first comes up.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResumeOffer {
+    Unchecked,
+    Asked,
+    Done,
+}
+
+/// The ids of the offer to resume and of the box saying it failed.
+const RESUME_ID: u32 = 0x5245_5355;
+const RESUME_FAILED_ID: u32 = RESUME_ID + 1;
+
+/// When `written` was, said as how long ago from `now`.
+fn time_ago(written: std::time::SystemTime, now: std::time::SystemTime) -> String {
+    let s = now.duration_since(written).map_or(0, |d| d.as_secs());
+    match s {
+        0..60 => "moments ago".to_string(),
+        60..120 => "a minute ago".to_string(),
+        120..3600 => format!("{} minutes ago", s / 60),
+        3600..7200 => "an hour ago".to_string(),
+        7200..86_400 => format!("{} hours ago", s / 3600),
+        86_400..172_800 => "yesterday".to_string(),
+        _ => format!("{} days ago", s / 86_400),
+    }
+}
+
+/// The newest of the saves' files in `dir` (when it was written), if there are any.
+fn newest_save(dir: &std::path::Path) -> Option<std::time::SystemTime> {
+    std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".meta.json"))
+        .filter_map(|e| e.metadata().ok()?.modified().ok())
+        .max()
+}
+
 /// Smallest box (pixels a side) taken as a marked spot; smaller is a stray click.
 const MIN_MARK: f32 = 8.0;
 
-fn ask_mark_choice(ui: &mut ui::UiLayer) {
+/// What the question whether to mark spots says to a player on the pad.
+const MARK_PROMPT_PAD: &str = "Want to point at something? Choose Mark spots, then move the \
+     pointer with the left stick, press A at one corner of the thing that is wrong and A again \
+     at the other, and say what is wrong there. Press B or Start when done.";
+
+/// The question whether to mark spots, worded for the pad when it was used last.
+fn mark_prompt(pad: bool) -> &'static str {
+    if pad {
+        MARK_PROMPT_PAD
+    } else {
+        report::MARK_PROMPT
+    }
+}
+
+fn ask_mark_choice(ui: &mut ui::UiLayer, pad: bool) {
     ui.ask_choice(
         report::MARK_ID,
-        report::MARK_PROMPT,
+        mark_prompt(pad),
         "Mark spots",
         "Just a note",
     );
@@ -856,6 +949,15 @@ fn play_interface(
         }
     }
 }
+
+/// When mod mode's live edits last looked for saved textures (see [`workspace`]).
+#[derive(Default)]
+struct LiveEdits {
+    last: Option<Instant>,
+}
+
+/// How often the exports are looked at for saved textures while live edits are on.
+const LIVE_EDIT_POLL: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// A presented frame being copied out: the buffer and its size and row pitch.
 struct FrameReadback {
@@ -1085,9 +1187,13 @@ impl App {
                         None => "OpenThedas".to_string(),
                     })
                     .with_inner_size(LogicalSize::new(self.size.0, self.size.1))
+                    .with_window_icon(icon::window_icon())
                     .with_visible(std::env::var_os("THEDAS_HIDDEN_WINDOW").is_none()),
             )?,
         );
+        if std::env::var_os("THEDAS_HIDDEN_WINDOW").is_none() {
+            icon::set_dock_icon();
+        }
         let instance =
             wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
         let surface = instance.create_surface(window.clone())?;
@@ -1340,6 +1446,7 @@ impl App {
         self.serve_control(dt);
         self.pad_frame(dt);
         self.report_frame(dt);
+        self.resume_frame();
         self.mod_mode_frame(dt);
         self.returning_frame();
         self.update();
@@ -1491,6 +1598,24 @@ impl App {
             }
             if (a.id == report::MARK_ID || a.id == report::REGION_ID) && self.recorder.busy() {
                 self.mark_answers.push(a);
+                continue;
+            }
+            // The offer to resume: Resume opens the kept game; Not now leaves the journal
+            // for next time.
+            if a.id == RESUME_ID {
+                self.resume_offer = ResumeOffer::Done;
+                if a.accepted {
+                    g.ui.requests.push(ui::FrontEnd::Resume);
+                }
+                continue;
+            }
+            // The resume failed: "Set it aside" moves the journal out of the way.
+            if a.id == RESUME_FAILED_ID {
+                if a.accepted {
+                    if let Err(e) = journal::discard(&journal::default_dir()) {
+                        log::warn!("resume: setting the journal aside: {e}");
+                    }
+                }
                 continue;
             }
             if a.id == report::NOTE_ID && self.recorder.busy() {
@@ -1663,6 +1788,24 @@ impl App {
                 self.mark_answers.push(a);
                 continue;
             }
+            // The offer to resume: Resume opens the kept game; Not now leaves the journal
+            // for next time.
+            if a.id == RESUME_ID {
+                self.resume_offer = ResumeOffer::Done;
+                if a.accepted {
+                    g.ui.requests.push(ui::FrontEnd::Resume);
+                }
+                continue;
+            }
+            // The resume failed: "Set it aside" moves the journal out of the way.
+            if a.id == RESUME_FAILED_ID {
+                if a.accepted {
+                    if let Err(e) = journal::discard(&journal::default_dir()) {
+                        log::warn!("resume: setting the journal aside: {e}");
+                    }
+                }
+                continue;
+            }
             if a.id == report::NOTE_ID && self.recorder.busy() {
                 if let Some(w) = self.report_wait.as_mut() {
                     w.note_asked = None;
@@ -1754,12 +1897,121 @@ impl App {
 
     /// Mod mode's frame: its panels laid out from the picked object, the scrubber's hold
     /// passed to the game's drawing, and what the panels asked for done.
+    /// Live edits: textures saved over an export's PNGs are written into the workspace and
+    /// the objects drawn again with them. Says what happened (`None`: nothing to do).
+    fn live_edit_sync(&mut self) -> Option<String> {
+        if !workspace::mounted() {
+            return None;
+        }
+        let overrides = workspace::override_dir();
+        let changes = workspace::changes(&workspace::blender_dir(), &overrides);
+        let glbs = workspace::glb_changes(&workspace::blender_dir());
+        if changes.is_empty() && glbs.is_empty() {
+            return None;
+        }
+        let (mut done, mut failed) = workspace::apply(&changes, &overrides);
+        // Objects moved in a saved file, moved in the world after the meshes.
+        let mut moves = Vec::new();
+        // Saved meshes: read against the game's own files, not earlier live edits.
+        if !glbs.is_empty() {
+            let vfs = self.live.as_ref().map(|l| l.sim().vfs.clone());
+            let read = |name: &str| {
+                let (data, p) = vfs.as_ref()?.read_beneath_workspace(name).ok()?;
+                Some(glb::Read {
+                    data,
+                    layer: p.layer_label,
+                    entry: p.entry,
+                })
+            };
+            for g in &glbs {
+                match workspace::import_glb(g, &overrides, &read) {
+                    Ok(r) => {
+                        for n in &r.notes {
+                            log::info!("live edits: {}: {n}", g.display());
+                        }
+                        done.extend(r.written);
+                        if let Some(m) = r.moved {
+                            moves.push(m);
+                        }
+                    }
+                    Err(e) => failed.push(format!("{}: {e}", g.display())),
+                }
+            }
+        }
+        for f in &failed {
+            log::warn!("live edits: {f}");
+        }
+        if !done.is_empty() {
+            thedas_vfs::Vfs::rescan_workspace();
+            if let Some(l) = self.live.as_mut() {
+                l.reload(&done);
+            }
+        }
+        let mut placed = Vec::new();
+        for (id, tag, p) in moves {
+            // The exported object, if it is still that one; else the one with its tag here.
+            let target = self.live.as_ref().and_then(|l| {
+                let sim = l.sim();
+                match sim.world.get(id) {
+                    Some(o) if o.tag.eq_ignore_ascii_case(&tag) => Some(id),
+                    _ => sim.world.find_tag(&tag, 0),
+                }
+            });
+            match target {
+                Some(t) => {
+                    let n = self.place_object(
+                        thedas_sim::commands::SimCommand::MoveObject {
+                            target: t,
+                            position: p.position,
+                            facing: p.facing,
+                        },
+                        format!("move {tag} (from Blender)"),
+                    );
+                    placed.push(n);
+                }
+                None => failed.push(format!("{tag}: not in the world to move")),
+            }
+        }
+        let mut said = Vec::new();
+        if !done.is_empty() {
+            said.push(format!("{} updated", done.join(", ")));
+        }
+        said.extend(placed);
+        if said.is_empty() {
+            said.push("nothing written".into());
+        }
+        let note = format!(
+            "Live edits: {}{}",
+            said.join("; "),
+            if failed.is_empty() {
+                String::new()
+            } else {
+                format!("; {} failed (see the log)", failed.len())
+            }
+        );
+        log::info!("{note}");
+        Some(note)
+    }
+
     fn mod_mode_frame(&mut self, dt_ms: f64) {
+        let due = self
+            .live_edits
+            .last
+            .is_none_or(|t| t.elapsed() >= LIVE_EDIT_POLL);
+        if due && workspace::mounted() {
+            self.live_edits.last = Some(Instant::now());
+            if let Some(note) = self.live_edit_sync()
+                && let Some(m) = self.mod_mode.as_mut()
+            {
+                m.live_note = Some(note);
+            }
+        }
         let flying = self.live.is_some() && self.follow.is_none();
         let Some(m) = self.mod_mode.as_mut() else {
             return;
         };
         m.fly = flying;
+        m.live = workspace::mounted();
         let inspected = match (m.open.then_some(m.selected).flatten(), self.live.as_mut()) {
             (Some(id), Some(l)) => l.inspect(id),
             _ => None,
@@ -1779,6 +2031,75 @@ impl App {
                 modmode::Action::World(a) => self.mod_mode_world(a),
                 modmode::Action::Fly(on) => self.set_fly(on),
                 modmode::Action::FlyTo(id) => self.fly_to(id),
+                modmode::Action::LiveEdits(on) => {
+                    let note = workspace::mount(on).unwrap_or_else(|e| e);
+                    if let Some(m) = self.mod_mode.as_mut() {
+                        m.live_note = Some(note);
+                    }
+                }
+                modmode::Action::Move {
+                    id,
+                    position,
+                    facing,
+                } => {
+                    self.mod_mode_place(
+                        thedas_sim::commands::SimCommand::MoveObject {
+                            target: id,
+                            position,
+                            facing,
+                        },
+                        format!("move {id}"),
+                    );
+                }
+                modmode::Action::MoveToView(id) => {
+                    if let Some(at) = self.view_point() {
+                        let facing = self
+                            .live
+                            .as_ref()
+                            .and_then(|l| l.sim().world.get(id).map(|o| o.facing))
+                            .unwrap_or(0.0);
+                        self.mod_mode_place(
+                            thedas_sim::commands::SimCommand::MoveObject {
+                                target: id,
+                                position: at,
+                                facing,
+                            },
+                            format!("move {id} to the view"),
+                        );
+                    }
+                }
+                modmode::Action::Spawn { creature, template } => {
+                    if let Some(at) = self.view_point() {
+                        // Facing the camera.
+                        let facing = (self.camera.yaw.to_degrees() + 90.0).rem_euclid(360.0);
+                        let kind = if creature {
+                            thedas_sim::world::ObjectKind::Creature
+                        } else {
+                            thedas_sim::world::ObjectKind::Placeable
+                        };
+                        self.mod_mode_place(
+                            thedas_sim::commands::SimCommand::CreateObject {
+                                kind,
+                                template: template.clone(),
+                                position: at,
+                                facing,
+                            },
+                            format!("spawn {template}"),
+                        );
+                    }
+                }
+                modmode::Action::Remove(id) => {
+                    self.mod_mode_place(
+                        thedas_sim::commands::SimCommand::DestroyObject { target: id },
+                        format!("remove {id}"),
+                    );
+                }
+                modmode::Action::Export(id) => {
+                    let note = self.export_glb(id);
+                    if let Some(m) = self.mod_mode.as_mut() {
+                        m.exported = Some(note);
+                    }
+                }
             }
         }
     }
@@ -1801,6 +2122,55 @@ impl App {
                 m.scrub = None;
             }
         }
+    }
+
+    /// A move, spawn or removal from mod mode: applied as mod mode's command, kept in its
+    /// history (with what undoes it), and the objects drawn anew.
+    fn mod_mode_place(
+        &mut self,
+        command: thedas_sim::commands::SimCommand,
+        what: String,
+    ) -> String {
+        if self.mod_mode.is_none() {
+            return "mod mode is not open".into();
+        }
+        self.place_object(command, what)
+    }
+
+    /// [`App::mod_mode_place`], also when mod mode's panels were never opened (live edits
+    /// from the launch option): the history is kept once they are.
+    fn place_object(&mut self, command: thedas_sim::commands::SimCommand, what: String) -> String {
+        let Some(live) = self.live.as_mut() else {
+            return "not playing".into();
+        };
+        let edit = {
+            let mut sim = live.sim();
+            modconv::object_edit(&mut sim, command, what)
+        };
+        let Some(m) = self.mod_mode.as_mut() else {
+            log::info!("mod mode: {}", edit.text);
+            return edit.text;
+        };
+        // Positions are read each frame, and a made or removed object changes the objects'
+        // key, which rebuilds them.
+        let note = edit.text.clone();
+        log::info!("mod mode: {note}");
+        m.placed = Some(note.clone());
+        m.convs.status = note.clone();
+        m.convs.history.push(edit);
+        note
+    }
+
+    /// Where the middle of the view meets the ground (or the object there), in the world.
+    fn view_point(&mut self) -> Option<[f32; 3]> {
+        let (live, g) = (self.live.as_mut()?, self.gfx.as_ref()?);
+        let (w, h) = (g.config.width as f32, g.config.height as f32);
+        let (origin, dir) = self.camera.ray(w / 2.0, h / 2.0, w, h);
+        let at = match live.pick(origin, dir)? {
+            live::Pick::Ground(p) => p,
+            live::Pick::Object(id) => live.sim().world.get(id)?.position,
+        };
+        Some(at)
     }
 
     /// Carries out a world-state browser request on the simulation.
@@ -1826,6 +2196,94 @@ impl App {
             return;
         }
         self.follow = (!on).then(|| follow::Follow::behind(self.camera.yaw));
+    }
+
+    /// Writes object `id`'s models for Blender into the player's folder,
+    /// `workspace/blender/<tag>/`: `<tag>.glb`, its textures as PNGs and `manifest.json`
+    /// (see [`glb`]). Says what it wrote, or why not.
+    fn export_glb(&mut self, id: thedas_script::vm::ObjectId) -> String {
+        let Some(live) = self.live.as_ref() else {
+            return "Export: not playing".into();
+        };
+        let (subject, drawn, vfs) = {
+            let sim = live.sim();
+            let Some(o) = sim.world.get(id) else {
+                return "Export: the object is gone".into();
+            };
+            let subject = glb::Subject {
+                id,
+                tag: o.tag.clone(),
+                area: o.area.and_then(|a| sim.world.get(a)).map(|a| a.tag.clone()),
+                template: o.template.clone(),
+                position: o.position,
+                facing: o.facing,
+            };
+            (
+                subject,
+                thedas_ui::models::object_models(&sim, o),
+                sim.vfs.clone(),
+            )
+        };
+        if drawn.models.is_empty() {
+            return format!("Export: {} draws no model", subject.tag);
+        }
+        let read = |name: &str| {
+            vfs.read(name).ok().map(|(data, p)| glb::Read {
+                data,
+                layer: p.layer_label,
+                entry: p.entry,
+            })
+        };
+        let mut e = glb::export(&read, &subject, &drawn.models);
+        e.manifest["left_out"] = serde_json::json!({
+            "attached": drawn.attached.iter().map(|a| [&a.model, &a.node]).collect::<Vec<_>>(),
+            "morph": drawn.morph,
+            "tints": drawn.tints,
+        });
+        let safe: String = subject
+            .tag
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        let dir = saves::data_dir()
+            .join("workspace")
+            .join("blender")
+            .join(&safe);
+        let write = || -> std::io::Result<()> {
+            std::fs::create_dir_all(&dir)?;
+            std::fs::write(dir.join(format!("{safe}.glb")), &e.glb)?;
+            for (name, png) in &e.images {
+                std::fs::write(dir.join(name), png)?;
+            }
+            let manifest = serde_json::to_vec_pretty(&e.manifest).unwrap_or_default();
+            std::fs::write(dir.join("manifest.json"), manifest)
+        };
+        match write() {
+            Ok(()) => {
+                let meshes = glb::check(&e.glb).unwrap_or(0);
+                let note = format!(
+                    "Exported {} ({} models, {meshes} meshes, {} textures{}) to {}",
+                    subject.tag,
+                    drawn.models.len(),
+                    e.images.len(),
+                    if e.warnings.is_empty() {
+                        String::new()
+                    } else {
+                        format!(", {} warnings in the manifest", e.warnings.len())
+                    },
+                    dir.display()
+                );
+                log::info!("{note}");
+                note
+            }
+            Err(err) => format!("Export to {} failed: {err}", dir.display()),
+        }
     }
 
     /// The camera flies free and looks at object `id`.
@@ -1907,15 +2365,49 @@ impl App {
             (None, _, Some(s)) => format!(
                 "modworld: {} globals, area {} with {} variables and {} objects, {} plots with \
                  {} stored flags",
-                s.module.len(),
-                s.area.as_ref().map_or("none", |a| a.0.as_str()),
-                s.area.as_ref().map_or(0, |a| a.1.len()),
+                s.module.as_ref().map_or(0, |m| m.vars.len()),
+                s.area.as_ref().map_or("none", |a| a.tag.as_str()),
+                s.area.as_ref().map_or(0, |a| a.vars.len()),
                 s.things.len(),
                 s.plots.len(),
                 s.plots.iter().map(|p| p.flags.len()).sum::<usize>()
             ),
             _ => "modworld: nothing read".into(),
         }
+    }
+
+    /// The `modlocal` step: a variable set (or removed) as the world-state browser does.
+    fn mod_mode_local(&mut self, who: &str, name: &str, kind: &str, value: &str) -> String {
+        if self.mod_mode.is_none() {
+            return "mod mode is not open".into();
+        }
+        let target = self.live.as_ref().and_then(|l| {
+            let sim = l.sim();
+            match who {
+                "module" => sim.world.module,
+                "area" => sim.world.area,
+                tag => sim.world.find_tag(tag, 0),
+            }
+        });
+        let Some(target) = target else {
+            return format!("modlocal: no {who}");
+        };
+        let value = match kind {
+            "remove" => None,
+            k => match modworld::parse_value(k, value) {
+                Ok(v) => Some(v),
+                Err(e) => return format!("modlocal: {e}"),
+            },
+        };
+        self.mod_mode_world(modworld::WorldAction::SetLocal {
+            target,
+            name: name.to_string(),
+            value,
+        });
+        self.mod_mode
+            .as_ref()
+            .map(|m| m.convs.status.clone())
+            .unwrap_or_default()
     }
 
     /// The `modstart` and `modflag` steps: the conversation panel's Start, or a flag set
@@ -2019,9 +2511,11 @@ impl App {
         );
         let mut now_save = None;
         let mut trace = None;
+        let mut journal = None;
         let mut pause = false;
         if let Some(live) = self.live.as_mut() {
             if !live.front_end {
+                journal = live.journal.as_mut().and_then(|j| j.files());
                 let sim = live.sim();
                 info["game"]["training_mode"] = json!(sim.world.training.mode);
                 info["game"]["hero"] = json!(sim.world.hero.map(|h| sim.display_name(h)));
@@ -2036,7 +2530,7 @@ impl App {
                 pause = !live.paused;
             }
         }
-        let dir = self.recorder.start(now_save, trace, info);
+        let dir = self.recorder.start(now_save, trace, journal, info);
         log::info!("report: started in {}", dir.display());
         // The frame as presented, read back as the next one is drawn; drawn again
         // offscreen where the surface cannot be read back.
@@ -2059,26 +2553,21 @@ impl App {
         // before a game: the report is kept without one).
         let in_game = self.live.as_ref().is_some_and(|l| !l.front_end)
             && self.screens.as_ref().is_some_and(|s| !s.front_end);
-        let mut note_asked = None;
         let mut marking = Marking::Off;
         match (report::preset_note(note), self.gfx.as_mut()) {
             (Some(text), _) => self.recorder.note(Some(text)),
-            // With the mouse, the player may first mark spots on the screen; the pad
-            // cannot draw boxes yet, so it goes straight to the note.
-            (None, Some(g)) if in_game && !self.pad_last => {
-                ask_mark_choice(&mut g.ui);
-                marking = Marking::Offered(0, 0);
-            }
+            // The player may first mark spots on the screen: boxes dragged with the mouse,
+            // or drawn with the pad's pointer (see `PadPlay::mark`).
             (None, Some(g)) if in_game => {
-                ask_report_note(&mut g.ui, self.pad.used);
-                note_asked = Some((0, 0));
+                ask_mark_choice(&mut g.ui, self.pad_last);
+                marking = Marking::Offered(0, 0);
             }
             (None, _) => self.recorder.note(Some(String::new())),
         }
         self.report_wait = Some(ReportWait {
             shot,
             reply,
-            note_asked,
+            note_asked: None,
             send: true,
             pause,
             paused_it: false,
@@ -2158,6 +2647,7 @@ impl App {
     /// One frame of marking: the choice and a spot's note asked again when they do not
     /// show (as the report's note is), the choice given up after a few tries.
     fn marking_frame(&mut self) {
+        let pad = self.pad_last;
         let (Some(w), Some(g)) = (self.report_wait.as_mut(), self.gfx.as_mut()) else {
             return;
         };
@@ -2166,7 +2656,7 @@ impl App {
             Marking::Off => {}
             Marking::Offered(frames, tries) => {
                 *frames += 1;
-                if box_shows(&g.ui, report::MARK_PROMPT) {
+                if box_shows(&g.ui, report::MARK_PROMPT) || box_shows(&g.ui, MARK_PROMPT_PAD) {
                     *frames = 0;
                 } else if *frames > NOTE_REASK_FRAMES {
                     *frames = 0;
@@ -2174,7 +2664,7 @@ impl App {
                     if *tries > NOTE_TRIES {
                         self.end_marking();
                     } else if !up {
-                        ask_mark_choice(&mut g.ui);
+                        ask_mark_choice(&mut g.ui, pad);
                     }
                 }
             }
@@ -2783,8 +3273,16 @@ impl App {
             }
             // An issue report (see [`report`]): ours, not the original's.
             KeyCode::F8 => self.report(None, None),
-            // Escape closes the screen up, else opens the game menu over a game; the viewer
-            // closes. The start menu stays (its Exit quits).
+            // Escape closes a store, container, job board or world map the game put up by
+            // its own Close (as the pad's B), else the player's screen up, else opens the game
+            // menu over a game; the viewer closes. The start menu stays (its Exit quits).
+            // Provisional: the exe's Escape on the game's screens is not traced.
+            KeyCode::Escape if self.screens.as_ref().is_some_and(game_screen_up) => {
+                match padplay::press_back(self) {
+                    Some(path) => log::info!("escape: {path}"),
+                    None => log::info!("escape: no close button on this screen"),
+                }
+            }
             KeyCode::Escape => match self.screens.as_mut() {
                 None => return true,
                 Some(s) if s.menu.is_some() => s.menu = None,
@@ -2813,6 +3311,15 @@ impl App {
                 };
                 if let Some(tag) = self.live.as_mut().and_then(|l| l.choose_leader(n)) {
                     log::info!("leading with {tag}");
+                }
+            }
+            // `SwapWeaponSets` (keymap.gda binds it to /): the controlled party member's other
+            // weapon set, as the quickbar's weapon set button. Provisional: the key is fixed
+            // here, not read from the player's bindings.
+            KeyCode::Slash if self.live.is_some() => {
+                if let Some(live) = self.live.as_ref() {
+                    live.switch_weapon_set();
+                    log::info!("weapon set switched");
                 }
             }
             // The quickbar's first ten slots: 1 to 9, then 0.
@@ -3286,6 +3793,10 @@ impl App {
                     None => format!("quickslot {}", slot + 1),
                 });
             }
+            Step::SwapWeapons => {
+                self.key_down(KeyCode::Slash);
+                log.push("weapon set key".into());
+            }
             Step::Pause => {
                 // As the Space key does (a training tutorial takes it as its unpause).
                 if let Some(live) = self.live.as_mut() {
@@ -3348,6 +3859,80 @@ impl App {
             },
             Step::ModWorld => log.push(self.mod_mode_world_step(None)),
             Step::ModPlot(name) => log.push(self.mod_mode_world_step(Some(name))),
+            &Step::ModLive(on) => log.push(workspace::mount(on).unwrap_or_else(|e| e)),
+            &Step::ModMove(position, facing) => {
+                log.push(match self.mod_mode.as_ref().and_then(|m| m.selected) {
+                    Some(id) => self.mod_mode_place(
+                        thedas_sim::commands::SimCommand::MoveObject {
+                            target: id,
+                            position,
+                            facing,
+                        },
+                        format!("move {id}"),
+                    ),
+                    None => "modmove: nothing inspected".into(),
+                })
+            }
+            Step::ModMoveView => {
+                let id = self.mod_mode.as_ref().and_then(|m| m.selected);
+                log.push(match (id, self.view_point()) {
+                    (Some(id), Some(at)) => {
+                        let facing = self
+                            .live
+                            .as_ref()
+                            .and_then(|l| l.sim().world.get(id).map(|o| o.facing))
+                            .unwrap_or(0.0);
+                        self.mod_mode_place(
+                            thedas_sim::commands::SimCommand::MoveObject {
+                                target: id,
+                                position: at,
+                                facing,
+                            },
+                            format!("move {id} to the view"),
+                        )
+                    }
+                    (None, _) => "modmoveview: nothing inspected".into(),
+                    (_, None) => "modmoveview: the view meets no ground".into(),
+                });
+            }
+            Step::ModSpawn(creature, template) => {
+                let kind = if *creature {
+                    thedas_sim::world::ObjectKind::Creature
+                } else {
+                    thedas_sim::world::ObjectKind::Placeable
+                };
+                let facing = (self.camera.yaw.to_degrees() + 90.0).rem_euclid(360.0);
+                log.push(match self.view_point() {
+                    Some(at) => self.mod_mode_place(
+                        thedas_sim::commands::SimCommand::CreateObject {
+                            kind,
+                            template: template.clone(),
+                            position: at,
+                            facing,
+                        },
+                        format!("spawn {template}"),
+                    ),
+                    None => "modspawn: the view meets no ground".into(),
+                });
+            }
+            Step::ModRemove => log.push(match self.mod_mode.as_ref().and_then(|m| m.selected) {
+                Some(id) => self.mod_mode_place(
+                    thedas_sim::commands::SimCommand::DestroyObject { target: id },
+                    format!("remove {id}"),
+                ),
+                None => "modremove: nothing inspected".into(),
+            }),
+            Step::ModSync => log.push(
+                self.live_edit_sync()
+                    .unwrap_or_else(|| "Live edits: nothing changed".into()),
+            ),
+            Step::ModExport => match self.mod_mode.as_ref().and_then(|m| m.selected) {
+                Some(id) => log.push(self.export_glb(id)),
+                None => log.push("modexport: nothing inspected".into()),
+            },
+            Step::ModLocal(who, name, kind, value) => {
+                log.push(self.mod_mode_local(who, name, kind, value))
+            }
             Step::Talk(tag) => {
                 let Some(live) = self.live.as_mut() else {
                     return;
@@ -3635,6 +4220,8 @@ impl App {
                 ui::FrontEnd::NewGame => live::Start::NewGame,
                 ui::FrontEnd::Load(b) => live::Start::SaveBytes(b),
                 ui::FrontEnd::StartMenu => live::Start::Menu,
+                // Opened on the worker below, from the journal (`Start::Resume`).
+                ui::FrontEnd::Resume => live::Start::NewGame,
             };
             // A game (new or loaded) opens on a worker while the window keeps presenting,
             // the running one held behind it (see `Live::hold`); the start menu opens at once.
@@ -3658,13 +4245,15 @@ impl App {
                 ui::FrontEnd::Load(b) => Some(b.clone()),
                 _ => None,
             };
+            let resume = matches!(r, ui::FrontEnd::Resume).then(journal::default_dir);
             let (tx, rx) = std::sync::mpsc::channel();
             let spawned = std::thread::Builder::new()
                 .name("game-open".into())
                 .spawn(move || {
-                    let start = match &save {
-                        Some(b) => live::Start::SaveBytes(b),
-                        None => live::Start::NewGame,
+                    let start = match (&save, &resume) {
+                        (Some(b), _) => live::Start::SaveBytes(b),
+                        (None, Some(dir)) => live::Start::Resume(dir),
+                        (None, None) => live::Start::NewGame,
                     };
                     let _ = tx.send(live::Live::open(&install, &module, start, &shaders));
                 });
@@ -3709,8 +4298,61 @@ impl App {
                 if let Some(l) = self.live.as_mut() {
                     l.hold(false);
                 }
+                // A resume that failed says so, and offers to set the journal aside.
+                if what == "Resume"
+                    && let Some(g) = self.gfx.as_mut()
+                {
+                    g.ui.ask_choice(
+                        RESUME_FAILED_ID,
+                        &format!("The last session could not be resumed: {e:#}"),
+                        "Set it aside",
+                        "Keep it",
+                    );
+                }
             }
         }
+    }
+
+    /// The start menu's offer to resume a session that ended unexpectedly, asked once, when
+    /// the start menu is up and no other box is: only for a journal this build wrote, of a
+    /// game not quit normally, newer than the newest save (see [`journal::resumable`]).
+    /// Ours: the original has no journal.
+    fn resume_frame(&mut self) {
+        if self.resume_offer != ResumeOffer::Unchecked || self.opening.is_some() {
+            return;
+        }
+        let at_menu = self.live.as_ref().is_some_and(|l| l.front_end)
+            && self.screens.as_ref().is_some_and(|s| {
+                s.front_end && s.menu.is_none() && s.shown().contains(&screens::Screen::StartMenu)
+            });
+        let Some(g) = self.gfx.as_mut() else {
+            return;
+        };
+        if !at_menu || g.ui.stage.dialog_up() {
+            return;
+        }
+        self.resume_offer = ResumeOffer::Done;
+        if !journal::enabled() {
+            return;
+        }
+        let Some(info) = journal::resumable(&journal::default_dir()) else {
+            return;
+        };
+        let newer = newest_save(&self.saves_dir).is_none_or(|s| info.written > s);
+        if info.closed || !info.this_build || !newer {
+            log::info!(
+                "resume: not offered (quit normally {}, this build {}, newer than the saves {newer})",
+                info.closed,
+                info.this_build
+            );
+            return;
+        }
+        let prompt = format!(
+            "Your last session ended unexpectedly ({}). Resume where you were?",
+            time_ago(info.written, std::time::SystemTime::now())
+        );
+        g.ui.ask_choice(RESUME_ID, &prompt, "Resume", "Not now");
+        self.resume_offer = ResumeOffer::Asked;
     }
 
     /// A newly opened game (or the start menu) becomes the running one.
@@ -3755,6 +4397,23 @@ impl App {
 }
 
 impl padplay::Host for App {
+    fn marking(&mut self) -> Option<bool> {
+        match self.report_wait.as_ref().map(|w| &w.marking) {
+            Some(Marking::On { drag, asking: None }) => Some(drag.is_some()),
+            _ => None,
+        }
+    }
+
+    fn end_marking(&mut self) {
+        App::end_marking(self);
+    }
+
+    fn drop_mark(&mut self) {
+        if let Some(Marking::On { drag, .. }) = self.report_wait.as_mut().map(|w| &mut w.marking) {
+            *drag = None;
+        }
+    }
+
     fn live(&mut self) -> Option<&mut live::Live> {
         self.live.as_mut()
     }
@@ -3884,7 +4543,12 @@ impl ApplicationHandler for App {
             }
         }
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                if let Some(l) = self.live.as_mut() {
+                    l.close_journal();
+                }
+                event_loop.exit()
+            }
             WindowEvent::Resized(size) => {
                 if let Some(g) = self.gfx.as_mut() {
                     if size.width > 0 && size.height > 0 {
@@ -4754,6 +5418,8 @@ enum Step {
     Quickslot(i32),
     /// Space: the game pauses or carries on.
     Pause,
+    /// The weapon set key (/).
+    SwapWeapons,
     /// F10: mod mode's panels open or close (windowed only).
     ModMode,
     /// Mod mode's inspector picks the creature or placeable with this tag nearest the
@@ -4779,6 +5445,25 @@ enum Step {
     ModWorld,
     /// The world-state browser looks up a plot (`modplot NAME`).
     ModPlot(String),
+    /// The inspected object's models are exported for Blender (`modexport`).
+    ModExport,
+    /// Live edits on or off (`modlive on`, `modlive off`).
+    ModLive(bool),
+    /// Live edits look for saved textures now (`modsync`).
+    ModSync,
+    /// The inspected object is put at a place, turned to a facing (`modmove X,Y,Z F`).
+    ModMove([f32; 3], f32),
+    /// The inspected object is put where the view's middle meets the ground (`modmoveview`).
+    ModMoveView,
+    /// A creature or placeable is made from a template where the view's middle meets the
+    /// ground (`modspawn creature TEMPLATE`, `modspawn placeable TEMPLATE`).
+    ModSpawn(bool, String),
+    /// The inspected object is removed (`modremove`).
+    ModRemove,
+    /// A variable set from the world-state browser (`modlocal WHO NAME TYPE VALUE`, WHO
+    /// `module`, `area` or an object's tag; TYPE `int`, `float`, `string`, `object` or
+    /// `resource`, or `remove` with no value).
+    ModLocal(String, String, String, String),
     /// The conversation's reply n (from 0) is chosen.
     Reply(usize),
     /// The game camera turns (degrees of yaw, then pitch), as dragging with the right
@@ -4915,6 +5600,18 @@ fn set_client_option(ui: Option<&ui::UiLayer>, live: Option<&live::Live>, name: 
             },
         );
     }
+}
+
+/// Whether the screen up is one the game put up that the player leaves by its Close: a store,
+/// a container (the inventory screen the player did not open), the job board or the world map.
+fn game_screen_up(s: &screens::Screens) -> bool {
+    use screens::Screen;
+    !s.front_end
+        && s.shown().iter().any(|m| match m {
+            Screen::Store | Screen::Chanters | Screen::WorldMap => true,
+            Screen::Inventory => s.menu != Some(Screen::Inventory),
+            _ => false,
+        })
 }
 
 /// A `key` step's text-field key, by name.
@@ -5134,6 +5831,7 @@ fn parse_step(s: &str) -> Result<Step> {
             Step::Leader(arg[1..].parse::<usize>()? - 1)
         }
         "key" if arg.eq_ignore_ascii_case("space") => Step::Pause,
+        "key" if arg == "/" => Step::SwapWeapons,
         "key" if arg.eq_ignore_ascii_case("f10") => Step::ModMode,
         "modmode" => Step::ModMode,
         "modselect" if !arg.is_empty() => Step::ModSelect(arg.to_string()),
@@ -5161,6 +5859,42 @@ fn parse_step(s: &str) -> Result<Step> {
         "modflyto" => Step::ModFlyTo,
         "modworld" => Step::ModWorld,
         "modplot" if !arg.is_empty() => Step::ModPlot(arg.to_string()),
+        "modexport" => Step::ModExport,
+        "modlive" => Step::ModLive(match arg {
+            "on" => true,
+            "off" => false,
+            _ => bail!("modlive takes on or off"),
+        }),
+        "modsync" => Step::ModSync,
+        "modmove" => {
+            let (at, f) = arg.split_once(' ').context("modmove takes X,Y,Z FACING")?;
+            let v: Vec<f32> = at
+                .split(',')
+                .map(|x| x.trim().parse::<f32>())
+                .collect::<Result<_, _>>()
+                .context("modmove's place is X,Y,Z")?;
+            let [x, y, z] = v[..] else {
+                bail!("modmove's place is X,Y,Z");
+            };
+            Step::ModMove([x, y, z], f.trim().parse().context("modmove's facing")?)
+        }
+        "modmoveview" => Step::ModMoveView,
+        "modspawn" => match arg.split_once(' ') {
+            Some(("creature", t)) if !t.trim().is_empty() => Step::ModSpawn(true, t.trim().into()),
+            Some(("placeable", t)) if !t.trim().is_empty() => {
+                Step::ModSpawn(false, t.trim().into())
+            }
+            _ => bail!("modspawn takes creature|placeable TEMPLATE"),
+        },
+        "modremove" => Step::ModRemove,
+        "modlocal" => {
+            let mut w = arg.splitn(4, ' ');
+            let (Some(who), Some(name), Some(kind)) = (w.next(), w.next(), w.next()) else {
+                bail!("modlocal takes WHO NAME TYPE VALUE");
+            };
+            let value = w.next().unwrap_or_default();
+            Step::ModLocal(who.into(), name.into(), kind.into(), value.into())
+        }
         "key" if arg.len() == 1 && arg.as_bytes()[0].is_ascii_digit() => {
             // 1 is the first slot, 0 the tenth.
             Step::Quickslot((arg.as_bytes()[0] - b'0' + 9) as i32 % 10)
@@ -5251,10 +5985,35 @@ fn main() -> Result<()> {
         paddev::probe(secs);
         return Ok(());
     }
+    if let Some(out) = &args.launcher_capture {
+        return launcher::capture(
+            out,
+            &args.launcher_page,
+            parse_size(&args.size)?,
+            args.launcher_scale,
+        );
+    }
+    if let Some(keys) = &args.keys {
+        thedas_vfs::keys_file::set_path(keys);
+    }
     let install = args
         .install
-        .or_else(|| std::env::var_os("THEDAS_INSTALL").map(PathBuf::from))
-        .context("give --install or set THEDAS_INSTALL")?;
+        .clone()
+        .or_else(|| std::env::var_os("THEDAS_INSTALL").map(PathBuf::from));
+    // No install named, playing in a window: the launcher picks one (and the game starts as
+    // a process of its own). Headless and driven runs keep needing `--install`.
+    let headless = args.capture.is_some()
+        || args.control.is_some()
+        || !args.steps.is_empty()
+        || args.check_report.is_some()
+        || std::env::var_os("THEDAS_HIDDEN_WINDOW").is_some();
+    if args.launcher || (install.is_none() && !headless) {
+        if let Some(launch) = launcher::run(args.launcher)? {
+            launch.spawn()?;
+        }
+        return Ok(());
+    }
+    let install = install.context("give --install or set THEDAS_INSTALL")?;
     if args.module.is_empty() {
         args.module = thedas_vfs::install::campaign_module(&install).to_string();
     }
@@ -5263,7 +6022,15 @@ fn main() -> Result<()> {
         .saves
         .clone()
         .unwrap_or_else(saves::SaveStore::default_dir);
-    let start = if let Some(save) = &args.save {
+    let journal_dir = journal::default_dir();
+    journal::set_enabled(
+        args.journal
+            || args.resume
+            || (args.capture.is_none() && args.steps.is_empty() && args.control.is_none()),
+    );
+    let start = if args.resume {
+        Some(live::Start::Resume(&journal_dir))
+    } else if let Some(save) = &args.save {
         Some(live::Start::Save(save))
     } else if args.new_game && args.quick_start {
         Some(live::Start::NewGameQuick)
@@ -5450,7 +6217,15 @@ fn main() -> Result<()> {
                     | Step::ModFly
                     | Step::ModFlyTo
                     | Step::ModWorld
-                    | Step::ModPlot(_) => {
+                    | Step::ModPlot(_)
+                    | Step::ModExport
+                    | Step::ModLive(_)
+                    | Step::ModSync
+                    | Step::ModMove(..)
+                    | Step::ModMoveView
+                    | Step::ModSpawn(..)
+                    | Step::ModRemove
+                    | Step::ModLocal(..) => {
                         println!("mod mode: windowed only")
                     }
                     Step::Talk(tag) => {
@@ -5837,6 +6612,10 @@ fn main() -> Result<()> {
                         Some(ability) => println!("aiming ability {ability}"),
                         None => println!("quickslot {}", slot + 1),
                     },
+                    Step::SwapWeapons => {
+                        l.switch_weapon_set();
+                        println!("weapon set switched");
+                    }
                     Step::Pause => {
                         // As the Space key does (a training tutorial takes it as its unpause).
                         l.toggle_pause();
@@ -5900,7 +6679,10 @@ fn main() -> Result<()> {
                     for r in std::mem::take(&mut layer.requests) {
                         println!("front end: {r:?}");
                         let start = match &r {
-                            ui::FrontEnd::Quit | ui::FrontEnd::Report | ui::FrontEnd::ModMode => {
+                            ui::FrontEnd::Quit
+                            | ui::FrontEnd::Report
+                            | ui::FrontEnd::ModMode
+                            | ui::FrontEnd::Resume => {
                                 continue;
                             }
                             ui::FrontEnd::NewGame => live::Start::NewGame,
@@ -6064,6 +6846,12 @@ fn main() -> Result<()> {
     let screens = (live.is_some() && ui.is_empty())
         .then(|| screens::Screens::new(live.as_ref().is_some_and(|l| l.front_end)));
     let loaded_vfs = loaded.vfs.clone();
+    if args.mod_workspace {
+        match workspace::mount(true) {
+            Ok(note) => log::info!("{note}"),
+            Err(e) => log::warn!("{e}"),
+        }
+    }
     let mut app = App {
         load_screen_up: false,
         loaded,
@@ -6124,7 +6912,9 @@ fn main() -> Result<()> {
         },
         update_answers: Vec::new(),
         mark_answers: Vec::new(),
+        resume_offer: ResumeOffer::Unchecked,
         mod_mode: None,
+        live_edits: LiveEdits::default(),
         pad_last: false,
         started_with: json!({
             "size": args.size,
@@ -6135,6 +6925,7 @@ fn main() -> Result<()> {
             "module": args.module,
             "install": report::install_info(&install, &args.language),
             "no_intro": args.no_intro,
+            "mod_workspace": args.mod_workspace,
             "audio": !(args.no_audio || std::env::var_os("THEDAS_NO_AUDIO").is_some()),
             "control": args.control.is_some(),
             "env": (["THEDAS_ASYNC_LOADS", "THEDAS_HIDDEN_WINDOW", "THEDAS_NO_LOAD_MOVIE"]
@@ -6166,14 +6957,14 @@ fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    /// Against a real install (`THEDAS_INSTALL`) and `ffmpeg`, offscreen: the EA logo's frame
+    /// Against a real install (`THEDAS_INSTALL`), offscreen: the EA logo's frame
     /// two seconds in is drawn letterboxed in a taller window (written to `$INTRO_PNG` when
     /// set, to look at).
     #[test]
     #[ignore]
     fn the_intro_draws_its_frame_letterboxed() {
         let install = PathBuf::from(std::env::var_os("THEDAS_INSTALL").expect("THEDAS_INSTALL"));
-        let mut intro = intro::Intro::boot(&install).expect("ffmpeg and the movies");
+        let mut intro = intro::Intro::boot(&install).expect("the movies");
         let ctx = GpuContext::headless().unwrap();
         let (w, h) = (1280, 960);
         let format = wgpu::TextureFormat::Bgra8Unorm;
@@ -6293,12 +7084,30 @@ mod tests {
         );
         assert!(parse_steps("modflag gen00pt_party 3").is_err());
         assert_eq!(
-            parse_steps("modfly; modflyto; modworld; modplot plt_a").unwrap(),
+            parse_steps("modmove 1,2.5,-3 90; modmoveview; modspawn creature c_wolf; modremove")
+                .unwrap(),
+            vec![
+                Step::ModMove([1.0, 2.5, -3.0], 90.0),
+                Step::ModMoveView,
+                Step::ModSpawn(true, "c_wolf".into()),
+                Step::ModRemove,
+            ]
+        );
+        assert!(parse_steps("modspawn trigger x").is_err());
+        assert!(parse_steps("modmove 1,2 0").is_err());
+        assert_eq!(
+            parse_steps(
+                "modfly; modflyto; modworld; modplot plt_a; modlocal module X string a b; \
+                 modlocal area Y remove"
+            )
+            .unwrap(),
             vec![
                 Step::ModFly,
                 Step::ModFlyTo,
                 Step::ModWorld,
-                Step::ModPlot("plt_a".into())
+                Step::ModPlot("plt_a".into()),
+                Step::ModLocal("module".into(), "X".into(), "string".into(), "a b".into()),
+                Step::ModLocal("area".into(), "Y".into(), "remove".into(), "".into()),
             ]
         );
         assert!(parse_steps("modflag gen00pt_party 3 yes").is_err());

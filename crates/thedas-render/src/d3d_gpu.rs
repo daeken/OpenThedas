@@ -115,6 +115,13 @@ pub(crate) struct D3dCache {
     vertices: HashMap<(String, String), wgpu::Buffer>,
 }
 
+impl D3dCache {
+    /// Drops the vertex buffers of the meshes `of` names (by mesh key).
+    pub(crate) fn forget_meshes(&mut self, of: &dyn Fn(&str) -> bool) {
+        self.vertices.retain(|(k, _), _| !of(k));
+    }
+}
+
 /// The level's far billboard batch's vertex buffer, whose TEXCOORD0 each frame rewrites with
 /// the placements' fades ([`crate::scene::BillboardInstance::texcoord0`]).
 struct BillboardStream {
@@ -1222,6 +1229,20 @@ fn is_distortion(program: &D3dProgram) -> bool {
     program.name.ends_with("+distortionmask.sta")
 }
 
+/// The depth bias of a blended pass that tests depth without writing it: a hair's second
+/// pass draws over the depth its first pass wrote, from another vertex shader, and our
+/// translations of the two need not land on bit-identical depths, so without a nudge
+/// towards the camera whole triangles of it fail the test (Hawke's beard showed
+/// triangular holes). A few steps of the depth format's precision, more on steep slopes;
+/// small enough not to bring a blended surface through anything in front of it.
+/// Provisional: D3D9's invariance between the original's two shaders is not ours to rely
+/// on.
+const OVERLAY_DEPTH_BIAS: wgpu::DepthBiasState = wgpu::DepthBiasState {
+    constant: -32,
+    slope_scale: -1.0,
+    clamp: 0.0,
+};
+
 fn create_pipeline(
     device: &wgpu::Device,
     program: &D3dProgram,
@@ -1336,7 +1357,11 @@ fn create_pipeline_faded(
                 wgpu::CompareFunction::Always
             }),
             stencil: wgpu::StencilState::default(),
-            bias: wgpu::DepthBiasState::default(),
+            bias: if pass.z_enable && !pass.z_write && pass.blend.is_some() {
+                OVERLAY_DEPTH_BIAS
+            } else {
+                wgpu::DepthBiasState::default()
+            },
         }),
         multisample: wgpu::MultisampleState::default(),
         fragment: Some(wgpu::FragmentState {

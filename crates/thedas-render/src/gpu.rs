@@ -279,6 +279,12 @@ pub(crate) struct TextureCache {
 }
 
 impl TextureCache {
+    /// Forgets textures (by resource name, any case), so their next use reads them again.
+    pub fn forget(&mut self, names: &[String]) {
+        self.map
+            .retain(|k, _| !names.iter().any(|n| n.eq_ignore_ascii_case(k)));
+    }
+
     pub fn get(&mut self, ctx: &GpuContext, vfs: &Vfs, name: &str) -> Option<&GpuTexture> {
         if !self.map.contains_key(name) {
             let tex = match vfs.read(name) {
@@ -474,6 +480,25 @@ pub struct RenderCache {
     /// What the objects' scenes built over these resources share (see
     /// [`AreaScene::load_objects_cached`]).
     pub scenes: crate::scene::SceneCache,
+}
+
+impl RenderCache {
+    /// Forgets resources (by name, any case) that changed on disk (mod mode's live edits),
+    /// so renderers built after this read them again. Renderers already built keep what
+    /// they have.
+    pub fn forget(&mut self, names: &[String]) {
+        self.textures.forget(names);
+        self.scenes.forget(names);
+        // Mesh buffers are keyed `<msh>:<chunk>` (with suffixes for variants).
+        let of = |k: &str| {
+            let k = k.to_ascii_lowercase();
+            names
+                .iter()
+                .any(|n| k.starts_with(&format!("{}:", n.to_ascii_lowercase())))
+        };
+        self.meshes.retain(|k, _| !of(k));
+        self.d3d.forget_meshes(&of);
+    }
 }
 
 #[derive(Clone, Copy)]

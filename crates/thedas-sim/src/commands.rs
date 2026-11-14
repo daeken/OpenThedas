@@ -46,6 +46,32 @@ pub enum SimCommand {
         target: ObjectId,
         dialog: String,
     },
+    /// Sets one of an object's variables (`value`), or removes it (`None`). The module
+    /// object's variables are the game's globals.
+    SetLocal {
+        target: ObjectId,
+        name: String,
+        value: Option<LocalValue>,
+    },
+    /// Puts an object at `position`, turned to `facing` (degrees), at once: no walking,
+    /// nothing triggered on the way.
+    MoveObject {
+        target: ObjectId,
+        position: [f32; 3],
+        facing: f32,
+    },
+    /// Makes a creature or placeable from its template (`.utc`, `.utp`) in the current
+    /// area, as a script's `CreateObject` does.
+    CreateObject {
+        kind: ObjectKind,
+        template: String,
+        position: [f32; 3],
+        facing: f32,
+    },
+    /// Removes an object, as a script's `DestroyObject` does (not the hero).
+    DestroyObject {
+        target: ObjectId,
+    },
     /// The simulation's clock goes on by `ms` milliseconds (0: what is due now runs).
     Tick {
         ms: u64,
@@ -175,8 +201,38 @@ impl SimCommand {
     pub fn is_edit(&self) -> bool {
         matches!(
             self,
-            SimCommand::SetPlotFlag { .. } | SimCommand::StartConversation { .. }
+            SimCommand::SetPlotFlag { .. }
+                | SimCommand::StartConversation { .. }
+                | SimCommand::SetLocal { .. }
+                | SimCommand::MoveObject { .. }
+                | SimCommand::CreateObject { .. }
+                | SimCommand::DestroyObject { .. }
         )
+    }
+}
+
+/// A variable's value, of one of the types an object keeps
+/// ([`crate::world::Locals`]; locations are not set this way).
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "type", content = "value", rename_all = "snake_case")]
+pub enum LocalValue {
+    Int(i32),
+    Float(f32),
+    String(String),
+    Object(ObjectId),
+    Resource(String),
+}
+
+impl LocalValue {
+    /// The variable's type, as the panels name it.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            LocalValue::Int(_) => "int",
+            LocalValue::Float(_) => "float",
+            LocalValue::String(_) => "string",
+            LocalValue::Object(_) => "object",
+            LocalValue::Resource(_) => "resource",
+        }
     }
 }
 
@@ -199,6 +255,16 @@ pub enum CommandOutcome {
     /// Another conversation is open: this one starts when it ends (if its owner is still
     /// there to talk).
     ConversationQueued { dialog: String },
+    /// The variable was set (or removed). `replaced` is what it held, of the same type
+    /// (`None`: it was not there): setting it back undoes it.
+    LocalSet { replaced: Option<LocalValue> },
+    /// The object was moved; `from` and `from_facing` are where it was (moving it back
+    /// undoes it).
+    ObjectMoved { from: [f32; 3], from_facing: f32 },
+    /// The object was made (destroying it undoes it).
+    ObjectCreated { id: ObjectId },
+    /// The object was removed.
+    ObjectDestroyed,
     /// A play input carried out (`ok`: what the method answered, where it answers).
     Done { ok: bool },
     /// Nothing was done.
@@ -243,6 +309,11 @@ pub struct JournalEntry {
 impl Sim {
     /// Carries out a command from outside the simulation and keeps it in the journal.
     pub fn apply(&mut self, source: CommandSource, command: SimCommand) -> CommandOutcome {
+        // An object about to go is named before it goes.
+        let doomed = match &command {
+            SimCommand::DestroyObject { target } => self.object_ref(*target),
+            _ => None,
+        };
         let outcome = match &command {
             SimCommand::SetPlotFlag {
                 plot,
@@ -280,6 +351,23 @@ impl Sim {
                 target,
                 dialog,
             } => self.start_commanded_conversation(*initiator, *target, dialog),
+            SimCommand::SetLocal {
+                target,
+                name,
+                value,
+            } => self.set_commanded_local(*target, name, value.as_ref()),
+            SimCommand::MoveObject {
+                target,
+                position,
+                facing,
+            } => self.move_commanded(*target, *position, *facing),
+            SimCommand::CreateObject {
+                kind,
+                template,
+                position,
+                facing,
+            } => self.create_commanded(*kind, template, *position, *facing),
+            SimCommand::DestroyObject { target } => self.destroy_commanded(*target),
             other => CommandOutcome::Done {
                 ok: self.play_input(other),
             },
@@ -301,6 +389,14 @@ impl Sim {
                 .iter()
                 .filter_map(|&id| self.object_ref(id))
                 .collect(),
+            SimCommand::SetLocal { target, .. } | SimCommand::MoveObject { target, .. } => {
+                self.object_ref(*target).into_iter().collect()
+            }
+            SimCommand::CreateObject { .. } => match &outcome {
+                CommandOutcome::ObjectCreated { id } => self.object_ref(*id).into_iter().collect(),
+                _ => Vec::new(),
+            },
+            SimCommand::DestroyObject { .. } => doomed.into_iter().collect(),
             _ => Vec::new(),
         };
         let entry = JournalEntry {
@@ -328,11 +424,54 @@ impl Sim {
         outcome
     }
 
+    /// [`SimCommand::SetLocal`]: the variable of `value`'s type set, or (`None`) removed.
+    fn set_commanded_local(
+        &mut self,
+        target: ObjectId,
+        name: &str,
+        value: Option<&LocalValue>,
+    ) -> CommandOutcome {
+        let Some(o) = self.world.get_mut(target) else {
+            return CommandOutcome::Refused {
+                reason: "no such object".into(),
+            };
+        };
+        let l = &mut o.locals;
+        let name = name.to_string();
+        let replaced = match value {
+            Some(LocalValue::Int(v)) => l.ints.insert(name, *v).map(LocalValue::Int),
+            Some(LocalValue::Float(v)) => l.floats.insert(name, *v).map(LocalValue::Float),
+            Some(LocalValue::String(v)) => {
+                l.strings.insert(name, v.clone()).map(LocalValue::String)
+            }
+            Some(LocalValue::Object(v)) => l.objects.insert(name, *v).map(LocalValue::Object),
+            Some(LocalValue::Resource(v)) => l
+                .resources
+                .insert(name, v.clone())
+                .map(LocalValue::Resource),
+            // Removed: whichever type holds it (the first, should two types share a name).
+            None => l
+                .ints
+                .remove(&name)
+                .map(LocalValue::Int)
+                .or_else(|| l.floats.remove(&name).map(LocalValue::Float))
+                .or_else(|| l.strings.remove(&name).map(LocalValue::String))
+                .or_else(|| l.objects.remove(&name).map(LocalValue::Object))
+                .or_else(|| l.resources.remove(&name).map(LocalValue::Resource)),
+        };
+        CommandOutcome::LocalSet { replaced }
+    }
+
     /// Carries out a play input; what the method answered, where it answers.
     fn play_input(&mut self, c: &SimCommand) -> bool {
         use SimCommand as C;
         match c {
-            C::SetPlotFlag { .. } | C::StartConversation { .. } => false,
+            C::SetPlotFlag { .. }
+            | C::StartConversation { .. }
+            | C::SetLocal { .. }
+            | C::MoveObject { .. }
+            | C::CreateObject { .. }
+            | C::DestroyObject { .. } => false,
             C::Tick { ms } => {
                 self.tick(*ms);
                 true
@@ -526,6 +665,86 @@ impl Sim {
     }
 
     /// How an object can be found again in another session.
+    /// [`SimCommand::MoveObject`].
+    fn move_commanded(
+        &mut self,
+        target: ObjectId,
+        position: [f32; 3],
+        facing: f32,
+    ) -> CommandOutcome {
+        let refused = |reason: &str| CommandOutcome::Refused {
+            reason: reason.to_string(),
+        };
+        if !position.iter().chain([&facing]).all(|x| x.is_finite()) {
+            return refused("the place is not a number");
+        }
+        let Some(o) = self.world.get(target) else {
+            return refused("no such object");
+        };
+        if matches!(o.kind, ObjectKind::Area | ObjectKind::Module) {
+            return refused("an area or module does not move");
+        }
+        if o.area.is_none() || o.area != self.world.area {
+            return refused("the object is not in the current area");
+        }
+        let (from, from_facing) = (o.position, o.facing);
+        // As the game moves things: trigger membership kept, ENTER and EXIT heard.
+        self.move_object(target, position, None);
+        if let Some(o) = self.world.get_mut(target) {
+            o.facing = facing;
+        }
+        CommandOutcome::ObjectMoved { from, from_facing }
+    }
+
+    /// [`SimCommand::CreateObject`].
+    fn create_commanded(
+        &mut self,
+        kind: ObjectKind,
+        template: &str,
+        position: [f32; 3],
+        facing: f32,
+    ) -> CommandOutcome {
+        let refused = |reason: &str| CommandOutcome::Refused {
+            reason: reason.to_string(),
+        };
+        if !matches!(kind, ObjectKind::Creature | ObjectKind::Placeable) {
+            return refused("only creatures and placeables are made this way");
+        }
+        if template.trim().is_empty() {
+            return refused("no template");
+        }
+        if !position.iter().chain([&facing]).all(|x| x.is_finite()) {
+            return refused("the place is not a number");
+        }
+        let Some(area) = self.world.area else {
+            return refused("no area");
+        };
+        let id = self.create_from_template(kind, template, Some(area), position, facing);
+        CommandOutcome::ObjectCreated { id }
+    }
+
+    /// [`SimCommand::DestroyObject`]: as the script function does ([`Sim::destroy_object`]).
+    /// Not the hero, a party member, an area or the module.
+    fn destroy_commanded(&mut self, target: ObjectId) -> CommandOutcome {
+        let refused = |reason: &str| CommandOutcome::Refused {
+            reason: reason.to_string(),
+        };
+        let Some(o) = self.world.get(target) else {
+            return refused("no such object");
+        };
+        if Some(target) == self.world.hero {
+            return refused("the hero is not removed");
+        }
+        if crate::engine::party_of(self).contains(&target) {
+            return refused("a party member is not removed");
+        }
+        if matches!(o.kind, ObjectKind::Area | ObjectKind::Module) {
+            return refused("an area or module is not removed");
+        }
+        self.destroy_object(target);
+        CommandOutcome::ObjectDestroyed
+    }
+
     fn object_ref(&self, id: ObjectId) -> Option<ObjectRef> {
         let o = self.world.get(id)?;
         Some(ObjectRef {
@@ -550,6 +769,191 @@ mod tests {
             std::sync::Arc::new(thedas_script::EngineTable::default()),
             1,
         )
+    }
+
+    #[test]
+    fn variables_are_set_journalled_and_undone() {
+        let mut s = sim();
+        let m = s.world.spawn(ObjectKind::Module, "module");
+        s.world
+            .get_mut(m)
+            .unwrap()
+            .locals
+            .ints
+            .insert("COUNT".into(), 3);
+        let set = |s: &mut Sim, value| {
+            s.apply(
+                CommandSource::ModMode,
+                SimCommand::SetLocal {
+                    target: m,
+                    name: "COUNT".into(),
+                    value,
+                },
+            )
+        };
+        let out = set(&mut s, Some(LocalValue::Int(7)));
+        assert_eq!(
+            out,
+            CommandOutcome::LocalSet {
+                replaced: Some(LocalValue::Int(3))
+            }
+        );
+        assert_eq!(s.world.get(m).unwrap().locals.ints["COUNT"], 7);
+        let e = s.world.command_journal.last().unwrap();
+        assert_eq!(e.objects.len(), 1);
+        assert_eq!(e.objects[0].tag, "module");
+        // Undo: set back what it replaced.
+        set(&mut s, Some(LocalValue::Int(3)));
+        assert_eq!(s.world.get(m).unwrap().locals.ints["COUNT"], 3);
+        // A new variable replaces nothing; removing it gives back its value.
+        let out = s.apply(
+            CommandSource::ModMode,
+            SimCommand::SetLocal {
+                target: m,
+                name: "NEW".into(),
+                value: Some(LocalValue::String("x".into())),
+            },
+        );
+        assert_eq!(out, CommandOutcome::LocalSet { replaced: None });
+        let out = s.apply(
+            CommandSource::ModMode,
+            SimCommand::SetLocal {
+                target: m,
+                name: "NEW".into(),
+                value: None,
+            },
+        );
+        assert_eq!(
+            out,
+            CommandOutcome::LocalSet {
+                replaced: Some(LocalValue::String("x".into()))
+            }
+        );
+        assert!(s.world.get(m).unwrap().locals.strings.is_empty());
+        assert_eq!(s.world.command_journal.len(), 4);
+        let out = s.apply(
+            CommandSource::ModMode,
+            SimCommand::SetLocal {
+                target: 999_999,
+                name: "X".into(),
+                value: None,
+            },
+        );
+        assert_eq!(
+            out,
+            CommandOutcome::Refused {
+                reason: "no such object".into()
+            }
+        );
+    }
+
+    #[test]
+    fn objects_are_moved_made_and_removed_with_what_undoes_them() {
+        let mut s = sim();
+        let area = s.world.spawn(ObjectKind::Area, "camp");
+        s.world.area = Some(area);
+        let hero = s.world.spawn(ObjectKind::Creature, "player");
+        s.world.hero = Some(hero);
+        s.world.get_mut(hero).unwrap().area = Some(area);
+        let barrel = s.world.spawn(ObjectKind::Placeable, "barrel");
+        {
+            let b = s.world.get_mut(barrel).unwrap();
+            b.area = Some(area);
+            b.position = [1.0, 2.0, 3.0];
+            b.facing = 45.0;
+        }
+        let out = s.apply(
+            CommandSource::ModMode,
+            SimCommand::MoveObject {
+                target: barrel,
+                position: [7.0, 8.0, 9.0],
+                facing: 180.0,
+            },
+        );
+        assert_eq!(
+            out,
+            CommandOutcome::ObjectMoved {
+                from: [1.0, 2.0, 3.0],
+                from_facing: 45.0
+            }
+        );
+        let b = s.world.get(barrel).unwrap();
+        assert_eq!((b.position, b.facing), ([7.0, 8.0, 9.0], 180.0));
+        assert_eq!(
+            s.world.command_journal.last().unwrap().objects[0].tag,
+            "barrel"
+        );
+
+        let out = s.apply(
+            CommandSource::ModMode,
+            SimCommand::CreateObject {
+                kind: ObjectKind::Creature,
+                template: "c_wolf".into(),
+                position: [0.0, 1.0, 0.0],
+                facing: 0.0,
+            },
+        );
+        let CommandOutcome::ObjectCreated { id } = out else {
+            panic!("{out:?}");
+        };
+        let made = s.world.get(id).unwrap();
+        assert_eq!((made.area, made.position), (Some(area), [0.0, 1.0, 0.0]));
+        assert_eq!(s.world.command_journal.last().unwrap().objects[0].id, id);
+
+        // Undo of the create: the new object goes; the journal names it.
+        let out = s.apply(
+            CommandSource::ModMode,
+            SimCommand::DestroyObject { target: id },
+        );
+        assert_eq!(out, CommandOutcome::ObjectDestroyed);
+        s.tick(0);
+        assert!(s.world.get(id).is_none());
+        assert_eq!(s.world.command_journal.last().unwrap().objects[0].id, id);
+        assert_eq!(s.world.command_journal.len(), 3);
+
+        let refused = |o: CommandOutcome| matches!(o, CommandOutcome::Refused { .. });
+        for c in [
+            SimCommand::DestroyObject { target: hero },
+            SimCommand::DestroyObject { target: area },
+            SimCommand::MoveObject {
+                target: area,
+                position: [0.0; 3],
+                facing: 0.0,
+            },
+            SimCommand::MoveObject {
+                target: barrel,
+                position: [f32::NAN, 0.0, 0.0],
+                facing: 0.0,
+            },
+            SimCommand::CreateObject {
+                kind: ObjectKind::Trigger,
+                template: "t".into(),
+                position: [0.0; 3],
+                facing: 0.0,
+            },
+            SimCommand::DestroyObject { target: 999_999 },
+        ] {
+            assert!(refused(s.apply(CommandSource::ModMode, c.clone())), "{c:?}");
+        }
+        // Out of the current area: not moved.
+        let elsewhere = s.world.spawn(ObjectKind::Placeable, "far");
+        let out = s.apply(
+            CommandSource::ModMode,
+            SimCommand::MoveObject {
+                target: elsewhere,
+                position: [0.0; 3],
+                facing: 0.0,
+            },
+        );
+        assert!(refused(out));
+    }
+
+    #[test]
+    fn local_values_serialize_with_their_type() {
+        let v = LocalValue::Float(1.5);
+        let j = serde_json::to_string(&v).unwrap();
+        assert_eq!(j, r#"{"type":"float","value":1.5}"#);
+        assert_eq!(serde_json::from_str::<LocalValue>(&j).unwrap(), v);
     }
 
     #[test]

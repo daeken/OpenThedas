@@ -12,10 +12,20 @@
 //! base one, whatever is mounted on the base later. Player mods live there (see
 //! [`crate::mods`]), so a level's archives mounted while its area is loaded never hide a mod's
 //! file, as the original's override folders outrank its `env` folders.
+//!
+//! Above both sits the *workspace*: one folder of loose files that mod mode mounts while the
+//! player asks for live edits ([`Vfs::set_workspace`]). It beats every layer, the last line
+//! of the mod list included. It is one for the process, seen by every stack the game plays
+//! from (those [`crate::DaoInstall::play_vfs`] builds for Dragon Age: Origins with mods on,
+//! marked by [`Vfs::play_from`]; other stacks never see it), and unlike the layers it can be
+//! mounted, unmounted and scanned again ([`Vfs::rescan_workspace`]) while those stacks are
+//! shared. A changed file is read afresh on its next read; what was already loaded from
+//! the old file stays as it was until its user reads it again.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 
 use crate::crypto::DaoKey;
 use crate::erf::Erf;
@@ -76,6 +86,41 @@ enum Slot {
     File(usize),
 }
 
+/// The workspace's layer label (see [`Vfs::set_workspace`]).
+pub const WORKSPACE_LABEL: &str = "workspace:override";
+
+/// The workspace: a folder of loose files, every file at any depth by name (a later path
+/// wins, as in a recursive directory layer).
+#[derive(Debug)]
+struct Workspace {
+    root: PathBuf,
+    files: HashMap<u64, (String, PathBuf)>,
+}
+
+impl Workspace {
+    fn scan(root: &Path) -> Workspace {
+        let mut paths = Vec::new();
+        if root.is_dir()
+            && let Err(e) = collect_files(root, true, &mut paths)
+        {
+            log::warn!("{WORKSPACE_LABEL}: {e}");
+        }
+        paths.retain(|p| !is_archive(p));
+        paths.sort();
+        let mut files = HashMap::new();
+        for path in paths {
+            let Some(name) = path.file_name().map(|n| n.to_string_lossy().into_owned()) else {
+                continue;
+            };
+            files.insert(name_hash(&name), (normalize_name(&name), path));
+        }
+        Workspace {
+            root: root.to_path_buf(),
+            files,
+        }
+    }
+}
+
 /// Where a resource came from.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Provenance {
@@ -101,7 +146,14 @@ pub struct Vfs {
     names: HashMap<u64, String>,
     /// Layers that beat every layer of this stack; see the module documentation.
     overlay: Option<Box<Vfs>>,
+    /// The game plays from this stack: the workspace, when mounted, beats its layers.
+    plays: bool,
 }
+
+/// Whether a workspace is mounted: the fast path every read checks first. Set after the
+/// slot is filled and cleared before it is emptied.
+static WORKSPACE_UP: AtomicBool = AtomicBool::new(false);
+static WORKSPACE: RwLock<Option<Workspace>> = RwLock::new(None);
 
 impl Vfs {
     pub fn new() -> Self {
@@ -416,6 +468,9 @@ impl Vfs {
 
     /// The winning source for a name, if any layer provides it.
     pub fn lookup(&self, name: &str) -> Option<Provenance> {
+        if let Some(p) = self.workspace_hit(name) {
+            return Some(p);
+        }
         if let Some(p) = self.overlay.as_ref().and_then(|o| o.lookup(name)) {
             return Some(self.lifted(p));
         }
@@ -426,11 +481,17 @@ impl Vfs {
 
     /// Every source for a name, highest priority first.
     pub fn hits(&self, name: &str) -> Vec<Provenance> {
-        let mut out: Vec<Provenance> = self
-            .overlay
-            .as_ref()
-            .map(|o| o.hits(name).into_iter().map(|p| self.lifted(p)).collect())
-            .unwrap_or_default();
+        let mut out: Vec<Provenance> = self.workspace_hit(name).into_iter().collect();
+        out.extend(self.layer_hits(name));
+        out
+    }
+
+    /// [`Vfs::hits`] without the workspace.
+    fn layer_hits(&self, name: &str) -> Vec<Provenance> {
+        let mut out = Vec::new();
+        if let Some(o) = &self.overlay {
+            out.extend(o.layer_hits(name).into_iter().map(|p| self.lifted(p)));
+        }
         if let Some(h) = self.index.get(&name_hash(name)) {
             out.extend(h.iter().rev().map(|&(l, s)| self.provenance(l, s)));
         }
@@ -457,6 +518,77 @@ impl Vfs {
         }
     }
 
+    /// Marks this stack as one the game plays from, so a mounted workspace beats its layers.
+    pub fn play_from(&mut self) {
+        self.plays = true;
+    }
+
+    /// Whether the game plays from this stack (see [`Vfs::play_from`]).
+    pub fn plays(&self) -> bool {
+        self.plays
+    }
+
+    /// Mounts folder `dir` as the workspace, above every layer of every stack (`None`
+    /// unmounts it). Returns how many files it holds.
+    pub fn set_workspace(dir: Option<&Path>) -> usize {
+        let mut slot = WORKSPACE.write().unwrap_or_else(|p| p.into_inner());
+        match dir {
+            Some(d) => {
+                let w = Workspace::scan(d);
+                let n = w.files.len();
+                *slot = Some(w);
+                WORKSPACE_UP.store(true, Ordering::Release);
+                n
+            }
+            None => {
+                WORKSPACE_UP.store(false, Ordering::Release);
+                *slot = None;
+                0
+            }
+        }
+    }
+
+    /// Scans the mounted workspace's folder again (for files added or removed); returns how
+    /// many files it holds (0 when none is mounted).
+    pub fn rescan_workspace() -> usize {
+        if !WORKSPACE_UP.load(Ordering::Acquire) {
+            return 0;
+        }
+        let mut slot = WORKSPACE.write().unwrap_or_else(|p| p.into_inner());
+        match slot.as_mut() {
+            Some(w) => {
+                *w = Workspace::scan(&w.root);
+                w.files.len()
+            }
+            None => 0,
+        }
+    }
+
+    /// The mounted workspace's folder and file count.
+    pub fn workspace() -> Option<(PathBuf, usize)> {
+        if !WORKSPACE_UP.load(Ordering::Acquire) {
+            return None;
+        }
+        let slot = WORKSPACE.read().unwrap_or_else(|p| p.into_inner());
+        slot.as_ref().map(|w| (w.root.clone(), w.files.len()))
+    }
+
+    /// The workspace's file for a name, with its provenance (counted above every layer).
+    fn workspace_hit(&self, name: &str) -> Option<Provenance> {
+        if !self.plays || !WORKSPACE_UP.load(Ordering::Acquire) {
+            return None;
+        }
+        let slot = WORKSPACE.read().unwrap_or_else(|p| p.into_inner());
+        let (n, path) = slot.as_ref()?.files.get(&name_hash(name))?;
+        let top = self.layers.len() + self.overlay.as_ref().map_or(0, |o| o.layers.len());
+        Some(Provenance {
+            layer: top,
+            layer_label: WORKSPACE_LABEL.to_string(),
+            file: path.clone(),
+            entry: Some(n.clone()),
+        })
+    }
+
     /// Reads the winning version of a resource.
     ///
     /// When the winner is an encrypted archive entry we have no key for (DLC archives that
@@ -464,6 +596,18 @@ impl Vfs {
     /// names the layer that actually supplied the data. With every DLC key available this
     /// is the original's lookup; without keys it is the closest readable approximation.
     pub fn read(&self, name: &str) -> Result<(Vec<u8>, Provenance)> {
+        if let Some(p) = self.workspace_hit(name) {
+            // A file removed since the last scan falls through to the layers.
+            if let Ok(data) = std::fs::read(&p.file) {
+                return Ok((data, p));
+            }
+        }
+        self.read_beneath_workspace(name)
+    }
+
+    /// [`Vfs::read`] as if no workspace were mounted: what the layers hold (mod mode reads
+    /// the originals of what it rewrites this way).
+    pub fn read_beneath_workspace(&self, name: &str) -> Result<(Vec<u8>, Provenance)> {
         let mut first_err = None;
         if let Some(o) = &self.overlay {
             match o.read(name) {
@@ -519,7 +663,14 @@ impl Vfs {
                     .map(|(_, n)| n.clone()),
             );
         }
+        if self.plays && WORKSPACE_UP.load(Ordering::Acquire) {
+            let slot = WORKSPACE.read().unwrap_or_else(|p| p.into_inner());
+            if let Some(w) = slot.as_ref() {
+                v.extend(w.files.values().map(|(n, _)| n.clone()));
+            }
+        }
         v.sort();
+        v.dedup();
         v
     }
 }

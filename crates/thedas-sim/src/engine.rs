@@ -103,6 +103,12 @@ fn void() -> Option<VmResult<Option<Value>>> {
     Some(Ok(None))
 }
 
+/// Dragon Age II creature fields its scripts set and read (`SetCreatureAmbientActivityPattern`
+/// and the rest); DA2's templates do not carry them.
+const DA2_AMBIENT_ACTIVITY: &str = "AmbientActivityPattern";
+const DA2_AMBIENT_MOVEMENT: &str = "AmbientMovementPattern";
+const DA2_ENCOUNTER: &str = "EncounterId";
+
 /// The party's inventory slots before any backpack (provisional).
 pub const DEFAULT_INVENTORY_SIZE: i32 = 70;
 
@@ -164,6 +170,39 @@ pub(crate) fn cell_string(c: Option<&Cell>) -> String {
         Some(Cell::Float(v)) => v.to_string(),
         Some(Cell::String(s)) => clean(s).to_string(),
         _ => String::new(),
+    }
+}
+
+/// The name of the local variable argument `a[i]` names on object `o`. Dragon Age: Origins
+/// names it; Dragon Age II's scripts pass the variable's row in the object's variable table
+/// instead (`var_module`, `var_area`, `var_creature`, `var_placeable`, `var_item`,
+/// `var_trigger`), whose `Label` column is the name templates use. A row that is not there
+/// keeps its number as its name. Provisional: read from DA2's scripts and tables (its
+/// `PlayCutscene` callers set `var_module` rows 1014 to 1016, `CUTSCENE_SET_PLOT`,
+/// `CUTSCENE_SET_PLOT_FLAG` and `CUTSCENE_TALK_SPEAKER`), not traced in the executable.
+fn local_name(sim: &Sim, o: ObjectId, a: &[Value], i: usize) -> String {
+    let Some(Value::Int(row)) = a.get(i) else {
+        return string(a, i);
+    };
+    let table = match sim.world.get(o).map(|o| o.kind) {
+        Some(ObjectKind::Module) => "var_module",
+        Some(ObjectKind::Area) => "var_area",
+        Some(ObjectKind::Creature) => "var_creature",
+        Some(ObjectKind::Placeable) => "var_placeable",
+        Some(ObjectKind::Item) => "var_item",
+        Some(ObjectKind::Trigger) => "var_trigger",
+        _ => return row.to_string(),
+    };
+    let name = sim
+        .world
+        .tables()
+        .get(0, table)
+        .map(|t| cell_string(t.cell("Label", *row as i64)))
+        .unwrap_or_default();
+    if name.is_empty() {
+        row.to_string()
+    } else {
+        name
     }
 }
 
@@ -1030,34 +1069,7 @@ pub fn call(
             }))
         }
         "DestroyObject" => {
-            let id = obj(a, 0);
-            if h.object(id)
-                .is_some_and(|o| o.kind == ObjectKind::AreaOfEffect)
-            {
-                h.sim.destroy_aoe(id);
-                return void();
-            }
-            if Some(id) != h.sim.world.hero {
-                // An item leaves whoever holds it: taken off if worn (its effects end and the
-                // wearer hears UNEQUIP), then out of the inventory, so no dangling ids stay
-                // behind (the City Elf house script destroys the hero's starting clothes).
-                // Provisional: the exe's container removal on destruction is not traced.
-                let holders: Vec<ObjectId> = h
-                    .sim
-                    .world
-                    .objects
-                    .values()
-                    .filter(|o| o.inventory.contains(&id))
-                    .map(|o| o.id)
-                    .collect();
-                for holder in holders {
-                    h.sim.unequip(holder, id);
-                    if let Some(o) = h.sim.world.get_mut(holder) {
-                        o.inventory.retain(|&i| i != id);
-                    }
-                }
-                h.sim.world.objects.remove(&id);
-            }
+            h.sim.destroy_object(obj(a, 0));
             void()
         }
         "CreateObject" => {
@@ -1104,63 +1116,96 @@ pub fn call(
         // --- Locals -----------------------------------------------------------------------
         "GetLocalInt" => ok(Value::Int(
             h.object(obj(a, 0))
-                .and_then(|o| o.locals.ints.get(&string(a, 1)).copied())
+                .and_then(|o| {
+                    o.locals
+                        .ints
+                        .get(&local_name(h.sim, obj(a, 0), a, 1))
+                        .copied()
+                })
                 .unwrap_or(0),
         )),
         "SetLocalInt" => {
+            let k = local_name(h.sim, obj(a, 0), a, 1);
             if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
-                o.locals.ints.insert(string(a, 1), int(a, 2));
+                o.locals.ints.insert(k, int(a, 2));
             }
             void()
         }
         "GetLocalFloat" => ok(Value::Float(
             h.object(obj(a, 0))
-                .and_then(|o| o.locals.floats.get(&string(a, 1)).copied())
+                .and_then(|o| {
+                    o.locals
+                        .floats
+                        .get(&local_name(h.sim, obj(a, 0), a, 1))
+                        .copied()
+                })
                 .unwrap_or(0.0),
         )),
         "SetLocalFloat" => {
+            let k = local_name(h.sim, obj(a, 0), a, 1);
             if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
-                o.locals.floats.insert(string(a, 1), float(a, 2));
+                o.locals.floats.insert(k, float(a, 2));
             }
             void()
         }
         "GetLocalString" => ok(Value::String(
             h.object(obj(a, 0))
-                .and_then(|o| o.locals.strings.get(&string(a, 1)).cloned())
+                .and_then(|o| {
+                    o.locals
+                        .strings
+                        .get(&local_name(h.sim, obj(a, 0), a, 1))
+                        .cloned()
+                })
                 .unwrap_or_default(),
         )),
         "SetLocalString" => {
+            let k = local_name(h.sim, obj(a, 0), a, 1);
             if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
-                o.locals.strings.insert(string(a, 1), string(a, 2));
+                o.locals.strings.insert(k, string(a, 2));
             }
             void()
         }
         "GetLocalObject" => ok(Value::Object(
             h.object(obj(a, 0))
-                .and_then(|o| o.locals.objects.get(&string(a, 1)).copied())
+                .and_then(|o| {
+                    o.locals
+                        .objects
+                        .get(&local_name(h.sim, obj(a, 0), a, 1))
+                        .copied()
+                })
                 .unwrap_or(OBJECT_INVALID),
         )),
         "SetLocalObject" => {
+            let k = local_name(h.sim, obj(a, 0), a, 1);
             if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
-                o.locals.objects.insert(string(a, 1), obj(a, 2));
+                o.locals.objects.insert(k, obj(a, 2));
             }
             void()
         }
         "GetLocalResource" => ok(Value::Resource(
             h.object(obj(a, 0))
-                .and_then(|o| o.locals.resources.get(&string(a, 1)).cloned())
+                .and_then(|o| {
+                    o.locals
+                        .resources
+                        .get(&local_name(h.sim, obj(a, 0), a, 1))
+                        .cloned()
+                })
                 .unwrap_or_default(),
         )),
         "SetLocalResource" => {
+            let k = local_name(h.sim, obj(a, 0), a, 1);
             if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
-                o.locals.resources.insert(string(a, 1), string(a, 2));
+                o.locals.resources.insert(k, string(a, 2));
             }
             void()
         }
         "GetLocalLocation" => {
-            let l = h
-                .object(obj(a, 0))
-                .and_then(|o| o.locals.locations.get(&string(a, 1)).copied());
+            let l = h.object(obj(a, 0)).and_then(|o| {
+                o.locals
+                    .locations
+                    .get(&local_name(h.sim, obj(a, 0), a, 1))
+                    .copied()
+            });
             let hd = l.map(|l| h.sim.world.store(EngineData::Location(l)));
             ok(Value::Engine {
                 ty: ty.location,
@@ -1168,9 +1213,10 @@ pub fn call(
             })
         }
         "SetLocalLocation" => {
+            let k = local_name(h.sim, obj(a, 0), a, 1);
             if let Some(EngineData::Location(l)) = h.sim.world.handle(handle(a, 2)).cloned() {
                 if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
-                    o.locals.locations.insert(string(a, 1), l);
+                    o.locals.locations.insert(k, l);
                 }
             }
             void()
@@ -2983,6 +3029,13 @@ pub fn call(
             h.sim.world.cutscenes.push(string(a, 0));
             void()
         }
+        // Dragon Age II's one call for both: `void PlayCutscene(resource rCutscene)` (its id
+        // 647 is DA:O's LoadCutscene). DA:O's own `PlayCutscene()` takes no argument and is
+        // left alone. Provisional: from DA2's script.ldf declaration.
+        "PlayCutscene" if matches!(a.first(), Some(Value::Resource(_) | Value::String(_))) => {
+            h.sim.world.cutscenes.push(string(a, 0));
+            void()
+        }
         "PreloadCharGen" => void(),
         "StartCharGen" => {
             h.sim.start_chargen(obj(a, 0), int(a, 1), int(a, 2));
@@ -2992,6 +3045,31 @@ pub fn call(
         // hero; the owner must be an active, living creature. Nothing here looks at the game
         // mode: a conversation may start in combat (and replaces it, see
         // `Sim::start_conversation`).
+        // Dragon Age II's `int BeginConversation(object oTarget, resource rConversationFile)`
+        // has no owner argument: the script's object talks to the target. Provisional: from
+        // DA2's script.ldf declaration and its prologue, whose plot script starts the
+        // player's own conversation (`pro000_opening_pc`) running as the player's creature.
+        "BeginConversation" if matches!(a.get(1), Some(Value::Resource(_) | Value::String(_))) => {
+            let target = obj(a, 0);
+            let owner = if h
+                .object(caller)
+                .is_some_and(|o| o.kind == ObjectKind::Creature)
+            {
+                caller
+            } else {
+                target
+            };
+            let target = if target == owner {
+                h.sim.world.hero.unwrap_or(target)
+            } else {
+                target
+            };
+            let can = h
+                .object(owner)
+                .is_some_and(|o| o.kind == ObjectKind::Creature && o.active && !o.dead);
+            let ok_ = can && h.sim.start_conversation(target, owner, &string(a, 1));
+            ok(b(ok_))
+        }
         "BeginConversation" => {
             let owner = obj(a, 1);
             let mut target = obj(a, 0);
@@ -4056,6 +4134,60 @@ pub fn call(
             void()
         }
 
+        // Dragon Age II's additions (none is in DA:O's script.ldf). Provisional: read from
+        // their script.ldf declarations and the fields DA2's templates carry, not traced in
+        // DragonAge2.exe.
+        "GetItemLevel"
+        | "GetItemVariation"
+        | "GetPlaceableStateController"
+        | "GetCreatureAmbientActivityPattern"
+        | "GetCreatureAmbientMovementPattern"
+        | "GetEncounterId" => {
+            let field = match name {
+                "GetItemLevel" => "Level",
+                "GetItemVariation" => "ModelVariation",
+                // A placeable template's state controller: a row of
+                // placeable_statecontrollers.gda (4 informational, 2 area transition, ...).
+                "GetPlaceableStateController" => "StateController",
+                "GetCreatureAmbientActivityPattern" => DA2_AMBIENT_ACTIVITY,
+                "GetCreatureAmbientMovementPattern" => DA2_AMBIENT_MOVEMENT,
+                _ => DA2_ENCOUNTER,
+            };
+            ok(Value::Int(
+                h.object(obj(a, 0))
+                    .and_then(|o| o.fields.get(field).copied())
+                    .unwrap_or(0),
+            ))
+        }
+        "SetItemLevel"
+        | "SetCreatureAmbientActivityPattern"
+        | "SetCreatureAmbientMovementPattern"
+        | "SetEncounterId" => {
+            let field = match name {
+                "SetItemLevel" => "Level",
+                "SetCreatureAmbientActivityPattern" => DA2_AMBIENT_ACTIVITY,
+                "SetCreatureAmbientMovementPattern" => DA2_AMBIENT_MOVEMENT,
+                _ => DA2_ENCOUNTER,
+            };
+            if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
+                o.fields.insert(field.to_string(), int(a, 1));
+            }
+            void()
+        }
+        "min" => ok(Value::Int(int(a, 0).min(int(a, 1)))),
+        "max" => ok(Value::Int(int(a, 0).max(int(a, 1)))),
+        "minf" => ok(Value::Float(float(a, 0).min(float(a, 1)))),
+        "maxf" => ok(Value::Float(float(a, 0).max(float(a, 1)))),
+        // The player's profile unlocks, the cross-game vault and the GUI attribute tree are
+        // not kept: none is set.
+        "GetGlobalUnlock" | "GetVaultInt" | "GetAttributeBool" => ok(Value::Int(0)),
+        // Presentation only.
+        "PreloadCreatureForConversation"
+        | "SetGUIElementEnabled"
+        | "SetPartyMailArea"
+        | "SetNextLoadScreenMovie"
+        | "ShowHelmetInPortrait"
+        | "SetAudioGlobalGameParameter" => void(),
         "GetItemStackSize" => ok(Value::Int(
             h.object(obj(a, 0))
                 .and_then(|o| o.fields.get("StackSize").copied())
@@ -4761,7 +4893,138 @@ mod tests {
         int GetHashedM2DABool(int n2DA, int nColumnHash, int nRow) = 883;\n\
         float GetHashedM2DAFloat(int n2DA, int nColumnHash, int nRow) = 864;\n\
         string GetHashedM2DAString(int n2DA, int nColumnHash, int nRow) = 865;\n\
-        resource GetHashedM2DAResource(int n2DA, int nColumnHash, int nRow) = 866;\n";
+        resource GetHashedM2DAResource(int n2DA, int nColumnHash, int nRow) = 866;\n\
+        int GetItemLevel( object oItem ) = 701;\n\
+        void SetItemLevel( object oItem, int nLevel ) = 880;\n\
+        int GetPlaceableStateController( object oPlaceable ) = 134;\n\
+        int GetCreatureAmbientActivityPattern(object oCreature) = 670;\n\
+        void SetCreatureAmbientActivityPattern(object oCreature, int n) = 671;\n\
+        int max(int a, int b) = 422;\n\
+        float minf(float a, float b) = 423;\n\
+        void SetLocalString(object o, int n, string s) = 990;\n\
+        string GetLocalString(object o, int n) = 991;\n\
+        void SetLocalInt(object o, int n, int v) = 992;\n\
+        int GetLocalInt(object o, int n) = 993;\n\
+        void PlayCutscene(resource r) = 994;\n";
+
+    #[test]
+    fn dragon_age_2_functions_read_and_set_template_fields() {
+        let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        let item = s.world.spawn(ObjectKind::Item, "sword");
+        s.world
+            .get_mut(item)
+            .unwrap()
+            .fields
+            .insert("Level".into(), 7);
+        let door = s.world.spawn(ObjectKind::Placeable, "door");
+        s.world
+            .get_mut(door)
+            .unwrap()
+            .fields
+            .insert("StateController".into(), 1);
+        let npc = s.world.spawn(ObjectKind::Creature, "npc");
+        let o = |id| Value::Object(id);
+        assert_eq!(
+            run(&mut s, 1, "GetItemLevel", &[o(item)]),
+            Some(Value::Int(7))
+        );
+        run(&mut s, 1, "SetItemLevel", &[o(item), Value::Int(9)]);
+        assert_eq!(
+            run(&mut s, 1, "GetItemLevel", &[o(item)]),
+            Some(Value::Int(9))
+        );
+        assert_eq!(
+            run(&mut s, 1, "GetPlaceableStateController", &[o(door)]),
+            Some(Value::Int(1))
+        );
+        run(
+            &mut s,
+            1,
+            "SetCreatureAmbientActivityPattern",
+            &[o(npc), Value::Int(3)],
+        );
+        assert_eq!(
+            run(&mut s, 1, "GetCreatureAmbientActivityPattern", &[o(npc)]),
+            Some(Value::Int(3))
+        );
+        assert_eq!(
+            run(&mut s, 1, "max", &[Value::Int(2), Value::Int(5)]),
+            Some(Value::Int(5))
+        );
+        assert_eq!(
+            run(&mut s, 1, "minf", &[Value::Float(2.5), Value::Float(1.5)]),
+            Some(Value::Float(1.5))
+        );
+    }
+
+    #[test]
+    fn dragon_age_2_locals_are_named_by_their_variable_table_row() {
+        let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        s.world.tables().insert(
+            "var_module",
+            &["Label"],
+            vec![
+                (1014, vec![Cell::String("CUTSCENE_SET_PLOT\0".into())]),
+                (1015, vec![Cell::String("CUTSCENE_SET_PLOT_FLAG\0".into())]),
+            ],
+        );
+        s.world.tables().insert(
+            "var_creature",
+            &["Label"],
+            vec![(1014, vec![Cell::String("AI_THING\0".into())])],
+        );
+        let module = s.world.spawn(ObjectKind::Module, "module");
+        let npc = s.world.spawn(ObjectKind::Creature, "npc");
+        let o = |id| Value::Object(id);
+        run(
+            &mut s,
+            1,
+            "SetLocalString",
+            &[o(module), Value::Int(1014), Value::String("plt_x".into())],
+        );
+        run(
+            &mut s,
+            1,
+            "SetLocalInt",
+            &[o(module), Value::Int(1015), Value::Int(3)],
+        );
+        run(
+            &mut s,
+            1,
+            "SetLocalInt",
+            &[o(npc), Value::Int(1014), Value::Int(7)],
+        );
+        run(
+            &mut s,
+            1,
+            "SetLocalInt",
+            &[o(npc), Value::Int(55), Value::Int(8)],
+        );
+        let m = &s.world.get(module).unwrap().locals;
+        assert_eq!(
+            m.strings.get("CUTSCENE_SET_PLOT").map(String::as_str),
+            Some("plt_x")
+        );
+        assert_eq!(m.ints.get("CUTSCENE_SET_PLOT_FLAG"), Some(&3));
+        // The row is looked up in the object's own table; a row it lacks keeps its number.
+        let n = &s.world.get(npc).unwrap().locals;
+        assert_eq!(n.ints.get("AI_THING"), Some(&7));
+        assert_eq!(n.ints.get("55"), Some(&8));
+        assert_eq!(
+            run(&mut s, 1, "GetLocalInt", &[o(npc), Value::Int(1014)]),
+            Some(Value::Int(7))
+        );
+        // Dragon Age II's PlayCutscene takes the cutscene and queues it.
+        run(
+            &mut s,
+            1,
+            "PlayCutscene",
+            &[Value::Resource("pro000cs_opening.cut".into())],
+        );
+        assert_eq!(s.world.cutscenes, vec!["pro000cs_opening.cut".to_string()]);
+    }
 
     #[test]
     fn hashed_table_reads_find_columns_by_hash() {
@@ -5449,6 +5712,8 @@ mod tests {
         let store = s.world.spawn(ObjectKind::Store, "store");
         let hero = s.world.spawn(ObjectKind::Creature, "hero");
         s.world.hero = Some(hero);
+        let module = s.world.spawn(ObjectKind::Module, "module");
+        s.world.module = Some(module);
         run(
             &mut s,
             door,
@@ -5461,13 +5726,15 @@ mod tests {
         );
         assert!(s.answer_popup(1));
         assert!(s.world.popup.is_none());
+        // The answer goes to the module, the popup's owner as object 0 (DAOrigins.exe
+        // 0x7098ef, 0x70993b).
         let q: Vec<_> = s
             .world
             .queue
             .values()
-            .map(|q| (q.target, q.event.ints.clone()))
+            .map(|q| (q.target, q.event.ints.clone(), q.event.objects.clone()))
             .collect();
-        assert_eq!(q, vec![(door, vec![1, 1])]);
+        assert_eq!(q, vec![(module, vec![1, 1], vec![door])]);
         // Text typed into the box rides along as string 0.
         assert!(
             s.world
