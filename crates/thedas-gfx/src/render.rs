@@ -204,6 +204,8 @@ pub struct Renderer {
     clamp: wgpu::Sampler,
     repeat: wgpu::Sampler,
     shapes: HashMap<(u16, u16), Vec<Arc<GpuMesh>>>,
+    cpu_shapes: HashMap<(u16, u16), Vec<(Arc<Mesh>, Arc<GpuMesh>)>>,
+    scale9: HashMap<(DisplayId, [u32; 8]), Vec<Arc<GpuMesh>>>,
     glyphs: HashMap<(usize, usize), Arc<(Vec<[f32; 2]>, Vec<u32>)>>,
     texts: HashMap<DisplayId, (u64, Vec<Arc<GpuMesh>>)>,
     drawings: HashMap<DisplayId, Vec<Arc<GpuMesh>>>,
@@ -293,6 +295,8 @@ impl Renderer {
             clamp,
             repeat,
             shapes: HashMap::new(),
+            cpu_shapes: HashMap::new(),
+            scale9: HashMap::new(),
             glyphs: HashMap::new(),
             texts: HashMap::new(),
             drawings: HashMap::new(),
@@ -692,9 +696,46 @@ impl Renderer {
                     self.upload(&m, Some(bg), *kind as f32, *to_gradient)
                 }
             };
+            if let Some(g) = &g {
+                self.cpu_shapes
+                    .entry((id, ratio))
+                    .or_default()
+                    .push((Arc::new(m.clone()), g.clone()));
+            }
             out.extend(g);
         }
         self.shapes.insert((id, ratio), out.clone());
+        out
+    }
+
+    /// A shape child of a scaling-grid clip, its outline moved as the grid lays it out: the
+    /// corners keep their size, the edges stretch one way and the middle both
+    /// (`DefineScalingGrid`). `place` maps the child's space into the clip's, `remap` the
+    /// clip's unscaled space to its scaled one.
+    fn scale9_meshes(
+        &mut self,
+        player: &Player,
+        images: &mut dyn Images,
+        id: u16,
+        key: (DisplayId, [u32; 8]),
+        place: Matrix,
+        grid: crate::swf::Rect,
+        remap: &dyn Fn(f32, f32) -> (f32, f32),
+    ) -> Vec<Arc<GpuMesh>> {
+        if let Some(m) = self.scale9.get(&key) {
+            return m.clone();
+        }
+        self.shape_meshes(player, images, id, 0);
+        let src = self.cpu_shapes.get(&(id, 0)).cloned().unwrap_or_default();
+        let mut out = Vec::new();
+        for (mesh, gpu) in src {
+            let m = slice_mesh(&mesh, place, grid, remap);
+            out.extend(self.upload(&m, gpu.binding.clone(), gpu.mode, gpu.to_gradient));
+        }
+        if self.scale9.len() > 4096 {
+            self.scale9.clear();
+        }
+        self.scale9.insert(key, out.clone());
         out
     }
 
@@ -894,22 +935,7 @@ impl Renderer {
         };
         let u = b.uniform(&world, &cx, view);
         for m in &meshes {
-            let mut un = b.uniforms[u as usize];
-            un.mode = [m.mode, 0.0, 0.0, 0.0];
-            if m.mode >= 2.0 {
-                let g = &m.to_gradient;
-                un.g0 = [g.a, g.c, g.tx, 0.0];
-                un.g1 = [g.b, g.d, g.ty, 0.0];
-            }
-            let idx = b.uniforms.len() as u32;
-            b.uniforms.push(un);
-            b.ops.push(Op {
-                mesh: m.clone(),
-                uniform: idx,
-                blend,
-                stencil: Stencil::Content,
-                reference: stencil,
-            });
+            b.push(m, u, blend, stencil);
         }
         let Some(o) = player.vm.display.get(d) else {
             return;
@@ -925,6 +951,7 @@ impl Renderer {
         // Open masks: (until depth, mask object, its matrix, stencil level inside).
         let mut masks: Vec<(i32, DisplayId)> = Vec::new();
         let mut level = stencil;
+        let grid = self.grid_for(player, d, parent);
         for (depth, c, clip) in kids {
             while let Some((until, m)) = masks.last().copied() {
                 if depth > until {
@@ -940,6 +967,39 @@ impl Renderer {
                 level += 1;
                 masks.push((until, c));
                 continue;
+            }
+            if let Some((noscale, remap)) = &grid {
+                let shape = player.vm.display.get(c).and_then(|co| match &co.kind {
+                    Kind::Shape(_, id) if co.visible => Some((*id, co.matrix, co.color)),
+                    _ => None,
+                });
+                if let Some((id, place, ccx)) = shape {
+                    let key = (
+                        c,
+                        [
+                            remap.sx.to_bits(),
+                            remap.sy.to_bits(),
+                            place.a.to_bits(),
+                            place.b.to_bits(),
+                            place.c.to_bits(),
+                            place.d.to_bits(),
+                            place.tx.to_bits(),
+                            place.ty.to_bits(),
+                        ],
+                    );
+                    let r = remap.clone();
+                    let g = r.grid;
+                    let meshes =
+                        self.scale9_meshes(player, images, id, key, place, g, &move |x, y| {
+                            r.apply(x, y)
+                        });
+                    let ccx = cx.concat(&ccx);
+                    let u = b.uniform(noscale, &ccx, view);
+                    for m in &meshes {
+                        b.push(m, u, blend, level);
+                    }
+                    continue;
+                }
             }
             self.walk(player, images, c, world, cx, blend, view, level, b);
         }
@@ -993,6 +1053,37 @@ impl Renderer {
             op.blend = Blend::Normal;
             b.ops.push(op);
         }
+    }
+
+    /// For a clip with a scaling grid that is scaled: its matrix with the scale taken out
+    /// (combined with `parent`), and how its points move.
+    fn grid_for(&self, player: &Player, d: DisplayId, parent: Matrix) -> Option<(Matrix, Grid)> {
+        let o = player.vm.display.get(d)?;
+        let character = o.clip()?.character;
+        let grid = *player.vm.movie.scale9.get(&character)?;
+        let (sx, sy, rot) = o.scale_rotation();
+        if (sx - 1.0).abs() < 1e-4 && (sy - 1.0).abs() < 1e-4 {
+            return None;
+        }
+        let bounds = crate::avm1::display_api::local_bounds(&player.vm, d)?;
+        let (s, c) = (rot.to_radians() as f32).sin_cos();
+        let m = Matrix {
+            a: c,
+            b: s,
+            c: -s,
+            d: c,
+            tx: o.matrix.tx,
+            ty: o.matrix.ty,
+        };
+        Some((
+            parent.mul(&m),
+            Grid {
+                sx: sx as f32,
+                sy: sy as f32,
+                bounds,
+                grid,
+            },
+        ))
     }
 
     /// Reads the output back (straight RGBA), for tests and captures.
@@ -1094,7 +1185,176 @@ struct Build {
     uniforms: Vec<DrawU>,
 }
 
+/// Cuts `mesh` (moved by `place`) along the grid's lines so each piece lies in one cell, then
+/// moves every point with `remap`: a cell's content then stretches only as its cell does.
+fn slice_mesh(
+    mesh: &Mesh,
+    place: Matrix,
+    grid: crate::swf::Rect,
+    remap: &dyn Fn(f32, f32) -> (f32, f32),
+) -> Mesh {
+    let xs = [f32::MIN, grid.x_min as f32, grid.x_max as f32, f32::MAX];
+    let ys = [f32::MIN, grid.y_min as f32, grid.y_max as f32, f32::MAX];
+    let mut out = Mesh {
+        paint: mesh.paint.clone(),
+        vertices: Vec::new(),
+        indices: Vec::new(),
+    };
+    let lerp = |a: &Vertex, b: &Vertex, t: f32| Vertex {
+        pos: [
+            a.pos[0] + (b.pos[0] - a.pos[0]) * t,
+            a.pos[1] + (b.pos[1] - a.pos[1]) * t,
+        ],
+        uv: [
+            a.uv[0] + (b.uv[0] - a.uv[0]) * t,
+            a.uv[1] + (b.uv[1] - a.uv[1]) * t,
+        ],
+        color: a.color,
+    };
+    // Clips a polygon to `coord(v) >= edge` (keep_above) or `<= edge`.
+    let clip = |poly: Vec<Vertex>, axis: usize, edge: f32, above: bool| -> Vec<Vertex> {
+        let inside = |v: &Vertex| {
+            if above {
+                v.pos[axis] >= edge
+            } else {
+                v.pos[axis] <= edge
+            }
+        };
+        let mut r = Vec::with_capacity(poly.len() + 2);
+        for i in 0..poly.len() {
+            let a = &poly[i];
+            let b = &poly[(i + 1) % poly.len()];
+            let (ia, ib) = (inside(a), inside(b));
+            if ia {
+                r.push(*a);
+            }
+            if ia != ib {
+                let t = (edge - a.pos[axis]) / (b.pos[axis] - a.pos[axis]);
+                r.push(lerp(a, b, t));
+            }
+        }
+        r
+    };
+    let placed: Vec<Vertex> = mesh
+        .vertices
+        .iter()
+        .map(|v| {
+            let (x, y) = place.apply(v.pos[0], v.pos[1]);
+            Vertex { pos: [x, y], ..*v }
+        })
+        .collect();
+    for tri in mesh.indices.chunks_exact(3) {
+        let t: Vec<Vertex> = tri
+            .iter()
+            .filter_map(|&i| placed.get(i as usize).copied())
+            .collect();
+        if t.len() != 3 {
+            continue;
+        }
+        for cy in 0..3 {
+            for cx in 0..3 {
+                let mut p = t.clone();
+                if xs[cx] > f32::MIN {
+                    p = clip(p, 0, xs[cx], true);
+                }
+                if xs[cx + 1] < f32::MAX {
+                    p = clip(p, 0, xs[cx + 1], false);
+                }
+                if ys[cy] > f32::MIN {
+                    p = clip(p, 1, ys[cy], true);
+                }
+                if ys[cy + 1] < f32::MAX {
+                    p = clip(p, 1, ys[cy + 1], false);
+                }
+                if p.len() < 3 {
+                    continue;
+                }
+                let base = out.vertices.len() as u32;
+                for v in &p {
+                    let (x, y) = remap(v.pos[0], v.pos[1]);
+                    out.vertices.push(Vertex { pos: [x, y], ..*v });
+                }
+                for k in 1..p.len() as u32 - 1 {
+                    out.indices.extend([base, base + k, base + k + 1]);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// How a scaling grid moves a clip's unscaled points (twips) to its scaled ones.
+#[derive(Clone, Debug)]
+struct Grid {
+    sx: f32,
+    sy: f32,
+    bounds: crate::swf::Rect,
+    grid: crate::swf::Rect,
+}
+
+impl Grid {
+    fn axis(v: f32, lo: f32, hi: f32, g0: f32, g1: f32, s: f32) -> f32 {
+        let left = lo * s;
+        let right = hi * s;
+        let (a, b) = (left + (g0 - lo), right - (hi - g1));
+        if b < a {
+            // Too small for the fixed parts: scale everything (Flash does the same).
+            return v * s;
+        }
+        if v <= g0 {
+            left + (v - lo)
+        } else if v >= g1 {
+            right - (hi - v)
+        } else if g1 > g0 {
+            a + (v - g0) / (g1 - g0) * (b - a)
+        } else {
+            a
+        }
+    }
+
+    fn apply(&self, x: f32, y: f32) -> (f32, f32) {
+        let (b, g) = (&self.bounds, &self.grid);
+        (
+            Self::axis(
+                x,
+                b.x_min as f32,
+                b.x_max as f32,
+                g.x_min as f32,
+                g.x_max as f32,
+                self.sx,
+            ),
+            Self::axis(
+                y,
+                b.y_min as f32,
+                b.y_max as f32,
+                g.y_min as f32,
+                g.y_max as f32,
+                self.sy,
+            ),
+        )
+    }
+}
+
 impl Build {
+    fn push(&mut self, m: &Arc<GpuMesh>, u: u32, blend: Blend, stencil: u32) {
+        let mut un = self.uniforms[u as usize];
+        un.mode = [m.mode, 0.0, 0.0, 0.0];
+        if m.mode >= 2.0 {
+            let g = &m.to_gradient;
+            un.g0 = [g.a, g.c, g.tx, 0.0];
+            un.g1 = [g.b, g.d, g.ty, 0.0];
+        }
+        let idx = self.uniforms.len() as u32;
+        self.uniforms.push(un);
+        self.ops.push(Op {
+            mesh: m.clone(),
+            uniform: idx,
+            blend,
+            stencil: Stencil::Content,
+            reference: stencil,
+        });
+    }
+
     fn uniform(&mut self, m: &Matrix, cx: &ColorTransform, v: &Viewport) -> u32 {
         let sx = 2.0 / v.w;
         let sy = -2.0 / v.h;

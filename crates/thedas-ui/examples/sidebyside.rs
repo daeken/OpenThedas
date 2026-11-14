@@ -112,12 +112,49 @@ fn main() {
     let (a, ta) = run(&gpu, &vfs, &names, frames, size, false);
     let (b, tb) = run(&gpu, &vfs, &names, frames, size, true);
     println!("{ta}\n{tb}");
+    // An optional reference picture (the original game, same size) goes first.
+    let reference = args.get(6).and_then(|p| {
+        let f = std::fs::File::open(p).ok()?;
+        let mut d = png::Decoder::new(std::io::BufReader::new(f));
+        d.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
+        let mut r = d.read_info().ok()?;
+        let mut buf = vec![0; r.output_buffer_size()?];
+        let info = r.next_frame(&mut buf).ok()?;
+        if (info.width, info.height) != size {
+            eprintln!(
+                "reference is {}x{}, not {}x{}",
+                info.width, info.height, size.0, size.1
+            );
+            return None;
+        }
+        let px: Vec<u8> = match info.color_type {
+            png::ColorType::Rgb => buf[..info.buffer_size()]
+                .chunks_exact(3)
+                .flat_map(|c| [c[0], c[1], c[2], 255])
+                .collect(),
+            _ => buf[..info.buffer_size()].to_vec(),
+        };
+        Some(Rgba {
+            width: size.0,
+            height: size.1,
+            pixels: px,
+        })
+    });
     let gap = 8;
-    let w = size.0 * 2 + gap;
+    let mut imgs: Vec<&Rgba> = Vec::new();
+    if let Some(r) = &reference {
+        imgs.push(r);
+    }
+    imgs.push(&a);
+    imgs.push(&b);
+    let n = imgs.len() as u32;
+    let w = size.0 * n + gap * (n - 1);
     let mut out = vec![0u8; (w * size.1 * 4) as usize];
     for y in 0..size.1 as usize {
-        for (img, x0) in [(&a, 0usize), (&b, (size.0 + gap) as usize)] {
+        for (i, img) in imgs.iter().enumerate() {
+            let x0 = i * (size.0 + gap) as usize;
             let src = &img.pixels[y * size.0 as usize * 4..(y + 1) * size.0 as usize * 4];
+            let _ = &x0;
             let at = (y * w as usize + x0) * 4;
             out[at..at + src.len()].copy_from_slice(src);
         }

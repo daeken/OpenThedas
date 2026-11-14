@@ -138,6 +138,45 @@ fn main() {
         p.run_frame();
     }
     let t_frames = t1.elapsed();
+    if std::env::var_os("GFX_RENDER").is_some() {
+        struct NoImages;
+        impl thedas_gfx::render::Images for NoImages {
+            fn image(&mut self, _: &str) -> Option<(u32, u32, Vec<u8>)> {
+                Some((4, 4, vec![128; 64]))
+            }
+        }
+        let instance =
+            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+        let adapter =
+            pollster::block_on(instance.request_adapter(&Default::default())).expect("adapter");
+        let (device, queue) =
+            pollster::block_on(adapter.request_device(&Default::default())).expect("device");
+        let mut r =
+            thedas_gfx::render::Renderer::new(&device, &queue, wgpu::TextureFormat::Rgba8Unorm);
+        let size = (1280, 720);
+        r.render(&mut p, &mut NoImages, size);
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        let n = 60;
+        let (mut script, mut render, mut drawn) =
+            (std::time::Duration::ZERO, std::time::Duration::ZERO, 0);
+        for _ in 0..n {
+            let a = std::time::Instant::now();
+            p.tick(1000.0 / 30.0);
+            let b = std::time::Instant::now();
+            if r.render_if_dirty(&mut p, &mut NoImages, size) {
+                drawn += 1;
+            }
+            let _ = device.poll(wgpu::PollType::wait_indefinitely());
+            script += b - a;
+            render += b.elapsed();
+        }
+        println!(
+            "per tick: script {:?}, render {:?} ({drawn}/{n} ticks drew, {} draws)",
+            script / n,
+            render / n,
+            r.draws
+        );
+    }
     for l in log
         .lock()
         .map(|l| l.clone())
