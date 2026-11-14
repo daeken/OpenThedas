@@ -165,8 +165,6 @@ once; the level's own textures and meshes change on its next load.
 
 - `.rar` archives, and encrypted `.7z` archives.
 - Archives inside a `.zip`.
-- A `.dazip` holding more than one add-in is read as if all shared the first one's settings,
-  and new areas inside a `.dazip` or a Documents add-in are not found.
 - The original's "offers" (its in-game DLC shop stubs) are not loaded.
 
 The full list, with what the original does in each case, is in

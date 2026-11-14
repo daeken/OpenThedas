@@ -714,6 +714,7 @@ pub fn unpack_dazip(path: &Path, cache: &Path) -> Result<Dazip> {
         .map(|b| String::from_utf8_lossy(&b).into_owned())
         .unwrap_or_default();
     let mut addins = Vec::new();
+    let items = crate::install::manifest_items(&manifest);
     let addins_dir = join_ci(&root, "Contents/addins");
     if let Ok(rd) = std::fs::read_dir(&addins_dir) {
         let mut dirs: Vec<PathBuf> = rd.flatten().map(|e| e.path()).collect();
@@ -721,12 +722,19 @@ pub fn unpack_dazip(path: &Path, cache: &Path) -> Result<Dazip> {
         dirs.sort();
         for dir in dirs {
             let name = dir.file_name().unwrap().to_string_lossy().into_owned();
-            let mut addin = crate::install::addin_from_manifest(&manifest, dir, name.clone());
-            // A package with several add-ins has one manifest item each; ours reads the
-            // first, so the others go by their folder's name with the first one's settings.
-            if !addin.uid.eq_ignore_ascii_case(&name) && !addins.is_empty() {
-                addin.uid = name;
-            }
+            // A package with several add-ins has a manifest item for each, matched by UID
+            // to its folder; a folder no item names takes the first item's settings under
+            // its own name.
+            let mut addin = match items.iter().find(|i| i.uid.eq_ignore_ascii_case(&name)) {
+                Some(i) => AddIn { dir, ..i.clone() },
+                None => {
+                    let mut a = crate::install::addin_from_manifest(&manifest, dir, name.clone());
+                    if !addins.is_empty() || !items.is_empty() {
+                        a.uid = name;
+                    }
+                    a
+                }
+            };
             // Listing the package is the player's way of enabling it.
             addin.enabled = true;
             addins.push(addin);
@@ -986,6 +994,54 @@ mod tests {
         assert_eq!(report[0].problems.len(), 1);
         assert!(overlay.is_empty());
         std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn every_add_in_of_a_dazip_takes_its_own_manifest_item() {
+        let base = std::env::temp_dir().join(format!("thedas-dazip-many-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let cache = base.join("mod-cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        let package = base.join("two.dazip");
+        let manifest = br#"<Manifest Type="AddIn"><AddInsList>
+            <AddInItem UID="first_one" ExtendedModuleUID="Single Player" Priority="10" Enabled="1"><Type>2</Type></AddInItem>
+            <AddInItem UID="second_one" ExtendedModuleUID="" Priority="40" Enabled="1"><Type>2</Type></AddInItem>
+            </AddInsList></Manifest>"#;
+        zip_of(
+            &package,
+            &[
+                ("Manifest.xml", manifest),
+                ("Contents/addins/first_one/core/data/a.uti", b"a"),
+                ("Contents/addins/second_one/core/env/newlvl.arl", b"arl"),
+                ("Contents/addins/third/core/data/c.uti", b"c"),
+            ],
+        );
+        let d = unpack_dazip(&package, &cache).unwrap();
+        let got: Vec<(&str, i64, bool)> = d
+            .addins
+            .iter()
+            .map(|a| (a.uid.as_str(), a.priority, a.extends_base_campaign()))
+            .collect();
+        // Each by its own item; a folder no item names takes the first item's settings.
+        assert_eq!(
+            got,
+            [
+                ("first_one", 10, true),
+                ("second_one", 40, false),
+                ("third", 10, true)
+            ]
+        );
+        // Their levels are searched with the install's.
+        let install_root = base.join("install");
+        std::fs::create_dir_all(install_root.join("packages/core/env")).unwrap();
+        std::fs::create_dir_all(install_root.join("modules/single player")).unwrap();
+        let install = crate::install::DaoInstall::open(&install_root).unwrap();
+        let dirs = install.env_dirs_with(d.addins.clone()).unwrap();
+        assert!(
+            dirs.iter().any(|p| p.ends_with("second_one/core/env")),
+            "{dirs:?}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
