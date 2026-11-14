@@ -71,6 +71,8 @@ struct DrawUniforms {
     mvp: [[f32; 4]; 4],
     world: [[f32; 4]; 4],
     light: [f32; 4],
+    alpha: [f32; 4],
+    clip: [f32; 4],
 }
 
 /// One caster: its mesh, model-to-world and world bounding sphere.
@@ -81,6 +83,9 @@ pub(crate) struct Caster<'a> {
     pub bone_offset: u32,
     pub world: Mat4,
     pub sphere: (Vec3, f32),
+    pub alpha: [f32; 4],
+    pub clip: f32,
+    pub material: Option<&'a crate::deferred_cutout::Material>,
 }
 
 pub(crate) struct ShadowPool {
@@ -90,10 +95,14 @@ pub(crate) struct ShadowPool {
     /// Slots of [`STRIDE`] the buffer holds.
     capacity: usize,
     culling: Option<bool>,
+    material_layout: wgpu::BindGroupLayout,
+    opaque: crate::deferred_cutout::Material,
     /// Per layer (slot · 6 + face), the colour and depth views drawn into.
     layers: Vec<(wgpu::TextureView, wgpu::TextureView)>,
     /// Every layer, for the lighting pass.
     pub(crate) view: wgpu::TextureView,
+    #[cfg(test)]
+    texture: wgpu::Texture,
 }
 
 impl ShadowPool {
@@ -127,9 +136,48 @@ impl ShadowPool {
                 },
             ],
         });
+        let material_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("deferred shadow opacity"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("deferred opaque shadow binding"),
+            size: wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let opaque = crate::deferred_cutout::Material {
+            view: texture.create_view(&Default::default()),
+            sampler: device.create_sampler(&Default::default()),
+        };
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("deferred shadows"),
-            bind_group_layouts: &[Some(&layout)],
+            bind_group_layouts: &[Some(&layout), Some(&material_layout)],
             immediate_size: 0,
         });
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -143,6 +191,11 @@ impl ShadowPool {
                     array_stride: std::mem::size_of::<DeferredVertex>() as u64,
                     step_mode: wgpu::VertexStepMode::Vertex,
                     attributes: &[
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x2,
+                            offset: 24,
+                            shader_location: 2,
+                        },
                         wgpu::VertexAttribute {
                             format: wgpu::VertexFormat::Float32x3,
                             offset: 0,
@@ -203,7 +256,9 @@ impl ShadowPool {
         let colour = texture(
             "deferred shadow distances",
             FORMAT,
-            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
         );
         let depth = texture(
             "deferred shadow depth",
@@ -232,8 +287,12 @@ impl ShadowPool {
             buffer,
             capacity: 1,
             culling: None,
+            material_layout,
+            opaque,
             layers,
             view,
+            #[cfg(test)]
+            texture: colour,
         }
     }
 
@@ -312,6 +371,8 @@ impl ShadowPool {
                         mvp: (view_proj * c.world).to_cols_array_2d(),
                         world: c.world.to_cols_array_2d(),
                         light: position.extend(radius).to_array(),
+                        alpha: c.alpha,
+                        clip: [c.clip, 0.0, 0.0, 0.0],
                     };
                     draws.push((i, (data.len() / STRIDE) as u32));
                     data.extend_from_slice(bytemuck::bytes_of(&u));
@@ -348,6 +409,35 @@ impl ShadowPool {
                 }
                 groups.push((c.bones, self.group(device, c.bones)));
                 groups.len() - 1
+            })
+            .collect();
+        let mut materials = Vec::<(&crate::deferred_cutout::Material, wgpu::BindGroup)>::new();
+        let caster_materials: Vec<usize> = casters
+            .iter()
+            .map(|c| {
+                let material = c.material.unwrap_or(&self.opaque);
+                if let Some(i) = materials
+                    .iter()
+                    .position(|(m, _)| std::ptr::eq(*m, material))
+                {
+                    return i;
+                }
+                let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("deferred shadow opacity"),
+                    layout: &self.material_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::TextureView(&material.view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::Sampler(&material.sampler),
+                        },
+                    ],
+                });
+                materials.push((material, group));
+                materials.len() - 1
             })
             .collect();
         for (layer, draws) in layers.iter().enumerate() {
@@ -392,6 +482,7 @@ impl ShadowPool {
                     &groups[caster_groups[i]].1,
                     &[slot * STRIDE as u32, c.bone_offset],
                 );
+                pass.set_bind_group(1, &materials[caster_materials[i]].1, &[]);
                 pass.set_vertex_buffer(0, c.vertices.slice(..));
                 pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..mesh.count, 0, 0..1);
@@ -403,6 +494,188 @@ impl ShadowPool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wgpu::util::DeviceExt;
+
+    #[test]
+    fn textured_shadow_faces_keep_holes_comparisons_blue_opacity_and_skin_motion() {
+        assert!(std::mem::size_of::<DrawUniforms>() <= STRIDE);
+        let ctx = crate::gpu::GpuContext::headless().unwrap();
+        let device = &ctx.device;
+        let mut pool = ShadowPool::new(device);
+        let vertex = |y, z, u, v| {
+            [
+                2.0f32, y, z, -1.0, 0.0, 0.0, u, v, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                0.0,
+            ]
+        };
+        let stream = [
+            vertex(0.75, 0.75, 0.0, 0.0),
+            vertex(-0.75, 0.75, 1.0, 0.0),
+            vertex(-0.75, -0.75, 1.0, 1.0),
+            vertex(0.75, -0.75, 0.0, 1.0),
+        ];
+        let vertices = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents: bytemuck::cast_slice(&stream),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        let mesh = GpuMesh {
+            vertices: vertices.clone(),
+            count: 6,
+            indices: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: None,
+                contents: bytemuck::cast_slice(&[0u32, 1, 2, 0, 2, 3]),
+                usage: wgpu::BufferUsages::INDEX,
+            }),
+        };
+        let mut rows = vec![0u8; crate::deferred_mesh::SKIN_STRIDE];
+        crate::deferred_mesh::write_palette(&mut rows, &[]);
+        let bones = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents: &rows,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d {
+                width: 2,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let write_opacity = |right: u8| {
+            ctx.queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &[0, 0, 255, 0, 0, 0, 0, right],
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(8),
+                    rows_per_image: Some(1),
+                },
+                texture.size(),
+            )
+        };
+        write_opacity(255);
+        let material = crate::deferred_cutout::Material {
+            view: texture.create_view(&Default::default()),
+            sampler: device.create_sampler(&Default::default()),
+        };
+        let read = |pool: &mut ShadowPool, alpha: [f32; 4], clip: f32| {
+            let caster = Caster {
+                mesh: &mesh,
+                vertices: &vertices,
+                bones: &bones,
+                bone_offset: 0,
+                world: Mat4::IDENTITY,
+                sphere: (Vec3::new(2.0, 0.0, 0.0), 3.0),
+                alpha,
+                clip,
+                material: Some(&material),
+            };
+            let readback = device.create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                size: 512,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            let mut encoder = device.create_command_encoder(&Default::default());
+            pool.encode(
+                device,
+                &ctx.queue,
+                &mut encoder,
+                &[(Vec3::ZERO, 10.0)],
+                &[caster],
+            );
+            for (i, x) in [210, 300].into_iter().enumerate() {
+                encoder.copy_texture_to_buffer(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &pool.texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d {
+                            x,
+                            y: SIZE / 2,
+                            z: 0,
+                        },
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::TexelCopyBufferInfo {
+                        buffer: &readback,
+                        layout: wgpu::TexelCopyBufferLayout {
+                            offset: i as u64 * 256,
+                            bytes_per_row: Some(256),
+                            rows_per_image: Some(1),
+                        },
+                    },
+                    wgpu::Extent3d {
+                        width: 1,
+                        height: 1,
+                        depth_or_array_layers: 1,
+                    },
+                );
+            }
+            ctx.queue.submit([encoder.finish()]);
+            let (tx, rx) = std::sync::mpsc::channel();
+            readback.slice(..).map_async(wgpu::MapMode::Read, move |r| {
+                tx.send(r).unwrap();
+            });
+            device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+            rx.recv().unwrap().unwrap();
+            let bytes = readback.slice(..).get_mapped_range().unwrap();
+            [0, 256].map(|i| *bytemuck::from_bytes::<f32>(&bytes[i..i + 4]) < 10.0)
+        };
+        assert_eq!(read(&mut pool, [7.0, 255.0, 3.0, 1.0], 0.0), [false, true]);
+        assert_eq!(read(&mut pool, [7.0, 255.0, 2.0, 1.0], 0.0), [true, false]);
+        // Match D3D9's 8-bit rounding: a fraction below one still passes >= 255.
+        assert_eq!(
+            read(&mut pool, [7.0, 255.0, 3.0, 0.999], 0.0),
+            [false, true]
+        );
+        write_opacity(128);
+        use thedas_formats::state::CompareFunc;
+        for (cmp, expected) in [
+            (CompareFunc::Never, [false, false]),
+            (CompareFunc::Less, [true, false]),
+            (CompareFunc::Equal, [false, true]),
+            (CompareFunc::LessEqual, [true, true]),
+            (CompareFunc::Greater, [false, false]),
+            (CompareFunc::NotEqual, [true, false]),
+            (CompareFunc::GreaterEqual, [false, true]),
+            (CompareFunc::Always, [true, true]),
+        ] {
+            assert_eq!(
+                read(
+                    &mut pool,
+                    [crate::deferred_cutout::comparison(cmp), 128.0, 3.0, 1.0],
+                    0.0
+                ),
+                expected,
+                "comparison {cmp:?}"
+            );
+        }
+        assert_eq!(read(&mut pool, [8.0, 0.0, 3.0, 1.0], 0.3), [false, true]);
+        write_opacity(255);
+        crate::deferred_mesh::write_palette(
+            &mut rows,
+            &[
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 1.0],
+                [0.0, 0.0, 1.0, 0.0],
+            ],
+        );
+        ctx.queue.write_buffer(&bones, 0, &rows);
+        assert_eq!(read(&mut pool, [7.0, 255.0, 3.0, 1.0], 0.0), [true, false]);
+    }
 
     #[test]
     fn face_culling_keeps_seams_near_crossings_and_unknown_bounds() {
