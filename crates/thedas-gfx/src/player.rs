@@ -163,6 +163,8 @@ impl Player {
         if self.accum > self.frame_ms {
             self.accum = 0.0;
         }
+        self.update_hover();
+        self.run_queue();
     }
 
     fn run_intervals(&mut self) {
@@ -219,6 +221,8 @@ impl Player {
         for c in clips {
             advance(&mut self.vm, c);
         }
+        self.run_queue();
+        self.update_hover();
         self.run_queue();
         self.maybe_collect();
     }
@@ -553,6 +557,8 @@ impl Player {
             "onMouseWheel",
             &[Value::Number(delta), top],
         );
+        self.run_queue();
+        self.update_hover();
         self.run_queue();
     }
 
@@ -2071,6 +2077,69 @@ mod queue_tests {
             p.vm.call_method(&selection, "getCaretIndex", &[]),
             Value::Number(-1.0)
         );
+    }
+
+    #[test]
+    fn stationary_hover_refreshes_after_geometry_visibility_and_wheel_changes() {
+        fn over(vm: &mut Vm, this: Value, _: &[Value]) -> Value {
+            let name = vm.get(&this, "_name");
+            let name = vm.to_str(&name);
+            vm.log.push(format!("{name} over"));
+            Value::Undefined
+        }
+        fn out(vm: &mut Vm, this: Value, _: &[Value]) -> Value {
+            let name = vm.get(&this, "_name");
+            let name = vm.to_str(&name);
+            vm.log.push(format!("{name} out"));
+            Value::Undefined
+        }
+        let (mut p, _) = input_player();
+        let root = p.vm.root;
+        let a = create_empty(&mut p.vm, root, "a", 2).unwrap();
+        let b = create_empty(&mut p.vm, root, "b", 3).unwrap();
+        for (d, x) in [(a, 0.0), (b, 1200.0)] {
+            let o = p.vm.display.get_mut(d).unwrap();
+            o.matrix.tx = x;
+            o.clip_mut().unwrap().drawing = Some(crate::display::Drawing {
+                fills: vec![(
+                    [255, 0, 0, 255],
+                    vec![(0.0, 0.0), (1000.0, 0.0), (1000.0, 400.0), (0.0, 400.0)],
+                )],
+                ..Default::default()
+            });
+            let v = display_api::display_value(&mut p.vm, d);
+            let f = p.vm.new_native(over);
+            p.vm.set(&v, "onRollOver", Value::Object(f));
+            let f = p.vm.new_native(out);
+            p.vm.set(&v, "onRollOut", Value::Object(f));
+        }
+        let av = display_api::display_value(&mut p.vm, a);
+        let bv = display_api::display_value(&mut p.vm, b);
+        p.mouse_move(10.0, 10.0);
+        assert_eq!(p.drain_log(), ["a over"]);
+        p.vm.set(&av, "_x", Value::Number(60.0));
+        p.vm.set(&bv, "_x", Value::Number(0.0));
+        p.tick(0.0);
+        assert_eq!(p.drain_log(), ["a out", "b over"]);
+        assert!(!p.vm.pick_dirty);
+        p.tick(0.0);
+        assert!(p.drain_log().is_empty());
+        p.vm.set(&bv, "_visible", Value::Bool(false));
+        p.run_frame();
+        assert_eq!(p.drain_log(), ["b out"]);
+        p.vm.set(&av, "_x", Value::Number(0.0));
+        p.run_frame();
+        assert_eq!(p.drain_log(), ["a over"]);
+        let wheel = p.vm.new_native(|vm, this, _| {
+            vm.set(&this, "_x", Value::Number(60.0));
+            Value::Undefined
+        });
+        p.vm.set(&av, "onMouseWheel", Value::Object(wheel));
+        let mouse = Value::Object(p.vm.mouse);
+        p.vm.call_method(&mouse, "addListener", std::slice::from_ref(&av));
+        p.vm.set(&bv, "_visible", Value::Bool(true));
+        p.mouse_wheel(10.0, 10.0, 1.0);
+        assert_eq!(p.drain_log(), ["a out", "b over"]);
     }
 
     #[test]
