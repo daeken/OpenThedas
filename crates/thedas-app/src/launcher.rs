@@ -25,6 +25,7 @@ use thedas_store::Store;
 
 use crate::launcher_control::{Host, Need, Script};
 use crate::launcher_download::{Download, Want};
+use crate::launcher_mods::ModReport;
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::WindowEvent;
@@ -289,6 +290,8 @@ struct Ui {
     candidates: Vec<Candidate>,
     inspected: HashMap<PathBuf, Option<Inspected>>,
     mods: ModFile,
+    /// What the saved mod list does to the chosen game (the Mods page's second half).
+    mod_report: ModReport,
     status: Option<(String, bool)>,
     actions: Vec<Action>,
     launch: Option<Launch>,
@@ -345,6 +348,7 @@ impl Ui {
             candidates: Vec::new(),
             inspected: HashMap::new(),
             mods,
+            mod_report: ModReport::new(),
             status: None,
             actions: Vec::new(),
             launch: None,
@@ -1112,6 +1116,9 @@ impl Ui {
             Some((i, 4)) => self.mods.remove(i),
             _ => {}
         }
+        if change.is_some() {
+            self.mod_report.forget();
+        }
         ui.add_space(8.0);
         ui.horizontal(|ui| {
             if ui.button("Add a folder…").clicked() {
@@ -1126,7 +1133,10 @@ impl Ui {
             let dirty = self.mods.dirty();
             if ui.add_enabled(dirty, big_button("Save")).clicked() {
                 match self.mods.save() {
-                    Ok(()) => self.status = Some(("Mod list saved.".into(), false)),
+                    Ok(()) => {
+                        self.mod_report.forget();
+                        self.status = Some(("Mod list saved.".into(), false))
+                    }
                     Err(e) => {
                         self.status = Some((format!("Could not save the mod list: {e}"), true))
                     }
@@ -1137,11 +1147,15 @@ impl Ui {
                 .clicked()
             {
                 self.mods.revert();
+                self.mod_report.forget();
             }
             if dirty {
                 ui.label(RichText::new("Not saved yet").color(BAD));
             }
         });
+        let root = self.cfg.selected_install().map(|i| i.root.clone());
+        let dirty = self.mods.dirty();
+        self.mod_report.draw(ui, root.as_ref(), dirty);
     }
 
     fn settings_page(&mut self, ui: &mut egui::Ui) {
@@ -1349,7 +1363,7 @@ impl Ui {
 
     /// Whether the window should keep redrawing: a search or a download is running.
     fn busy(&self) -> bool {
-        self.search.is_some() || self.dl.running()
+        self.search.is_some() || self.dl.running() || self.mod_report.running()
     }
 
     // ---- actions ----
@@ -1439,6 +1453,7 @@ impl Ui {
                         true,
                     ) {
                         self.mods.add(&d.to_string_lossy());
+                        self.mod_report.forget();
                     }
                 }
                 Action::AddModArchive => {
@@ -1452,6 +1467,7 @@ impl Ui {
                         false,
                     ) {
                         self.mods.add(&f.to_string_lossy());
+                        self.mod_report.forget();
                     }
                 }
                 Action::OpenUrl(url) => {
@@ -1550,7 +1566,7 @@ pub(crate) fn tilde(p: &Path) -> String {
 
 /// Gives a button the name screen readers and scripts use, where its text alone is ambiguous
 /// ("Remove" on every install's card).
-fn named(r: egui::Response, name: &str) -> egui::Response {
+pub(crate) fn named(r: egui::Response, name: &str) -> egui::Response {
     let enabled = r.enabled();
     r.widget_info(|| egui::WidgetInfo::labeled(egui::accesskit::Role::Button, enabled, name));
     r
@@ -1761,6 +1777,7 @@ impl LauncherApp {
     fn redraw(&mut self, event_loop: &ActiveEventLoop) {
         let Some(g) = self.gfx.as_mut() else { return };
         self.ui.poll_search();
+        self.ui.mod_report.poll();
         if let Some(w) = self.ui.dl.poll() {
             self.ui.download_wants(w);
         }

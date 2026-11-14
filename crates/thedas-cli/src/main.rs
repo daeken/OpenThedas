@@ -736,40 +736,24 @@ fn mods(install: &Path, list: Option<&Path>) -> Result<()> {
             println!("problem: {}: {p}", m.entry.path.display());
         }
     }
-    let Some(overlay) = vfs.overlay() else {
+    if vfs.overlay().is_none() {
         println!("no mods mounted");
         return Ok(());
-    };
-    let base = vfs.layers().len();
-    // Per overlay layer: files provided, winning, replacing a game file, hidden by a later mod.
-    let mut stats = vec![[0usize; 4]; overlay.layers().len()];
-    for name in overlay.names() {
-        let hits = vfs.hits(&name);
-        let in_game = hits.iter().any(|h| h.layer < base);
-        for (i, h) in hits.iter().enumerate().filter(|(_, h)| h.layer >= base) {
-            let s = &mut stats[h.layer - base];
-            s[0] += 1;
-            if i == 0 {
-                s[1] += 1;
-                s[2] += usize::from(in_game);
-            } else {
-                s[3] += 1;
-            }
-        }
     }
+    // Per overlay layer: files provided, winning, replacing a game file, hidden by a later mod.
     println!(
         "{:>3}  {:>7} {:>7} {:>8} {:>7}  mod",
         "#", "files", "winning", "replaces", "hidden"
     );
-    for (i, (layer, s)) in overlay.layers().iter().zip(&stats).enumerate() {
+    for (i, s) in mods::mod_stats(&vfs).iter().enumerate() {
         println!(
             "{:>3}  {:>7} {:>7} {:>8} {:>7}  {}",
             i + 1,
-            s[0],
-            s[1],
-            s[2],
-            s[3],
-            layer.label
+            s.files,
+            s.winning,
+            s.replaces,
+            s.hidden,
+            s.label
         );
     }
     Ok(())

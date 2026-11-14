@@ -56,6 +56,16 @@ understand (comments, blank lines) stay where they are. A mod turned off becomes
 moves a mod; adding a mod puts it at the end (highest priority). Nothing is written until
 Save, and the first save keeps the old list as `mods.txt.bak`.
 
+Under the list, "What your mods do" shows, once the player asks ("Check what my mods do"),
+what the saved list does to the chosen game: for each layer the list adds, how many files it
+provides, how many of the game's own it replaces, how many a later mod hides, and (with
+"Files") the files it fights over and who wins. It builds the stack the game builds
+(`DaoInstall::play_vfs`) on a background thread, because a large archive is unpacked into the
+mod cache the first time; it reads the saved list, so the page asks the player to save first.
+The counts come from `thedas_vfs::mods::mod_stats` and `fights`, the same ones `thedas mods`
+prints. Each Files button is named for its mod (`Show the files of <mod>`) so scripts can
+tell the rows apart.
+
 ## Getting the game
 
 Two ways, side by side on the welcome page ("Don't have the game?"):
