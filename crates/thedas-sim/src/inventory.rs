@@ -827,8 +827,9 @@ impl Sim {
 
     /// What a creature's equipped items add to a property: for each item stat that
     /// `itemstatdefines.gda` links to the property (its fourth column), the item's value
-    /// from `itemstats.gda` (by base item type). Provisional: material and quality do not
-    /// scale it, and items' own property lists are not applied yet.
+    /// from `itemstats.gda` (by base item type), scaled by its material as `GetItemStat`
+    /// scales it ([`Sim::item_stat`]). Items' own property lists (enchantments) are not
+    /// part of this: they are effects on the wearer while the item is worn.
     pub fn equipment_bonus(&self, id: ObjectId, property: i32) -> f32 {
         const COL_PROPERTY: u32 = 0xd650_5aa1;
         let Some(o) = self.world.get(id) else {
