@@ -19,9 +19,14 @@ url = "2"
 async-channel = "2"
 encoding_rs = "0.8"
 thedas-formats.workspace = true
+thedas-gfx.workspace = true
 roxmltree.workspace = true
 png.workspace = true
 thedas-sim.workspace = true
 thedas-script.workspace = true
 thedas-vfs.workspace = true
 
+
+[dev-dependencies]
+pollster.workspace = true
+env_logger.workspace = true
