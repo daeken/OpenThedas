@@ -95,6 +95,14 @@ The player lives in `crates/thedas-gfx`:
    insertion caret. Focused ranges draw white text over black highlights; an input caret
    blinks at 500 ms intervals, resets on edits/navigation, and disappears on focus loss.
    Blink boundaries invalidate the picture without discarding the cached text layout.
+   AVM1 text measurements truncate to pixels after laying out in twips. Empty fields
+   with dynamic text measure zero while retaining a caret line; a trailing empty
+   dynamic line adds no measured height. Input fields retain that line's height.
+   Closing multiline HTML paragraphs retain their delimiters, including empty
+   paragraphs; single-line fields ignore paragraph and break tags.
+   Leading is included once for a single line, and between subsequent lines.
+   A newline within an HTML span carries the first span's line metrics forward until
+   another span begins at a line boundary, matching the credits' mixed-size headings.
 5. **`render`**: wgpu. Shapes are tessellated once per character (lyon) into cached vertex
    buffers; bitmaps (atlas DDS pages) uploaded once; scale9 drawn natively. Colour transform
    and blend mode per draw; multiply and the few other modes against the scene picture,
