@@ -515,7 +515,13 @@ impl Player {
                 button_event(&mut self.vm, h, "onPress", &press_args);
             }
             // A click outside the focused text field takes its focus away.
-            let under = self.topmost_at(x, y);
+            let under = pick_in(
+                &self.vm,
+                self.vm.root,
+                (x * 20.0) as f32,
+                (y * 20.0) as f32,
+                PickMode::Focus,
+            );
             let text = under.filter(|d| {
                 self.vm
                     .display
@@ -1767,14 +1773,21 @@ fn enabled(vm: &Vm, d: DisplayId) -> bool {
 
 /// The topmost clip taking button events under the point (twips, stage space).
 fn pick(vm: &Vm, x: f32, y: f32) -> Option<DisplayId> {
-    pick_in(vm, vm.root, x, y, true)
+    pick_in(vm, vm.root, x, y, PickMode::Button)
 }
 
 fn pick_any(vm: &Vm, d: DisplayId, x: f32, y: f32) -> Option<DisplayId> {
-    pick_in(vm, d, x, y, false)
+    pick_in(vm, d, x, y, PickMode::Any)
 }
 
-fn pick_in(vm: &Vm, d: DisplayId, x: f32, y: f32, buttons: bool) -> Option<DisplayId> {
+#[derive(Clone, Copy)]
+enum PickMode {
+    Button,
+    Any,
+    Focus,
+}
+
+fn pick_in(vm: &Vm, d: DisplayId, x: f32, y: f32, mode: PickMode) -> Option<DisplayId> {
     let o = vm.display.get(d)?;
     if !o.visible
         || o.hit_test_disable
@@ -1805,7 +1818,26 @@ fn pick_in(vm: &Vm, d: DisplayId, x: f32, y: f32, buttons: bool) -> Option<Displ
             continue;
         }
         let is_clip = vm.display.get(*c).is_some_and(|co| co.clip().is_some());
-        if buttons {
+        if matches!(mode, PickMode::Focus) {
+            // Decorative geometry (including a widget's transparent hit area) must
+            // not intercept a field. Another interactive widget still blocks it.
+            if is_clip {
+                if let Some(h) = pick_in(vm, *c, x, y, mode) {
+                    return Some(h);
+                }
+                if takes_mouse(vm, *c) && enabled(vm, *c) && hit_shape(vm, *c, x, y) {
+                    return Some(*c);
+                }
+            } else if vm
+                .display
+                .get(*c)
+                .and_then(|o| o.text())
+                .is_some_and(|t| t.input || t.selectable)
+                && hit_shape(vm, *c, x, y)
+            {
+                return Some(*c);
+            }
+        } else if matches!(mode, PickMode::Button) {
             if is_clip && takes_mouse(vm, *c) && enabled(vm, *c) {
                 if hit_shape(vm, *c, x, y) {
                     return Some(*c);
@@ -1813,13 +1845,13 @@ fn pick_in(vm: &Vm, d: DisplayId, x: f32, y: f32, buttons: bool) -> Option<Displ
                 continue;
             }
             if is_clip {
-                if let Some(h) = pick_in(vm, *c, x, y, true) {
+                if let Some(h) = pick_in(vm, *c, x, y, mode) {
                     return Some(h);
                 }
             }
         } else {
             if is_clip {
-                if let Some(h) = pick_in(vm, *c, x, y, false) {
+                if let Some(h) = pick_in(vm, *c, x, y, mode) {
                     return Some(h);
                 }
             } else if hit_shape(vm, *c, x, y) {
@@ -2059,8 +2091,23 @@ mod queue_tests {
         t.bounds = (3.0, 4.0, 40.0, 30.0);
         t.default_format.size = 10.0;
         t.set_text("ab Ωd");
+        let matrix = p.vm.display.get(field).unwrap().matrix;
+        let root = p.vm.root;
+        let overlay = create_empty(&mut p.vm, root, "hitArea", 2).unwrap();
+        let o = p.vm.display.get_mut(overlay).unwrap();
+        o.matrix = matrix;
+        o.color.mul[3] = 0.0;
+        let mut area = Object::new(Kind::Bitmap {
+            url: "hit-area".into(),
+            width: 40.0,
+            height: 30.0,
+        });
+        area.matrix = crate::swf::Matrix::translate(60.0, 80.0);
+        let area = p.vm.display.add(area);
+        insert_child(&mut p.vm, overlay, area, 0);
         let point = |x: f64, y: f64| (100.0 - y * 2.0, 20.0 + x * 2.0);
         let (x, y) = point(8.0, 8.0);
+        assert_eq!(p.topmost_at(x, y), Some(overlay));
         p.mouse_button(x, y, MOUSE_LEFT, true, false);
         assert_eq!(p.vm.focus, Some(field));
         assert_eq!(
@@ -2102,6 +2149,14 @@ mod queue_tests {
         assert_eq!(
             p.vm.display.get(field).unwrap().text().unwrap().selection(),
             (0, 2)
+        );
+        let button = display_api::display_value(&mut p.vm, overlay);
+        let press = p.vm.new_native(|_, _, _| Value::Undefined);
+        p.vm.set(&button, "onPress", Value::Object(press));
+        p.mouse_button(x, y, MOUSE_LEFT, true, false);
+        assert_eq!(
+            p.vm.focus, None,
+            "an interactive button must block text behind it"
         );
     }
 
