@@ -1528,7 +1528,11 @@ impl Live {
     /// are drawn anew with them. The level keeps what it has (see `workspace`).
     pub fn reload(&mut self, names: &[String]) {
         self.cache.forget(names);
-        self.objects = None;
+        // Rebuilt in place at the next sync, as when a creature comes or goes (dropping
+        // them would show the loading screen).
+        if let Some(o) = self.objects.as_mut() {
+            o.key.clear();
+        }
     }
 
     /// Mod mode's scrubber: draws creature `id` with its own animation held at `time`

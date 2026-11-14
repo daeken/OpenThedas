@@ -1069,34 +1069,7 @@ pub fn call(
             }))
         }
         "DestroyObject" => {
-            let id = obj(a, 0);
-            if h.object(id)
-                .is_some_and(|o| o.kind == ObjectKind::AreaOfEffect)
-            {
-                h.sim.destroy_aoe(id);
-                return void();
-            }
-            if Some(id) != h.sim.world.hero {
-                // An item leaves whoever holds it: taken off if worn (its effects end and the
-                // wearer hears UNEQUIP), then out of the inventory, so no dangling ids stay
-                // behind (the City Elf house script destroys the hero's starting clothes).
-                // Provisional: the exe's container removal on destruction is not traced.
-                let holders: Vec<ObjectId> = h
-                    .sim
-                    .world
-                    .objects
-                    .values()
-                    .filter(|o| o.inventory.contains(&id))
-                    .map(|o| o.id)
-                    .collect();
-                for holder in holders {
-                    h.sim.unequip(holder, id);
-                    if let Some(o) = h.sim.world.get_mut(holder) {
-                        o.inventory.retain(|&i| i != id);
-                    }
-                }
-                h.sim.world.objects.remove(&id);
-            }
+            h.sim.destroy_object(obj(a, 0));
             void()
         }
         "CreateObject" => {
