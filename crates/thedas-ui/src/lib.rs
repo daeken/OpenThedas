@@ -1032,8 +1032,10 @@ impl UiMovie {
     /// a HUD movie's time), but with the mouse outside the window there is nothing to find,
     /// and with the mouse still since the last tick, while something is hovered, the player
     /// keeps that hover without looking (it skips hover changes then; a hovered clip that
-    /// is hidden still loses it). So it looks only on a tick after the mouse stirred.
-    /// Provisional: a clip that comes under a still mouse, with nothing hovered before, is
+    /// is hidden still loses it). So it looks only on a tick after the mouse stirred, or
+    /// after the engine pushed the movie a value or the movie placed observers (clips
+    /// placed or taken away under a still mouse: a tooltip stayed up over an item taken from
+    /// a chest). Provisional: a clip that comes under a still mouse, with nothing hovered before, is
     /// hovered only once the mouse moves (Flash would hover it on its next frame).
     fn picks(&mut self) -> bool {
         self.mouse_in && std::mem::take(&mut self.mouse_stirred)
@@ -1359,6 +1361,8 @@ impl UiMovie {
             _ => Vec::new(),
         };
         let added = take(self, "AddTokenObserverBatchData");
+        // Clips placed or removed since the last tick: a hover may have lost its clip.
+        self.mouse_stirred |= !added.is_empty();
         for t in added.chunks(3) {
             if let (Some(id), Some(UiValue::String(token))) =
                 (t.first().and_then(callback_key), t.get(1))
@@ -1411,6 +1415,8 @@ impl UiMovie {
                             std::slice::from_ref(&v),
                         );
                         self.sent.insert(id, v);
+                        // A value may have removed or placed clips under a still mouse.
+                        self.mouse_stirred = true;
                     }
                 }
                 None => missing.push(token),
