@@ -71,15 +71,36 @@ The orchestrator's responsibilities:
 - **Gaps:** FMT-012 and FMT-013, plus about 30 SCR items. Each was traced in DAOrigins.exe and gated to Origins. Notable ones:
   heartbeat scheduling, health floor, placeable health and bashing, GetItemsInInventory, HandleEvent, StringToInt and StringToFloat.
 
-## In flight or parked when the stream stopped
+## In flight and parked, by area
 
-- #863 heartbeat scheduling: sim approved it on two conditions, detcheck 4/4 and a table showing the final plot state per step matches
-  main. Codex was adding both.
-- #860 window leave: UI approved it once the scripts that only read hover state get a `hover` step.
-- #864 glyph winding and #866 bitmap sampling: SF, not yet reviewed.
-- DA2 next steps: the night-map selection message, the cleanup-fight wipe at t≈903 s, then continuing through Act 1.
-- Deferred next steps: 1440p cost for Tower, Cousland and Lothering (target about 1.3x), and the 136 passes still lit faithfully.
-- Gaps next steps: appearance-dependent walkmesh, animation-completion destruction, then the remaining SCR items, then sim and UI gaps.
+Each area below says who owns it. "Codex only" means no human or Claude stream works on it other than this Codex orchestration.
+Each job's full state is in `OpenThedas-wt/codex-briefs/<job>.report.md`.
+
+- **Deferred renderer (Codex only).** The paused Claude deferred stream never resumed.
+  - Open PR: none. A job was running on worktree `codex-deferred`, branch to be named `m1-deferred-*`.
+  - Next: 1440p lighting and G-buffer cost (Tower, Cousland and Lothering are the worst; target about 1.3x the faithful path), the 136
+    passes still lit faithfully, and wider material coverage.
+  - Parked: the experimental lightmaps-off probe mode has no tuning yet.
+- **DA2 (Codex only).** The DA2 Claude stream is paused.
+  - Open PR: none. A job was running on worktree `codex-da2`.
+  - Next: the DA2 night-map selection message, which blocks Darktown, then the prologue cleanup fight that still wipes the party at
+    about t=903 s, then continuing through Act 1 from Anders's clinic.
+  - Parked: face-bone offsets, the full DA2 package-order trace (`docs/resource-order-da2.md`), and DA2 IsHumanoid tree names.
+- **Scaleform player (Codex only, but the UI stream owns `thedas-ui` and the app input files).**
+  - #860 `sf-window-leave`: UI approved it once the scripts that only read hover state get a `hover` step first.
+  - #864 `sf-glyph-winding` and #866 `sf-bitmap-sampling`: open, not yet reviewed.
+  - Parked: the remaining tooltip and glyph-outline differences. The comparison index is at
+    `OpenThedas-testdata/codex-captures/sf-host-polish/candidate/index.html`.
+- **Mods (Codex only, but triage owns the shared resource stack, so announce any stack change).**
+  - Open PR: none.
+  - Parked: a real .dazip validation (only synthetic packages and registry metadata have been tested), the named RIM/TLK load
+    lifecycle (`docs/resource-order-rim.md`, `docs/resource-order-tlk.md`), and the end-to-end trace of the data/ tie-break (marked
+    PROVISIONAL).
+- **Script gaps from KNOWN_GAPS (Codex only, but sim owns `thedas-sim`, so announce behaviour changes).**
+  - #863 `m1-gaps-scr068-heartbeat-scheduling`: sim approved it on two conditions, detcheck 4/4 and a table showing the final plot state
+    at the end of each step matches main. Codex was adding both.
+  - Next: appearance-dependent walkmesh, animation-completion destruction, the remaining SCR items, then the simulation and UI gaps.
+  - Partial: SCR-024, SCR-026 and SCR-031 (x87 numeric parity).
 
 ## Running it in a new harness
 
