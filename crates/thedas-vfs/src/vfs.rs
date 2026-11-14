@@ -281,12 +281,15 @@ impl Vfs {
     /// Traced (the folder indexer 0x4cf690 and the container list's order 0x4e6660): a
     /// folder registered to be scanned in full registers each subfolder as a folder of its
     /// own and each `.erf` file as an archive, all at the folder's priority. Sources of one
-    /// priority are ordered by kind (a scanned folder ranks 1, an archive above it, lower first:
-    /// vtable slot +0x20, 0x4cf1b0; an archive class ranks 2 or 3, which of the two for `.erf` is not traced) and then by path, the greater path first
+    /// priority are ordered by kind (a scanned folder ranks 1, an ERF ranks 3, lower first:
+    /// vtable slot +0x20, 0x4cf1b0) and then by path, the greater path first
     /// (`std::wstring::compare` at 0x414600, so case counts); a lookup takes the first source
     /// that holds the name (0x4c5c80). So any loose file beats any `.erf`, and between two
     /// folders, or two archives, the one with the greater path wins. A `.rim` in such a folder
-    /// is handed to another registry (0x4c7b00), not mounted as an archive: not done here.
+    /// is recorded by name for an explicit later load (0x4cfa10 -> 0x4c7b00), not added to
+    /// the searchable sources. Explicit loading (0x4c8550 -> 0x4c8190 -> 0x4c8259) gives
+    /// the loaded RIM rank 2. This method likewise leaves scanned RIM contents unmounted;
+    /// the general named-RIM load lifecycle is not implemented. See `docs/resource-order-rim.md`.
     pub fn push_folder(
         &mut self,
         root: impl AsRef<Path>,
