@@ -13,6 +13,7 @@ flate2.workspace = true
 blowfish.workspace = true
 md-5.workspace = true
 log.workspace = true
+roxmltree.workspace = true
 dirs = "6"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 sevenz-rust2 = { version = "0.25", default-features = false }
