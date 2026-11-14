@@ -1337,6 +1337,35 @@ pub fn call(
             void()
         }
         "IsDead" => ok(b(h.object(obj(a, 0)).is_some_and(|o| o.dead))),
+        "IsDestroyable" | "SetDestroyable"
+            if h.sim.game == thedas_vfs::Game::Origins
+                && h.object(obj(a, 0)).is_none_or(|o| {
+                    !matches!(
+                        o.kind,
+                        ObjectKind::Stage | ObjectKind::Map | ObjectKind::MapPin
+                    )
+                }) =>
+        {
+            // 0x659a50 / 0x659ab0 resolve CCObject, then read/write its
+            // independent flag. Construction defaults it to one (0x699afd).
+            let target = h.sim.world.get_mut(obj(a, 0)).filter(|o| {
+                !matches!(
+                    o.kind,
+                    ObjectKind::Module | ObjectKind::Area | ObjectKind::Party
+                )
+            });
+            if name == "SetDestroyable" {
+                if let Some(o) = target {
+                    o.fields
+                        .insert("IsDestroyable".into(), i32::from(int(a, 1) != 0));
+                }
+                void()
+            } else {
+                ok(b(target.is_some_and(|o| {
+                    o.fields.get("IsDestroyable").copied().unwrap_or(1) != 0
+                })))
+            }
+        }
         "IsImmortal" => ok(b(h.object(obj(a, 0)).is_some_and(|o| o.immortal))),
         "SetImmortal" | "Engine_SetImmortal" => {
             let origins = h.sim.game == thedas_vfs::Game::Origins;
@@ -7621,6 +7650,120 @@ mod tests {
         );
         // The native int reader reinterprets the float cell's bits, rather than converting 1.0.
         assert_eq!(run(&mut s, 0, "GetMaxLevel", &[]), Some(Value::Int(1)));
+    }
+
+    #[test]
+    fn origins_destroyability_is_an_independent_saved_object_flag() {
+        let table = Arc::new(
+            EngineTable::parse(
+                b"int IsDestroyable(object o) = 215;\n\
+                  void SetDestroyable(object o, int n) = 216;",
+            )
+            .unwrap(),
+        );
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        for kind in [
+            ObjectKind::Creature,
+            ObjectKind::Placeable,
+            ObjectKind::Item,
+            ObjectKind::Trigger,
+            ObjectKind::Sound,
+            ObjectKind::Waypoint,
+            ObjectKind::Projectile,
+            ObjectKind::Store,
+            ObjectKind::AreaOfEffect,
+        ] {
+            let id = s.world.spawn(kind, "target");
+            assert_eq!(
+                run(&mut s, id, "IsDestroyable", &[Value::Object(id)]),
+                Some(Value::Int(1)),
+                "the native constructor defaults to true even without health"
+            );
+            let o = s.world.get_mut(id).unwrap();
+            o.active = false;
+            o.dead = true;
+            o.immortal = true;
+            o.plot = true;
+            o.properties.insert(7, (40.0, 12.0));
+            o.modifiers.insert(7, 13.5);
+            o.fields.insert("Health".into(), 16);
+            o.fields.insert("MaxHealth".into(), 77);
+            for value in [0, -1, 1, i32::MIN, i32::MAX, 0] {
+                let mut expected = s.world.get(id).unwrap().clone();
+                expected
+                    .fields
+                    .insert("IsDestroyable".into(), i32::from(value != 0));
+                let queued = s.world.queue.len();
+                run(
+                    &mut s,
+                    id,
+                    "SetDestroyable",
+                    &[Value::Object(id), Value::Int(value)],
+                );
+                assert_eq!(s.world.get(id).unwrap(), &expected);
+                assert_eq!(s.world.queue.len(), queued);
+                s.load_json(&s.save_json().unwrap()).unwrap();
+                assert_eq!(s.world.get(id).unwrap().fields, expected.fields);
+                assert_eq!(
+                    run(&mut s, id, "IsDestroyable", &[Value::Object(id)]),
+                    Some(Value::Int(i32::from(value != 0)))
+                );
+            }
+        }
+        for kind in [ObjectKind::Module, ObjectKind::Area, ObjectKind::Party] {
+            let id = s.world.spawn(kind, "not_a_ccobject");
+            s.world
+                .get_mut(id)
+                .unwrap()
+                .fields
+                .insert("IsDestroyable".into(), 1);
+            run(
+                &mut s,
+                id,
+                "SetDestroyable",
+                &[Value::Object(id), Value::Int(0)],
+            );
+            assert_eq!(s.world.get(id).unwrap().fields["IsDestroyable"], 1);
+            assert_eq!(
+                run(&mut s, id, "IsDestroyable", &[Value::Object(id)]),
+                Some(Value::Int(0))
+            );
+        }
+        assert_eq!(
+            run(&mut s, 1, "IsDestroyable", &[Value::Object(OBJECT_INVALID)]),
+            Some(Value::Int(0))
+        );
+        run(
+            &mut s,
+            1,
+            "SetDestroyable",
+            &[Value::Object(OBJECT_INVALID), Value::Int(1)],
+        );
+        for (game, kind) in [
+            (thedas_vfs::Game::Origins, ObjectKind::Stage),
+            (thedas_vfs::Game::Origins, ObjectKind::Map),
+            (thedas_vfs::Game::Origins, ObjectKind::MapPin),
+            (thedas_vfs::Game::DragonAge2, ObjectKind::Creature),
+        ] {
+            s.game = game;
+            let id = s.world.spawn(kind, "untraced");
+            for name in ["IsDestroyable", "SetDestroyable"] {
+                let f = s.table.function_by_name(name).cloned().unwrap();
+                let mut host = ScriptHost {
+                    sim: &mut s,
+                    event: None,
+                    script: "test".into(),
+                };
+                assert!(call(&mut host, id, &f, &[Value::Object(id), Value::Int(0)]).is_none());
+            }
+            assert!(
+                !s.world
+                    .get(id)
+                    .unwrap()
+                    .fields
+                    .contains_key("IsDestroyable")
+            );
+        }
     }
 
     #[test]

@@ -389,6 +389,7 @@ Dispatch summary: `engine::call` (`crates/thedas-sim/src/engine.rs:483`) matches
 
 ### Checked and looks complete
 
+- SCR-001 Origins `IsDestroyable`/`SetDestroyable` read and write the independent CCObject flag, including its native true default and failed-lookup behavior ([trace](../notes/script-destroyability-flag.md)). Stage/map/map-pin casts, DA2 and placeable destruction remain outside this accessor slice.
 - SCR-026 Origins base-object maximum health: missing objects, modules, areas, the party, items, triggers, sounds, waypoints, projectiles, stores and area effects return -1 and ignore `SetMaxHealth` ([trace](../notes/script-base-health.md)). Placeable, stage, map and map-pin health paths remain provisional.
 - Local variables on objects, modules and areas (int, float, string, object, resource, location get/set).
 - Event construction and access (Event, Get/SetEvent* including locations, GetCurrentEvent, SignalEvent immediate and queued, DelayEvent with script override).
