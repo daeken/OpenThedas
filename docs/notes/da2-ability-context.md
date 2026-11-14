@@ -44,6 +44,10 @@ in reach, stores the chosen ability and target point on the command, then uses
 the modern START/IMPACT pipeline above. A script can prepend an animation during
 selection; its command must survive removal of the placeholder. A saved concrete
 attack is not selected again on reload. Origins' constructor remains unchanged.
+Completing the existing approach also marks a modern default attack as arrived;
+without that handoff it can repeat a zero-distance approach indefinitely instead
+of entering selection. The regression test exercises walking into the selection
+script and retaining the command it prepends.
 
 A normal checkpoint probe now selects 3210 (two-handed medium front) from a
 request for default ability 1. Its scripted impact deals 8.7422, 4.3711 and 2.1855

@@ -1129,6 +1129,7 @@ impl Sim {
                 (_, Some((due, id))) if due <= until => {
                     self.world.time_ms = self.world.time_ms.max(due);
                     self.advance_movers();
+                    let da2 = self.game == thedas_vfs::Game::DragonAge2;
                     let approached = self
                         .world
                         .get_mut(id)
@@ -1137,7 +1138,10 @@ impl Sim {
                             let at = c.approach.take()?;
                             c.due = None;
                             c.from = None;
-                            c.arrived = c.name == "CommandAttack";
+                            c.arrived = c.name == "CommandAttack"
+                                || (da2
+                                    && c.name == "CommandUseAbility"
+                                    && c.ints.first() == Some(&1));
                             Some(at)
                         });
                     // An ability whose impact comes before its animation ends deals the
@@ -4907,13 +4911,16 @@ mod tests {
         bytes.extend(code);
         s.add_script("choose.ncs", Ncs::parse(&bytes).unwrap());
         s.order_attack(who, target);
-        s.world.get_mut(who).unwrap().commands[0].arrived = true;
-        s.next_command();
+        // A modern default attack must finish its approach with the same
+        // arrival tolerance as the old attack, then enter selection once.
+        let (arrival, _) = s.next_command().unwrap();
+        assert!(s.world.get(who).unwrap().commands[0].approach.is_some());
+        s.tick(arrival);
         let commands = &s.world.get(who).unwrap().commands;
         assert_eq!(commands.len(), 1);
         assert_eq!(commands[0].name, "CommandWait");
         assert_eq!(commands[0].seconds, 0.25);
-        assert_eq!(s.next_command(), Some((250, who)));
+        assert_eq!(s.next_command(), Some((arrival + 250, who)));
     }
 
     #[test]
