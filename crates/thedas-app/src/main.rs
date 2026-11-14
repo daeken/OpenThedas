@@ -1,7 +1,7 @@
 //! `thedas-app`: play Dragon Age: Origins, or walk through an area.
 //!
 //! With only `--install`, the game boots as the original does: the EA logo and intro movies
-//! (decoded by `ffmpeg`, silent for now; a key, a click or the pad's A, B or Start skips
+//! (decoded by `thedas-video`, with their sound; a key, a click or the pad's A, B or Start skips
 //! one; `--no-intro` skips them), then its start menu (startmenu2.gfx: New Game, Load,
 //! Options, Quit); in a game Escape (or the pad's Start) opens the game menu (mainmenu.gfx),
 //! whose Exit Game returns to the start menu.
@@ -3317,7 +3317,7 @@ impl App {
             // here, not read from the player's bindings.
             KeyCode::Slash if self.live.is_some() => {
                 if let Some(live) = self.live.as_ref() {
-                    switch_weapon_set(live);
+                    live.switch_weapon_set();
                     log::info!("weapon set switched");
                 }
             }
@@ -5601,18 +5601,6 @@ fn set_client_option(ui: Option<&ui::UiLayer>, live: Option<&live::Live>, name: 
     }
 }
 
-/// The weapon set key: the controlled party member switches to its other set, as the
-/// quickbar's weapon set button does.
-fn switch_weapon_set(live: &live::Live) {
-    live.sim().input(
-        thedas_sim::commands::CommandSource::Player,
-        thedas_sim::commands::SimCommand::GuiMessage {
-            name: thedas_sim::inventory::MSG_SWITCH_WEAPON_SET.into(),
-            args: vec!["-1".into()],
-        },
-    );
-}
-
 /// Whether the screen up is one the game put up that the player leaves by its Close: a store,
 /// a container (the inventory screen the player did not open), the job board or the world map.
 fn game_screen_up(s: &screens::Screens) -> bool {
@@ -6624,7 +6612,7 @@ fn main() -> Result<()> {
                         None => println!("quickslot {}", slot + 1),
                     },
                     Step::SwapWeapons => {
-                        switch_weapon_set(l);
+                        l.switch_weapon_set();
                         println!("weapon set switched");
                     }
                     Step::Pause => {
@@ -6968,14 +6956,14 @@ fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    /// Against a real install (`THEDAS_INSTALL`) and `ffmpeg`, offscreen: the EA logo's frame
+    /// Against a real install (`THEDAS_INSTALL`), offscreen: the EA logo's frame
     /// two seconds in is drawn letterboxed in a taller window (written to `$INTRO_PNG` when
     /// set, to look at).
     #[test]
     #[ignore]
     fn the_intro_draws_its_frame_letterboxed() {
         let install = PathBuf::from(std::env::var_os("THEDAS_INSTALL").expect("THEDAS_INSTALL"));
-        let mut intro = intro::Intro::boot(&install).expect("ffmpeg and the movies");
+        let mut intro = intro::Intro::boot(&install).expect("the movies");
         let ctx = GpuContext::headless().unwrap();
         let (w, h) = (1280, 960);
         let format = wgpu::TextureFormat::Bgra8Unorm;

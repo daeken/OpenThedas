@@ -141,46 +141,26 @@ pub struct AudioState {
     pub volumes: Volumes,
 }
 
-/// A movie's sound track: decoded by ffmpeg on a thread, then played from where the
-/// movie is.
+/// A movie's sound track: decoded on a thread, then played from where the movie is.
 struct MovieSound {
     path: std::path::PathBuf,
     decoding: Option<std::sync::mpsc::Receiver<Option<thedas_audio::Pcm>>>,
     voice: Option<thedas_audio::VoiceId>,
 }
 
-/// Decodes a movie's audio to interleaved stereo `f32` at `rate` with `ffmpeg`.
-fn decode_movie_audio(path: &Path, rate: u32) -> Option<thedas_audio::Pcm> {
-    use std::io::Read;
-    let ffmpeg = crate::intro::find_ffmpeg()?;
-    let mut child = std::process::Command::new(ffmpeg)
-        .args(["-nostdin", "-v", "error", "-i"])
-        .arg(path)
-        .args([
-            "-vn",
-            "-f",
-            "f32le",
-            "-ac",
-            "2",
-            "-ar",
-            &rate.to_string(),
-            "-",
-        ])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
+/// Decodes a movie's first audio track (at its own rate; the mixer resamples).
+fn decode_movie_audio(path: &Path) -> Option<thedas_audio::Pcm> {
+    let mut movie = thedas_video::bink::Movie::open(path)
+        .map_err(|e| log::warn!("movie sound: {}: {e}", path.display()))
         .ok()?;
-    let mut bytes = Vec::new();
-    child.stdout.take()?.read_to_end(&mut bytes).ok()?;
-    let _ = child.wait();
-    let samples: Vec<f32> = bytes
-        .chunks_exact(4)
-        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-        .collect();
+    let track = *movie.header.tracks.first()?;
+    let samples = movie
+        .decode_audio(0)
+        .map_err(|e| log::warn!("movie sound: {}: {e}", path.display()))
+        .ok()?;
     (!samples.is_empty()).then_some(thedas_audio::Pcm {
-        rate,
-        channels: 2,
+        rate: track.rate,
+        channels: track.channels(),
         samples,
     })
 }
@@ -1384,9 +1364,8 @@ impl GameAudio {
             if let Some((path, _)) = &movie {
                 let (tx, rx) = std::sync::mpsc::channel();
                 let p = path.clone();
-                let rate = self.engine.mixer.lock().map(|m| m.rate()).unwrap_or(48000);
                 std::thread::spawn(move || {
-                    let _ = tx.send(decode_movie_audio(&p, rate));
+                    let _ = tx.send(decode_movie_audio(&p));
                 });
                 self.movie = Some(MovieSound {
                     path: path.clone(),

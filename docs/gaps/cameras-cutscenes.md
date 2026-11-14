@@ -47,12 +47,11 @@ Found by reading the code at main on 2026-11-12: provisional markers, stubs, ign
 
 ### Movies
 
-- **CAM-029** **Bink is decoded by an external ffmpeg.** Original: Bink decoding natively. Ours: video (and boot-movie audio) come from `ffmpeg` on the PATH; without it movies are skipped; only the Bink header is parsed in-tree. The README's planned `thedas-video` crate does not exist. Evidence: `crates/thedas-app/src/intro.rs:5`, `crates/thedas-app/src/intro.rs:28`, `README.md:146`. Size: L. Depends: none. Kind: missing.
 - **CAM-031** **Movie skip input not traced.** Original: not traced. Ours: any key, click or pad A/B/Start skips. Evidence: `crates/thedas-app/src/intro.rs:7`. Size: S. Depends: none. Kind: provisional.
 - **CAM-032** **`DisableIntroMovies` and the FirstRun gate are not read.** Original: options `DisableIntroMovies` and the exe's `FirstRun` gate (per comment). Ours: only `--no-intro`. Evidence: `crates/thedas-app/src/intro.rs:8`. Size: S. Depends: CAM-044. Kind: missing.
 - **CAM-033** **Movie path resolution guessed.** Original: not traced. Ours: the resource stack's loose file, else `packages/core/data/movies`. Evidence: `crates/thedas-app/src/intro.rs:88`. Size: S. Depends: none. Kind: provisional.
 - **CAM-034** **Movie timing edge cases guessed.** Original: `ActionPlayMovie` update 0x7ce740 (not traced for short movies). Ours: black after a movie ends before its cutscene; frames dropped when behind; the world returns when the last movie ends early. Evidence: `crates/thedas-app/src/intro.rs:473`, `crates/thedas-app/src/intro.rs:593`. Size: S. Depends: none. Kind: provisional.
-- **CAM-035** **Subtitles in movies.** Original: subtitles in movies. Ours: no code found. Evidence: `crates/thedas-app/src/intro.rs:1`. Size: M. Depends: CAM-029. Kind: missing.
+- **CAM-035** **Subtitles in movies.** Original: subtitles in movies. Ours: no code found. Evidence: `crates/thedas-app/src/intro.rs:1`. Size: M. Depends: none. Kind: missing.
 - **CAM-036** **Movie docs contradict each other.** Original: n/a. Ours: `intro.rs` and `main.rs` say movies play silent; `audio.rs` plays boot-movie sound; README "Playing" says boot movies are not shown while README status says they play. Evidence: `crates/thedas-app/src/intro.rs:7`, `crates/thedas-app/src/intro.rs:96`, `crates/thedas-app/src/main.rs:4`, `README.md:158`. Size: S. Depends: none. Kind: bug.
 
 ### Startup, configuration, user files

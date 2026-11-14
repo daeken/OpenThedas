@@ -22,7 +22,7 @@ use serde_json::json;
 
 /// The environment variable naming the folder of the program the player started, handed
 /// down to every build started from it (an update's, or the newest build taking over), so
-/// what the player put beside their download (`ffmpeg.exe`) is still found.
+/// what the player put beside their download is still found.
 pub const PROGRAM_DIR: &str = "THEDAS_PROGRAM_DIR";
 
 /// The folder to hand down as [`PROGRAM_DIR`]: the one already handed to us, else our own.

@@ -22,3 +22,4 @@ anyhow.workspace = true
 serde_json.workspace = true
 png.workspace = true
 thedas-audio.workspace = true
+thedas-video.workspace = true

@@ -3203,6 +3203,18 @@ impl Live {
     /// The player's pause key (Space). During a training tutorial the game may not be
     /// unpaused: the key is the training action `EVENT_TYPE_TRAINING_UNPAUSE` instead (see
     /// `thedas_sim::training`), and the player's own pause is left as it was.
+    /// The controlled party member switches to its other weapon set, as the quickbar's
+    /// weapon set button does (the / key, the pad's RT+A).
+    pub fn switch_weapon_set(&self) {
+        self.sim().input(
+            thedas_sim::commands::CommandSource::Player,
+            thedas_sim::commands::SimCommand::GuiMessage {
+                name: thedas_sim::inventory::MSG_SWITCH_WEAPON_SET.into(),
+                args: vec!["-1".into()],
+            },
+        );
+    }
+
     pub fn toggle_pause(&mut self) {
         let mut sim = self.sim();
         if sim.training_paused() {
