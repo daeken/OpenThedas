@@ -9,7 +9,7 @@ The NWScript-style VM and the engine functions, events, commands and effects tha
 Gathered 2026-11-12 on main 1eb844a, from the release `thedas` binary and source. No game text.
 
 The [complete unanswered-function inventory](../notes/unanswered-script-functions.md)
-was measured again on 2026-11-14 at main `c293855c`: 168 of 676 declarations
+was measured again on 2026-11-14 at main `e67af2e3`: 168 of 676 declarations
 fall through Origins dispatch, including 63 called functions and 105 with no
 static call site. It includes a runtime dispatch audit and supersedes the older
 coverage counts below; the older sections remain the historical measurement.

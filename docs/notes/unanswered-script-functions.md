@@ -1,6 +1,6 @@
 # Unanswered Origins engine functions (SCR-002)
 
-Snapshot against main `c293855c`, measured 2026-11-14 on the local Origins
+Snapshot against main `e67af2e3`, measured 2026-11-14 on the local Origins
 1.05 install. This lists every declaration in the winning `script.ldf` whose
 Origins dispatch falls through `engine::call` to `None`, including functions
 not called by the installed scripts. It records API names and our measurements;
