@@ -22,6 +22,7 @@ pub mod d3d;
 mod d3d_gpu;
 pub mod deferred;
 mod deferred_shadow;
+mod deferred_terrain;
 pub mod distortion;
 pub mod fxaa;
 pub mod gpu;

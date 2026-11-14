@@ -16,6 +16,14 @@ struct Frame {
     fog: vec4<f32>,
 };
 
+struct Terrain {
+    dimensions: vec4<f32>,
+    parameters: vec4<f32>,
+    scales: array<vec4<f32>, 2>,
+    specular: array<vec4<f32>, 8>,
+    tint: vec4<f32>,
+};
+
 struct Draw {
     mvp: mat4x4<f32>,
     world: mat4x4<f32>,
@@ -25,6 +33,7 @@ struct Draw {
     falloff: vec4<f32>,
     // x: room index (0: none), y: mml_fSpecularReflectionMult
     room: vec4<f32>,
+    terrain: Terrain,
 };
 
 @group(0) @binding(0) var<uniform> frame: Frame;
@@ -38,6 +47,12 @@ struct Draw {
 @group(1) @binding(5) var clamp_smp: sampler;
 // The draw's light probe's cubemap (Static1's `aur_cmLightProbe0`).
 @group(1) @binding(6) var env_tex: texture_cube<f32>;
+@group(1) @binding(7) var mask_v: texture_2d<f32>;
+@group(1) @binding(8) var mask_a: texture_2d<f32>;
+@group(1) @binding(9) var mask_a2: texture_2d<f32>;
+@group(1) @binding(10) var point_smp: sampler;
+@group(1) @binding(11) var terrain_diffuse: texture_2d<f32>;
+@group(1) @binding(12) var terrain_normal: texture_2d<f32>;
 
 struct VsIn {
     @location(0) position: vec3<f32>,
@@ -52,6 +67,7 @@ struct VsOut {
     @location(1) uv_lm: vec2<f32>,
     @location(2) normal: vec3<f32>,
     @location(3) world: vec3<f32>,
+    @location(4) terrain_falloff: f32,
 };
 
 @vertex
@@ -66,9 +82,10 @@ fn vs_gbuffer(v: VsIn) -> VsOut {
     let p = r + f.mvp[3];
     out.clip = vec4<f32>(p.x + frame.fixup.x * p.w, p.y - frame.fixup.y * p.w, p.z, p.w);
     out.uv0 = v.uv0;
-    out.uv_lm = v.uv1 * f.lightmap.zw + f.lightmap.xy;
+    out.uv_lm = select(v.uv1, v.uv0, f.room.z > 0.5) * f.lightmap.zw + f.lightmap.xy;
     out.normal = (f.world * vec4<f32>(v.normal, 0.0)).xyz;
     out.world = (f.world * vec4<f32>(v.position, 1.0)).xyz;
+    out.terrain_falloff = 2.0 - length(frame.eye.xyz - out.world) / 32.0;
     return out;
 }
 
@@ -95,7 +112,7 @@ fn oct_encode(n: vec3<f32>) -> vec2<f32> {
     return (1.0 - abs(p.yx)) * select(vec2<f32>(-1.0), vec2<f32>(1.0), p >= vec2<f32>(0.0));
 }
 
-fn surface(in: VsOut) -> Surface {
+fn surface_normal(in: VsOut, nm: vec4<f32>) -> Surface {
     let d = draw;
     // Tangent frame from the screen-space derivatives of position and texture coordinate
     // (provisional: the meshes' own tangents and binormals, which Static1 reads, are not in
@@ -113,12 +130,11 @@ fn surface(in: VsOut) -> Surface {
     t = t * scale;
     b = b * scale;
 
-    let nm = textureSample(normal_tex, wrap_smp, in.uv0);
     let xy = nm.wy * 2.0 - 1.0;
     let z = sqrt(max(1.0 - dot(xy, xy), 0.0));
     var n = xy.x * t + xy.y * b + z * n_v;
     n = n * inverseSqrt(max(dot(n, n), 1e-20));
-    if (frame.fog.z > 0.5) {
+    if (frame.fog.z > 0.5 || (draw.room.z > 0.5 && draw.room.w > 0.5)) {
         n = normalize(n_v);
     }
 
@@ -129,14 +145,83 @@ fn surface(in: VsOut) -> Surface {
     out.n = n;
     out.v = v;
     out.falloff = (3.0 - 2.0 * x) * x * x * d.falloff.w;
+    if (draw.room.z > 0.5) {
+        // Terrain2.vsh's specular distance factor, interpolated per vertex.
+        out.falloff = in.terrain_falloff;
+    }
     return out;
+}
+
+fn surface(in: VsOut) -> Surface {
+    return surface_normal(in, textureSample(normal_tex, wrap_smp, in.uv0));
+}
+
+struct TerrainMaterial {
+    albedo: vec4<f32>,
+    normal: vec4<f32>,
+    specular: vec4<f32>,
+};
+
+// MaskV picks three of eight layers, encoded at 0, 2/15, ..., 14/15.
+// MaskA/MaskA2 hold all eight weights. The palette's tile padding and each
+// layer's UV scale come from the material, never a fixed world-space tiling.
+fn terrain_material(uv: vec2<f32>) -> TerrainMaterial {
+    let t = draw.terrain;
+    let indices = textureSampleLevel(mask_v, point_smp, uv, 0.0).rgb;
+    let a = textureSample(mask_a, clamp_smp, uv);
+    let b = textureSample(mask_a2, clamp_smp, uv);
+    let weights = array<f32, 8>(a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w);
+    let dx = dpdx(uv) * t.parameters.zw;
+    let dy = dpdy(uv) * t.parameters.zw;
+    var result: TerrainMaterial;
+    result.albedo = vec4<f32>(0.0);
+    result.normal = vec4<f32>(0.0);
+    result.specular = vec4<f32>(0.0);
+    var total = 0.0;
+    for (var layer = 0u; layer < 8u; layer += 1u) {
+        result.specular += weights[layer] * t.specular[layer];
+    }
+    for (var k = 0u; k < 3u; k += 1u) {
+        let encoded = indices[k];
+        var weight = 0.0;
+        var scale = 0.0;
+        for (var layer = 0u; layer < 8u; layer += 1u) {
+            let selected = abs(encoded - f32(layer) * (2.0 / 15.0)) <= 0.0625;
+            weight += select(0.0, weights[layer], selected);
+            scale += select(0.0, t.scales[layer / 4u][layer % 4u], selected);
+        }
+        let column = floor(encoded * t.dimensions.z);
+        let row = floor(fract(encoded * t.dimensions.z) * t.dimensions.w);
+        let tile = vec2<f32>(column, row) * t.dimensions.xy + t.parameters.xy;
+        let coord = fract(uv * scale) * t.parameters.zw + tile;
+        result.albedo += weight * textureSampleGrad(terrain_diffuse, clamp_smp, coord, dx * scale, dy * scale);
+        result.normal += weight * textureSampleGrad(terrain_normal, clamp_smp, coord, dx * scale, dy * scale);
+        total += weight;
+    }
+    result.albedo /= max(total, 1e-6);
+    result.normal /= max(total, 1e-6);
+    result.specular = vec4<f32>(result.specular.rgb * result.albedo.a, result.specular.a);
+    if (draw.room.w > 0.5) {
+        result.specular = vec4<f32>(0.0);
+    }
+    return result;
 }
 
 @fragment
 fn fs_gbuffer(in: VsOut) -> GBuffer {
+    if (draw.room.z > 0.5) {
+        let m = terrain_material(in.uv0);
+        let s = surface_normal(in, m.normal);
+        var out: GBuffer;
+        out.albedo = vec4<f32>(m.albedo.rgb, 1.0);
+        out.specular = m.specular;
+        out.normal = vec4<f32>(oct_encode(s.n), draw.room.x, s.falloff);
+        out.lightmap = textureSample(lightmap_tex, clamp_smp, in.uv_lm);
+        return out;
+    }
     let s = surface(in);
     var out: GBuffer;
-    out.albedo = vec4<f32>(textureSample(diffuse_tex, wrap_smp, in.uv0).rgb, 1.0);
+    out.albedo = vec4<f32>(textureSample(diffuse_tex, wrap_smp, in.uv0).rgb, 0.0);
     out.specular = textureSample(spec_tex, wrap_smp, in.uv0);
     out.normal = vec4<f32>(oct_encode(s.n), draw.room.x, s.falloff);
     out.lightmap = textureSample(lightmap_tex, clamp_smp, in.uv_lm);
@@ -149,6 +234,18 @@ fn fs_gbuffer(in: VsOut) -> GBuffer {
 // and the falloff.
 @fragment
 fn fs_env(in: VsOut) -> @location(0) vec4<f32> {
+    if (draw.room.z > 0.5) {
+        let m = terrain_material(in.uv0);
+        let s = surface_normal(in, m.normal);
+        let r = 2.0 * dot(s.n, s.v) * s.n - s.v;
+        let power = m.specular.a * 255.0 + 1.0;
+        let env = textureSampleLevel(env_tex, wrap_smp, r, (1.0 - power / 255.0) * 9.0).rgb;
+        let lm = textureSample(lightmap_tex, clamp_smp, in.uv_lm);
+        let to_eye = in.world - frame.eye.xyz;
+        let fog = max(min(exp(-dot(to_eye, to_eye) * frame.fog.x), 1.0), frame.fog.y);
+        let reflection = env * m.specular.rgb * (0.75 * lm.a + 0.25) * s.falloff;
+        return vec4<f32>((reflection + m.albedo.rgb * draw.terrain.tint.rgb) * fog, 1.0);
+    }
     let s = surface(in);
     let specular = textureSample(spec_tex, wrap_smp, in.uv0);
     let r = 2.0 * dot(s.n, s.v) * s.n - s.v;
@@ -277,7 +374,9 @@ fn fs_lighting(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     let w = lighting.inv_view_proj * vec4<f32>(ndc, depth, 1.0);
     let p = w.xyz / w.w;
 
-    let albedo = textureLoad(g_albedo, px, 0).rgb;
+    let ga = textureLoad(g_albedo, px, 0);
+    let albedo = ga.rgb;
+    let terrain = ga.a > 0.5;
     let spec = textureLoad(g_specular, px, 0);
     let gn = textureLoad(g_normal, px, 0);
     let lm = textureLoad(g_lightmap, px, 0);
@@ -345,8 +444,10 @@ fn fs_lighting(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
         }
     }
     // No real-time shadow yet: Static1's shadow term is 1, so its lightmap blend is too.
-    let diffuse = diff_s * lm.a + lm.rgb + diff_d;
-    let specular = (spec_s * max(lm.a, 0.2) + spec_d) * 3.0;
+    // Terrain1 masks static diffuse twice with baked alpha; Static1 only once.
+    let diffuse = diff_s * select(lm.a, lm.a * lm.a, terrain) + lm.rgb + diff_d;
+    let specular = select((spec_s * max(lm.a, 0.2) + spec_d) * 3.0,
+        (spec_s + spec_d) * 3.0 * (0.75 * lm.a + 0.25), terrain);
     var colour = albedo * diffuse + spec.rgb * specular * falloff;
     switch lighting.counts.y {
         case 1u: { return vec4<f32>(albedo, 1.0); }

@@ -63,7 +63,7 @@ impl RenderPath {
 /// array, at most 16 KiB, which every backend can bind.
 const MAX_LIGHTS: usize = 192;
 /// Dynamic uniform offsets must be multiples of this on every backend.
-const DRAW_STRIDE: usize = 256;
+const DRAW_STRIDE: usize = 512;
 /// Room indices the lights' room sets can name; rooms past it are lit by every light.
 const MAX_ROOMS: u32 = 255;
 
@@ -100,6 +100,7 @@ struct DrawData {
     lightmap: [f32; 4],
     falloff: [f32; 4],
     room: [f32; 4],
+    terrain: crate::deferred_terrain::TerrainData,
 }
 
 #[repr(C)]
@@ -146,7 +147,7 @@ pub(crate) struct DeferredPass {
     draws: Vec<PlanDraw>,
     data: Vec<DrawData>,
     /// Diffuse, normal map, specular mask, lightmap and probe cubemap, per distinct set.
-    groups: Vec<[wgpu::TextureView; 5]>,
+    groups: Vec<[wgpu::TextureView; 8]>,
     /// Per faithful draw (index into [`D3dPass::draws`]): whether this pass draws it.
     takes: Vec<bool>,
     /// The index each room id has in the lights' room sets (1 on; 0 is "no room").
@@ -238,6 +239,17 @@ fn static1(program: &crate::d3d::D3dProgram) -> bool {
         && p.z_write
 }
 
+fn terrain(program: &crate::d3d::D3dProgram) -> bool {
+    let p = &program.pass;
+    (program.name.starts_with("terrain2.vsh+terrain1.psh+")
+        || program.name.starts_with("terrain3.vsh+terrain3.psh+"))
+        && !program.instanced
+        && p.blend.is_none()
+        && p.alpha_test.is_none()
+        && p.z_enable
+        && p.z_write
+}
+
 impl DeferredPass {
     /// What a renderer of `scene` (the level's own meshes) draws deferred, with the
     /// textures it reads; `None` when nothing qualifies.
@@ -262,6 +274,7 @@ impl DeferredPass {
         let mut draws = Vec::new();
         let mut data = Vec::new();
         let mut takes = vec![false; d3d.draws.len()];
+        let terrain_enabled = std::env::var("THEDAS_DEFERRED_TERRAIN").as_deref() != Ok("0");
         for (k, d) in d3d.draws.iter().enumerate() {
             let program = d3d.program(d);
             let Some(item) = scene.draws.get(d.draw) else {
@@ -270,7 +283,7 @@ impl DeferredPass {
             let taken = d.draw < scene.static_draws
                 && !d3d.is_blended(d)
                 && !d.multipass
-                && static1(program)
+                && (static1(program) || (terrain_enabled && terrain(program)))
                 && item.skin.is_none()
                 && item.lod.is_none()
                 && !scene.cut_away.contains(&d.draw)
@@ -279,6 +292,7 @@ impl DeferredPass {
                 continue;
             };
             let lightmap = item.lightmap.as_ref().map(|l| l.texture.clone());
+            let is_terrain = terrain(program);
             // The probe's cubemap as the faithful pass binds it (see `d3d::sampler_texture`).
             let cube = item.probe.and_then(|p| scene.probes.get(p)).map(|p| {
                 let name = p.name.to_ascii_lowercase();
@@ -293,9 +307,25 @@ impl DeferredPass {
                 .or_insert_with(|| {
                     let param = |p: &str| [m.texture(p), crate::d3d::texture_default(m, p)];
                     groups.push([
-                        texture(&param("mml_tDiffuse"), tex2d, [128, 128, 128, 255]),
+                        texture(
+                            &param(if is_terrain {
+                                "palette"
+                            } else {
+                                "mml_tDiffuse"
+                            }),
+                            tex2d,
+                            [128, 128, 128, 255],
+                        ),
                         // A flat normal in DXT5nm's channels (x in alpha, y in green).
-                        texture(&param("mml_tNormalMap"), tex2d, [128, 128, 128, 128]),
+                        texture(
+                            &param(if is_terrain {
+                                "normal"
+                            } else {
+                                "mml_tNormalMap"
+                            }),
+                            tex2d,
+                            [128, 128, 128, 128],
+                        ),
                         texture(&param("mml_tSpecularMask"), tex2d, [0, 0, 0, 0]),
                         texture(
                             &[lightmap.clone(), Some("default_black.dds".into())],
@@ -307,6 +337,9 @@ impl DeferredPass {
                             TextureType::Cube,
                             [0, 0, 0, 255],
                         ),
+                        texture(&param("MaskV"), tex2d, [0, 0, 0, 255]),
+                        texture(&param("MaskA"), tex2d, [255, 0, 0, 0]),
+                        texture(&param("MaskA2"), tex2d, [0, 0, 0, 0]),
                     ]);
                     groups.len() - 1
                 });
@@ -345,13 +378,24 @@ impl DeferredPass {
                     [l.offset[0], l.offset[1], l.scale[0], l.scale[1]]
                 }),
                 falloff,
-                room: [room as f32, reflection, 0.0, 0.0],
+                room: [
+                    room as f32,
+                    reflection,
+                    if is_terrain { 1.0 } else { 0.0 },
+                    if program.name.starts_with("terrain3.") {
+                        1.0
+                    } else {
+                        0.0
+                    },
+                ],
+                terrain: crate::deferred_terrain::TerrainData::new(m),
             });
         }
         log::info!(
-            "deferred: {} of the level's {} drawn meshes can be drawn deferred",
+            "deferred: {} of the level's {} drawn meshes can be drawn deferred ({} terrain)",
             draws.len(),
-            d3d.draws.len()
+            d3d.draws.len(),
+            data.iter().filter(|d| d.room[2] > 0.5).count()
         );
         (!draws.is_empty()).then(|| DeferredPass {
             draws,
@@ -478,6 +522,12 @@ impl DeferredPass {
                     },
                     count: None,
                 },
+                tex(7, true),
+                tex(8, true),
+                tex(9, true),
+                smp(10),
+                tex(11, true),
+                tex(12, true),
             ],
         });
         let lighting_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -692,10 +742,16 @@ impl DeferredPass {
         };
         let wrap = sampler("deferred wrap", wgpu::AddressMode::Repeat, 8);
         let clamp = sampler("deferred lightmap", wgpu::AddressMode::ClampToEdge, 1);
+        let point = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("deferred terrain layer indices"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            ..Default::default()
+        });
         let material_groups = self
             .groups
             .iter()
-            .map(|[d, n, s, l, e]| {
+            .map(|[d, n, s, l, e, mv, ma, ma2]| {
                 device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("deferred material"),
                     layout: &material_layout,
@@ -727,6 +783,32 @@ impl DeferredPass {
                         wgpu::BindGroupEntry {
                             binding: 6,
                             resource: wgpu::BindingResource::TextureView(e),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 7,
+                            resource: wgpu::BindingResource::TextureView(mv),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 8,
+                            resource: wgpu::BindingResource::TextureView(ma),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 9,
+                            resource: wgpu::BindingResource::TextureView(ma2),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 10,
+                            resource: wgpu::BindingResource::Sampler(&point),
+                        },
+                        // Separate bindings keep GL's one-sampler-per-image restriction:
+                        // static textures wrap; terrain palette textures clamp.
+                        wgpu::BindGroupEntry {
+                            binding: 11,
+                            resource: wgpu::BindingResource::TextureView(d),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 12,
+                            resource: wgpu::BindingResource::TextureView(n),
                         },
                     ],
                 })
