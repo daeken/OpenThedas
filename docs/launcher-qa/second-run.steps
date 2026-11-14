@@ -1,0 +1,11 @@
+# The launcher's second start, on what first-run.steps left behind (run.sh plays it right
+# after): the wizard is done, so it opens on Play with the one install selected.
+
+run 300
+expect page Play
+expect installs 1
+expect text Play Dragon Age: Origins
+click Play Dragon Age: Origins
+run 300
+expect launch dragon age origins
+quit

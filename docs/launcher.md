@@ -158,8 +158,43 @@ Scripts drive the launcher through the same tree, clicking controls by name
   `status`, `screenshot`, `quit`). `--control` without `--launcher` still drives the game.
 - File and folder dialogs can't be driven, so `choose <path>` answers the next one:
   `choose C:\Games\Dragon Age; click Pick the game's folder myself…`.
+- `thedas-app --launcher-script file.steps`: the same steps from a file, one or more to a line,
+  `#` comment lines ignored, `${NAME}` replaced by an environment variable.
+- `expect <what>` fails the step unless the page is as said (it retries for four seconds):
+  `page`, `heading`, `text`, `no text`, `focus`, `enabled`/`disabled`, `installs`, `message`,
+  `launch`. `mkinstall <folder> [da2]` makes a stand-in install (folders only) to find or
+  pick. `key Shift+Tab` and other modifier combinations work.
+- `THEDAS_LAUNCHER_CONFIG=<file>` points the launcher at a scratch settings file, and
+  `THEDAS_LAUNCHER_DRY_RUN=1` makes Play report the command it would run (`launch` in `status`)
+  instead of starting the game.
 - Typed text never reaches a log line (a step logs only the field and the length), and a
   password field reads back as dots.
+
+### Regression scripts for QA
+
+`docs/launcher-qa/` holds scripts to rerun after any launcher change. `run.sh` plays one in a
+scratch home with a scratch settings file and no mods, so a player's own setup is never read
+or changed, and exits non-zero when a step or an `expect` fails:
+
+```
+docs/launcher-qa/run.sh first-run   # wizard start to finish on stand-in installs, then a
+                                    # second start on what it saved; all four tabs; Play
+docs/launcher-qa/run.sh keyboard    # keyboard only: Tab order, focus after page changes
+```
+
+`run.sh <script> [thedas-app]` uses `target/debug/thedas-app` or `$THEDAS_APP`. On a Linux
+box with no display, wrap it in `xvfb-run -a`. On Windows, set `HOME`/`USERPROFILE`,
+`THEDAS_LAUNCHER_CONFIG`, `THEDAS_LAUNCHER_DRY_RUN`, `THEDAS_MODS=none`, `SCRATCH` and `OUT`
+(see `run.sh`) and run `thedas-app --launcher-script docs\launcher-qa\first-run.steps`.
+Screenshots of each stage go to `$OUT`. The scripts read the page through the same
+accessibility tree a screen reader does, so a control that loses its name or order fails them.
+They do not stand in for hearing it in VoiceOver or Narrator: that needs a person.
+
+Keyboard behaviour they pin down: Tab goes header, page, footer (Back before the primary
+button, the tabs in reading order); a page change that is not a click on a tab moves focus to
+the new page's first control; a finished search moves focus to the results; page titles are
+headings, the footer message and the search status are live regions, and the Steam Guard field
+takes focus when asked for.
 
 ## Screenshots and checks
 
