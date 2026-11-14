@@ -1,12 +1,16 @@
 //! Frame-rate figures for the window's title bar, so a slow spot can be measured rather than
 //! described: the frame rate over the last window, the 1% low (the frame rate of the slowest
 //! 1% of frames) and the 90th and 99th percentile frame times. Not in the original game; a
-//! development aid that reads nothing from the simulation.
+//! development aid that reads nothing from the simulation. Every [`LOG_EVERY`]th figure also
+//! goes to the log, so a hidden window (a headless run) can be measured too.
 
 use std::time::{Duration, Instant};
 
 /// How often the title is rewritten, and so the window the figures cover.
 const WINDOW: Duration = Duration::from_secs(1);
+
+/// How many title figures go by between two written to the log.
+pub const LOG_EVERY: u32 = 10;
 
 /// Frame times gathered since the title was last written.
 #[derive(Default)]
@@ -15,6 +19,8 @@ pub struct FrameStats {
     since: Option<Instant>,
     /// Frame times in milliseconds.
     times: Vec<f32>,
+    /// Figures given so far.
+    given: u32,
 }
 
 impl FrameStats {
@@ -31,7 +37,14 @@ impl FrameStats {
         self.since = Some(now);
         let text = summary(&mut self.times);
         self.times.clear();
+        self.given = self.given.wrapping_add(1);
         text
+    }
+
+    /// Whether the figure just given is one for the log too (the first, then every
+    /// [`LOG_EVERY`]th).
+    pub fn log_due(&self) -> bool {
+        self.given % LOG_EVERY == 1
     }
 }
 
@@ -94,5 +107,8 @@ mod tests {
         let s = f.frame(t0 + Duration::from_millis(1001)).unwrap();
         assert!(s.contains("fps"), "{s}");
         assert!(f.times.is_empty());
+        assert!(f.log_due());
+        let s = f.frame(t0 + Duration::from_millis(2002));
+        assert!(s.is_some() && !f.log_due());
     }
 }
