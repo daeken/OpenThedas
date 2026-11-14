@@ -71,7 +71,8 @@ pub const MOD_LABEL: &str = "mod:";
 /// A layer of a stack that does not come from the install: the player's own.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlayerLayer {
-    /// `user:<path under the original's documents folder>` or `mod:<name>`.
+    /// `user:<path under the original's documents folder>`, `mod:<name>`, or
+    /// [`crate::WORKSPACE_LABEL`] for mod mode's live edits.
     pub label: String,
     /// Files the layer holds, counting ones a higher layer hides.
     pub files: usize,
@@ -94,6 +95,13 @@ pub fn player_layers(vfs: &Vfs) -> Vec<PlayerLayer> {
     let mut out = of(vfs);
     if let Some(o) = vfs.overlay() {
         out.extend(of(o));
+    }
+    // Mod mode's live edits, when mounted: a report from such a session is a modded one.
+    if let Some((_, files)) = Vfs::workspace().filter(|_| vfs.plays()) {
+        out.push(PlayerLayer {
+            label: crate::vfs::WORKSPACE_LABEL.to_string(),
+            files,
+        });
     }
     out
 }

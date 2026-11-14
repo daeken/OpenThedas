@@ -78,6 +78,7 @@ mod talkcam;
 mod ui;
 mod update;
 mod upload;
+mod workspace;
 
 use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -231,6 +232,10 @@ struct Args {
     /// print their events for this many seconds, then exit. No window, no install needed.
     #[arg(long)]
     pad_probe: Option<f64>,
+    /// Mod mode's live edits from the start: the workspace folder (`workspace/override` in
+    /// the player's data folder) mounted above every mod (see `workspace`).
+    #[arg(long)]
+    mod_workspace: bool,
     /// Booting to the start menu: skip the logo and intro movies the game plays first.
     #[arg(long)]
     no_intro: bool,
@@ -657,6 +662,8 @@ struct App {
     resume_offer: ResumeOffer,
     /// Mod mode's panels over the game (see [`modmode`]), made the first time it opens.
     mod_mode: Option<modmode::ModMode>,
+    /// Mod mode's live edits: when the exports were last looked at for saved textures.
+    live_edits: LiveEdits,
     /// The last input came from a game controller (not the mouse or keyboard): a report
     /// then skips marking spots, which needs the mouse.
     pad_last: bool,
@@ -920,6 +927,15 @@ fn play_interface(
         }
     }
 }
+
+/// When mod mode's live edits last looked for saved textures (see [`workspace`]).
+#[derive(Default)]
+struct LiveEdits {
+    last: Option<Instant>,
+}
+
+/// How often the exports are looked at for saved textures while live edits are on.
+const LIVE_EDIT_POLL: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// A presented frame being copied out: the buffer and its size and row pitch.
 struct FrameReadback {
@@ -1855,12 +1871,63 @@ impl App {
 
     /// Mod mode's frame: its panels laid out from the picked object, the scrubber's hold
     /// passed to the game's drawing, and what the panels asked for done.
+    /// Live edits: textures saved over an export's PNGs are written into the workspace and
+    /// the objects drawn again with them. Says what happened (`None`: nothing to do).
+    fn live_edit_sync(&mut self) -> Option<String> {
+        if !workspace::mounted() {
+            return None;
+        }
+        let overrides = workspace::override_dir();
+        let changes = workspace::changes(&workspace::blender_dir(), &overrides);
+        if changes.is_empty() {
+            return None;
+        }
+        let (done, failed) = workspace::apply(&changes, &overrides);
+        for f in &failed {
+            log::warn!("live edits: {f}");
+        }
+        if !done.is_empty() {
+            thedas_vfs::Vfs::rescan_workspace();
+            if let Some(l) = self.live.as_mut() {
+                l.reload(&done);
+            }
+        }
+        let note = format!(
+            "Live edits: {}{}",
+            if done.is_empty() {
+                "nothing written".to_string()
+            } else {
+                format!("{} updated", done.join(", "))
+            },
+            if failed.is_empty() {
+                String::new()
+            } else {
+                format!("; {} failed (see the log)", failed.len())
+            }
+        );
+        log::info!("{note}");
+        Some(note)
+    }
+
     fn mod_mode_frame(&mut self, dt_ms: f64) {
+        let due = self
+            .live_edits
+            .last
+            .is_none_or(|t| t.elapsed() >= LIVE_EDIT_POLL);
+        if due && workspace::mounted() {
+            self.live_edits.last = Some(Instant::now());
+            if let Some(note) = self.live_edit_sync()
+                && let Some(m) = self.mod_mode.as_mut()
+            {
+                m.live_note = Some(note);
+            }
+        }
         let flying = self.live.is_some() && self.follow.is_none();
         let Some(m) = self.mod_mode.as_mut() else {
             return;
         };
         m.fly = flying;
+        m.live = workspace::mounted();
         let inspected = match (m.open.then_some(m.selected).flatten(), self.live.as_mut()) {
             (Some(id), Some(l)) => l.inspect(id),
             _ => None,
@@ -1880,6 +1947,12 @@ impl App {
                 modmode::Action::World(a) => self.mod_mode_world(a),
                 modmode::Action::Fly(on) => self.set_fly(on),
                 modmode::Action::FlyTo(id) => self.fly_to(id),
+                modmode::Action::LiveEdits(on) => {
+                    let note = workspace::mount(on).unwrap_or_else(|e| e);
+                    if let Some(m) = self.mod_mode.as_mut() {
+                        m.live_note = Some(note);
+                    }
+                }
                 modmode::Action::Export(id) => {
                     let note = self.export_glb(id);
                     if let Some(m) = self.mod_mode.as_mut() {
@@ -3575,6 +3648,11 @@ impl App {
             },
             Step::ModWorld => log.push(self.mod_mode_world_step(None)),
             Step::ModPlot(name) => log.push(self.mod_mode_world_step(Some(name))),
+            &Step::ModLive(on) => log.push(workspace::mount(on).unwrap_or_else(|e| e)),
+            Step::ModSync => log.push(
+                self.live_edit_sync()
+                    .unwrap_or_else(|| "Live edits: nothing changed".into()),
+            ),
             Step::ModExport => match self.mod_mode.as_ref().and_then(|m| m.selected) {
                 Some(id) => log.push(self.export_glb(id)),
                 None => log.push("modexport: nothing inspected".into()),
@@ -5094,6 +5172,10 @@ enum Step {
     ModPlot(String),
     /// The inspected object's models are exported for Blender (`modexport`).
     ModExport,
+    /// Live edits on or off (`modlive on`, `modlive off`).
+    ModLive(bool),
+    /// Live edits look for saved textures now (`modsync`).
+    ModSync,
     /// A variable set from the world-state browser (`modlocal WHO NAME TYPE VALUE`, WHO
     /// `module`, `area` or an object's tag; TYPE `int`, `float`, `string`, `object` or
     /// `resource`, or `remove` with no value).
@@ -5481,6 +5563,12 @@ fn parse_step(s: &str) -> Result<Step> {
         "modworld" => Step::ModWorld,
         "modplot" if !arg.is_empty() => Step::ModPlot(arg.to_string()),
         "modexport" => Step::ModExport,
+        "modlive" => Step::ModLive(match arg {
+            "on" => true,
+            "off" => false,
+            _ => bail!("modlive takes on or off"),
+        }),
+        "modsync" => Step::ModSync,
         "modlocal" => {
             let mut w = arg.splitn(4, ' ');
             let (Some(who), Some(name), Some(kind)) = (w.next(), w.next(), w.next()) else {
@@ -5788,6 +5876,8 @@ fn main() -> Result<()> {
                     | Step::ModWorld
                     | Step::ModPlot(_)
                     | Step::ModExport
+                    | Step::ModLive(_)
+                    | Step::ModSync
                     | Step::ModLocal(..) => {
                         println!("mod mode: windowed only")
                     }
@@ -6405,6 +6495,12 @@ fn main() -> Result<()> {
     let screens = (live.is_some() && ui.is_empty())
         .then(|| screens::Screens::new(live.as_ref().is_some_and(|l| l.front_end)));
     let loaded_vfs = loaded.vfs.clone();
+    if args.mod_workspace {
+        match workspace::mount(true) {
+            Ok(note) => log::info!("{note}"),
+            Err(e) => log::warn!("{e}"),
+        }
+    }
     let mut app = App {
         load_screen_up: false,
         loaded,
@@ -6467,6 +6563,7 @@ fn main() -> Result<()> {
         mark_answers: Vec::new(),
         resume_offer: ResumeOffer::Unchecked,
         mod_mode: None,
+        live_edits: LiveEdits::default(),
         pad_last: false,
         started_with: json!({
             "size": args.size,
@@ -6477,6 +6574,7 @@ fn main() -> Result<()> {
             "module": args.module,
             "install": report::install_info(&install, &args.language),
             "no_intro": args.no_intro,
+            "mod_workspace": args.mod_workspace,
             "audio": !(args.no_audio || std::env::var_os("THEDAS_NO_AUDIO").is_some()),
             "control": args.control.is_some(),
             "env": (["THEDAS_ASYNC_LOADS", "THEDAS_HIDDEN_WINDOW", "THEDAS_NO_LOAD_MOVIE"]
