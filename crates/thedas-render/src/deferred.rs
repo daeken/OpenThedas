@@ -366,6 +366,25 @@ impl DeferredPass {
 
     /// Sets the lights only this pass draws (see [`DeferredPass::effect_lights`]).
     pub(crate) fn set_effect_lights(&mut self, lights: Vec<SceneLight>) {
+        // `THEDAS_DEFERRED_LOG_LIGHTS=1`: the first frame's effect lights, once (to frame
+        // shots of them).
+        static LOGGED: std::sync::Once = std::sync::Once::new();
+        if !lights.is_empty() && std::env::var_os("THEDAS_DEFERRED_LOG_LIGHTS").is_some() {
+            LOGGED.call_once(|| {
+                for l in &lights {
+                    if let SceneLight::Point {
+                        position,
+                        color,
+                        radius,
+                        name,
+                        ..
+                    } = l
+                    {
+                        log::info!("effect light {name} at {position} colour {color} reach {radius}");
+                    }
+                }
+            });
+        }
         self.effect_lights = lights;
     }
 
@@ -1040,7 +1059,8 @@ impl DeferredPass {
                 bits[(i / 32) as usize] |= 1 << (i % 32);
             }
         }
-        bits
+        // Rooms none of the deferred draws are in: no test, as for a light of no room.
+        if bits == [0; 8] { [u32::MAX; 8] } else { bits }
     }
 }
 
@@ -1108,12 +1128,12 @@ fn debug_view() -> u32 {
 /// colour times alpha times area (m²). Ours, tuned by eye: a torch or brazier already has
 /// a light of the level's beside its flames, so this adds a flicker and spell glow on top
 /// rather than a second torch (provisional).
-const EMITTER_PEAK: f32 = 0.6;
-const EMITTER_SHOWN: f32 = 6.0;
+const EMITTER_PEAK: f32 = 2.0;
+const EMITTER_SHOWN: f32 = 1.0;
 /// An emitter light's reach: this much past its particles' spread, plus this much at its
 /// peak.
 const EMITTER_REACH: f32 = 2.0;
-const EMITTER_REACH_PER: f32 = 3.0;
+const EMITTER_REACH_PER: f32 = 4.0;
 
 /// The light an emitter's living particles give, as a point light at their glow-weighted
 /// centre (ours: the original's particles light nothing). `None` when they show none.
