@@ -3465,21 +3465,25 @@ pub fn call(
         // optimisation the simulation does without (it creates objects when asked).
         "CreatePool" => ok(Value::Int(1)),
         "GetCreatureGoreLevel" => ok(Value::Float(0.0)),
-        "GetCreaturePropertyType" => ok(Value::Int(
-            h.sim
-                .world
-                .tables
-                .get(0, "properties")
-                .and_then(|t| t.cell("Type", int(a, 1) as i64).cloned())
-                .map_or(0, |c| match c {
-                    Cell::String(s) if clean(&s).eq_ignore_ascii_case("ATTRIBUTE") => 1,
-                    Cell::String(s) if clean(&s).eq_ignore_ascii_case("SIMPLE") => 2,
-                    Cell::String(s) if clean(&s).eq_ignore_ascii_case("DEPLETABLE") => 3,
-                    Cell::String(s) if clean(&s).eq_ignore_ascii_case("DERIVED") => 4,
-                    Cell::Int(v) => v as i32,
-                    _ => 0,
-                }),
-        )),
+        "GetCreaturePropertyType" => {
+            ok(Value::Int(if h.sim.game == thedas_vfs::Game::DragonAge2 {
+                property_bounds(h.sim, int(a, 1)).map_or(0, |b| b.0)
+            } else {
+                h.sim
+                    .world
+                    .tables
+                    .get(0, "properties")
+                    .and_then(|t| t.cell("Type", int(a, 1) as i64).cloned())
+                    .map_or(0, |c| match c {
+                        Cell::String(s) if clean(&s).eq_ignore_ascii_case("ATTRIBUTE") => 1,
+                        Cell::String(s) if clean(&s).eq_ignore_ascii_case("SIMPLE") => 2,
+                        Cell::String(s) if clean(&s).eq_ignore_ascii_case("DEPLETABLE") => 3,
+                        Cell::String(s) if clean(&s).eq_ignore_ascii_case("DERIVED") => 4,
+                        Cell::Int(v) => v as i32,
+                        _ => 0,
+                    })
+            }))
+        }
         "Deprecated_GetMaxHealth" => ok(Value::Int(
             h.object(obj(a, 0))
                 .and_then(|o| {
@@ -5066,6 +5070,14 @@ pub(crate) fn property_bounds(sim: &Sim, property: i32) -> Option<(i32, f32, f32
         Some(Cell::Float(v)) => Some(*v as f32),
         _ => None,
     };
+    if sim.game == thedas_vfs::Game::DragonAge2 {
+        let (ty, min, max) = (
+            num(t.cell_by_hash(0xbaf5_5bcf, property as i64))? as i32,
+            num(t.cell_by_hash(0x9837_7833, property as i64))?,
+            num(t.cell_by_hash(0xb48b_ff62, property as i64))?,
+        );
+        return (min <= max).then_some((ty, min, max));
+    }
     let (min, max) = (
         num(t.cell("Min", property as i64))?,
         num(t.cell("Max", property as i64))?,

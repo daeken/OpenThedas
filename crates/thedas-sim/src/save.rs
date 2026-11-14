@@ -265,6 +265,14 @@ impl Sim {
         self.ambient.clear();
         self.world.ambient_lines.clear();
         self.forget_world_caches();
+        // Native DA2 template loading initializes race from appearance. Earlier saves
+        // omitted it; filling only absent fields preserves script-assigned races.
+        if self.game == thedas_vfs::Game::DragonAge2 {
+            let ids: Vec<ObjectId> = self.world.objects.keys().copied().collect();
+            for id in ids {
+                self.init_da2_race(id);
+            }
+        }
         // The area list is loaded again, so the add-ins' scripts for it run again.
         self.prcscr_ran = None;
         if save_revision < 1 {
