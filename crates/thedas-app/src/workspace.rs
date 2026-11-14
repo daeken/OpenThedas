@@ -149,21 +149,30 @@ pub fn glb_changes(blender: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// Imports a saved `.glb` beside its `manifest.json`, writing the meshes into `overrides`
-/// and a note in `.imported`. Returns the `.msh` files written, and what came of each with
-/// the warnings (or the error).
+/// What importing a saved `.glb` did.
+pub struct GlbImport {
+    /// The `.msh` files written.
+    pub written: Vec<String>,
+    /// What came of each, and the warnings.
+    pub notes: Vec<String>,
+    /// The object moved in the file: its id and tag as exported, and its new place.
+    pub moved: Option<(u32, String, crate::glb_in::Placed)>,
+}
+
+/// Imports a saved `.glb` beside its `manifest.json`, writing the meshes that changed into
+/// `overrides` and a note in `.imported` (or the error).
 pub fn import_glb(
     glb: &Path,
     overrides: &Path,
     read: &dyn Fn(&str) -> Option<crate::glb::Read>,
-) -> Result<(Vec<String>, Vec<String>), String> {
+) -> Result<GlbImport, String> {
     let dir = glb.parent().ok_or("no folder")?;
     let result = (|| {
         let manifest: serde_json::Value = std::fs::read(dir.join("manifest.json"))
             .map_err(|e| format!("manifest.json: {e}"))
             .and_then(|b| serde_json::from_slice(&b).map_err(|e| format!("manifest.json: {e}")))?;
         let bytes = std::fs::read(glb).map_err(|e| format!("{}: {e}", glb.display()))?;
-        let imp = crate::glb_in::import(&bytes, &manifest, read)?;
+        let imp = crate::glb_in::import(&bytes, &manifest, read, false)?;
         std::fs::create_dir_all(overrides).map_err(|e| e.to_string())?;
         let mut written = Vec::new();
         let mut warnings = imp.warnings;
@@ -184,11 +193,29 @@ pub fn import_glb(
                 }
             ));
         }
-        Ok((written, warnings))
+        let object = &manifest["object"];
+        let moved = imp.moved.map(|p| {
+            (
+                object["id"].as_u64().unwrap_or(0) as u32,
+                object["tag"].as_str().unwrap_or("").to_string(),
+                p,
+            )
+        });
+        Ok(GlbImport {
+            written,
+            notes: warnings,
+            moved,
+        })
     })();
     // Noted whatever came of it, so a file that fails is not tried again until saved again.
     let note = match &result {
-        Ok((w, warn)) => serde_json::json!({"written": w, "warnings": warn}),
+        Ok(r) => serde_json::json!({
+            "written": r.written,
+            "warnings": r.notes,
+            "moved": r.moved.as_ref().map(|(_, _, p)| serde_json::json!({
+                "position": p.position, "facing": p.facing,
+            })),
+        }),
         Err(e) => serde_json::json!({"error": e}),
     };
     let _ = std::fs::write(
