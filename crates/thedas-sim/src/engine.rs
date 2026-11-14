@@ -7989,7 +7989,7 @@ mod tests {
             &[Value::Object(absent), Value::Int(0)],
         );
         assert_eq!(s.world.get(absent).unwrap().properties[&7], (40.0, 0.0));
-        // Other virtuals and DA2 keep their previous paths in this creature-only slice.
+        // Placeables have a separate maximum; DA2 keeps its previous property write.
         for (game, target) in [
             (thedas_vfs::Game::Origins, chest),
             (thedas_vfs::Game::DragonAge2, id),
@@ -8006,7 +8006,14 @@ mod tests {
                 "SetMaxHealth",
                 &[Value::Object(target), Value::Int(30)],
             );
-            assert_eq!(s.world.get(target).unwrap().properties[&7], (30.0, 12.0));
+            let o = s.world.get(target).unwrap();
+            if game == thedas_vfs::Game::Origins {
+                assert_eq!(o.properties[&7], (40.0, 12.0));
+                assert_eq!(o.fields["MaxHealth"], 30);
+                assert!(!o.health_floor_one);
+            } else {
+                assert_eq!(o.properties[&7], (30.0, 12.0));
+            }
         }
     }
 
