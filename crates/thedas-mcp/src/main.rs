@@ -498,7 +498,9 @@ fn summary(sim: &Sim, id: ObjectId) -> J {
             "id": o.id, "kind": kind_name(o.kind), "tag": o.tag, "template": o.template,
             "position": o.position, "facing": o.facing, "active": o.active,
             "dialog": o.dialog, "script": o.script,
-            "name": o.name_strref.and_then(|s| sim.string(s)),
+            // The name the game shows: one a script set (`SetName`: the dog the player
+            // named) before the template's.
+            "name": Some(sim.display_name(id)).filter(|n| *n != o.tag),
         }),
         None => J::Null,
     }
