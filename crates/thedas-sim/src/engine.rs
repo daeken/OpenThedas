@@ -3083,11 +3083,20 @@ pub fn call(
         }
         "GetHealth" => {
             let health = constant(&h.sim.table, "PROPERTY_DEPLETABLE_HEALTH");
-            ok(Value::Int(
-                h.object(obj(a, 0))
-                    .and_then(|o| o.properties.get(&health))
-                    .map_or(0, |p| p.1.round() as i32),
-            ))
+            let current = h.object(obj(a, 0)).map_or(0, |o| {
+                if let Some(p) = o.properties.get(&health) {
+                    // Retain explicit currents from our older saves.
+                    p.1.round() as i32
+                } else if h.sim.game == thedas_vfs::Game::Origins && o.kind == ObjectKind::Placeable
+                {
+                    // 0x750370 loads Health independently of MaxHealth, after
+                    // signed-short narrowing; 0x750f50 reads that current.
+                    i32::from(o.fields.get("Health").copied().unwrap_or(0) as i16)
+                } else {
+                    0
+                }
+            });
+            ok(Value::Int(current))
         }
         "MoveItem" => {
             let (from, to, item) = (obj(a, 0), obj(a, 1), obj(a, 2));
@@ -3438,6 +3447,19 @@ pub fn call(
             } else {
                 void()
             }
+        }
+        "SetMaxHealth"
+            if h.sim.game == thedas_vfs::Game::Origins
+                && h.object(obj(a, 0))
+                    .is_some_and(|o| o.kind == ObjectKind::Placeable) =>
+        {
+            // 0x65a330 -> 0x750f70: store the sign-extended short in the
+            // placeable's separate maximum member. Current health stays put.
+            if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
+                o.fields
+                    .insert("MaxHealth".into(), i32::from(int(a, 1) as i16));
+            }
+            void()
         }
         "SetMaxHealth" => {
             let id = obj(a, 0);
@@ -7624,6 +7646,178 @@ mod tests {
     }
 
     #[test]
+    fn origins_placeable_max_health_does_not_assign_current_health() {
+        let table = Arc::new(
+            EngineTable::parse(
+                b"int PROPERTY_DEPLETABLE_HEALTH = 7;\n\
+                  void SetMaxHealth(object o, int n) = 1;\n\
+                  int Deprecated_GetMaxHealth(object o) = 2;\n\
+                  int GetHealth(object o) = 3;",
+            )
+            .unwrap(),
+        );
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        let id = s.world.spawn(ObjectKind::Placeable, "chest");
+        let o = s.world.get_mut(id).unwrap();
+        o.fields.insert("Health".into(), 16);
+        o.dead = true;
+        o.active = false;
+        o.immortal = true;
+        o.plot = true;
+        o.modifiers.insert(7, 13.5);
+        for health in [None, Some(0.0), Some(80.0)] {
+            let o = s.world.get_mut(id).unwrap();
+            o.properties.remove(&7);
+            if let Some(current) = health {
+                o.properties.insert(7, (100.0, current));
+            }
+            let properties = o.properties.clone();
+            for value in [
+                i32::MIN,
+                -65537,
+                -32769,
+                -32768,
+                -1,
+                0,
+                1,
+                30,
+                32767,
+                32768,
+                65535,
+                65536,
+                i32::MAX,
+            ] {
+                let queued = s.world.queue.len();
+                run(
+                    &mut s,
+                    id,
+                    "SetMaxHealth",
+                    &[Value::Object(id), Value::Int(value)],
+                );
+                let o = s.world.get(id).unwrap();
+                assert_eq!(o.properties, properties);
+                assert_eq!(o.fields["MaxHealth"], i32::from(value as i16));
+                assert_eq!(o.fields["Health"], 16);
+                assert_eq!(o.modifiers[&7], 13.5);
+                assert!(o.dead && o.immortal && o.plot && !o.active);
+                assert_eq!(s.world.queue.len(), queued);
+                assert_eq!(
+                    run(&mut s, id, "Deprecated_GetMaxHealth", &[Value::Object(id)]),
+                    Some(Value::Int(i32::from(value as i16)))
+                );
+                assert_eq!(
+                    run(&mut s, id, "GetHealth", &[Value::Object(id)]),
+                    Some(Value::Int(health.unwrap_or(16.0) as i32))
+                );
+                s.load_json(&s.save_json().unwrap()).unwrap();
+                assert_eq!(s.world.get(id).unwrap().properties, properties);
+                assert_eq!(
+                    s.world.get(id).unwrap().clone().fields["MaxHealth"],
+                    i32::from(value as i16)
+                );
+            }
+        }
+        s.world.get_mut(id).unwrap().properties.remove(&7);
+        for current in [i32::MIN, -65537, 0, 32768, 65535, i32::MAX] {
+            s.world
+                .get_mut(id)
+                .unwrap()
+                .fields
+                .insert("Health".into(), current);
+            assert_eq!(
+                run(&mut s, id, "GetHealth", &[Value::Object(id)]),
+                Some(Value::Int(i32::from(current as i16)))
+            );
+        }
+        s.game = thedas_vfs::Game::DragonAge2;
+        s.world
+            .get_mut(id)
+            .unwrap()
+            .properties
+            .insert(7, (100.0, 0.0));
+        run(
+            &mut s,
+            id,
+            "SetMaxHealth",
+            &[Value::Object(id), Value::Int(65535)],
+        );
+        assert_eq!(s.world.get(id).unwrap().properties[&7], (65535.0, 65535.0));
+        s.world.get_mut(id).unwrap().properties.remove(&7);
+        assert_eq!(
+            run(&mut s, id, "GetHealth", &[Value::Object(id)]),
+            Some(Value::Int(0))
+        );
+        s.game = thedas_vfs::Game::Origins;
+        s.world.get_mut(id).unwrap().kind = ObjectKind::Creature;
+        assert_eq!(
+            run(&mut s, id, "GetHealth", &[Value::Object(id)]),
+            Some(Value::Int(0))
+        );
+    }
+
+    #[test]
+    fn old_placeable_saves_preserve_explicit_currents_and_default_missing_fields() {
+        let table = Arc::new(
+            EngineTable::parse(
+                b"int PROPERTY_DEPLETABLE_HEALTH = 7;\n\
+                  int GetHealth(object o) = 1;\n\
+                  int Deprecated_GetMaxHealth(object o) = 2;",
+            )
+            .unwrap(),
+        );
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        let id = s.world.spawn(ObjectKind::Placeable, "old_chest");
+        for fields in [
+            vec![],
+            vec![("Health", 16)],
+            vec![("MaxHealth", 77)],
+            vec![("Health", 16), ("MaxHealth", 77)],
+        ] {
+            for current in [None, Some(0.0), Some(80.0)] {
+                let o = s.world.get_mut(id).unwrap();
+                o.fields = fields.iter().map(|&(k, v)| (k.into(), v)).collect();
+                o.properties.clear();
+                if let Some(current) = current {
+                    o.properties.insert(7, (100.0, current));
+                }
+                let fields = o.fields.clone();
+                let properties = o.properties.clone();
+                // #844 adds no Object or SaveGame members. Older JSON may also
+                // omit #838's independently defaulted creature health floor.
+                let mut legacy: serde_json::Value =
+                    serde_json::from_slice(&s.save_json().unwrap()).unwrap();
+                legacy["world"]["objects"][id.to_string()]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("health_floor_one");
+                s.load_json(&serde_json::to_vec(&legacy).unwrap()).unwrap();
+                for _ in 0..2 {
+                    let o = s.world.get(id).unwrap();
+                    assert_eq!(o.fields, fields);
+                    assert_eq!(o.properties, properties);
+                    assert!(!o.health_floor_one);
+                    assert_eq!(
+                        run(&mut s, id, "GetHealth", &[Value::Object(id)]),
+                        Some(Value::Int(
+                            current.unwrap_or(*fields.get("Health").unwrap_or(&0) as f32) as i32
+                        ))
+                    );
+                    assert_eq!(
+                        run(&mut s, id, "Deprecated_GetMaxHealth", &[Value::Object(id)]),
+                        Some(Value::Int(
+                            *fields
+                                .get("MaxHealth")
+                                .or_else(|| fields.get("Health"))
+                                .unwrap_or(&0)
+                        ))
+                    );
+                    s.load_json(&s.save_json().unwrap()).unwrap();
+                }
+            }
+        }
+    }
+
+    #[test]
     fn party_members_and_no_perm_death_creatures_cannot_die_permanently() {
         let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
         let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
@@ -7795,7 +7989,7 @@ mod tests {
             &[Value::Object(absent), Value::Int(0)],
         );
         assert_eq!(s.world.get(absent).unwrap().properties[&7], (40.0, 0.0));
-        // Other virtuals and DA2 keep their previous paths in this creature-only slice.
+        // Placeables have a separate maximum; DA2 keeps its previous property write.
         for (game, target) in [
             (thedas_vfs::Game::Origins, chest),
             (thedas_vfs::Game::DragonAge2, id),
@@ -7812,7 +8006,14 @@ mod tests {
                 "SetMaxHealth",
                 &[Value::Object(target), Value::Int(30)],
             );
-            assert_eq!(s.world.get(target).unwrap().properties[&7], (30.0, 12.0));
+            let o = s.world.get(target).unwrap();
+            if game == thedas_vfs::Game::Origins {
+                assert_eq!(o.properties[&7], (40.0, 12.0));
+                assert_eq!(o.fields["MaxHealth"], 30);
+                assert!(!o.health_floor_one);
+            } else {
+                assert_eq!(o.properties[&7], (30.0, 12.0));
+            }
         }
     }
 
