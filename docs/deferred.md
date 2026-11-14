@@ -229,7 +229,7 @@ the next coverage step.
 
 ## Measuring frame cost
 
-For fixed-scene frame-cost comparisons, `THEDAS_BENCH_FRAMES=120 THEDAS_BENCH_DUMP=1`
+For fixed-scene save captures (`--save ...`), `THEDAS_BENCH_FRAMES=120 THEDAS_BENCH_DUMP=1`
 reports the headless capture loop's CPU/submission/GPU-wait/readback cost, excluding
 scene load and PNG encoding. `THEDAS_BENCH_DEFERRED_COMPARE=all` alternates full-candidate
 and optimized frames in ABBA order within one loaded scene. `tiles` or `shadows` isolates
