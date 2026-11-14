@@ -92,6 +92,9 @@ A new crate, `crates/thedas-gfx`, with no Ruffle dependency:
 6. **Change tracking**: any change to a display property, frame, text, or the display list
    marks the movie dirty. A tick that changes nothing does no rendering and the texture is
    reused. Static subtrees can be cached to a texture later if profiling asks for it.
+   Dirty mouse picking is refreshed after frame/interval actions and wheel listeners, so
+   clips moved or hidden beneath a stationary pointer receive the corresponding rollover
+   changes. Unchanged display lists skip the pick walk.
 
 ## Switch and parity
 
