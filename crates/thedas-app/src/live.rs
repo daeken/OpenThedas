@@ -2469,7 +2469,12 @@ impl Live {
             o.renderer.encode_shadows(encoder, false);
         }
         level.renderer.finish_shadows(encoder);
-        let mut contributors: Vec<_> = self.objects.iter_mut().map(|o| &mut o.renderer).collect();
+        let mut contributors: Vec<_> = self
+            .objects
+            .iter_mut()
+            .map(|o| &mut o.renderer)
+            .chain(self.effects.iter_mut().map(|e| &mut e.renderer))
+            .collect();
         level.renderer.render_main_with(
             ctx,
             encoder,
@@ -2501,6 +2506,16 @@ impl Live {
             let depth = level.renderer.depth(&ctx.device, width, height);
             e.renderer
                 .render_over(ctx, encoder, &frame, width, height, camera, &depth);
+        }
+        let depth = level.renderer.depth(&ctx.device, width, height);
+        level.renderer.finish_transparency(encoder, &frame, &depth);
+        for r in self
+            .objects
+            .iter_mut()
+            .map(|o| &mut o.renderer)
+            .chain(self.effects.iter_mut().map(|e| &mut e.renderer))
+        {
+            r.finish_transparency(encoder, &frame, &depth);
         }
         level
             .renderer
