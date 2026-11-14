@@ -1631,7 +1631,13 @@ pub fn call(
         "ReadIniEntry" => ok(Value::String(String::new())),
         // Achievements belong to the player's profile, not the game: the simulation's profile has
         // none (by id or, the older form, by name).
-        "GetPRCEnabled" | "GetHasAchievementByID" | "GetHasAchievement" => ok(Value::Int(0)),
+        "GetHasAchievementByID" | "GetHasAchievement" => ok(Value::Int(0)),
+        // Traced (COMMAND_GETPRCENABLED, handler 0x66d6d0): the add-in record whose UID matches
+        // gives its Enabled byte (+0x15d), cleared when it needs authorization (+0x15e) and has
+        // none (+0x15f) or when an unidentified pair (+0x175 set, +0x176 clear) says so; no
+        // such record gives 0. Ours: whether the stack mounts that add-in, which applies the
+        // registry's own gates and not the authorization (FMT-011).
+        "GetPRCEnabled" => ok(b(h.sim.vfs.addin_enabled(&string(a, 0)))),
         "IsPackageLoaded" => {
             // Inferred (#862): whether a package's archives are in our resource stack.
             let pkg = format!("packages/{}/", string(a, 0).to_ascii_lowercase());
