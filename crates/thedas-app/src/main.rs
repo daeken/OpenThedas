@@ -230,6 +230,11 @@ struct Args {
     /// sun shadows are 1024 texels a side and reach further).
     #[arg(long, default_value = "medium", value_parser = ["low", "medium", "high"])]
     detail: String,
+    /// Multisampled anti-aliasing for the world: samples a pixel (the original's
+    /// `AntialiasingLevel`; 1 is off, which leaves the post-process smoothing on). Limited to
+    /// what the GPU supports.
+    #[arg(long, default_value_t = 1)]
+    antialiasing: u32,
     /// Headless: the shaders' clock (`ApplicationTime`) at the capture, in seconds; it runs
     /// on from there through `run` steps. The clouds drift with it.
     #[arg(long, default_value_t = 0.0)]
@@ -1276,7 +1281,7 @@ impl App {
             ui.attach(&live.sim);
             ui.set_saves(saves::SaveStore::new(self.saves_dir.clone()));
         }
-        let reticle = reticle::ReticlePass::new(&ctx.device, config.format);
+        let reticle = reticle::ReticlePass::new(&ctx.device, config.format, 1);
         self.cursors = Some(cursor::Cursors::load(event_loop, &self.install));
         self.gfx = Some(Gfx {
             window,
@@ -6214,6 +6219,10 @@ fn main() -> Result<()> {
     ));
     let mut args = Args::parse();
     faces::set_language(&args.language);
+    live::ANTIALIASING.store(
+        args.antialiasing.max(1),
+        std::sync::atomic::Ordering::Relaxed,
+    );
     // A client's or a test's run sends and fetches nothing (see `upload::online`).
     if args.control.is_some() || std::env::var_os("THEDAS_HIDDEN_WINDOW").is_some() {
         upload::set_automated();
