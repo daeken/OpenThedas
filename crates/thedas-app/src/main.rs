@@ -3879,6 +3879,12 @@ impl App {
                 self.cursor_to(x, y);
                 log.push(format!("hover {x},{y}"));
             }
+            Step::MouseLeave => {
+                if let Some(g) = self.gfx.as_mut() {
+                    g.ui.mouse_leave();
+                }
+                log.push("mouse left the window".into());
+            }
             Step::Picker => {
                 if let Some(l) = self.live.as_ref() {
                     l.sim().input(
@@ -5031,6 +5037,9 @@ impl ApplicationHandler for App {
             WindowEvent::Focused(false) => {
                 self.keys.clear();
                 self.looking = false;
+                if let Some(g) = self.gfx.as_mut() {
+                    g.ui.mouse_leave();
+                }
             }
             WindowEvent::RedrawRequested => {
                 if let Err(e) = self.redraw() {
@@ -5832,6 +5841,8 @@ enum Step {
     ClickAs(f64, f64, f64),
     /// The mouse rests at a pixel (where an aimed ability's reticle shows).
     Hover(f64, f64),
+    /// The pointer leaves the window (`leave`), clearing movie hover.
+    MouseLeave,
     /// F1-F4: party member n leads.
     Leader(usize),
     /// 1-9, 0: the quickbar's slot n is used.
@@ -6389,6 +6400,7 @@ fn parse_step(s: &str) -> Result<Step> {
             let (x, y) = arg.split_once(',').context("hover takes x,y")?;
             Step::Hover(x.trim().parse()?, y.trim().parse()?)
         }
+        "leave" if arg.is_empty() => Step::MouseLeave,
         "rpress" | "rrelease" => {
             let (x, y) = arg.split_once(',').context("rpress takes x,y")?;
             Step::RightAt(x.trim().parse()?, y.trim().parse()?, verb == "rpress")
@@ -6660,6 +6672,13 @@ fn main() -> Result<()> {
                         if let Some((layer, _)) = played.as_mut() {
                             layer.mouse_move(x, y);
                         }
+                    }
+                    Step::MouseLeave => {
+                        hovering = false;
+                        if let Some((layer, _)) = played.as_mut() {
+                            layer.mouse_leave();
+                        }
+                        println!("mouse left the window");
                     }
                     &Step::Press(x, y) | &Step::Release(x, y) => {
                         let down = matches!(step, Step::Press(..));
@@ -7627,8 +7646,8 @@ mod tests {
             ]
         );
         assert_eq!(
-            parse_steps("hover 5,6; key F4").unwrap(),
-            vec![Step::Hover(5.0, 6.0), Step::Leader(3)]
+            parse_steps("hover 5,6; leave; key F4").unwrap(),
+            vec![Step::Hover(5.0, 6.0), Step::MouseLeave, Step::Leader(3)]
         );
         assert_eq!(
             parse_steps("rclick 1,2; dclick 3,4").unwrap(),

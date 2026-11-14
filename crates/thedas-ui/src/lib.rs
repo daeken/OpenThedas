@@ -803,9 +803,10 @@ impl UiMovie {
         self.player.mouse_move(x, y);
     }
 
-    /// The mouse left the window. The current player keeps its last pointer position.
+    /// The mouse left the window. Clear hover while retaining its last coordinates.
     pub fn mouse_leave(&mut self) {
-        // Window leave has no movie event in the current player.
+        self.player.mouse_leave();
+        self.after_step();
     }
 
     /// The mouse wheel turned `lines` (up positive) with the mouse at (`x`, `y`): the movie's

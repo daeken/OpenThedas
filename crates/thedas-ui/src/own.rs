@@ -313,6 +313,10 @@ impl OwnMovie {
         self.player.mouse_move(x, y);
     }
 
+    pub fn mouse_leave(&mut self) {
+        self.player.mouse_leave();
+    }
+
     pub fn mouse_wheel(&mut self, x: f64, y: f64, lines: f64) {
         let (x, y) = self.to_stage(x, y);
         self.player.mouse_move(x, y);
