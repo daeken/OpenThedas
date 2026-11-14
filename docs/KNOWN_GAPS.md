@@ -37,7 +37,7 @@ so an untraced item starts with a trace, not with a guess.
 | Simulation and gameplay | [gaps/simulation.md](gaps/simulation.md) | 167 (`SIM-`), plus ability coverage by family |
 | Script VM and engine functions | [gaps/scripting.md](gaps/scripting.md) | 96 (`SCR-`), plus the measured lists of unimplemented functions, unraised events, idle commands and stored-only effects |
 | Rendering | [gaps/rendering.md](gaps/rendering.md) | 152 (`RND-`) |
-| Interface, input and controller | [gaps/ui.md](gaps/ui.md) | 181 (`UI-`), plus the movies never opened and the values no screen gets answered |
+| Interface, input and controller | [gaps/ui.md](gaps/ui.md) | 180 (`UI-`), plus the movies never opened and the values no screen gets answered |
 | Audio | [gaps/audio.md](gaps/audio.md) | 55 (`AUD-`) |
 | Cameras, cutscene presentation, startup | [gaps/cameras-cutscenes.md](gaps/cameras-cutscenes.md) | 41 (`CAM-`) |
 | File formats and file system | [gaps/formats.md](gaps/formats.md) | 47 (`FMT-`), plus a table of every resource type and the tables and types nothing reads |
@@ -122,7 +122,7 @@ these, so they are the places where one person or stream can take a large, separ
 
 - **Screens never built**: crafting, item upgrade, the slideshow, the army
   screen, the party camp gift screen, and the online, downloadable-content and
-  achievement screens (`UI-052`, `UI-077`, `UI-126`, `UI-127`, and the stream's list).
+  achievement screens (`UI-052`, `UI-126`, `UI-127`, and the stream's list).
   Of the install's 68 interface movies, 37 are never opened.
 - **Screens ask for values nothing answers**: 220 on the HUD (quickslot cooldowns, current and
   pending actions, summons), 170 on spells and talents, 98 on skills, 42 in the inventory
