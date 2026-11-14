@@ -696,6 +696,8 @@ impl UiMovie {
             .build();
         if let Ok(mut p) = player.lock() {
             p.set_window_mode("transparent");
+            // Not in the window until the mouse moves (see `UiMovie::mouse_move`).
+            p.set_mouse_in_stage(false);
         }
         Ok(Self {
             name: name.to_string(),
@@ -1131,13 +1133,29 @@ impl UiMovie {
     }
 
     pub fn mouse_move(&mut self, x: f64, y: f64) {
-        self.with_player(|p| p.handle_event(PlayerEvent::MouseMove { x, y }));
+        self.with_player(|p| {
+            // The player looks for what the mouse is over after every frame it runs, a walk
+            // of every clip (most of a HUD movie's time a frame); while the mouse is outside
+            // the window there is nothing to find.
+            p.set_mouse_in_stage(true);
+            p.handle_event(PlayerEvent::MouseMove { x, y })
+        });
+    }
+
+    /// The mouse left the window: what it was over hears it leave (`onRollOut`), and the
+    /// player stops looking for what it is over until it comes back.
+    pub fn mouse_leave(&mut self) {
+        self.with_player(|p| {
+            p.handle_event(PlayerEvent::MouseLeave);
+            p.set_mouse_in_stage(false);
+        });
     }
 
     /// The mouse wheel turned `lines` (up positive) with the mouse at (`x`, `y`): the movie's
     /// `onMouseWheel` listeners and the scrollable under the mouse hear it.
     pub fn mouse_wheel(&mut self, x: f64, y: f64, lines: f64) {
         self.with_player(|p| {
+            p.set_mouse_in_stage(true);
             p.handle_event(PlayerEvent::MouseMove { x, y });
             p.handle_event(PlayerEvent::MouseWheel {
                 delta: ruffle_core::events::MouseWheelDelta::Lines(lines),
@@ -1179,14 +1197,22 @@ impl UiMovie {
                 button,
                 index: None,
             };
-            self.with_player(|p| p.handle_event(ev));
+            self.with_player(|p| {
+                // A press is where the mouse is, in the window (a click sent with no move
+                // before it: the pad, the control steps).
+                p.set_mouse_in_stage(true);
+                p.handle_event(ev)
+            });
             self.after_step();
             return;
         }
         // The button under the mouse is released before the movies' mouse-up handlers hide
         // anything (see `avm1::HIDE_LATER`).
         self.set(avm1::HIDE_LATER, UiValue::List(Vec::new()));
-        self.with_player(|p| p.handle_event(PlayerEvent::MouseUp { x, y, button }));
+        self.with_player(|p| {
+            p.set_mouse_in_stage(true);
+            p.handle_event(PlayerEvent::MouseUp { x, y, button })
+        });
         self.call(avm1::HIDE_FLUSH, &[]);
         self.after_step();
     }
