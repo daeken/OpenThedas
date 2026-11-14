@@ -444,7 +444,7 @@ impl UiMovie {
             lookup,
             atlas,
             bridge,
-            avm1::register_invoke(),
+            avm1::register_invoke(name),
         )?;
         let authored = {
             let (w, h) = m.player.vm.movie.stage_size();
