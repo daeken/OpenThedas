@@ -117,6 +117,9 @@ pub struct Object {
     /// see [`heading_of`] and [`facing_toward`].
     pub facing: f32,
     pub active: bool,
+    /// A placeable's runtime physics group override (Origins destruction writes 1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placeable_group: Option<u32>,
     pub locals: Locals,
     /// The script that receives this object's events.
     pub script: Option<String>,
@@ -235,6 +238,7 @@ impl Object {
             area: None,
             position: [0.0; 3],
             facing: 0.0,
+            placeable_group: None,
             active: true,
             locals: Locals::default(),
             script: None,
@@ -605,6 +609,9 @@ pub struct World {
     /// Plot flags by (plot resource, flag).
     #[serde(with = "pairs")]
     pub plots: BTreeMap<(String, i32), bool>,
+    /// Runtime pathing-cell writes by area, independent of the shared layout resource.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) nav_patches: BTreeMap<ObjectId, BTreeMap<u32, u8>>,
     /// Each quest's latest journal entry, by plot GUID (see [`crate::journal`]).
     #[serde(default)]
     pub journal: BTreeMap<String, crate::journal::JournalMark>,
@@ -890,6 +897,7 @@ impl World {
             controlled: None,
             party: None,
             plots: BTreeMap::new(),
+            nav_patches: BTreeMap::new(),
             journal: BTreeMap::new(),
             journal_seq: 0,
             recipes: BTreeSet::new(),
