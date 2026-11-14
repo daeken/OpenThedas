@@ -242,6 +242,12 @@ fn selection_listener_wrap_maker() -> Vec<u8> {
     inner.branch(IF, "original");
     let c = &mut inner.code;
     get_path(c, &["callback", "m_Function"]);
+    c.push(0x44); // TypeOf
+    push(c, &[Push::Str("function")]);
+    c.extend_from_slice(&[EQUALS2, NOT]);
+    inner.branch(IF, "original");
+    let c = &mut inner.code;
+    get_path(c, &["callback", "m_Function"]);
     get_path(
         c,
         &[
@@ -1397,6 +1403,26 @@ mod tests {
                 Value::Bool(expected)
             );
         }
+        player
+            .vm
+            .set(&prototype, "SelectionChanged", Value::Undefined);
+        player.vm.set(&callback, "m_Function", Value::Undefined);
+        player.vm.set(&container, "_currentObject", current);
+        player.vm.set(&child, "SI_ItemSelected", Value::Bool(true));
+        player.vm.call_method(
+            &observable,
+            "RegisterListener",
+            &[
+                child.clone(),
+                Value::from("SI_ItemSelected"),
+                callback,
+                child.clone(),
+            ],
+        );
+        assert_eq!(
+            player.vm.get(&child, "selectedWhenRegistered"),
+            Value::Bool(true)
+        );
     }
 
     #[test]
