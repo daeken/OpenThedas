@@ -94,6 +94,8 @@ pub struct LiveLevel {
     pub layout: String,
     pub vfs: Arc<Vfs>,
     pub renderer: AreaRenderer,
+    /// A failed on-demand scene reload should not be retried every frame.
+    deferred_load_failed: bool,
     /// The `AREA_ID` whose colour grading the renderer has (several areas share a layout).
     pub area_id: Option<i64>,
     /// How high above the leader's feet the game camera's eye cuts roofs away
@@ -452,6 +454,7 @@ struct BuildSpec {
     size: (u32, u32),
     /// Samples a pixel (see [`Live::antialiasing`]).
     samples: u32,
+    render_path: thedas_render::RenderPath,
 }
 
 /// A handle on the same device and queue, for a worker thread.
@@ -512,7 +515,15 @@ fn build_level_with(
     install.mount_level(&mut vfs, layout)?;
     let scene = AreaScene::load_with_props_at(&vfs, layout, &[], spec.detail)?;
     let programs = crate::programs_cached(&vfs, &scene, &spec.shaders, cache)?;
-    let mut renderer = AreaRenderer::new_cached(ctx, &vfs, &scene, &programs, spec.format, cache);
+    let mut renderer = AreaRenderer::new_cached_with_path(
+        ctx,
+        &vfs,
+        &scene,
+        &programs,
+        spec.format,
+        cache,
+        spec.render_path,
+    );
     renderer.frame_effects = spec.frame_effects;
     // First-use work at load, not on the first frames.
     renderer.warm(ctx, spec.size.0, spec.size.1);
@@ -528,6 +539,7 @@ fn build_level_with(
         cutaway_height: scene.cutaway_height.unwrap_or(5.5),
         cutaway_shown: 1.0,
         renderer,
+        deferred_load_failed: false,
         area_id: None,
         collider,
     })
@@ -550,7 +562,15 @@ fn build_objects_with(
     let loaded = started.elapsed();
     let programs = crate::programs_cached(vfs, &scene, &spec.shaders, cache)?;
     let translated = started.elapsed();
-    let mut renderer = AreaRenderer::new_cached(ctx, vfs, &scene, &programs, spec.format, cache);
+    let mut renderer = AreaRenderer::new_cached_with_path(
+        ctx,
+        vfs,
+        &scene,
+        &programs,
+        spec.format,
+        cache,
+        spec.render_path,
+    );
     let made = started.elapsed();
     renderer.warm(ctx, spec.size.0, spec.size.1);
     log::info!(
@@ -2360,13 +2380,35 @@ impl Live {
     /// particles give (its objects' and the visual effects'; the level's renderer adds its
     /// own), which light the level's geometry (ours: the original's particles light
     /// nothing).
-    fn give_effect_lights(&mut self) {
+    fn give_effect_lights(&mut self, ctx: &GpuContext) {
         let path = self.render_path;
         if let Some(l) = self.level.as_mut() {
             l.renderer.path = path;
         }
+        if let Some(o) = self.objects.as_mut() {
+            o.renderer.path = path;
+        }
         if path != thedas_render::RenderPath::Deferred {
             return;
+        }
+        if let Some(l) = self.level.as_mut() {
+            if !l.renderer.deferred_planned() && !l.deferred_load_failed {
+                // Faithful loads retain no extra level streams. Reload only the CPU
+                // scene on the first F11 switch; keep the existing renderer and poses.
+                match AreaScene::load_with_props_at(&l.vfs, &l.layout, &[], self.detail) {
+                    Ok(scene) => l
+                        .renderer
+                        .prepare_deferred(ctx, &l.vfs, &scene, &mut self.cache),
+                    Err(e) => {
+                        l.deferred_load_failed = true;
+                        log::warn!("deferred: could not prepare {}: {e}", l.layout);
+                    }
+                }
+            }
+            if let Some(o) = self.objects.as_mut() {
+                o.renderer
+                    .prepare_deferred(ctx, &l.vfs, &o.scene, &mut self.cache);
+            }
         }
         let lights: Vec<_> = self
             .objects
@@ -2409,7 +2451,7 @@ impl Live {
         }
         self.set_shader_time();
         self.apply_cutaway(ctx);
-        self.give_effect_lights();
+        self.give_effect_lights(ctx);
         let aim = self.reticle(camera, (width, height), self.cursor);
         let format = self.format.unwrap_or(thedas_render::gpu::CAPTURE_FORMAT);
         let samples = self.level.as_ref().map_or(1, |l| l.renderer.samples());
@@ -2427,9 +2469,17 @@ impl Live {
             o.renderer.encode_shadows(encoder, false);
         }
         level.renderer.finish_shadows(encoder);
-        level
-            .renderer
-            .render_main(ctx, encoder, target, width, height, camera);
+        let mut contributors: Vec<_> = self.objects.iter_mut().map(|o| &mut o.renderer).collect();
+        level.renderer.render_main_with(
+            ctx,
+            encoder,
+            target,
+            width,
+            height,
+            camera,
+            &mut contributors,
+        );
+        drop(contributors);
         // The rest goes over the level's frame: multisampled, its own targets (see
         // `thedas_render::msaa`), resolved into `target` at the end.
         let frame = level
@@ -2542,7 +2592,7 @@ impl Live {
         }
         self.set_shader_time();
         self.apply_cutaway(ctx);
-        self.give_effect_lights();
+        self.give_effect_lights(ctx);
         let cut_effects = self.cut_effects();
         let aim = self.reticle(camera, (width, height), self.cursor);
         let samples = self.level.as_ref().map_or(1, |l| l.renderer.samples());
@@ -2605,6 +2655,7 @@ impl Live {
             format,
             size: self.frame_size,
             samples: self.antialiasing.max(1),
+            render_path: self.render_path,
         }
     }
 
