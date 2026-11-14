@@ -1048,15 +1048,17 @@ pub fn call(
         // DAOrigins.exe 0x666450 -> 0x6a25a0 -> 0x69f030: a creature's
         // 16-bit appearance indexes table 2, column 0xde80b418 (combat tree).
         // The predicate is a case-sensitive substring search, not a creature-kind test
-        // or an exact match of the whole resource name.
+        // or an exact match of the whole resource name. DA2 uses different tree names;
+        // preserve its prior creature-kind answer until its predicate is traced.
         "IsHumanoid" => ok(b(h
             .object(obj(a, 0))
             .filter(|o| o.kind == ObjectKind::Creature)
             .is_some_and(|o| {
-                h.sim.world.tables.get(2, "").is_some_and(|t| {
-                    matches!(t.cell_by_hash(0xde80b418, i64::from(o.appearance as u16)),
-                        Some(Cell::String(s)) if clean(s).contains("combat_humanoid"))
-                })
+                h.sim.game != thedas_vfs::Game::Origins
+                    || h.sim.world.tables.get(2, "").is_some_and(|t| {
+                        matches!(t.cell_by_hash(0xde80b418, i64::from(o.appearance as u16)),
+                            Some(Cell::String(s)) if clean(s).contains("combat_humanoid"))
+                    })
             }))),
         "GetAppearanceType" => ok(Value::Int(h.object(obj(a, 0)).map_or(0, |o| o.appearance))),
         "GetCreatureRank" => ok(Value::Int(h.object(obj(a, 0)).map_or(0, |o| o.rank))),
@@ -1621,8 +1623,9 @@ pub fn call(
         // property 8 (PROPERTY_DEPLETABLE_MANA_STAMINA) directly: GetCreatureMana its current
         // value (0x66cc30), GetCreatureMaxMana its total (0x66cdc0), both truncated to
         // whole numbers and -1 for what is not a creature; SetCreatureMana its current value
-        // (0x66cd00). Provisional: the setter is taken to keep the value within 0 and the
-        // total as SetCreatureProperty's does.
+        // (0x66cd00 -> 0x79c8d0). That setter clamps between the property's current floor
+        // and computed total. Mana's floor stays at its initialized zero; the immortality
+        // setter changes health's floor only (0x6ad130). See notes/mana-property-floor.md.
         "GetCreatureMana" | "GetCreatureMaxMana" => {
             let (id, p) = (obj(a, 0), PROPERTY_MANA_STAMINA);
             let creature = h.object(id).is_some_and(|o| o.kind == ObjectKind::Creature);
@@ -5935,11 +5938,25 @@ mod tests {
                 Some(Value::Int(0))
             );
         }
+        s.game = thedas_vfs::Game::DragonAge2;
+        s.world.get_mut(creature).unwrap().appearance = 2;
+        assert_eq!(
+            run(&mut s, creature, "IsHumanoid", &[Value::Object(creature)]),
+            Some(Value::Int(1))
+        );
+        s.game = thedas_vfs::Game::Origins;
         s.world.tables = Arc::new(crate::m2da::Tables::empty());
         assert_eq!(
             run(&mut s, creature, "IsHumanoid", &[Value::Object(creature)]),
             Some(Value::Int(0))
         );
+        s.game = thedas_vfs::Game::DragonAge2;
+        for (target, expected) in [(creature, 1), (placeable, 0), (OBJECT_INVALID, 0)] {
+            assert_eq!(
+                run(&mut s, creature, "IsHumanoid", &[Value::Object(target)]),
+                Some(Value::Int(expected))
+            );
+        }
     }
 
     #[test]
@@ -8071,6 +8088,63 @@ mod coverage_tests {
             );
             assert_eq!(get(&mut s, "GetCreatureMana", mage), Some(Value::Int(want)));
         }
+        // The ceiling is the computed total, including fractional modifiers.
+        s.world
+            .get_mut(mage)
+            .unwrap()
+            .modifiers
+            .insert(PROPERTY_MANA_STAMINA, 13.5);
+        run(
+            &mut s,
+            mage,
+            "SetCreatureMana",
+            &[Value::Object(mage), Value::Int(90)],
+        );
+        assert_eq!(
+            s.world.get(mage).unwrap().properties[&PROPERTY_MANA_STAMINA].1,
+            53.5
+        );
+        assert_eq!(get(&mut s, "GetCreatureMana", mage), Some(Value::Int(53)));
+        assert_eq!(
+            get(&mut s, "GetCreatureMaxMana", mage),
+            Some(Value::Int(53))
+        );
+        // Immortality's nonzero health floor does not raise the mana floor.
+        s.world.get_mut(mage).unwrap().immortal = true;
+        run(
+            &mut s,
+            mage,
+            "SetCreatureMana",
+            &[Value::Object(mage), Value::Int(-1)],
+        );
+        assert_eq!(get(&mut s, "GetCreatureMana", mage), Some(Value::Int(0)));
+        let o = s.world.get_mut(mage).unwrap();
+        o.modifiers.clear();
+        o.properties.insert(PROPERTY_MANA_STAMINA, (-5.0, 0.0));
+        run(
+            &mut s,
+            mage,
+            "SetCreatureMana",
+            &[Value::Object(mage), Value::Int(90)],
+        );
+        assert_eq!(get(&mut s, "GetCreatureMana", mage), Some(Value::Int(0)));
+        s.world
+            .get_mut(chest)
+            .unwrap()
+            .properties
+            .insert(PROPERTY_MANA_STAMINA, (40.0, 12.0));
+        for target in [chest, OBJECT_INVALID] {
+            run(
+                &mut s,
+                mage,
+                "SetCreatureMana",
+                &[Value::Object(target), Value::Int(90)],
+            );
+        }
+        assert_eq!(
+            s.world.get(chest).unwrap().properties[&PROPERTY_MANA_STAMINA],
+            (40.0, 12.0)
+        );
     }
 
     #[test]
