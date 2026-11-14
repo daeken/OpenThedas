@@ -619,7 +619,7 @@ mod tests {
         s.world.get_mut(follower).unwrap().appearance = 0;
         s.load_game(s.save_game()).unwrap();
         assert_eq!(s.world.get(follower).unwrap().appearance, 0);
-        // SetAppearanceType -1 is the creature's own; setting a party member's to 0 is traced.
+        // Older worlds without an assigned base still restore the template appearance.
         let set = |s: &mut Sim, n: i32| {
             let f = s
                 .table
@@ -641,7 +641,8 @@ mod tests {
         set(&mut s, -1);
         assert_eq!(s.world.get(follower).unwrap().appearance, 15);
         set(&mut s, 0);
-        assert!(s.world.trace.entries.iter().any(|e| matches!(
+        assert_eq!(s.world.get(follower).unwrap().appearance, 15);
+        assert!(!s.world.trace.entries.iter().any(|e| matches!(
             e,
             crate::trace::TraceEntry::Log { text, .. } if text.contains("leaves it nothing to draw")
         )));
