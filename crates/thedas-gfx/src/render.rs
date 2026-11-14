@@ -124,6 +124,8 @@ enum Blend {
     Subtract,
     Lighten,
     Darken,
+    Alpha,
+    Erase,
 }
 
 impl Blend {
@@ -135,6 +137,8 @@ impl Blend {
             BlendMode::Subtract => Blend::Subtract,
             BlendMode::Lighten => Blend::Lighten,
             BlendMode::Darken => Blend::Darken,
+            BlendMode::Alpha => Blend::Alpha,
+            BlendMode::Erase => Blend::Erase,
             _ => Blend::Normal,
         }
     }
@@ -142,12 +146,20 @@ impl Blend {
     fn state(self) -> wgpu::BlendState {
         use wgpu::{BlendComponent as C, BlendFactor as F, BlendOperation as O};
         let alpha = C {
-            src_factor: F::One,
-            dst_factor: F::OneMinusSrcAlpha,
+            src_factor: if matches!(self, Self::Alpha | Self::Erase) {
+                F::Zero
+            } else {
+                F::One
+            },
+            dst_factor: if self == Self::Alpha {
+                F::SrcAlpha
+            } else {
+                F::OneMinusSrcAlpha
+            },
             operation: O::Add,
         };
         let color = match self {
-            Blend::Normal => alpha,
+            Blend::Normal | Blend::Alpha | Blend::Erase => alpha,
             // Over an opaque picture: src * dst + dst * (1 - src alpha).
             Blend::Multiply => C {
                 src_factor: F::Dst,
@@ -986,9 +998,27 @@ impl Renderer {
         if !o.visible {
             return;
         }
+        // Alpha/erase operate on an enclosing layer's isolated picture. Outside a
+        // layer Flash draws neither the source nor an opaque stand-in for its mask.
+        if !self.masking
+            && matches!(o.blend, BlendMode::Alpha | BlendMode::Erase)
+            && !self.filter_stack.iter().any(|d| {
+                player
+                    .vm
+                    .display
+                    .get(*d)
+                    .is_some_and(|o| o.blend == BlendMode::Layer)
+            })
+        {
+            return;
+        }
         if !self.masking
             && !self.filter_stack.contains(&d)
-            && o.filters.iter().any(crate::filters::Filters::supported)
+            && (o.filters.iter().any(crate::filters::Filters::supported)
+                || matches!(
+                    o.blend,
+                    BlendMode::Layer | BlendMode::Alpha | BlendMode::Erase
+                ))
         {
             let filters = o.filters.clone();
             let blend = if o.blend == BlendMode::Normal {
@@ -996,8 +1026,8 @@ impl Renderer {
             } else {
                 Blend::of(o.blend)
             };
-            // Isolate just this object. Descendant filters still run, and the parent's
-            // stencil clips the final result, rather than clipping the blur's input.
+            // Isolate just this object. Descendant filters/layers still run, and the
+            // parent's stencil clips the final result rather than the filter input.
             self.filter_stack.push(d);
             let mut source = Build {
                 ops: Vec::new(),
@@ -1812,6 +1842,69 @@ mod shadow_tests {
     impl Images for Empty {
         fn image(&mut self, _: &str) -> Option<(u32, u32, Vec<u8>)> {
             None
+        }
+    }
+
+    #[test]
+    fn alpha_and_erase_affect_only_the_enclosing_layer() {
+        let instance =
+            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+        let adapter = pollster::block_on(instance.request_adapter(&Default::default())).unwrap();
+        let (device, queue) =
+            pollster::block_on(adapter.request_device(&Default::default())).unwrap();
+        let bytes = b"FWS\x08\x12\0\0\0\x08\0\0\x1e\x01\0\x40\0\0\0";
+        let mut p =
+            Player::new(bytes, "blend-test", Box::new(Empty), Arc::new(Empty), None).unwrap();
+        p.vm.movie = Arc::new(Movie {
+            stage: Rect {
+                x_max: 640,
+                y_max: 640,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let root = p.vm.root;
+        let quad = |p: &mut Player, parent, depth, color, width| {
+            let id = crate::player::create_empty(&mut p.vm, parent, "quad", depth).unwrap();
+            p.vm.display
+                .get_mut(id)
+                .unwrap()
+                .clip_mut()
+                .unwrap()
+                .drawing = Some(crate::display::Drawing {
+                fills: vec![(
+                    color,
+                    vec![(0.0, 0.0), (width, 0.0), (width, 640.0), (0.0, 640.0)],
+                )],
+                ..Default::default()
+            });
+            id
+        };
+        quad(&mut p, root, 0, [255, 0, 0, 255], 640.0);
+        let layer = crate::player::create_empty(&mut p.vm, root, "layer", 1).unwrap();
+        p.vm.display.get_mut(layer).unwrap().blend = BlendMode::Layer;
+        quad(&mut p, layer, 0, [0, 255, 0, 255], 640.0);
+        let mask = quad(&mut p, layer, 1, [0, 0, 0, 128], 320.0);
+        // This full-screen mask has no enclosing layer and must not cover the scene.
+        let outside = quad(&mut p, root, 2, [0, 0, 0, 255], 640.0);
+        let mut renderer = Renderer::new(&device, &queue, wgpu::TextureFormat::Rgba8Unorm);
+        for mode in [BlendMode::Erase, BlendMode::Alpha] {
+            p.vm.display.get_mut(mask).unwrap().blend = mode;
+            p.vm.display.get_mut(outside).unwrap().blend = mode;
+            renderer.render(&mut p, &mut Empty, (32, 32));
+            let (_, _, pixels) = renderer.capture().unwrap();
+            let pixel = |x: usize| &pixels[(16 * 32 + x) * 4..(16 * 32 + x + 1) * 4];
+            let left = pixel(8);
+            assert!((left[0] as i32 - 128).abs() <= 2 && (left[1] as i32 - 128).abs() <= 2);
+            assert_eq!(left[3], 255);
+            assert_eq!(
+                pixel(24),
+                if mode == BlendMode::Erase {
+                    &[0, 255, 0, 255]
+                } else {
+                    &[255, 0, 0, 255]
+                }
+            );
         }
     }
 
