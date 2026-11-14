@@ -599,11 +599,15 @@ pub struct AreaRenderer {
     cut_away: Vec<usize>,
     /// The emitters of models with a `CutAway` mesh ([`SceneEmitter::cut_away`]).
     cut_away_emitters: Vec<usize>,
-    /// How the level is drawn (see [`crate::deferred`]). Only a renderer of the level's own
-    /// meshes draws deferred; any other draws faithfully whatever this says.
+    /// How the world is drawn (see [`crate::deferred`]). Object renderers with this path
+    /// contribute eligible geometry when passed to `render_main_with` or `capture_with`.
     pub path: crate::deferred::RenderPath,
-    /// The deferred pass, for a renderer of the level's own meshes with draws it can take.
+    /// This renderer's eligible deferred geometry, including objects.
     deferred: Option<crate::deferred::DeferredPass>,
+    /// Planning is opt-in; even a scene with no eligible draws is planned only once.
+    deferred_planned: bool,
+    /// Its eligible geometry was already drawn into another renderer's G-buffer.
+    deferred_in_frame: bool,
 }
 
 /// The colour curve `da_hsvmatrix` reads: `name` (an area's curve, `<name>.dds`) or by
@@ -679,6 +683,29 @@ impl AreaRenderer {
         programs: &ProgramRegistry,
         color_format: wgpu::TextureFormat,
         render_cache: &mut RenderCache,
+    ) -> Self {
+        Self::new_cached_with_path(
+            ctx,
+            vfs,
+            scene,
+            programs,
+            color_format,
+            render_cache,
+            crate::deferred::RenderPath::Faithful,
+        )
+    }
+
+    /// Builds for `path`, preparing deferred geometry only when selected. To switch a
+    /// faithful renderer later, call [`Self::prepare_deferred`] before setting [`Self::path`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_cached_with_path(
+        ctx: &GpuContext,
+        vfs: &Vfs,
+        scene: &AreaScene,
+        programs: &ProgramRegistry,
+        color_format: wgpu::TextureFormat,
+        render_cache: &mut RenderCache,
+        path: crate::deferred::RenderPath,
     ) -> Self {
         let device = &ctx.device;
         let mut stats = RenderStats::default();
@@ -1002,8 +1029,10 @@ impl AreaRenderer {
         stats.textures_loaded = cache.loaded - loaded0;
         stats.textures_compressed = cache.compressed - compressed0;
         stats.textures_missing = cache.missing[missing0..].to_vec();
-        // What the deferred path would draw (no GPU objects until a frame is drawn so).
-        let deferred = (scene.static_draws > 0)
+        // CPU stream conversion and texture lookup also cost time: faithful loads skip
+        // the entire plan, not just GPU pipeline creation.
+        let deferred_planned = path == crate::deferred::RenderPath::Deferred;
+        let deferred = deferred_planned
             .then(|| crate::deferred::DeferredPass::plan(ctx, vfs, scene, &d3d, cache))
             .flatten();
         if uniforms.is_empty() {
@@ -1105,8 +1134,37 @@ impl AreaRenderer {
                 .filter(|(_, e)| e.cut_away)
                 .map(|(i, _)| i)
                 .collect(),
-            path: crate::deferred::RenderPath::Faithful,
+            path,
             deferred,
+            deferred_planned,
+            deferred_in_frame: false,
+        }
+    }
+
+    /// Whether deferred planning has been attempted, including a scene with no eligible
+    /// draws. This stays true across faithful/deferred toggles.
+    pub fn deferred_planned(&self) -> bool {
+        self.deferred_planned
+    }
+
+    /// Prepares this renderer's deferred draws on first selection. `scene` must be the
+    /// scene used to build this renderer; poses and placements come from its current D3D pass.
+    pub fn prepare_deferred(
+        &mut self,
+        ctx: &GpuContext,
+        vfs: &Vfs,
+        scene: &AreaScene,
+        cache: &mut RenderCache,
+    ) {
+        if !self.deferred_planned {
+            self.deferred = crate::deferred::DeferredPass::plan(
+                ctx,
+                vfs,
+                scene,
+                &self.d3d,
+                &mut cache.textures,
+            );
+            self.deferred_planned = true;
         }
     }
 
@@ -1130,7 +1188,7 @@ impl AreaRenderer {
         }
     }
 
-    /// Whether this renderer can draw deferred: it is the level's, has draws the deferred
+    /// Whether this renderer can draw deferred: it has draws the deferred
     /// pass takes, and the GPU has not refused that pass.
     pub fn can_defer(&self) -> bool {
         self.deferred.as_ref().is_some_and(|d| !d.refused())
@@ -1499,6 +1557,22 @@ impl AreaRenderer {
         self.render_pass(ctx, encoder, target, width, height, camera, None);
     }
 
+    /// Shares the level's G-buffer and point shadows with eligible object renderers.
+    /// Their remaining materials are drawn later by `render_over`, as usual.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_main_with(
+        &mut self,
+        ctx: &GpuContext,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &wgpu::TextureView,
+        width: u32,
+        height: u32,
+        camera: &Camera,
+        objects: &mut [&mut AreaRenderer],
+    ) {
+        self.render_pass_with(ctx, encoder, target, width, height, camera, None, objects);
+    }
+
     /// Fills this frame's constants: placing the shadow partitions (a renderer of the
     /// level's own meshes) and choosing the casters each draws. Call it for every renderer
     /// of a frame, the level's first, before [`AreaRenderer::encode_shadows`] for any of
@@ -1551,6 +1625,25 @@ impl AreaRenderer {
         camera: &Camera,
         over: Option<&wgpu::TextureView>,
     ) {
+        self.render_pass_with(ctx, encoder, target, width, height, camera, over, &mut []);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_pass_with(
+        &mut self,
+        ctx: &GpuContext,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &wgpu::TextureView,
+        width: u32,
+        height: u32,
+        camera: &Camera,
+        over: Option<&wgpu::TextureView>,
+        objects: &mut [&mut AreaRenderer],
+    ) {
+        let contributed = std::mem::take(&mut self.deferred_in_frame);
+        for o in objects.iter_mut() {
+            o.deferred_in_frame = false;
+        }
         // For the effects that read the depth buffer back (see `finish_frame_with`).
         self.frame_projection = Some(camera.projection(width as f32 / height.max(1) as f32));
         let frame = FrameUniforms {
@@ -1603,6 +1696,17 @@ impl AreaRenderer {
         } else {
             Vec::new()
         };
+        let mut contributors: Vec<_> = objects
+            .iter_mut()
+            .filter(|o| o.path == crate::deferred::RenderPath::Deferred && o.only_draws.is_none())
+            .filter_map(|o| {
+                Some(crate::deferred::Contributor {
+                    pass: o.deferred.as_mut()?,
+                    d3d: &o.d3d,
+                    meshes: &o.meshes,
+                })
+            })
+            .collect();
         let deferred = deferred_now
             && self.deferred.as_mut().is_some_and(|p| {
                 p.set_own_lights(own);
@@ -1617,8 +1721,16 @@ impl AreaRenderer {
                     &self.d3d,
                     &self.meshes,
                     self.clear,
+                    &mut contributors,
                 )
             });
+        drop(contributors);
+        for o in objects.iter_mut() {
+            o.deferred_in_frame = deferred
+                && o.path == crate::deferred::RenderPath::Deferred
+                && o.only_draws.is_none()
+                && o.deferred.as_ref().is_some_and(|p| p.ready());
+        }
         if deferred && let Some(m) = &self.msaa {
             m.fill(&ctx.device, encoder, &deferred_target, &deferred_depth);
         }
@@ -1668,7 +1780,9 @@ impl AreaRenderer {
                 DrawRef::StandIn(i) => &self.stand_in[i],
                 DrawRef::D3d(i) => {
                     if !self.d3d.in_view(i)
-                        || (deferred && self.deferred.as_ref().is_some_and(|p| p.takes(i)))
+                        || ((deferred || contributed)
+                            && !self.d3d.is_faded(&self.d3d.draws[i])
+                            && self.deferred.as_ref().is_some_and(|p| p.takes(i)))
                     {
                         continue;
                     }
@@ -1903,7 +2017,16 @@ impl AreaRenderer {
             o.encode_shadows(&mut encoder, false);
         }
         self.finish_shadows(&mut encoder);
-        self.render_pass(ctx, &mut encoder, &view, width, height, camera, None);
+        self.render_pass_with(
+            ctx,
+            &mut encoder,
+            &view,
+            width,
+            height,
+            camera,
+            None,
+            overlays,
+        );
         let frame = self.frame_view(&ctx.device, &view, width, height);
         under(&mut encoder, &frame);
         if !overlays.is_empty() {
@@ -2130,6 +2253,10 @@ mod tests {
             CAPTURE_FORMAT,
         );
         assert_eq!(r.stats.draws, 1);
+        assert!(
+            !r.deferred_planned(),
+            "faithful construction skips planning"
+        );
         let camera = Camera::new(Vec3::ZERO, 0.0, 0.0);
         let px = r.capture(&ctx, &camera, 32, 32).unwrap();
         let at = |x: usize, y: usize| &px[(y * 32 + x) * 4..(y * 32 + x) * 4 + 4];
@@ -2137,5 +2264,9 @@ mod tests {
         let centre = at(16, 16);
         assert!((120..=136).contains(&centre[0]), "centre {centre:?}");
         assert_eq!(at(1, 1), &[0, 0, 0, 255], "corner is the clear colour");
+        assert!(!r.deferred_planned(), "faithful frames skip planning too");
+        r.prepare_deferred(&ctx, &Vfs::new(), &scene, &mut RenderCache::default());
+        assert!(r.deferred_planned());
+        assert!(!r.can_defer(), "stand-in materials stay forward");
     }
 }
