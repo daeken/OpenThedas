@@ -354,27 +354,36 @@ fn talk_line(sim: &Sim) -> Option<TalkLine> {
 
 /// The depth of field an open conversation runs
 /// ([`thedas_render::cut_effects::conversation_depth_of_field`]), from the game's tables 203
-/// and 204 (`conversation_dof_values`, `conversation_dof_parameters`). Provisional: taken
-/// to run whenever a conversation line is up, the conversation game mode's own start and
-/// end not being modelled.
+/// and 204 (`conversation_dof_values`, `conversation_dof_parameters`). Dragon Age II numbers
+/// its tables otherwise but ships both by name, with the same values row (focus distance
+/// −1: radius 8, far fade 20), so the names stand in when the numbers do not give them.
+/// Provisional: taken to run whenever a conversation line is up, the conversation game
+/// mode's own start and end not being modelled; that Dragon Age II reads these tables is
+/// inferred from their being there.
 fn conversation_depth_of_field(sim: &Sim) -> Option<thedas_render::cut_effects::DepthOfField> {
     use thedas_formats::gda::Cell;
     sim.conversation_line()?;
     let tables = sim.world.tables();
-    let values = tables.get(203, "");
-    let parameters = tables.get(204, "");
     let number = |c: Option<&Cell>| match c {
         Some(Cell::Float(v)) => Some(*v as f32),
         Some(Cell::Int(v)) => Some(*v as f32),
         _ => None,
     };
     // The first row whose focus distance is below zero holds the values.
-    let row = values.as_ref().and_then(|t| {
+    let values_row = |t: &thedas_sim::m2da::Table| {
         t.order
             .iter()
             .copied()
             .find(|&r| number(t.cell("FocusDistance", r)).is_some_and(|v| v < 0.0))
-    });
+    };
+    let (values, parameters) = match tables.get(203, "") {
+        Some(t) if values_row(&t).is_some() => (Some(t), tables.get(204, "")),
+        _ => (
+            tables.get(0, "conversation_dof_values"),
+            tables.get(0, "conversation_dof_parameters"),
+        ),
+    };
+    let row = values.as_ref().and_then(|t| values_row(t));
     let listed = |name: &str| {
         parameters.as_ref().is_some_and(|t| {
             t.order.iter().any(|&r| {
@@ -554,6 +563,15 @@ pub enum Start<'a> {
     /// inputs since it replayed. An error when there is none, or its log cannot be
     /// replayed by this build.
     Resume(&'a Path),
+}
+
+/// Whether an ability waiting for its target can no longer be aimed (see
+/// [`Live::drop_stale_aim`]).
+pub fn aim_is_stale(sim: &Sim, aim: &thedas_ui::input::Aim, field: bool) -> bool {
+    let caster = sim.world.get(aim.caster);
+    !field
+        || sim.world.controlled() != Some(aim.caster)
+        || caster.is_none_or(|c| c.dead || c.area != sim.world.area)
 }
 
 /// Who gets a portrait drawn: the party, and the followers picked in an open party picker
@@ -2584,8 +2602,9 @@ impl Live {
                     shapes.insert(m.id, shape);
                 }
             }
-            // A creature's eyes (`_uem_` meshes) or head (`_uhm_`). Provisional: from the
-            // character models' names.
+            // A creature's eyes (`_uem_` meshes) or head (`_uhm_`; Dragon Age II's heads are
+            // its morph base models, `mt_bas_hm`). Provisional: from the character models'
+            // names.
             let part = |tag: &str| {
                 p.draws.clone().find_map(|d| {
                     let d = scene.draws.get(d)?;
@@ -2595,7 +2614,10 @@ impl Live {
                         .then_some(d.sphere.0)
                 })
             };
-            if let Some(face) = part("_uem_").or_else(|| part("_uhm_")) {
+            if let Some(face) = part("_uem_")
+                .or_else(|| part("_uhm_"))
+                .or_else(|| part("\\mt_bas_"))
+            {
                 faces.insert(m.id, face - glam::Vec3::from_array(m.position));
             }
             let spheres: Vec<(glam::Vec3, f32)> = p
@@ -3309,6 +3331,19 @@ impl Live {
         );
     }
 
+    /// Drops an ability waiting for its target once nothing can aim it: a screen is up over
+    /// the field (`field` false: a conversation, cutscene, menu or the like), the player
+    /// now controls someone else, or the caster is gone, dead or in another area. Returns
+    /// the ability dropped. Provisional: the exe's own rule for ending its targeting mode is
+    /// not traced; a right click, a world click and the pad's B or D-pad down end it too.
+    pub fn drop_stale_aim(&mut self, field: bool) -> Option<i32> {
+        let aim = self.aiming.as_ref()?;
+        if !aim_is_stale(&self.sim(), aim, field) {
+            return None;
+        }
+        self.aiming.take().map(|a| a.ability)
+    }
+
     pub fn toggle_pause(&mut self) {
         let mut sim = self.sim();
         if sim.training_paused() {
@@ -3573,5 +3608,45 @@ mod load_screen_tests {
         // No area before (the first load), or an area outside the tree.
         assert_eq!(load_screen_for(None, list), LoadScreen::Town);
         assert_eq!(load_screen_for(list, None), LoadScreen::Town);
+    }
+}
+
+#[cfg(test)]
+mod aim_tests {
+    use std::sync::Arc;
+
+    use thedas_script::EngineTable;
+    use thedas_sim::Sim;
+    use thedas_sim::world::ObjectKind;
+    use thedas_vfs::Vfs;
+
+    use super::aim_is_stale;
+
+    #[test]
+    fn an_aim_lasts_only_while_its_caster_can_still_aim_it() {
+        let mut s = Sim::new(
+            Arc::new(Vfs::new()),
+            Arc::new(EngineTable::parse(b"").unwrap()),
+            1,
+        );
+        let hero = s.world.spawn(ObjectKind::Creature, "hero");
+        let other = s.world.spawn(ObjectKind::Creature, "other");
+        s.world.hero = Some(hero);
+        let aim = thedas_ui::input::Aim {
+            caster: hero,
+            ability: 10_000,
+            item: String::new(),
+        };
+        assert!(!aim_is_stale(&s, &aim, true));
+        // A screen over the field: a conversation, a menu.
+        assert!(aim_is_stale(&s, &aim, false));
+        // Someone else's aim, or a dead caster.
+        let theirs = thedas_ui::input::Aim {
+            caster: other,
+            ..aim.clone()
+        };
+        assert!(aim_is_stale(&s, &theirs, true));
+        s.world.get_mut(hero).unwrap().dead = true;
+        assert!(aim_is_stale(&s, &aim, true));
     }
 }

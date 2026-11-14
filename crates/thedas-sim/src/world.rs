@@ -276,6 +276,9 @@ pub struct Event {
     pub objects: Vec<ObjectId>,
     pub resources: Vec<String>,
     pub locations: Vec<Location>,
+    /// Dragon Age II's vector parameters (`SetEventVector`, `GetEventVector`).
+    #[serde(default)]
+    pub vectors: Vec<[f32; 3]>,
 }
 
 /// A queued command (`AddCommand`). Provisional: commands complete as soon as the executor
