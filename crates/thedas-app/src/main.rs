@@ -3994,6 +3994,43 @@ impl App {
                 ));
             }
             &Step::ModConvAt(n) => log.push(self.mod_mode_command(modconv::ConvAction::StartAt(n))),
+            Step::ModStat(name, current, value) => {
+                let id = self.mod_mode.as_ref().and_then(|m| m.selected);
+                let found = match (id, self.live.as_ref()) {
+                    (Some(id), Some(l)) => {
+                        let sim = l.sim();
+                        modworld::creature_stats(&sim, id).and_then(|st| {
+                            st.stats
+                                .iter()
+                                .find(|s| {
+                                    s.name.eq_ignore_ascii_case(name) || s.id.to_string() == *name
+                                })
+                                .map(|s| (id, s.id))
+                        })
+                    }
+                    _ => None,
+                };
+                log.push(match found {
+                    Some((id, p)) => {
+                        let (base, cur) = if *current {
+                            (None, Some(*value))
+                        } else {
+                            (Some(*value), None)
+                        };
+                        self.mod_mode_world(modworld::WorldAction::SetStat {
+                            target: id,
+                            property: p,
+                            base,
+                            current: cur,
+                        });
+                        self.mod_mode
+                            .as_ref()
+                            .map(|m| m.convs.status.clone())
+                            .unwrap_or_default()
+                    }
+                    None => format!("modstat: no property {name} on the inspected creature"),
+                });
+            }
             Step::ModRemove => log.push(match self.mod_mode.as_ref().and_then(|m| m.selected) {
                 Some(id) => self.mod_mode_place(
                     thedas_sim::commands::SimCommand::DestroyObject { target: id },
@@ -5551,6 +5588,9 @@ enum Step {
     ModAnim(String),
     /// The picked conversation starts at this line (`modconvat N`).
     ModConvAt(usize),
+    /// The inspected creature's property (by its `PROPERTY_*` name or id) set: its base or
+    /// current value (`modstat STRENGTH base 30`).
+    ModStat(String, bool, f32),
     /// A variable set from the world-state browser (`modlocal WHO NAME TYPE VALUE`, WHO
     /// `module`, `area` or an object's tag; TYPE `int`, `float`, `string`, `object` or
     /// `resource`, or `remove` with no value).
@@ -5981,6 +6021,19 @@ fn parse_step(s: &str) -> Result<Step> {
         "modanims" => Step::ModAnims,
         "modanim" if !arg.is_empty() => Step::ModAnim(arg.to_string()),
         "modconvat" => Step::ModConvAt(arg.parse().context("modconvat takes a line number")?),
+        "modstat" => {
+            let mut w = arg.split_whitespace();
+            let (Some(name), Some(which), Some(v), None) = (w.next(), w.next(), w.next(), w.next())
+            else {
+                bail!("modstat takes NAME base|current VALUE");
+            };
+            let current = match which {
+                "base" => false,
+                "current" => true,
+                _ => bail!("modstat sets base or current"),
+            };
+            Step::ModStat(name.into(), current, v.parse().context("modstat's value")?)
+        }
         "modlocal" => {
             let mut w = arg.splitn(4, ' ');
             let (Some(who), Some(name), Some(kind)) = (w.next(), w.next(), w.next()) else {
@@ -6322,6 +6375,7 @@ fn main() -> Result<()> {
                     | Step::ModAnims
                     | Step::ModAnim(_)
                     | Step::ModConvAt(_)
+                    | Step::ModStat(..)
                     | Step::ModLocal(..) => {
                         println!("mod mode: windowed only")
                     }
