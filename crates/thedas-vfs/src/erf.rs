@@ -442,8 +442,9 @@ impl Erf {
     }
 
     /// The password that matches the header's digest: from the player's keys file (see
-    /// [`crate::keys_file`]), else for DA:O read from the player's own `DAOrigins.exe` (see
-    /// [`crate::gog_dlc`]; GOG Ultimate Edition layout only, provisional). Dragon Age II's
+    /// [`crate::keys_file`]), else for DA:O read from the player's own `DAOrigins.exe` when it is the
+    /// GOG build or found by trying every eight-digit password against the digest once (see
+    /// [`crate::dlc_search`]). Dragon Age II's
     /// come only from the keys file.
     pub fn installed_key(&self) -> Option<&DaoKey> {
         self.installed_key
@@ -454,7 +455,7 @@ impl Erf {
                 }
                 match self.encryption {
                     Encryption::Xor | Encryption::BlowfishDao => {
-                        crate::gog_dlc::key(&self.path, self.module_id, digest)
+                        crate::dlc_search::key(&self.path, self.module_id, digest)
                     }
                     Encryption::BlowfishDa2 => {
                         log::warn!(
