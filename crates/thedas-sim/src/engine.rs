@@ -571,8 +571,8 @@ const VFX_PERSISTENT_TABLE: i32 = 96;
 ///
 /// `bReturnFirstMatch` is read but unused. Provisional: the candidates are the
 /// simulation's perception list (the engine's perception query, which also drops creatures
-/// beyond a per-creature limit, is not traced), and creatures the engine skips (virtual
-/// 0x1d0 returning 1) are taken to be the dead.
+/// beyond a per-creature limit, is not traced). Origins excludes creatures whose integer
+/// current health is at most zero (0x6a3660). DA2's predicate still needs tracing.
 fn cluster_center(
     sim: &mut Sim,
     creator: ObjectId,
@@ -588,7 +588,19 @@ fn cluster_center(
         .combat
         .perceived
         .iter()
-        .filter_map(|&c| sim.world.get(c).map(|o| (c, o.position, o.dead)))
+        .filter_map(|&c| {
+            let o = sim.world.get(c)?;
+            let excluded = if sim.game == thedas_vfs::Game::Origins {
+                // 0x6a3660 -> 0x6ab4b0 -> 0x8e34f0. Positive integer results require
+                // current health >= 1 and below SSE2's positive overflow boundary.
+                !o.properties
+                    .get(&7)
+                    .is_some_and(|&(_, current)| (1.0..2147483648.0).contains(&current))
+            } else {
+                o.dead
+            };
+            Some((c, o.position, excluded))
+        })
         .collect();
     let tables = sim.world.tables.clone();
     let abi = tables.get(0, "ABI_base");
@@ -9857,6 +9869,7 @@ mod coverage_tests {
             let c = s.world.spawn(ObjectKind::Creature, "c");
             let o = s.world.get_mut(c).unwrap();
             (o.area, o.group, o.position) = (Some(area), group, p);
+            o.properties.insert(7, (100.0, 100.0));
             c
         };
         let mage = put(&mut s, 1, [0.0, -10.0, 0.0]);
@@ -9914,6 +9927,48 @@ mod coverage_tests {
         let (got_area, p) = center(&mut s, vec![x2, a2, b2, c2], 1, 3, 0);
         assert_eq!(got_area, area);
         assert!((p[0] - 309.5 / 3.0).abs() < 1e-4 && (p[1] - 1.0).abs() < 1e-4);
+
+        for game in [thedas_vfs::Game::Origins, thedas_vfs::Game::DragonAge2] {
+            s.game = game;
+            for dead in [false, true] {
+                for (current, origins_keeps) in [
+                    (None, false),
+                    (Some(-1.0), false),
+                    (Some(0.0), false),
+                    (Some(0.999_999_94), false),
+                    (Some(1.0), true),
+                    (Some(12.9), true),
+                    (Some(2147483520.0), true),
+                    (Some(2147483648.0), false),
+                    (Some(f32::NAN), false),
+                    (Some(f32::NEG_INFINITY), false),
+                    (Some(f32::INFINITY), false),
+                ] {
+                    let o = s.world.get_mut(a).unwrap();
+                    o.dead = dead;
+                    o.active = false;
+                    o.properties.remove(&7);
+                    if let Some(current) = current {
+                        o.properties.insert(7, (999.0, current));
+                    }
+                    let keeps = if game == thedas_vfs::Game::Origins {
+                        origins_keeps
+                    } else {
+                        !dead
+                    };
+                    let expected = if keeps {
+                        (area, [21.0, 0.0, 0.0])
+                    } else {
+                        (OBJECT_INVALID, [0.0; 3])
+                    };
+                    assert_eq!(
+                        center(&mut s, vec![lone, a, b], 2, 2, 0),
+                        expected,
+                        "{game:?} dead={dead} current={current:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
