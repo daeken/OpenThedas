@@ -861,6 +861,8 @@ impl UiMovie {
             inline_images: Default::default(),
             multiply_pass: None,
             multiply_texture: None,
+            above_texture: None,
+            own_texture: None,
         })
     }
 
@@ -1201,53 +1203,7 @@ impl UiMovie {
     pub fn render_multiply(&mut self) -> Option<wgpu::Texture> {
         self.in_multiply_pass(|m| {
             m.render();
-<<<<<<< HEAD
-            let own_tex = m.own().and_then(|o| {
-                let (d, q) = o.device();
-                o.texture().map(|t| (t, d, q))
-            });
-            let (texture, device, queue) = own_tex.or_else(|| {
-                m.with_player(|p| {
-                    let r: &mut dyn std::any::Any = p.renderer_mut();
-                    r.downcast_mut::<WgpuRenderBackend<TextureTarget>>()
-                        .map(|b| {
-                            (
-                                b.target().texture.clone(),
-                                b.descriptors().device.clone(),
-                                b.descriptors().queue.clone(),
-                            )
-                        })
-                })
-                .flatten()
-            })?;
-            let same = m
-                .multiply_texture
-                .as_ref()
-                .is_some_and(|t| t.size() == texture.size() && t.format() == texture.format());
-            if !same {
-                m.multiply_texture = Some(device.create_texture(&wgpu::TextureDescriptor {
-                    label: Some("ui multiply pass"),
-                    size: texture.size(),
-                    mip_level_count: 1,
-                    sample_count: 1,
-                    dimension: wgpu::TextureDimension::D2,
-                    format: texture.format(),
-                    usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
-                    view_formats: &[],
-                }));
-            }
-            let copy = m.multiply_texture.clone()?;
-            let mut encoder = device.create_command_encoder(&Default::default());
-            encoder.copy_texture_to_texture(
-                texture.as_image_copy(),
-                copy.as_image_copy(),
-                texture.size(),
-            );
-            queue.submit([encoder.finish()]);
-            Some(copy)
-=======
             m.copy_rendered(PassCopy::Multiply)
->>>>>>> origin/main
         })
         .flatten()
     }
@@ -1279,8 +1235,12 @@ impl UiMovie {
     /// A copy of the frame just rendered, kept in one of the movie's pass textures: the
     /// movie renders the next pass into the same target.
     fn copy_rendered(&mut self, which: PassCopy) -> Option<wgpu::Texture> {
-        let (texture, device, queue) = self
-            .with_player(|p| {
+        let own = self.own().and_then(|o| {
+            let (d, q) = o.device();
+            o.texture().map(|t| (t, d, q))
+        });
+        let (texture, device, queue) = own.or_else(|| {
+            self.with_player(|p| {
                 let r: &mut dyn std::any::Any = p.renderer_mut();
                 r.downcast_mut::<WgpuRenderBackend<TextureTarget>>()
                     .map(|b| {
@@ -1291,7 +1251,8 @@ impl UiMovie {
                         )
                     })
             })
-            .flatten()?;
+            .flatten()
+        })?;
         let slot = match which {
             PassCopy::Multiply => &mut self.multiply_texture,
             PassCopy::Above => &mut self.above_texture,
@@ -1384,13 +1345,10 @@ impl UiMovie {
     }
 
     pub fn mouse_move(&mut self, x: f64, y: f64) {
-<<<<<<< HEAD
         if let Some(o) = self.own() {
             o.mouse_move(x, y);
             return;
         }
-        self.with_player(|p| p.handle_event(PlayerEvent::MouseMove { x, y }));
-=======
         self.with_player(|p| {
             // The player looks for what the mouse is over after every frame it runs, a walk
             // of every clip (most of a HUD movie's time a frame); while the mouse is outside
@@ -1407,7 +1365,6 @@ impl UiMovie {
             p.handle_event(PlayerEvent::MouseLeave);
             p.set_mouse_in_stage(false);
         });
->>>>>>> origin/main
     }
 
     /// The mouse wheel turned `lines` (up positive) with the mouse at (`x`, `y`): the movie's
