@@ -24,6 +24,7 @@ pub mod deferred;
 mod deferred_alpha;
 mod deferred_character;
 mod deferred_cutout;
+mod deferred_ground;
 mod deferred_mesh;
 mod deferred_shadow;
 mod deferred_terrain;

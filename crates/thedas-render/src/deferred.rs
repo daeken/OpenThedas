@@ -784,6 +784,10 @@ impl DeferredPass {
         self.gpu.is_some() && !self.refused
     }
 
+    pub(crate) fn material_mask(&self) -> Option<&wgpu::TextureView> {
+        Some(&self.gpu.as_ref()?.targets.as_ref()?.views[0])
+    }
+
     fn build(&self, ctx: &GpuContext, color_format: wgpu::TextureFormat) -> Gpu {
         let device = &ctx.device;
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
