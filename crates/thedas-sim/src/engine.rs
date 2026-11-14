@@ -3072,6 +3072,31 @@ pub fn call(
         // hero; the owner must be an active, living creature. Nothing here looks at the game
         // mode: a conversation may start in combat (and replaces it, see
         // `Sim::start_conversation`).
+        // Dragon Age II's `int BeginConversation(object oTarget, resource rConversationFile)`
+        // has no owner argument: the script's object talks to the target. Provisional: from
+        // DA2's script.ldf declaration and its prologue, whose plot script starts the
+        // player's own conversation (`pro000_opening_pc`) running as the player's creature.
+        "BeginConversation" if matches!(a.get(1), Some(Value::Resource(_) | Value::String(_))) => {
+            let target = obj(a, 0);
+            let owner = if h
+                .object(caller)
+                .is_some_and(|o| o.kind == ObjectKind::Creature)
+            {
+                caller
+            } else {
+                target
+            };
+            let target = if target == owner {
+                h.sim.world.hero.unwrap_or(target)
+            } else {
+                target
+            };
+            let can = h
+                .object(owner)
+                .is_some_and(|o| o.kind == ObjectKind::Creature && o.active && !o.dead);
+            let ok_ = can && h.sim.start_conversation(target, owner, &string(a, 1));
+            ok(b(ok_))
+        }
         "BeginConversation" => {
             let owner = obj(a, 1);
             let mut target = obj(a, 0);
