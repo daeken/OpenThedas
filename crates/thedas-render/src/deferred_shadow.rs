@@ -397,7 +397,7 @@ impl ShadowPool {
     ) {
         let reuse = self
             .reuse_override
-            .unwrap_or_else(|| std::env::var("THEDAS_DEFERRED_SHADOW_REUSE").as_deref() != Ok("0"));
+            .unwrap_or(crate::config::CONFIG.shadow_reuse);
         // Paired benchmarks keep exact input bookkeeping in both modes and force the
         // control's redraw. Its freshly drawn maps can then be reused by the next frame.
         let inputs: Vec<_> = if reuse || self.reuse_override.is_some() {
@@ -430,9 +430,7 @@ impl ShadowPool {
         // Per layer, its draws: (caster, slot in the buffer).
         let mut data: Vec<u8> = Vec::new();
         let mut layers: Vec<Vec<(usize, u32)>> = Vec::new();
-        let cull = self
-            .culling
-            .unwrap_or_else(|| std::env::var("THEDAS_DEFERRED_SHADOW_CULL").as_deref() != Ok("0"));
+        let cull = self.culling.unwrap_or(crate::config::CONFIG.shadow_cull);
         let mut before = 0;
         for (slot, &(position, radius)) in lights.iter().take(SLOTS).enumerate() {
             if !dirty[slot] {
@@ -468,7 +466,7 @@ impl ShadowPool {
                 layers.push(draws);
             }
         }
-        if std::env::var_os("THEDAS_DEFERRED_LOG_LIGHTS").is_some() {
+        if crate::config::CONFIG.log_lights {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| {
                 log::info!(

@@ -40,6 +40,10 @@ mod gpu_tests;
 #[path = "deferred_alpha_tests.rs"]
 mod alpha_gpu_tests;
 
+#[cfg(test)]
+#[path = "deferred_reflection_tests.rs"]
+mod reflection_gpu_tests;
+
 /// How the level is drawn.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum RenderPath {
@@ -84,8 +88,9 @@ const DRAW_STRIDE: usize = 1280;
 const MAX_ROOMS: u32 = 255;
 
 /// The G-buffer's targets: albedo; specular mask and power; normal, room and specular
-/// falloff; lightmap texel. That is 32 bytes a pixel as wgpu counts them, its limit: the
-/// environment reflection is added by a pass of its own ([`Gpu::env`]).
+/// falloff; HDR base colour (or lightmap texel in separate-pass modes). That is 32
+/// bytes a pixel as wgpu counts them, its limit. Baked frames fold reflection into
+/// the base; probe/AO and diagnostic modes add it through [`Gpu::env`].
 const GBUFFER: [wgpu::TextureFormat; 4] = [
     wgpu::TextureFormat::Rgba8Unorm,
     wgpu::TextureFormat::Rgba8Unorm,
@@ -97,6 +102,7 @@ const GBUFFER: [wgpu::TextureFormat; 4] = [
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct FrameUniforms {
     eye: [f32; 4],
+    /// xy: half-pixel correction, z: fused baked base, w: unused.
     fixup: [f32; 4],
     fog: [f32; 4],
 }
@@ -208,6 +214,7 @@ pub(crate) struct DeferredPass {
     /// Diagnostic override: tiled lighting and cube-face culling, respectively.
     culling: Option<[bool; 2]>,
     shadow_reuse: Option<bool>,
+    fused_reflections: Option<bool>,
 }
 
 pub(crate) struct Contributor<'a> {
@@ -219,8 +226,7 @@ pub(crate) struct Contributor<'a> {
 struct Gpu {
     /// By cull mode: none, back, front.
     gbuffer: [wgpu::RenderPipeline; 3],
-    /// The environment reflection, added over the lit frame by drawing the deferred draws
-    /// again (by cull mode).
+    /// Separate reflection for probe/AO and diagnostic modes (by cull mode).
     env: [wgpu::RenderPipeline; 3],
     lighting: wgpu::RenderPipeline,
     frame_buffer: wgpu::Buffer,
@@ -363,7 +369,7 @@ impl DeferredPass {
         cache: &mut TextureCache,
     ) -> Option<DeferredPass> {
         let started = std::time::Instant::now();
-        let punch_enabled = std::env::var("THEDAS_DEFERRED_PUNCH").as_deref() != Ok("0");
+        let punch_enabled = crate::config::CONFIG.punch;
         let punch: HashMap<usize, _> = if punch_enabled {
             d3d.draws
                 .iter()
@@ -396,9 +402,9 @@ impl DeferredPass {
         let mut takes = vec![false; d3d.draws.len()];
         let mut vertices = HashMap::new();
         let mut skin_count = 1; // Slot zero is identity for rigid meshes.
-        let objects_enabled = std::env::var("THEDAS_DEFERRED_OBJECTS").as_deref() != Ok("0");
-        let terrain_enabled = std::env::var("THEDAS_DEFERRED_TERRAIN").as_deref() != Ok("0");
-        let faces_enabled = std::env::var("THEDAS_DEFERRED_FACES").as_deref() != Ok("0");
+        let objects_enabled = crate::config::CONFIG.objects;
+        let terrain_enabled = crate::config::CONFIG.terrain;
+        let faces_enabled = crate::config::CONFIG.faces;
         for (k, d) in d3d.draws.iter().enumerate() {
             let program = d3d.program(d);
             let Some(item) = scene.draws.get(d.draw) else {
@@ -743,10 +749,11 @@ impl DeferredPass {
             effect_lights: Vec::new(),
             own_lights: Vec::new(),
             refused: false,
-            baked_lighting: std::env::var("THEDAS_DEFERRED_BAKED_LIGHTING").as_deref() != Ok("0"),
-            ssao: std::env::var("THEDAS_DEFERRED_SSAO").as_deref() != Ok("0"),
+            baked_lighting: crate::config::CONFIG.baked_lighting,
+            ssao: crate::config::CONFIG.ssao,
             culling: None,
             shadow_reuse: None,
+            fused_reflections: None,
         })
     }
 
@@ -759,12 +766,16 @@ impl DeferredPass {
         self.shadow_reuse = enabled;
     }
 
+    pub(crate) fn set_fused_reflections(&mut self, enabled: Option<bool>) {
+        self.fused_reflections = enabled;
+    }
+
     /// Sets the lights only this pass draws (see [`DeferredPass::effect_lights`]).
     pub(crate) fn set_effect_lights(&mut self, lights: Vec<SceneLight>) {
         // `THEDAS_DEFERRED_LOG_LIGHTS=1`: the first frame's effect lights, once (to frame
         // shots of them).
         static LOGGED: std::sync::Once = std::sync::Once::new();
-        if !lights.is_empty() && std::env::var_os("THEDAS_DEFERRED_LOG_LIGHTS").is_some() {
+        if !lights.is_empty() && crate::config::CONFIG.log_lights {
             LOGGED.call_once(|| {
                 for l in &lights {
                     if let SceneLight::Point {
@@ -938,7 +949,11 @@ impl DeferredPass {
         });
         let gbuffer_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("deferred g-buffer"),
-            bind_group_layouts: &[Some(&scene_layout), Some(&material_layout)],
+            bind_group_layouts: &[
+                Some(&scene_layout),
+                Some(&material_layout),
+                Some(&sun_layout),
+            ],
             immediate_size: 0,
         });
         let env_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -1370,6 +1385,7 @@ impl DeferredPass {
         camera: &Camera,
         d3d: &D3dPass,
         rooms: &HashMap<i64, u32>,
+        fused_reflections: bool,
     ) -> bool {
         if self.refused {
             return false;
@@ -1421,7 +1437,7 @@ impl DeferredPass {
             fixup: [
                 1.0 / width.max(1) as f32,
                 1.0 / height.max(1) as f32,
-                0.0,
+                if fused_reflections { 1.0 } else { 0.0 },
                 0.0,
             ],
             fog: [
@@ -1480,6 +1496,14 @@ impl DeferredPass {
         contributors: &mut [Contributor<'_>],
         mut profile: Option<&mut crate::profile::CaptureProfile>,
     ) -> bool {
+        // AO needs the completed depth buffer and independently scales probe bounce.
+        // Keep separate reflection terms in that mode and in diagnostic views.
+        let fused_reflections = self
+            .fused_reflections
+            .unwrap_or(crate::config::CONFIG.fused_reflections)
+            && self.baked_lighting
+            && contributors.iter().all(|c| c.pass.baked_lighting)
+            && debug_view() == 0;
         for c in contributors.iter() {
             for &room in c.pass.rooms.keys() {
                 let next = self.rooms.len() as u32 + 1;
@@ -1495,6 +1519,7 @@ impl DeferredPass {
             camera,
             d3d,
             &self.rooms.clone(),
+            fused_reflections,
         ) {
             return false;
         }
@@ -1506,6 +1531,7 @@ impl DeferredPass {
                 camera,
                 c.d3d,
                 &self.rooms,
+                fused_reflections,
             );
         }
         let characters = self.data.iter().any(|d| d.material[0] > 1.5)
@@ -1532,12 +1558,12 @@ impl DeferredPass {
             }
         }
         // Keep a capture/benchmark switch for comparing only the shadow contribution.
-        let shadowed = if std::env::var("THEDAS_DEFERRED_POINT_SHADOWS").as_deref() == Ok("0") {
+        let shadowed = if !crate::config::CONFIG.point_shadows {
             Vec::new()
         } else {
             shadow_slots(&mut lights, camera.position)
         };
-        if std::env::var_os("THEDAS_DEFERRED_LOG_LIGHTS").is_some() {
+        if crate::config::CONFIG.log_lights {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| {
                 log::info!(
@@ -1648,16 +1674,16 @@ impl DeferredPass {
             (width, height),
             gpu.lights.iter().map(|l| l.position),
             if debug_view() == 9 { 2.0 } else { 1.0 },
-            self.culling.map(|c| c[0]).unwrap_or_else(|| {
-                std::env::var("THEDAS_DEFERRED_TILED_LIGHTS").as_deref() != Ok("0")
-            }),
+            self.culling
+                .map(|c| c[0])
+                .unwrap_or(crate::config::CONFIG.tiled_lights),
         );
         if gpu.tiles.as_slice() != tiles {
             ctx.queue
                 .write_buffer(&gpu.tile_buffer, 0, bytemuck::cast_slice(&tiles));
             gpu.tiles = tiles.to_vec();
         }
-        if std::env::var_os("THEDAS_DEFERRED_LOG_LIGHTS").is_some() {
+        if crate::config::CONFIG.log_lights {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| {
                 let counts: Vec<_> = tiles
@@ -1696,7 +1722,12 @@ impl DeferredPass {
                     1
                 },
             ],
-            size: [width as f32, height as f32, 0.0, 0.0],
+            size: [
+                width as f32,
+                height as f32,
+                if fused_reflections { 1.0 } else { 0.0 },
+                0.0,
+            ],
         };
         let sun = SunUniforms {
             data: d3d
@@ -1704,10 +1735,7 @@ impl DeferredPass {
                 .map_or(crate::d3d::NO_SHADOW_DATA, |(data, _)| data),
             direction: sun_dir.to_array(),
             enabled: [
-                u32::from(
-                    d3d.sun_shadows().is_some()
-                        && std::env::var("THEDAS_DEFERRED_SUN_SHADOWS").as_deref() != Ok("0"),
-                ),
+                u32::from(d3d.sun_shadows().is_some() && crate::config::CONFIG.sun_shadows),
                 0,
                 0,
                 0,
@@ -1786,6 +1814,7 @@ impl DeferredPass {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
+            pass.set_bind_group(2, gpu.sun_group.as_ref().expect("sun targets"), &[]);
             draw_all(&self.draws, &mut pass, gpu, &gpu.gbuffer, d3d, meshes);
             for c in contributors.iter() {
                 if let Some(g) = c.pass.gpu.as_ref() {
@@ -1821,6 +1850,12 @@ impl DeferredPass {
         }
         if let Some(p) = profile.as_deref_mut() {
             p.mark("lighting");
+        }
+        if fused_reflections {
+            if let Some(p) = profile {
+                p.mark("reflection");
+            }
+            return true;
         }
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("deferred reflection"),

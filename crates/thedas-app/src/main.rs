@@ -542,6 +542,13 @@ fn capture(
         {
             let mut ms = Vec::new();
             let compare = std::env::var("THEDAS_BENCH_DEFERRED_COMPARE").ok();
+            if compare.as_deref().is_some_and(|s| {
+                !matches!(s, "all" | "tiles" | "shadows" | "faithful" | "reflections")
+            }) {
+                bail!(
+                    "THEDAS_BENCH_DEFERRED_COMPARE must be all, tiles, shadows, faithful or reflections"
+                );
+            }
             let comparison = std::env::var("THEDAS_BENCH_SHADOW_COMPARE").ok();
             if comparison
                 .as_deref()
@@ -568,10 +575,14 @@ fn capture(
                             thedas_render::RenderPath::Faithful
                         };
                     } else if let Some(level) = live.level.as_mut() {
-                        level.renderer.set_deferred_culling(Some([
-                            enabled && compare != "shadows",
-                            enabled && compare != "tiles",
-                        ]));
+                        if compare == "reflections" {
+                            level.renderer.set_deferred_fused_reflections(Some(enabled));
+                        } else {
+                            level.renderer.set_deferred_culling(Some([
+                                enabled && compare != "shadows",
+                                enabled && compare != "tiles",
+                            ]));
+                        }
                     }
                     modes.push(if enabled { "1" } else { "0" });
                 }
@@ -595,6 +606,7 @@ fn capture(
                 live.render_path = original_path;
                 if let Some(level) = live.level.as_mut() {
                     level.renderer.set_deferred_culling(None);
+                    level.renderer.set_deferred_fused_reflections(None);
                 }
                 println!("bench comparison modes: {}", modes.join(" "));
             }

@@ -63,7 +63,7 @@ worker threads exist. Discard warm-up frames and pair adjacent opposite modes.
    | 0 | `Rgba8Unorm` | albedo rgb; alpha material code: Static1 (0), prop (64/255), Low terrain (128/255), character (192/255), other terrain (1) |
    | 1 | `Rgba8Unorm` | specular mask rgb (`mml_tSpecularMask`), specular power code (its alpha) |
    | 2 | `Rgba16Float` | normal (octahedral xy, world space, from `mml_tNormalMap` through a derivative-built tangent frame), room index, specular falloff (`mml_vFalloffParams`, as Static1's vertex shader works it out) |
-   | 3 | `Rgba16Float` | lightmap RGB and baked visibility, or object probe irradiance and visibility 1; floats preserve HDR probes |
+   | 3 | `Rgba16Float` | fused baked ambient/reflection/emission RGB and baked visibility; separate-pass modes retain lightmap or probe irradiance RGB; floats preserve HDR probes |
 
    Position comes back from depth. 24 bytes a pixel (32 under wgpu's attachment accounting),
    within the portable limit.
@@ -105,9 +105,22 @@ worker threads exist. Discard warm-up frames and pair adjacent opposite modes.
 Debug views in place of the lit frame: `THEDAS_DEFERRED_VIEW=albedo|normal|lightmap|
 visibility|diffuse|specular|no-rooms|flat|wrap|shadows|sun-shadows|ao` (see `deferred::debug_view`).
 
-The environment reflection Static1 adds (the probe cubemap times
-`mml_fSpecularReflectionMult`, the specular mask and falloff) has no room in the G-buffer
-(wgpu's 32 bytes a pixel): a second draw of the deferred meshes adds it over the lit frame.
+With baked lighting, the G-buffer's HDR lightmap RGB stores the sum of baked ambient
+colour, probe reflection and emission. This reuses the material samples and tangent frame
+from the first geometry pass and removes the second geometry pass. The baked visibility
+alpha still masks direct lights in the lighting pass. The probe cubemap, reflection
+multiplier, full-resolution normals, specular mask/power/falloff, terrain sun visibility,
+terrain additive tint and character emission retain their existing equations. Faces and
+eyes still receive no cubemap reflection. Bounce retains the stored albedo's UNORM
+clipping and the lightmap's half-float precision. This reorders ambient shading and
+colour writes. Captures have small mean differences and larger localized differences;
+use the comparison control when reviewing image changes.
+
+`THEDAS_DEFERRED_FUSED_REFLECTIONS=0` retains the separate reflection pass for comparison.
+Probe/SSAO mode and debug views always retain it: AO needs the completed depth buffer and
+must affect bounce independently of reflection. Fusion is selected for the whole shared
+G-buffer, including object contributors, on each frame; renderer switches, target resizes
+and shadow updates do not reuse stale reflection pixels.
 
 Static1's material tint and the meshes' own tangents remain to come (the G-buffer builds
 a tangent frame from screen derivatives).
@@ -311,13 +324,17 @@ For fixed-scene save captures (`--save ...`), `THEDAS_BENCH_FRAMES=120 THEDAS_BE
 reports the headless capture loop's CPU/submission/GPU-wait/readback cost, excluding
 scene load and PNG encoding. `THEDAS_BENCH_DEFERRED_COMPARE=all` alternates full-candidate
 and optimized frames in ABBA order within one loaded scene. `tiles` or `shadows` isolates
-one optimization; `faithful` alternates the faithful path with optimized deferred.
+one optimization; `reflections` compares the separate and fused reflection paths;
+`faithful` alternates the faithful path with optimized deferred.
 Start with `--renderer deferred` so planning is already complete, keep `--time`, camera,
 resolution and AA fixed, and discard the first twenty frames before comparing adjacent
 pairs. `bench comparison modes` labels control frames 0 and test frames 1. Overrides
 are per renderer, without mutating environment variables while other threads run, and
 are cleared after the benchmark. These measurements are not isolated GPU timings or
 whole-gameplay FPS; shared-machine load can still affect absolute values.
+
+Rendering environment controls are read once per process. Set them before starting the
+engine; paired benchmarks use renderer overrides instead of changing the environment.
 
 ## Capture profiling
 
@@ -332,7 +349,8 @@ ABBA path comparison can collect warmed samples for each renderer.
 CPU encoding, submission/wait/pixel unpacking and GPU execution are reported separately.
 Per-pass GPU intervals can overlap on pipelined GPUs and can overlap CPU work.
 Keep each interval separate when interpreting the frame budget.
-The GPU samples cover these four passes. Forward object passes, shadows, uploads and
+The reflection interval is absent when its work is fused into the G-buffer. The GPU
+samples cover these passes. Forward object passes, shadows, uploads and
 post-processing need separate instrumentation for a complete GPU frame budget.
 Profiling adds query resources, timestamp writes and a diagnostic readback per capture.
 Use ordinary paired captures with profiling disabled for the relative frame-cost target.
