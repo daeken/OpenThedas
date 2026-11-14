@@ -87,7 +87,13 @@ worker threads exist. Discard warm-up frames and pair adjacent opposite modes.
    4,608 bytes in a portable uniform buffer; there are no storage buffers or candidate
    count truncations. The `wrap` debug view expands tile bounds to twice the radius.
    `THEDAS_DEFERRED_TILED_LIGHTS=0` puts every light in every tile for comparisons.
-4. Everything not deferred draws forward with its original shaders over that colour and
+4. Roomless rigid `SPT_Fronds` draws join the G-buffer using their existing translated
+   wind/placement vertex shader, instance groups and LOD alpha references. Their authored
+   ambient and rotated normals feed the shared per-pixel lighting. Fronds receive runtime
+   shadows and contribute to SSAO depth. Their point-shadow casting remains to come.
+   `THEDAS_DEFERRED_FRONDS=0` keeps them forward. The material survey and remaining coverage
+   are recorded in [the inventory](notes/deferred-material-coverage.md).
+5. Everything not deferred draws forward with its original shaders over that colour and
    depth. In a shared deferred frame, all renderers first draw their remaining opaque
    geometry (including hair depth cores and unsupported materials). Blended and faded
    geometry and particles then draw against the completed opaque depth, before the MSAA

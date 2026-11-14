@@ -7,6 +7,7 @@ pub(crate) struct Config {
     pub objects: bool,
     pub terrain: bool,
     pub faces: bool,
+    pub fronds: bool,
     pub baked_lighting: bool,
     pub ssao: bool,
     pub point_shadows: bool,
@@ -28,6 +29,7 @@ pub(crate) struct Config {
     pub character_cutouts: bool,
     pub fused_reflections: bool,
     pub log_lights: bool,
+    pub log_materials: bool,
     pub profile: bool,
     pub profile_serial: bool,
 }
@@ -39,6 +41,7 @@ pub(crate) static CONFIG: LazyLock<Config> = LazyLock::new(|| {
         objects: enabled("THEDAS_DEFERRED_OBJECTS"),
         terrain: enabled("THEDAS_DEFERRED_TERRAIN"),
         faces: enabled("THEDAS_DEFERRED_FACES"),
+        fronds: enabled("THEDAS_DEFERRED_FRONDS"),
         baked_lighting: enabled("THEDAS_DEFERRED_BAKED_LIGHTING"),
         ssao: enabled("THEDAS_DEFERRED_SSAO"),
         point_shadows: enabled("THEDAS_DEFERRED_POINT_SHADOWS"),
@@ -60,6 +63,7 @@ pub(crate) static CONFIG: LazyLock<Config> = LazyLock::new(|| {
         character_cutouts: enabled("THEDAS_DEFERRED_CHARACTER_CUTOUTS"),
         fused_reflections: enabled("THEDAS_DEFERRED_FUSED_REFLECTIONS"),
         log_lights: std::env::var_os("THEDAS_DEFERRED_LOG_LIGHTS").is_some(),
+        log_materials: std::env::var_os("THEDAS_DEFERRED_LOG_MATERIALS").is_some(),
         profile: std::env::var("THEDAS_RENDER_PROFILE").as_deref() == Ok("1"),
         profile_serial: std::env::var("THEDAS_RENDER_PROFILE_SERIAL").as_deref() == Ok("1"),
     }
