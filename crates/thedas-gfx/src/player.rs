@@ -92,6 +92,7 @@ impl Player {
             global,
             protos,
             root,
+            native_target: None,
             movie: movie.clone(),
             name: name.to_string(),
             classes: HashMap::new(),
@@ -1693,7 +1694,11 @@ fn pick_any(vm: &Vm, d: DisplayId, x: f32, y: f32) -> Option<DisplayId> {
 
 fn pick_in(vm: &Vm, d: DisplayId, x: f32, y: f32, buttons: bool) -> Option<DisplayId> {
     let o = vm.display.get(d)?;
-    if !o.visible || o.hit_test_disable {
+    if !o.visible
+        || o.hit_test_disable
+        || o.mask_for.is_some()
+        || o.mask.is_some_and(|m| !hit_shape_impl(vm, m, x, y, true))
+    {
         return None;
     }
     // Children, topmost first; masks hide what is outside them.
@@ -1711,10 +1716,11 @@ fn pick_in(vm: &Vm, d: DisplayId, x: f32, y: f32, buttons: bool) -> Option<Displ
         if vm.display.get(*c).is_some_and(|co| co.clip_depth.is_some()) {
             continue;
         }
-        if let Some((_, _, m)) = masks.iter().find(|(md, cd, _)| depth > md && depth <= cd) {
-            if !hit_shape(vm, *m, x, y) {
-                continue;
-            }
+        if masks
+            .iter()
+            .any(|(md, cd, m)| depth > md && depth <= cd && !hit_shape_impl(vm, *m, x, y, true))
+        {
+            continue;
         }
         let is_clip = vm.display.get(*c).is_some_and(|co| co.clip().is_some());
         if buttons {
@@ -1748,10 +1754,19 @@ fn pick_in(vm: &Vm, d: DisplayId, x: f32, y: f32, buttons: bool) -> Option<Displ
 
 /// Whether the point (twips, stage space) is on `d`'s drawn content.
 pub fn hit_shape(vm: &Vm, d: DisplayId, x: f32, y: f32) -> bool {
+    hit_shape_impl(vm, d, x, y, false)
+}
+
+fn hit_shape_impl(vm: &Vm, d: DisplayId, x: f32, y: f32, masking: bool) -> bool {
     let Some(o) = vm.display.get(d) else {
         return false;
     };
-    if !o.visible || o.hit_test_disable {
+    if !masking
+        && (!o.visible
+            || o.hit_test_disable
+            || o.mask_for.is_some()
+            || o.mask.is_some_and(|m| !hit_shape_impl(vm, m, x, y, true)))
+    {
         return false;
     }
     let Some(inv) = vm.display.world_matrix(d).invert() else {
@@ -1796,7 +1811,7 @@ pub fn hit_shape(vm: &Vm, d: DisplayId, x: f32, y: f32) -> bool {
             let kids: Vec<DisplayId> = o.children.values().copied().collect();
             kids.iter().any(|k| {
                 vm.display.get(*k).is_some_and(|ko| ko.clip_depth.is_none())
-                    && hit_shape(vm, *k, x, y)
+                    && hit_shape_impl(vm, *k, x, y, masking)
             })
         }
     }
@@ -1928,6 +1943,110 @@ mod queue_tests {
         code.extend_from_slice(text.as_bytes());
         code.extend_from_slice(&[0, 0x26, 0]);
         Arc::from(code)
+    }
+
+    #[test]
+    fn script_masks_reassign_clear_and_detach_on_removal() {
+        let movie = b"FWS\x08\x12\0\0\0\x08\0\0\x1e\x01\0\x40\0\0\0";
+        let mut p = Player::new(movie, "masks", Box::new(Empty), Arc::new(Empty), None).unwrap();
+        let root = p.vm.root;
+        let a = create_empty(&mut p.vm, root, "a", 1).unwrap();
+        let b = create_empty(&mut p.vm, root, "b", 2).unwrap();
+        let mask = create_empty(&mut p.vm, root, "mask", 3).unwrap();
+        let av = p.vm.display_object(a);
+        let bv = p.vm.display_object(b);
+        let mv = p.vm.display_object(mask);
+        assert_eq!(
+            p.vm.call_method(&av, "setMask", std::slice::from_ref(&mv)),
+            Value::Bool(true)
+        );
+        assert_eq!(p.vm.display.get(a).unwrap().mask, Some(mask));
+        assert_eq!(p.vm.display.get(mask).unwrap().mask_for, Some(a));
+        assert_eq!(
+            p.vm.call_method(&bv, "setMask", std::slice::from_ref(&mv)),
+            Value::Bool(true)
+        );
+        assert_eq!(p.vm.display.get(a).unwrap().mask, None);
+        assert_eq!(p.vm.display.get(mask).unwrap().mask_for, Some(b));
+        assert_eq!(
+            p.vm.call_method(&bv, "setMask", &[Value::from("missing")]),
+            Value::Bool(false)
+        );
+        assert_eq!(p.vm.call_method(&bv, "setMask", &[]), Value::Undefined);
+        assert_eq!(p.vm.display.get(b).unwrap().mask, Some(mask));
+        assert_eq!(
+            p.vm.call_method(&bv, "setMask", std::slice::from_ref(&bv)),
+            Value::Bool(false)
+        );
+        assert_eq!(
+            p.vm.call_method(&bv, "setMask", &[Value::Null]),
+            Value::Bool(true)
+        );
+        assert_eq!(p.vm.display.get(mask).unwrap().mask_for, None);
+        p.vm.call_method(&av, "setMask", std::slice::from_ref(&mv));
+        remove_clip(&mut p.vm, mask);
+        assert_eq!(p.vm.display.get(a).unwrap().mask, None);
+        let reused = create_empty(&mut p.vm, root, "newMask", 3).unwrap();
+        assert_ne!(reused, mask);
+        assert!(p.vm.display.set_mask(a, Some(reused)));
+        remove_clip(&mut p.vm, a);
+        assert_eq!(p.vm.display.get(reused).unwrap().mask_for, None);
+    }
+
+    #[test]
+    fn script_mask_paths_use_the_activation_and_masks_clip_mouse_picking() {
+        let movie = b"FWS\x08\x12\0\0\0\x08\0\0\x1e\x01\0\x40\0\0\0";
+        let mut p = Player::new(movie, "masks", Box::new(Empty), Arc::new(Empty), None).unwrap();
+        let root = p.vm.root;
+        let container = create_empty(&mut p.vm, root, "container", 1).unwrap();
+        let target = create_empty(&mut p.vm, container, "target", 0).unwrap();
+        let mask = create_empty(&mut p.vm, container, "mask", 1).unwrap();
+        let rect = |width| crate::display::Drawing {
+            fills: vec![(
+                [255; 4],
+                vec![(0.0, 0.0), (width, 0.0), (width, 400.0), (0.0, 400.0)],
+            )],
+            ..Default::default()
+        };
+        p.vm.display
+            .get_mut(target)
+            .unwrap()
+            .clip_mut()
+            .unwrap()
+            .drawing = Some(rect(400.0));
+        let o = p.vm.display.get_mut(mask).unwrap();
+        o.clip_mut().unwrap().drawing = Some(rect(100.0));
+        o.matrix.tx = 100.0;
+        o.visible = false;
+        o.color.mul[3] = 0.0;
+        let tv = p.vm.display_object(target);
+        let press = p.vm.new_native(|_, _, _| Value::Undefined);
+        p.vm.set(&tv, "onPress", Value::Object(press));
+        // target.setMask("mask"), evaluated on container's timeline.
+        let mut code = Vec::new();
+        let string = |code: &mut Vec<u8>, value: &str| {
+            code.push(0x96);
+            code.extend_from_slice(&((value.len() + 2) as u16).to_le_bytes());
+            code.push(0);
+            code.extend_from_slice(value.as_bytes());
+            code.push(0);
+        };
+        string(&mut code, "mask");
+        code.extend_from_slice(&[0x96, 5, 0, 7, 1, 0, 0, 0]);
+        string(&mut code, "target");
+        code.push(0x1c);
+        string(&mut code, "setMask");
+        code.extend_from_slice(&[0x52, 0x17, 0]);
+        interp::run_actions(&mut p.vm, &Arc::from(code), container);
+        assert_eq!(p.vm.native_target, None);
+        assert_eq!(p.vm.display.get(target).unwrap().mask, Some(mask));
+        assert_eq!(pick(&p.vm, 150.0, 200.0), Some(target));
+        assert_eq!(pick(&p.vm, 50.0, 200.0), None);
+        assert_eq!(pick(&p.vm, 250.0, 200.0), None);
+        p.vm.display.get_mut(mask).unwrap().matrix.tx = 200.0;
+        assert_eq!(pick(&p.vm, 150.0, 200.0), None);
+        assert_eq!(pick(&p.vm, 250.0, 200.0), Some(target));
+        assert!(!hit_shape(&p.vm, mask, 250.0, 200.0));
     }
 
     #[test]

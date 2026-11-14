@@ -106,6 +106,8 @@ pub struct Vm {
     pub global: ObjId,
     pub protos: Protos,
     pub root: DisplayId,
+    /// Timeline target of the current bytecode activation, for native path arguments.
+    pub(crate) native_target: Option<DisplayId>,
     pub movie: Arc<Movie>,
     pub name: String,
     /// Registered classes (`Object.registerClass`) by character id.

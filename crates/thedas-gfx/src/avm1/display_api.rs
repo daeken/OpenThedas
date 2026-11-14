@@ -1358,6 +1358,42 @@ fn nums(vm: &mut Vm, o: &Value, keys: &[&str]) -> Vec<f64> {
         .collect()
 }
 
+fn mc_set_mask(vm: &mut Vm, this: Value, args: &[Value]) -> Value {
+    let Some(target) = vm.display_of(&this) else {
+        return Value::Undefined;
+    };
+    let Some(value) = args.first() else {
+        return Value::Undefined;
+    };
+    let mask = if value.is_nullish() {
+        None
+    } else {
+        let activation = vm.native_target.unwrap_or(vm.root);
+        let object = display_value(vm, activation)
+            .as_object()
+            .unwrap_or(vm.global);
+        let scope = std::rc::Rc::new(super::Scope {
+            object,
+            kind: super::ScopeKind::Target,
+            parent: Some(std::rc::Rc::new(super::Scope {
+                object: vm.global,
+                kind: super::ScopeKind::Global,
+                parent: None,
+            })),
+        });
+        let Some(mask) = vm.as_display(value, &scope, activation) else {
+            return Value::Bool(false);
+        };
+        Some(mask)
+    };
+    let ok = vm.display.set_mask(target, mask);
+    if ok {
+        vm.dirty = true;
+        vm.pick_dirty = true;
+    }
+    Value::Bool(ok)
+}
+
 pub fn install(vm: &mut Vm) {
     let g = vm.global;
     let p = vm.protos;
@@ -1422,10 +1458,7 @@ pub fn install(vm: &mut Vm) {
         ("getSWFVersion", |_, _, _| Value::Number(8.0)),
         ("getBytesLoaded", |_, _, _| Value::Number(1.0)),
         ("getBytesTotal", |_, _, _| Value::Number(1.0)),
-        ("setMask", |vm, _, _| {
-            vm.warn_once("setMask is not supported".into());
-            Value::Undefined
-        }),
+        ("setMask", mc_set_mask),
     ];
     for (n, f) in mc_methods {
         vm.define_native(p.movie_clip, n, *f);
