@@ -1,7 +1,8 @@
 //! The aiming reticle: where an ability aimed at a place would land, drawn on the ground
-//! under the mouse while the player picks it, with the world: after the level and before the
-//! creatures, as the selection rings are (`crate::rings`), so creatures stand over it. A circle the size of its area (a fireball's
-//! blast), a cone from the user (a cone of cold), or a small ring for a single point.
+//! under the mouse while the player picks it. A circle the size of its area (a fireball's
+//! blast), a cone from the user (a cone of cold), or a small ring for a single point. It is
+//! drawn with the world, after the level and before the creatures, as the selection rings
+//! are (`crate::rings`), so creatures stand over it.
 //! Provisional: the game's own reticle art is not used; this is a plain outline.
 
 use glam::{Vec2, Vec3};
