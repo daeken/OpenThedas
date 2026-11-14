@@ -40,6 +40,88 @@ pub const EYE_SHADOW_INTENSITY: u32 = 9;
 pub const BLUSH_INTENSITY: u32 = 47;
 pub const COMPLEXION: u32 = 44;
 
+/// The face screen's Portrait group (labels 374751-374757): how the creature's portrait is
+/// framed. Their setters (0x7ff310, 0x7ff350, 0x7ff390, 0x7ff3d0, 0x7ff410, 0x7ff450 from the
+/// slider table 0x80ada0) write the creature's portrait settings (its appearance block
+/// +0x598: +0x58 look up/down, +0x5c turn, +0x60 camera distance, +0x64 and +0x68 the
+/// moves, +0x6c the background), the values `portraits.gda` holds for a follower.
+pub const PORTRAIT_PITCH: u32 = 50;
+pub const PORTRAIT_TURN: u32 = 51;
+pub const PORTRAIT_DISTANCE: u32 = 52;
+pub const PORTRAIT_MOVE_X: u32 = 53;
+pub const PORTRAIT_MOVE_Y: u32 = 54;
+pub const PORTRAIT_BACKGROUND: u32 = 56;
+
+/// How a creature's portrait is framed: `portraits.gda`'s row for its tag, else its
+/// `default` row, with the face screen's Portrait choices over it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Portrait {
+    /// Degrees the camera looks up (+) or down at the face (`CameraPitch`).
+    pub pitch: f32,
+    /// Degrees the camera turns round the face from its front (`CameraRotation`).
+    pub turn: f32,
+    /// Metres from the face (`CameraDistance`).
+    pub distance: f32,
+    /// Metres the camera moves along its right and up (the columns hashed 0xdb253899 and
+    /// 0x3a4bfc34; names not known).
+    pub shift: (f32, f32),
+    /// The background picture (1 to 20; column 0xc9210008).
+    pub background: i32,
+}
+
+/// `portraits.gda`'s columns without a known name.
+const PORTRAIT_SHIFT_X: u32 = 0xdb25_3899;
+const PORTRAIT_SHIFT_Y: u32 = 0x3a4b_fc34;
+const PORTRAIT_BACKGROUND_COLUMN: u32 = 0xc921_0008;
+
+impl Sim {
+    /// Creature `id`'s portrait framing (see [`Portrait`]). Provisional: the face screen's
+    /// starting values are taken to be the `default` row's (the exe's are not traced), and
+    /// the moves' directions are not traced.
+    pub fn portrait(&self, id: thedas_script::vm::ObjectId) -> Portrait {
+        use thedas_formats::gda::Cell;
+        let o = self.world.get(id);
+        let tables = self.world.tables();
+        let table = tables.get(0, "portraits");
+        let row = table.as_ref().and_then(|t| {
+            o.and_then(|o| t.find("Tag", &o.tag))
+                .or_else(|| t.find("Tag", "default"))
+        });
+        let num = |c: Option<&Cell>, d: f32| match c {
+            Some(Cell::Float(v)) => *v as f32,
+            Some(Cell::Int(v)) => *v as f32,
+            _ => d,
+        };
+        let cell = |name: &str| table.as_ref().zip(row).and_then(|(t, r)| t.cell(name, r));
+        let hashed = |h: u32| {
+            table
+                .as_ref()
+                .zip(row)
+                .and_then(|(t, r)| t.cell_by_hash(h, r))
+        };
+        let mut p = Portrait {
+            pitch: num(cell("CameraPitch"), 0.0),
+            turn: num(cell("CameraRotation"), 0.0),
+            distance: num(cell("CameraDistance"), 0.7),
+            shift: (
+                num(hashed(PORTRAIT_SHIFT_X), 0.0),
+                num(hashed(PORTRAIT_SHIFT_Y), 0.0),
+            ),
+            background: num(hashed(PORTRAIT_BACKGROUND_COLUMN), 1.0) as i32,
+        };
+        if let Some(o) = o {
+            let chosen = |s: u32| o.face_choices.get(&s).copied();
+            p.pitch = chosen(PORTRAIT_PITCH).unwrap_or(p.pitch);
+            p.turn = chosen(PORTRAIT_TURN).unwrap_or(p.turn);
+            p.distance = chosen(PORTRAIT_DISTANCE).unwrap_or(p.distance);
+            p.shift.0 = chosen(PORTRAIT_MOVE_X).unwrap_or(p.shift.0);
+            p.shift.1 = chosen(PORTRAIT_MOVE_Y).unwrap_or(p.shift.1);
+            p.background = chosen(PORTRAIT_BACKGROUND).map_or(p.background, |v| v as i32);
+        }
+        p
+    }
+}
+
 /// The face-shape sliders' morph targets (slider id, the target its negative side
 /// weighs, the one its positive side weighs; one target: the slider weighs it alone).
 pub const FACE_TARGETS: &[(u32, Option<&str>, &str)] = &[

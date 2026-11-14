@@ -22,9 +22,9 @@ Found by reading the code at main on 2026-11-12: provisional markers, stubs, ign
 
 ### Cutscene actors
 
-- **CAM-011** **Animations are layered, not weight-blended.** Original: not traced. Ours: animations laid over each other by bones moved; snap-to-walkmesh sets actors on the level surface; loop rule guessed; the cutscene's own creatures take their template's look. Evidence: `crates/thedas-app/src/cutactors.rs:16`. Size: M. Depends: none. Kind: provisional.
+- **CAM-011** **Animations are layered, not weight-blended.** Original: not traced. Ours: animations laid over each other by bones moved; snap-to-walkmesh sets actors on the level surface; loop rule partly inferred (an animation loops when the creature's own trees loop it, else when the cutscene's tree loops its node, as every `.cub` node does: a passer-by's `mov.walkf` cycle keeps walking while its position track moves it; the executable's own wrap of a track's time is not traced, only its stop 0.001 s short of the track's end, 0x7db400); the cutscene's own creatures take their template's look. Evidence: `crates/thedas-app/src/cutactors.rs:16`. Size: M. Depends: none. Kind: provisional.
 - **CAM-012** **Animations held until the conversation closes.** Original: leaves the model's animation as the cutscene set it (per comment). Ours: kept until the conversation closes, then dropped. Evidence: `crates/thedas-app/src/cutactors.rs:110`. Size: S. Depends: none. Kind: provisional.
-- **CAM-013** **Facial animation in cutscenes.** Original: facial animation / lip sync in cutscenes. Ours: no code found. Evidence: `crates/thedas-app/src/cutactors.rs:1`. Size: L. Depends: FMT-027. Kind: missing.
+- **CAM-013** **Facial animation in cutscenes.** Original: lines a cutscene voices move their speakers' faces. Ours: only conversation lines are lip synced (AUD-052); a cutscene's own lines are not. Evidence: `crates/thedas-app/src/faces.rs:1`. Size: S. Depends: AUD-052. Kind: missing.
 
 ### Conversation camera
 
