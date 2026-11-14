@@ -1297,7 +1297,10 @@ fn event_variation(pitch: f32, r: f32, v: f32, flags: u32, (u1, u2): (f32, f32))
 /// `pre400_ogre`), the delay in seconds before it is cued, and the `combat` token. The
 /// cutscenes' `music/cutscene/*_switch` events are such cues and play nothing else.
 ///
-/// Provisional: what the `combat` token changes (the music's +0x15d) is not traced.
+/// The `combat` token is read but not acted on. In the exe it marks the cued track (music
+/// +0x15d, copied to +0x15c when the track starts, 0x5c2f0e); when a cutscene passes its last
+/// time mark (CCutscene 0x7cf2e0) and the playing track is so marked, `main` is cued at once
+/// (0x5b73f0). None of the 77 `#music:` cues in the shipped banks carries the token.
 #[derive(Clone, Debug, PartialEq)]
 pub struct MusicCue {
     pub event: String,
