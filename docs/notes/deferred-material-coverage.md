@@ -88,8 +88,20 @@ The shared G-buffer uses the prop material code for these unlightmapped surfaces
 This introduces the deferred renderer's Lambert lighting for these tree families.
 The faithful tree materials have their own height-dependent shadow adjustments;
 fronds also clamp the final colour. Cutout families retain single-sample binary
-coverage at their G-buffer edges under MSAA. Tree point-shadow caster coverage and
-far billboards remain outstanding.
+coverage at their G-buffer edges under MSAA. Far billboards remain outstanding.
+
+The four tree families also cast into point-light cubes independently of G-buffer
+coverage. A separate portable uniform stream runs the same translated vertex shader
+with an identity view-projection, preserving wind/placement and the viewing camera's
+leaf orientation. Offscreen placements remain eligible, with the same viewing LOD
+range and 8-bit cutout reference; faded or inactive placements are absent. Branches
+remain opaque. These point casters intentionally include trees whose scene flag
+excludes them from faithful sun shadows. Neither that sun path nor its instance
+groups/constants change. Exact cache keys include vertex constants, index range,
+alpha reference, bounds and immutable geometry/material identities. Wind, LOD,
+camera-dependent leaf orientation and removal invalidate affected cubes.
+`THEDAS_DEFERRED_TREE_SHADOWS=0` disables planning; it is read once. A renderer-local
+`THEDAS_BENCH_DEFERRED_COMPARE=tree-shadows` control compares casting within one load.
 
 Room-assigned, skinned, multipass or incompatible tree pipelines retain forward
 rendering. Any runtime-faded tree part sends the renderer's complete family through
