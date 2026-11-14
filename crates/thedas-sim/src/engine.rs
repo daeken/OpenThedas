@@ -1419,7 +1419,20 @@ pub fn call(
         "GetDistanceBetween" => {
             let (x, y) = (h.object(obj(a, 0)), h.object(obj(a, 1)));
             ok(Value::Float(match (x, y) {
-                (Some(x), Some(y)) if x.area == y.area => dist(x.position, y.position),
+                (Some(x), Some(y)) if x.area == y.area => {
+                    let distance = dist(x.position, y.position);
+                    if h.sim.game == thedas_vfs::Game::DragonAge2
+                        && int(a, 2) != 0
+                        && x.kind == ObjectKind::Creature
+                        && y.kind == ObjectKind::Creature
+                    {
+                        // 0x4db770 subtracts both personal spaces when asked;
+                        // overlapping creatures may return a negative distance.
+                        distance - h.sim.body_radius(x.id) - h.sim.body_radius(y.id)
+                    } else {
+                        distance
+                    }
+                }
                 _ => -1.0,
             }))
         }
@@ -9991,6 +10004,53 @@ mod coverage_tests {
             script: "test".into(),
         };
         call(&mut h, caller, &f, a).unwrap().unwrap()
+    }
+
+    #[test]
+    fn da2_distance_can_subtract_both_personal_spaces() {
+        use thedas_formats::gda::Cell;
+        let table = Arc::new(
+            EngineTable::parse(
+                b"float GetDistanceBetween(object a, object b, int spaces = 0) = 37;",
+            )
+            .unwrap(),
+        );
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        let tables = crate::m2da::Tables::empty();
+        tables.insert(
+            "apr_base",
+            &["PERSPACE"],
+            vec![(1, vec![Cell::Float(0.35)]), (2, vec![Cell::Float(0.95)])],
+        );
+        s.world.tables = Arc::new(tables);
+        let area = s.world.spawn(ObjectKind::Area, "arena");
+        let x = s.world.spawn(ObjectKind::Creature, "human");
+        let y = s.world.spawn(ObjectKind::Creature, "ogre");
+        for (id, appearance) in [(x, 1), (y, 2)] {
+            let o = s.world.get_mut(id).unwrap();
+            o.area = Some(area);
+            o.appearance = appearance;
+        }
+        s.world.get_mut(y).unwrap().position = [3., 4., 0.];
+        let distance = |s: &mut Sim, target, spaces| match run(
+            s,
+            x,
+            "GetDistanceBetween",
+            &[Value::Object(x), Value::Object(target), Value::Int(spaces)],
+        ) {
+            Some(Value::Float(v)) => v,
+            v => panic!("expected distance, got {v:?}"),
+        };
+        // Origins keeps its existing semantics, including the optional flag.
+        assert_eq!(distance(&mut s, y, 1), 5.);
+        s.game = thedas_vfs::Game::DragonAge2;
+        assert_eq!(distance(&mut s, y, 0), 5.);
+        assert!((distance(&mut s, y, 1) - 3.7).abs() < 0.0001);
+        s.world.get_mut(y).unwrap().position = [0.; 3];
+        assert!((distance(&mut s, y, 1) + 1.3).abs() < 0.0001);
+        assert_eq!(distance(&mut s, OBJECT_INVALID, 1), -1.);
+        s.world.get_mut(y).unwrap().area = None;
+        assert_eq!(distance(&mut s, y, 1), -1.);
     }
 
     fn effect_value(s: &mut Sim, e: Effect) -> Value {
