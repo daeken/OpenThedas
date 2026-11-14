@@ -3032,7 +3032,15 @@ pub fn call(
             }
             void()
         }
-        "DoAutoSave" | "TakeScreenshot" | "SetCreatureGoreLevel" => {
+        // The game is saved to the autosave slot: the presentation writes it (see
+        // `World::autosave_requested`), as it writes every save. Provisional: when
+        // DAOrigins.exe writes it (at once, or when the update ends) and what it does in a
+        // tutorial that forbids saving are not traced.
+        "DoAutoSave" => {
+            h.sim.world.autosave_requested = true;
+            void()
+        }
+        "TakeScreenshot" | "SetCreatureGoreLevel" => {
             h.sim.world.trace.push(TraceEntry::Log {
                 t,
                 channel: -3,
@@ -4833,6 +4841,7 @@ mod tests {
     use super::*;
 
     const LDF: &str = "void SetCooldown(object o, int n, float f, string s) = 1;\n\
+        void DoAutoSave() = 9001;\n\
         float GetRemainingCooldown(object o, int n, string s) = 2;\n\
         void RemoveItem(object o, int n) = 3;\n\
         void SetFollowerState(object o, int n) = 4;\n\
@@ -5785,6 +5794,16 @@ mod tests {
             Some(objects(vec![team[0], team[1]])),
             "inactive members count, other areas' do not"
         );
+    }
+
+    #[test]
+    fn an_autosave_is_asked_of_the_presentation() {
+        let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        let m = s.world.spawn(ObjectKind::Module, "module");
+        assert!(!s.world.autosave_requested);
+        run(&mut s, m, "DoAutoSave", &[]);
+        assert!(s.world.autosave_requested);
     }
 
     #[test]
