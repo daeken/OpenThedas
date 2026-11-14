@@ -3030,11 +3030,9 @@ pub fn call(
             }
             void()
         }
-        // Whether the conversation line whose condition or action is running is ambient:
-        // DAOrigins.exe (0x65dc00) returns the flag the conversation sets from the line's
-        // field 12207 before running its scripts (0x7f04ca). Provisional: another path
-        // (0x7eee00) sets it from a flag of the conversation itself, not traced; here it is
-        // always the line's.
+        // DAOrigins.exe 0x65dc00 reads the script context: conditions use the line's
+        // field 12207 (0x7f04ca), actions the conversation's ambient state (0x7eee00).
+        // dialog.rs sets the appropriate context before each script.
         "DialogIsAmbient" => ok(b(h.sim.dialog_ambient)),
         // DAOrigins.exe (0x6510f0) stops the ambient lines still to be spoken by an object
         // (all of them for OBJECT_INVALID) and returns TRUE.
