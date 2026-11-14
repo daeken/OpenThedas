@@ -154,6 +154,8 @@ pub struct Mounted {
     pub layers: usize,
     /// Why it was skipped or what in it was not loaded; empty when all went well.
     pub problems: Vec<String>,
+    /// Add-ins in a DAZIP, including the manifest's display and prerequisite metadata.
+    pub addins: Vec<AddIn>,
 }
 
 /// What one mod layer does to the stack, counted over every name it provides.
@@ -373,7 +375,8 @@ impl ModList {
             .map(|entry| {
                 let before = overlay.layers().len();
                 let mut problems = Vec::new();
-                if let Err(e) = mount_entry(overlay, entry, cache, &mut problems) {
+                let mut addins = Vec::new();
+                if let Err(e) = mount_entry(overlay, entry, cache, &mut problems, &mut addins) {
                     overlay.truncate(before);
                     problems.push(e.to_string());
                 }
@@ -381,6 +384,7 @@ impl ModList {
                     entry: entry.clone(),
                     layers: overlay.layers().len() - before,
                     problems,
+                    addins,
                 }
             })
             .collect()
@@ -441,6 +445,7 @@ fn mount_entry(
     entry: &ModEntry,
     cache: &Path,
     problems: &mut Vec<String>,
+    addins: &mut Vec<AddIn>,
 ) -> Result<()> {
     let path = &entry.path;
     if path.is_dir() {
@@ -463,6 +468,7 @@ fn mount_entry(
             // package's override files, as a mod layer.
             let package = unpack_dazip(path, cache)?;
             problems.extend(package.problems);
+            addins.extend(package.addins.clone());
             let label = |p: &Path| label_under(cache, p);
             match &package.override_dir {
                 Some(dir) => mount_folder(overlay, dir, &label, problems)?,
@@ -847,7 +853,8 @@ pub fn prune_cache(cache: &Path, list: &ModList) -> Vec<CacheEntry> {
 pub struct Dazip {
     /// The folder it was unpacked into.
     pub root: PathBuf,
-    /// Its add-ins (`Contents/addins/*`), described by the package's manifest and enabled.
+    /// Its add-ins (`Contents/addins/*`), each described by its own manifest item. Listing
+    /// the package requests enablement; Type and GameVersion still gate mounting.
     pub addins: Vec<AddIn>,
     /// Its `Contents/packages/core/override` folder, when it has one.
     pub override_dir: Option<PathBuf>,
@@ -937,13 +944,14 @@ pub fn unpack_dazip(path: &Path, cache: &Path) -> Result<Dazip> {
             }
         }
     }
-    let manifest = resolve_ci(&root, "manifest.xml")
+    let manifest_path = resolve_ci(&root, "manifest.xml")
         .filter(|p| p.is_file())
-        .and_then(|p| std::fs::read(p).ok())
-        .map(|b| String::from_utf8_lossy(&b).into_owned())
-        .unwrap_or_default();
+        .ok_or_else(|| bad("no Manifest.xml in the package".into()))?;
+    let manifest = std::fs::read(&manifest_path).map_err(io(&manifest_path))?;
+    let manifest =
+        crate::manifest::decode(&manifest).map_err(|e| bad(format!("Manifest.xml: {e}")))?;
     let mut addins = Vec::new();
-    let items = crate::install::manifest_items(&manifest);
+    let items = crate::manifest::items(&manifest).map_err(|e| bad(format!("Manifest.xml: {e}")))?;
     let addins_dir = join_ci(&root, "Contents/addins");
     if let Ok(rd) = std::fs::read_dir(&addins_dir) {
         let mut dirs: Vec<PathBuf> = rd.flatten().map(|e| e.path()).collect();
@@ -951,22 +959,29 @@ pub fn unpack_dazip(path: &Path, cache: &Path) -> Result<Dazip> {
         dirs.sort();
         for dir in dirs {
             let name = dir.file_name().unwrap().to_string_lossy().into_owned();
-            // A package with several add-ins has a manifest item for each, matched by UID
-            // to its folder; a folder no item names takes the first item's settings under
-            // its own name.
-            let mut addin = match items.iter().find(|i| i.uid.eq_ignore_ascii_case(&name)) {
+            // Each folder must have its own record; never inherit another item's gates
+            // or campaign. The original discovers add-ins from registry records by UID.
+            let addin = match items.iter().find(|i| i.uid.eq_ignore_ascii_case(&name)) {
                 Some(i) => AddIn { dir, ..i.clone() },
                 None => {
-                    let mut a = crate::install::addin_from_manifest(&manifest, dir, name.clone());
-                    if !addins.is_empty() || !items.is_empty() {
-                        a.uid = name;
-                    }
-                    a
+                    problems.push(format!(
+                        "add-in folder {name}: no matching manifest item, skipped"
+                    ));
+                    continue;
                 }
             };
-            // Listing the package is the player's way of enabling it.
-            addin.enabled = true;
+            if !addin.enabled {
+                problems.push(format!("add-in {name}: Type is not 1 or 2, not mounted"));
+            }
             addins.push(addin);
+        }
+    }
+    for item in items {
+        if !addins.iter().any(|a| a.uid.eq_ignore_ascii_case(&item.uid)) {
+            problems.push(format!(
+                "add-in {}: manifest item has no folder, skipped",
+                item.uid
+            ));
         }
     }
     let override_dir =
@@ -1037,7 +1052,13 @@ pub fn mount_default(vfs: &mut Vfs, user: Option<&Path>) -> Vec<Mounted> {
             inner: None,
         };
         let mut problems = Vec::new();
-        if let Err(e) = mount_entry(&mut overlay, &entry, &cache_dir(), &mut problems) {
+        if let Err(e) = mount_entry(
+            &mut overlay,
+            &entry,
+            &cache_dir(),
+            &mut problems,
+            &mut Vec::new(),
+        ) {
             problems.push(e.to_string());
         }
         for p in problems {
@@ -1273,15 +1294,10 @@ mod tests {
             .iter()
             .map(|a| (a.uid.as_str(), a.priority, a.extends_base_campaign()))
             .collect();
-        // Each by its own item; a folder no item names takes the first item's settings.
-        assert_eq!(
-            got,
-            [
-                ("first_one", 10, true),
-                ("second_one", 40, false),
-                ("third", 10, true)
-            ]
-        );
+        // Each by its own item; an unmatched folder cannot borrow another item's settings.
+        assert_eq!(got, [("first_one", 10, true), ("second_one", 40, false)]);
+        assert_eq!(d.problems.len(), 1);
+        assert!(d.problems[0].contains("third"));
         // Their levels are searched with the install's.
         let install_root = base.join("install");
         std::fs::create_dir_all(install_root.join("packages/core/env")).unwrap();
@@ -1301,7 +1317,7 @@ mod tests {
         let cache = base.join("cache");
         let package = base.join("My Mod (v1).dazip");
         let manifest = br#"<Manifest Type="AddIn"><AddInsList><AddInItem UID="my_mod"
-            Name="My Mod" ExtendedModuleUID="Single Player" Priority="77" Enabled="0">"#;
+            Name="My Mod" ExtendedModuleUID="Single Player" Priority="77" Enabled="0"><Type>2</Type></AddInItem></AddInsList></Manifest>"#;
         zip_of(
             &package,
             &[

@@ -1962,8 +1962,9 @@ impl Sim {
         self.body_radius(id) + self.body_radius(target) + MELEE_GAP
     }
 
-    /// How close `id` must be to attack: its main-hand weapon's range (item stat 9 in
-    /// `itemstats.gda`) when that is a ranged weapon, otherwise [`MELEE_REACH`].
+    /// How close `id` must be to attack. DA:O reads item stat 9 in `itemstats.gda`.
+    /// DA2 reads the equipped ranged weapon's combat style and its maximum range class
+    /// in tables 12000 -> 300 -> 301. Other weapons use [`MELEE_REACH`].
     pub fn attack_reach(&self, id: ObjectId) -> f32 {
         let slot = constant_of(self, "INVENTORY_SLOT_MAIN");
         let base = self
@@ -1973,6 +1974,29 @@ impl Sim {
             .and_then(|w| self.world.get(*w))
             .and_then(|w| w.fields.get("BaseItem").copied());
         let tables = self.world.tables();
+        if self.game == thedas_vfs::Game::DragonAge2 {
+            let range = base.and_then(|base| {
+                let items = tables.get(12000, "")?;
+                // DragonAge2.exe 0x53b1a0 classifies types 5 and 6 as ranged.
+                let kind = crate::engine::cell_int(items.cell_by_hash(0x12a0_2374, base as i64));
+                if !matches!(kind, 5 | 6) {
+                    return None;
+                }
+                // 0x55ff60 selects the equipped weapon's combat style from ITM_.
+                let style = crate::engine::cell_int(items.cell_by_hash(0x93b9_42d7, base as i64));
+                let styles = tables.get(300, "")?;
+                // ability_core reads this style's maximum range class. The native
+                // ability range checks at 0x561033 and 0x641104 read its upper distance.
+                let row = crate::engine::cell_int(styles.cell_by_hash(0x065e_4d58, style as i64));
+                let ranges = tables.get(301, "")?;
+                Some(crate::engine::cell_float(
+                    ranges.cell_by_hash(0x814f_8b88, row as i64),
+                ))
+            });
+            return range
+                .filter(|r| r.is_finite() && *r > MELEE_REACH)
+                .unwrap_or(MELEE_REACH);
+        }
         let range = base.and_then(|b| {
             let label = tables
                 .get(0, "itemstatdefines")
@@ -2019,6 +2043,87 @@ mod tests {
     fn sim() -> Sim {
         let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
         Sim::new(Arc::new(Vfs::new()), table, 3)
+    }
+
+    #[test]
+    fn da2_ranged_attacks_read_equipment_style_and_combat_range() {
+        let mut s = sim();
+        let tables = crate::m2da::Tables::empty();
+        tables.insert(
+            "#12000",
+            &["#12a02374", "#93b942d7"],
+            vec![
+                (1200, vec![Cell::Int(5), Cell::Int(15)]),
+                (1101, vec![Cell::Int(6), Cell::Int(16)]),
+                (1000, vec![Cell::Int(2), Cell::Int(15)]),
+                (1201, vec![Cell::Int(5), Cell::Int(99)]),
+                (1202, vec![Cell::Int(5), Cell::Int(17)]),
+            ],
+        );
+        tables.insert(
+            "#300",
+            &["#065e4d58"],
+            vec![
+                (15, vec![Cell::Int(7)]),
+                (16, vec![Cell::Int(6)]),
+                (17, vec![Cell::Int(8)]),
+            ],
+        );
+        tables.insert(
+            "#301",
+            &["#814f8b88"],
+            vec![
+                (7, vec![Cell::Float(27.0)]),
+                (6, vec![Cell::Float(32.0)]),
+                (8, vec![Cell::Float(f64::NAN)]),
+            ],
+        );
+        tables.insert(
+            "itemstatdefines",
+            &["Label"],
+            vec![(9, vec![Cell::String("Range".into())])],
+        );
+        tables.insert(
+            "itemstats",
+            &["Range"],
+            vec![(1200, vec![Cell::Float(25.0)])],
+        );
+        s.world.tables = Arc::new(tables);
+        let attacker = s.world.spawn(ObjectKind::Creature, "mage");
+        let target = s.world.spawn(ObjectKind::Creature, "target");
+        let staff = s.world.spawn(ObjectKind::Item, "staff");
+        s.world
+            .get_mut(staff)
+            .unwrap()
+            .fields
+            .insert("BaseItem".into(), 1200);
+        let slot = constant_of(&s, "INVENTORY_SLOT_MAIN");
+        s.world
+            .get_mut(attacker)
+            .unwrap()
+            .equipment
+            .insert(slot, staff);
+        assert_eq!(s.attack_reach(attacker), 25.0, "DA:O's item stat");
+        s.game = thedas_vfs::Game::DragonAge2;
+        assert_eq!(s.attack_reach(attacker), 27.0, "DA2's table chain");
+        assert_eq!(s.reach_to(attacker, target), 27.0);
+        for (base, expected) in [
+            (1101, 32.0),
+            (1000, MELEE_REACH),
+            (1201, MELEE_REACH),
+            (1202, MELEE_REACH),
+            (9999, MELEE_REACH),
+        ] {
+            s.world
+                .get_mut(staff)
+                .unwrap()
+                .fields
+                .insert("BaseItem".into(), base);
+            assert_eq!(s.attack_reach(attacker), expected, "base {base}");
+        }
+        s.world.get_mut(attacker).unwrap().equipment.clear();
+        assert_eq!(s.attack_reach(attacker), MELEE_REACH);
+        assert_eq!(s.attack_reach(OBJECT_INVALID), MELEE_REACH);
     }
 
     #[test]

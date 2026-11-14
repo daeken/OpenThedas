@@ -564,6 +564,22 @@ fn mc_create_empty(vm: &mut Vm, this: Value, args: &[Value]) -> Value {
     }
 }
 
+fn mc_duplicate(vm: &mut Vm, this: Value, args: &[Value]) -> Value {
+    let Some(source) = this_display(vm, &this) else {
+        return Value::Undefined;
+    };
+    let Some(name) = args.first() else {
+        return Value::Undefined;
+    };
+    let name = vm.to_str(name);
+    let depth = args.get(1).map(|v| vm.to_number(v)).unwrap_or(0.0);
+    let init = args.get(2).and_then(Value::as_object);
+    match crate::player::duplicate(vm, source, &name, super::value::to_int32(depth), init) {
+        Some(d) => display_value(vm, d),
+        None => Value::Undefined,
+    }
+}
+
 fn mc_create_text_field(vm: &mut Vm, this: Value, args: &[Value]) -> Value {
     let Some(parent) = this_display(vm, &this) else {
         return Value::Undefined;
@@ -724,6 +740,42 @@ fn mc_load_movie(vm: &mut Vm, this: Value, args: &[Value]) -> Value {
 fn mc_unload_movie(vm: &mut Vm, this: Value, _: &[Value]) -> Value {
     if let Some(d) = this_display(vm, &this) {
         crate::player::unload(vm, d);
+    }
+    Value::Undefined
+}
+
+fn bitmap_load(vm: &mut Vm, this: Value, args: &[Value]) -> Value {
+    let name = vm.to_str(&arg(args, 0));
+    let image = vm.movie.exports.get(&name.to_ascii_lowercase())
+        .and_then(|id| vm.movie.characters.get(id))
+        .or_else(|| vm.movie.characters.values().find(|c| matches!(c, crate::swf::Character::Image(i) if i.export_name.eq_ignore_ascii_case(&name))));
+    let Some(crate::swf::Character::Image(image)) = image else {
+        return Value::Null;
+    };
+    let (url, width, height) = (image.file.clone(), image.width, image.height);
+    let proto = vm.get(&this, "prototype").as_object();
+    let object = vm.alloc(proto, OKind::BitmapData { url, width, height });
+    for (key, size) in [("width", width), ("height", height)] {
+        vm.define(
+            object,
+            key,
+            Value::Number(size as f64),
+            DONT_ENUM | super::object::READ_ONLY | super::object::DONT_DELETE,
+        );
+    }
+    Value::Object(object)
+}
+
+fn mc_attach_bitmap(vm: &mut Vm, this: Value, args: &[Value]) -> Value {
+    let bitmap = arg(args, 0)
+        .as_object()
+        .and_then(|id| vm.heap.get(id))
+        .map(|o| o.kind.clone());
+    if let (Some(parent), Some(OKind::BitmapData { url, width, height })) =
+        (vm.display_of(&this), bitmap)
+    {
+        let depth = super::value::to_int32(vm.to_number(&arg(args, 1)));
+        crate::player::attach_bitmap(vm, parent, depth, url, width, height);
     }
     Value::Undefined
 }
@@ -1188,6 +1240,59 @@ fn selection_get_focus(vm: &mut Vm, _: Value, _: &[Value]) -> Value {
     }
 }
 
+fn selection_index(vm: &Vm, which: u8) -> Value {
+    let Some(t) = vm
+        .focus
+        .and_then(|f| vm.display.get(f))
+        .and_then(|o| o.text())
+    else {
+        return Value::Number(-1.0);
+    };
+    let (begin, end) = t.selection();
+    let index = match which {
+        0 => begin,
+        1 => end,
+        _ => t.caret.unwrap_or(end).min(t.len()),
+    };
+    Value::Number(
+        t.text()
+            .chars()
+            .take(index)
+            .map(|c| c.len_utf16())
+            .sum::<usize>() as f64,
+    )
+}
+
+fn selection_set_range(vm: &mut Vm, _: Value, args: &[Value]) -> Value {
+    if args.is_empty() {
+        return Value::Undefined;
+    }
+    let begin = super::value::to_int32(vm.to_number(&arg(args, 0))).max(0) as usize;
+    let end = args
+        .get(1)
+        .map(|v| super::value::to_int32(vm.to_number(v)).max(0) as usize)
+        .unwrap_or(usize::MAX);
+    if let Some(t) = vm
+        .focus
+        .and_then(|f| vm.display.get_mut(f))
+        .and_then(|o| o.text_mut())
+    {
+        let text = t.text();
+        let char_index = |index| {
+            let mut units = 0;
+            text.chars()
+                .take_while(|c| {
+                    units += c.len_utf16();
+                    units <= index
+                })
+                .count()
+        };
+        t.set_selection(char_index(begin), char_index(end));
+        vm.dirty = true;
+    }
+    Value::Undefined
+}
+
 fn selection_set_focus(vm: &mut Vm, _: Value, args: &[Value]) -> Value {
     let a = arg(args, 0);
     let d = match &a {
@@ -1306,6 +1411,42 @@ fn nums(vm: &mut Vm, o: &Value, keys: &[&str]) -> Vec<f64> {
         .collect()
 }
 
+fn mc_set_mask(vm: &mut Vm, this: Value, args: &[Value]) -> Value {
+    let Some(target) = vm.display_of(&this) else {
+        return Value::Undefined;
+    };
+    let Some(value) = args.first() else {
+        return Value::Undefined;
+    };
+    let mask = if value.is_nullish() {
+        None
+    } else {
+        let activation = vm.native_target.unwrap_or(vm.root);
+        let object = display_value(vm, activation)
+            .as_object()
+            .unwrap_or(vm.global);
+        let scope = std::rc::Rc::new(super::Scope {
+            object,
+            kind: super::ScopeKind::Target,
+            parent: Some(std::rc::Rc::new(super::Scope {
+                object: vm.global,
+                kind: super::ScopeKind::Global,
+                parent: None,
+            })),
+        });
+        let Some(mask) = vm.as_display(value, &scope, activation) else {
+            return Value::Bool(false);
+        };
+        Some(mask)
+    };
+    let ok = vm.display.set_mask(target, mask);
+    if ok {
+        vm.dirty = true;
+        vm.pick_dirty = true;
+    }
+    Value::Bool(ok)
+}
+
 pub fn install(vm: &mut Vm) {
     let g = vm.global;
     let p = vm.protos;
@@ -1314,6 +1455,7 @@ pub fn install(vm: &mut Vm) {
     let mc_methods: &[(&str, NativeFn)] = &[
         ("attachMovie", mc_attach_movie),
         ("createEmptyMovieClip", mc_create_empty),
+        ("duplicateMovieClip", mc_duplicate),
         ("createTextField", mc_create_text_field),
         ("removeMovieClip", mc_remove),
         ("swapDepths", mc_swap_depths),
@@ -1358,6 +1500,7 @@ pub fn install(vm: &mut Vm) {
         }),
         ("loadMovie", mc_load_movie),
         ("unloadMovie", mc_unload_movie),
+        ("attachBitmap", mc_attach_bitmap),
         ("beginFill", mc_begin_fill),
         ("endFill", mc_end_fill),
         ("moveTo", mc_move_to),
@@ -1368,10 +1511,7 @@ pub fn install(vm: &mut Vm) {
         ("getSWFVersion", |_, _, _| Value::Number(8.0)),
         ("getBytesLoaded", |_, _, _| Value::Number(1.0)),
         ("getBytesTotal", |_, _, _| Value::Number(1.0)),
-        ("setMask", |vm, _, _| {
-            vm.warn_once("setMask is not supported".into());
-            Value::Undefined
-        }),
+        ("setMask", mc_set_mask),
     ];
     for (n, f) in mc_methods {
         vm.define_native(p.movie_clip, n, *f);
@@ -1478,10 +1618,10 @@ pub fn install(vm: &mut Vm) {
     let sel = vm.selection;
     vm.define_native(sel, "getFocus", selection_get_focus);
     vm.define_native(sel, "setFocus", selection_set_focus);
-    vm.define_native(sel, "getBeginIndex", |_, _, _| Value::Number(-1.0));
-    vm.define_native(sel, "getEndIndex", |_, _, _| Value::Number(-1.0));
-    vm.define_native(sel, "getCaretIndex", |_, _, _| Value::Number(-1.0));
-    vm.define_native(sel, "setSelection", |_, _, _| Value::Undefined);
+    vm.define_native(sel, "getBeginIndex", |vm, _, _| selection_index(vm, 0));
+    vm.define_native(sel, "getEndIndex", |vm, _, _| selection_index(vm, 1));
+    vm.define_native(sel, "getCaretIndex", |vm, _, _| selection_index(vm, 2));
+    vm.define_native(sel, "setSelection", selection_set_range);
 
     let loader_proto = vm.new_object();
     class(vm, g, "MovieClipLoader", loader_new, loader_proto);
@@ -1499,6 +1639,11 @@ pub fn install(vm: &mut Vm) {
     // The `flash` package.
     let flash = vm.new_object();
     vm.define(g, "flash", Value::Object(flash), DONT_ENUM);
+    let display = vm.new_object();
+    vm.define(flash, "display", Value::Object(display), 0);
+    let bitmap_proto = vm.new_object();
+    let bitmap_class = class(vm, display, "BitmapData", |_, this, _| this, bitmap_proto);
+    vm.define_native(bitmap_class, "loadBitmap", bitmap_load);
     let external = vm.new_object();
     vm.define(flash, "external", Value::Object(external), 0);
     let ei = vm.new_object();

@@ -33,6 +33,7 @@ struct Draw {
 @group(0) @binding(0) var<uniform> d: Draw;
 @group(1) @binding(0) var tex: texture_2d<f32>;
 @group(1) @binding(1) var smp: sampler;
+@group(2) @binding(0) var backdrop: texture_2d<f32>;
 
 struct V {
     @builtin(position) pos: vec4<f32>,
@@ -53,8 +54,7 @@ fn vs(@location(0) pos: vec2<f32>, @location(1) uv: vec2<f32>, @location(2) colo
     return o;
 }
 
-@fragment
-fn fs(i: V) -> @location(0) vec4<f32> {
+fn shade(i: V) -> vec4<f32> {
     var c = i.color;
     let mode = i32(d.mode.x + 0.5);
     if (mode == 1) {
@@ -78,6 +78,30 @@ fn fs(i: V) -> @location(0) vec4<f32> {
     }
     c = clamp(c * d.mul + d.add, vec4<f32>(0.0), vec4<f32>(1.0));
     return vec4<f32>(c.rgb * c.a, c.a);
+}
+
+@fragment
+fn fs(i: V) -> @location(0) vec4<f32> { return shade(i); }
+
+// Both pictures are premultiplied. Blend straight colours only in their overlap;
+// preserve the source/destination contributions outside that overlap.
+@fragment
+fn fs_blend(i: V) -> @location(0) vec4<f32> {
+    let src = shade(i);
+    if (src.a == 0.0) { discard; }
+    let dst = textureLoad(backdrop, vec2<i32>(i.pos.xy), 0);
+    let s = src.rgb / max(src.a, 0.00001);
+    let dc = dst.rgb / max(dst.a, 0.00001);
+    var mixed = abs(dc - s);
+    let mode = i32(d.mode.y + 0.5);
+    if (mode == 2) { mixed = 1.0 - dc; }
+    if (mode == 3 || mode == 4) {
+        let threshold = select(dc, s, mode == 4);
+        mixed = select(2.0 * s * dc, 1.0 - 2.0 * (1.0 - s) * (1.0 - dc),
+                       threshold > vec3<f32>(0.5));
+    }
+    return vec4<f32>(src.rgb * (1.0 - dst.a) + dst.rgb * (1.0 - src.a)
+                     + src.a * dst.a * mixed, src.a + dst.a * (1.0 - src.a));
 }
 "#;
 
@@ -104,6 +128,8 @@ struct GpuMesh {
     to_gradient: Matrix,
     /// The texture binding (ramp or bitmap); `None` for solid colours.
     binding: Option<Arc<wgpu::BindGroup>>,
+    /// Scaleform text shadows keep shadowColor when the text's parent is tinted.
+    fixed_rgb: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -122,6 +148,12 @@ enum Blend {
     Subtract,
     Lighten,
     Darken,
+    Alpha,
+    Erase,
+    Difference,
+    Invert,
+    Overlay,
+    HardLight,
 }
 
 impl Blend {
@@ -133,19 +165,49 @@ impl Blend {
             BlendMode::Subtract => Blend::Subtract,
             BlendMode::Lighten => Blend::Lighten,
             BlendMode::Darken => Blend::Darken,
+            BlendMode::Alpha => Blend::Alpha,
+            BlendMode::Erase => Blend::Erase,
+            BlendMode::Difference => Blend::Difference,
+            BlendMode::Invert => Blend::Invert,
+            BlendMode::Overlay => Blend::Overlay,
+            BlendMode::HardLight => Blend::HardLight,
             _ => Blend::Normal,
+        }
+    }
+
+    fn shader_mode(self) -> u8 {
+        match self {
+            Self::Difference => 1,
+            Self::Invert => 2,
+            Self::Overlay => 3,
+            Self::HardLight => 4,
+            _ => 0,
         }
     }
 
     fn state(self) -> wgpu::BlendState {
         use wgpu::{BlendComponent as C, BlendFactor as F, BlendOperation as O};
         let alpha = C {
-            src_factor: F::One,
-            dst_factor: F::OneMinusSrcAlpha,
+            src_factor: if matches!(self, Self::Alpha | Self::Erase) {
+                F::Zero
+            } else {
+                F::One
+            },
+            dst_factor: if self == Self::Alpha {
+                F::SrcAlpha
+            } else {
+                F::OneMinusSrcAlpha
+            },
             operation: O::Add,
         };
         let color = match self {
-            Blend::Normal => alpha,
+            Blend::Normal
+            | Blend::Alpha
+            | Blend::Erase
+            | Blend::Difference
+            | Blend::Invert
+            | Blend::Overlay
+            | Blend::HardLight => alpha,
             // Over an opaque picture: src * dst + dst * (1 - src alpha).
             Blend::Multiply => C {
                 src_factor: F::Dst,
@@ -197,6 +259,11 @@ type GlyphMesh = (Vec<[f32; 2]>, Vec<u32>);
 /// An uploaded image: its binding and size.
 type Bitmap = (Arc<wgpu::BindGroup>, f32, f32);
 
+struct EngineImage {
+    texture: wgpu::Texture,
+    binding: Arc<wgpu::BindGroup>,
+}
+
 pub struct Renderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -210,16 +277,20 @@ pub struct Renderer {
     white: Arc<wgpu::BindGroup>,
     clamp: wgpu::Sampler,
     repeat: wgpu::Sampler,
-    shapes: HashMap<(u16, u16), Vec<Arc<GpuMesh>>>,
+    shapes: HashMap<(u16, u16, bool), Vec<Arc<GpuMesh>>>,
     cpu_shapes: HashMap<(u16, u16), Vec<CpuShape>>,
     scale9: HashMap<(DisplayId, [u32; 8]), Vec<Arc<GpuMesh>>>,
     glyphs: HashMap<(usize, usize), Arc<GlyphMesh>>,
     texts: HashMap<DisplayId, (u64, Vec<Arc<GpuMesh>>)>,
     drawings: HashMap<DisplayId, Vec<Arc<GpuMesh>>>,
     bitmaps: HashMap<(String, bool), Option<Bitmap>>,
+    engine_images: HashMap<String, Option<EngineImage>>,
     targets: Option<Targets>,
     /// Draws in the last frame.
     pub draws: usize,
+    filters: crate::filters::Filters,
+    filter_stack: Vec<DisplayId>,
+    masking: bool,
 }
 
 struct Targets {
@@ -271,7 +342,11 @@ impl Renderer {
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("gfx"),
-            bind_group_layouts: &[Some(&uniform_layout), Some(&texture_layout)],
+            bind_group_layouts: &[
+                Some(&uniform_layout),
+                Some(&texture_layout),
+                Some(&texture_layout),
+            ],
             immediate_size: 0,
         });
         let sampler = |mode| {
@@ -308,8 +383,12 @@ impl Renderer {
             texts: HashMap::new(),
             drawings: HashMap::new(),
             bitmaps: HashMap::new(),
+            engine_images: HashMap::new(),
             targets: None,
             draws: 0,
+            filters: crate::filters::Filters::new(device, format),
+            filter_stack: Vec::new(),
+            masking: false,
         }
     }
 
@@ -363,11 +442,15 @@ impl Renderer {
                     },
                     fragment: Some(wgpu::FragmentState {
                         module: &self.shader,
-                        entry_point: Some("fs"),
+                        entry_point: Some(if blend.shader_mode() == 0 {
+                            "fs"
+                        } else {
+                            "fs_blend"
+                        }),
                         compilation_options: Default::default(),
                         targets: &[Some(wgpu::ColorTargetState {
                             format: self.format,
-                            blend: Some(blend.state()),
+                            blend: (blend.shader_mode() == 0).then(|| blend.state()),
                             write_mask: if stencil == Stencil::Content {
                                 wgpu::ColorWrites::ALL
                             } else {
@@ -387,6 +470,10 @@ impl Renderer {
         if self.targets.as_ref().is_some_and(|t| t.size == size) {
             return;
         }
+        self.targets = Some(self.create_targets(size));
+    }
+
+    fn create_targets(&self, size: (u32, u32)) -> Targets {
         let tex = |format, samples, usage| {
             self.device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("gfx target"),
@@ -418,17 +505,61 @@ impl Renderer {
             wgpu::TextureUsages::RENDER_ATTACHMENT,
         )
         .create_view(&Default::default());
-        self.targets = Some(Targets {
+        Targets {
             size,
             output,
             msaa,
             stencil,
-        });
+        }
     }
 
     /// The texture [`Renderer::render`] draws into.
     pub fn output(&self) -> Option<&wgpu::Texture> {
         self.targets.as_ref().map(|t| &t.output)
+    }
+
+    /// Registers or refreshes an engine render target (e.g. `paperdoll`). Shapes filled
+    /// only with that external image display the complete target in their authored bounds.
+    /// Same-size refreshes keep the texture and all cached shape bindings alive.
+    pub fn set_engine_image(&mut self, name: &str, image: Option<(u32, u32, &[u8])>) {
+        let key = engine_image_name(name);
+        let old = self.engine_images.entry(key).or_default();
+        if let Some((w, h, rgba)) = image {
+            if w == 0 || h == 0 || rgba.len() != w as usize * h as usize * 4 {
+                return;
+            }
+            let mut pixels = rgba.to_vec();
+            premultiply(&mut pixels);
+            if let Some(old) = old
+                .as_ref()
+                .filter(|old| old.texture.width() == w && old.texture.height() == h)
+            {
+                write_image(&self.queue, &old.texture, &pixels);
+                return;
+            }
+            let texture = upload_texture(&self.device, &self.queue, w, h, &pixels);
+            let binding = Arc::new(texture_binding(
+                &self.device,
+                &self.texture_layout,
+                &texture,
+                &self.clamp,
+            ));
+            *old = Some(EngineImage { texture, binding });
+        } else if let Some(old) = old {
+            // Keep existing meshes valid while clearing the target, and reuse its storage
+            // if the engine supplies another frame of the same size later.
+            write_image(
+                &self.queue,
+                &old.texture,
+                &vec![0; (old.texture.width() * old.texture.height() * 4) as usize],
+            );
+            return;
+        }
+        // Only first allocation or a size change needs new bindings. Ordinary frames do
+        // not invalidate atlas textures or retessellate the rest of the movie.
+        self.shapes.clear();
+        self.cpu_shapes.clear();
+        self.scale9.clear();
     }
 
     /// Renders when the movie changed (or the size did); returns whether it drew.
@@ -477,6 +608,18 @@ impl Renderer {
             &mut b,
         );
         self.draws = b.ops.len();
+        if let Some(targets) = self.targets.take() {
+            self.draw_build(&b, &targets);
+            self.targets = Some(targets);
+        }
+        // Drop text meshes of fields that are gone.
+        self.texts
+            .retain(|d, _| player.vm.display.get(*d).is_some());
+        self.drawings
+            .retain(|d, _| player.vm.display.get(*d).is_some());
+    }
+
+    fn draw_build(&mut self, b: &Build, t: &Targets) {
         // Upload the uniforms.
         let need = (b.uniforms.len().max(1) as u64) * UNIFORM_STRIDE;
         if self.uniforms.as_ref().is_none_or(|u| u.2 < need) {
@@ -517,8 +660,38 @@ impl Renderer {
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("gfx") });
-        {
-            let Some(t) = &self.targets else { return };
+        // Resolve before a destination-dependent blend, then sample a snapshot rather
+        // than the active attachment. Keep the multisample colour/stencil between passes
+        // so later siblings and open clip-depth masks retain their state.
+        let snapshot = b.ops.iter().any(|op| op.blend.shader_mode() != 0).then(|| {
+            let tex = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("gfx blend backdrop"),
+                size: t.output.size(),
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: self.format,
+                usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            });
+            let binding = texture_binding(&self.device, &self.texture_layout, &tex, &self.clamp);
+            (tex, binding)
+        });
+        // Even a first draw that needs a backdrop must see a cleared target.
+        let mut start = 0;
+        let mut first = true;
+        loop {
+            let end = (start + usize::from(!first)..b.ops.len())
+                .find(|&i| b.ops[i].blend.shader_mode() != 0)
+                .unwrap_or(b.ops.len());
+            if !first && start < b.ops.len() && b.ops[start].blend.shader_mode() != 0 {
+                let (texture, _) = snapshot.as_ref().unwrap();
+                encoder.copy_texture_to_texture(
+                    t.output.as_image_copy(),
+                    texture.as_image_copy(),
+                    t.output.size(),
+                );
+            }
             let out_view = t.output.create_view(&Default::default());
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("gfx"),
@@ -527,8 +700,16 @@ impl Renderer {
                     resolve_target: Some(&out_view),
                     depth_slice: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                        store: wgpu::StoreOp::Discard,
+                        load: if first {
+                            wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT)
+                        } else {
+                            wgpu::LoadOp::Load
+                        },
+                        store: if snapshot.is_some() {
+                            wgpu::StoreOp::Store
+                        } else {
+                            wgpu::StoreOp::Discard
+                        },
                     },
                 })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
@@ -538,8 +719,16 @@ impl Renderer {
                         store: wgpu::StoreOp::Discard,
                     }),
                     stencil_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(0),
-                        store: wgpu::StoreOp::Discard,
+                        load: if first {
+                            wgpu::LoadOp::Clear(0)
+                        } else {
+                            wgpu::LoadOp::Load
+                        },
+                        store: if snapshot.is_some() {
+                            wgpu::StoreOp::Store
+                        } else {
+                            wgpu::StoreOp::Discard
+                        },
                     }),
                 }),
                 ..Default::default()
@@ -547,7 +736,13 @@ impl Renderer {
             let Some((_, ubg, _)) = &self.uniforms else {
                 return;
             };
-            for op in &b.ops {
+            // All pipelines share this layout; ordinary draws do not read group 2.
+            pass.set_bind_group(
+                2,
+                snapshot.as_ref().map(|(_, bg)| bg).unwrap_or(&self.white),
+                &[],
+            );
+            for op in &b.ops[start..end] {
                 let Some(p) = self.pipelines.get(&(op.blend, op.stencil)) else {
                     continue;
                 };
@@ -559,13 +754,14 @@ impl Renderer {
                 pass.set_index_buffer(op.mesh.ib.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..op.mesh.count, 0, 0..1);
             }
+            drop(pass);
+            if end == b.ops.len() {
+                break;
+            }
+            start = end;
+            first = false;
         }
         self.queue.submit(Some(encoder.finish()));
-        // Drop text meshes of fields that are gone.
-        self.texts
-            .retain(|d, _| player.vm.display.get(*d).is_some());
-        self.drawings
-            .retain(|d, _| player.vm.display.get(*d).is_some());
     }
 
     fn upload(
@@ -574,6 +770,17 @@ impl Renderer {
         binding: Option<Arc<wgpu::BindGroup>>,
         mode: f32,
         to_gradient: Matrix,
+    ) -> Option<Arc<GpuMesh>> {
+        self.upload_colored(m, binding, mode, to_gradient, false)
+    }
+
+    fn upload_colored(
+        &self,
+        m: &Mesh,
+        binding: Option<Arc<wgpu::BindGroup>>,
+        mode: f32,
+        to_gradient: Matrix,
+        fixed_rgb: bool,
     ) -> Option<Arc<GpuMesh>> {
         if m.indices.is_empty() {
             return None;
@@ -599,6 +806,7 @@ impl Renderer {
             mode,
             to_gradient,
             binding,
+            fixed_rgb,
         }))
     }
 
@@ -628,10 +836,30 @@ impl Renderer {
         id: u16,
         ratio: u16,
     ) -> Vec<Arc<GpuMesh>> {
-        if let Some(m) = self.shapes.get(&(id, ratio)) {
+        let key = (id, ratio, self.masking);
+        if let Some(m) = self.shapes.get(&key) {
             return m.clone();
         }
         let movie = player.vm.movie.clone();
+        if let Some(Character::Shape(shape)) = movie.characters.get(&id)
+            && let Some(name) = engine_shape(shape, &movie)
+            && let Some(image) = self.engine_images.get(&name)
+        {
+            let out: Vec<_> = image
+                .as_ref()
+                .and_then(|image| {
+                    self.upload(
+                        &image_quad(shape.bounds),
+                        Some(image.binding.clone()),
+                        1.0,
+                        Matrix::IDENTITY,
+                    )
+                })
+                .into_iter()
+                .collect();
+            self.shapes.insert(key, out.clone());
+            return out;
+        }
         let size = |bid: u16| -> Option<(f32, f32)> {
             match movie.characters.get(&bid) {
                 Some(Character::Image(img)) => Some((img.width as f32, img.height as f32)),
@@ -640,7 +868,23 @@ impl Renderer {
         };
         let meshes = match movie.characters.get(&id) {
             Some(Character::Shape(s)) => {
-                tess::tessellate_shape(&s.fills, &s.lines, &s.records, &size)
+                if self.masking {
+                    let mut records = s.records.clone();
+                    for record in &mut records {
+                        if let crate::swf::Record::Style {
+                            line, new_styles, ..
+                        } = record
+                        {
+                            *line = None;
+                            if let Some((_, lines)) = new_styles {
+                                lines.clear();
+                            }
+                        }
+                    }
+                    tess::tessellate_shape(&s.fills, &[], &records, &size)
+                } else {
+                    tess::tessellate_shape(&s.fills, &s.lines, &s.records, &size)
+                }
             }
             Some(Character::Morph(m)) => {
                 let t = ratio as f32 / 65535.0;
@@ -698,7 +942,9 @@ impl Renderer {
                     self.upload(&m, Some(bg), *kind as f32, *to_gradient)
                 }
             };
-            if let Some(g) = &g {
+            if let Some(g) = &g
+                && !self.masking
+            {
                 self.cpu_shapes
                     .entry((id, ratio))
                     .or_default()
@@ -706,7 +952,7 @@ impl Renderer {
             }
             out.extend(g);
         }
-        self.shapes.insert((id, ratio), out.clone());
+        self.shapes.insert(key, out.clone());
         out
     }
 
@@ -824,6 +1070,15 @@ impl Renderer {
                 );
             }
         }
+        // Background/border/underlines are drawn first. Keep shadow geometry separate
+        // from the glyphs: a button's RGB replacement must not recolour black shadows.
+        let mut out: Vec<_> = self
+            .upload(&m, None, 0.0, Matrix::IDENTITY)
+            .into_iter()
+            .collect();
+        m.vertices.clear();
+        m.indices.clear();
+        let mut shadow_mesh = m.clone();
         for pass in 0..=shadow.len() {
             for (g, dy) in &glyphs {
                 let mesh = self.glyph(&g.font, g.glyph);
@@ -833,9 +1088,14 @@ impl Renderer {
                 } else {
                     (0.0, 0.0, g.color)
                 };
-                let base = m.vertices.len() as u32;
+                let target = if pass < shadow.len() {
+                    &mut shadow_mesh
+                } else {
+                    &mut m
+                };
+                let base = target.vertices.len() as u32;
                 for p in &mesh.0 {
-                    m.vertices.push(Vertex {
+                    target.vertices.push(Vertex {
                         pos: [
                             (bx + g.x + ox) * 20.0 + p[0] * scale,
                             (by + g.y + dy + oy) * 20.0 + p[1] * scale,
@@ -844,13 +1104,11 @@ impl Renderer {
                         color: [c[0], c[1], c[2], 255],
                     });
                 }
-                m.indices.extend(mesh.1.iter().map(|i| i + base));
+                target.indices.extend(mesh.1.iter().map(|i| i + base));
             }
         }
-        let out: Vec<Arc<GpuMesh>> = self
-            .upload(&m, None, 0.0, Matrix::IDENTITY)
-            .into_iter()
-            .collect();
+        out.extend(self.upload_colored(&shadow_mesh, None, 0.0, Matrix::IDENTITY, true));
+        out.extend(self.upload(&m, None, 0.0, Matrix::IDENTITY));
         self.texts.insert(d, (rev, out.clone()));
         out
     }
@@ -871,12 +1129,187 @@ impl Renderer {
         let Some(o) = player.vm.display.get(d) else {
             return;
         };
-        if !o.visible {
+        if !self.masking && o.mask_for.is_some() {
             return;
         }
+        let mask = o.mask.filter(|m| player.vm.display.get(*m).is_some());
+        if let Some(mask) = mask.filter(|_| !self.masking && !self.filter_stack.contains(&d)) {
+            let mask_parent = player
+                .vm
+                .display
+                .get(mask)
+                .and_then(|o| o.parent)
+                .map(|p| player.vm.display.world_matrix(p))
+                .unwrap_or(Matrix::IDENTITY);
+            self.mask_ops(
+                player,
+                images,
+                mask,
+                mask_parent,
+                view,
+                stencil,
+                Stencil::Push,
+                b,
+            );
+            self.walk_content(
+                player,
+                images,
+                d,
+                parent,
+                parent_cx,
+                parent_blend,
+                view,
+                stencil + 1,
+                b,
+            );
+            self.mask_ops(
+                player,
+                images,
+                mask,
+                mask_parent,
+                view,
+                stencil + 1,
+                Stencil::Pop,
+                b,
+            );
+        } else {
+            self.walk_content(
+                player,
+                images,
+                d,
+                parent,
+                parent_cx,
+                parent_blend,
+                view,
+                stencil,
+                b,
+            );
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn walk_content(
+        &mut self,
+        player: &mut Player,
+        images: &mut dyn Images,
+        d: DisplayId,
+        parent: Matrix,
+        parent_cx: ColorTransform,
+        parent_blend: Blend,
+        view: &Viewport,
+        stencil: u32,
+        b: &mut Build,
+    ) {
+        let Some(o) = player.vm.display.get(d) else {
+            return;
+        };
+        if !o.visible && !self.masking {
+            return;
+        }
+        // Alpha/erase operate on an enclosing layer's isolated picture. Outside a
+        // layer Flash draws neither the source nor an opaque stand-in for its mask.
+        if !self.masking
+            && matches!(o.blend, BlendMode::Alpha | BlendMode::Erase)
+            && !self.filter_stack.iter().any(|d| {
+                player
+                    .vm
+                    .display
+                    .get(*d)
+                    .is_some_and(|o| o.blend == BlendMode::Layer)
+            })
+        {
+            return;
+        }
+        if !self.masking
+            && !self.filter_stack.contains(&d)
+            && (o.filters.iter().any(crate::filters::Filters::supported)
+                || matches!(
+                    o.blend,
+                    BlendMode::Layer
+                        | BlendMode::Alpha
+                        | BlendMode::Erase
+                        | BlendMode::Difference
+                        | BlendMode::Invert
+                        | BlendMode::Overlay
+                        | BlendMode::HardLight
+                ))
+        {
+            let filters = o.filters.clone();
+            let blend = if o.blend == BlendMode::Normal {
+                parent_blend
+            } else {
+                Blend::of(o.blend)
+            };
+            // Isolate just this object. Descendant filters/layers still run, and the
+            // parent's stencil clips the final result rather than the filter input.
+            self.filter_stack.push(d);
+            let mut source = Build {
+                ops: Vec::new(),
+                uniforms: Vec::new(),
+            };
+            self.walk(
+                player,
+                images,
+                d,
+                parent,
+                parent_cx,
+                Blend::Normal,
+                view,
+                0,
+                &mut source,
+            );
+            self.filter_stack.pop();
+            let targets = self.create_targets((view.w as u32, view.h as u32));
+            self.draw_build(&source, &targets);
+            let output = self.filters.apply(
+                &self.device,
+                &self.queue,
+                targets.output,
+                &filters,
+                view.k * 20.0,
+            );
+            let binding = Arc::new(texture_binding(
+                &self.device,
+                &self.texture_layout,
+                &output,
+                &self.clamp,
+            ));
+            let mesh = Mesh {
+                paint: Paint::Solid,
+                vertices: [
+                    (-1.0, 1.0, 0.0, 0.0),
+                    (1.0, 1.0, 1.0, 0.0),
+                    (1.0, -1.0, 1.0, 1.0),
+                    (-1.0, -1.0, 0.0, 1.0),
+                ]
+                .map(|(x, y, u, v)| Vertex {
+                    pos: [x, y],
+                    uv: [u, v],
+                    color: [255; 4],
+                })
+                .to_vec(),
+                indices: vec![0, 1, 2, 0, 2, 3],
+            };
+            if let Some(mesh) = self.upload(&mesh, Some(binding), 1.0, Matrix::IDENTITY) {
+                let u = b.uniforms.len() as u32;
+                b.uniforms.push(DrawU {
+                    m0: [1.0, 0.0, 0.0, 0.0],
+                    m1: [0.0, 1.0, 0.0, 0.0],
+                    mul: [1.0; 4],
+                    ..Default::default()
+                });
+                b.push(&mesh, u, blend, stencil);
+            }
+            return;
+        }
+        let Some(o) = player.vm.display.get(d) else {
+            return;
+        };
         let world = parent.mul(&o.matrix);
         let cx = parent_cx.concat(&o.color);
-        let blend = if o.blend == BlendMode::Normal {
+        let blend = if self.filter_stack.last() == Some(&d) {
+            Blend::Normal
+        } else if o.blend == BlendMode::Normal {
             parent_blend
         } else {
             Blend::of(o.blend)
@@ -934,6 +1367,9 @@ impl Renderer {
         };
         let u = b.uniform(&world, &cx, view);
         for m in &meshes {
+            if self.masking && m.fixed_rgb {
+                continue;
+            }
             b.push(m, u, blend, stencil);
         }
         let Some(o) = player.vm.display.get(d) else {
@@ -969,8 +1405,20 @@ impl Renderer {
             }
             if let Some((noscale, remap)) = &grid {
                 let shape = player.vm.display.get(c).and_then(|co| match &co.kind {
-                    Kind::Shape(_, id) if co.visible => Some((*id, co.matrix, co.color)),
+                    Kind::Shape(_, id)
+                        if co.visible && co.filters.is_empty() && co.blend == BlendMode::Normal =>
+                    {
+                        Some((*id, co.matrix, co.color))
+                    }
                     _ => None,
+                });
+                let shape = shape.filter(|_| {
+                    !self.masking
+                        && player
+                            .vm
+                            .display
+                            .get(c)
+                            .is_some_and(|co| co.mask.is_none() && co.mask_for.is_none())
                 });
                 if let Some((id, place, ccx)) = shape {
                     let key = (
@@ -1030,6 +1478,8 @@ impl Renderer {
         if let Some(o) = player.vm.display.get_mut(m) {
             o.visible = true;
         }
+        let was_masking = self.masking;
+        self.masking = true;
         self.walk(
             player,
             images,
@@ -1041,6 +1491,7 @@ impl Renderer {
             0,
             &mut tmp,
         );
+        self.masking = was_masking;
         if let (Some(v), Some(o)) = (vis, player.vm.display.get_mut(m)) {
             o.visible = v;
         }
@@ -1337,7 +1788,12 @@ impl Grid {
 impl Build {
     fn push(&mut self, m: &Arc<GpuMesh>, u: u32, blend: Blend, stencil: u32) {
         let mut un = self.uniforms[u as usize];
-        un.mode = [m.mode, 0.0, 0.0, 0.0];
+        if m.fixed_rgb {
+            // The shadow still follows alpha (including fades) and the object's matrix.
+            un.mul[..3].fill(1.0);
+            un.add[..3].fill(0.0);
+        }
+        un.mode = [m.mode, blend.shader_mode() as f32, 0.0, 0.0];
         if m.mode >= 2.0 {
             let g = &m.to_gradient;
             un.g0 = [g.a, g.c, g.tx, 0.0];
@@ -1393,6 +1849,68 @@ fn premultiply(px: &mut [u8]) {
             *c = ((*c as u32 * a + 127) / 255) as u8;
         }
     }
+}
+
+fn engine_image_name(name: &str) -> String {
+    let name = name.to_ascii_lowercase();
+    name.rsplit_once('.')
+        .map(|(stem, _)| stem.to_string())
+        .unwrap_or(name)
+}
+
+/// The exporter uses a small placeholder bitmap and sometimes an empty 0xffff fill.
+/// A target replaces only a shape whose fills all reference the same engine image.
+fn engine_shape(shape: &crate::swf::Shape, movie: &crate::swf::Movie) -> Option<String> {
+    let mut name = None;
+    if !shape.lines.is_empty() {
+        return None;
+    }
+    for fill in &shape.fills {
+        let crate::swf::Fill::Bitmap { id, .. } = fill else {
+            return None;
+        };
+        if *id == u16::MAX {
+            continue;
+        }
+        let Some(Character::Image(image)) = movie.characters.get(id) else {
+            return None;
+        };
+        let next = engine_image_name(&image.file);
+        if name.as_ref().is_some_and(|old| *old != next) {
+            return None;
+        }
+        name = Some(next);
+    }
+    name
+}
+
+fn image_quad(bounds: crate::swf::Rect) -> Mesh {
+    let x = [bounds.x_min as f32, bounds.x_max as f32];
+    let y = [bounds.y_min as f32, bounds.y_max as f32];
+    Mesh {
+        paint: Paint::Solid,
+        vertices: [(0, 0), (1, 0), (1, 1), (0, 1)]
+            .map(|(u, v)| Vertex {
+                pos: [x[u], y[v]],
+                uv: [u as f32, v as f32],
+                color: [255; 4],
+            })
+            .to_vec(),
+        indices: vec![0, 1, 2, 0, 2, 3],
+    }
+}
+
+fn write_image(queue: &wgpu::Queue, texture: &wgpu::Texture, pixels: &[u8]) {
+    queue.write_texture(
+        texture.as_image_copy(),
+        pixels,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(texture.width() * 4),
+            rows_per_image: None,
+        },
+        texture.size(),
+    );
 }
 
 fn upload_texture(
@@ -1525,5 +2043,518 @@ fn lerp_fill(a: &crate::swf::Fill, b: &crate::swf::Fill, t: f32) -> crate::swf::
             })
         }
         _ => a.clone(),
+    }
+}
+
+#[cfg(test)]
+mod shadow_tests {
+    use super::*;
+    use crate::avm1::{Host, HostValue};
+    use crate::swf::text::Glyph;
+    use crate::swf::{EditText, Font, Movie, Record, Rect};
+    use crate::text::{Fonts, Layout, Line, PlacedGlyph, TextField};
+
+    struct Empty;
+    impl Host for Empty {
+        fn fscommand(&mut self, _: &str, _: &str) {}
+        fn external_call(&mut self, _: &str, _: &[HostValue]) -> HostValue {
+            HostValue::Undefined
+        }
+    }
+    impl Fonts for Empty {
+        fn font(&self, _: &str, _: bool, _: bool) -> Option<Arc<Font>> {
+            None
+        }
+    }
+    impl Images for Empty {
+        fn image(&mut self, _: &str) -> Option<(u32, u32, Vec<u8>)> {
+            None
+        }
+    }
+
+    fn blend_player() -> Player {
+        let bytes = b"FWS\x08\x12\0\0\0\x08\0\0\x1e\x01\0\x40\0\0\0";
+        let mut p =
+            Player::new(bytes, "blend-test", Box::new(Empty), Arc::new(Empty), None).unwrap();
+        p.vm.movie = Arc::new(Movie {
+            stage: Rect {
+                x_max: 640,
+                y_max: 640,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        p
+    }
+
+    fn quad(
+        p: &mut Player,
+        parent: DisplayId,
+        depth: i32,
+        color: [u8; 4],
+        width: f32,
+    ) -> DisplayId {
+        let id = crate::player::create_empty(&mut p.vm, parent, "quad", depth).unwrap();
+        p.vm.display
+            .get_mut(id)
+            .unwrap()
+            .clip_mut()
+            .unwrap()
+            .drawing = Some(crate::display::Drawing {
+            fills: vec![(
+                color,
+                vec![(0.0, 0.0), (width, 0.0), (width, 640.0), (0.0, 640.0)],
+            )],
+            ..Default::default()
+        });
+        id
+    }
+
+    #[test]
+    fn destination_blends_handle_transparent_pictures_and_flatten_the_source() {
+        let instance =
+            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+        let adapter = pollster::block_on(instance.request_adapter(&Default::default())).unwrap();
+        let (device, queue) =
+            pollster::block_on(adapter.request_device(&Default::default())).unwrap();
+        let mut renderer = Renderer::new(&device, &queue, wgpu::TextureFormat::Rgba8Unorm);
+        for mode in [
+            BlendMode::Difference,
+            BlendMode::Invert,
+            BlendMode::Overlay,
+            BlendMode::HardLight,
+        ] {
+            for da in [0, 128, 255] {
+                for sa in [0, 128, 255] {
+                    let mut p = blend_player();
+                    let root = p.vm.root;
+                    let dst = [204, 77, 26, da];
+                    let src = [64, 192, 128, sa];
+                    if da != 0 {
+                        quad(&mut p, root, 0, dst, 640.0);
+                    }
+                    let group = crate::player::create_empty(&mut p.vm, root, "group", 1).unwrap();
+                    p.vm.display.get_mut(group).unwrap().blend = mode;
+                    // The second, opaque child replaces the first before the group blends.
+                    quad(&mut p, group, 0, [255, 0, 0, 255], 320.0);
+                    quad(&mut p, group, 1, [src[0], src[1], src[2], 255], 320.0);
+                    p.vm.display.get_mut(group).unwrap().color.mul[3] = sa as f32 / 255.0;
+                    // Inherited alpha is applied per child in this player. A single child
+                    // provides the exact alpha fixture; overlap at full opacity tests flattening.
+                    if sa != 255 {
+                        let first = p.vm.display.get(group).unwrap().children[&0];
+                        p.vm.display.get_mut(first).unwrap().visible = false;
+                    }
+                    renderer.render(&mut p, &mut Empty, (32, 32));
+                    let (_, _, pixels) = renderer.capture().unwrap();
+                    let pixel = &pixels[(16 * 32 + 8) * 4..(16 * 32 + 9) * 4];
+                    let (s_alpha, d_alpha) = (sa as f32 / 255.0, da as f32 / 255.0);
+                    let alpha = s_alpha + d_alpha * (1.0 - s_alpha);
+                    for c in 0..3 {
+                        let (s, d) = (src[c] as f32 / 255.0, dst[c] as f32 / 255.0);
+                        let mixed = match mode {
+                            BlendMode::Difference => (d - s).abs(),
+                            BlendMode::Invert => 1.0 - d,
+                            BlendMode::Overlay | BlendMode::HardLight => {
+                                let threshold = if mode == BlendMode::Overlay { d } else { s };
+                                if threshold <= 0.5 {
+                                    2.0 * s * d
+                                } else {
+                                    1.0 - 2.0 * (1.0 - s) * (1.0 - d)
+                                }
+                            }
+                            _ => unreachable!(),
+                        };
+                        let expected = if alpha == 0.0 {
+                            0.0
+                        } else {
+                            (s * s_alpha * (1.0 - d_alpha)
+                                + d * d_alpha * (1.0 - s_alpha)
+                                + s_alpha * d_alpha * mixed)
+                                / alpha
+                                * 255.0
+                        };
+                        assert!(
+                            (pixel[c] as f32 - expected).abs() <= 3.0,
+                            "{mode:?} sa={sa} da={da}: {pixel:?}, channel {c} expected {expected}"
+                        );
+                    }
+                    assert!((pixel[3] as f32 - alpha * 255.0).abs() <= 1.0);
+                    let right = &pixels[(16 * 32 + 24) * 4..(16 * 32 + 25) * 4];
+                    assert_eq!(right[3], da);
+                    if da != 0 {
+                        for c in 0..3 {
+                            assert!((right[c] as i32 - dst[c] as i32).abs() <= 1);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn destination_snapshots_preserve_open_masks_and_later_draws() {
+        let instance =
+            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+        let adapter = pollster::block_on(instance.request_adapter(&Default::default())).unwrap();
+        let (device, queue) =
+            pollster::block_on(adapter.request_device(&Default::default())).unwrap();
+        let mut p = blend_player();
+        let root = p.vm.root;
+        quad(&mut p, root, 0, [64, 128, 192, 255], 640.0);
+        let mask = quad(&mut p, root, 1, [255; 4], 320.0);
+        p.vm.display.get_mut(mask).unwrap().clip_depth = Some(3);
+        for depth in [2, 3] {
+            let id = quad(&mut p, root, depth, [128; 4], 640.0);
+            p.vm.display.get_mut(id).unwrap().color.mul[3] = 255.0 / 128.0;
+            p.vm.display.get_mut(id).unwrap().blend = BlendMode::Invert;
+        }
+        // Both inversions cancel inside the mask; neither may affect its exterior.
+        let last = quad(&mut p, root, 4, [255, 0, 0, 255], 80.0);
+        p.vm.display.get_mut(last).unwrap().matrix.tx = 480.0;
+        let mut renderer = Renderer::new(&device, &queue, wgpu::TextureFormat::Rgba8Unorm);
+        renderer.render(&mut p, &mut Empty, (32, 32));
+        let (_, _, pixels) = renderer.capture().unwrap();
+        for x in [8, 20, 30] {
+            assert_eq!(
+                &pixels[(16 * 32 + x) * 4..(16 * 32 + x + 1) * 4],
+                &[64, 128, 192, 255]
+            );
+        }
+        assert_eq!(
+            &pixels[(16 * 32 + 25) * 4..(16 * 32 + 26) * 4],
+            &[255, 0, 0, 255]
+        );
+    }
+
+    #[test]
+    fn moving_script_mask_clips_filtered_content_in_stage_space() {
+        let instance =
+            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+        let adapter = pollster::block_on(instance.request_adapter(&Default::default())).unwrap();
+        let (device, queue) =
+            pollster::block_on(adapter.request_device(&Default::default())).unwrap();
+        let bytes = b"FWS\x08\x12\0\0\0\x08\0\0\x1e\x01\0\x40\0\0\0";
+        let mut p =
+            Player::new(bytes, "mask-test", Box::new(Empty), Arc::new(Empty), None).unwrap();
+        p.vm.movie = Arc::new(Movie {
+            stage: Rect {
+                x_max: 640,
+                y_max: 640,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let root = p.vm.root;
+        let quad = |p: &mut Player, parent, depth, color, width| {
+            let id = crate::player::create_empty(&mut p.vm, parent, "quad", depth).unwrap();
+            p.vm.display
+                .get_mut(id)
+                .unwrap()
+                .clip_mut()
+                .unwrap()
+                .drawing = Some(crate::display::Drawing {
+                fills: vec![(
+                    color,
+                    vec![(0.0, 0.0), (width, 0.0), (width, 640.0), (0.0, 640.0)],
+                )],
+                ..Default::default()
+            });
+            id
+        };
+        quad(&mut p, root, 0, [0, 0, 255, 255], 640.0);
+        let target = quad(&mut p, root, 1, [255, 0, 0, 255], 640.0);
+        p.vm.display.get_mut(target).unwrap().filters = vec![crate::swf::Filter::Blur {
+            blur: (3.0, 3.0),
+            passes: 1,
+        }];
+        let container = crate::player::create_empty(&mut p.vm, root, "elsewhere", 2).unwrap();
+        let mask = quad(&mut p, container, 0, [255; 4], 160.0);
+        let o = p.vm.display.get_mut(mask).unwrap();
+        o.visible = false;
+        o.color.mul[3] = 0.0;
+        // Overlapping mask children form a union, rather than incrementing twice.
+        quad(&mut p, mask, 0, [255; 4], 80.0);
+        assert!(p.vm.display.set_mask(target, Some(mask)));
+        let mut renderer = Renderer::new(&device, &queue, wgpu::TextureFormat::Rgba8Unorm);
+        for offset in [160.0, 320.0] {
+            p.vm.display.get_mut(container).unwrap().matrix.tx = offset;
+            renderer.render(&mut p, &mut Empty, (32, 32));
+            let (_, _, pixels) = renderer.capture().unwrap();
+            for x in [4, 12, 20, 28] {
+                let expected = if (x as f32 * 20.0) > offset && (x as f32 * 20.0) < offset + 160.0 {
+                    [255, 0, 0, 255]
+                } else {
+                    [0, 0, 255, 255]
+                };
+                assert_eq!(&pixels[(16 * 32 + x) * 4..(16 * 32 + x + 1) * 4], &expected);
+            }
+        }
+        p.vm.display.set_mask(target, None);
+        renderer.render(&mut p, &mut Empty, (32, 32));
+        let (_, _, pixels) = renderer.capture().unwrap();
+        assert_eq!(
+            &pixels[(16 * 32 + 12) * 4..(16 * 32 + 13) * 4],
+            &[255, 0, 0, 255]
+        );
+        let shape = Arc::new(crate::swf::Shape {
+            bounds: Rect {
+                x_max: 640,
+                y_max: 640,
+                ..Default::default()
+            },
+            lines: vec![crate::swf::Line {
+                width: 320,
+                color: crate::swf::Color {
+                    r: 255,
+                    g: 255,
+                    b: 255,
+                    a: 255,
+                },
+                fill: None,
+                no_scale: (false, false),
+                start_cap: crate::swf::LineCap::Round,
+                end_cap: crate::swf::LineCap::Round,
+                join: crate::swf::LineJoin::Round,
+                no_close: false,
+            }],
+            records: vec![
+                Record::Style {
+                    move_to: Some((0, 320)),
+                    fill0: None,
+                    fill1: None,
+                    line: Some(1),
+                    new_styles: None,
+                },
+                Record::Line { to: (640, 320) },
+            ],
+            ..Default::default()
+        });
+        Arc::get_mut(&mut p.vm.movie)
+            .unwrap()
+            .characters
+            .insert(1, Character::Shape(shape.clone()));
+        let mut object = crate::display::Object::new(Kind::Shape(shape, 1));
+        object.parent = Some(root);
+        let stroke = p.vm.display.add(object);
+        p.vm.display
+            .get_mut(root)
+            .unwrap()
+            .children
+            .insert(3, stroke);
+        p.vm.display.set_mask(target, Some(stroke));
+        renderer.render(&mut p, &mut Empty, (32, 32));
+        let (_, _, pixels) = renderer.capture().unwrap();
+        assert_eq!(
+            &pixels[(16 * 32 + 12) * 4..(16 * 32 + 13) * 4],
+            &[0, 0, 255, 255]
+        );
+    }
+
+    #[test]
+    fn alpha_and_erase_affect_only_the_enclosing_layer() {
+        let instance =
+            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+        let adapter = pollster::block_on(instance.request_adapter(&Default::default())).unwrap();
+        let (device, queue) =
+            pollster::block_on(adapter.request_device(&Default::default())).unwrap();
+        let bytes = b"FWS\x08\x12\0\0\0\x08\0\0\x1e\x01\0\x40\0\0\0";
+        let mut p =
+            Player::new(bytes, "blend-test", Box::new(Empty), Arc::new(Empty), None).unwrap();
+        p.vm.movie = Arc::new(Movie {
+            stage: Rect {
+                x_max: 640,
+                y_max: 640,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let root = p.vm.root;
+        let quad = |p: &mut Player, parent, depth, color, width| {
+            let id = crate::player::create_empty(&mut p.vm, parent, "quad", depth).unwrap();
+            p.vm.display
+                .get_mut(id)
+                .unwrap()
+                .clip_mut()
+                .unwrap()
+                .drawing = Some(crate::display::Drawing {
+                fills: vec![(
+                    color,
+                    vec![(0.0, 0.0), (width, 0.0), (width, 640.0), (0.0, 640.0)],
+                )],
+                ..Default::default()
+            });
+            id
+        };
+        quad(&mut p, root, 0, [255, 0, 0, 255], 640.0);
+        let layer = crate::player::create_empty(&mut p.vm, root, "layer", 1).unwrap();
+        p.vm.display.get_mut(layer).unwrap().blend = BlendMode::Layer;
+        quad(&mut p, layer, 0, [0, 255, 0, 255], 640.0);
+        let mask = quad(&mut p, layer, 1, [0, 0, 0, 128], 320.0);
+        // This full-screen mask has no enclosing layer and must not cover the scene.
+        let outside = quad(&mut p, root, 2, [0, 0, 0, 255], 640.0);
+        let mut renderer = Renderer::new(&device, &queue, wgpu::TextureFormat::Rgba8Unorm);
+        for mode in [BlendMode::Erase, BlendMode::Alpha] {
+            p.vm.display.get_mut(mask).unwrap().blend = mode;
+            p.vm.display.get_mut(outside).unwrap().blend = mode;
+            renderer.render(&mut p, &mut Empty, (32, 32));
+            let (_, _, pixels) = renderer.capture().unwrap();
+            let pixel = |x: usize| &pixels[(16 * 32 + x) * 4..(16 * 32 + x + 1) * 4];
+            let left = pixel(8);
+            assert!((left[0] as i32 - 128).abs() <= 2 && (left[1] as i32 - 128).abs() <= 2);
+            assert_eq!(left[3], 255);
+            assert_eq!(
+                pixel(24),
+                if mode == BlendMode::Erase {
+                    &[0, 255, 0, 255]
+                } else {
+                    &[255, 0, 0, 255]
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn tinted_text_keeps_black_shadows_and_inherits_alpha() {
+        let instance =
+            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+        let adapter = pollster::block_on(instance.request_adapter(&Default::default())).unwrap();
+        let (device, queue) =
+            pollster::block_on(adapter.request_device(&Default::default())).unwrap();
+        let bytes = b"FWS\x08\x12\0\0\0\x08\0\0\x1e\x01\0\x40\0\0\0";
+        let mut player =
+            Player::new(bytes, "shadow-test", Box::new(Empty), Arc::new(Empty), None).unwrap();
+        player.vm.movie = Arc::new(Movie {
+            stage: Rect {
+                x_min: 0,
+                y_min: 0,
+                x_max: 640,
+                y_max: 640,
+            },
+            ..Default::default()
+        });
+        let font = Arc::new(Font {
+            em: 100.0,
+            glyphs: vec![Glyph {
+                outline: vec![
+                    Record::Style {
+                        move_to: Some((0, 0)),
+                        fill0: None,
+                        fill1: Some(1),
+                        line: None,
+                        new_styles: None,
+                    },
+                    Record::Line { to: (100, 0) },
+                    Record::Line { to: (100, 100) },
+                    Record::Line { to: (0, 100) },
+                    Record::Line { to: (0, 0) },
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let mut text = TextField::new(
+            Arc::new(EditText {
+                bounds: Rect {
+                    x_min: 0,
+                    y_min: 0,
+                    x_max: 640,
+                    y_max: 640,
+                },
+                ..Default::default()
+            }),
+            None,
+        );
+        text.shadow_style = "s{8,0}".into();
+        text.layout = Some(Layout {
+            lines: vec![Line {
+                glyphs: vec![PlacedGlyph {
+                    font,
+                    glyph: 0,
+                    x: 2.0,
+                    y: 10.0,
+                    size: 6.0,
+                    color: [255; 3],
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let root = player.vm.root;
+        let mut object = crate::display::Object::new(Kind::Text(Box::new(text)));
+        object.parent = Some(root);
+        let id = player.vm.display.add(object);
+        let root = player.vm.display.get_mut(root).unwrap();
+        root.children.insert(1, id);
+        root.color = ColorTransform {
+            mul: [0.0, 0.0, 0.0, 0.5],
+            add: [255.0, 200.0, 0.0, 0.0],
+        };
+        let mut renderer = Renderer::new(&device, &queue, wgpu::TextureFormat::Rgba8Unorm);
+        renderer.render(&mut player, &mut Empty, (32, 32));
+        let (_, _, pixels) = renderer.capture().unwrap();
+        let pixel = |x: usize, y: usize| &pixels[(y * 32 + x) * 4..(y * 32 + x + 1) * 4];
+        let glyph = pixel(4, 14);
+        assert!(glyph[0] > 250 && (glyph[1] as i32 - 200).abs() < 3 && glyph[2] == 0);
+        assert!((glyph[3] as i32 - 128).abs() < 2);
+        let shadow = pixel(12, 14);
+        assert_eq!(&shadow[..3], &[0, 0, 0]);
+        assert!((shadow[3] as i32 - 128).abs() < 2);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::swf::{Color, ExternalImage, Fill, Movie, Rect, Shape};
+
+    #[test]
+    fn engine_slot_uses_the_authored_rect_and_only_its_own_image() {
+        let mut movie = Movie::default();
+        for (id, file) in [(1, "PaperDoll.dds"), (2, "other.dds")] {
+            movie.characters.insert(
+                id,
+                Character::Image(ExternalImage {
+                    format: 14,
+                    width: 16,
+                    height: 16,
+                    export_name: String::new(),
+                    file: file.into(),
+                }),
+            );
+        }
+        let bitmap = |id| Fill::Bitmap {
+            id,
+            matrix: Matrix::IDENTITY,
+            repeat: false,
+            smooth: true,
+        };
+        let mut shape = Shape {
+            bounds: Rect {
+                x_min: -100,
+                x_max: 5300,
+                y_min: 200,
+                y_max: 9380,
+            },
+            fills: vec![bitmap(u16::MAX), bitmap(1)],
+            ..Default::default()
+        };
+        assert_eq!(engine_shape(&shape, &movie).as_deref(), Some("paperdoll"));
+        let quad = image_quad(shape.bounds);
+        assert_eq!(quad.vertices[0].pos, [-100.0, 200.0]);
+        assert_eq!(quad.vertices[2].pos, [5300.0, 9380.0]);
+        assert_eq!(quad.vertices[2].uv, [1.0, 1.0]);
+        shape.fills.push(bitmap(2));
+        assert_eq!(engine_shape(&shape, &movie), None);
+        shape.fills = vec![
+            Fill::Solid(Color {
+                r: 255,
+                g: 255,
+                b: 255,
+                a: 255,
+            }),
+            bitmap(1),
+        ];
+        assert_eq!(engine_shape(&shape, &movie), None);
     }
 }

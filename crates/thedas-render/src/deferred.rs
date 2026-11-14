@@ -24,6 +24,10 @@ use crate::scene::{AreaScene, DOMAIN_LEVEL, SceneLight, Vertex};
 
 pub const DEFERRED_WGSL: &str = include_str!("deferred.wgsl");
 
+#[cfg(test)]
+#[path = "deferred_gpu_tests.rs"]
+mod gpu_tests;
+
 /// How the level is drawn.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum RenderPath {
@@ -63,7 +67,7 @@ impl RenderPath {
 /// array, at most 16 KiB, which every backend can bind.
 const MAX_LIGHTS: usize = 192;
 /// Dynamic uniform offsets must be multiples of this on every backend.
-const DRAW_STRIDE: usize = 512;
+const DRAW_STRIDE: usize = 768;
 /// Room indices the lights' room sets can name; rooms past it are lit by every light.
 const MAX_ROOMS: u32 = 255;
 
@@ -100,6 +104,8 @@ struct DrawData {
     lightmap: [f32; 4],
     falloff: [f32; 4],
     room: [f32; 4],
+    /// The assigned irradiance probe's twelve rows (RGB), evaluated at the mapped normal.
+    probe: [[f32; 4]; 12],
     terrain: crate::deferred_terrain::TerrainData,
 }
 
@@ -107,6 +113,7 @@ struct DrawData {
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct LightingUniforms {
     inv_view_proj: [[f32; 4]; 4],
+    view_proj: [[f32; 4]; 4],
     eye: [f32; 4],
     sun_dir: [f32; 4],
     sun_colour: [f32; 4],
@@ -169,6 +176,19 @@ pub(crate) struct DeferredPass {
     own_lights: Vec<SceneLight>,
     /// The GPU refused the pass: the level stays faithful.
     refused: bool,
+    /// Experimental probe + runtime visibility mode. Fixed when this renderer is built.
+    baked_lighting: bool,
+    ssao: bool,
+}
+
+/// Keep the baked path's exact attachment format; probes need values above one.
+/// Both variants cost 32 bytes per pixel under WebGPU's attachment accounting.
+fn gbuffer_formats(baked_lighting: bool) -> [wgpu::TextureFormat; 4] {
+    let mut formats = GBUFFER;
+    if !baked_lighting {
+        formats[3] = wgpu::TextureFormat::Rgba16Float;
+    }
+    formats
 }
 
 struct Gpu {
@@ -391,6 +411,16 @@ impl DeferredPass {
                     [l.offset[0], l.offset[1], l.scale[0], l.scale[1]]
                 }),
                 falloff,
+                probe: item
+                    .probe
+                    .and_then(|i| scene.probes.get(i))
+                    .map(|p| p.probe.rows())
+                    .unwrap_or_else(|| {
+                        thedas_formats::probe::IrradianceProbe::uniform(
+                            crate::d3d::NO_PROBE_IRRADIANCE,
+                        )
+                        .rows()
+                    }),
                 room: [
                     room as f32,
                     reflection,
@@ -421,6 +451,8 @@ impl DeferredPass {
             effect_lights: Vec::new(),
             own_lights: Vec::new(),
             refused: false,
+            baked_lighting: std::env::var("THEDAS_DEFERRED_BAKED_LIGHTING").as_deref() != Ok("0"),
+            ssao: std::env::var("THEDAS_DEFERRED_SSAO").as_deref() != Ok("0"),
         })
     }
 
@@ -594,16 +626,17 @@ impl DeferredPass {
             ],
             immediate_size: 0,
         });
-        let gbuffer_targets: Vec<Option<wgpu::ColorTargetState>> = GBUFFER
-            .iter()
-            .map(|&format| {
-                Some(wgpu::ColorTargetState {
-                    format,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
+        let gbuffer_targets: Vec<Option<wgpu::ColorTargetState>> =
+            gbuffer_formats(self.baked_lighting)
+                .iter()
+                .map(|&format| {
+                    Some(wgpu::ColorTargetState {
+                        format,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })
                 })
-            })
-            .collect();
+                .collect();
         let gbuffer = [None, Some(wgpu::Face::Back), Some(wgpu::Face::Front)].map(|cull| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some("deferred g-buffer"),
@@ -974,6 +1007,13 @@ impl DeferredPass {
             }
         }
         let mut lights = self.lights(camera, width, height, d3d);
+        if !self.baked_lighting {
+            // Without baked alpha every point light uses its own runtime visibility.
+            // The sun alone keeps the directional visibility term in the lighting pass.
+            for light in &mut lights {
+                light.colour[3] = 0.0;
+            }
+        }
         // Keep a capture/benchmark switch for comparing only the shadow contribution.
         let shadowed = if std::env::var("THEDAS_DEFERRED_POINT_SHADOWS").as_deref() == Ok("0") {
             Vec::new()
@@ -1001,7 +1041,7 @@ impl DeferredPass {
             .as_ref()
             .is_some_and(|t| t.size == (width, height) && t.depth == *depth);
         if stale {
-            let views = GBUFFER.map(|format| {
+            let views = gbuffer_formats(self.baked_lighting).map(|format| {
                 device
                     .create_texture(&wgpu::TextureDescriptor {
                         label: Some("deferred g-buffer"),
@@ -1114,7 +1154,7 @@ impl DeferredPass {
                 fog[0][3],
                 fog[1][0],
                 if debug_view() == 8 { 1.0 } else { 0.0 },
-                0.0,
+                if self.baked_lighting { 0.0 } else { 1.0 },
             ],
         };
         ctx.queue
@@ -1132,12 +1172,24 @@ impl DeferredPass {
         };
         let lighting = LightingUniforms {
             inv_view_proj: (projection * view).inverse().to_cols_array_2d(),
+            view_proj: (projection * view).to_cols_array_2d(),
             eye: camera.position.extend(1.0).to_array(),
             sun_dir: sun_dir.to_array(),
             sun_colour: sun_colour.to_array(),
             fog0: fog[0],
             fog1: fog[1],
-            counts: [gpu.lights.len() as u32, debug_view(), 0, 0],
+            counts: [
+                gpu.lights.len() as u32,
+                debug_view(),
+                0,
+                if self.baked_lighting {
+                    0
+                } else if self.ssao {
+                    2
+                } else {
+                    1
+                },
+            ],
             size: [width as f32, height as f32, 0.0, 0.0],
         };
         let sun = SunUniforms {
@@ -1381,8 +1433,8 @@ fn draw_all(
     }
 }
 
-/// Gives the shadow slots to the dynamic lights (those the lightmaps' visibility does not
-/// already mask: the emitters' and other moving lights) that matter most from `eye`: their
+/// Gives the shadow slots to lights without baked visibility (emitters, moving lights,
+/// and all point lights in probe mode) that matter most from `eye`: their
 /// brightness times reach over their distance. Returns each slot's light (position,
 /// radius).
 fn shadow_slots(lights: &mut [GpuLight], eye: Vec3) -> Vec<(Vec3, f32)> {
@@ -1430,6 +1482,7 @@ fn debug_view() -> u32 {
             "wrap" => 9,
             "shadows" => 10,
             "sun-shadows" => 11,
+            "ao" => 12,
             _ => 0,
         }
     })
@@ -1511,6 +1564,18 @@ mod tests {
     #[test]
     fn deferred_shaders_translate_everywhere() {
         crate::backend_check::translates("deferred", DEFERRED_WGSL);
+    }
+
+    #[test]
+    fn probe_draws_fit_uniform_slots_and_attachment_budget() {
+        assert!(std::mem::size_of::<DrawUniforms>() <= DRAW_STRIDE);
+        for baked in [false, true] {
+            let cost: u32 = gbuffer_formats(baked)
+                .iter()
+                .map(|format| format.target_pixel_byte_cost().unwrap())
+                .sum();
+            assert!(cost <= 32, "{cost} exceeds the portable attachment budget");
+        }
     }
 
     #[test]

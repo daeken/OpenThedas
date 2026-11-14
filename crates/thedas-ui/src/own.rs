@@ -255,7 +255,10 @@ impl OwnMovie {
         // The Ruffle-era glue takes the button from a global the host sets; until it goes,
         // press handlers get no button from the player.
         player.pass_buttons = false;
-        let renderer = Renderer::new(&gpu.device, &gpu.queue, wgpu::TextureFormat::Rgba8Unorm);
+        let mut renderer = Renderer::new(&gpu.device, &gpu.queue, wgpu::TextureFormat::Rgba8Unorm);
+        for name in crate::ENGINE_IMAGES {
+            renderer.set_engine_image(name, None);
+        }
         let mut m = Self {
             player,
             renderer,
@@ -302,6 +305,17 @@ impl OwnMovie {
             .render_if_dirty(&mut self.player, &mut images, self.size);
     }
 
+    pub fn set_engine_image(&mut self, name: &str, url: Option<&str>) {
+        let image = url.and_then(|url| self.images.fetch(url));
+        self.renderer.set_engine_image(
+            name,
+            image
+                .as_ref()
+                .map(|image| (image.width, image.height, image.pixels.as_slice())),
+        );
+        self.player.vm.dirty = true;
+    }
+
     pub fn texture(&self) -> Option<wgpu::Texture> {
         self.renderer.output().cloned()
     }
@@ -339,6 +353,10 @@ impl OwnMovie {
     }
 
     pub fn key(&mut self, key: UiKey) {
+        if key == UiKey::SelectAll {
+            self.player.select_all();
+            return;
+        }
         let (code, ch) = match key {
             UiKey::Char(c) => (c.to_ascii_uppercase() as u32, Some(c)),
             UiKey::Backspace => (8, None),
