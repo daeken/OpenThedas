@@ -231,6 +231,106 @@ impl DaoInstall {
         Ok(out)
     }
 
+    /// Offers (`Offers/`): the store's stand-ins for DLC, each an add-in-shaped package with
+    /// `core` and `module` folders, in the order the original's records hold them (the
+    /// registry's first item first).
+    ///
+    /// Traced (the offer manager, `OfferManager.cpp`): `LoadOffers` (from 0x4a3f8c) reads
+    /// `offers.xml` from the player's settings folder (`OPTIONS:`; GOG's installer keeps a copy
+    /// at `__support/userdocs/Offers.xml`, as it does `AddIns.xml`), one record per
+    /// `OfferItem`, and looks for each one's folder under `OFFERS:`. Its `GameVersion` is
+    /// held against the game's as an add-in's is (0x497570 sets record byte +0x1a8). Then:
+    /// - 0x498dc0 registers every offer's `core` folder (and its `textures/high` or `medium`)
+    ///   at priority 199997, with no campaign test, when +0x1a8 is set;
+    /// - 0x499a30, called with the add-in `module` registration when a campaign loads (with
+    ///   1, at 0x5fdf0e) and unloads (with 0, at 0x5fc235), registers the `module` folder's
+    ///   campaign aliases (`CAMP_DATA`, `CAMP_ENV`, `CAMP_AUDIO_SOUND`, `CAMP_AUDIO_VO`,
+    ///   `CAMP_LOCALE`, `CAMP_PATCH`, `CAMP_OVERRIDE`) of each offer whose
+    ///   `ExtendedModuleUID` matches the campaign and whose +0x1a8 is set, walking the records
+    ///   from last to first with priorities from 199998 down by 7; record byte +0x1a6 only
+    ///   remembers that it did (cleared on unload).
+    ///
+    /// Nothing asks whether the player owns the DLC an offer sells: the offer's own scripts do
+    /// (`GetPRCEnabled`, see [`Vfs::addin_enabled`]). Lowest number wins, so offers lie below
+    /// the core package and supply only names nothing else has.
+    ///
+    /// Provisional: offers no registry names are taken from their folders' `manifest.xml`,
+    /// after the registry's (as for add-ins); the `OFFERS:` alias is taken to be the install's
+    /// `Offers` folder only; the record's `Type` (0, 1 or 2 register `core`; every shipped
+    /// offer has 1) is not applied.
+    pub fn offers(&self) -> Result<Vec<AddIn>> {
+        self.offers_with(&[])
+    }
+
+    /// [`DaoInstall::offers`] with other copies of the registry consulted first (the
+    /// player's `Settings/Offers.xml`).
+    fn offers_with(&self, registries: &[PathBuf]) -> Result<Vec<AddIn>> {
+        let dir = join_ci(&self.root, "Offers");
+        let mut out: Vec<AddIn> = Vec::new();
+        if !dir.is_dir() {
+            return Ok(out);
+        }
+        let install_registry = join_ci(&self.root, "__support/userdocs/Offers.xml");
+        let game_version = self.game_version();
+        let known = |out: &[AddIn], uid: &str| out.iter().any(|a| a.uid.eq_ignore_ascii_case(uid));
+        for registry in registries.iter().chain([&install_registry]) {
+            let Ok(bytes) = std::fs::read(registry) else {
+                continue;
+            };
+            let text = String::from_utf8_lossy(&bytes);
+            for (item, left_out) in items_of(&text, "OfferItem", game_version) {
+                let folder = resolve_ci(&dir, &item.uid).filter(|d| d.is_dir());
+                if let (false, Some(folder)) = (known(&out, &item.uid), folder) {
+                    if let Some(why) = left_out {
+                        log_left_out(&item.uid, &why);
+                    }
+                    out.push(AddIn {
+                        dir: folder,
+                        rank: Some(out.len()),
+                        ..item
+                    });
+                }
+            }
+        }
+        let mut folders: Vec<PathBuf> = std::fs::read_dir(&dir)
+            .map_err(|e| Error::Io {
+                path: dir.clone(),
+                source: e,
+            })?
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_dir())
+            .collect();
+        folders.sort();
+        for folder in folders {
+            if out.iter().any(|a| a.dir == folder) {
+                continue;
+            }
+            let manifest = resolve_ci(&folder, "manifest.xml").filter(|p| p.is_file());
+            let Some(text) = manifest.and_then(|m| std::fs::read(m).ok()) else {
+                continue;
+            };
+            let text = String::from_utf8_lossy(&text);
+            if let Some((item, left_out)) = items_of(&text, "OfferItem", game_version)
+                .into_iter()
+                .next()
+            {
+                if known(&out, &item.uid) {
+                    continue;
+                }
+                if let Some(why) = left_out {
+                    log_left_out(&item.uid, &why);
+                }
+                out.push(AddIn {
+                    dir: folder,
+                    rank: None,
+                    ..item
+                });
+            }
+        }
+        Ok(out)
+    }
+
     /// The install's own resource stack: core package, single-player campaign, then enabled
     /// DLC, with the install's `packages/core/override` above them all as the stack's overlay
     /// (the original's priority 1: it beats add-ins and a level's archives too).
@@ -287,6 +387,34 @@ impl DaoInstall {
         let mut vfs = Vfs::new();
         let core = join_ci(&self.root, "packages/core");
         let install = |p: &Path| self.relative(p).into_owned();
+        // Offers first: their priorities (199997 and up) are under the core package's. The
+        // registry's first offer is pushed last, so it wins between offers.
+        let offer_registries: Vec<PathBuf> = user
+            .map(|u| join_ci(u, "Settings/Offers.xml"))
+            .into_iter()
+            .collect();
+        for offer in self.offers_with(&offer_registries)?.iter().rev() {
+            if !offer.enabled {
+                continue;
+            }
+            if offer.extends_base_campaign() {
+                push_package(
+                    &mut vfs,
+                    &join_ci(&offer.dir, "module"),
+                    quality,
+                    true,
+                    &install,
+                )?;
+            }
+            // 0x498dc0 registers `core`'s data, patch and textures, no override.
+            push_package(
+                &mut vfs,
+                &join_ci(&offer.dir, "core"),
+                quality,
+                false,
+                &install,
+            )?;
+        }
         // Layers from the player's folder are labelled `user:<path under it>`, so tools can
         // tell them from the install's and a label never carries the player's home path.
         let player = |p: &Path| {
@@ -320,7 +448,9 @@ impl DaoInstall {
         addins.extend(packaged);
         sort_addins(&mut addins);
         let from_user = |p: &Path| user.is_some_and(|u| p.starts_with(u));
-        for addin in addins.into_iter().filter(|a| a.enabled) {
+        let addins: Vec<AddIn> = addins.into_iter().filter(|a| a.enabled).collect();
+        vfs.set_addins(addins.iter().map(|a| a.uid.clone()).collect());
+        for addin in addins {
             let label: &dyn Fn(&Path) -> String = if addin.dir.starts_with(&self.root) {
                 &install
             } else if from_user(&addin.dir) {
@@ -433,13 +563,19 @@ pub(crate) fn manifest_items(text: &str) -> Vec<AddIn> {
 /// An add-in described by a manifest's first `AddInItem`. `fallback_uid` names it when the
 /// manifest gives no UID.
 pub(crate) fn addin_from_manifest(text: &str, dir: PathBuf, fallback_uid: String) -> AddIn {
+    item_from(text, "AddInItem", dir, fallback_uid)
+}
+
+/// An add-in or offer described by the first `element` (`AddInItem` or `OfferItem`) of a
+/// manifest or registry.
+fn item_from(text: &str, element: &str, dir: PathBuf, fallback_uid: String) -> AddIn {
     AddIn {
-        uid: xml_attr(text, "AddInItem", "UID").unwrap_or(fallback_uid),
-        priority: xml_attr(text, "AddInItem", "Priority")
+        uid: xml_attr(text, element, "UID").unwrap_or(fallback_uid),
+        priority: xml_attr(text, element, "Priority")
             .and_then(|p| p.parse().ok())
             .unwrap_or(0),
-        enabled: xml_attr(text, "AddInItem", "Enabled").as_deref() != Some("0"),
-        extends: xml_attr(text, "AddInItem", "ExtendedModuleUID"),
+        enabled: xml_attr(text, element, "Enabled").as_deref() != Some("0"),
+        extends: xml_attr(text, element, "ExtendedModuleUID"),
         dir,
         rank: None,
     }
@@ -618,9 +754,19 @@ fn archives_in(dir: &Path) -> Result<Vec<PathBuf>> {
 ///
 /// Each item comes with the reason it is left out, when it is.
 fn registry_items(text: &str, game_version: Option<f64>) -> Vec<(AddIn, Option<String>)> {
+    items_of(text, "AddInItem", game_version)
+}
+
+/// [`registry_items`] for items of either registry: `AddInItem` (add-ins, with the `Type`
+/// gate) or `OfferItem` (offers, which have no `Enabled` attribute and whose `Type` decides
+/// only which folders the original registers, not whether: see [`DaoInstall::offers`]).
+fn items_of(text: &str, element: &str, game_version: Option<f64>) -> Vec<(AddIn, Option<String>)> {
+    let open = format!("<{element}");
+    let close_tag = format!("</{element}>");
+    let offers = element == "OfferItem";
     let mut out = Vec::new();
     let mut rest = text;
-    while let Some(start) = rest.find("<AddInItem") {
+    while let Some(start) = rest.find(&open) {
         rest = &rest[start..];
         let end = rest.find('>').map_or(rest.len(), |e| e + 1);
         let tag = &rest[..end];
@@ -629,10 +775,8 @@ fn registry_items(text: &str, game_version: Option<f64>) -> Vec<(AddIn, Option<S
         let body = if tag.ends_with("/>") {
             ""
         } else {
-            let close = rest.find("</AddInItem>").unwrap_or(rest.len());
-            &rest[..rest
-                .find("<AddInItem")
-                .map_or(close, |next| close.min(next))]
+            let close = rest.find(&close_tag).unwrap_or(rest.len());
+            &rest[..rest.find(&open).map_or(close, |next| close.min(next))]
         };
         let kind = body.find("<Type>").and_then(|a| {
             let value = &body[a + "<Type>".len()..];
@@ -642,10 +786,10 @@ fn registry_items(text: &str, game_version: Option<f64>) -> Vec<(AddIn, Option<S
             let value = &body[a + "<GameVersion>".len()..];
             leading_number(&value[..value.find('<').unwrap_or(value.len())])
         });
-        let mut addin = addin_from_manifest(tag, PathBuf::new(), String::new());
+        let mut addin = item_from(tag, element, PathBuf::new(), String::new());
         let why = if !addin.enabled {
             Some("its registry entry says Enabled=\"0\"".to_string())
-        } else if !matches!(kind, Some(1 | 2)) {
+        } else if !offers && !matches!(kind, Some(1 | 2)) {
             Some(match kind {
                 Some(k) => format!("its registry entry has Type {k}, not 1 or 2"),
                 None => "its registry entry has no Type".to_string(),
@@ -954,6 +1098,114 @@ mod tests {
         assert_eq!(vfs.read("sp_core.uti").unwrap().0, b"sp core");
         assert_eq!(vfs.read("sword.uti").unwrap().0, b"dlc sword");
         assert!(vfs.lookup("sp_only.utc").is_some());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Offers sit under the core package: each registry offer's `core`, and its `module`
+    /// when it sells base-campaign content, supplies only names nothing else has; the
+    /// registry's first offer wins between offers; one made for a newer game, or with no
+    /// folder, is left out; an unlisted offer folder is known from its manifest. The stack
+    /// also records which add-ins it mounts, for `GetPRCEnabled`.
+    #[test]
+    fn offers_lie_under_core_and_addins_are_recorded() {
+        let root = std::env::temp_dir().join(format!("thedas-offers-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let write = |rel: &str, bytes: &[u8]| {
+            let p = root.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, bytes).unwrap();
+        };
+        write(
+            "packages/core/data/core.erf",
+            &erf_v20(&[("shared.gda", b"core")]),
+        );
+        write(
+            "Addins/dlc/Manifest.xml",
+            br#"<AddInItem UID="DAO_PRC_DLC" ExtendedModuleUID="Single Player" Enabled="1">"#,
+        );
+        write(
+            "Addins/dlc/core/data/dlc.erf",
+            &erf_v20(&[("dlc.uti", b"dlc")]),
+        );
+        let item = |uid: &str, extends: &str, version: &str| {
+            format!(
+                r#"<OfferItem UID="{uid}" ExtendedModuleUID="{extends}" Priority="1"><GameVersion>{version}</GameVersion><Type>1</Type></OfferItem>"#
+            )
+        };
+        write(
+            "__support/userdocs/Offers.xml",
+            format!(
+                "<OfferList>{}{}{}{}</OfferList>",
+                item("O_FIRST", "Single Player", "1.0"),
+                item("O_SECOND", "Single Player", "1.0"),
+                item("O_NEW", "Single Player", "9.0"),
+                item("O_MISSING", "Single Player", "1.0"),
+            )
+            .as_bytes(),
+        );
+        write(
+            "Offers/o_first/core/data/f.erf",
+            &erf_v20(&[("shared.gda", b"first"), ("both.gda", b"first")]),
+        );
+        write(
+            "Offers/o_first/module/data/fm.erf",
+            &erf_v20(&[("first_seller.ncs", b"first module")]),
+        );
+        write(
+            "Offers/O_Second/core/data/s.erf",
+            &erf_v20(&[("both.gda", b"second"), ("second.gda", b"second")]),
+        );
+        write(
+            "Offers/o_new/core/data/n.erf",
+            &erf_v20(&[("new.gda", b"x")]),
+        );
+        // Another campaign's offer, known only from its folder: `core` only.
+        write(
+            "Offers/o_ep/manifest.xml",
+            item("O_EP", "DAO_PRC_EP_1", "1.0").as_bytes(),
+        );
+        write(
+            "Offers/o_ep/core/data/e.erf",
+            &erf_v20(&[("ep.gda", b"ep")]),
+        );
+        write(
+            "Offers/o_ep/module/data/em.erf",
+            &erf_v20(&[("ep_seller.ncs", b"x")]),
+        );
+        // The game's version, as `game_version` reads it.
+        let exe: Vec<u8> = "FileVersion\u{0}1.05.13263.0\u{0}"
+            .encode_utf16()
+            .flat_map(|u| u.to_le_bytes())
+            .collect();
+        write("bin_ship/DAOrigins.exe", &exe);
+
+        let install = DaoInstall::open(&root).unwrap();
+        let offers: Vec<(String, bool, Option<usize>)> = install
+            .offers()
+            .unwrap()
+            .into_iter()
+            .map(|o| (o.uid, o.enabled, o.rank))
+            .collect();
+        assert_eq!(
+            offers,
+            [
+                ("O_FIRST".into(), true, Some(0)),
+                ("O_SECOND".into(), true, Some(1)),
+                ("O_NEW".into(), false, Some(2)),
+                ("O_EP".into(), true, None),
+            ]
+        );
+        let vfs = install.global_vfs(TextureQuality::High).unwrap();
+        assert_eq!(vfs.read("shared.gda").unwrap().0, b"core");
+        assert_eq!(vfs.read("both.gda").unwrap().0, b"first");
+        assert_eq!(vfs.read("second.gda").unwrap().0, b"second");
+        assert_eq!(vfs.read("first_seller.ncs").unwrap().0, b"first module");
+        assert_eq!(vfs.read("ep.gda").unwrap().0, b"ep");
+        assert!(vfs.lookup("ep_seller.ncs").is_none());
+        assert!(vfs.lookup("new.gda").is_none());
+        assert!(vfs.addin_enabled("dao_prc_dlc"));
+        assert!(!vfs.addin_enabled("O_FIRST"));
+        assert!(!vfs.addin_enabled("DAO_PRC_OTHER"));
         std::fs::remove_dir_all(&root).unwrap();
     }
 

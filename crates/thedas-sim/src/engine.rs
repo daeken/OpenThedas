@@ -657,6 +657,9 @@ pub fn call(
         "Random" => ok(Value::Int(h.sim.world.rng.below(int(a, 0)))),
         "RandomFloat" => ok(Value::Float(h.sim.world.rng.unit())),
         "Vector" => ok(Value::Vector([float(a, 0), float(a, 1), float(a, 2)])),
+        // Whether x, y and z each compare equal to 0.0 (DAOrigins.exe's handler for function
+        // 40, 0x64f010): -0.0 counts as empty, NaN does not, as float comparison gives.
+        "IsVectorEmpty" => ok(b(vector(a, 0) == [0.0; 3])),
         // DAOrigins.exe's conversions (0x64f260, 0x64f310), in its own constants: an angle
         // a (degrees) is the ground vector (-sin a, cos a, 0), and a vector's angle is
         // atan2(-x, y) in degrees, -180 to 180 (0x4ee570).
@@ -1273,7 +1276,8 @@ pub fn call(
             _ => 0,
         })),
         "GetEventType" | "GetEventCreator" | "GetEventTarget" | "GetEventInteger"
-        | "GetEventFloat" | "GetEventString" | "GetEventObject" | "GetEventResource" => {
+        | "GetEventFloat" | "GetEventString" | "GetEventObject" | "GetEventResource"
+        | "GetEventVector" => {
             let ev = match h.sim.world.handle(handle(a, 0)) {
                 Some(EngineData::Event(e)) => e.clone(),
                 _ => Event::default(),
@@ -1289,11 +1293,13 @@ pub fn call(
                 "GetEventResource" => {
                     Value::Resource(ev.resources.get(i).cloned().unwrap_or_default())
                 }
+                // Dragon Age II's vector parameters; one never set reads as the zero vector.
+                "GetEventVector" => Value::Vector(ev.vectors.get(i).copied().unwrap_or([0.0; 3])),
                 _ => Value::Object(ev.objects.get(i).copied().unwrap_or(OBJECT_INVALID)),
             })
         }
         "SetEventType" | "SetEventCreator" | "SetEventInteger" | "SetEventFloat"
-        | "SetEventString" | "SetEventObject" | "SetEventResource" => {
+        | "SetEventString" | "SetEventObject" | "SetEventResource" | "SetEventVector" => {
             let mut ev = match h.sim.world.handle(handle(a, 0)) {
                 Some(EngineData::Event(e)) => e.clone(),
                 _ => Event::default(),
@@ -1314,6 +1320,7 @@ pub fn call(
                 "SetEventFloat" => put(&mut ev.floats, i, float(a, 2)),
                 "SetEventString" => put(&mut ev.strings, i, string(a, 2)),
                 "SetEventResource" => put(&mut ev.resources, i, string(a, 2)),
+                "SetEventVector" => put(&mut ev.vectors, i, vector(a, 2)),
                 _ => put(&mut ev.objects, i, obj(a, 2)),
             }
             let hd = h.sim.world.store(EngineData::Event(ev));
@@ -1624,7 +1631,13 @@ pub fn call(
         "ReadIniEntry" => ok(Value::String(String::new())),
         // Achievements belong to the player's profile, not the game: the simulation's profile has
         // none (by id or, the older form, by name).
-        "GetPRCEnabled" | "GetHasAchievementByID" | "GetHasAchievement" => ok(Value::Int(0)),
+        "GetHasAchievementByID" | "GetHasAchievement" => ok(Value::Int(0)),
+        // Traced (COMMAND_GETPRCENABLED, handler 0x66d6d0): the add-in record whose UID matches
+        // gives its Enabled byte (+0x15d), cleared when it needs authorization (+0x15e) and has
+        // none (+0x15f) or when an unidentified pair (+0x175 set, +0x176 clear) says so; no
+        // such record gives 0. Ours: whether the stack mounts that add-in, which applies the
+        // registry's own gates and not the authorization (FMT-011).
+        "GetPRCEnabled" => ok(b(h.sim.vfs.addin_enabled(&string(a, 0)))),
         "IsPackageLoaded" => {
             // Inferred (#862): whether a package's archives are in our resource stack.
             let pkg = format!("packages/{}/", string(a, 0).to_ascii_lowercase());
@@ -5129,6 +5142,45 @@ mod tests {
             &[Value::Resource("pro000cs_opening.cut".into())],
         );
         assert_eq!(s.world.cutscenes, vec!["pro000cs_opening.cut".to_string()]);
+    }
+
+    #[test]
+    fn dragon_age_2_events_carry_vectors() {
+        let ldf = "#define ENGINE_STRUCTURE_0 event\n\
+            event Event(int nType) = 1;\n\
+            event SetEventVector(event e, int n, vector v) = 2;\n\
+            vector GetEventVector(event e, int n) = 3;\n\
+            int IsVectorEmpty(vector v) = 4;\n";
+        let table = Arc::new(EngineTable::parse(ldf.as_bytes()).unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        let ev = run(&mut s, 1, "Event", &[Value::Int(1001)]).unwrap();
+        let ev = run(
+            &mut s,
+            1,
+            "SetEventVector",
+            &[ev, Value::Int(1), Value::Vector([1.0, 2.0, 3.0])],
+        )
+        .unwrap();
+        assert_eq!(
+            run(&mut s, 1, "GetEventVector", &[ev.clone(), Value::Int(1)]),
+            Some(Value::Vector([1.0, 2.0, 3.0]))
+        );
+        // One never set is the zero vector, which is empty.
+        let unset = run(&mut s, 1, "GetEventVector", &[ev, Value::Int(0)]).unwrap();
+        assert_eq!(unset, Value::Vector([0.0; 3]));
+        assert_eq!(
+            run(&mut s, 1, "IsVectorEmpty", &[unset]),
+            Some(Value::Int(1))
+        );
+        assert_eq!(
+            run(
+                &mut s,
+                1,
+                "IsVectorEmpty",
+                &[Value::Vector([0.0, 0.5, 0.0])]
+            ),
+            Some(Value::Int(0))
+        );
     }
 
     #[test]
