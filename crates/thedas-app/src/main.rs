@@ -4976,6 +4976,8 @@ fn audio_state(
     let Some(live) = live else {
         return state;
     };
+    // The voice playing keeps the speaker's lip sync in time with it.
+    live.set_voice_position(a.voice_position());
     // The loading frame is up: the world's sounds duck as in the exe's loading mode.
     state.loading = live.loading();
     state.paused = live.paused;
