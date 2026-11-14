@@ -1282,19 +1282,20 @@ impl Renderer {
                 masks.push((until, c));
                 continue;
             }
-            if let Some((noscale, remap)) = &grid
-                && !self.masking
-            {
-                let shape = player.vm.display.get(c).and_then(|co| {
-                    if co.mask.is_some() || co.mask_for.is_some() {
-                        return None;
+            if let Some((noscale, remap)) = &grid {
+                let shape = player.vm.display.get(c).and_then(|co| match &co.kind {
+                    Kind::Shape(_, id) if co.visible && co.filters.is_empty() => {
+                        Some((*id, co.matrix, co.color))
                     }
-                    match &co.kind {
-                        Kind::Shape(_, id) if co.visible && co.filters.is_empty() => {
-                            Some((*id, co.matrix, co.color))
-                        }
-                        _ => None,
-                    }
+                    _ => None,
+                });
+                let shape = shape.filter(|_| {
+                    !self.masking
+                        && player
+                            .vm
+                            .display
+                            .get(c)
+                            .is_some_and(|co| co.mask.is_none() && co.mask_for.is_none())
                 });
                 if let Some((id, place, ccx)) = shape {
                     let key = (
