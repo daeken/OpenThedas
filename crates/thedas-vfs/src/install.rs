@@ -1340,6 +1340,38 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
+    #[test]
+    fn scanned_rims_wait_for_an_explicit_load() {
+        let root = std::env::temp_dir().join(format!("thedas-scanned-rim-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let over = root.join("override");
+        std::fs::create_dir_all(over.join("nested")).unwrap();
+        std::fs::write(
+            over.join("neighbor.erf"),
+            erf_v20(&[("shared.gda", b"erf")]),
+        )
+        .unwrap();
+        let rim = over.join("nested/later.rim");
+        std::fs::write(
+            &rim,
+            erf_v20(&[("shared.gda", b"rim"), ("only_rim.gda", b"rim only")]),
+        )
+        .unwrap();
+        let mut vfs = Vfs::new();
+        let label = |p: &Path| {
+            p.strip_prefix(&root)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        };
+        assert!(vfs.push_folder(&over, &label).unwrap().is_empty());
+        assert_eq!(vfs.read("shared.gda").unwrap().0, b"erf");
+        assert!(vfs.lookup("only_rim.gda").is_none());
+        vfs.push_archive(&rim, label(&rim)).unwrap();
+        assert_eq!(vfs.read("only_rim.gda").unwrap().0, b"rim only");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
     /// Offers sit under the core package: each registry offer's `core`, and its `module`
     /// when it sells base-campaign content, supplies only names nothing else has; the
     /// registry's first offer wins between offers; one made for a newer game, or with no
