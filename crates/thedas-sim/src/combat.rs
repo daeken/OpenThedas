@@ -1242,6 +1242,8 @@ impl Sim {
             approach: None,
             ring_wait: false,
             after_impact_ms: None,
+            cancellable_at: None,
+            cancellable: false,
             impacted: false,
             arrived: false,
             path: Vec::new(),
@@ -1353,6 +1355,8 @@ impl Sim {
             approach: None,
             ring_wait: false,
             after_impact_ms: None,
+            cancellable_at: None,
+            cancellable: false,
             impacted: false,
             arrived: false,
             path: Vec::new(),
@@ -1985,6 +1989,7 @@ const IMPACT_EVENT_KINDS: [i64; 2] = [7, 9];
 pub struct AbilityTiming {
     pub impact_ms: u64,
     pub end_ms: u64,
+    pub cancel_ms: Option<u64>,
 }
 
 impl Sim {
@@ -2012,6 +2017,9 @@ impl Sim {
     ///   end (the following `_end` animation is not counted); a projectile's flight is not
     ///   simulated (the impact comes at the release).
     pub fn ability_timing(&mut self, id: ObjectId, ability: i32) -> Option<AbilityTiming> {
+        if self.game == thedas_vfs::Game::DragonAge2 {
+            return self.da2_ability_timing(id, ability);
+        }
         let abi = self.world.tables().get(1, "")?;
         let int = |t: &crate::m2da::Table, hash: u32, row: i64| match t.cell_by_hash(hash, row) {
             Some(thedas_formats::gda::Cell::Int(v)) => Some(*v),
@@ -2055,6 +2063,7 @@ impl Sim {
         Some(AbilityTiming {
             impact_ms: conjure_ms + cast_impact,
             end_ms: conjure_ms + cast.len_ms.max(cast_impact),
+            cancel_ms: None,
         })
     }
 
@@ -3009,6 +3018,7 @@ mod tests {
             Some(AbilityTiming {
                 impact_ms: 467 + 900,
                 end_ms: 467 + 1333,
+                cancel_ms: None,
             })
         );
         // A fast one loops the conjure once, a normal one twice.
@@ -3205,6 +3215,8 @@ mod tests {
                 approach: None,
                 ring_wait: false,
                 after_impact_ms: None,
+                cancellable_at: None,
+                cancellable: false,
                 impacted: false,
                 arrived: false,
                 path: Vec::new(),
