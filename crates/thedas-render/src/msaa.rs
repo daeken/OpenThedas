@@ -178,7 +178,7 @@ impl MsaaTargets {
         let colour = make(
             "multisampled colour",
             format,
-            wgpu::TextureUsages::RENDER_ATTACHMENT,
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
         );
         let depth = make(
             "multisampled depth",

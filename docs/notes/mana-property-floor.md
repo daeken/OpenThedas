@@ -9,9 +9,13 @@ at virtual slot +0x2c. Non-creatures and missing properties are left alone.
 The depletable property's vtable is 0xb210bc. Its current setter, 0x79c8d0,
 reads its total through virtual +0x0c and the lower bound from member +0x78,
 then passes the requested current, total and lower bound to 0x79c2d0. For finite
-values this is min(max(requested, lower), total), with the effective upper bound
-raised to the lower bound when total is smaller. Thus a negative total and a
-zero lower bound yield zero. The total includes modifiers; it is not just base.
+values this is `min(max(requested, lower), total)`. The total includes modifiers.
+The first comparison selects the requested value or the lower bound. The
+second selects the total whenever it is at most that result or unordered.
+A total below the lower bound is returned directly. Thus a negative total
+and a zero lower bound yield that negative total. An unordered total is
+also returned. This corrects the earlier note's claim that the ceiling was
+raised to the floor.
 
 The lower bound is not universally zero. The depletable constructor 0x79ca30
 initializes it to zero at 0x79ca60; clone 0x79c7d0 copies it. The virtual +0x30
@@ -25,10 +29,14 @@ The static callers of the floor setter and the writes in the depletable
 implementation provide no path that changes property 8's zero floor. The
 property serialization at 0x79ca80 does not load a lower-bound field either.
 Mana's initialized zero floor therefore survives both construction and load.
-The current Origins implementation's 0..max(total, 0) clamp is confirmed; no
-runtime change is needed for SCR-053. Existing tests exercise negative inputs,
-above-total inputs, fractional and modifier-derived totals, and non-creatures.
-The separate health immortality-floor behavior is outside this mana gap.
+Origins now checks that property 8 already exists, matching the handler's
+checks at 0x66cd77..0x66cd90, and applies the traced floor-then-ceiling
+selection. This corrects the previous creation of an absent property and
+the zero result for negative totals. Tests exercise modded bounds, negative
+inputs and totals, fractional modifiers, integer limits, absent properties,
+non-creatures and the independent dead, active and immortal flags.
+
+The separate health immortality-floor behavior remains under SCR-026.
 
 This trace establishes Origins behavior only. It does not establish DA2's
 property implementation, whose existing path is retained.
