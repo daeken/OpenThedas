@@ -93,11 +93,8 @@ struct VsOut {
     @location(5) irradiance: vec3<f32>,
 };
 
-@vertex
-fn vs_gbuffer(v: VsIn) -> VsOut {
+fn gbuffer_vertex(v: VsIn, position: vec3<f32>, normal: vec3<f32>) -> VsOut {
     let f = draw;
-    let position = skin_vector(vec4<f32>(v.position, 1.0), v.weights, v.indices);
-    let normal = skin_vector(vec4<f32>(v.normal, 0.0), v.weights, v.indices);
     var out: VsOut;
     // As Static1.vsh does it (`mul`, `mad`, `mad`, `add` by the matrix's columns), so the
     // depth matches what the original shaders write for the same surface.
@@ -118,6 +115,18 @@ fn vs_gbuffer(v: VsIn) -> VsOut {
         out.irradiance = object_probe(normalize(out.normal));
     }
     return out;
+}
+
+@vertex
+fn vs_gbuffer(v: VsIn) -> VsOut {
+    return gbuffer_vertex(v,
+        skin_vector(vec4<f32>(v.position, 1.0), v.weights, v.indices),
+        skin_vector(vec4<f32>(v.normal, 0.0), v.weights, v.indices));
+}
+
+@vertex
+fn vs_gbuffer_rigid(v: VsIn) -> VsOut {
+    return gbuffer_vertex(v, v.position, v.normal);
 }
 
 struct GBuffer {
@@ -243,6 +252,15 @@ struct TerrainMaterial {
     specular: vec4<f32>,
 };
 
+fn terrain_selection(encoded: f32, a: vec4<f32>, b: vec4<f32>, scales: array<vec4<f32>, 2>) -> vec2<f32> {
+    // The eight acceptance intervals do not overlap. Keep the authored tolerance
+    // (including its gaps) while indexing the sole possible layer directly.
+    let layer = min(u32(round(encoded * 7.5)), 7u);
+    let selected = abs(encoded - f32(layer) * (2.0 / 15.0)) <= 0.0625;
+    return select(vec2<f32>(0.0), vec2<f32>(select(a, b, layer >= 4u)[layer % 4u],
+        scales[layer / 4u][layer % 4u]), selected);
+}
+
 // MaskV picks three of eight layers, encoded at 0, 2/15, ..., 14/15.
 // MaskA/MaskA2 hold all eight weights. The palette's tile padding and each
 // layer's UV scale come from the material, never a fixed world-space tiling.
@@ -251,7 +269,6 @@ fn terrain_material(uv: vec2<f32>) -> TerrainMaterial {
     let indices = textureSampleLevel(mask_v, point_smp, uv, 0.0).rgb;
     let a = textureSample(mask_a, clamp_smp, uv);
     let b = textureSample(mask_a2, clamp_smp, uv);
-    let weights = array<f32, 8>(a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w);
     let dx = dpdx(uv) * t.parameters.zw;
     let dy = dpdy(uv) * t.parameters.zw;
     var result: TerrainMaterial;
@@ -259,18 +276,28 @@ fn terrain_material(uv: vec2<f32>) -> TerrainMaterial {
     result.normal = vec4<f32>(0.0);
     result.specular = vec4<f32>(0.0);
     var total = 0.0;
-    for (var layer = 0u; layer < 8u; layer += 1u) {
-        result.specular += weights[layer] * t.specular[layer];
-    }
+    result.specular += a.x * t.specular[0];
+    result.specular += a.y * t.specular[1];
+    result.specular += a.z * t.specular[2];
+    result.specular += a.w * t.specular[3];
+    result.specular += b.x * t.specular[4];
+    result.specular += b.y * t.specular[5];
+    result.specular += b.z * t.specular[6];
+    result.specular += b.w * t.specular[7];
     for (var k = 0u; k < 3u; k += 1u) {
         let encoded = indices[k];
-        var weight = 0.0;
-        var scale = 0.0;
-        for (var layer = 0u; layer < 8u; layer += 1u) {
-            let selected = abs(encoded - f32(layer) * (2.0 / 15.0)) <= 0.0625;
-            weight += select(0.0, weights[layer], selected);
-            scale += select(0.0, t.scales[layer / 4u][layer % 4u], selected);
+        var selection = terrain_selection(encoded, a, b, t.scales);
+        if (frame.fixup.w < 0.5) {
+            selection = vec2<f32>(0.0);
+            let weights = array<f32, 8>(a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w);
+            for (var layer = 0u; layer < 8u; layer += 1u) {
+                let selected = abs(encoded - f32(layer) * (2.0 / 15.0)) <= 0.0625;
+                selection += select(vec2<f32>(0.0),
+                    vec2<f32>(weights[layer], t.scales[layer / 4u][layer % 4u]), selected);
+            }
         }
+        let weight = selection.x;
+        let scale = selection.y;
         let column = floor(encoded * t.dimensions.z);
         let row = floor(fract(encoded * t.dimensions.z) * t.dimensions.w);
         let tile = vec2<f32>(column, row) * t.dimensions.xy + t.parameters.xy;
@@ -386,8 +413,7 @@ struct GBufferSample {
 
 // Shared material work has no discard, so opaque pipelines can reject hidden fragments
 // before evaluating textures. Cutout pipelines keep their authored alpha test below.
-fn gbuffer_material(in: VsOut) -> GBufferSample {
-    if (draw.material.w > 0.5) {
+fn head_gbuffer_material(in: VsOut) -> GBufferSample {
         var m: TerrainMaterial;
         if (draw.material.w < 1.5) {
             m = face_material(in.uv0);
@@ -402,8 +428,9 @@ fn gbuffer_material(in: VsOut) -> GBufferSample {
         let ambient = select(vec3<f32>(1.0), draw.character.ambient.rgb, draw.material.w < 1.5);
         out.lightmap = vec4<f32>(in.irradiance * ambient, 1.0);
         return GBufferSample(out, 1.0, s);
-    }
-    if (draw.room.z > 0.5) {
+}
+
+fn terrain_gbuffer_material(in: VsOut) -> GBufferSample {
         let m = terrain_material(in.uv0);
         let s = surface_normal(in, m.normal);
         var out: GBuffer;
@@ -415,7 +442,9 @@ fn gbuffer_material(in: VsOut) -> GBufferSample {
             out.lightmap = vec4<f32>(probe_irradiance(s.n), 1.0);
         }
         return GBufferSample(out, 1.0, s);
-    }
+}
+
+fn basic_gbuffer_material(in: VsOut, object: bool) -> GBufferSample {
     let s = surface(in);
     var out: GBuffer;
     let diffuse = textureSample(diffuse_tex, wrap_smp, in.uv0);
@@ -423,7 +452,7 @@ fn gbuffer_material(in: VsOut) -> GBufferSample {
     out.specular = textureSample(spec_tex, wrap_smp, in.uv0);
     out.normal = vec4<f32>(oct_encode(s.n), draw.room.x, s.falloff);
     out.lightmap = textureSample(lightmap_tex, clamp_smp, in.uv_lm);
-    if (draw.material.x > 0.5) {
+    if (object && draw.material.x > 0.5) {
         out.albedo.a = select(64.0 / 255.0, 192.0 / 255.0, draw.material.x > 1.5);
         out.lightmap = vec4<f32>(in.irradiance, 1.0);
         if (draw.material.z > 0.5) {
@@ -438,17 +467,44 @@ fn gbuffer_material(in: VsOut) -> GBufferSample {
     return GBufferSample(out, diffuse.a, s);
 }
 
+// Separate helpers keep head and terrain sampling unreachable from Static1 entry
+// points, even on backends that retain material functions instead of inlining them.
+fn gbuffer_material(in: VsOut) -> GBufferSample {
+    if (draw.material.w > 0.5) { return head_gbuffer_material(in); }
+    if (draw.room.z > 0.5) { return terrain_gbuffer_material(in); }
+    return basic_gbuffer_material(in, true);
+}
+
 @fragment
 fn fs_gbuffer(in: VsOut) -> GBuffer {
     let sampled = gbuffer_material(in);
     if (draw.material.w <= 0.5 && draw.room.z <= 0.5 && !alpha_kept(sampled.alpha)) { discard; }
-    return baked_base(in, sampled.data, sampled.surface);
+    return baked_base(in, sampled.data, sampled.surface, 0u);
 }
 
 @fragment
 fn fs_gbuffer_opaque(in: VsOut) -> GBuffer {
     let sampled = gbuffer_material(in);
-    return baked_base(in, sampled.data, sampled.surface);
+    return baked_base(in, sampled.data, sampled.surface, 0u);
+}
+
+@fragment
+fn fs_gbuffer_static(in: VsOut) -> GBuffer {
+    let sampled = basic_gbuffer_material(in, false);
+    if (!alpha_kept(sampled.alpha)) { discard; }
+    return baked_base(in, sampled.data, sampled.surface, 1u);
+}
+
+@fragment
+fn fs_gbuffer_static_opaque(in: VsOut) -> GBuffer {
+    let sampled = basic_gbuffer_material(in, false);
+    return baked_base(in, sampled.data, sampled.surface, 1u);
+}
+
+@fragment
+fn fs_gbuffer_terrain(in: VsOut) -> GBuffer {
+    let sampled = terrain_gbuffer_material(in);
+    return baked_base(in, sampled.data, sampled.surface, 2u);
 }
 
 // Match the translated D3D9 shader's extra clip and rounded saturated 8-bit alpha test.
@@ -479,11 +535,11 @@ fn alpha_test(sampled: f32, test: vec4<f32>) -> bool {
 // intact. Reuse this draw's full-precision material samples and tangent frame instead
 // of evaluating them again in a second geometry pass. Probe/SSAO and debug modes keep
 // the separate terms because AO must be evaluated after the depth buffer is complete.
-fn baked_base(in: VsOut, g: GBuffer, s: Surface) -> GBuffer {
+fn baked_base(in: VsOut, g: GBuffer, s: Surface, kind: u32) -> GBuffer {
     if (frame.fixup.z < 0.5) { return g; }
     var out = g;
-    let terrain = draw.room.z > 0.5;
-    let object = draw.material.x > 0.5;
+    let terrain = kind == 2u || (kind == 0u && draw.room.z > 0.5);
+    let object = kind == 0u && draw.material.x > 0.5;
     var shade = 1.0;
     if (!object) {
         shade = sun_visibility(in.world, s.n, !terrain || draw.room.w < 0.5);
@@ -494,7 +550,7 @@ fn baked_base(in: VsOut, g: GBuffer, s: Surface) -> GBuffer {
     // and terrain's additive tint still use the full-precision material samples.
     let albedo = floor(clamp(g.albedo.rgb, vec3<f32>(0.0), vec3<f32>(1.0)) * 255.0 + 0.5) / 255.0;
     var base = albedo * quantizeToF16(g.lightmap.rgb) * ambient_shade;
-    if (draw.material.w < 0.5) {
+    if (kind != 0u || draw.material.w < 0.5) {
         if (terrain || draw.room.y != 0.0) {
             let r = 2.0 * dot(s.n, s.v) * s.n - s.v;
             let power = g.specular.a * 255.0 + 1.0;
@@ -568,7 +624,8 @@ struct Lighting {
     fog1: vec4<f32>,
     // x: lights, y: debug view, z: membership masks, w: 0 baked, 1 probes, 2 probes + SSAO
     counts: vec4<u32>,
-    // xy: target size
+    depth_plane: vec4<f32>,
+    // xy: target size, z: fused base, w: light rejection flags
     size: vec4<f32>,
 };
 
@@ -590,7 +647,11 @@ struct Light {
 // Per shadow slot, its six faces' view-projections (`deferred_shadow::faces`).
 @group(0) @binding(2) var<uniform> shadow_faces: array<mat4x4<f32>, 24>;
 // 16 x 9 screen tiles, two vec4s each: six ascending 32-bit light masks plus padding.
-@group(0) @binding(3) var<uniform> tile_lights: array<vec4<u32>, 288>;
+struct TileLights {
+    screen: array<vec4<u32>, 288>,
+    depth: array<vec4<u32>, 32>,
+};
+@group(0) @binding(3) var<uniform> tile_lights: TileLights;
 struct LightMasks {
     rooms: array<vec4<u32>, 512>,
     domains: array<vec4<u32>, 4>,
@@ -829,8 +890,12 @@ fn fs_lighting(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     let tile_base = (tile_y * 16u + tile_x) * 2u;
     let mask_room = select(room, 0u, room > 255u || lighting.counts.y == 7u);
     let domain_base = select(0u, 2u, character);
+    let depth_slice = min(u32(max(dot(lighting.depth_plane, vec4<f32>(p, 1.0)), 0.0) / 4.0), 15u);
     for (var word = 0u; word < 6u; word = word + 1u) {
-      var bits = tile_lights[tile_base + word / 4u][word % 4u];
+      var bits = tile_lights.screen[tile_base + word / 4u][word % 4u];
+      if ((u32(lighting.size.w) & 2u) != 0u) {
+          bits &= tile_lights.depth[depth_slice * 2u + word / 4u][word % 4u];
+      }
       if (lighting.counts.z != 0u) {
           bits &= light_masks.rooms[mask_room * 2u + word / 4u][word % 4u]
               & light_masks.domains[domain_base + word / 4u][word % 4u];
@@ -839,46 +904,52 @@ fn fs_lighting(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
         let i = word * 32u + firstTrailingBit(bits);
         bits = bits & (bits - 1u);
         if (i >= lighting.counts.x) { continue; }
-        let l = lights[i];
+        let position = lights[i].position;
+        let to = position.xyz - p;
+        // Reject candidates before loading the complete light or evaluating sqrt,
+        // trigonometric falloff, specular normalization and shadow lookups.
+        let wrap = lighting.counts.y == 9u;
+        let reach = position.w * select(1.0, 2.0, wrap);
+        if ((u32(lighting.size.w) & 1u) != 0u && dot(to, to) >= reach * reach * 1.000001) { continue; }
+        let light_colour = lights[i].colour;
+        let light_shadow = lights[i].shadow;
         if (lighting.counts.z == 0u) {
-            if ((character && l.shadow.y < 1.5) || (!character && l.shadow.y > 1.5 && l.shadow.y < 2.5)) {
+            if ((character && light_shadow.y < 1.5) || (!character && light_shadow.y > 1.5 && light_shadow.y < 2.5)) {
                 continue;
             }
-            if (lighting.counts.y != 7u && !reaches(l, room)) {
+            if (lighting.counts.y != 7u && !reaches(lights[i], room)) {
                 continue;
             }
         }
-        let to = l.position.xyz - p;
         let d = max(length(to), 0.001);
         // Static1's cos²(π/2 · d/R), which repeats past the radius (rising back to full at
         // 2R). The original gives a light to whole objects whose bounding sphere it reaches,
         // so on a large mesh that rise shows; here it ends at the radius (the `wrap` debug
         // view keeps it out to 2R).
-        let wrap = lighting.counts.y == 9u;
-        if (d >= l.position.w * select(1.0, 2.0, wrap)) {
+        if (d >= reach) {
             continue;
         }
-        let c = cos(d / l.position.w * PI * 0.5);
-        let att = c * c;
         let ln = to / d;
         let ndl = dot(n, ln);
         if (ndl < 0.0) {
             continue;
         }
+        let c = cos(d / position.w * PI * 0.5);
+        let att = c * c;
         let h = normalize(v + ln);
         let ndh = max(dot(n, h), 1e-6);
         var shade = 1.0;
-        if (l.shadow.x >= 0.0) {
-            shade = shadowed(i32(l.shadow.x + 0.5), l.position.xyz, p, n);
+        if (light_shadow.x >= 0.0) {
+            shade = shadowed(i32(light_shadow.x + 0.5), position.xyz, p, n);
             if (lighting.counts.y == 10u) {
                 return vec4<f32>(shade, att, 0.0, 1.0);
             }
         }
-        let dif = att * ndl * l.colour.rgb * shade;
-        let sp = att * pow(ndh, power) * l.colour.rgb * shade;
+        let dif = att * ndl * light_colour.rgb * shade;
+        let sp = att * pow(ndh, power) * light_colour.rgb * shade;
         // Objects have no baked direct visibility. Their point lights use their own
         // cube visibility, never the sun's mask or Static1's grazing-angle floor.
-        if (point_uses_baked_mask(l.colour.w > 0.5, material)) {
+        if (point_uses_baked_mask(light_colour.w > 0.5, material)) {
             diff_s = diff_s + dif;
             spec_s = spec_s + sp;
         } else {

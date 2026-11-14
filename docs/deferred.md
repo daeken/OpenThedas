@@ -329,7 +329,12 @@ side-plane rejection; `reflections` compares the separate and fused reflection p
 `light-masks` compares per-light room/domain checks with transposed membership masks;
 `opaque-gbuffer` compares the general G-buffer pipeline with discard-free opaque
 pipelines; `lighting` compares all three new optimizations together;
-`faithful` alternates the faithful path with optimized deferred.
+`faithful` alternates the faithful path with optimized deferred. `specialized-gbuffer`
+compares the general shaders with rigid Static1/terrain variants; `terrain-layers`
+compares the eight terrain-layer comparisons with direct palette selection;
+`depth-lights` compares screen tiles with additional view-depth masks;
+`early-light-reject` compares early squared-distance rejection;
+`pass-cost` switches these four controls together.
 Start with `--renderer deferred` so planning is already complete, keep `--time`, camera,
 resolution and AA fixed, and discard the first twenty frames before comparing adjacent
 pairs. `bench comparison modes` labels control frames 0 and test frames 1. Overrides
@@ -339,6 +344,26 @@ whole-gameplay FPS; shared-machine load can still affect absolute values.
 
 Rendering environment controls are read once per process. Set them before starting the
 engine; paired benchmarks use renderer overrides instead of changing the environment.
+
+Rigid Static1 and terrain draws use dedicated G-buffer entry points, sharing the same
+material equations while allowing unrelated face/eye/tint branches to be removed. Their
+vertex entry point reads positions/normals directly, omitting the identity bone palette.
+Skinned draws retain the general vertex path. Cutouts retain their alpha test, and draw
+order is unchanged. `THEDAS_DEFERRED_SPECIALIZED_GBUFFER=0` restores the general shaders.
+Terrain's MaskV decoding selects its sole possible layer directly, retaining the same
+0.0625 tolerance and the gaps between codes. Specular blending still accumulates all
+eight authored weights in order. `THEDAS_DEFERRED_DIRECT_TERRAIN_LAYERS=0` restores the
+eight comparisons for layer weight/scale selection.
+
+Sixteen four-metre view-depth slices further intersect the screen/room/domain light
+masks. The final slice extends to infinity; spheres crossing boundaries reach both
+slices, with a reconstruction margin, and invalid bounds reach every slice. The screen
+and depth masks together occupy 5,120 bytes of portable uniform storage. `wrap` expands
+both masks to twice the radius. `THEDAS_DEFERRED_DEPTH_LIGHTS=0` omits the depth
+intersection. `THEDAS_DEFERRED_EARLY_LIGHT_REJECT=0` omits the conservative squared-radius
+test before full light evaluation. The original distance cutoff remains, and normal
+rejection precedes trigonometric falloff. Light accumulation order and shadow equations
+are preserved.
 
 ## Capture profiling
 
