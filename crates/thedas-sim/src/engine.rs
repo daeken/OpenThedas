@@ -1130,11 +1130,13 @@ pub fn call(
                 .unwrap_or_default(),
         )),
         "GetName" => ok(Value::String(h.sim.display_name(obj(a, 0)))),
-        // An empty name gives the template's back. Provisional.
         "SetName" => {
             let name = string(a, 1);
+            // Origins explicitly assigns even an empty localized name (0x66ba00 ->
+            // 0x4d1bb0). DA2's empty-name behavior has not been traced.
+            let assigned = h.sim.game == thedas_vfs::Game::Origins || !name.is_empty();
             if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
-                o.name = (!name.is_empty()).then_some(name);
+                o.name = assigned.then_some(name);
             }
             void()
         }
@@ -1210,6 +1212,9 @@ pub fn call(
                 });
             };
             let tag = tag.to_ascii_lowercase();
+            // Origins 0x67fefa requires a type-mask intersection, including for zero.
+            // Keep DA2's untraced zero-as-any behavior.
+            let zero_is_any = h.sim.game == thedas_vfs::Game::DragonAge2;
             let mut found: Vec<(f32, ObjectId)> = h
                 .sim
                 .world
@@ -1224,7 +1229,7 @@ pub fn call(
                 .filter(|o| !perceived || seen.contains(&o.id))
                 .filter(|o| {
                     kind == -1
-                        || kind == 0
+                        || (kind == 0 && zero_is_any)
                         || (kind as u32 as i64 & o.kind.script_type() as i64) != 0
                 })
                 .map(|o| (dist(o.position, origin.0), o.id))
@@ -3817,6 +3822,26 @@ pub fn call(
                     })
             }))
         }
+        // Origins 0x65a2c0 -> creature virtual 0x6ab530 reads property 7's total,
+        // narrows it to f32 and uses the CRT's SSE2 integer conversion (0x8e34f0).
+        "Deprecated_GetMaxHealth"
+            if h.sim.game == thedas_vfs::Game::Origins
+                && h.object(obj(a, 0))
+                    .is_some_and(|o| o.kind == ObjectKind::Creature) =>
+        {
+            let id = obj(a, 0);
+            let total = h
+                .object(id)
+                .filter(|o| o.properties.contains_key(&7))
+                .map_or(0.0, |_| h.sim.property_total(id, 7));
+            ok(Value::Int(
+                if (i32::MIN as f32..2147483648.0).contains(&total) {
+                    total as i32
+                } else {
+                    i32::MIN
+                },
+            ))
+        }
         "Deprecated_GetMaxHealth" => ok(Value::Int(
             h.object(obj(a, 0))
                 .and_then(|o| {
@@ -4926,15 +4951,15 @@ pub fn call(
             }
             void()
         }
-        // DAOrigins.exe 0x6645a0: the template's `NoPermDeath` is 0 and the creature is not
-        // in the party (0x6316f0 on the party list). So the scripts that eat corpses (Death
-        // Magic's heartbeat) leave a fallen party member alone.
+        // Origins 0x6645a0 resolves a creature (0x5d58c0), then requires NoPermDeath == 0
+        // and absence from the party list (0x6316f0). DA2's object-kind behavior is untraced.
         "GetCanDiePermanently" => {
             let id = obj(a, 0);
             let in_party = party_of(h.sim).contains(&id);
             ok(b(!in_party
                 && h.object(id).is_some_and(|o| {
-                    o.fields.get("NoPermDeath").copied().unwrap_or(0) == 0
+                    (h.sim.game != thedas_vfs::Game::Origins || o.kind == ObjectKind::Creature)
+                        && o.fields.get("NoPermDeath").copied().unwrap_or(0) == 0
                 })))
         }
         // A placeable's treasure category and rank, as its instance sets them (`TreasureCategory`,
@@ -6781,6 +6806,63 @@ mod tests {
     }
 
     #[test]
+    fn origins_keeps_explicitly_empty_object_names_through_save_reload() {
+        let table = Arc::new(
+            EngineTable::parse(
+                b"void SetName(object o, string s) = 1; string GetName(object o) = 2;",
+            )
+            .unwrap(),
+        );
+        for game in [thedas_vfs::Game::Origins, thedas_vfs::Game::DragonAge2] {
+            let mut s = Sim::new(Arc::new(Vfs::new()), table.clone(), 7);
+            s.game = game;
+            let id = s.world.spawn(ObjectKind::Creature, "fallback_name");
+            assert_eq!(
+                run(&mut s, id, "GetName", &[Value::Object(id)]),
+                Some(Value::String("fallback_name".into()))
+            );
+            // Replacing a name must not turn a later empty assignment into a reset.
+            for name in ["Renamed", "", "Named again", ""] {
+                run(
+                    &mut s,
+                    id,
+                    "SetName",
+                    &[Value::Object(id), Value::String(name.into())],
+                );
+                let expected = if game == thedas_vfs::Game::DragonAge2 && name.is_empty() {
+                    "fallback_name"
+                } else {
+                    name
+                };
+                assert_eq!(
+                    run(&mut s, id, "GetName", &[Value::Object(id)]),
+                    Some(Value::String(expected.into()))
+                );
+            }
+            let save = s.save_json().unwrap();
+            s.world.get_mut(id).unwrap().name = Some("Overwritten".into());
+            s.load_json(&save).unwrap();
+            let expected = if game == thedas_vfs::Game::Origins {
+                ""
+            } else {
+                "fallback_name"
+            };
+            assert_eq!(
+                run(&mut s, id, "GetName", &[Value::Object(id)]),
+                Some(Value::String(expected.into()))
+            );
+            let before = s.save_json().unwrap();
+            run(
+                &mut s,
+                id,
+                "SetName",
+                &[Value::Object(OBJECT_INVALID), Value::String(String::new())],
+            );
+            assert_eq!(s.save_json().unwrap(), before);
+        }
+    }
+
+    #[test]
     fn origins_appearance_base_survives_temporary_changes_and_reload() {
         let table =
             EngineTable::parse(b"void SetAppearanceType(object o, int n, int b = 0) = 178;\n")
@@ -7155,6 +7237,182 @@ mod tests {
         s.world.queue_destroy(0, follower);
         s.world.destroy_due();
         assert!(s.world.get(hero).unwrap().followers.is_empty());
+    }
+
+    #[test]
+    fn deprecated_max_health_reads_the_origins_creatures_bounded_total() {
+        let table =
+            Arc::new(EngineTable::parse(b"int Deprecated_GetMaxHealth(object o) = 235;").unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        s.world.tables.insert(
+            "properties",
+            &["Type", "Min", "Max", "#106ccdd5"],
+            vec![(
+                7,
+                vec![
+                    Cell::String("DEPLETABLE".into()),
+                    Cell::Float(5.0),
+                    Cell::Float(150.0),
+                    Cell::Int(6),
+                ],
+            )],
+        );
+        let id = s.world.spawn(ObjectKind::Creature, "creature");
+        let o = s.world.get_mut(id).unwrap();
+        o.fields.insert("MaxHealth".into(), 999);
+        o.fields.insert("Health".into(), 888);
+        o.properties.insert(7, (100.5, 3.0));
+        o.properties.insert(6, (14.0, 14.0));
+        o.modifiers.insert(7, 7.25);
+        o.dead = true;
+        o.active = false;
+        o.immortal = true;
+        let query = |s: &mut Sim| run(s, id, "Deprecated_GetMaxHealth", &[Value::Object(id)]);
+        let before = serde_json::to_value(&s.world).unwrap();
+        assert_eq!(s.property_total(id, 7), 127.75);
+        assert_eq!(query(&mut s), Some(Value::Int(127)));
+        assert_eq!(serde_json::to_value(&s.world).unwrap(), before);
+        s.load_game(s.save_game()).unwrap();
+        assert_eq!(query(&mut s), Some(Value::Int(127)));
+        for (base, expected) in [(1000.0, 150), (-1000.0, 5)] {
+            s.world
+                .get_mut(id)
+                .unwrap()
+                .properties
+                .get_mut(&7)
+                .unwrap()
+                .0 = base;
+            assert_eq!(query(&mut s), Some(Value::Int(expected)));
+        }
+        s.world.get_mut(id).unwrap().properties.remove(&7);
+        assert_eq!(query(&mut s), Some(Value::Int(0)));
+    }
+
+    #[test]
+    fn deprecated_max_health_uses_the_native_sse2_conversion_for_creatures() {
+        let table =
+            Arc::new(EngineTable::parse(b"int Deprecated_GetMaxHealth(object o) = 235;").unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        let id = s.world.spawn(ObjectKind::Creature, "creature");
+        for (total, expected) in [
+            (12.99, 12),
+            (-12.99, -12),
+            (-2147483648.0, i32::MIN),
+            (2147483520.0, 2147483520),
+            (2147483648.0, i32::MIN),
+            (f32::MAX, i32::MIN),
+            (f32::NEG_INFINITY, i32::MIN),
+            (f32::INFINITY, i32::MIN),
+            (f32::NAN, i32::MIN),
+        ] {
+            s.world
+                .get_mut(id)
+                .unwrap()
+                .properties
+                .insert(7, (total, 0.0));
+            assert_eq!(
+                run(&mut s, id, "Deprecated_GetMaxHealth", &[Value::Object(id)]),
+                Some(Value::Int(expected)),
+                "{total:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn deprecated_max_health_retains_the_other_paths_pending_their_traces() {
+        let table =
+            Arc::new(EngineTable::parse(b"int Deprecated_GetMaxHealth(object o) = 235;").unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        for kind in [
+            ObjectKind::Creature,
+            ObjectKind::Placeable,
+            ObjectKind::Item,
+        ] {
+            let id = s.world.spawn(kind, "target");
+            s.world
+                .get_mut(id)
+                .unwrap()
+                .properties
+                .insert(7, (100.0, 1.0));
+            for game in [thedas_vfs::Game::Origins, thedas_vfs::Game::DragonAge2] {
+                s.game = game;
+                for (maximum, expected) in [(None, 11), (Some(22), 22)] {
+                    let o = s.world.get_mut(id).unwrap();
+                    o.fields.remove("MaxHealth");
+                    o.fields.insert("Health".into(), 11);
+                    if let Some(maximum) = maximum {
+                        o.fields.insert("MaxHealth".into(), maximum);
+                    }
+                    let expected =
+                        if game == thedas_vfs::Game::Origins && kind == ObjectKind::Creature {
+                            100
+                        } else {
+                            expected
+                        };
+                    assert_eq!(
+                        run(&mut s, id, "Deprecated_GetMaxHealth", &[Value::Object(id)]),
+                        Some(Value::Int(expected)),
+                        "{game:?} {kind:?} {maximum:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn permanent_death_query_requires_an_origins_creature() {
+        let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        for kind in [
+            ObjectKind::Module,
+            ObjectKind::Area,
+            ObjectKind::Creature,
+            ObjectKind::Placeable,
+            ObjectKind::Trigger,
+            ObjectKind::Waypoint,
+            ObjectKind::Store,
+            ObjectKind::Sound,
+            ObjectKind::Item,
+            ObjectKind::Stage,
+            ObjectKind::Party,
+            ObjectKind::Map,
+            ObjectKind::MapPin,
+            ObjectKind::Projectile,
+            ObjectKind::AreaOfEffect,
+        ] {
+            let id = s.world.spawn(kind, "target");
+            for game in [thedas_vfs::Game::Origins, thedas_vfs::Game::DragonAge2] {
+                s.game = game;
+                for no_perm_death in [None, Some(0), Some(1), Some(-1)] {
+                    let o = s.world.get_mut(id).unwrap();
+                    o.fields.remove("NoPermDeath");
+                    if let Some(flag) = no_perm_death {
+                        o.fields.insert("NoPermDeath".into(), flag);
+                    }
+                    // Immortality, active/dead state and health are not this predicate.
+                    o.immortal = true;
+                    o.active = false;
+                    o.dead = true;
+                    let expected = (game != thedas_vfs::Game::Origins
+                        || kind == ObjectKind::Creature)
+                        && no_perm_death.unwrap_or(0) == 0;
+                    assert_eq!(
+                        run(&mut s, id, "GetCanDiePermanently", &[Value::Object(id)]),
+                        Some(Value::Int(expected as i32)),
+                        "{game:?} {kind:?} {no_perm_death:?}"
+                    );
+                }
+            }
+        }
+        for game in [thedas_vfs::Game::Origins, thedas_vfs::Game::DragonAge2] {
+            s.game = game;
+            for id in [OBJECT_INVALID, u32::MAX] {
+                assert_eq!(
+                    run(&mut s, id, "GetCanDiePermanently", &[Value::Object(id)]),
+                    Some(Value::Int(0))
+                );
+            }
+        }
     }
 
     #[test]
@@ -8797,6 +9055,73 @@ mod tests {
         match near {
             Some(Value::Array { items, .. }) => assert_eq!(items, vec![Value::Object(here)]),
             other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn origins_nearest_object_queries_require_a_nonempty_type_mask() {
+        let table = Arc::new(EngineTable::parse(b"\
+            object[] GetNearestObject(object o, int t, int n, int l, int p, int s) = 433;\n\
+            object[] GetNearestObjectByTag(object o, string tag, int t, int n, int l, int p, int s) = 435;\n\
+            object[] GetNearestObjectByGroup(object o, int g, int t, int n, int l, int p, int s) = 436;\n\
+            object[] GetNearestObjectByHostility(object o, int h, int t, int n, int l, int p, int s) = 127;\n"
+        ).unwrap());
+        for game in [thedas_vfs::Game::Origins, thedas_vfs::Game::DragonAge2] {
+            let mut s = Sim::new(Arc::new(Vfs::new()), table.clone(), 1);
+            s.game = game;
+            let area = s.world.spawn(ObjectKind::Area, "area");
+            let origin = s.world.spawn(ObjectKind::Creature, "origin");
+            s.world.get_mut(origin).unwrap().area = Some(area);
+            let creature = s.world.spawn(ObjectKind::Creature, "match");
+            let placeable = s.world.spawn(ObjectKind::Placeable, "match");
+            for (id, x) in [(creature, 1.0), (placeable, 2.0)] {
+                let o = s.world.get_mut(id).unwrap();
+                o.area = Some(area);
+                o.position = [x, 0.0, 0.0];
+            }
+            for name in [
+                "GetNearestObject",
+                "GetNearestObjectByTag",
+                "GetNearestObjectByGroup",
+                "GetNearestObjectByHostility",
+            ] {
+                for (mask, expected) in [
+                    (
+                        0,
+                        if game == thedas_vfs::Game::Origins {
+                            vec![]
+                        } else {
+                            vec![creature, placeable]
+                        },
+                    ),
+                    (32, vec![creature]),
+                    (512, vec![placeable]),
+                    (32 | 512, vec![creature, placeable]),
+                    (-1, vec![creature, placeable]),
+                    (1, vec![]),
+                ] {
+                    let mut args = vec![Value::Object(origin)];
+                    match name {
+                        "GetNearestObjectByTag" => args.push(Value::String("match".into())),
+                        "GetNearestObjectByGroup" | "GetNearestObjectByHostility" => {
+                            args.push(Value::Int(0))
+                        }
+                        _ => {}
+                    }
+                    args.extend([
+                        Value::Int(mask),
+                        Value::Int(10),
+                        Value::Int(0),
+                        Value::Int(0),
+                        Value::Int(0),
+                    ]);
+                    assert_eq!(
+                        run(&mut s, origin, name, &args),
+                        Some(objects(expected)),
+                        "{game:?} {name} mask {mask}"
+                    );
+                }
+            }
         }
     }
 
