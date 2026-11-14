@@ -869,12 +869,18 @@ mod tests {
         assert_eq!(s.per_vertex_technique().map(|(i, _)| i), Some(3));
         assert!(semantic(Vec::new()).technique().is_none());
         assert!(semantic(Vec::new()).per_vertex_technique().is_none());
-        // The definition gives the per-vertex technique as a second form of the semantic.
+        assert_eq!(s.shadow_technique().map(|(i, _)| i), Some(0));
+        // The definition gives the per-vertex and shadow techniques as further forms of the
+        // semantic.
         let def = Bmat { semantics: vec![s] }.definition("static.mat");
         let names: Vec<&str> = def.semantics.iter().map(|s| s.name.as_str()).collect();
-        assert_eq!(names, ["Default", "Default#PerVertex"]);
+        assert_eq!(names, ["Default", "Default#Shadow", "Default#PerVertex"]);
         assert_eq!(
             def.semantics[1].logic[0].techniques[0].name.as_deref(),
+            Some("ShadowPass")
+        );
+        assert_eq!(
+            def.semantics[2].logic[0].techniques[0].name.as_deref(),
             Some("HighToo")
         );
         assert_eq!(engine_usage(6), Some("ModelViewProjection"));
