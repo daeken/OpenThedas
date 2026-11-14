@@ -224,3 +224,93 @@ fn cutaways_return_to_forward_during_fades_and_black_stays_unlit() {
         }
     }
 }
+
+#[test]
+fn baked_lighting_specialization_keeps_light_word_boundaries_and_fallbacks() {
+    let ctx = match GpuContext::headless() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("skipping GPU test: {e}");
+            return;
+        }
+    };
+    let mut scene = super::forward_transparency_tests::scene(6.0, "static");
+    scene.static_draws = 1;
+    let mesh = &mut scene.meshes[0];
+    mesh.chunk.vertex_size = std::mem::size_of::<Vertex>() as u32;
+    mesh.chunk.elements = vec![VertexElement {
+        stream: 0,
+        offset: 0,
+        ty: DeclType::Float3,
+        usage: DeclUsage::Position,
+        usage_index: 0,
+    }];
+    mesh.raw_vertices = bytemuck::cast_slice(&mesh.vertices).to_vec();
+    let mut programs = ProgramRegistry::default();
+    programs.push_front(Box::new(Fixture));
+    let mut renderer = AreaRenderer::new_cached_with_path(
+        &ctx,
+        &Vfs::new(),
+        &scene,
+        &programs,
+        wgpu::TextureFormat::Rgba8Unorm,
+        &mut RenderCache::default(),
+        crate::RenderPath::Deferred,
+    );
+    assert!(renderer.deferred.as_ref().unwrap().takes(0));
+    let camera = Camera::new(Vec3::ZERO, 0.0, 0.0);
+    let mut colours = Vec::new();
+    // Include empty words and both sides of every boundary in the 192-light array.
+    for count in [
+        0, 1, 31, 32, 33, 63, 64, 65, 95, 96, 97, 127, 128, 129, 159, 160, 161, 191, 192,
+    ] {
+        renderer.set_effect_lights(
+            (0..count)
+                .map(|i| crate::scene::SceneLight::Point {
+                    position: Vec3::new(2.0, (i % 7) as f32 * 0.1, (i % 11) as f32 * 0.1),
+                    color: Vec3::new(0.002, 0.001, 0.0005),
+                    radius: 10.0,
+                    name: format!("fixture {i}"),
+                    domain: None,
+                    is_static: false,
+                    version: 0,
+                    intensity: 1.0,
+                    room: None,
+                })
+                .collect(),
+        );
+        for fused in [true, false] {
+            renderer.set_deferred_fused_reflections(Some(fused));
+            renderer.set_deferred_specialized_lighting(Some(false));
+            let general = renderer.capture(&ctx, &camera, 32, 32).unwrap();
+            renderer.set_deferred_specialized_lighting(Some(true));
+            let specialized = renderer.capture(&ctx, &camera, 32, 32).unwrap();
+            assert!(!renderer.deferred.as_ref().unwrap().refused());
+            assert_eq!(general, specialized, "{count} lights, fused={fused}");
+            if fused {
+                colours.push(specialized[(16 * 32 + 16) * 4]);
+            }
+        }
+    }
+    assert_eq!(colours[0], 0);
+    assert!(
+        colours.last().unwrap() > &20,
+        "point lighting must contribute: {colours:?}"
+    );
+    assert!(colours.windows(2).all(|p| p[0] <= p[1]), "{colours:?}");
+    for feature in 0..3 {
+        renderer.set_deferred_fused_reflections(Some(true));
+        match feature {
+            0 => renderer.set_deferred_light_masks(Some(false)),
+            1 => renderer.set_deferred_depth_lights(Some(false)),
+            _ => renderer.set_deferred_early_light_reject(Some(false)),
+        }
+        renderer.set_deferred_specialized_lighting(Some(false));
+        let general = renderer.capture(&ctx, &camera, 32, 32).unwrap();
+        renderer.set_deferred_specialized_lighting(Some(true));
+        assert_eq!(general, renderer.capture(&ctx, &camera, 32, 32).unwrap());
+        renderer.set_deferred_light_masks(None);
+        renderer.set_deferred_depth_lights(None);
+        renderer.set_deferred_early_light_reject(None);
+    }
+}

@@ -1265,6 +1265,13 @@ impl AreaRenderer {
         }
     }
 
+    /// Diagnostic override for the ordinary baked-lighting shader specialization.
+    pub fn set_deferred_specialized_lighting(&mut self, enabled: Option<bool>) {
+        if let Some(d) = &mut self.deferred {
+            d.set_specialized_lighting(enabled);
+        }
+    }
+
     /// Diagnostic override for squared-distance rejection before point-light shading.
     pub fn set_deferred_early_light_reject(&mut self, enabled: Option<bool>) {
         if let Some(d) = &mut self.deferred {
