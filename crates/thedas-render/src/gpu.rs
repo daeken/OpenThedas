@@ -1233,6 +1233,55 @@ impl AreaRenderer {
         }
     }
 
+    /// Diagnostic override for sphere-versus-tile light rejection; `None` restores config.
+    pub fn set_deferred_tight_tiles(&mut self, enabled: Option<bool>) {
+        if let Some(d) = &mut self.deferred {
+            d.set_tight_tiles(enabled);
+        }
+    }
+
+    /// Diagnostic override for room/domain light-mask intersection.
+    pub fn set_deferred_light_masks(&mut self, enabled: Option<bool>) {
+        if let Some(d) = &mut self.deferred {
+            d.set_light_masks(enabled);
+        }
+    }
+
+    /// Diagnostic override for opaque G-buffer pipelines without fragment discard.
+    pub fn set_deferred_opaque_gbuffer(&mut self, enabled: Option<bool>) {
+        if let Some(d) = &mut self.deferred {
+            d.set_opaque_gbuffer(enabled);
+        }
+    }
+
+    /// Diagnostic override for material-specific G-buffer shaders.
+    pub fn set_deferred_specialized_gbuffer(&mut self, enabled: Option<bool>) {
+        if let Some(d) = &mut self.deferred {
+            d.set_specialized_gbuffer(enabled);
+        }
+    }
+
+    /// Diagnostic override for squared-distance rejection before point-light shading.
+    pub fn set_deferred_early_light_reject(&mut self, enabled: Option<bool>) {
+        if let Some(d) = &mut self.deferred {
+            d.set_early_light_reject(enabled);
+        }
+    }
+
+    /// Diagnostic override for conservative view-depth light masks.
+    pub fn set_deferred_depth_lights(&mut self, enabled: Option<bool>) {
+        if let Some(d) = &mut self.deferred {
+            d.set_depth_lights(enabled);
+        }
+    }
+
+    /// Diagnostic override for direct terrain palette-layer selection.
+    pub fn set_deferred_direct_terrain_layers(&mut self, enabled: Option<bool>) {
+        if let Some(d) = &mut self.deferred {
+            d.set_direct_terrain_layers(enabled);
+        }
+    }
+
     /// Grades the frame as area `grade` says: its colour curve and `da_hsvmatrix` values
     /// (DAOrigins.exe swaps them when an area becomes active, 0x67b1b0).
     pub fn set_area_grade(&mut self, ctx: &GpuContext, vfs: &Vfs, grade: &crate::post::AreaGrade) {
@@ -1804,7 +1853,11 @@ impl AreaRenderer {
             })
             .collect();
         if let Some(p) = profile.as_deref_mut() {
-            p.mark("frame_prepare");
+            p.mark(if over.is_some() {
+                "object_prepare"
+            } else {
+                "frame_prepare"
+            });
         }
         let deferred = deferred_now
             && self.deferred.as_mut().is_some_and(|p| {
@@ -1845,6 +1898,11 @@ impl AreaRenderer {
             _ => (wgpu::LoadOp::Load, wgpu::LoadOp::Load),
         };
         let colour = ms.as_ref().map_or(target, |(c, _, _)| c);
+        let forward_label = if over.is_some() {
+            "object_forward"
+        } else {
+            "level_forward"
+        };
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("area"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -1864,7 +1922,7 @@ impl AreaRenderer {
                 }),
                 stencil_ops: None,
             }),
-            timestamp_writes: profile.as_deref_mut().and_then(|p| p.pass("level_forward")),
+            timestamp_writes: profile.as_deref_mut().and_then(|p| p.pass(forward_label)),
             occlusion_query_set: None,
             multiview_mask: None,
         });
@@ -1876,7 +1934,7 @@ impl AreaRenderer {
         );
         drop(pass);
         if let Some(p) = profile {
-            p.mark("level_forward");
+            p.stage(ctx, encoder, forward_label);
         }
     }
 
@@ -1887,6 +1945,16 @@ impl AreaRenderer {
         encoder: &mut wgpu::CommandEncoder,
         target: &wgpu::TextureView,
         depth: &wgpu::TextureView,
+    ) {
+        self.finish_transparency_with(encoder, target, depth, None);
+    }
+
+    fn finish_transparency_with(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &wgpu::TextureView,
+        depth: &wgpu::TextureView,
+        timestamp_writes: Option<wgpu::RenderPassTimestampWrites<'_>>,
     ) {
         if !std::mem::take(&mut self.late_transparency) {
             return;
@@ -1910,7 +1978,7 @@ impl AreaRenderer {
                 }),
                 stencil_ops: None,
             }),
-            timestamp_writes: None,
+            timestamp_writes,
             occlusion_query_set: None,
             multiview_mask: None,
         });
@@ -2188,7 +2256,7 @@ impl AreaRenderer {
         }
         self.finish_shadows(&mut encoder);
         if let Some(p) = &mut profile {
-            p.mark("sun_shadows");
+            p.stage(ctx, &mut encoder, "sun_shadows");
         }
         self.render_pass_with(
             ctx,
@@ -2208,16 +2276,35 @@ impl AreaRenderer {
             });
         }
         if let Some(p) = &mut profile {
-            p.mark("ground");
+            p.stage(ctx, &mut encoder, "ground");
         }
         if !overlays.is_empty() {
             let depth = self.depth(&ctx.device, width, height);
             for o in overlays.iter_mut() {
-                o.render_over(ctx, &mut encoder, &frame, width, height, camera, &depth);
+                o.render_pass_with(
+                    ctx,
+                    &mut encoder,
+                    &frame,
+                    width,
+                    height,
+                    camera,
+                    Some(&depth),
+                    &mut [],
+                    profile.as_mut(),
+                );
             }
-            self.finish_transparency(&mut encoder, &frame, &depth);
-            for o in overlays.iter_mut() {
-                o.finish_transparency(&mut encoder, &frame, &depth);
+            for o in std::iter::once(&mut *self).chain(overlays.iter_mut().map(|o| &mut **o)) {
+                if o.late_transparency {
+                    o.finish_transparency_with(
+                        &mut encoder,
+                        &frame,
+                        &depth,
+                        profile.as_mut().and_then(|p| p.pass("transparency")),
+                    );
+                    if let Some(p) = &mut profile {
+                        p.stage(ctx, &mut encoder, "transparency");
+                    }
+                }
             }
         }
         if let Some(p) = &mut profile {
@@ -2229,7 +2316,7 @@ impl AreaRenderer {
             self.finish_frame_with(ctx, &mut encoder, &target, width, height, &over);
         }
         if let Some(p) = &mut profile {
-            p.mark("resolve_post");
+            p.stage(ctx, &mut encoder, "resolve_post");
         }
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {

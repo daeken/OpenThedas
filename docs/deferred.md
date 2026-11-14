@@ -324,8 +324,17 @@ For fixed-scene save captures (`--save ...`), `THEDAS_BENCH_FRAMES=120 THEDAS_BE
 reports the headless capture loop's CPU/submission/GPU-wait/readback cost, excluding
 scene load and PNG encoding. `THEDAS_BENCH_DEFERRED_COMPARE=all` alternates full-candidate
 and optimized frames in ABBA order within one loaded scene. `tiles` or `shadows` isolates
-one optimization; `reflections` compares the separate and fused reflection paths;
-`faithful` alternates the faithful path with optimized deferred.
+one optimization; `tile-frusta` compares projected-box tiles with additional sphere/tile
+side-plane rejection; `reflections` compares the separate and fused reflection paths;
+`light-masks` compares per-light room/domain checks with transposed membership masks;
+`opaque-gbuffer` compares the general G-buffer pipeline with discard-free opaque
+pipelines; `lighting` compares all three new optimizations together;
+`faithful` alternates the faithful path with optimized deferred. `specialized-gbuffer`
+compares the general shaders with rigid Static1/terrain variants; `terrain-layers`
+compares the eight terrain-layer comparisons with direct palette selection;
+`depth-lights` compares screen tiles with additional view-depth masks;
+`early-light-reject` compares early squared-distance rejection;
+`pass-cost` switches these four controls together.
 Start with `--renderer deferred` so planning is already complete, keep `--time`, camera,
 resolution and AA fixed, and discard the first twenty frames before comparing adjacent
 pairs. `bench comparison modes` labels control frames 0 and test frames 1. Overrides
@@ -336,12 +345,36 @@ whole-gameplay FPS; shared-machine load can still affect absolute values.
 Rendering environment controls are read once per process. Set them before starting the
 engine; paired benchmarks use renderer overrides instead of changing the environment.
 
+Rigid Static1 and terrain draws use dedicated G-buffer entry points, sharing the same
+material equations while allowing unrelated face/eye/tint branches to be removed. Their
+vertex entry point reads positions/normals directly, omitting the identity bone palette.
+Skinned draws retain the general vertex path. Cutouts retain their alpha test, and draw
+order is unchanged. `THEDAS_DEFERRED_SPECIALIZED_GBUFFER=0` restores the general shaders.
+These variants run only with fused baked reflections: probe/AO and diagnostic modes
+retain the general vertex path so their separate reflection pass matches G-buffer depth.
+Terrain's MaskV decoding selects its sole possible layer directly, retaining the same
+0.0625 tolerance and the gaps between codes. Specular blending still accumulates all
+eight authored weights in order. `THEDAS_DEFERRED_DIRECT_TERRAIN_LAYERS=0` restores the
+eight comparisons for layer weight/scale selection.
+
+Sixteen four-metre view-depth slices further intersect the screen/room/domain light
+masks. The final slice extends to infinity; spheres crossing boundaries reach both
+slices, with a reconstruction margin, and invalid bounds reach every slice. The screen
+and depth masks together occupy 5,120 bytes of portable uniform storage. `wrap` expands
+both masks to twice the radius. `THEDAS_DEFERRED_DEPTH_LIGHTS=0` omits the depth
+intersection. `THEDAS_DEFERRED_EARLY_LIGHT_REJECT=0` omits the conservative squared-radius
+test before full light evaluation. The original distance cutoff remains, and normal
+rejection precedes trigonometric falloff. Light accumulation order and shadow equations
+are preserved.
+
 ## Capture profiling
 
 `THEDAS_RENDER_PROFILE=1` records CPU stage durations for offscreen world captures and
 requests optional GPU timestamps from the adapter. When timestamps are
-available, it also reports durations on the actual G-buffer, lighting, reflection and
-level-forward render passes. CPU stages cover shadow preparation/encoding, object overlays,
+available, it also reports durations on the actual G-buffer, lighting, reflection,
+level-forward, object-forward and delayed-transparency render passes. Repeated object
+or transparency stages are separate passes, with their own timestamp pair.
+CPU stages cover shadow preparation/encoding, object overlays,
 post-processing and pixel copies too. Unsupported adapters still report CPU durations.
 The existing `THEDAS_BENCH_FRAMES` and same-process
 ABBA path comparison can collect warmed samples for each renderer.
@@ -350,10 +383,39 @@ CPU encoding, submission/wait/pixel unpacking and GPU execution are reported sep
 Per-pass GPU intervals can overlap on pipelined GPUs and can overlap CPU work.
 Keep each interval separate when interpreting the frame budget.
 The reflection interval is absent when its work is fused into the G-buffer. The GPU
-samples cover these passes. Forward object passes, shadows, uploads and
-post-processing need separate instrumentation for a complete GPU frame budget.
+samples cover these passes. Shadows, uploads, ground and post-processing still have
+CPU stage timings rather than individual GPU queries.
 Profiling adds query resources, timestamp writes and a diagnostic readback per capture.
 Use ordinary paired captures with profiling disabled for the relative frame-cost target.
+
+`THEDAS_RENDER_PROFILE_SERIAL=1`, together with profiling, submits and waits between
+stages. This prevents an earlier pass's fragments from overlapping a later pass's vertex
+timestamp, making the individual lighting and forward intervals easier to interpret.
+It also prints `render-profile-serial ... submit_wait_ms=...` for each boundary, including
+the shadow, ground and post stages. These wall waits include submission/driver overhead;
+they are not GPU durations. CPU stage times exclude these waits. Serialization perturbs
+scheduling and adds overhead, so it is a diagnostic budget, not a gameplay or benchmark
+mode. Compare ordinary same-process captures to establish an optimization's benefit.
+
+`THEDAS_DEFERRED_TIGHT_TILES=0` retains projected-box light tiles as a comparison. The
+default also tests each candidate sphere against the tile's four side planes, with a
+one-pixel margin for reconstruction and rounding. This rejects false candidates when
+the enclosing box crosses the camera plane; spheres containing the eye still reach all
+tiles. Light indices, accumulation order, room/domain filtering and shader equations
+are unchanged. The `wrap` view scales both broad and narrow phases to twice the radius.
+
+`THEDAS_DEFERRED_LIGHT_MASKS=0` retains per-light room/domain checks. The default
+transposes those memberships into six light words per room and per domain, intersects
+them with the tile mask, then iterates the surviving indices in the same ascending
+order. Unassigned/overflow rooms and the `no-rooms` view use the unrestricted row.
+The 8,256-byte uniform block fits portable limits and is uploaded only when membership
+changes.
+
+`THEDAS_DEFERRED_OPAQUE_GBUFFER=0` retains the general alpha-capable G-buffer pipeline
+for every draw. The default uses a separate fragment entry point with no reachable
+discard for draws without an alpha test. Material sampling and G-buffer outputs are
+shared with the cutout pipeline. Cutouts retain authored comparisons, opacity and clip;
+faded draws retain forward rendering. Draw order and depth tests are unchanged.
 
 ## Order of work
 
