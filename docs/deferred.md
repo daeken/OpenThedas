@@ -350,6 +350,8 @@ material equations while allowing unrelated face/eye/tint branches to be removed
 vertex entry point reads positions/normals directly, omitting the identity bone palette.
 Skinned draws retain the general vertex path. Cutouts retain their alpha test, and draw
 order is unchanged. `THEDAS_DEFERRED_SPECIALIZED_GBUFFER=0` restores the general shaders.
+These variants run only with fused baked reflections: probe/AO and diagnostic modes
+retain the general vertex path so their separate reflection pass matches G-buffer depth.
 Terrain's MaskV decoding selects its sole possible layer directly, retaining the same
 0.0625 tolerance and the gaps between codes. Specular blending still accumulates all
 eight authored weights in order. `THEDAS_DEFERRED_DIRECT_TERRAIN_LAYERS=0` restores the

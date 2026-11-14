@@ -1960,7 +1960,10 @@ impl DeferredPass {
                 .unwrap_or(crate::config::CONFIG.opaque_gbuffer);
             let specialized = self
                 .specialized_gbuffer
-                .unwrap_or(crate::config::CONFIG.specialized_gbuffer);
+                .unwrap_or(crate::config::CONFIG.specialized_gbuffer)
+                // Separate reflection redraws use the general vertex entry point.
+                // Retain identical clip/depth evaluation across those two passes.
+                && fused_reflections;
             draw_all(
                 &self.draws,
                 &mut pass,
