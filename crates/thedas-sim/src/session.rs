@@ -34,9 +34,12 @@ pub fn open(o: &SessionOptions) -> Result<Sim, SimError> {
     let (data, _) = vfs
         .read("script.ldf")
         .map_err(|_| SimError::NotFound("script.ldf".into()))?;
-    let table = EngineTable::parse(&data)
+    let mut table = EngineTable::parse(&data)
         .map_err(|e| SimError::Parse("script.ldf".into(), e.to_string()))?
         .with_inferred();
+    if install.game() == thedas_vfs::Game::DragonAge2 {
+        add_dragon_age_2_constants(&mut table);
+    }
     // Mount the area's level archives so lookups match the renderer's.
     if let Some(area) = &o.area {
         if let Ok((data, _)) = vfs.read(&format!("{area}.are")) {
@@ -69,12 +72,38 @@ pub fn open_bare(o: &SessionOptions) -> Result<Sim, SimError> {
     let (data, _) = vfs
         .read("script.ldf")
         .map_err(|_| SimError::NotFound("script.ldf".into()))?;
-    let table = EngineTable::parse(&data)
+    let mut table = EngineTable::parse(&data)
         .map_err(|e| SimError::Parse("script.ldf".into(), e.to_string()))?
         .with_inferred();
+    if install.game() == thedas_vfs::Game::DragonAge2 {
+        add_dragon_age_2_constants(&mut table);
+    }
     let mut sim = Sim::new(Arc::new(vfs), Arc::new(table), o.seed);
     sim.game = install.game();
     Ok(sim)
+}
+
+/// Constants the simulation reads by name that Dragon Age II's `script.ldf` does not
+/// declare (its scripts have them compiled in): the creature property ids, which are the
+/// rows of DA2's `properties` table (`Health` 7, `Mana` 10, `Experience` 35, `Level` 36;
+/// DA2 keeps mana and stamina in one property). One the table declares is left as it is.
+/// Provisional: read from the shipped table, not traced in DragonAge2.exe.
+fn add_dragon_age_2_constants(table: &mut EngineTable) {
+    use thedas_script::ldf::{ConstValue, Constant, Type};
+    for (name, value) in [
+        ("PROPERTY_DEPLETABLE_HEALTH", 7),
+        ("PROPERTY_DEPLETABLE_MANA_STAMINA", 10),
+        ("PROPERTY_SIMPLE_EXPERIENCE", 35),
+        ("PROPERTY_SIMPLE_LEVEL", 36),
+    ] {
+        if !table.constants.iter().any(|c| c.name == name) {
+            table.constants.push(Constant {
+                ty: Type::Int,
+                name: name.to_string(),
+                value: ConstValue::Int(value),
+            });
+        }
+    }
 }
 
 /// The install root from `THEDAS_INSTALL`, if set.
@@ -84,4 +113,23 @@ pub fn install_from_env() -> Option<std::path::PathBuf> {
 
 pub fn exists(p: &Path) -> bool {
     thedas_vfs::join_ci(p, "packages/core").is_dir()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dragon_age_2_gets_the_property_ids_its_script_ldf_lacks() {
+        let mut table =
+            EngineTable::parse(b"int PROPERTY_SIMPLE_LEVEL = 99;\nint PROPERTY_VALUE_TOTAL = 1;\n")
+                .unwrap();
+        add_dragon_age_2_constants(&mut table);
+        let c = |n: &str| crate::sim::constant(&table, n);
+        assert_eq!(c("PROPERTY_DEPLETABLE_HEALTH"), 7);
+        assert_eq!(c("PROPERTY_DEPLETABLE_MANA_STAMINA"), 10);
+        assert_eq!(c("PROPERTY_SIMPLE_EXPERIENCE"), 35);
+        // One the table declares stays as declared.
+        assert_eq!(c("PROPERTY_SIMPLE_LEVEL"), 99);
+    }
 }
