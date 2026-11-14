@@ -489,6 +489,15 @@ impl RenderCache {
     pub fn forget(&mut self, names: &[String]) {
         self.textures.forget(names);
         self.scenes.forget(names);
+        // Mesh buffers are keyed `<msh>:<chunk>` (with suffixes for variants).
+        let of = |k: &str| {
+            let k = k.to_ascii_lowercase();
+            names
+                .iter()
+                .any(|n| k.starts_with(&format!("{}:", n.to_ascii_lowercase())))
+        };
+        self.meshes.retain(|k, _| !of(k));
+        self.d3d.forget_meshes(&of);
     }
 }
 

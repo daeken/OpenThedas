@@ -115,6 +115,13 @@ pub(crate) struct D3dCache {
     vertices: HashMap<(String, String), wgpu::Buffer>,
 }
 
+impl D3dCache {
+    /// Drops the vertex buffers of the meshes `of` names (by mesh key).
+    pub(crate) fn forget_meshes(&mut self, of: &dyn Fn(&str) -> bool) {
+        self.vertices.retain(|(k, _), _| !of(k));
+    }
+}
+
 /// The level's far billboard batch's vertex buffer, whose TEXCOORD0 each frame rewrites with
 /// the placements' fades ([`crate::scene::BillboardInstance::texcoord0`]).
 struct BillboardStream {
