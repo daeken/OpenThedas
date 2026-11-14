@@ -617,21 +617,22 @@ fn command_constant(name: &str) -> String {
     out
 }
 
-/// Constructors whose command type script.ldf does not name; scripts only check that a
-/// command's type is not 0 (`COMMAND_TYPE_INVALID`: rules_core warns "Something is trying to
-/// add an invalid command"), so these get types of their own above the named ones.
-/// Provisional: the engine's own numbers for them are not recovered.
-const UNNAMED_COMMANDS: &[&str] = &[
-    "CommandMoveAwayFromObject",
-    "CommandMoveToMultiLocations",
-    "CommandSheatheWeapons",
-    "CommandUnsheatheWeapons",
-    "CommandTurn",
+/// Origins constructors whose runtime type script.ldf does not name. Traced assignments
+/// go through 0x742090 and are read back by GetCommandType (0x66eba0). Different
+/// constructors may share a type; their payload and executor still distinguish them.
+const UNNAMED_COMMANDS: &[(&str, i32)] = &[
+    ("CommandMoveAwayFromObject", 21),   // 0x66f564
+    ("CommandMoveToMultiLocations", 22), // 0x673383
+    ("CommandSheatheWeapons", 39),       // 0x66fbb9
+    ("CommandUnsheatheWeapons", 39),     // same handler, different payload
+    ("CommandTurn", 41),                 // 0x66eabe
 ];
 
 /// A command constructor's `COMMAND_TYPE_*` value (see [`UNNAMED_COMMANDS`]).
-fn command_type(table: &thedas_script::EngineTable, name: &str) -> i32 {
-    match UNNAMED_COMMANDS.iter().position(|n| *n == name) {
+fn command_type(table: &thedas_script::EngineTable, name: &str, game: thedas_vfs::Game) -> i32 {
+    match UNNAMED_COMMANDS.iter().position(|(n, _)| *n == name) {
+        Some(i) if game == thedas_vfs::Game::Origins => UNNAMED_COMMANDS[i].1,
+        // DA2's assignments have not been traced; keep its existing placeholders.
         Some(i) => 1000 + i as i32,
         None => constant(table, &command_constant(name)),
     }
@@ -2370,7 +2371,7 @@ pub fn call(
         // --- Commands ---------------------------------------------------------------------
         n if n.starts_with("Command") && f.ret == Type::Engine(ty.command) => {
             let mut c = Command {
-                ty: command_type(&h.sim.table, n),
+                ty: command_type(&h.sim.table, n, h.sim.game),
                 name: n.to_string(),
                 target: None,
                 location: None,
@@ -5814,6 +5815,46 @@ mod tests {
     }
 
     #[test]
+    fn unnamed_constructor_types_are_observable_through_the_script_accessor() {
+        let table = Arc::new(
+            EngineTable::parse(
+                br#"
+          #define ENGINE_STRUCTURE_2 command
+          command CommandMoveAwayFromObject() = 1;
+          command CommandMoveToMultiLocations() = 2;
+          command CommandSheatheWeapons() = 3;
+          command CommandUnsheatheWeapons() = 4;
+          command CommandTurn() = 5;
+          int GetCommandType(command c) = 6;
+        "#,
+            )
+            .unwrap(),
+        );
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        let creature = s.world.spawn(ObjectKind::Creature, "creature");
+        for (name, expected) in [
+            ("CommandMoveAwayFromObject", 21),
+            ("CommandMoveToMultiLocations", 22),
+            ("CommandSheatheWeapons", 39),
+            ("CommandUnsheatheWeapons", 39),
+            ("CommandTurn", 41),
+        ] {
+            let command = run(&mut s, creature, name, &[]).unwrap();
+            assert_eq!(
+                run(&mut s, creature, "GetCommandType", &[command]),
+                Some(Value::Int(expected)),
+                "{name}"
+            );
+        }
+        s.game = thedas_vfs::Game::DragonAge2;
+        let command = run(&mut s, creature, "CommandTurn", &[]).unwrap();
+        assert_eq!(
+            run(&mut s, creature, "GetCommandType", &[command]),
+            Some(Value::Int(1004))
+        );
+    }
+
+    #[test]
     fn treasure_rank_reads_only_a_placeables_rank() {
         let table =
             Arc::new(EngineTable::parse(b"int GetPlaceableTreasureRank(object o) = 818;").unwrap());
@@ -7506,11 +7547,11 @@ mod tests {
             "COMMAND_TYPE_SWITCH_WEAPON_SETS"
         );
         let table = thedas_script::EngineTable::default();
-        assert!(
-            UNNAMED_COMMANDS
-                .iter()
-                .all(|n| command_type(&table, n) >= 1000)
-        );
+        assert!(UNNAMED_COMMANDS.iter().all(|(n, _)| command_type(
+            &table,
+            n,
+            thedas_vfs::Game::DragonAge2
+        ) >= 1000));
         assert_eq!(format_float(1.5, 0, 6), "1.500000");
         assert_eq!(format_float(2.0, 6, 1), "   2.0");
         let square = [
