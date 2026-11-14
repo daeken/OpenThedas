@@ -5689,6 +5689,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "thedas-gfx"
+version = "0.1.0"
+dependencies = [
+ "flate2",
+ "log",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "thedas-launcher"
 version = "0.1.0"
 dependencies = [
