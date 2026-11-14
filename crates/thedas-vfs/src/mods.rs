@@ -40,6 +40,10 @@
 //! as a folder: a 7z is one compressed stream, so serving single files out of it in place is
 //! not practical. `archive.7z!/folder` picks one folder of it, as for a zip.
 //!
+//! A `.rar` archive is unpacked the same way ([`unpack_rar`], with the UnRAR library through
+//! the `unrar` crate); `archive.rar!/folder` works too. Multi-volume archives are read from
+//! their first volume, with the others beside it.
+//!
 //! A `.dazip` is the original's add-in package: a zip holding `Manifest.xml` and `Contents/`,
 //! with add-ins under `Contents/addins/<uid>/` and sometimes files for
 //! `Contents/packages/core/override/`. The original installs it into the player's documents.
@@ -339,8 +343,12 @@ fn mount_entry(
                 None => {}
             }
         }
-        "7z" => {
-            let (root, skipped) = unpack_7z(path, cache)?;
+        "7z" | "rar" => {
+            let (root, skipped) = if ext == "rar" {
+                unpack_rar(path, cache)?
+            } else {
+                unpack_7z(path, cache)?
+            };
             problems.extend(skipped);
             let dir = match entry.inner.as_deref() {
                 Some(inner) => match resolve_ci(&root, inner).filter(|d| d.is_dir()) {
@@ -366,7 +374,7 @@ fn mount_entry(
             }
         }
         _ => problems.push(
-            "not a folder, .zip, .7z, .dazip, .erf or .rim (unpack other archive types to a folder and list the folder)"
+            "not a folder, .zip, .7z, .rar, .dazip, .erf or .rim (unpack other archive types to a folder and list the folder)"
                 .into(),
         ),
     }
@@ -517,6 +525,98 @@ pub fn unpack_7z(path: &Path, cache: &Path) -> Result<(PathBuf, Vec<String>)> {
     Ok((root, problems))
 }
 
+/// Unpacks a `.rar` archive into its own folder under `cache`, as [`unpack_7z`] does a `.7z`
+/// (same cache slot, limits and refusals): through the UnRAR library, whose licence lets it
+/// be shipped with the program (see `docs/mods.md`). A multi-volume archive is read from the
+/// volume named, which should be the first, with the others beside it. Encrypted entries
+/// (and archives whose headers are encrypted) are refused.
+// The UnRAR library's licence asks for this paragraph in the source of a program that
+// includes it:
+// UnRAR source code may be used in any software to handle RAR archives without limitations
+// free of charge, but cannot be used to develop RAR (WinRAR) compatible archiver and to
+// re-create RAR compression algorithm, which is proprietary. Distribution of modified UnRAR
+// source code in separate form or as a part of other software is permitted, provided that
+// full text of this paragraph, starting from "UnRAR source code" words, is included in
+// license, or in documentation if license is not available, and in source code comments of
+// resulting package.
+pub fn unpack_rar(path: &Path, cache: &Path) -> Result<(PathBuf, Vec<String>)> {
+    let bad = |reason: String| crate::Error::Malformed {
+        path: path.to_path_buf(),
+        reason,
+    };
+    let (root, stem) = cache_slot(path, cache)?;
+    let mut problems = Vec::new();
+    if root.is_dir() {
+        return Ok((root, problems));
+    }
+    let partial = cache.join(format!(".{stem}-{}.partial", std::process::id()));
+    let _ = std::fs::remove_dir_all(&partial);
+    std::fs::create_dir_all(&partial).map_err(|e| crate::Error::Io {
+        path: partial.clone(),
+        source: e,
+    })?;
+    let walked = (|| -> std::result::Result<(), String> {
+        let mut archive = unrar::Archive::new(path)
+            .open_for_processing()
+            .map_err(|e| format!("not a readable rar: {e}"))?;
+        let mut left = MAX_DAZIP_BYTES;
+        let mut entries = 0usize;
+        while let Some(header) = archive
+            .read_header()
+            .map_err(|e| format!("not a readable rar: {e}"))?
+        {
+            entries += 1;
+            if entries > MAX_DAZIP_ENTRIES {
+                return Err(format!("more than {MAX_DAZIP_ENTRIES} entries"));
+            }
+            let entry = header.entry();
+            let name = entry.filename.to_string_lossy().into_owned();
+            if entry.is_encrypted() {
+                return Err(format!("{name} is encrypted"));
+            }
+            let Some(rel) = contained(&name) else {
+                problems.push(format!("{name}: path leaves the archive, skipped"));
+                archive = header.skip().map_err(|e| e.to_string())?;
+                continue;
+            };
+            let out = partial.join(rel);
+            if entry.is_directory() {
+                std::fs::create_dir_all(&out).map_err(|e| e.to_string())?;
+                archive = header.skip().map_err(|e| e.to_string())?;
+                continue;
+            }
+            if entry.unpacked_size > left {
+                return Err("unpacks past the size limit".into());
+            }
+            let (bytes, next) = header.read().map_err(|e| format!("{name}: {e}"))?;
+            if bytes.len() as u64 > left {
+                return Err("unpacks past the size limit".into());
+            }
+            left -= bytes.len() as u64;
+            if let Some(parent) = out.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            }
+            std::fs::write(&out, &bytes).map_err(|e| e.to_string())?;
+            archive = next;
+        }
+        Ok(())
+    })();
+    if let Err(reason) = walked {
+        let _ = std::fs::remove_dir_all(&partial);
+        return Err(bad(reason));
+    }
+    // Another session may have unpacked the same archive meanwhile: keep theirs.
+    if std::fs::rename(&partial, &root).is_err() {
+        let _ = std::fs::remove_dir_all(&partial);
+        if !root.is_dir() {
+            return Err(bad(
+                "could not move the unpacked archive into the cache".into()
+            ));
+        }
+    }
+    Ok((root, problems))
+}
+
 /// One unpacked archive in the mod cache.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CacheEntry {
@@ -562,7 +662,7 @@ pub fn cache_report(cache: &Path, list: &ModList) -> Vec<CacheEntry> {
             e.path.is_file()
                 && matches!(
                     ext.as_deref().and_then(|x| x.to_str()),
-                    Some("7z" | "dazip")
+                    Some("7z" | "rar" | "dazip")
                 )
         })
         .filter_map(|e| cache_slot(&e.path, cache).ok().map(|(dir, _)| dir))
@@ -714,6 +814,7 @@ pub fn unpack_dazip(path: &Path, cache: &Path) -> Result<Dazip> {
         .map(|b| String::from_utf8_lossy(&b).into_owned())
         .unwrap_or_default();
     let mut addins = Vec::new();
+    let items = crate::install::manifest_items(&manifest);
     let addins_dir = join_ci(&root, "Contents/addins");
     if let Ok(rd) = std::fs::read_dir(&addins_dir) {
         let mut dirs: Vec<PathBuf> = rd.flatten().map(|e| e.path()).collect();
@@ -721,12 +822,19 @@ pub fn unpack_dazip(path: &Path, cache: &Path) -> Result<Dazip> {
         dirs.sort();
         for dir in dirs {
             let name = dir.file_name().unwrap().to_string_lossy().into_owned();
-            let mut addin = crate::install::addin_from_manifest(&manifest, dir, name.clone());
-            // A package with several add-ins has one manifest item each; ours reads the
-            // first, so the others go by their folder's name with the first one's settings.
-            if !addin.uid.eq_ignore_ascii_case(&name) && !addins.is_empty() {
-                addin.uid = name;
-            }
+            // A package with several add-ins has a manifest item for each, matched by UID
+            // to its folder; a folder no item names takes the first item's settings under
+            // its own name.
+            let mut addin = match items.iter().find(|i| i.uid.eq_ignore_ascii_case(&name)) {
+                Some(i) => AddIn { dir, ..i.clone() },
+                None => {
+                    let mut a = crate::install::addin_from_manifest(&manifest, dir, name.clone());
+                    if !addins.is_empty() || !items.is_empty() {
+                        a.uid = name;
+                    }
+                    a
+                }
+            };
             // Listing the package is the player's way of enabling it.
             addin.enabled = true;
             addins.push(addin);
@@ -989,6 +1097,54 @@ mod tests {
     }
 
     #[test]
+    fn every_add_in_of_a_dazip_takes_its_own_manifest_item() {
+        let base = std::env::temp_dir().join(format!("thedas-dazip-many-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let cache = base.join("mod-cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        let package = base.join("two.dazip");
+        let manifest = br#"<Manifest Type="AddIn"><AddInsList>
+            <AddInItem UID="first_one" ExtendedModuleUID="Single Player" Priority="10" Enabled="1"><Type>2</Type></AddInItem>
+            <AddInItem UID="second_one" ExtendedModuleUID="" Priority="40" Enabled="1"><Type>2</Type></AddInItem>
+            </AddInsList></Manifest>"#;
+        zip_of(
+            &package,
+            &[
+                ("Manifest.xml", manifest),
+                ("Contents/addins/first_one/core/data/a.uti", b"a"),
+                ("Contents/addins/second_one/core/env/newlvl.arl", b"arl"),
+                ("Contents/addins/third/core/data/c.uti", b"c"),
+            ],
+        );
+        let d = unpack_dazip(&package, &cache).unwrap();
+        let got: Vec<(&str, i64, bool)> = d
+            .addins
+            .iter()
+            .map(|a| (a.uid.as_str(), a.priority, a.extends_base_campaign()))
+            .collect();
+        // Each by its own item; a folder no item names takes the first item's settings.
+        assert_eq!(
+            got,
+            [
+                ("first_one", 10, true),
+                ("second_one", 40, false),
+                ("third", 10, true)
+            ]
+        );
+        // Their levels are searched with the install's.
+        let install_root = base.join("install");
+        std::fs::create_dir_all(install_root.join("packages/core/env")).unwrap();
+        std::fs::create_dir_all(install_root.join("modules/single player")).unwrap();
+        let install = crate::install::DaoInstall::open(&install_root).unwrap();
+        let dirs = install.env_dirs_with(d.addins.clone()).unwrap();
+        assert!(
+            dirs.iter().any(|p| p.ends_with("second_one/core/env")),
+            "{dirs:?}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
     fn a_dazip_is_unpacked_once_into_the_cache_and_split_into_add_in_and_override() {
         let base = scratch("dazip");
         let cache = base.join("cache");
@@ -1119,6 +1275,91 @@ mod tests {
         assert_eq!((report[0].layers, report[1].layers), (0, 0));
         assert!(report[0].problems.iter().any(|p| p.contains("nope")));
         assert_eq!(report[1].problems.len(), 1);
+        assert_eq!(std::fs::read_dir(&cache).unwrap().count(), 1);
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// A RAR 4 archive storing `files` uncompressed (method 0x30), written by hand: RAR
+    /// cannot be written by the library, and a stored archive is enough to drive the reader.
+    fn rar_of(path: &Path, files: &[(&str, &[u8])]) {
+        fn crc32(bytes: &[u8]) -> u32 {
+            let mut c = !0u32;
+            for &b in bytes {
+                c ^= b as u32;
+                for _ in 0..8 {
+                    c = if c & 1 != 0 {
+                        (c >> 1) ^ 0xedb8_8320
+                    } else {
+                        c >> 1
+                    };
+                }
+            }
+            !c
+        }
+        // A block: CRC16 (the low half of the CRC32 of everything after it), then the rest.
+        fn block(rest: &[u8]) -> Vec<u8> {
+            let mut out = (crc32(rest) as u16).to_le_bytes().to_vec();
+            out.extend_from_slice(rest);
+            out
+        }
+        let mut out = b"Rar!\x1a\x07\x00".to_vec();
+        // Main header: type 0x73, no flags, size 13, two reserved fields.
+        let mut main = vec![0x73, 0, 0, 13, 0];
+        main.extend_from_slice(&[0; 6]);
+        out.extend(block(&main));
+        for (name, data) in files {
+            let mut head = vec![0x74];
+            head.extend_from_slice(&0x8000u16.to_le_bytes());
+            head.extend_from_slice(&(32 + name.len() as u16).to_le_bytes());
+            head.extend_from_slice(&(data.len() as u32).to_le_bytes()); // packed
+            head.extend_from_slice(&(data.len() as u32).to_le_bytes()); // unpacked
+            head.push(3); // made on Unix
+            head.extend_from_slice(&crc32(data).to_le_bytes());
+            head.extend_from_slice(&0x5a21_0000u32.to_le_bytes()); // DOS time
+            head.push(20); // version needed
+            head.push(0x30); // stored
+            head.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            head.extend_from_slice(&0o100_644u32.to_le_bytes());
+            head.extend_from_slice(name.as_bytes());
+            out.extend(block(&head));
+            out.extend_from_slice(data);
+        }
+        // End of archive.
+        out.extend(block(&[0x7b, 0x00, 0x40, 0x07, 0x00]));
+        std::fs::write(path, out).unwrap();
+    }
+
+    #[test]
+    fn a_rar_is_unpacked_once_into_the_cache_and_mounted_as_a_folder() {
+        let base = scratch("rar");
+        let cache = base.join("cache");
+        rar_of(
+            &base.join("Teeth v1.rar"),
+            &[
+                ("Teeth/Pearly/face.dds", b"pearly"),
+                ("Teeth/Pearly/sub/teeth.dds", b"pearly teeth"),
+                ("Teeth/Dingy/face.dds", b"dingy"),
+                ("Teeth/readme.txt", b"hi"),
+            ],
+        );
+        let list = ModList::parse("Teeth v1.rar!/teeth/pearly\nTeeth v1.rar\n", &base);
+        let mut overlay = Vfs::new();
+        let report = list.mount_with_cache(&mut overlay, &cache);
+        assert_eq!((report[0].layers, report[1].layers), (1, 1), "{report:?}");
+        assert!(report[0].problems.is_empty(), "{:?}", report[0].problems);
+        assert_eq!(overlay.read("teeth.dds").unwrap().0, b"pearly teeth");
+        assert_eq!(overlay.read("readme.txt").unwrap().0, b"hi");
+        // Later lines win: the whole archive's `face.dds` is one of the two variants.
+        assert!(overlay.read("face.dds").is_ok());
+        assert_eq!(std::fs::read_dir(&cache).unwrap().count(), 1);
+
+        // A file that is not a rar: refused, nothing left in the cache.
+        write(&base, "broken.rar", b"Rar! junk");
+        let list = ModList::parse("broken.rar\n", &base);
+        let mut overlay = Vfs::new();
+        let report = list.mount_with_cache(&mut overlay, &cache);
+        assert_eq!(report[0].layers, 0);
+        assert_eq!(report[0].problems.len(), 1, "{:?}", report[0].problems);
         assert_eq!(std::fs::read_dir(&cache).unwrap().count(), 1);
         std::fs::remove_dir_all(&base).unwrap();
     }

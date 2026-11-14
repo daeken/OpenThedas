@@ -20,7 +20,9 @@ pub mod collide;
 pub mod cut_effects;
 pub mod d3d;
 mod d3d_gpu;
+pub mod deferred;
 pub mod distortion;
+pub mod fxaa;
 pub mod gpu;
 pub mod look;
 pub mod material;
@@ -32,6 +34,7 @@ pub mod skeleton;
 
 pub use animate::{Animator, Clip};
 pub use camera::Camera;
+pub use deferred::RenderPath;
 pub use gpu::{AreaRenderer, GpuContext, RenderCache};
 pub use material::{ProgramRegistry, ProgramSource};
 pub use scene::{AreaScene, Prop, PropDraws, PropEffect, SceneProbe};

@@ -271,6 +271,8 @@ pub struct Live {
     owed_ms: f64,
     /// Whether frames get the level's frame buffer effects.
     pub frame_effects: bool,
+    /// How the level is drawn: the original's shaders or our deferred renderer (F11).
+    pub render_path: thedas_render::RenderPath,
     /// The graphics detail level scenes are loaded at.
     pub detail: thedas_render::scene::Detail,
     /// The conversation camera's resources and current shot.
@@ -320,6 +322,10 @@ pub struct Live {
     pub async_loads: bool,
     /// The frame size renderers are warmed for when they are built.
     pub frame_size: (u32, u32),
+    /// Where the mouse is in the frame (pixels), for the aiming reticle.
+    pub cursor: (f64, f64),
+    /// The aiming reticle's pass, for the format it was made for.
+    reticle_pass: Option<(wgpu::TextureFormat, crate::reticle::ReticlePass)>,
     /// The load under way while [`Live::async_loads`] is set (see [`Loading`]).
     loading: Option<Loading>,
     /// A layout whose build failed: not tried again until the area changes.
@@ -348,27 +354,36 @@ fn talk_line(sim: &Sim) -> Option<TalkLine> {
 
 /// The depth of field an open conversation runs
 /// ([`thedas_render::cut_effects::conversation_depth_of_field`]), from the game's tables 203
-/// and 204 (`conversation_dof_values`, `conversation_dof_parameters`). Provisional: taken
-/// to run whenever a conversation line is up, the conversation game mode's own start and
-/// end not being modelled.
+/// and 204 (`conversation_dof_values`, `conversation_dof_parameters`). Dragon Age II numbers
+/// its tables otherwise but ships both by name, with the same values row (focus distance
+/// −1: radius 8, far fade 20), so the names stand in when the numbers do not give them.
+/// Provisional: taken to run whenever a conversation line is up, the conversation game
+/// mode's own start and end not being modelled; that Dragon Age II reads these tables is
+/// inferred from their being there.
 fn conversation_depth_of_field(sim: &Sim) -> Option<thedas_render::cut_effects::DepthOfField> {
     use thedas_formats::gda::Cell;
     sim.conversation_line()?;
     let tables = sim.world.tables();
-    let values = tables.get(203, "");
-    let parameters = tables.get(204, "");
     let number = |c: Option<&Cell>| match c {
         Some(Cell::Float(v)) => Some(*v as f32),
         Some(Cell::Int(v)) => Some(*v as f32),
         _ => None,
     };
     // The first row whose focus distance is below zero holds the values.
-    let row = values.as_ref().and_then(|t| {
+    let values_row = |t: &thedas_sim::m2da::Table| {
         t.order
             .iter()
             .copied()
             .find(|&r| number(t.cell("FocusDistance", r)).is_some_and(|v| v < 0.0))
-    });
+    };
+    let (values, parameters) = match tables.get(203, "") {
+        Some(t) if values_row(&t).is_some() => (Some(t), tables.get(204, "")),
+        _ => (
+            tables.get(0, "conversation_dof_values"),
+            tables.get(0, "conversation_dof_parameters"),
+        ),
+    };
+    let row = values.as_ref().and_then(|t| values_row(t));
     let listed = |name: &str| {
         parameters.as_ref().is_some_and(|t| {
             t.order.iter().any(|&r| {
@@ -550,6 +565,15 @@ pub enum Start<'a> {
     Resume(&'a Path),
 }
 
+/// Whether an ability waiting for its target can no longer be aimed (see
+/// [`Live::drop_stale_aim`]).
+pub fn aim_is_stale(sim: &Sim, aim: &thedas_ui::input::Aim, field: bool) -> bool {
+    let caster = sim.world.get(aim.caster);
+    !field
+        || sim.world.controlled() != Some(aim.caster)
+        || caster.is_none_or(|c| c.dead || c.area != sim.world.area)
+}
+
 /// Who gets a portrait drawn: the party, and the followers picked in an open party picker
 /// (partypicker.gfx shows theirs).
 pub fn portrait_subjects(sim: &Sim) -> Vec<ObjectId> {
@@ -675,6 +699,8 @@ impl Live {
             cache: RenderCache::default(),
             async_loads: false,
             frame_size: (1280, 720),
+            cursor: (0.0, 0.0),
+            reticle_pass: None,
             loading: None,
             failed_layout: None,
             held: false,
@@ -683,6 +709,7 @@ impl Live {
             cut_held: None,
             owed_ms: 0.0,
             frame_effects: true,
+            render_path: Default::default(),
             detail: Default::default(),
             talk_camera: Default::default(),
             cutscene_camera: Default::default(),
@@ -1267,7 +1294,7 @@ fn body_models(scene: &AreaScene, prop: usize, own: &[String]) -> Vec<String> {
 
 /// A creature's height from its appearance (see [`Live::creature_height`]), with the
 /// simulation already in hand.
-fn appearance_height(sim: &Sim, id: ObjectId) -> f32 {
+pub(crate) fn appearance_height(sim: &Sim, id: ObjectId) -> f32 {
     {
         let w = &sim.world;
         let height = w.get(id).and_then(|o| {
@@ -2323,9 +2350,13 @@ impl Live {
         }
         self.set_shader_time();
         self.apply_cutaway(ctx);
+        let aim = self.reticle(camera, (width, height), self.cursor);
+        let format = self.format.unwrap_or(thedas_render::gpu::CAPTURE_FORMAT);
+        let reticle = self.reticle_pass(&ctx.device, format);
         let Some(level) = self.level.as_mut() else {
             return false;
         };
+        level.renderer.path = self.render_path;
         // Every renderer's shadow casters go into the partitions before anything is drawn.
         level.renderer.prepare_shadows(ctx, camera, width, height);
         if let Some(o) = self.objects.as_mut() {
@@ -2339,6 +2370,8 @@ impl Live {
         level
             .renderer
             .render_main(ctx, encoder, target, width, height, camera);
+        // An aimed ability's reticle lies on the ground: under the creatures, as the rings.
+        reticle.draw(&ctx.device, encoder, target, (width, height), &aim);
         if let Some(r) = self.rings.as_mut() {
             let depth = level.renderer.depth(&ctx.device, width, height);
             r.renderer
@@ -2442,10 +2475,13 @@ impl Live {
         self.set_shader_time();
         self.apply_cutaway(ctx);
         let cut_effects = self.cut_effects();
+        let aim = self.reticle(camera, (width, height), self.cursor);
+        let reticle = self.reticle_pass(&ctx.device, thedas_render::gpu::CAPTURE_FORMAT);
         let Some(level) = self.level.as_mut() else {
             return Ok(None);
         };
         level.renderer.cut_effects = cut_effects;
+        level.renderer.path = self.render_path;
         let mut overlays: Vec<&mut AreaRenderer> = self
             .rings
             .iter_mut()
@@ -2459,7 +2495,24 @@ impl Live {
             width,
             height,
             &mut overlays,
+            &mut |encoder, view| reticle.draw(&ctx.device, encoder, view, (width, height), &aim),
         )?))
+    }
+
+    /// The aiming reticle's pass for frames of `format`, made once for each format.
+    fn reticle_pass(
+        &mut self,
+        device: &wgpu::Device,
+        format: wgpu::TextureFormat,
+    ) -> crate::reticle::ReticlePass {
+        match &self.reticle_pass {
+            Some((f, p)) if *f == format => p.clone(),
+            _ => {
+                let p = crate::reticle::ReticlePass::new(device, format);
+                self.reticle_pass = Some((format, p.clone()));
+                p
+            }
+        }
     }
 
     fn spec(&self, format: wgpu::TextureFormat) -> BuildSpec {
@@ -2549,8 +2602,9 @@ impl Live {
                     shapes.insert(m.id, shape);
                 }
             }
-            // A creature's eyes (`_uem_` meshes) or head (`_uhm_`). Provisional: from the
-            // character models' names.
+            // A creature's eyes (`_uem_` meshes) or head (`_uhm_`; Dragon Age II's heads are
+            // its morph base models, `mt_bas_hm`). Provisional: from the character models'
+            // names.
             let part = |tag: &str| {
                 p.draws.clone().find_map(|d| {
                     let d = scene.draws.get(d)?;
@@ -2560,7 +2614,10 @@ impl Live {
                         .then_some(d.sphere.0)
                 })
             };
-            if let Some(face) = part("_uem_").or_else(|| part("_uhm_")) {
+            if let Some(face) = part("_uem_")
+                .or_else(|| part("_uhm_"))
+                .or_else(|| part("\\mt_bas_"))
+            {
                 faces.insert(m.id, face - glam::Vec3::from_array(m.position));
             }
             let spheres: Vec<(glam::Vec3, f32)> = p
@@ -3274,6 +3331,19 @@ impl Live {
         );
     }
 
+    /// Drops an ability waiting for its target once nothing can aim it: a screen is up over
+    /// the field (`field` false: a conversation, cutscene, menu or the like), the player
+    /// now controls someone else, or the caster is gone, dead or in another area. Returns
+    /// the ability dropped. Provisional: the exe's own rule for ending its targeting mode is
+    /// not traced; a right click, a world click and the pad's B or D-pad down end it too.
+    pub fn drop_stale_aim(&mut self, field: bool) -> Option<i32> {
+        let aim = self.aiming.as_ref()?;
+        if !aim_is_stale(&self.sim(), aim, field) {
+            return None;
+        }
+        self.aiming.take().map(|a| a.ability)
+    }
+
     pub fn toggle_pause(&mut self) {
         let mut sim = self.sim();
         if sim.training_paused() {
@@ -3538,5 +3608,45 @@ mod load_screen_tests {
         // No area before (the first load), or an area outside the tree.
         assert_eq!(load_screen_for(None, list), LoadScreen::Town);
         assert_eq!(load_screen_for(list, None), LoadScreen::Town);
+    }
+}
+
+#[cfg(test)]
+mod aim_tests {
+    use std::sync::Arc;
+
+    use thedas_script::EngineTable;
+    use thedas_sim::Sim;
+    use thedas_sim::world::ObjectKind;
+    use thedas_vfs::Vfs;
+
+    use super::aim_is_stale;
+
+    #[test]
+    fn an_aim_lasts_only_while_its_caster_can_still_aim_it() {
+        let mut s = Sim::new(
+            Arc::new(Vfs::new()),
+            Arc::new(EngineTable::parse(b"").unwrap()),
+            1,
+        );
+        let hero = s.world.spawn(ObjectKind::Creature, "hero");
+        let other = s.world.spawn(ObjectKind::Creature, "other");
+        s.world.hero = Some(hero);
+        let aim = thedas_ui::input::Aim {
+            caster: hero,
+            ability: 10_000,
+            item: String::new(),
+        };
+        assert!(!aim_is_stale(&s, &aim, true));
+        // A screen over the field: a conversation, a menu.
+        assert!(aim_is_stale(&s, &aim, false));
+        // Someone else's aim, or a dead caster.
+        let theirs = thedas_ui::input::Aim {
+            caster: other,
+            ..aim.clone()
+        };
+        assert!(aim_is_stale(&s, &theirs, true));
+        s.world.get_mut(hero).unwrap().dead = true;
+        assert!(aim_is_stale(&s, &aim, true));
     }
 }

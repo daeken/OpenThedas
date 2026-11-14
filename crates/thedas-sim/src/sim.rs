@@ -91,6 +91,14 @@ pub struct Sim {
     pub game: thedas_vfs::Game,
     pub cutscene_policy: CutscenePolicy,
     pub party_picker_policy: PartyPickerPolicy,
+    /// Each creature's answer to the restriction scripts' question, set with
+    /// `SetCanUseItem` (DAOrigins.exe keeps it at creature +0xc70; see
+    /// [`Sim::can_use_item`]). Only read during that check, so not saved.
+    pub can_use_answers: HashMap<ObjectId, i32>,
+    /// Whether each party member may use each item the party carries, by
+    /// [`Sim::can_use_item`], worked out when a screen opens ([`Sim::gui_opened`]) for the
+    /// inventory screen's dimmed rows to read without running scripts. Not saved.
+    pub item_usable: HashMap<(ObjectId, ObjectId), bool>,
     /// The player's "auto-pause when combat starts" option (`GetAutoPauseCombatStatus`);
     /// off, as the game's options start.
     pub auto_pause_combat: bool,
@@ -589,6 +597,8 @@ impl Sim {
             game: thedas_vfs::Game::Origins,
             cutscene_policy: CutscenePolicy::default(),
             party_picker_policy: PartyPickerPolicy::default(),
+            can_use_answers: Default::default(),
+            item_usable: Default::default(),
             auto_pause_combat: false,
             show_tutorials: true,
             training_done: 0,
@@ -1489,12 +1499,37 @@ impl Sim {
     /// sends it (0x60afa3-0x60b065). Provisional: target and creator are taken to be the
     /// module (0x5d4fc0 is not fully traced).
     pub fn gui_opened(&mut self, gui: i32) {
+        self.refresh_item_usable();
         let Some(module) = self.world.module else {
             return;
         };
         let mut ev = self.new_event("GUI_OPENED", Some(module));
         ev.ints = vec![gui];
         self.world.queue_event(0, module, ev, None);
+    }
+
+    /// Works out [`Sim::item_usable`] for every party member and every item the party
+    /// carries. DAOrigins.exe answers the inventory screen's `CreatureCanUseItem` (0x715180,
+    /// registered at 0x7166e6) by running its check, restriction scripts included, as the
+    /// screen asks; the screen cannot run scripts here (it only reads the simulation), so the
+    /// answers are worked out when a screen opens. Provisional: an item picked up while the
+    /// screen is open has no answer and shows as usable.
+    pub fn refresh_item_usable(&mut self) {
+        let party = crate::engine::party_of(self);
+        let mut items: Vec<ObjectId> = party
+            .iter()
+            .filter_map(|&m| self.world.get(m))
+            .flat_map(|o| o.inventory.iter().chain(o.equipment.values()).copied())
+            .collect();
+        items.sort_unstable();
+        items.dedup();
+        self.item_usable.clear();
+        for &m in &party {
+            for &item in &items {
+                let ok = self.can_use_item(m, item);
+                self.item_usable.insert((m, item), ok);
+            }
+        }
     }
 
     /// Tells the module a creature joined or left the active party
@@ -1874,9 +1909,39 @@ impl Sim {
         ev.strings = strings;
         if ty == "CHARGEN_END" {
             self.world.chargen = None;
+            if self.game == thedas_vfs::Game::DragonAge2 && self.world.chargen_mode == 0 {
+                self.hide_chargen_lineup();
+            }
         }
         self.world.queue_event(0, module, ev, None);
         true
+    }
+
+    /// Dragon Age II's character creation shows a lineup of the hero's choices as creatures
+    /// standing in the area: those whose tags are the `CreatureTag` column of the
+    /// `chargen_dae` table (M2DA 374; `fake_warrior_male` and the rest in the prologue).
+    /// When creation ends they leave the scene, and the hero goes on as the one chosen. No
+    /// script touches them, so the engine does it. Provisional: the lineup is read from
+    /// the table, not traced in DragonAge2.exe; here they are made inactive.
+    fn hide_chargen_lineup(&mut self) {
+        let Some(t) = self.world.tables().get(374, "") else {
+            return;
+        };
+        let tags: Vec<String> = t
+            .order
+            .iter()
+            .map(|&row| crate::engine::cell_string(t.cell("CreatureTag", row)).to_ascii_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let hero = self.world.hero;
+        for o in self.world.objects.values_mut() {
+            if o.kind == ObjectKind::Creature
+                && Some(o.id) != hero
+                && tags.contains(&o.tag.to_ascii_lowercase())
+            {
+                o.active = false;
+            }
+        }
     }
 
     /// How long a command takes once it reaches the front of its queue. Waits take their time,
@@ -3308,6 +3373,62 @@ impl Sim {
         best
     }
 
+    /// Where `CommandJumpToObject` puts `jumper` next to `target`, with its facing and area,
+    /// as DAOrigins.exe's executor (0x7a3c80) does: by the target's kind (object byte +0x14)
+    /// - a waypoint: its position and facing;
+    /// - a creature: at a random whole-degree angle round it (0x73d540(360)), as far out as
+    ///   the two bodies' radii (vfunc +0x9c of each), facing it;
+    /// - anything else: one jumper's radius in front of it, facing it;
+    ///
+    /// then the safe-location search (0x73e370) round that point, out to 5 m (0xae7308),
+    /// with the check off: the point if walkable and free, else the first free ring point.
+    /// `None` (the command fails, 0x7a3eef) when nothing is found. Provisional: a placeable's
+    /// spot comes from 0x74f650 (not traced; here it is treated as "anything else"); a
+    /// creature target for which 0x6a7d30 holds and a jumper for which 0x69f140 does take a
+    /// spot from 0x6aa440 instead (not traced; likely the party formation), not modelled;
+    /// the bodies' radii are [`Sim::capsule_radius`]; and the angle is drawn from the
+    /// simulation's generator.
+    pub(crate) fn jump_to_object_spot(
+        &mut self,
+        jumper: ObjectId,
+        target: ObjectId,
+    ) -> Option<([f32; 3], f32, ObjectId)> {
+        /// How far round the spot a jump looks (DAOrigins.exe 0xae7308).
+        const JUMP_SEARCH_RADIUS: f32 = 5.0;
+        let t = self.world.get(target)?;
+        let (tp, tf, tkind, area) = (t.position, t.facing, t.kind, t.area?);
+        if jumper == target {
+            return None;
+        }
+        let mine = self.capsule_radius(jumper);
+        let (spot, facing) = match tkind {
+            ObjectKind::Waypoint => (tp, tf),
+            ObjectKind::Creature => {
+                let a = (self.world.rng.below(360) as f32).to_radians();
+                let d = mine + self.capsule_radius(target);
+                let p = [tp[0] + d * a.dcos(), tp[1] + d * a.dsin(), tp[2]];
+                (p, crate::world::facing_toward(tp[0] - p[0], tp[1] - p[1]))
+            }
+            _ => {
+                let h = crate::world::heading_of(tf).to_radians();
+                let p = [tp[0] + mine * h.dcos(), tp[1] + mine * h.dsin(), tp[2]];
+                (p, crate::world::facing_toward(tp[0] - p[0], tp[1] - p[1]))
+            }
+        };
+        let how = crate::nav::SafeSearch {
+            radius: JUMP_SEARCH_RADIUS,
+            body_radius: mine,
+            mover: Some(jumper),
+            standable_keeps: false,
+        };
+        match self.safe_search(area, spot, how) {
+            Some(p) => Some((p, facing, area)),
+            // No pathing grid (tests, tools): the spot itself.
+            None if self.nav_grid(area).is_none() => Some((spot, facing, area)),
+            None => None,
+        }
+    }
+
     /// Completes an object's front command: applies its movement and tells the object.
     fn finish_command(&mut self, id: ObjectId) {
         let Some(cmd) = self.world.get_mut(id).and_then(|o| {
@@ -3319,10 +3440,22 @@ impl Sim {
         }) else {
             return;
         };
-        // A move or jump to an object ends where the object stands (the Fade's mouse holes
-        // jump the hero to a waypoint this way). Provisional: the jumper keeps its facing.
-        let to_object =
-            cmd.name.starts_with("CommandMoveToObject") || cmd.name == "CommandJumpToObject";
+        // A jump to an object lands beside it, where DAOrigins.exe's executor puts it
+        // ([`Sim::jump_to_object_spot`]); with no such spot the jumper stays put.
+        if cmd.name == "CommandJumpToObject" {
+            if let Some(t) = cmd.target {
+                if let Some((p, facing, area)) = self.jump_to_object_spot(id, t) {
+                    if let Some(obj) = self.world.get_mut(id) {
+                        obj.position = p;
+                        obj.area = Some(area);
+                        obj.facing = facing;
+                    }
+                }
+            }
+        }
+        // A move to an object ends where the object stands. Provisional: the mover keeps
+        // its facing.
+        let to_object = cmd.name.starts_with("CommandMoveToObject");
         // A walk whose end lies in a closed door's doorway stopped at the door (its route is
         // cut short there, see `Sim::route_to`): the walker stays where the route left it
         // and is not set down at the end asked for, inside the doorway or past the leaf. (A
@@ -4303,6 +4436,9 @@ fn read_vars(doc: &Gff3, s: &Struct, locals: &mut crate::world::Locals) {
         let Some(name) = text(v, "Name") else {
             continue;
         };
+        if !locals.order.contains(&name) {
+            locals.order.push(name.clone());
+        }
         match int(v, "Type") {
             Some(1) => {
                 locals.ints.insert(name, int(v, "Value").unwrap_or(0));
@@ -5466,6 +5602,75 @@ mod tests {
         assert!(o.commands.is_empty());
         assert_eq!(o.position, [80.0, 120.0, 29.5]);
         assert_eq!(o.area, Some(area));
+    }
+
+    #[test]
+    fn a_jump_to_a_creature_lands_beside_it_on_free_ground() {
+        // DA2's prologue hires Carver and Bethany and jumps them onto Hawke; they stood
+        // inside Hawke. DAOrigins.exe puts a jumper beside a creature, its two bodies apart,
+        // facing it, then on the nearest free walkable point.
+        let mut s = sim();
+        let area = s.world.spawn(ObjectKind::Area, "a");
+        let (w, h) = (40u32, 40u32);
+        s.area_layouts.insert(area, "open".into());
+        s.nav_grids.insert(
+            "open".into(),
+            Some(Arc::new(thedas_formats::level::NavGrid {
+                columns: w,
+                rows: h,
+                cell_size: 0.5,
+                clearance: 2.0,
+                base: [0.0, 0.0, 0.0],
+                normal: [0.0, 0.0, 1.0],
+                data: vec![1u8; (w * h) as usize],
+                heights: vec![0.0; (w * h) as usize],
+                surfaces: Vec::new(),
+            })),
+        );
+        let hero = s.world.spawn(ObjectKind::Creature, "hero");
+        let a = s.world.spawn(ObjectKind::Creature, "a");
+        let b = s.world.spawn(ObjectKind::Creature, "b");
+        for id in [hero, a, b] {
+            let o = s.world.get_mut(id).unwrap();
+            o.area = Some(area);
+            o.position = [10.0, 10.0, 0.0];
+        }
+        for id in [a, b] {
+            s.world.get_mut(id).unwrap().commands.push(Command {
+                ty: 0,
+                name: "CommandJumpToObject".into(),
+                target: Some(hero),
+                location: None,
+                seconds: 0.0,
+                ints: Vec::new(),
+                strings: Vec::new(),
+                due: None,
+                from: None,
+                approach: None,
+                ring_wait: false,
+                after_impact_ms: None,
+                impacted: false,
+                arrived: false,
+                path: Vec::new(),
+            });
+        }
+        s.tick(1);
+        let at = |s: &Sim, id| s.world.get(id).unwrap().position;
+        let apart =
+            |p: [f32; 3], q: [f32; 3]| ((p[0] - q[0]).powi(2) + (p[1] - q[1]).powi(2)).sqrt();
+        let (h_at, a_at, b_at) = (at(&s, hero), at(&s, a), at(&s, b));
+        let reach = |x| s.capsule_radius(hero) + s.capsule_radius(x);
+        assert!(s.world.get(a).unwrap().commands.is_empty());
+        assert!(apart(h_at, a_at) >= reach(a) - 1e-3, "{a_at:?}");
+        assert!(apart(h_at, b_at) >= reach(b) - 1e-3, "{b_at:?}");
+        assert!(apart(a_at, b_at) >= s.capsule_radius(a) + s.capsule_radius(b) - 1e-3);
+        assert!(apart(h_at, a_at) < 5.5 && apart(h_at, b_at) < 5.5);
+        // Facing the hero from the spot picked before the search (the exe turns it to
+        // the look-at it worked out first): within a quarter turn here.
+        let f = s.world.get(a).unwrap().facing;
+        let want = crate::world::facing_toward(h_at[0] - a_at[0], h_at[1] - a_at[1]);
+        let off = (f - want).rem_euclid(360.0);
+        assert!(off.min(360.0 - off) < 90.0, "{f} {want}");
     }
 
     #[test]

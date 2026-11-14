@@ -46,7 +46,7 @@ So there are 70 unimplemented functions that scripts call, fewer than the 150 as
   Engine_SetModalAbilityGUI, ShowFloatyIcon, ShowSpecUnlockedNotification.
   (SetMapPinState and SetPlaceableHealth are listed here even though they arguably change game state. Whether that matters is unverified.)
 - `STUBS` (fixed placeholder, counted in `Trace::stubbed`): GetPlotSummary (returns an empty string).
-- Arms that return a constant or do nothing: GetGraphicsDetailLevel (1), GetMaxLevel (20), GetPRCEnabled /
+- Arms that return a constant or do nothing: GetGraphicsDetailLevel (1), GetMaxLevel (20),
   GetHasAchievement / GetHasAchievementByID (0), ClearAmbientDialogs (1), CreatePool (1), GetCreatureGoreLevel (0.0),
   GetShowSpecialMoveFloaties (0), ReadIniEntry (empty string), PreloadCharGen, SetDeathHint, PlayAdditiveAnimation, SignalDamage,
   EnableWeaponTrail (no-ops).
@@ -73,24 +73,22 @@ adds inferred signatures for three of them, and the sim session loads them with 
 4088 of 4158 scripts finish. The rest fail as follows: 58 exhaust the instruction budget of 2,000,000 (looping test/debug scripts such as zz_*), 4 call
 unknown ids, 2 IsInTrigger with 0 args, 2 SetFacingPosition with 1 arg, 2 division by zero, 1 bad stack offset.
 
-### Unimplemented functions scripts call (all 71, by static call count)
+### Unimplemented functions scripts call (all 69, by static call count)
 
 Static call sites / distinct scripts. The debug and console ones (DEBUG_ConsoleCommand, GetDebugHelpersEnabled,
-SetCheatUsedFlag, Screenshot, SendOnlineTelemetry) matter less. InteractWithObject, ShowAsAllyOnMap, GetSafeLocation,
-SetPartyLeader, CloseQuestGroup, SetCanUseItem, the trap-difficulty getters and the item functions affect gameplay.
+SetCheatUsedFlag, Screenshot, SendOnlineTelemetry) matter less. InteractWithObject, ShowAsAllyOnMap,
+SetPartyLeader, CloseQuestGroup, the trap-difficulty getters and the item functions affect gameplay.
 
 | function | id | calls | scripts |
 | --- | --- | --- | --- |
 | DEBUG_ConsoleCommand | 704 | 649 | 57 |
 | GetDebugHelpersEnabled | 331 | 421 | 421 |
-| SetCanUseItem | 813 | 140 | 65 |
 | InteractWithObject | 587 | 108 | 108 |
 | CloseQuestGroup | 846 | 65 | 5 |
 | ShowAsAllyOnMap | 364 | 62 | 26 |
 | GetPlaceablePopupText | 356 | 53 | 51 |
 | SetMusicVolumeStateByTag | 488 | 52 | 36 |
 | SetPhysicsController | 839 | 52 | 39 |
-| GetSafeLocation | 659 | 50 | 22 |
 | SetCheatUsedFlag | 627 | 48 | 44 |
 | GetEffectID | 614 | 38 | 13 |
 | SetPartyLeader | 625 | 36 | 18 |
@@ -275,7 +273,7 @@ Dispatch summary: `engine::call` (`crates/thedas-sim/src/engine.rs:483`) matches
 ### Stubs, constant answers and no-ops
 
 - **SCR-006** **GetPlotSummary is a stub.** Original: not traced. Ours: returns "" and is counted in `Trace::stubbed`, the only entry of `STUBS`. Evidence: `crates/thedas-sim/src/engine.rs:212`, `engine.rs:2578`. Size: M. Depends: none. Kind: missing.
-- **SCR-007** **Functions answered with a fixed constant.** Original: not traced for any of them. Ours: `GetGraphicsDetailLevel` = 1 (marked provisional), `GetMaxLevel` = 20, `ReadIniEntry` = "", `GetPRCEnabled` = 0, `GetHasAchievement` = 0, `GetHasAchievementByID` = 0, `CreatePool` = 1 (exe builds a creature pool, 0x6598d0; skipped as a load optimisation), `GetCreatureGoreLevel` = 0.0, `GetShowSpecialMoveFloaties` = 0, `GetAbilitiesDueToAOEs` = empty `int[]`, `ClearAmbientDialogs` = 1 (exe 0x6510f0 stops queued ambient lines; none ever queue here). Evidence: `crates/thedas-sim/src/engine.rs:1548`, `engine.rs:1565`, `engine.rs:1567`, `engine.rs:1570`, `engine.rs:3074`, `engine.rs:3075`, `engine.rs:4209`, `engine.rs:3975`, `engine.rs:2713`. Size: M. Depends: SCR-090. Kind: missing.
+- **SCR-007** **Functions answered with a fixed constant.** Original: not traced for any of them. Ours: `GetGraphicsDetailLevel` = 1 (marked provisional), `GetMaxLevel` = 20, `ReadIniEntry` = "", `GetHasAchievement` = 0, `GetHasAchievementByID` = 0, `CreatePool` = 1 (exe builds a creature pool, 0x6598d0; skipped as a load optimisation), `GetCreatureGoreLevel` = 0.0, `GetShowSpecialMoveFloaties` = 0, `GetAbilitiesDueToAOEs` = empty `int[]`, `ClearAmbientDialogs` = 1 (exe 0x6510f0 stops queued ambient lines; none ever queue here). Evidence: `crates/thedas-sim/src/engine.rs:1548`, `engine.rs:1565`, `engine.rs:1567`, `engine.rs:1570`, `engine.rs:3074`, `engine.rs:3075`, `engine.rs:4209`, `engine.rs:3975`, `engine.rs:2713`. Size: M. Depends: SCR-090. Kind: missing.
 - **SCR-008** **Presentation functions accepted as pure no-ops.** Original: not traced. Ours: return void and are only counted: `ApplyEffectVisualEffect`, `ApplyEffectVisualEffectOnLocation`, `SetAtmosphere`, `SetAtmosphereRGB`, `FB_SetEffectResource`, `FB_SetEffectEnabled`, `SetLoadHint`, `LinkAreaMiniMaps`, `SendGameEventRunDatabase`, `SendToRunDatabase`, `SetTrainingMode`, `SetPlaceableHealth`, `SetMapPinState`, `SetCameraTarget`, `SetLookAtEnabled`, `SetCreatureGoreLevel`, `Engine_SetModalAbilityGUI`, `ShowFloatyIcon` (exe 0x662db0), `ShowSpecUnlockedNotification` (0x663b80). Nothing is kept for rendering or the UI to read, so object visual effects, atmosphere, camera targets and the modal-ability indicator never show. Evidence: `crates/thedas-sim/src/engine.rs:178-207`, `engine.rs:519-527`. Size: M. Depends: none. Kind: missing.
 - **SCR-009** **Some "presentation" no-ops hold simulation state.** Original: not traced. Ours: `SetPlaceableHealth`, `SetMapPinState` and `SetTrainingMode` are in the presentation list, so a placeable's health, a map pin's state and training mode are not stored, saved or readable. Evidence: `crates/thedas-sim/src/engine.rs:190-192`. Size: S. Depends: none. Kind: unverified.
 - **SCR-010** **Other functions that do nothing.** Original: not traced. Ours: `PreloadCharGen`, `SetDeathHint`, `PlayAdditiveAnimation`, `SignalDamage`, `EnableWeaponTrail` return void with no record; `SetAbilityResult` is only counted; `DoAutoSave`, `TakeScreenshot`, `UnlockAchievement`, `UnlockAchievementByID`, `IncrementAchievementCountByID`, `SetStoryPlot` and `ShowAreaUnlockedNotification` only write a trace log line. Evidence: `crates/thedas-sim/src/engine.rs:2835`, `engine.rs:3682`, `engine.rs:4091`, `engine.rs:4288`, `engine.rs:4200`, `engine.rs:2823`, `engine.rs:3692`, `engine.rs:3452`, `engine.rs:2432`. Size: M. Depends: SCR-090, SCR-091. Kind: missing.

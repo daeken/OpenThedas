@@ -460,7 +460,7 @@ impl Default for StandInLight {
 
 #[derive(Clone)]
 pub(crate) struct GpuMesh {
-    vertices: wgpu::Buffer,
+    pub(crate) vertices: wgpu::Buffer,
     pub(crate) indices: wgpu::Buffer,
     pub(crate) count: u32,
 }
@@ -581,12 +581,21 @@ pub struct AreaRenderer {
     /// ([`checked`]): they are left out, and not tried again.
     distortion_refused: bool,
     cut_refused: bool,
+    /// Whether the finished frame is anti-aliased (see [`crate::fxaa`]); on unless turned off.
+    pub antialias: bool,
+    fxaa: Option<crate::fxaa::Fxaa>,
+    antialias_refused: bool,
     /// The projection the frame was last drawn with.
     frame_projection: Option<glam::Mat4>,
     /// The draws of `CutAway` meshes ([`AreaScene::cut_away`]).
     cut_away: Vec<usize>,
     /// The emitters of models with a `CutAway` mesh ([`SceneEmitter::cut_away`]).
     cut_away_emitters: Vec<usize>,
+    /// How the level is drawn (see [`crate::deferred`]). Only a renderer of the level's own
+    /// meshes draws deferred; any other draws faithfully whatever this says.
+    pub path: crate::deferred::RenderPath,
+    /// The deferred pass, for a renderer of the level's own meshes with draws it can take.
+    deferred: Option<crate::deferred::DeferredPass>,
 }
 
 /// The colour curve `da_hsvmatrix` reads: `name` (an area's curve, `<name>.dds`) or by
@@ -976,6 +985,10 @@ impl AreaRenderer {
         stats.textures_loaded = cache.loaded - loaded0;
         stats.textures_compressed = cache.compressed - compressed0;
         stats.textures_missing = cache.missing[missing0..].to_vec();
+        // What the deferred path would draw (no GPU objects until a frame is drawn so).
+        let deferred = (scene.static_draws > 0)
+            .then(|| crate::deferred::DeferredPass::plan(ctx, vfs, scene, &d3d, cache))
+            .flatten();
         if uniforms.is_empty() {
             uniforms.resize(DRAW_STRIDE as usize, 0);
         }
@@ -1059,6 +1072,9 @@ impl AreaRenderer {
             cut_pass: None,
             distortion_refused: false,
             cut_refused: false,
+            antialias: std::env::var_os("THEDAS_NO_AA").is_none(),
+            fxaa: None,
+            antialias_refused: false,
             frame_projection: None,
             light: StandInLight::default(),
             stats,
@@ -1070,7 +1086,15 @@ impl AreaRenderer {
                 .filter(|(_, e)| e.cut_away)
                 .map(|(i, _)| i)
                 .collect(),
+            path: crate::deferred::RenderPath::Faithful,
+            deferred,
         }
+    }
+
+    /// Whether this renderer can draw deferred: it is the level's, has draws the deferred
+    /// pass takes, and the GPU has not refused that pass.
+    pub fn can_defer(&self) -> bool {
+        self.deferred.as_ref().is_some_and(|d| !d.refused())
     }
 
     /// Grades the frame as area `grade` says: its colour curve and `da_hsvmatrix` values
@@ -1441,9 +1465,27 @@ impl AreaRenderer {
             Some(d) => d.clone(),
             None => self.depth_view(&ctx.device, width, height).clone(),
         };
+        // The deferred path draws its share first, clearing the frame; the rest goes over.
+        let deferred = over.is_none()
+            && self.only_draws.is_none()
+            && self.path == crate::deferred::RenderPath::Deferred
+            && self.deferred.as_mut().is_some_and(|p| {
+                p.encode(
+                    ctx,
+                    encoder,
+                    target,
+                    self.color_format,
+                    &depth,
+                    (width, height),
+                    camera,
+                    &self.d3d,
+                    &self.meshes,
+                    self.clear,
+                )
+            });
         let (color_load, depth_load) = match over {
-            Some(_) => (wgpu::LoadOp::Load, wgpu::LoadOp::Load),
-            None => (wgpu::LoadOp::Clear(self.clear), wgpu::LoadOp::Clear(1.0)),
+            None if !deferred => (wgpu::LoadOp::Clear(self.clear), wgpu::LoadOp::Clear(1.0)),
+            _ => (wgpu::LoadOp::Load, wgpu::LoadOp::Load),
         };
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("area"),
@@ -1485,7 +1527,9 @@ impl AreaRenderer {
             let d = match *r {
                 DrawRef::StandIn(i) => &self.stand_in[i],
                 DrawRef::D3d(i) => {
-                    if !self.d3d.in_view(i) {
+                    if !self.d3d.in_view(i)
+                        || (deferred && self.deferred.as_ref().is_some_and(|p| p.takes(i)))
+                    {
                         continue;
                     }
                     let d = &self.d3d.draws[i];
@@ -1530,6 +1574,34 @@ impl AreaRenderer {
     /// effect's mask with this renderer's (see [`crate::distortion`]). The distortion runs
     /// before the level's own effects.
     pub fn finish_frame_with(
+        &mut self,
+        ctx: &GpuContext,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &wgpu::Texture,
+        width: u32,
+        height: u32,
+        overlays: &[&AreaRenderer],
+    ) {
+        self.frame_effects_with(ctx, encoder, target, width, height, overlays);
+        // Edges smoothed last, over everything the world drew (see [`crate::fxaa`]).
+        if self.antialias && !self.antialias_refused {
+            if !self
+                .fxaa
+                .as_ref()
+                .is_some_and(|f| f.fits(target.format(), (width, height)))
+            {
+                self.fxaa = checked(&ctx.device, "anti-aliasing", || {
+                    crate::fxaa::Fxaa::new(&ctx.device, target.format(), (width, height))
+                });
+                self.antialias_refused = self.fxaa.is_none();
+            }
+            if let Some(f) = &self.fxaa {
+                f.apply(encoder, target);
+            }
+        }
+    }
+
+    fn frame_effects_with(
         &mut self,
         ctx: &GpuContext,
         encoder: &mut wgpu::CommandEncoder,
@@ -1640,11 +1712,12 @@ impl AreaRenderer {
         width: u32,
         height: u32,
     ) -> Result<Vec<u8>, GpuError> {
-        self.capture_with(ctx, camera, width, height, &mut [])
+        self.capture_with(ctx, camera, width, height, &mut [], &mut |_, _| {})
     }
 
     /// [`AreaRenderer::capture`] with `overlays` drawn over this renderer's pass (see
-    /// [`AreaRenderer::render_over`]).
+    /// [`AreaRenderer::render_over`]); `under` draws into the frame after this renderer's
+    /// pass and before the overlays (what lies on the ground under the creatures).
     pub fn capture_with(
         &mut self,
         ctx: &GpuContext,
@@ -1652,6 +1725,7 @@ impl AreaRenderer {
         width: u32,
         height: u32,
         overlays: &mut [&mut AreaRenderer],
+        under: &mut dyn FnMut(&mut wgpu::CommandEncoder, &wgpu::TextureView),
     ) -> Result<Vec<u8>, GpuError> {
         let target = ctx.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("capture"),
@@ -1690,6 +1764,7 @@ impl AreaRenderer {
         }
         self.finish_shadows(&mut encoder);
         self.render_pass(ctx, &mut encoder, &view, width, height, camera, None);
+        under(&mut encoder, &view);
         if !overlays.is_empty() {
             let depth = self.depth(&ctx.device, width, height);
             for o in overlays.iter_mut() {

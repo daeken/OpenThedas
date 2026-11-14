@@ -252,6 +252,43 @@ mod tests {
     }
 
     #[test]
+    fn dragon_age_2_creation_ends_with_the_class_lineup_leaving() {
+        let table = EngineTable::parse(LDF.as_bytes()).unwrap();
+        let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(table), 1);
+        s.game = thedas_vfs::Game::DragonAge2;
+        let m = s.world.spawn(ObjectKind::Module, "module");
+        s.world.module = Some(m);
+        let hero = s.world.spawn(ObjectKind::Creature, "player");
+        s.world.hero = Some(hero);
+        s.world.tables().insert(
+            "#374",
+            &["CreatureTag"],
+            vec![
+                (
+                    1311,
+                    vec![thedas_formats::gda::Cell::String(
+                        "fake_warrior_male\0".into(),
+                    )],
+                ),
+                (
+                    2321,
+                    vec![thedas_formats::gda::Cell::String(
+                        "fake_mage_female\0".into(),
+                    )],
+                ),
+            ],
+        );
+        let lineup = s.world.spawn(ObjectKind::Creature, "fake_warrior_male");
+        let sister = s.world.spawn(ObjectKind::Creature, "pro000cr_bethany_fake");
+        for id in [lineup, sister] {
+            s.world.get_mut(id).unwrap().active = true;
+        }
+        s.start_chargen(hero, 0, 0);
+        assert!(!s.world.get(lineup).unwrap().active);
+        assert!(s.world.get(sister).unwrap().active);
+    }
+
+    #[test]
     fn the_creation_screen_choices_become_chargen_events() {
         let table = EngineTable::parse(LDF.as_bytes()).unwrap();
         let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(table), 1);

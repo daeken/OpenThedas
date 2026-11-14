@@ -179,8 +179,9 @@ impl Collider {
         // A step's neighbours too: the segment may graze a corner between steps, and a
         // sphere reaches past its centre's cell.
         let around = 1 + (reach / self.cell).ceil().clamp(0.0, 8.0) as i64;
-        let mut seen = std::collections::HashSet::new();
-        let mut best: Option<f32> = None;
+        // The triangles of the cells walked, each once (sorted, then tested); a triangle
+        // whose box is clear of the segment's box (widened by `reach`) cannot be met.
+        let mut near: Vec<u32> = Vec::new();
         let mut last = None;
         for s in 0..=steps {
             let p = from + d * (s as f32 / steps as f32);
@@ -198,18 +199,28 @@ impl Collider {
                     let Some(list) = self.cells.get(y as usize * self.size[0] + x as usize) else {
                         continue;
                     };
-                    for &i in list {
-                        if !seen.insert(i) {
-                            continue;
-                        }
-                        let Some(tri) = self.triangles.get(i as usize) else {
-                            continue;
-                        };
-                        if let Some(t) = hit(tri) {
-                            best = Some(best.map_or(t, |b: f32| b.min(t)));
-                        }
-                    }
+                    near.extend_from_slice(list);
                 }
+            }
+        }
+        near.sort_unstable();
+        near.dedup();
+        let lo = from.min(to) - Vec3::splat(reach);
+        let hi = from.max(to) + Vec3::splat(reach);
+        let mut best: Option<f32> = None;
+        for i in near {
+            let Some(tri) = self.triangles.get(i as usize) else {
+                continue;
+            };
+            let (tlo, thi) = (
+                tri[0].min(tri[1]).min(tri[2]),
+                tri[0].max(tri[1]).max(tri[2]),
+            );
+            if tlo.cmpgt(hi).any() || thi.cmplt(lo).any() {
+                continue;
+            }
+            if let Some(t) = hit(tri) {
+                best = Some(best.map_or(t, |b: f32| b.min(t)));
             }
         }
         best

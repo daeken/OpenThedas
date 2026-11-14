@@ -22,11 +22,12 @@ use thedas_launcher::detect::{self, Found, Inspected, Os};
 use thedas_launcher::{ModFile, store};
 use thedas_store::Store;
 
+use crate::launcher_control::{Host, Need, Script};
 use crate::launcher_download::{Download, Want};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::WindowEvent;
-use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::window::{Window, WindowId};
 
 /// The emblem's gold and the dark red behind it.
@@ -88,7 +89,7 @@ impl Launch {
 
 /// Shows the launcher (or, when the player chose to skip it and its install is still there,
 /// goes straight to the game) and returns what to start, or `None` when the player closed it.
-pub fn run(force: bool) -> Result<Option<Launch>> {
+pub fn run(force: bool, script: Option<Script>) -> Result<Option<Launch>> {
     let cfg_path = LauncherConfig::default_path();
     let cfg = LauncherConfig::load(&cfg_path);
     if !force && cfg.skip_launcher {
@@ -102,17 +103,22 @@ pub fn run(force: bool) -> Result<Option<Launch>> {
             );
         }
     }
-    let event_loop = EventLoop::new()?;
+    let event_loop = EventLoop::<LauncherEvent>::with_user_event().build()?;
     let mut app = LauncherApp {
         ui: Ui::new(cfg, cfg_path),
         gfx: None,
         error: None,
+        proxy: event_loop.create_proxy(),
+        script,
     };
     event_loop.run_app(&mut app)?;
     if let Some(e) = app.error {
         return Err(e);
     }
     app.ui.save_config();
+    if app.script.as_ref().is_some_and(|s| s.failed()) {
+        anyhow::bail!("a launcher step failed");
+    }
     Ok(app.ui.launch)
 }
 
@@ -291,6 +297,8 @@ struct Ui {
     before_download: Page,
     /// Screenshots only: draw the download page mid-download.
     demo: bool,
+    /// What the next file or folder dialog answers, from a script (`choose`).
+    chosen: Option<PathBuf>,
 }
 
 const SIZES: &[&str] = &[
@@ -331,6 +339,7 @@ impl Ui {
             dl: Download::new(&cfg_language),
             before_download: Page::Welcome,
             demo: false,
+            chosen: None,
         }
     }
 
@@ -680,7 +689,7 @@ impl Ui {
                     ui.set_width(ui.available_width());
                     ui.horizontal(|ui| {
                         ui.add_enabled_ui(!c.known, |ui| {
-                            ui.checkbox(&mut c.keep, "");
+                            ui.checkbox(&mut c.keep, "Keep");
                         });
                         ui.vertical(|ui| {
                             let game: GameKind = c.found.game.into();
@@ -734,6 +743,7 @@ impl Ui {
         for idx in 0..self.cfg.installs.len() {
             let inst = self.cfg.installs[idx].clone();
             let info = self.inspect(&inst.root);
+            let whose = format!("{} ({})", inst.game.name(), inst.found);
             egui::Frame::group(ui.style()).show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.label(RichText::new(inst.game.name()).strong().size(18.0));
@@ -772,10 +782,21 @@ impl Ui {
                             ui.label("none");
                         }
                     }
-                    if ui.button("Choose…").clicked() {
+                    if named(
+                        ui.button("Choose…"),
+                        &format!("Choose a keys file for {whose}"),
+                    )
+                    .clicked()
+                    {
                         self.actions.push(Action::PickKeys(idx));
                     }
-                    if inst.keys_file.is_some() && ui.button("Clear").clicked() {
+                    if inst.keys_file.is_some()
+                        && named(
+                            ui.button("Clear"),
+                            &format!("Clear the keys file for {whose}"),
+                        )
+                        .clicked()
+                    {
                         self.actions.push(Action::ClearKeys(idx));
                     }
                 });
@@ -783,16 +804,25 @@ impl Ui {
                     ui.horizontal(|ui| {
                         if self.cfg.selected == Some(idx) {
                             ui.label(RichText::new("Plays when you press Play").color(GOLD));
-                        } else if ui.button("Play this one").clicked() {
+                        } else if named(ui.button("Play this one"), &format!("Play {whose}"))
+                            .clicked()
+                        {
                             self.cfg.selected = Some(idx);
                         }
-                        if ui.button("Open folder").clicked() {
+                        if named(
+                            ui.button("Open folder"),
+                            &format!("Open the folder of {whose}"),
+                        )
+                        .clicked()
+                        {
                             self.actions.push(Action::OpenFolder(inst.root.clone()));
                         }
-                        if ui
-                            .button("Remove")
-                            .on_hover_text("Forget it here; nothing is deleted")
-                            .clicked()
+                        if named(
+                            ui.button("Remove")
+                                .on_hover_text("Forget it here; nothing is deleted"),
+                            &format!("Remove {whose}"),
+                        )
+                        .clicked()
                         {
                             remove = Some(idx);
                         }
@@ -833,7 +863,18 @@ impl Ui {
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     ui.horizontal(|ui| {
-                        if ui.radio(selected, "").clicked() {
+                        let radio = ui.radio(selected, "");
+                        // Named for screen readers and scripts: the game and where it was found.
+                        let name = format!("{} ({})", inst.game.name(), inst.found);
+                        radio.widget_info(|| {
+                            egui::WidgetInfo::selected(
+                                egui::accesskit::Role::RadioButton,
+                                true,
+                                selected,
+                                &name,
+                            )
+                        });
+                        if radio.clicked() {
                             picked = true;
                         }
                         ui.vertical(|ui| {
@@ -1094,6 +1135,15 @@ impl Ui {
                 );
                 ui.end_row();
 
+                ui.label("Renderer");
+                ui.horizontal(|ui| {
+                    ui.radio_value(&mut play.renderer, "faithful".to_string(), "Original")
+                        .on_hover_text("The game's own shaders and lighting (the reference)");
+                    ui.radio_value(&mut play.renderer, "deferred".to_string(), "Deferred")
+                        .on_hover_text("OpenThedas's own per-pixel lighting; F11 switches in game");
+                });
+                ui.end_row();
+
                 ui.label("Intro movies");
                 ui.checkbox(&mut play.intro, "Play the logos and intro before the menu");
                 ui.end_row();
@@ -1154,15 +1204,22 @@ impl Ui {
                     ui.horizontal_wrapped(|ui| {
                         for st in [Store::Steam, Store::Gog] {
                             if st.sells(game)
-                                && ui
-                                    .add(big_button(&format!("Download from {}", st.name())))
-                                    .clicked()
+                                && named(
+                                    ui.add(big_button(&format!("Download from {}", st.name()))),
+                                    &format!("Download {} from {}", game.name(), st.name()),
+                                )
+                                .clicked()
                             {
                                 self.actions.push(Action::Download(game, st));
                             }
                         }
                         for l in &links {
-                            if ui.button(&l.label).clicked() {
+                            if named(
+                                ui.button(&l.label),
+                                &format!("{} ({})", l.label, game.name()),
+                            )
+                            .clicked()
+                            {
                                 self.actions.push(Action::OpenUrl(l.url.clone()));
                             }
                         }
@@ -1223,6 +1280,18 @@ impl Ui {
 
     // ---- actions ----
 
+    /// A file (or with `folder`, a folder) from `dialog`, or what a script chose instead.
+    fn pick(&mut self, dialog: rfd::FileDialog, folder: bool) -> Option<PathBuf> {
+        if let Some(p) = self.chosen.take() {
+            return Some(p);
+        }
+        if folder {
+            dialog.pick_folder()
+        } else {
+            dialog.pick_file()
+        }
+    }
+
     fn act(&mut self) {
         for action in std::mem::take(&mut self.actions) {
             match action {
@@ -1235,10 +1304,10 @@ impl Ui {
                     self.start_search(back);
                 }
                 Action::PickInstall => {
-                    let Some(dir) = rfd::FileDialog::new()
-                        .set_title("Choose the game's folder")
-                        .pick_folder()
-                    else {
+                    let Some(dir) = self.pick(
+                        rfd::FileDialog::new().set_title("Choose the game's folder"),
+                        true,
+                    ) else {
                         continue;
                     };
                     match detect::install_root(&dir) {
@@ -1269,12 +1338,13 @@ impl Ui {
                     }
                 }
                 Action::PickKeys(i) => {
-                    if let Some(f) = rfd::FileDialog::new()
-                        .set_title("Choose a keys file (erfpasswords.txt format)")
-                        .add_filter("Text", &["txt"])
-                        .add_filter("All files", &["*"])
-                        .pick_file()
-                    {
+                    if let Some(f) = self.pick(
+                        rfd::FileDialog::new()
+                            .set_title("Choose a keys file (erfpasswords.txt format)")
+                            .add_filter("Text", &["txt"])
+                            .add_filter("All files", &["*"]),
+                        false,
+                    ) {
                         if let Some(inst) = self.cfg.installs.get_mut(i) {
                             inst.keys_file = Some(f);
                         }
@@ -1286,19 +1356,23 @@ impl Ui {
                     }
                 }
                 Action::AddModFolder => {
-                    if let Some(d) = rfd::FileDialog::new()
-                        .set_title("Choose a mod's folder")
-                        .pick_folder()
-                    {
+                    if let Some(d) = self.pick(
+                        rfd::FileDialog::new().set_title("Choose a mod's folder"),
+                        true,
+                    ) {
                         self.mods.add(&d.to_string_lossy());
                     }
                 }
                 Action::AddModArchive => {
-                    if let Some(f) = rfd::FileDialog::new()
-                        .set_title("Choose a mod archive")
-                        .add_filter("Mod archives", &["zip", "dazip", "7z", "erf", "rim"])
-                        .pick_file()
-                    {
+                    if let Some(f) = self.pick(
+                        rfd::FileDialog::new()
+                            .set_title("Choose a mod archive")
+                            .add_filter(
+                                "Mod archives",
+                                &["zip", "dazip", "7z", "rar", "erf", "rim"],
+                            ),
+                        false,
+                    ) {
                         self.mods.add(&f.to_string_lossy());
                     }
                 }
@@ -1321,10 +1395,10 @@ impl Ui {
                     self.page = Page::Download;
                 }
                 Action::PickDownloadDest => {
-                    if let Some(d) = rfd::FileDialog::new()
-                        .set_title("Choose where to put the game")
-                        .pick_folder()
-                    {
+                    if let Some(d) = self.pick(
+                        rfd::FileDialog::new().set_title("Choose where to put the game"),
+                        true,
+                    ) {
                         self.dl.dest = Some(d);
                     }
                 }
@@ -1384,6 +1458,14 @@ pub(crate) fn tilde(p: &Path) -> String {
         Some(rest) if !cfg!(windows) => format!("~/{}", rest.display()),
         _ => p.display().to_string(),
     }
+}
+
+/// Gives a button the name screen readers and scripts use, where its text alone is ambiguous
+/// ("Remove" on every install's card).
+fn named(r: egui::Response, name: &str) -> egui::Response {
+    let enabled = r.enabled();
+    r.widget_info(|| egui::WidgetInfo::labeled(egui::accesskit::Role::Button, enabled, name));
+    r
 }
 
 pub(crate) fn big_button(text: &str) -> egui::Button<'static> {
@@ -1454,17 +1536,65 @@ struct Gfx {
     renderer: egui_wgpu::Renderer,
 }
 
+/// The launcher window's own events: AccessKit's (a screen reader or UI Automation asking for
+/// the tree, or acting on a control).
+struct LauncherEvent(egui_winit::accesskit_winit::Event);
+
+impl From<egui_winit::accesskit_winit::Event> for LauncherEvent {
+    fn from(e: egui_winit::accesskit_winit::Event) -> Self {
+        LauncherEvent(e)
+    }
+}
+
+impl Host for Ui {
+    fn working(&self) -> bool {
+        self.busy()
+    }
+
+    fn status(&self) -> serde_json::Value {
+        serde_json::json!({
+            "page": format!("{:?}", self.page),
+            "message": self.status.as_ref().map(|(m, _)| m.clone()),
+            "message_is_error": self.status.as_ref().is_some_and(|(_, bad)| *bad),
+            "searching": self.search.is_some(),
+            "downloading": self.dl.running(),
+            "wizard_done": self.cfg.wizard_done,
+            "installs": self.cfg.installs.iter().map(|i| serde_json::json!({
+                "game": i.game.name(),
+                "root": i.root,
+                "found": i.found,
+                "keys_file": i.keys_file,
+            })).collect::<Vec<_>>(),
+            "selected": self.cfg.selected,
+            "launch": self.launch.as_ref().map(|l| serde_json::json!({
+                "install": l.install,
+                "args": l.args,
+            })),
+        })
+    }
+
+    fn choose(&mut self, path: PathBuf) {
+        self.chosen = Some(path);
+    }
+}
+
 struct LauncherApp {
     ui: Ui,
     gfx: Option<Gfx>,
     error: Option<anyhow::Error>,
+    proxy: EventLoopProxy<LauncherEvent>,
+    /// Steps or a control client driving the launcher (`--launcher-steps`, `--control`).
+    script: Option<Script>,
 }
 
 impl LauncherApp {
     fn init(&mut self, event_loop: &ActiveEventLoop) -> Result<()> {
         let window = Arc::new(
             event_loop.create_window(
+                // Hidden until AccessKit is attached: its adapter must exist before the
+                // window is first shown.
                 Window::default_attributes()
+                    .with_visible(false)
                     .with_title("OpenThedas")
                     .with_inner_size(LogicalSize::new(960.0, 680.0))
                     .with_min_inner_size(LogicalSize::new(640.0, 480.0))
@@ -1507,6 +1637,13 @@ impl LauncherApp {
             None,
             Some(device.limits().max_texture_dimension_2d as usize),
         );
+        let mut state = state;
+        state.init_accesskit(event_loop, &window, self.proxy.clone());
+        if self.script.is_some() {
+            // A script reads the same tree a screen reader would; build it from the start.
+            ctx.enable_accesskit();
+        }
+        window.set_visible(true);
         let renderer = egui_wgpu::Renderer::new(&device, config.format, Default::default());
         self.gfx = Some(Gfx {
             window,
@@ -1527,11 +1664,23 @@ impl LauncherApp {
         if let Some(w) = self.ui.dl.poll() {
             self.ui.download_wants(w);
         }
-        let input = g.state.take_egui_input(&g.window);
+        let mut input = g.state.take_egui_input(&g.window);
+        let mut need = Need::Nothing;
+        if let Some(script) = self.script.as_mut() {
+            script.poll();
+            need = script.before_frame(&mut input.events, &mut self.ui);
+        }
+        if matches!(need, Need::Quit) {
+            event_loop.exit();
+            return;
+        }
         let ui = &mut self.ui;
-        let output = g.ctx.run_ui(input, |eui| ui.draw(eui));
+        let mut output = g.ctx.run_ui(input, |eui| ui.draw(eui));
+        if let Some(script) = self.script.as_mut() {
+            script.after_frame(output.platform_output.accesskit_update.as_ref());
+        }
         g.state
-            .handle_platform_output(&g.window, output.platform_output);
+            .handle_platform_output(&g.window, std::mem::take(&mut output.platform_output));
         let ppp = output.pixels_per_point;
         let primitives = g.ctx.tessellate(output.shapes, ppp);
         let frame = match g.surface.get_current_texture() {
@@ -1546,6 +1695,12 @@ impl LauncherApp {
         for (id, deltas) in &output.textures_delta.set {
             for delta in deltas {
                 g.renderer.update_texture(&g.device, &g.queue, *id, delta);
+            }
+        }
+        if matches!(need, Need::Screenshot) {
+            let png = shot(g, &primitives, ppp);
+            if let Some(script) = self.script.as_mut() {
+                script.screenshot_taken(png);
             }
         }
         if let Some(frame) = frame {
@@ -1603,13 +1758,141 @@ impl LauncherApp {
             .viewport_output
             .get(&egui::ViewportId::ROOT)
             .is_some_and(|v| v.repaint_delay < Duration::from_millis(100));
-        if soon || self.ui.busy() {
+        if soon || self.ui.busy() || self.script.as_ref().is_some_and(|s| s.busy()) {
             g.window.request_redraw();
         }
     }
 }
 
-impl ApplicationHandler for LauncherApp {
+/// The launcher as drawn this frame, read back from an offscreen target, as a PNG.
+fn shot(g: &mut Gfx, primitives: &[egui::ClippedPrimitive], ppp: f32) -> Result<Vec<u8>> {
+    let (w, h) = (g.config.width, g.config.height);
+    let tex = g.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("launcher shot"),
+        size: wgpu::Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: g.config.format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+    let row = (w * 4).div_ceil(256) * 256;
+    let buf = g.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("launcher shot readback"),
+        size: (row * h) as u64,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let mut encoder = g
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+    let screen = egui_wgpu::ScreenDescriptor {
+        size_in_pixels: [w, h],
+        pixels_per_point: ppp,
+    };
+    let extra = g
+        .renderer
+        .update_buffers(&g.device, &g.queue, &mut encoder, primitives, &screen);
+    {
+        let pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("launcher shot"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &view,
+                resolve_target: None,
+                depth_slice: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color {
+                        r: BG.r() as f64 / 255.0,
+                        g: BG.g() as f64 / 255.0,
+                        b: BG.b() as f64 / 255.0,
+                        a: 1.0,
+                    }),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            ..Default::default()
+        });
+        let mut pass = pass.forget_lifetime();
+        g.renderer.render(&mut pass, primitives, &screen);
+    }
+    encoder.copy_texture_to_buffer(
+        tex.as_image_copy(),
+        wgpu::TexelCopyBufferInfo {
+            buffer: &buf,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(row),
+                rows_per_image: Some(h),
+            },
+        },
+        wgpu::Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        },
+    );
+    g.queue.submit(extra.into_iter().chain([encoder.finish()]));
+    let slice = buf.slice(..);
+    let (tx, rx) = std::sync::mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |r| {
+        let _ = tx.send(r);
+    });
+    let _ = g.device.poll(wgpu::PollType::wait_indefinitely());
+    rx.recv()??;
+    let bgra = matches!(
+        g.config.format,
+        wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb
+    );
+    let mut px = Vec::with_capacity((w * h * 4) as usize);
+    {
+        let data = slice
+            .get_mapped_range()
+            .map_err(|e| anyhow::anyhow!("reading the screenshot back: {e:?}"))?;
+        for y in 0..h as usize {
+            let line = &data[y * row as usize..][..w as usize * 4];
+            for p in line.chunks_exact(4) {
+                if bgra {
+                    px.extend_from_slice(&[p[2], p[1], p[0], 255]);
+                } else {
+                    px.extend_from_slice(&[p[0], p[1], p[2], 255]);
+                }
+            }
+        }
+    }
+    buf.unmap();
+    let mut png = Vec::new();
+    {
+        let mut enc = png::Encoder::new(&mut png, w, h);
+        enc.set_color(png::ColorType::Rgba);
+        enc.set_depth(png::BitDepth::Eight);
+        enc.write_header()?.write_image_data(&px)?;
+    }
+    Ok(png)
+}
+
+impl ApplicationHandler<LauncherEvent> for LauncherApp {
+    fn user_event(&mut self, _: &ActiveEventLoop, event: LauncherEvent) {
+        use egui_winit::accesskit_winit::WindowEvent as A;
+        let Some(g) = self.gfx.as_mut() else { return };
+        match event.0.window_event {
+            A::InitialTreeRequested => g.ctx.enable_accesskit(),
+            A::ActionRequested(request) => g.state.on_accesskit_action_request(request),
+            A::AccessibilityDeactivated => {
+                // A script keeps reading the tree after a screen reader stops.
+                if self.script.is_none() {
+                    g.ctx.disable_accesskit();
+                }
+            }
+        }
+        g.window.request_redraw();
+    }
+
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.gfx.is_none() {
             if let Err(e) = self.init(event_loop) {
@@ -1645,8 +1928,14 @@ impl ApplicationHandler for LauncherApp {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        // While a search or download runs, look for news now and then.
-        if self.ui.busy() {
+        // While a search or download runs, or a script drives the launcher, look for news now
+        // and then.
+        if self.ui.busy()
+            || self
+                .script
+                .as_ref()
+                .is_some_and(|s| s.busy() || s.has_control())
+        {
             event_loop.set_control_flow(ControlFlow::WaitUntil(
                 Instant::now() + Duration::from_millis(100),
             ));

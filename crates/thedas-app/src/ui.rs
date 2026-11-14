@@ -221,6 +221,7 @@ fn splash_pass(
         hide,
         show: vec![splash.to_string()],
         multiply,
+        above: None,
     }
 }
 
@@ -246,7 +247,82 @@ fn branches_pass(paths: &[&str], multiply: &[&str]) -> thedas_ui::MultiplyPass {
         hide,
         show: multiply.clone(),
         multiply,
+        above: None,
     }
+}
+
+/// A white backdrop added under a movie's clips, shown only in its multiply pass (see
+/// `UiLayer::death_blood`).
+const BACKDROP: &str = "_level0.thedas_white";
+
+/// Adds [`BACKDROP`] to movie `m` (at the lowest depth a script can use), hidden, once.
+fn white_backdrop(m: &mut thedas_ui::UiMovie) {
+    let num = thedas_ui::UiValue::Number;
+    if m.call(&format!("{BACKDROP}._visible.toString"), &[]) != thedas_ui::UiValue::Undefined {
+        return;
+    }
+    m.call(
+        "_level0.createEmptyMovieClip",
+        &[
+            thedas_ui::UiValue::String("thedas_white".into()),
+            num(-16384.0),
+        ],
+    );
+    m.call(
+        &format!("{BACKDROP}.beginFill"),
+        &[num(16_777_215.0), num(100.0)],
+    );
+    let far = 20_000.0;
+    m.call(&format!("{BACKDROP}.moveTo"), &[num(-far), num(-far)]);
+    for (x, y) in [(far, -far), (far, far), (-far, far), (-far, -far)] {
+        m.call(&format!("{BACKDROP}.lineTo"), &[num(x), num(y)]);
+    }
+    m.call(&format!("{BACKDROP}.endFill"), &[]);
+    m.set(
+        &format!("{BACKDROP}._visible"),
+        thedas_ui::UiValue::Bool(false),
+    );
+}
+
+/// The clips movie `m` draws above its `multiply` clips: at each level from the root down
+/// to them, a sibling of the branch leading to them with a greater depth than that branch's
+/// deepest (`getDepth`). Clips inside such a sibling are left out (they go with it).
+fn clips_above(m: &mut thedas_ui::UiMovie, paths: &[&str], multiply: &[&str]) -> Vec<String> {
+    let within = |outer: &str, p: &str| {
+        p == outer || p.strip_prefix(outer).is_some_and(|r| r.starts_with('.'))
+    };
+    let on_branch = |p: &str| multiply.iter().any(|x| within(p, x) || within(x, p));
+    let parent = |p: &str| p.rsplit_once('.').map(|(a, _)| a.to_string());
+    let depth = |m: &mut thedas_ui::UiMovie, p: &str| match m.call(&format!("{p}.getDepth"), &[]) {
+        thedas_ui::UiValue::Number(d) => Some(d),
+        _ => None,
+    };
+    // The parents of the branch: the root and every clip on the way to a multiplied one.
+    let mut parents: Vec<String> = paths
+        .iter()
+        .filter(|p| multiply.iter().any(|x| *x != **p && within(p, x)))
+        .map(|p| p.to_string())
+        .collect();
+    parents.push("_level0".into());
+    let mut out = Vec::new();
+    for top in &parents {
+        let children: Vec<&str> = paths
+            .iter()
+            .copied()
+            .filter(|p| parent(p).as_deref() == Some(top.as_str()))
+            .collect();
+        let deepest = children
+            .iter()
+            .filter(|c| on_branch(c))
+            .filter_map(|c| depth(m, c))
+            .fold(f64::NEG_INFINITY, f64::max);
+        for c in children.iter().filter(|c| !on_branch(c)) {
+            if depth(m, c).is_some_and(|d| d > deepest) {
+                out.push(c.to_string());
+            }
+        }
+    }
+    out
 }
 
 /// For how long after the death screen comes up its blood is looked for again (its layers
@@ -397,6 +473,11 @@ pub struct UiLayer {
     /// The death screen's multiplied layers found so far (one hidden for the movie's own
     /// picture is no longer listed among its visible clips, so they are remembered).
     death_multiply: Vec<String>,
+    /// The loading screen's stains and the clips above them found so far, and how long
+    /// until they are looked for again (see `loading_stains`).
+    load_multiply: Vec<String>,
+    load_above: Vec<String>,
+    load_look_ms: f64,
     /// Milliseconds left in which the large notification's splash is looked for again (see
     /// `UiLayer::uber_alert_splash`).
     uber_settle: f64,
@@ -822,6 +903,9 @@ impl UiLayer {
             uber_splash: None,
             death_settle: None,
             death_multiply: Vec::new(),
+            load_multiply: Vec::new(),
+            load_above: Vec::new(),
+            load_look_ms: 0.0,
             uber_settle: 0.0,
             uber_cut: false,
             notifications_up: false,
@@ -1386,7 +1470,6 @@ impl UiLayer {
     /// picture under the whole movie, not onto the movie's own background art as well.
     fn death_blood(&mut self, dt_ms: f64) {
         const MOVIE: &str = "deathscreen.gfx";
-        const BACKDROP: &str = "_level0.thedas_white";
         if !self.stage.movies.iter().any(|m| m.name == MOVIE) {
             self.death_settle = None;
             self.death_multiply.clear();
@@ -1430,39 +1513,96 @@ impl UiLayer {
             for p in &multiply {
                 m.set(&format!("{p}._visible"), thedas_ui::UiValue::Bool(false));
             }
-            // The white backdrop, under every clip of the movie (the lowest depth a script
-            // can use), once.
-            let num = thedas_ui::UiValue::Number;
-            if m.call(&format!("{BACKDROP}._visible.toString"), &[])
-                == thedas_ui::UiValue::Undefined
-            {
-                m.call(
-                    "_level0.createEmptyMovieClip",
-                    &[
-                        thedas_ui::UiValue::String("thedas_white".into()),
-                        num(-16384.0),
-                    ],
-                );
-                m.call(
-                    &format!("{BACKDROP}.beginFill"),
-                    &[num(16_777_215.0), num(100.0)],
-                );
-                let far = 20_000.0;
-                m.call(&format!("{BACKDROP}.moveTo"), &[num(-far), num(-far)]);
-                for (x, y) in [(far, -far), (far, far), (-far, far), (-far, -far)] {
-                    m.call(&format!("{BACKDROP}.lineTo"), &[num(x), num(y)]);
-                }
-                m.call(&format!("{BACKDROP}.endFill"), &[]);
-                m.set(
-                    &format!("{BACKDROP}._visible"),
-                    thedas_ui::UiValue::Bool(false),
-                );
-            }
+            white_backdrop(m);
             let mut pass = branches_pass(&paths, &multiply);
             pass.hide.retain(|h| h != BACKDROP);
             pass.show.push(BACKDROP.into());
             // The layers keep their blend in the pass.
             pass.multiply.clear();
+            m.set_multiply_pass(Some(pass));
+        }
+    }
+
+    /// The loading screen's stains (load_town.gfx: blood and dirt, opaque pictures on white
+    /// blended with `multiply` onto its parchment) and what it draws above them (the
+    /// "Loading" text, the knot). The original draws the movie straight onto the opaque
+    /// frame, so where the parchment fades out in the outro a stain's white multiplies the
+    /// level to itself; here the movie renders into its own transparent picture and the
+    /// whites showed as pale leaves. So the parchment is drawn first (the stains and the
+    /// clips above them hidden), the stains in a pass of their own (over a white backdrop,
+    /// keeping their blend among themselves) multiplied onto the frame, then the clips above
+    /// in a third pass (see `thedas_ui::MultiplyPass::above`). Looked for every
+    /// [`DEATH_LOOK_MS`] while the screen is up. Provisional: "above" is a clip with a
+    /// greater depth than the stains' branch beside it; the knot's own `overlay` blend
+    /// is drawn by the player over nothing in its pass.
+    fn loading_stains(&mut self, dt_ms: f64) {
+        const MOVIE: &str = "load_town.gfx";
+        if !self.stage.movies.iter().any(|m| m.name == MOVIE) {
+            self.load_multiply.clear();
+            self.load_above.clear();
+            self.load_look_ms = 0.0;
+            return;
+        }
+        self.load_look_ms -= dt_ms;
+        if self.load_look_ms > 0.0 {
+            return;
+        }
+        self.load_look_ms = DEATH_LOOK_MS;
+        let Some(thedas_ui::UiValue::String(tree)) =
+            self.stage.call_in(MOVIE, "_global.thedas_tree_list", &[])
+        else {
+            return;
+        };
+        let visible: Vec<&str> = tree
+            .split(';')
+            .filter_map(|e| e.split('|').next())
+            .filter(|p| !p.is_empty() && *p != BACKDROP)
+            .collect();
+        let (found, above) = (&mut self.load_multiply, &mut self.load_above);
+        for m in self.stage.movies.iter_mut().filter(|m| m.name == MOVIE) {
+            for p in &visible {
+                let blended = m.call(&format!("{p}.blendMode.toString"), &[])
+                    == thedas_ui::UiValue::String("multiply".into());
+                if blended && !found.iter().any(|f| f == p) {
+                    found.push(p.to_string());
+                }
+            }
+            if found.is_empty() {
+                continue;
+            }
+            // Every clip known: those listed now, and those hidden for the passes.
+            let mut known: Vec<String> = visible.iter().map(|p| p.to_string()).collect();
+            for p in found.iter().chain(above.iter()) {
+                if !known.contains(p) {
+                    known.push(p.clone());
+                }
+            }
+            let paths: Vec<&str> = known.iter().map(String::as_str).collect();
+            let multiply: Vec<&str> = found.iter().map(String::as_str).collect();
+            for p in clips_above(m, &paths, &multiply) {
+                if !above.contains(&p) {
+                    above.push(p);
+                }
+            }
+            for p in multiply
+                .iter()
+                .copied()
+                .chain(above.iter().map(String::as_str))
+            {
+                m.set(&format!("{p}._visible"), thedas_ui::UiValue::Bool(false));
+            }
+            white_backdrop(m);
+            let mut pass = branches_pass(&paths, &multiply);
+            pass.hide.retain(|h| h != BACKDROP);
+            pass.show.push(BACKDROP.into());
+            // The stains keep their blend among themselves, over the backdrop.
+            pass.multiply.clear();
+            let tops: Vec<&str> = above.iter().map(String::as_str).collect();
+            let over = branches_pass(&paths, &tops);
+            pass.above = Some(thedas_ui::ClipPass {
+                hide: over.hide,
+                show: over.show,
+            });
             m.set_multiply_pass(Some(pass));
         }
     }
@@ -2209,6 +2349,7 @@ impl UiLayer {
         self.select_clicked_portrait(sim);
         self.uber_alert_splash(sim, dt_ms);
         self.death_blood(dt_ms);
+        self.loading_stains(dt_ms);
         self.loading_frame(dt_ms);
         self.travel_map_frame();
         let mut messages = self.stage.tick(dt_ms);
@@ -3274,6 +3415,7 @@ impl UiLayer {
     }
 
     pub fn tick(&mut self, dt_ms: f64) -> Vec<GameMessage> {
+        self.loading_stains(dt_ms);
         self.stage.tick(dt_ms)
     }
 
@@ -3283,6 +3425,11 @@ impl UiLayer {
 
     pub fn mouse_move(&mut self, x: f64, y: f64) {
         self.stage.mouse_move(x, y);
+    }
+
+    /// The mouse left the window.
+    pub fn mouse_leave(&mut self) {
+        self.stage.mouse_leave();
     }
 
     /// The mouse wheel turned `lines` (up positive) at (`x`, `y`): lists and text under the
@@ -3382,12 +3529,31 @@ impl UiLayer {
         // The movies' multiplied clips first, onto the game's picture under the whole
         // interface (the original's "New Quest" splash leaves the minimap above it as it
         // was: reference cx_city_elf_after_unpause_new_quest.png).
-        for m in &mut self.stage.movies {
+        for m in self
+            .stage
+            .movies
+            .iter_mut()
+            .filter(|m| !m.multiplies_over())
+        {
             if let Some(tex) = m.render_multiply() {
                 groups.push((group(&tex), true));
             }
         }
         for m in &mut self.stage.movies {
+            // A movie whose clips multiply onto its own art (the loading screen's stains):
+            // its passes are copies, so it renders them after its own frame is copied too.
+            if m.multiplies_over() {
+                m.render();
+                let own = m.render_own_copy();
+                let multiply = m.render_multiply();
+                let above = m.render_above();
+                for (tex, mul) in [(own, false), (multiply, true), (above, false)] {
+                    if let Some(tex) = tex {
+                        groups.push((group(&tex), mul));
+                    }
+                }
+                continue;
+            }
             m.render();
             let Some(tex) = m.texture() else { continue };
             groups.push((group(&tex), false));

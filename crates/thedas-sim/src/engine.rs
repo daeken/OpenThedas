@@ -174,17 +174,21 @@ pub(crate) fn cell_string(c: Option<&Cell>) -> String {
 }
 
 /// The name of the local variable argument `a[i]` names on object `o`. Dragon Age: Origins
-/// names it; Dragon Age II's scripts pass the variable's row in the object's variable table
-/// instead (`var_module`, `var_area`, `var_creature`, `var_placeable`, `var_item`,
-/// `var_trigger`), whose `Label` column is the name templates use. A row that is not there
-/// keeps its number as its name. Provisional: read from DA2's scripts and tables (its
-/// `PlayCutscene` callers set `var_module` rows 1014 to 1016, `CUTSCENE_SET_PLOT`,
-/// `CUTSCENE_SET_PLOT_FLAG` and `CUTSCENE_TALK_SPEAKER`), not traced in the executable.
+/// names it; Dragon Age II's scripts pass a number instead: the variable's row in the
+/// object's variable table (`var_module`, `var_area`, `var_creature`, `var_placeable`,
+/// `var_item`, `var_trigger`), whose `Label` column is the name templates use. An object
+/// whose template's variables are not that table's rows (a talk trigger's `TRIG_TALK_*`,
+/// which are `var_trigger_talk`'s) numbers them by their place in its template's list,
+/// which follows its own table's rows (row 0 `TRIG_TALK_SPEAKER`, 2 the conversation). A
+/// number neither answers keeps its digits as its name. Provisional: read from DA2's scripts,
+/// tables and templates (`PlayCutscene`'s callers set `var_module` rows 1014 to 1016,
+/// `gen00tr_talk` reads its trigger's speaker at 0), not traced in the executable.
 fn local_name(sim: &Sim, o: ObjectId, a: &[Value], i: usize) -> String {
     let Some(Value::Int(row)) = a.get(i) else {
         return string(a, i);
     };
-    let table = match sim.world.get(o).map(|o| o.kind) {
+    let obj = sim.world.get(o);
+    let table = match obj.map(|o| o.kind) {
         Some(ObjectKind::Module) => "var_module",
         Some(ObjectKind::Area) => "var_area",
         Some(ObjectKind::Creature) => "var_creature",
@@ -193,12 +197,24 @@ fn local_name(sim: &Sim, o: ObjectId, a: &[Value], i: usize) -> String {
         Some(ObjectKind::Trigger) => "var_trigger",
         _ => return row.to_string(),
     };
-    let name = sim
-        .world
-        .tables()
-        .get(0, table)
-        .map(|t| cell_string(t.cell("Label", *row as i64)))
-        .unwrap_or_default();
+    let Some(t) = sim.world.tables().get(0, table) else {
+        return row.to_string();
+    };
+    let name = cell_string(t.cell("Label", *row as i64));
+    // An object whose template's variables are another table's (its first is none of this
+    // table's labels) numbers them by their place in its template's list.
+    let order = obj.map(|o| &o.locals.order);
+    if let Some(first) = order.and_then(|l| l.first()) {
+        let foreign = !t
+            .order
+            .iter()
+            .any(|&r| cell_string(t.cell("Label", r)) == *first);
+        if foreign {
+            if let Some(placed) = order.and_then(|l| l.get(usize::try_from(*row).ok()?)) {
+                return placed.clone();
+            }
+        }
+    }
     if name.is_empty() {
         row.to_string()
     } else {
@@ -657,6 +673,9 @@ pub fn call(
         "Random" => ok(Value::Int(h.sim.world.rng.below(int(a, 0)))),
         "RandomFloat" => ok(Value::Float(h.sim.world.rng.unit())),
         "Vector" => ok(Value::Vector([float(a, 0), float(a, 1), float(a, 2)])),
+        // Whether x, y and z each compare equal to 0.0 (DAOrigins.exe's handler for function
+        // 40, 0x64f010): -0.0 counts as empty, NaN does not, as float comparison gives.
+        "IsVectorEmpty" => ok(b(vector(a, 0) == [0.0; 3])),
         // DAOrigins.exe's conversions (0x64f260, 0x64f310), in its own constants: an angle
         // a (degrees) is the ground vector (-sin a, cos a, 0), and a vector's angle is
         // atan2(-x, y) in degrees, -180 to 180 (0x4ee570).
@@ -1041,6 +1060,23 @@ pub fn call(
                 handle: Some(hd),
             })
         }
+        // DAOrigins.exe 0x65b0d0: the location moved to a safe spot by the safe-location
+        // search (see [`Sim::safe_location`]); an invalid location comes back as it is.
+        "GetSafeLocation" => {
+            let l = match h.sim.world.handle(handle(a, 0)) {
+                Some(EngineData::Location(l)) => h.sim.safe_location(*l),
+                _ => Location {
+                    area: OBJECT_INVALID,
+                    position: [0.0; 3],
+                    facing: 0.0,
+                },
+            };
+            let hd = h.sim.world.store(EngineData::Location(l));
+            ok(Value::Engine {
+                ty: ty.location,
+                handle: Some(hd),
+            })
+        }
         "GetPositionFromLocation"
         | "GetAreaFromLocation"
         | "GetFacingFromLocation"
@@ -1124,6 +1160,17 @@ pub fn call(
                 })
                 .unwrap_or(0),
         )),
+        // DAOrigins.exe 0x66be50 (function 813): the creature's answer to a restriction
+        // script's question (+0xc70), read by [`Sim::can_use_item`].
+        "SetCanUseItem" => {
+            h.sim.can_use_answers.insert(obj(a, 0), int(a, 1));
+            void()
+        }
+        // DAOrigins.exe 0x665710: 0x6ae8b0 on the creature and item ([`Sim::can_use_item`]).
+        "CanUseItem" => {
+            let ok_ = h.sim.can_use_item(obj(a, 0), obj(a, 1));
+            ok(Value::Int(ok_ as i32))
+        }
         "SetLocalInt" => {
             let k = local_name(h.sim, obj(a, 0), a, 1);
             if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
@@ -1245,7 +1292,8 @@ pub fn call(
             _ => 0,
         })),
         "GetEventType" | "GetEventCreator" | "GetEventTarget" | "GetEventInteger"
-        | "GetEventFloat" | "GetEventString" | "GetEventObject" | "GetEventResource" => {
+        | "GetEventFloat" | "GetEventString" | "GetEventObject" | "GetEventResource"
+        | "GetEventVector" => {
             let ev = match h.sim.world.handle(handle(a, 0)) {
                 Some(EngineData::Event(e)) => e.clone(),
                 _ => Event::default(),
@@ -1261,11 +1309,13 @@ pub fn call(
                 "GetEventResource" => {
                     Value::Resource(ev.resources.get(i).cloned().unwrap_or_default())
                 }
+                // Dragon Age II's vector parameters; one never set reads as the zero vector.
+                "GetEventVector" => Value::Vector(ev.vectors.get(i).copied().unwrap_or([0.0; 3])),
                 _ => Value::Object(ev.objects.get(i).copied().unwrap_or(OBJECT_INVALID)),
             })
         }
         "SetEventType" | "SetEventCreator" | "SetEventInteger" | "SetEventFloat"
-        | "SetEventString" | "SetEventObject" | "SetEventResource" => {
+        | "SetEventString" | "SetEventObject" | "SetEventResource" | "SetEventVector" => {
             let mut ev = match h.sim.world.handle(handle(a, 0)) {
                 Some(EngineData::Event(e)) => e.clone(),
                 _ => Event::default(),
@@ -1286,6 +1336,7 @@ pub fn call(
                 "SetEventFloat" => put(&mut ev.floats, i, float(a, 2)),
                 "SetEventString" => put(&mut ev.strings, i, string(a, 2)),
                 "SetEventResource" => put(&mut ev.resources, i, string(a, 2)),
+                "SetEventVector" => put(&mut ev.vectors, i, vector(a, 2)),
                 _ => put(&mut ev.objects, i, obj(a, 2)),
             }
             let hd = h.sim.world.store(EngineData::Event(ev));
@@ -1596,7 +1647,13 @@ pub fn call(
         "ReadIniEntry" => ok(Value::String(String::new())),
         // Achievements belong to the player's profile, not the game: the simulation's profile has
         // none (by id or, the older form, by name).
-        "GetPRCEnabled" | "GetHasAchievementByID" | "GetHasAchievement" => ok(Value::Int(0)),
+        "GetHasAchievementByID" | "GetHasAchievement" => ok(Value::Int(0)),
+        // Traced (COMMAND_GETPRCENABLED, handler 0x66d6d0): the add-in record whose UID matches
+        // gives its Enabled byte (+0x15d), cleared when it needs authorization (+0x15e) and has
+        // none (+0x15f) or when an unidentified pair (+0x175 set, +0x176 clear) says so; no
+        // such record gives 0. Ours: whether the stack mounts that add-in, which applies the
+        // registry's own gates and not the authorization (FMT-011).
+        "GetPRCEnabled" => ok(b(h.sim.vfs.addin_enabled(&string(a, 0)))),
         "IsPackageLoaded" => {
             // Inferred (#862): whether a package's archives are in our resource stack.
             let pkg = format!("packages/{}/", string(a, 0).to_ascii_lowercase());
@@ -5036,6 +5093,67 @@ mod tests {
     }
 
     #[test]
+    fn dragon_age_2_objects_with_another_tables_variables_number_them_in_template_order() {
+        let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        s.world.tables().insert(
+            "var_trigger",
+            &["Label"],
+            vec![
+                (0, vec![Cell::String("TRIGGER_COUNTER_1\0".into())]),
+                (1, vec![Cell::String("TRIGGER_COUNTER_2\0".into())]),
+            ],
+        );
+        // A talk trigger: its template's variables are var_trigger_talk's, in its rows' order.
+        let talk = s.world.spawn(ObjectKind::Trigger, "gentr_talk");
+        {
+            let l = &mut s.world.get_mut(talk).unwrap().locals;
+            l.order = vec!["TRIG_TALK_SPEAKER".into(), "TRIG_TALK_REPEAT".into()];
+            l.strings
+                .insert("TRIG_TALK_SPEAKER".into(), "gen00fl_bethany".into());
+        }
+        // A generic trigger keeps the kind's table.
+        let plain = s.world.spawn(ObjectKind::Trigger, "gentr_counter");
+        s.world.get_mut(plain).unwrap().locals.order =
+            vec!["TRIGGER_COUNTER_1".into(), "TRIGGER_COUNTER_2".into()];
+        let o = |id| Value::Object(id);
+        assert_eq!(
+            run(&mut s, 1, "GetLocalString", &[o(talk), Value::Int(0)]),
+            Some(Value::String("gen00fl_bethany".into()))
+        );
+        run(
+            &mut s,
+            1,
+            "SetLocalInt",
+            &[o(talk), Value::Int(1), Value::Int(1)],
+        );
+        assert_eq!(
+            s.world
+                .get(talk)
+                .unwrap()
+                .locals
+                .ints
+                .get("TRIG_TALK_REPEAT"),
+            Some(&1)
+        );
+        run(
+            &mut s,
+            1,
+            "SetLocalInt",
+            &[o(plain), Value::Int(1), Value::Int(4)],
+        );
+        assert_eq!(
+            s.world
+                .get(plain)
+                .unwrap()
+                .locals
+                .ints
+                .get("TRIGGER_COUNTER_2"),
+            Some(&4)
+        );
+    }
+
+    #[test]
     fn dragon_age_2_locals_are_named_by_their_variable_table_row() {
         let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
         let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
@@ -5101,6 +5219,45 @@ mod tests {
             &[Value::Resource("pro000cs_opening.cut".into())],
         );
         assert_eq!(s.world.cutscenes, vec!["pro000cs_opening.cut".to_string()]);
+    }
+
+    #[test]
+    fn dragon_age_2_events_carry_vectors() {
+        let ldf = "#define ENGINE_STRUCTURE_0 event\n\
+            event Event(int nType) = 1;\n\
+            event SetEventVector(event e, int n, vector v) = 2;\n\
+            vector GetEventVector(event e, int n) = 3;\n\
+            int IsVectorEmpty(vector v) = 4;\n";
+        let table = Arc::new(EngineTable::parse(ldf.as_bytes()).unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        let ev = run(&mut s, 1, "Event", &[Value::Int(1001)]).unwrap();
+        let ev = run(
+            &mut s,
+            1,
+            "SetEventVector",
+            &[ev, Value::Int(1), Value::Vector([1.0, 2.0, 3.0])],
+        )
+        .unwrap();
+        assert_eq!(
+            run(&mut s, 1, "GetEventVector", &[ev.clone(), Value::Int(1)]),
+            Some(Value::Vector([1.0, 2.0, 3.0]))
+        );
+        // One never set is the zero vector, which is empty.
+        let unset = run(&mut s, 1, "GetEventVector", &[ev, Value::Int(0)]).unwrap();
+        assert_eq!(unset, Value::Vector([0.0; 3]));
+        assert_eq!(
+            run(&mut s, 1, "IsVectorEmpty", &[unset]),
+            Some(Value::Int(1))
+        );
+        assert_eq!(
+            run(
+                &mut s,
+                1,
+                "IsVectorEmpty",
+                &[Value::Vector([0.0, 0.5, 0.0])]
+            ),
+            Some(Value::Int(0))
+        );
     }
 
     #[test]

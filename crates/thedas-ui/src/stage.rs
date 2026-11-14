@@ -256,6 +256,69 @@ const OFF_STAGE: (f64, f64) = (-10_000.0, -10_000.0);
 /// The context the popup layer pushes while a dialog box is up.
 const POPUP_CONTEXT: &str = "GUIPopup";
 
+/// Time each movie's tick takes, logged every few hundred ticks when `THEDAS_UI_PROFILE` is
+/// set: its token sync (the engine's values pushed in) and its player tick (scripts, frames
+/// and Ruffle's mouse picking).
+mod profile {
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    /// Ticks between reports.
+    const EVERY: u32 = 300;
+
+    /// Each movie's summed sync and tick time.
+    type ByMovie = BTreeMap<String, (Duration, Duration)>;
+
+    /// The ticks counted and the times summed since the last report.
+    static TIMES: Mutex<Option<(u32, ByMovie)>> = Mutex::new(None);
+
+    fn on() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("THEDAS_UI_PROFILE").is_some())
+    }
+
+    pub fn note(movie: &str, sync: Duration, tick: Duration) {
+        if !on() {
+            return;
+        }
+        let Ok(mut t) = TIMES.lock() else { return };
+        let (_, by) = t.get_or_insert_with(Default::default);
+        let e = by.entry(movie.to_string()).or_default();
+        e.0 += sync;
+        e.1 += tick;
+    }
+
+    /// One stage tick done: every [`EVERY`], the averages are logged and start again.
+    pub fn tick_done() {
+        if !on() {
+            return;
+        }
+        let Ok(mut t) = TIMES.lock() else { return };
+        let (n, by) = t.get_or_insert_with(Default::default);
+        *n += 1;
+        if *n < EVERY {
+            return;
+        }
+        let per = |d: Duration| d.as_secs_f64() * 1000.0 / f64::from(*n);
+        let mut rows: Vec<_> = by
+            .iter()
+            .map(|(m, (s, k))| (per(*s) + per(*k), m, per(*s), per(*k)))
+            .collect();
+        rows.sort_by(|a, b| b.0.total_cmp(&a.0));
+        let total: f64 = rows.iter().map(|r| r.0).sum();
+        let line: Vec<String> = rows
+            .iter()
+            .map(|(_, m, s, k)| format!("{m} {s:.2}+{k:.2}"))
+            .collect();
+        log::info!(
+            "ui profile: {total:.2} ms a tick (sync+tick): {}",
+            line.join(", ")
+        );
+        *t = None;
+    }
+}
+
 pub struct Stage {
     pub movies: Vec<UiMovie>,
     /// Where the mouse is (stage pixels), which a movie is told as it opens: a player takes
@@ -390,7 +453,6 @@ impl Stage {
         }
     }
 
-    /// Loads a movie (`mainmenu.gfx`) on top of the others and starts it.
     /// A movie on Ruffle: rewritten to a plain SWF with its images inlined.
     fn open_ruffle(&mut self, name: &str) -> Result<UiMovie, UiError> {
         let (swf, rep) = {
@@ -422,6 +484,8 @@ impl Stage {
         Ok(m)
     }
 
+    /// Loads a movie (`mainmenu.gfx`) on top of the others and starts it, on Ruffle or on
+    /// our own player (see [`crate::own::wanted`]).
     pub fn open(&mut self, name: &str) -> Result<(), UiError> {
         // A popup layer loaded anew has no dialog box up, whatever the one before it left
         // on the context stack.
@@ -450,7 +514,9 @@ impl Stage {
             self.open_ruffle(name)?
         };
         let swf = (self.lookup)(name).unwrap_or_default();
-        m.mouse_move(self.mouse.0, self.mouse.1);
+        if self.mouse != OFF_STAGE {
+            m.mouse_move(self.mouse.0, self.mouse.1);
+        }
         for (name, url) in &self.engine_images {
             m.set_engine_image(name, Some(url));
         }
@@ -535,9 +601,12 @@ impl Stage {
         let bridge = self.bridge.clone();
         let mut finished = Vec::new();
         for m in &mut self.movies {
+            let started = std::time::Instant::now();
             let missing = m.sync_tokens(&|t| bridge.value(t));
             bridge.note_unanswered(missing);
+            let synced = started.elapsed();
             m.tick(dt_ms);
+            profile::note(&m.name, synced, started.elapsed() - synced);
             // quickbar.gfx's first frame places its expansion handle before the handle's
             // own init (Ruffle runs the clips' init in another order than Scaleform): the
             // handle sits at its authored place, the bar's full width, and the movie writes
@@ -598,6 +667,7 @@ impl Stage {
             }
         }
         self.movies.retain(|m| !finished.contains(&m.name));
+        profile::tick_done();
         out
     }
 
@@ -644,7 +714,18 @@ impl Stage {
             .collect()
     }
 
+    /// The mouse left the window (see `UiMovie::mouse_leave`).
+    pub fn mouse_leave(&mut self) {
+        self.mouse = OFF_STAGE;
+        for m in &mut self.movies {
+            m.mouse_leave();
+        }
+    }
+
     pub fn mouse_move(&mut self, x: f64, y: f64) {
+        if self.mouse == OFF_STAGE {
+            log::debug!("ui: the mouse is in the window at {x:.0},{y:.0}");
+        }
         self.mouse = (x, y);
         for m in self.input_movies() {
             m.mouse_move(x, y);
@@ -833,7 +914,7 @@ impl Stage {
     pub fn capture_over(&mut self, base: &mut Rgba) -> Result<(), UiError> {
         // The movies' multiplied clips first, onto the picture under the whole interface
         // (see `UiMovie::render_multiply`).
-        for m in &mut self.movies {
+        for m in self.movies.iter_mut().filter(|m| !m.multiplies_over()) {
             if let Some(pass) = m.capture_multiply() {
                 blend_multiply(base, &pass);
             }
@@ -844,6 +925,15 @@ impl Stage {
                 .capture()
                 .ok_or_else(|| UiError::Render(format!("capturing {}", m.name)))?;
             blend_premultiplied(base, &frame);
+            // Clips multiplied onto the movie's own art, and those above them.
+            if m.multiplies_over() {
+                if let Some(pass) = m.capture_multiply() {
+                    blend_multiply(base, &pass);
+                }
+                if let Some(above) = m.capture_above() {
+                    blend_premultiplied(base, &above);
+                }
+            }
         }
         Ok(())
     }

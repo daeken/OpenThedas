@@ -382,7 +382,7 @@ impl Sim {
             }
         }
         let text = self.node_text(&node);
-        let speaker = match node.speaker.as_str() {
+        let speaker = match self.line_speaker_tag(&node).as_str() {
             "OWNER" | "" => c.owner,
             "PLAYER" => c.player,
             tag => self.world.by_tag(tag).next().map_or(c.owner, |o| o.id),
@@ -468,7 +468,7 @@ impl Sim {
             .dlg
             .nodes
             .get(line)
-            .map(|n| n.speaker.trim_end_matches('\0').to_string())
+            .map(|n| self.line_speaker_tag(n).trim_end_matches('\0').to_string())
             .filter(|s| !s.is_empty())
             .and_then(|s| self.cutscene_actor_object(&s, Some(c.owner), Some(c.player)))
             .unwrap_or(c.owner);
@@ -602,6 +602,53 @@ impl Sim {
         out
     }
 
+    /// The tag (or `OWNER`, `PLAYER`) of whoever says line `n`. A Dragon Age II line given to
+    /// the conversation's other participant ([`crate::cnv::PARTNER`]) goes to the first of
+    /// its candidates that is active and alive, else the first that is there, else the owner.
+    pub fn line_speaker_tag(&self, n: &Node) -> String {
+        let Some(list) = n.speaker.strip_prefix(crate::cnv::PARTNER) else {
+            return n.speaker.clone();
+        };
+        let tags: Vec<&str> = list.split('|').filter(|t| !t.is_empty()).collect();
+        let here = |live: bool| {
+            tags.iter()
+                .copied()
+                .find(|t| self.world.by_tag(t).any(|o| !o.dead && (!live || o.active)))
+        };
+        here(true)
+            .or_else(|| here(false))
+            .map_or_else(|| "OWNER".to_string(), str::to_string)
+    }
+
+    /// Who speaks the lines of Dragon Age II conversation `name`, by talk-table id: the
+    /// speakers its line performances name (`cln_<name>.crf`, see
+    /// [`crate::cnv::performance_speaker`]). Empty when no archive of that name is mounted.
+    fn performance_speakers(&self, name: &str) -> std::collections::HashMap<u32, String> {
+        let file = format!("cln_{}.crf", name.to_ascii_lowercase());
+        let mut out = std::collections::HashMap::new();
+        for layer in self.vfs.layers() {
+            let thedas_vfs::vfs::LayerSource::Archive { erf, key } = &layer.source else {
+                continue;
+            };
+            let label = layer.label.replace('\\', "/").to_ascii_lowercase();
+            if !label.ends_with(&format!("/{file}")) && label != file {
+                continue;
+            }
+            for entry in &erf.entries {
+                let Ok(data) = erf.read(entry, key.as_ref()) else {
+                    continue;
+                };
+                let Ok(g) = Gff4::parse(&data) else {
+                    continue;
+                };
+                if let Some((line, who)) = crate::cnv::performance_speaker(&g) {
+                    out.entry(line).or_insert(who);
+                }
+            }
+        }
+        out
+    }
+
     /// Starts a conversation between `initiator` and `target` (the owner); an empty `dlg`
     /// uses the target's own conversation. Returns whether it started.
     pub fn start_conversation(&mut self, initiator: ObjectId, target: ObjectId, dlg: &str) -> bool {
@@ -650,7 +697,9 @@ impl Sim {
                     .vfs
                     .read(&format!("{}.cnv", name.to_ascii_lowercase()))
                     .ok()?;
-                crate::cnv::dlg_from_cnv(&Gff4::parse(&data).ok()?, &name)
+                let mut d = crate::cnv::dlg_from_cnv(&Gff4::parse(&data).ok()?, &name)?;
+                crate::cnv::apply_speakers(&mut d, &self.performance_speakers(&name));
+                Some(d)
             })
         else {
             let t = self.world.time_ms;
@@ -1048,7 +1097,7 @@ impl Sim {
         Some(DialogState {
             dialog: c.dlg.name.clone(),
             owner: c.owner,
-            speaker: line.map(|n| n.speaker.clone()).unwrap_or_default(),
+            speaker: line.map(|n| self.line_speaker_tag(n)).unwrap_or_default(),
             line: line.map(|n| self.node_text(n)).unwrap_or_default(),
             replies: c
                 .replies

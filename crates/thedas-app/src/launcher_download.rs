@@ -317,16 +317,18 @@ impl Download {
             .num_columns(2)
             .spacing([16.0, 8.0])
             .show(ui, |ui| {
-                ui.label("Account name");
-                ui.add(egui::TextEdit::singleline(&mut self.account).desired_width(260.0));
+                let l = ui.label("Account name");
+                ui.add(egui::TextEdit::singleline(&mut self.account).desired_width(260.0))
+                    .labelled_by(l.id);
                 ui.end_row();
-                ui.label("Password");
+                let l = ui.label("Password");
                 ui.add(
                     egui::TextEdit::singleline(&mut self.password)
                         .id(egui::Id::unique(PASSWORD_ID))
                         .password(true)
                         .desired_width(260.0),
-                );
+                )
+                .labelled_by(l.id);
                 ui.end_row();
             });
         ui.label(
@@ -348,7 +350,7 @@ impl Download {
                 want = Some(Want::OpenUrl(gog::login_url()));
             }
         });
-        ui.label(
+        let l = ui.label(
             "2. Sign in there. GOG then shows an almost empty page. Copy that page's whole \
              address from the browser's address bar and paste it here:",
         );
@@ -357,7 +359,8 @@ impl Download {
                 .id(egui::Id::unique(GOG_ID))
                 .hint_text("https://embed.gog.com/on_login_success?origin=client&code=…")
                 .desired_width(f32::INFINITY),
-        );
+        )
+        .labelled_by(l.id);
         if !self.gog_pasted.trim().is_empty() && gog::code_from(&self.gog_pasted).is_none() {
             ui.label(RichText::new("That address has no sign-in code in it.").color(BAD));
         }
@@ -405,18 +408,20 @@ impl Download {
         }
         if let Some(email) = r.guard {
             ui.add_space(6.0);
-            ui.label(if email {
+            let l = ui.label(if email {
                 "Steam sent a code to your email. Type it here:"
             } else {
                 "Type the code from the Steam app on your phone:"
             });
             let mut send = false;
             ui.horizontal(|ui| {
-                let resp = ui.add(
-                    egui::TextEdit::singleline(&mut self.guard)
-                        .id(egui::Id::unique(GUARD_ID))
-                        .desired_width(120.0),
-                );
+                let resp = ui
+                    .add(
+                        egui::TextEdit::singleline(&mut self.guard)
+                            .id(egui::Id::unique(GUARD_ID))
+                            .desired_width(120.0),
+                    )
+                    .labelled_by(l.id);
                 send = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                 send |= ui.button("Send").clicked();
             });

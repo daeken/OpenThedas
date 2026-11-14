@@ -554,6 +554,8 @@ pub struct UiMovie {
     /// their own (see [`MultiplyPass`]), and the texture that pass is copied to.
     multiply_pass: Option<MultiplyPass>,
     multiply_texture: Option<wgpu::Texture>,
+    above_texture: Option<wgpu::Texture>,
+    own_texture: Option<wgpu::Texture>,
 }
 
 /// Clips a movie draws with the `multiply` blend onto what is under the interface (the
@@ -569,6 +571,27 @@ pub struct MultiplyPass {
     pub show: Vec<String>,
     /// The `multiply` clips, drawn with the normal blend in the pass.
     pub multiply: Vec<String>,
+    /// For clips that multiply onto the movie's own art (the loading screen's stains on its
+    /// parchment): the pass is multiplied onto the frame after the movie's own picture, not
+    /// before, and these clips, which the movie draws above the multiplied ones, follow it
+    /// in a pass of their own (normal blend; hidden in the movie's own frame).
+    pub above: Option<ClipPass>,
+}
+
+/// Which of a movie's pass textures a rendered frame is copied into.
+#[derive(Clone, Copy)]
+enum PassCopy {
+    Multiply,
+    Above,
+    Own,
+}
+
+/// A pass of some of a movie's clips: those it hides, and those it shows (hidden in the
+/// movie's own frame).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ClipPass {
+    pub hide: Vec<String>,
+    pub show: Vec<String>,
 }
 
 /// An `<img>` tag in HTML text: where it is, its linkage name and its horizontal space.
@@ -716,6 +739,8 @@ impl UiMovie {
             .build();
         if let Ok(mut p) = player.lock() {
             p.set_window_mode("transparent");
+            // Not in the window until the mouse moves (see `UiMovie::mouse_move`).
+            p.set_mouse_in_stage(false);
         }
         Ok(Self {
             name: name.to_string(),
@@ -735,6 +760,8 @@ impl UiMovie {
             inline_images: Default::default(),
             multiply_pass: None,
             multiply_texture: None,
+            above_texture: None,
+            own_texture: None,
         })
     }
 
@@ -1112,6 +1139,31 @@ impl UiMovie {
     /// made). `None` without a pass.
     fn in_multiply_pass<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> Option<R> {
         let pass = self.multiply_pass.clone()?;
+        Some(self.in_pass(&pass.hide, &pass.show, &pass.multiply, f))
+    }
+
+    /// Sets the movie up for its above pass (see [`MultiplyPass::above`]), as
+    /// [`UiMovie::in_multiply_pass`] does. `None` without one.
+    fn in_above_pass<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> Option<R> {
+        let above = self.multiply_pass.as_ref()?.above.clone()?;
+        Some(self.in_pass(&above.hide, &above.show, &[], f))
+    }
+
+    /// Hides `hide`, shows `show` and draws `multiply` with the normal blend while `f` runs,
+    /// then puts them back as they were.
+    fn in_pass<R>(
+        &mut self,
+        hide: &[String],
+        show: &[String],
+        multiply: &[String],
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let pass = MultiplyPass {
+            hide: hide.to_vec(),
+            show: show.to_vec(),
+            multiply: multiply.to_vec(),
+            above: None,
+        };
         let visible = |m: &mut Self, path: &str| {
             m.call(&format!("{path}._visible.toString"), &[]) == UiValue::String("true".into())
         };
@@ -1140,7 +1192,7 @@ impl UiMovie {
         for (p, v) in was {
             self.set(&format!("{p}._visible"), UiValue::Bool(v));
         }
-        Some(r)
+        r
     }
 
     /// Renders the movie's multiply pass (see [`MultiplyPass`]) and returns a copy of it
@@ -1149,6 +1201,7 @@ impl UiMovie {
     pub fn render_multiply(&mut self) -> Option<wgpu::Texture> {
         self.in_multiply_pass(|m| {
             m.render();
+<<<<<<< HEAD
             let own_tex = m.own().and_then(|o| {
                 let (d, q) = o.device();
                 o.texture().map(|t| (t, d, q))
@@ -1192,14 +1245,97 @@ impl UiMovie {
             );
             queue.submit([encoder.finish()]);
             Some(copy)
+=======
+            m.copy_rendered(PassCopy::Multiply)
+>>>>>>> origin/main
         })
         .flatten()
+    }
+
+    /// Renders the movie's above pass (see [`MultiplyPass::above`]) and returns a copy of
+    /// it, drawn normally after the multiply pass. `None` without one.
+    pub fn render_above(&mut self) -> Option<wgpu::Texture> {
+        self.in_above_pass(|m| {
+            m.render();
+            m.copy_rendered(PassCopy::Above)
+        })
+        .flatten()
+    }
+
+    /// Whether the movie's multiply pass goes onto its own picture, followed by its above
+    /// pass (see [`MultiplyPass::above`]), rather than under it.
+    pub fn multiplies_over(&self) -> bool {
+        self.multiply_pass
+            .as_ref()
+            .is_some_and(|p| p.above.is_some())
+    }
+
+    /// A copy of the movie's own frame as last rendered, for a movie that renders more
+    /// passes after it (see [`UiMovie::multiplies_over`]).
+    pub fn render_own_copy(&mut self) -> Option<wgpu::Texture> {
+        self.copy_rendered(PassCopy::Own)
+    }
+
+    /// A copy of the frame just rendered, kept in one of the movie's pass textures: the
+    /// movie renders the next pass into the same target.
+    fn copy_rendered(&mut self, which: PassCopy) -> Option<wgpu::Texture> {
+        let (texture, device, queue) = self
+            .with_player(|p| {
+                let r: &mut dyn std::any::Any = p.renderer_mut();
+                r.downcast_mut::<WgpuRenderBackend<TextureTarget>>()
+                    .map(|b| {
+                        (
+                            b.target().texture.clone(),
+                            b.descriptors().device.clone(),
+                            b.descriptors().queue.clone(),
+                        )
+                    })
+            })
+            .flatten()?;
+        let slot = match which {
+            PassCopy::Multiply => &mut self.multiply_texture,
+            PassCopy::Above => &mut self.above_texture,
+            PassCopy::Own => &mut self.own_texture,
+        };
+        let same = slot
+            .as_ref()
+            .is_some_and(|t| t.size() == texture.size() && t.format() == texture.format());
+        if !same {
+            *slot = Some(device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("ui pass"),
+                size: texture.size(),
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: texture.format(),
+                usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            }));
+        }
+        let copy = slot.clone()?;
+        let mut encoder = device.create_command_encoder(&Default::default());
+        encoder.copy_texture_to_texture(
+            texture.as_image_copy(),
+            copy.as_image_copy(),
+            texture.size(),
+        );
+        queue.submit([encoder.finish()]);
+        Some(copy)
     }
 
     /// The movie's multiply pass read back to the CPU (RGBA8, premultiplied), as
     /// [`UiMovie::render_multiply`] draws it. `None` without a pass.
     pub fn capture_multiply(&mut self) -> Option<Rgba> {
         self.in_multiply_pass(|m| {
+            m.render();
+            m.capture()
+        })
+        .flatten()
+    }
+
+    /// The movie's above pass read back to the CPU, as [`UiMovie::render_above`] draws it.
+    pub fn capture_above(&mut self) -> Option<Rgba> {
+        self.in_above_pass(|m| {
             m.render();
             m.capture()
         })
@@ -1248,11 +1384,30 @@ impl UiMovie {
     }
 
     pub fn mouse_move(&mut self, x: f64, y: f64) {
+<<<<<<< HEAD
         if let Some(o) = self.own() {
             o.mouse_move(x, y);
             return;
         }
         self.with_player(|p| p.handle_event(PlayerEvent::MouseMove { x, y }));
+=======
+        self.with_player(|p| {
+            // The player looks for what the mouse is over after every frame it runs, a walk
+            // of every clip (most of a HUD movie's time a frame); while the mouse is outside
+            // the window there is nothing to find.
+            p.set_mouse_in_stage(true);
+            p.handle_event(PlayerEvent::MouseMove { x, y })
+        });
+    }
+
+    /// The mouse left the window: what it was over hears it leave (`onRollOut`), and the
+    /// player stops looking for what it is over until it comes back.
+    pub fn mouse_leave(&mut self) {
+        self.with_player(|p| {
+            p.handle_event(PlayerEvent::MouseLeave);
+            p.set_mouse_in_stage(false);
+        });
+>>>>>>> origin/main
     }
 
     /// The mouse wheel turned `lines` (up positive) with the mouse at (`x`, `y`): the movie's
@@ -1263,6 +1418,7 @@ impl UiMovie {
             return;
         }
         self.with_player(|p| {
+            p.set_mouse_in_stage(true);
             p.handle_event(PlayerEvent::MouseMove { x, y });
             p.handle_event(PlayerEvent::MouseWheel {
                 delta: ruffle_core::events::MouseWheelDelta::Lines(lines),
@@ -1321,14 +1477,22 @@ impl UiMovie {
                 button,
                 index: None,
             };
-            self.with_player(|p| p.handle_event(ev));
+            self.with_player(|p| {
+                // A press is where the mouse is, in the window (a click sent with no move
+                // before it: the pad, the control steps).
+                p.set_mouse_in_stage(true);
+                p.handle_event(ev)
+            });
             self.after_step();
             return;
         }
         // The button under the mouse is released before the movies' mouse-up handlers hide
         // anything (see `avm1::HIDE_LATER`).
         self.set(avm1::HIDE_LATER, UiValue::List(Vec::new()));
-        self.with_player(|p| p.handle_event(PlayerEvent::MouseUp { x, y, button }));
+        self.with_player(|p| {
+            p.set_mouse_in_stage(true);
+            p.handle_event(PlayerEvent::MouseUp { x, y, button })
+        });
         self.call(avm1::HIDE_FLUSH, &[]);
         self.after_step();
     }
