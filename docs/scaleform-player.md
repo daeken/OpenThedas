@@ -76,6 +76,10 @@ A new crate, `crates/thedas-gfx`, with no Ruffle dependency:
 4. **`text`**: HTML-subset parser (p, br, font face/size/color, b, i, u, img), layout with
    word wrap, autosize, `textAutoSize` shrink, shadows; glyphs from the font library's
    DefineFont3 outlines, rasterised into a glyph atlas at the drawn size.
+   Focused fields track a selection anchor and caret. Ctrl+A and `Selection.setSelection`
+   replace/delete the selected range; Shift navigation extends it. Selection getters and
+   setters translate script UTF-16 indices to the text storage's character boundaries.
+   Selection highlighting, mouse caret placement and caret drawing remain separate work.
 5. **`render`**: wgpu. Shapes are tessellated once per character (lyon) into cached vertex
    buffers; bitmaps (atlas DDS pages) uploaded once; scale9 drawn natively. Colour transform
    and blend mode per draw; multiply and the few other modes against the scene picture,
