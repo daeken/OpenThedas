@@ -3317,7 +3317,7 @@ impl App {
             // here, not read from the player's bindings.
             KeyCode::Slash if self.live.is_some() => {
                 if let Some(live) = self.live.as_ref() {
-                    switch_weapon_set(live);
+                    live.switch_weapon_set();
                     log::info!("weapon set switched");
                 }
             }
@@ -5601,18 +5601,6 @@ fn set_client_option(ui: Option<&ui::UiLayer>, live: Option<&live::Live>, name: 
     }
 }
 
-/// The weapon set key: the controlled party member switches to its other set, as the
-/// quickbar's weapon set button does.
-fn switch_weapon_set(live: &live::Live) {
-    live.sim().input(
-        thedas_sim::commands::CommandSource::Player,
-        thedas_sim::commands::SimCommand::GuiMessage {
-            name: thedas_sim::inventory::MSG_SWITCH_WEAPON_SET.into(),
-            args: vec!["-1".into()],
-        },
-    );
-}
-
 /// Whether the screen up is one the game put up that the player leaves by its Close: a store,
 /// a container (the inventory screen the player did not open), the job board or the world map.
 fn game_screen_up(s: &screens::Screens) -> bool {
@@ -6624,7 +6612,7 @@ fn main() -> Result<()> {
                         None => println!("quickslot {}", slot + 1),
                     },
                     Step::SwapWeapons => {
-                        switch_weapon_set(l);
+                        l.switch_weapon_set();
                         println!("weapon set switched");
                     }
                     Step::Pause => {
