@@ -121,9 +121,8 @@ these, so they are the places where one person or stream can take a large, separ
 ### Interface and input
 
 - **Screens never built**: crafting, item upgrade, the slideshow, the army
-  screen, the party camp gift screen, store buyback, credits, and the online,
-  downloadable-content and achievement screens (`UI-052`, `UI-077`, `UI-124`, `UI-126`,
-  `UI-127`, and the stream's list). Of the install's 68 interface movies, 37 are never opened.
+  screen, the party camp gift screen, and the online, downloadable-content and
+  achievement screens (`UI-052`, `UI-077`, `UI-126`, `UI-127`, and the stream's list). Of the install's 68 interface movies, 37 are never opened.
 - **Screens ask for values nothing answers**: 220 on the HUD (quickslot cooldowns, current and
   pending actions, summons), 170 on spells and talents, 98 on skills, 42 in the inventory
   ([gaps/ui.md](gaps/ui.md)).
