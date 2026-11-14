@@ -1202,6 +1202,10 @@ impl Sim {
             return true;
         }
         let target = cmd.target.unwrap_or(OBJECT_INVALID);
+        // The legacy attack path already turns before its scripts run. Keep
+        // that behavior when DA2 default attacks take the modern ability path:
+        // the authored selector and close-attack damage both test the arc.
+        self.face_target(id, target);
         let point = self
             .world
             .get(target)
@@ -2298,6 +2302,8 @@ mod tests {
         let target = s.world.spawn(ObjectKind::Creature, "target");
         s.world.get_mut(who).unwrap().area = Some(area);
         s.world.get_mut(who).unwrap().script = Some("select.ncs".into());
+        s.world.get_mut(who).unwrap().facing = 170.;
+        s.world.get_mut(target).unwrap().area = Some(area);
         s.world.get_mut(target).unwrap().position = [3., 4., 5.];
         // Own script: SetCommandResult(attacker, 3110). The native event lets
         // the shipped script return the selected attack through this API.
@@ -2317,6 +2323,9 @@ mod tests {
             ("CommandUseAbility", 25, &[1][..])
         );
         assert!(s.choose_da2_basic_attack(who, &mut cmd));
+        assert!(
+            (s.world.get(who).unwrap().facing - crate::world::facing_toward(3., 4.)).abs() < 0.001
+        );
         assert_eq!(cmd.ints, [3110]);
         assert_eq!(cmd.target, Some(target));
         assert_eq!(

@@ -49,6 +49,12 @@ without that handoff it can repeat a zero-distance approach indefinitely instead
 of entering selection. The regression test exercises walking into the selection
 script and retaining the command it prepends.
 
+The modern default-attack path also retains the legacy executor's existing
+turn-to-target behavior before script selection. Without this handoff, a
+close attack can execute while the actor still faces the last movement heading;
+the authored narrow attack arc then excludes its own target. This uses the
+existing instantaneous turn approximation, not a newly inferred native turn rate.
+
 A normal checkpoint probe now selects 3210 (two-handed medium front) from a
 request for default ability 1. Its scripted impact deals 8.7422, 4.3711 and 2.1855
 damage across three targets, with no script errors. The earlier placeholder-only
