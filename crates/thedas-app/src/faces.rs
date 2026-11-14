@@ -16,8 +16,11 @@
 //! object drawn for the line's actor), and lines said in passing, each by its speaker at
 //! once, until its animation's last key.
 //!
-//! Provisional: the animation runs from when the line comes up, on the frame clock, not
-//! the voice's own playback; which of a creature's models names its rig in the original is
+//! The open conversation's or the cutscene's line runs on its voice-over's own clock (how
+//! far into its sample the voice is) once the voice plays, and on the frame clock from when
+//! the line comes up before that and without sound.
+//!
+//! Provisional: lines said in passing run on the frame clock; which of a creature's models names its rig in the original is
 //! not traced (the race's base head is taken); the animation's blend in and out are not
 //! applied.
 
@@ -124,6 +127,18 @@ impl Faces {
             return;
         }
         self.playing = Some(self.start(install, module, &line));
+    }
+
+    /// Where the voice-over playing is (its line's talk-table reference, seconds into its
+    /// sample): the line animated with that reference takes that time, so its mouth keeps
+    /// to the voice (a voice that starts late, or a frame clock that runs unevenly).
+    pub fn voice_at(&mut self, at: Option<(u32, f64)>) {
+        if let (Some((strref, t)), Some(p)) = (at, self.playing.as_mut())
+            && p.key.1 == strref
+            && t.is_finite()
+        {
+            p.time = t as f32;
+        }
     }
 
     /// A line said in passing (`SpokenLine::speaker` says it at once), animated beside the

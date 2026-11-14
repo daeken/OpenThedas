@@ -1833,6 +1833,9 @@ impl Live {
         let kept = shown.kept;
         // A cutscene's weapon draws and hidden actors.
         let mut hidden = std::collections::HashSet::new();
+        // Party members the playing cutscene does not cast are not drawn while it plays
+        // (`Sim::cutscene_hidden_party`).
+        hidden.extend(sim.cutscene_hidden_party());
         for (id, show) in &posing {
             if show.hidden {
                 hidden.insert(*id);
@@ -2560,6 +2563,12 @@ impl Live {
             &mut overlays,
             &mut |encoder, view| reticle.draw(&ctx.device, encoder, view, (width, height), &aim),
         )?))
+    }
+
+    /// Where the voice-over playing is (its line's talk-table reference, seconds into it),
+    /// which the speaking line's lip sync follows (see [`crate::faces`]).
+    pub fn set_voice_position(&mut self, at: Option<(u32, f64)>) {
+        self.faces.voice_at(at);
     }
 
     /// A line said in passing, for its speaker's lip sync (see [`crate::faces`]).
