@@ -581,6 +581,10 @@ pub struct AreaRenderer {
     /// ([`checked`]): they are left out, and not tried again.
     distortion_refused: bool,
     cut_refused: bool,
+    /// Whether the finished frame is anti-aliased (see [`crate::fxaa`]); on unless turned off.
+    pub antialias: bool,
+    fxaa: Option<crate::fxaa::Fxaa>,
+    antialias_refused: bool,
     /// The projection the frame was last drawn with.
     frame_projection: Option<glam::Mat4>,
     /// The draws of `CutAway` meshes ([`AreaScene::cut_away`]).
@@ -1068,6 +1072,9 @@ impl AreaRenderer {
             cut_pass: None,
             distortion_refused: false,
             cut_refused: false,
+            antialias: std::env::var_os("THEDAS_NO_AA").is_none(),
+            fxaa: None,
+            antialias_refused: false,
             frame_projection: None,
             light: StandInLight::default(),
             stats,
@@ -1567,6 +1574,34 @@ impl AreaRenderer {
     /// effect's mask with this renderer's (see [`crate::distortion`]). The distortion runs
     /// before the level's own effects.
     pub fn finish_frame_with(
+        &mut self,
+        ctx: &GpuContext,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &wgpu::Texture,
+        width: u32,
+        height: u32,
+        overlays: &[&AreaRenderer],
+    ) {
+        self.frame_effects_with(ctx, encoder, target, width, height, overlays);
+        // Edges smoothed last, over everything the world drew (see [`crate::fxaa`]).
+        if self.antialias && !self.antialias_refused {
+            if !self
+                .fxaa
+                .as_ref()
+                .is_some_and(|f| f.fits(target.format(), (width, height)))
+            {
+                self.fxaa = checked(&ctx.device, "anti-aliasing", || {
+                    crate::fxaa::Fxaa::new(&ctx.device, target.format(), (width, height))
+                });
+                self.antialias_refused = self.fxaa.is_none();
+            }
+            if let Some(f) = &self.fxaa {
+                f.apply(encoder, target);
+            }
+        }
+    }
+
+    fn frame_effects_with(
         &mut self,
         ctx: &GpuContext,
         encoder: &mut wgpu::CommandEncoder,
