@@ -3970,16 +3970,14 @@ pub fn call(
                 .map_or(OBJECT_INVALID, |&b| b as ObjectId),
         )),
         // DAOrigins.exe (0x65d0c0, 0x67c230) switches the current area's sound objects with
-        // that tag on or off (0x7c2190). Kept as the objects' active flag; there is no
-        // audio yet. Provisional: tags are compared ignoring case.
+        // that tag on or off (0x7c2190). The comparison at 0x67c2a4 calls 0x4c0de0 ->
+        // 0x414170 -> 0x413800: an exact, case-sensitive UTF-16 comparison. The app's
+        // audio snapshot already carries these objects' active flags to the mixer.
         "ActivateSoundByTag" => {
             let (tag, on) = (string(a, 0), int(a, 1) != 0);
             let area = h.sim.world.area;
             for o in h.sim.world.objects.values_mut() {
-                if o.kind == ObjectKind::Sound
-                    && o.area.is_some()
-                    && o.area == area
-                    && o.tag.eq_ignore_ascii_case(&tag)
+                if o.kind == ObjectKind::Sound && o.area.is_some() && o.area == area && o.tag == tag
                 {
                     o.active = on;
                 }
@@ -8321,6 +8319,8 @@ mod coverage_tests {
             o
         };
         let bells = sound(&mut s, here, "snd_bells");
+        let duplicate = sound(&mut s, here, "snd_bells");
+        let upper = sound(&mut s, here, "SND_BELLS");
         let other = sound(&mut s, here, "snd_wind");
         let far = sound(&mut s, there, "snd_bells");
         run(
@@ -8330,14 +8330,24 @@ mod coverage_tests {
             &[Value::String("snd_bells".into()), Value::Int(0)],
         );
         let active = |s: &Sim, o: ObjectId| s.world.get(o).unwrap().active;
-        assert!(!active(&s, bells) && active(&s, other) && active(&s, far));
+        assert!(!active(&s, bells) && !active(&s, duplicate));
+        assert!(active(&s, upper) && active(&s, other) && active(&s, far));
+        s.world.get_mut(upper).unwrap().active = false;
         run(
             &mut s,
             1,
             "ActivateSoundByTag",
             &[Value::String("SND_BELLS".into()), Value::Int(1)],
         );
-        assert!(active(&s, bells));
+        assert!(active(&s, upper));
+        assert!(!active(&s, bells) && !active(&s, duplicate));
+        run(
+            &mut s,
+            1,
+            "ActivateSoundByTag",
+            &[Value::String("snd_bells".into()), Value::Int(-1)],
+        );
+        assert!(active(&s, bells) && active(&s, duplicate));
     }
 
     #[test]
