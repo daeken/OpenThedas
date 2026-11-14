@@ -4340,9 +4340,12 @@ pub fn call(
             }
             void()
         }
-        "IsAbilityAvailable" => ok(b(h
-            .object(obj(a, 0))
-            .is_some_and(|o| o.abilities.contains(&int(a, 1))))),
+        "IsAbilityAvailable" => ok(b(if h.sim.game == thedas_vfs::Game::DragonAge2 {
+            h.sim.da2_ability_available(obj(a, 0), int(a, 1))
+        } else {
+            h.object(obj(a, 0))
+                .is_some_and(|o| o.abilities.contains(&int(a, 1)))
+        })),
         "LoadItemsFromTemplate" => {
             h.sim
                 .load_items_from_template(obj(a, 0), &string(a, 1), int(a, 2) != 0);
@@ -4573,12 +4576,9 @@ pub fn call(
         }
         "SetCanLevelUp" => {
             let who = obj(a, 0);
-            let points: f32 = [34, 35, 36]
-                .iter()
-                .map(|&p| h.sim.property_total(who, p))
-                .sum();
+            let can = h.sim.has_level_up_points(who);
             if let Some(o) = h.sim.world.get_mut(who) {
-                o.fields.insert("CanLevelUp".into(), (points > 0.0) as i32);
+                o.fields.insert("CanLevelUp".into(), i32::from(can));
             }
             void()
         }
