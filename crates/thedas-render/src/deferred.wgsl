@@ -378,8 +378,15 @@ fn compose_eye(base: vec4<f32>, tint: vec4<f32>, normal: vec4<f32>, cornea: vec4
     return out;
 }
 
-@fragment
-fn fs_gbuffer(in: VsOut) -> GBuffer {
+struct GBufferSample {
+    data: GBuffer,
+    alpha: f32,
+    surface: Surface,
+};
+
+// Shared material work has no discard, so opaque pipelines can reject hidden fragments
+// before evaluating textures. Cutout pipelines keep their authored alpha test below.
+fn gbuffer_material(in: VsOut) -> GBufferSample {
     if (draw.material.w > 0.5) {
         var m: TerrainMaterial;
         if (draw.material.w < 1.5) {
@@ -394,7 +401,7 @@ fn fs_gbuffer(in: VsOut) -> GBuffer {
         out.normal = vec4<f32>(oct_encode(s.n), draw.room.x, 1.0);
         let ambient = select(vec3<f32>(1.0), draw.character.ambient.rgb, draw.material.w < 1.5);
         out.lightmap = vec4<f32>(in.irradiance * ambient, 1.0);
-        return out;
+        return GBufferSample(out, 1.0, s);
     }
     if (draw.room.z > 0.5) {
         let m = terrain_material(in.uv0);
@@ -407,7 +414,7 @@ fn fs_gbuffer(in: VsOut) -> GBuffer {
         if (frame.fog.w > 0.5) {
             out.lightmap = vec4<f32>(probe_irradiance(s.n), 1.0);
         }
-        return out;
+        return GBufferSample(out, 1.0, s);
     }
     let s = surface(in);
     var out: GBuffer;
@@ -428,8 +435,20 @@ fn fs_gbuffer(in: VsOut) -> GBuffer {
     } else if (frame.fog.w > 0.5) {
         out.lightmap = vec4<f32>(probe_irradiance(s.n), 1.0);
     }
-    if (!alpha_kept(diffuse.a)) { discard; }
-    return out;
+    return GBufferSample(out, diffuse.a, s);
+}
+
+@fragment
+fn fs_gbuffer(in: VsOut) -> GBuffer {
+    let sampled = gbuffer_material(in);
+    if (draw.material.w <= 0.5 && draw.room.z <= 0.5 && !alpha_kept(sampled.alpha)) { discard; }
+    return baked_base(in, sampled.data, sampled.surface);
+}
+
+@fragment
+fn fs_gbuffer_opaque(in: VsOut) -> GBuffer {
+    let sampled = gbuffer_material(in);
+    return baked_base(in, sampled.data, sampled.surface);
 }
 
 // Match the translated D3D9 shader's extra clip and rounded saturated 8-bit alpha test.
@@ -440,7 +459,7 @@ fn alpha_kept(sampled: f32) -> bool {
 fn alpha_test(sampled: f32, test: vec4<f32>) -> bool {
     if (test.x < 0.5) { return true; }
     let opacity = sampled * test.z;
-    if (opacity < test.w) { return false; }
+    if (test.w >= 0.0 && opacity < test.w) { return false; }
     let a = floor(clamp(opacity, 0.0, 1.0) * 255.0 + 0.5);
     let r = test.y;
     switch u32(test.x) {
@@ -453,6 +472,44 @@ fn alpha_test(sampled: f32, test: vec4<f32>) -> bool {
         case 7u: { return a >= r; }
         default: { return true; }
     }
+}
+
+// Baked bounce, probe reflection and emission are independent of point lights. Their
+// sum fits in the existing HDR lightmap target, leaving its baked visibility alpha
+// intact. Reuse this draw's full-precision material samples and tangent frame instead
+// of evaluating them again in a second geometry pass. Probe/SSAO and debug modes keep
+// the separate terms because AO must be evaluated after the depth buffer is complete.
+fn baked_base(in: VsOut, g: GBuffer, s: Surface) -> GBuffer {
+    if (frame.fixup.z < 0.5) { return g; }
+    var out = g;
+    let terrain = draw.room.z > 0.5;
+    let object = draw.material.x > 0.5;
+    var shade = 1.0;
+    if (!object) {
+        shade = sun_visibility(in.world, s.n, !terrain || draw.room.w < 0.5);
+    }
+    let ambient_shade = select(mix(1.0, shade, 0.15), 1.0, object);
+    // Bounce previously used the stored UNORM albedo and half-float lightmap. Keep
+    // that clipping/precision, including material tints outside [0, 1]. Reflection
+    // and terrain's additive tint still use the full-precision material samples.
+    let albedo = floor(clamp(g.albedo.rgb, vec3<f32>(0.0), vec3<f32>(1.0)) * 255.0 + 0.5) / 255.0;
+    var base = albedo * quantizeToF16(g.lightmap.rgb) * ambient_shade;
+    if (draw.material.w < 0.5) {
+        if (terrain || draw.room.y != 0.0) {
+            let r = 2.0 * dot(s.n, s.v) * s.n - s.v;
+            let power = g.specular.a * 255.0 + 1.0;
+            let env = textureSampleLevel(env_tex, wrap_smp, r, (1.0 - power / 255.0) * 9.0).rgb;
+            let visibility = select(draw.room.y, 0.75 * shade * g.lightmap.a + 0.25, terrain);
+            base += env * visibility * g.specular.rgb * s.falloff;
+        }
+        if (terrain) {
+            base += g.albedo.rgb * draw.terrain.tint.rgb;
+        } else if (draw.material.y != 0.0) {
+            base += textureSample(emissive_tex, wrap_smp, in.uv0).rgb * draw.material.y;
+        }
+    }
+    out.lightmap = vec4<f32>(base, g.lightmap.a);
+    return out;
 }
 
 // Static1's reflection, which no light changes, added over the lit frame by a second draw of
@@ -509,7 +566,7 @@ struct Lighting {
     // mml_vFogParams: (colour, intensity²), (1 − cap, ...)
     fog0: vec4<f32>,
     fog1: vec4<f32>,
-    // x: lights, y: debug view, z: sun shadows, w: 0 baked, 1 probes, 2 probes + SSAO
+    // x: lights, y: debug view, z: membership masks, w: 0 baked, 1 probes, 2 probes + SSAO
     counts: vec4<u32>,
     // xy: target size
     size: vec4<f32>,
@@ -532,6 +589,13 @@ struct Light {
 @group(0) @binding(1) var<uniform> lights: array<Light, 192>;
 // Per shadow slot, its six faces' view-projections (`deferred_shadow::faces`).
 @group(0) @binding(2) var<uniform> shadow_faces: array<mat4x4<f32>, 24>;
+// 16 x 9 screen tiles, two vec4s each: six ascending 32-bit light masks plus padding.
+@group(0) @binding(3) var<uniform> tile_lights: array<vec4<u32>, 288>;
+struct LightMasks {
+    rooms: array<vec4<u32>, 512>,
+    domains: array<vec4<u32>, 4>,
+};
+@group(0) @binding(4) var<uniform> light_masks: LightMasks;
 
 @group(1) @binding(0) var g_albedo: texture_2d<f32>;
 @group(1) @binding(1) var g_specular: texture_2d<f32>;
@@ -760,13 +824,29 @@ fn fs_lighting(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     var spec_s = vec3<f32>(0.0);
     var diff_d = vec3<f32>(0.0);
     var spec_d = vec3<f32>(0.0);
-    for (var i = 0u; i < lighting.counts.x; i = i + 1u) {
+    let tile_x = min(u32(frag.x * 16.0 / lighting.size.x), 15u);
+    let tile_y = min(u32(frag.y * 9.0 / lighting.size.y), 8u);
+    let tile_base = (tile_y * 16u + tile_x) * 2u;
+    let mask_room = select(room, 0u, room > 255u || lighting.counts.y == 7u);
+    let domain_base = select(0u, 2u, character);
+    for (var word = 0u; word < 6u; word = word + 1u) {
+      var bits = tile_lights[tile_base + word / 4u][word % 4u];
+      if (lighting.counts.z != 0u) {
+          bits &= light_masks.rooms[mask_room * 2u + word / 4u][word % 4u]
+              & light_masks.domains[domain_base + word / 4u][word % 4u];
+      }
+      while (bits != 0u) {
+        let i = word * 32u + firstTrailingBit(bits);
+        bits = bits & (bits - 1u);
+        if (i >= lighting.counts.x) { continue; }
         let l = lights[i];
-        if ((character && l.shadow.y < 1.5) || (!character && l.shadow.y > 1.5 && l.shadow.y < 2.5)) {
-            continue;
-        }
-        if (lighting.counts.y != 7u && !reaches(l, room)) {
-            continue;
+        if (lighting.counts.z == 0u) {
+            if ((character && l.shadow.y < 1.5) || (!character && l.shadow.y > 1.5 && l.shadow.y < 2.5)) {
+                continue;
+            }
+            if (lighting.counts.y != 7u && !reaches(l, room)) {
+                continue;
+            }
         }
         let to = l.position.xyz - p;
         let d = max(length(to), 0.001);
@@ -805,6 +885,7 @@ fn fs_lighting(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
             diff_d = diff_d + dif;
             spec_d = spec_d + sp;
         }
+      }
     }
     if (lighting.sun_dir.w > 0.5) {
         let ls = -lighting.sun_dir.xyz;
@@ -825,11 +906,14 @@ fn fs_lighting(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     // Dynamic lights have their own visibility and never take this sun mask.
     let ambient_shade = select(select(mix(1.0, sun_shade, 0.15), 1.0, object), ao, lighting.counts.w > 0u);
     // Terrain1 masks static diffuse twice; Static1 and Low's Terrain3 only once.
-    let diffuse = diff_s * sun_shade * select(lm.a, lm.a * lm.a, terrain && !terrain_low)
-        + lm.rgb * ambient_shade + diff_d;
+    let static_diffuse = diff_s * sun_shade * select(lm.a, lm.a * lm.a, terrain && !terrain_low);
+    let diffuse = static_diffuse + lm.rgb * ambient_shade + diff_d;
     let specular = select((spec_s * sun_shade * max(lm.a, 0.2) + spec_d) * 3.0,
         (spec_s * (0.75 * sun_shade * lm.a + 0.25) + spec_d) * 3.0, terrain);
     var colour = albedo * diffuse + spec.rgb * specular * falloff;
+    if (lighting.size.z > 0.5) {
+        colour = albedo * (static_diffuse + diff_d) + spec.rgb * specular * falloff + lm.rgb;
+    }
     switch lighting.counts.y {
         case 1u: { return vec4<f32>(albedo, 1.0); }
         case 2u: { return vec4<f32>(n * 0.5 + 0.5, 1.0); }

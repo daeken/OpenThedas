@@ -143,6 +143,10 @@ fn punch_opacity_keeps_holes_comparisons_rounding_and_shader_clip() {
             (255, 0.999, 0.3),
             (0, 0.25, 0.3),
             (128, 2.0, 0.3),
+            (128, 1.0, -1.0),
+            (0, 0.25, -1.0),
+            (255, 0.999, -1.0),
+            (0, -2.0, -1.0),
         ] {
             draw.data.alpha = [
                 crate::deferred_alpha::comparison(cmp),
@@ -198,7 +202,7 @@ fn punch_opacity_keeps_holes_comparisons_rounding_and_shader_clip() {
             for (i, a) in alpha.iter().enumerate() {
                 let opacity = *a as f32 / 255.0 * multiplier;
                 let rounded = (opacity.clamp(0.0, 1.0) * 255.0 + 0.5).floor() as u32;
-                let expected = opacity >= clip
+                let expected = (clip < 0.0 || opacity >= clip)
                     && match cmp {
                         CompareFunc::Never => false,
                         CompareFunc::Less => rounded < reference,

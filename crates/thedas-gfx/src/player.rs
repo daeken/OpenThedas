@@ -2152,6 +2152,36 @@ mod queue_tests {
     }
 
     #[test]
+    fn display_positions_truncate_twips_and_preserve_repeated_scroll_steps() {
+        let (mut p, field) = input_player();
+        for d in [p.vm.root, field] {
+            let value = p.vm.display_object(d);
+            for name in ["_x", "_y"] {
+                for (input, expected) in [
+                    (10.039, 10.0),
+                    (10.076, 10.05),
+                    (-10.039, -10.0),
+                    (-10.076, -10.05),
+                    (0.049, 0.0),
+                    (-0.049, 0.0),
+                ] {
+                    p.vm.set(&value, name, Value::Number(input));
+                    assert_eq!(p.vm.get(&value, name), Value::Number(expected));
+                }
+            }
+            // The credits repeatedly subtract a fractional-pixel speed from _y.
+            // Rounding each write loses one twip per positive-coordinate update.
+            p.vm.set(&value, "_y", Value::Number(864.0));
+            for _ in 0..164 {
+                let y = p.vm.get(&value, "_y");
+                let y = p.vm.to_number(&y);
+                p.vm.set(&value, "_y", Value::Number(y - 42.8688679245283 / 60.0));
+            }
+            assert_eq!(p.vm.get(&value, "_y"), Value::Number(741.0));
+        }
+    }
+
+    #[test]
     fn programmatic_focus_selects_prefilled_text_and_reselects_the_same_field() {
         let (mut p, field) = input_player();
         p.vm.display.get_mut(field).unwrap().name = Str::from("NameField");
@@ -3015,6 +3045,38 @@ mod queue_tests {
                 .collect();
             assert_eq!(ids, expected);
         }
+    }
+
+    #[test]
+    fn zero_and_negative_goto_calls_leave_the_frame_and_play_state_unchanged() {
+        let (mut p, _) = input_player();
+        let root = p.vm.root;
+        p.vm.display
+            .get_mut(root)
+            .unwrap()
+            .clip_mut()
+            .unwrap()
+            .timeline = Arc::new(crate::swf::Timeline {
+            frames: vec![Default::default(); 100],
+            labels: vec![],
+        });
+        goto(&mut p.vm, root, 82, true);
+        let object = p.vm.display_object(root);
+        for value in [
+            Value::Number(0.0),
+            Value::Number(-1.0),
+            Value::from("0"),
+            Value::from("-42"),
+        ] {
+            p.vm.call_method(&object, "gotoAndStop", &[value]);
+            let clip = p.vm.display.get(root).unwrap().clip().unwrap();
+            assert_eq!(clip.frame, Some(82));
+            assert!(clip.playing);
+        }
+        p.vm.call_method(&object, "gotoAndStop", &[Value::Number(8.0)]);
+        let clip = p.vm.display.get(root).unwrap().clip().unwrap();
+        assert_eq!(clip.frame, Some(7));
+        assert!(!clip.playing);
     }
 
     #[test]
