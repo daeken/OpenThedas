@@ -1611,7 +1611,10 @@ impl App {
         if !live::ANTIALIASING_FORCED.load(std::sync::atomic::Ordering::Relaxed)
             && let Some(n) = g.ui.antialiasing()
         {
-            live::ANTIALIASING.store(n, std::sync::atomic::Ordering::Relaxed);
+            let was = live::ANTIALIASING.swap(n, std::sync::atomic::Ordering::Relaxed);
+            if was != n {
+                log::info!("anti-aliasing: {n} samples a pixel, from the next level build");
+            }
             if let Some(live) = self.live.as_mut() {
                 live.antialiasing = n;
             }

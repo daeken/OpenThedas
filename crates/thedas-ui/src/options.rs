@@ -229,6 +229,16 @@ pub fn values(
         v.insert(format!("ClientOptions.{k}"), UiValue::Number(x));
     }
     let list = antialias_list(samples);
+    // The list's own value, which the movie's observer (`OptionLabels_`) hears to write the
+    // slider's labels.
+    v.insert(
+        "ClientOptions.AntialiasList".into(),
+        UiValue::List(
+            list.iter()
+                .map(|&n| UiValue::Number(f64::from(n)))
+                .collect(),
+        ),
+    );
     for (i, n) in list.iter().enumerate() {
         v.insert(
             format!("ClientOptions.AntialiasList.{i}"),

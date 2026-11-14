@@ -415,12 +415,16 @@ impl GameBridge {
                 };
                 // A child counts when it has members of its own or a value (an empty party
                 // slot is a bare null, or 0).
+                // A list whose members are values, 0 among them (the anti-aliasing counts, 0
+                // being "Off"), counts them all.
+                let zeros = arg(0) == "ClientOptions.AntialiasList";
                 let n = s
                     .values
                     .range(prefix.clone()..)
                     .take_while(|(k, _)| k.starts_with(&prefix))
                     .filter(|(k, v)| {
-                        k[prefix.len()..].contains('.')
+                        zeros
+                            || k[prefix.len()..].contains('.')
                             || !matches!(
                                 **v,
                                 UiValue::Number(0.0) | UiValue::Null | UiValue::Undefined
