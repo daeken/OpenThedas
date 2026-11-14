@@ -1046,9 +1046,19 @@ pub fn call(
             }
             void()
         }
+        // DAOrigins.exe 0x666450 -> 0x6a25a0 -> 0x69f030: a creature's
+        // 16-bit appearance indexes table 2, column 0xde80b418 (combat tree).
+        // The predicate is a case-sensitive substring search, not a creature-kind test
+        // or an exact match of the whole resource name.
         "IsHumanoid" => ok(b(h
             .object(obj(a, 0))
-            .is_some_and(|o| o.kind == ObjectKind::Creature))),
+            .filter(|o| o.kind == ObjectKind::Creature)
+            .is_some_and(|o| {
+                h.sim.world.tables.get(2, "").is_some_and(|t| {
+                    matches!(t.cell_by_hash(0xde80b418, i64::from(o.appearance as u16)),
+                        Some(Cell::String(s)) if clean(s).contains("combat_humanoid"))
+                })
+            }))),
         "GetAppearanceType" => ok(Value::Int(h.object(obj(a, 0)).map_or(0, |o| o.appearance))),
         "GetCreatureRank" => ok(Value::Int(h.object(obj(a, 0)).map_or(0, |o| o.rank))),
         "GetGroupId" => ok(Value::Int(h.object(obj(a, 0)).map_or(0, |o| o.group))),
@@ -5722,6 +5732,56 @@ mod tests {
             script: "test".into(),
         };
         call(&mut h, caller, &f, a).unwrap().unwrap()
+    }
+
+    #[test]
+    fn humanoids_are_identified_by_the_appearances_combat_tree() {
+        let table = Arc::new(EngineTable::parse(b"int IsHumanoid(object o) = 363;").unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        let tables = crate::m2da::Tables::empty();
+        tables.insert(
+            "#2",
+            &["ID", "#de80b418"],
+            [
+                "combat_humanoid.anb",
+                "combat_wolf.anb",
+                "Combat_Humanoid.anb",
+                "prefix_combat_humanoid_variant.anb",
+                "",
+            ]
+            .into_iter()
+            .enumerate()
+            .map(|(i, tree)| {
+                (
+                    (i + 1) as i64,
+                    vec![Cell::Int((i + 1) as i64), Cell::String(tree.into())],
+                )
+            })
+            .collect(),
+        );
+        s.world.tables = Arc::new(tables);
+        let creature = s.world.spawn(ObjectKind::Creature, "creature");
+        for (appearance, expected) in [(1, 1), (2, 0), (3, 0), (4, 1), (5, 0), (6, 0), (65537, 1)] {
+            s.world.get_mut(creature).unwrap().appearance = appearance;
+            assert_eq!(
+                run(&mut s, creature, "IsHumanoid", &[Value::Object(creature)]),
+                Some(Value::Int(expected)),
+                "appearance {appearance}"
+            );
+        }
+        let placeable = s.world.spawn(ObjectKind::Placeable, "placeable");
+        s.world.get_mut(placeable).unwrap().appearance = 1;
+        for target in [placeable, OBJECT_INVALID] {
+            assert_eq!(
+                run(&mut s, creature, "IsHumanoid", &[Value::Object(target)]),
+                Some(Value::Int(0))
+            );
+        }
+        s.world.tables = Arc::new(crate::m2da::Tables::empty());
+        assert_eq!(
+            run(&mut s, creature, "IsHumanoid", &[Value::Object(creature)]),
+            Some(Value::Int(0))
+        );
     }
 
     #[test]
