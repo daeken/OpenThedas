@@ -2338,6 +2338,26 @@ impl D3dPass {
         self.pipelines[d.pipeline].blended
     }
 
+    /// The program `d` draws with.
+    pub(crate) fn program(&self, d: &D3dDraw) -> &D3dProgram {
+        &self.pipelines[d.pipeline].program
+    }
+
+    /// The scene's lights, then those added since ([`D3dPass::set_extra_lights`]).
+    pub(crate) fn lights(&self) -> &[SceneLight] {
+        &self.scene_lights
+    }
+
+    /// The level's sun (direction its light travels, colour), if it has one.
+    pub(crate) fn sun(&self) -> Option<(Vec3, Vec3)> {
+        self.sun
+    }
+
+    /// The fog registers (`mml_vFogParams`, see [`crate::atmosphere::fog_params`]).
+    pub(crate) fn fog(&self) -> [[f32; 4]; 2] {
+        self.fog
+    }
+
     /// Fills this frame's constants of the draws in the camera's view (see [`in_view`]; the
     /// rest are not drawn); `time` is the shaders' `ApplicationTime` in seconds.
     pub fn update(&self, ctx: &GpuContext, camera: &Camera, width: u32, height: u32, time: f32) {

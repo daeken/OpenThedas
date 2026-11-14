@@ -62,6 +62,9 @@ pub struct PlayOptions {
     pub detail: String,
     /// Bloom and the other frame buffer effects (`--frame-effects`).
     pub frame_effects: bool,
+    /// `faithful` (the original's shaders) or `deferred` (ours) (`--renderer`); F11 flips
+    /// between them in game.
+    pub renderer: String,
     /// The logo and intro movies before the start menu (off: `--no-intro`).
     pub intro: bool,
     /// Voice-over language folder (`--language`).
@@ -76,6 +79,7 @@ impl Default for PlayOptions {
             size: "1280x720".into(),
             detail: "medium".into(),
             frame_effects: true,
+            renderer: "faithful".into(),
             intro: true,
             language: "en-us".into(),
             audio: true,
@@ -93,6 +97,8 @@ impl PlayOptions {
             self.detail.clone(),
             "--frame-effects".into(),
             if self.frame_effects { "on" } else { "off" }.into(),
+            "--renderer".into(),
+            self.renderer.clone(),
             "--language".into(),
             self.language.clone(),
         ];
@@ -274,5 +280,6 @@ mod tests {
         assert!(a.contains("--no-intro"));
         assert!(a.contains("--no-audio"));
         assert!(a.contains("--frame-effects off"));
+        assert!(a.contains("--renderer faithful"));
     }
 }
