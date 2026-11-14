@@ -32,6 +32,9 @@ pub fn modal(targets: Vec<FocusTarget>) -> Vec<FocusTarget> {
     let targets: Vec<FocusTarget> = targets
         .into_iter()
         .filter(|t| !t.path.contains("DropArea") && !t.path.contains("DropTarget"))
+        // Nor a list's scrollbar (its track, thumb and arrows): the right stick scrolls a
+        // list, and in the store the scrollbar took the step meant for the items beside it.
+        .filter(|t| !t.path.contains(".Scrollbar_mc."))
         // Nor is the inventory's paperdoll (an unnamed clip of the stage, dragged to turn
         // the figure): it sat between the two columns of equipment slots and took the
         // step from one to the other.
@@ -371,6 +374,36 @@ mod tests {
         assert_eq!(under(&ts, (50.0, 50.0)), Some(1));
         assert_eq!(under(&ts, (10.0, 10.0)), Some(0));
         assert_eq!(under(&ts, (500.0, 10.0)), None);
+    }
+
+    #[test]
+    fn a_lists_scrollbar_is_not_a_focus_target() {
+        let targets = vec![
+            t(
+                "_level0.StorePage_mc.StoreItemWindow_mc.Scrollbar_mc.Slider_mc.Thumb_mc.HitArea_mc",
+                600.0,
+                200.0,
+                10.0,
+                40.0,
+            ),
+            t(
+                "_level0.StorePage_mc.StoreItemWindow_mc.Scrollbar_mc.UpArrow_mc.HitArea_mc",
+                600.0,
+                180.0,
+                10.0,
+                10.0,
+            ),
+            t(
+                "_level0.StorePage_mc.StoreItemWindow_mc.Scrollable_mc.StoreItemEntry1.HitArea_mc",
+                300.0,
+                200.0,
+                280.0,
+                40.0,
+            ),
+        ];
+        let kept = modal(targets);
+        assert_eq!(kept.len(), 1);
+        assert!(kept[0].path.ends_with("StoreItemEntry1.HitArea_mc"));
     }
 
     #[test]
