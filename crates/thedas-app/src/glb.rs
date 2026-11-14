@@ -78,6 +78,7 @@ struct Doc {
     textures: Vec<J>,
     images: Vec<J>,
     skins: Vec<J>,
+    animations: Vec<J>,
     bin: Vec<u8>,
 }
 
@@ -208,6 +209,7 @@ impl Doc {
             ("textures", self.textures),
             ("images", self.images),
             ("skins", self.skins),
+            ("animations", self.animations),
         ] {
             if !v.is_empty() {
                 gltf[k] = J::Array(v);
@@ -282,7 +284,22 @@ pub(crate) fn weights(w: [f32; 4], given: usize) -> [f32; 4] {
 
 /// Exports `models` (resource names without `.mmh`) of `subject`. `read` reads a resource
 /// from the game's stack.
+#[cfg(test)]
 pub fn export(read: &dyn Fn(&str) -> Option<Read>, subject: &Subject, models: &[String]) -> Export {
+    export_with(read, subject, models, &[])
+}
+
+/// [`export`], with `clips` (name, animation) as glTF animations on the models' bones,
+/// sampled as the game samples them: a rotation key is the bone's local rotation; a
+/// translation key moves the bone from its rest by how far it is from the clip's first key
+/// (the convention `thedas_render::skeleton` follows, provisional). Additive clips (laid
+/// over a pose, not a pose) are left out.
+pub fn export_with(
+    read: &dyn Fn(&str) -> Option<Read>,
+    subject: &Subject,
+    models: &[String],
+    clips: &[(String, thedas_formats::anim::Animation)],
+) -> Export {
     let mut d = Doc::default();
     let mut warnings = Vec::new();
     // Z-up to Y-up: -90 degrees about X.
@@ -301,6 +318,8 @@ pub fn export(read: &dyn Fn(&str) -> Option<Read>, subject: &Subject, models: &[
     let mut images: Vec<(String, Vec<u8>)> = Vec::new();
     let mut image_index: BTreeMap<String, usize> = BTreeMap::new();
     let mut model_list = Vec::new();
+    // Every model's named nodes: (lowercase name, glTF node, rest translation).
+    let mut named: Vec<(String, usize, Vec3)> = Vec::new();
     for name in models {
         let file = format!("{}.mmh", name.to_ascii_lowercase());
         let Some(r) = read(&file) else {
@@ -337,6 +356,7 @@ pub fn export(read: &dyn Fn(&str) -> Option<Read>, subject: &Subject, models: &[
         let mut rest: Vec<(usize, Mat4)> = Vec::new();
         let mut by_bone: BTreeMap<u32, usize> = BTreeMap::new();
         let mut pieces: Vec<(usize, &Node, Mat4)> = Vec::new();
+        #[allow(clippy::too_many_arguments)]
         fn walk<'a>(
             d: &mut Doc,
             n: &'a Node,
@@ -345,8 +365,16 @@ pub fn export(read: &dyn Fn(&str) -> Option<Read>, subject: &Subject, models: &[
             rest: &mut Vec<(usize, Mat4)>,
             by_bone: &mut BTreeMap<u32, usize>,
             pieces: &mut Vec<(usize, &'a Node, Mat4)>,
+            named: &mut Vec<(String, usize, Vec3)>,
         ) {
             let here = above * trs(&n.transform);
+            if let Some(name) = &n.name {
+                named.push((
+                    name.to_ascii_lowercase(),
+                    d.nodes.len(),
+                    Vec3::from_array(n.transform.position),
+                ));
+            }
             let mut extras = json!({"kind": n.kind.to_string()});
             if let Some(b) = n.bone {
                 extras["bone"] = json!(b);
@@ -372,7 +400,7 @@ pub fn export(read: &dyn Fn(&str) -> Option<Read>, subject: &Subject, models: &[
                 pieces.push((i, n, here));
             }
             for c in &n.children {
-                walk(d, c, i, here, rest, by_bone, pieces);
+                walk(d, c, i, here, rest, by_bone, pieces, named);
             }
         }
         for n in &mmh.nodes {
@@ -384,6 +412,7 @@ pub fn export(read: &dyn Fn(&str) -> Option<Read>, subject: &Subject, models: &[
                 &mut rest,
                 &mut by_bone,
                 &mut pieces,
+                &mut named,
             );
         }
         let rest_of: BTreeMap<usize, Mat4> = rest.into_iter().collect();
@@ -474,6 +503,19 @@ pub fn export(read: &dyn Fn(&str) -> Option<Read>, subject: &Subject, models: &[
             "meshes": mesh_list,
         }));
     }
+    let mut clip_list = Vec::new();
+    for (name, anim) in clips {
+        if anim.additive {
+            warnings.push(format!("animation {name}: additive, left out"));
+            continue;
+        }
+        match clip(&mut d, name, anim, &named) {
+            Some(channels) => {
+                clip_list.push(json!({"name": name, "length": anim.length, "channels": channels}))
+            }
+            None => warnings.push(format!("animation {name}: moves no bone of these models")),
+        }
+    }
     let manifest = json!({
         "format": "openthedas-export",
         "version": MANIFEST_VERSION,
@@ -485,6 +527,7 @@ pub fn export(read: &dyn Fn(&str) -> Option<Read>, subject: &Subject, models: &[
         "axes": "the glTF root node turns the game's Z-up into Y-up; its child is the object's placement",
         "models": model_list,
         "materials": material_list,
+        "animations": clip_list,
         "warnings": warnings,
     });
     let glb =
@@ -495,6 +538,89 @@ pub fn export(read: &dyn Fn(&str) -> Option<Read>, subject: &Subject, models: &[
         manifest,
         warnings,
     }
+}
+
+/// One animation as a glTF animation over the nodes `named` gives (every model's node of a
+/// track's bone). Returns how many channels it has, `None` when it moves none of them.
+fn clip(
+    d: &mut Doc,
+    name: &str,
+    anim: &thedas_formats::anim::Animation,
+    named: &[(String, usize, Vec3)],
+) -> Option<usize> {
+    use thedas_formats::anim::Channel;
+    let mut samplers = Vec::new();
+    let mut channels = Vec::new();
+    for track in &anim.tracks {
+        // Strictly increasing times, as glTF wants (a repeated time keeps its last key).
+        let mut keys: Vec<&thedas_formats::anim::Key> = Vec::new();
+        for k in &track.keys {
+            if !k.time.is_finite() {
+                continue;
+            }
+            match keys.last() {
+                Some(last) if k.time <= last.time => {
+                    if k.time == last.time {
+                        keys.pop();
+                        keys.push(k);
+                    }
+                }
+                _ => keys.push(k),
+            }
+        }
+        if keys.is_empty() {
+            continue;
+        }
+        let targets: Vec<&(String, usize, Vec3)> =
+            named.iter().filter(|(n, ..)| *n == track.bone).collect();
+        if targets.is_empty() {
+            continue;
+        }
+        let times: Vec<f32> = keys.iter().map(|k| k.time).collect();
+        let input = d.floats(&times, 1, "SCALAR", true, None);
+        for (_, node, rest) in targets {
+            let (values, path, n, ty) = match track.channel {
+                Channel::Rotation => {
+                    let v: Vec<f32> = keys
+                        .iter()
+                        .flat_map(|k| {
+                            let q = Quat::from_array(k.value);
+                            let q = if q.length_squared() > 0.0 {
+                                q.normalize()
+                            } else {
+                                Quat::IDENTITY
+                            };
+                            q.to_array()
+                        })
+                        .collect();
+                    (v, "rotation", 4, "VEC4")
+                }
+                Channel::Translation => {
+                    let first = Vec3::new(keys[0].value[0], keys[0].value[1], keys[0].value[2]);
+                    let v: Vec<f32> = keys
+                        .iter()
+                        .flat_map(|k| {
+                            let p = *rest + (Vec3::new(k.value[0], k.value[1], k.value[2]) - first);
+                            p.to_array()
+                        })
+                        .collect();
+                    (v, "translation", 3, "VEC3")
+                }
+            };
+            let output = d.floats(&values, n, ty, false, None);
+            samplers.push(json!({"input": input, "output": output, "interpolation": "LINEAR"}));
+            channels.push(
+                json!({"sampler": samplers.len() - 1, "target": {"node": node, "path": path}}),
+            );
+        }
+    }
+    if channels.is_empty() {
+        return None;
+    }
+    let count = channels.len();
+    d.animations
+        .push(json!({"name": name, "samplers": samplers, "channels": channels}));
+    Some(count)
 }
 
 /// The glTF material for `.mao` `name`, made once; its textures written as PNGs.
@@ -932,6 +1058,95 @@ mod tests {
             println!("  {b}");
         }
         assert!(bad.is_empty(), "{} models failed", bad.len());
+    }
+
+    /// Against a real install: the dog's own animations, exported as clips, pose its
+    /// bones in the file as the game's skeleton poses them.
+    #[test]
+    #[ignore]
+    fn exported_clips_pose_as_the_game_does() {
+        let root = std::env::var_os("THEDAS_INSTALL").expect("THEDAS_INSTALL");
+        let install = thedas_vfs::DaoInstall::open(root).unwrap();
+        let vfs = install
+            .global_vfs(thedas_vfs::install::TextureQuality::High)
+            .unwrap();
+        let read = |name: &str| {
+            if name.ends_with(".dds") {
+                return None;
+            }
+            vfs.read(name).ok().map(|(data, p)| Read {
+                data,
+                layer: p.layer_label,
+                entry: p.entry,
+            })
+        };
+        let s = Subject {
+            id: 0,
+            tag: "t".into(),
+            area: None,
+            template: "t".into(),
+            position: [0.0; 3],
+            facing: 0.0,
+        };
+        let ani = "c_dog.amb_feed.ani";
+        let anim = thedas_formats::anim::Animation::parse(&vfs.read(ani).unwrap().0).unwrap();
+        let e = export_with(
+            &read,
+            &s,
+            &["c_doga_0".to_string()],
+            &[("ambfeed".into(), anim.clone())],
+        );
+        assert_eq!(check(&e.glb), Ok(2));
+        assert_eq!(e.manifest["animations"][0]["name"], "ambfeed");
+        // The file's own animation, sampled at a key, against the game's skeleton.
+        let g = crate::glb_in::Gltf::parse(&e.glb).unwrap();
+        let mmh = thedas_formats::model::Mmh::parse(&vfs.read("c_doga_0.mmh").unwrap().0).unwrap();
+        let sk = thedas_render::skeleton::Skeleton::from_mmh(&mmh);
+        let t = anim.length * 0.5;
+        let pose = sk.pose(&anim, t);
+        let anims = g.json["animations"].as_array().unwrap();
+        assert_eq!(anims.len(), 1);
+        // Every rotation channel's value at its key nearest the middle matches the pose's
+        // local rotation of that bone there (to the slerp between keys).
+        let mut checked = 0;
+        for c in anims[0]["channels"].as_array().unwrap() {
+            if c["target"]["path"] != "rotation" {
+                continue;
+            }
+            let node = c["target"]["node"].as_u64().unwrap() as usize;
+            let name = g.json["nodes"][node]["name"]
+                .as_str()
+                .unwrap()
+                .to_ascii_lowercase();
+            let Some(bi) = sk.bones.iter().position(|b| b.name == name) else {
+                continue;
+            };
+            let track = anim
+                .tracks
+                .iter()
+                .find(|tr| tr.bone == name && tr.channel == thedas_formats::anim::Channel::Rotation)
+                .unwrap();
+            // The keys as the file has them equal the track's keys, normalized.
+            let sampler = &anims[0]["samplers"][c["sampler"].as_u64().unwrap() as usize];
+            let n = g.json["accessors"][sampler["output"].as_u64().unwrap() as usize]["count"]
+                .as_u64()
+                .unwrap() as usize;
+            assert!(n <= track.keys.len() && n > 0, "{name}");
+            // The game's local rotation of that bone at t comes from these same keys.
+            let parent = sk.bones[bi].parent.map_or(Mat4::IDENTITY, |p| pose[p]);
+            let local = parent.inverse() * pose[bi];
+            let (_, r, _) = local.to_scale_rotation_translation();
+            let k = track
+                .keys
+                .iter()
+                .min_by(|a, b| (a.time - t).abs().total_cmp(&(b.time - t).abs()))
+                .unwrap();
+            let q = Quat::from_array(k.value).normalize();
+            // Between keys the pose moves on; near a key they agree within the step.
+            assert!(r.dot(q).abs() > 0.9, "{name}: {r:?} vs {q:?}");
+            checked += 1;
+        }
+        assert!(checked > 10, "{checked}");
     }
 
     #[test]
