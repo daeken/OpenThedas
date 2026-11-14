@@ -1600,19 +1600,52 @@ pub fn call(
                 _ => Value::Resource(cell_string(c)),
             })
         }
-        // Dragon Age II: a number from ability `a[2]`'s row of the abilities table (M2DA 1,
-        // `ABI_*`), in the column whose name hashes to `a[1]`, for creature `a[0]`.
-        // Provisional: DA2's script.ldf declares it; how an upgrade the creature has to the
-        // ability changes the number is not traced, so the ability's own row answers.
+        // DragonAge2.exe 0x4e1700/0x4e17a0 -> 0x6a1300/0x6a1b50:
+        // row 0 marks which columns accept additions from the four learned upgrades.
+        // Read the live ability set, so grants/removals and reload need no cached totals.
         "GetUpgradableAbilityHashedM2DAInt" | "GetUpgradableAbilityHashedM2DAFloat" => {
+            let Some(creature) = h
+                .object(obj(a, 0))
+                .filter(|o| o.kind == ObjectKind::Creature)
+            else {
+                return ok(if name.ends_with("Float") {
+                    Value::Float(0.0)
+                } else {
+                    Value::Int(0)
+                });
+            };
             let table = h.sim.world.tables.get(1, "");
-            let c = table
-                .as_ref()
-                .and_then(|t| t.cell_by_hash(int(a, 1) as u32, int(a, 2) as i64));
-            ok(if name.ends_with("Float") {
-                Value::Float(cell_float(c))
+            let column = int(a, 1) as u32;
+            let ability = i64::from(int(a, 2));
+            let cell = |row| table.as_ref().and_then(|t| t.cell_by_hash(column, row));
+            let mut rows = vec![ability];
+            let upgradeable = if name.ends_with("Float") {
+                cell_float(cell(0)) != 0.0
             } else {
-                Value::Int(cell_int(c))
+                cell_int(cell(0)) != 0
+            };
+            if upgradeable && cell(ability).is_some() {
+                for upgrade in [0xd300_f4d9, 0xf82d_a71a, 0xe136_965b, 0xae77_009c] {
+                    let id = cell_int(
+                        table
+                            .as_ref()
+                            .and_then(|t| t.cell_by_hash(upgrade, ability)),
+                    );
+                    if creature.abilities.contains(&id) {
+                        rows.push(i64::from(id));
+                    }
+                }
+            }
+            ok(if name.ends_with("Float") {
+                Value::Float(
+                    rows.into_iter()
+                        .fold(0.0, |n, row| n + cell_float(cell(row))),
+                )
+            } else {
+                Value::Int(
+                    rows.into_iter()
+                        .fold(0i32, |n, row| n.wrapping_add(cell_int(cell(row)))),
+                )
             })
         }
         "GetM2DARows" => ok(Value::Int(
@@ -5860,6 +5893,141 @@ mod tests {
         assert_eq!(
             read(&mut s, "GetHashedM2DAString", "Nope", 3),
             Some(Value::String(String::new()))
+        );
+    }
+
+    #[test]
+    fn da2_upgradable_numbers_add_only_learned_direct_upgrades_in_marked_columns() {
+        let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 7);
+        s.world.tables().insert(
+            "#1",
+            &[
+                "Range",
+                "Charges",
+                "Fixed",
+                "#d300f4d9",
+                "#f82da71a",
+                "#e136965b",
+                "#ae77009c",
+            ],
+            vec![
+                (0, vec![Cell::Float(1.0), Cell::Int(1), Cell::Int(0)]),
+                (
+                    100,
+                    vec![
+                        Cell::Float(2.5),
+                        Cell::Int(3),
+                        Cell::Int(9),
+                        Cell::Int(101),
+                        Cell::Int(102),
+                        Cell::Int(103),
+                        Cell::Int(104),
+                    ],
+                ),
+                (
+                    101,
+                    vec![
+                        Cell::Float(0.75),
+                        Cell::Int(2),
+                        Cell::Int(100),
+                        Cell::Int(105),
+                    ],
+                ),
+                (102, vec![Cell::Float(-0.25), Cell::Int(-1), Cell::Int(200)]),
+                (103, vec![Cell::Float(0.5), Cell::Int(4), Cell::Int(300)]),
+                (104, vec![Cell::Float(1.25), Cell::Int(5), Cell::Int(400)]),
+                (105, vec![Cell::Float(99.0), Cell::Int(99), Cell::Int(999)]),
+            ],
+        );
+        let npc = s.world.spawn(ObjectKind::Creature, "npc");
+        let read = |s: &mut Sim, float: bool, column: &str| {
+            run(
+                s,
+                npc,
+                if float {
+                    "GetUpgradableAbilityHashedM2DAFloat"
+                } else {
+                    "GetUpgradableAbilityHashedM2DAInt"
+                },
+                &[
+                    Value::Object(npc),
+                    Value::Int(thedas_formats::gda::column_hash(column) as i32),
+                    Value::Int(100),
+                ],
+            )
+        };
+        assert_eq!(read(&mut s, true, "Range"), Some(Value::Float(2.5)));
+        assert_eq!(read(&mut s, false, "Charges"), Some(Value::Int(3)));
+        // The base ability need not be learned. A learned upgrade's own upgrade
+        // does not recursively contribute, and an unlearned direct upgrade does not.
+        s.world
+            .get_mut(npc)
+            .unwrap()
+            .abilities
+            .extend([101, 103, 104, 105]);
+        let before = s.save_json().unwrap();
+        assert_eq!(read(&mut s, true, "Range"), Some(Value::Float(5.0)));
+        assert_eq!(read(&mut s, false, "Charges"), Some(Value::Int(14)));
+        assert_eq!(read(&mut s, false, "Fixed"), Some(Value::Int(9)));
+        assert_eq!(read(&mut s, false, "Missing"), Some(Value::Int(0)));
+        assert_eq!(
+            s.save_json().unwrap(),
+            before,
+            "queries change no world state or RNG"
+        );
+        s.world.get_mut(npc).unwrap().abilities.remove(&101);
+        assert_eq!(read(&mut s, true, "Range"), Some(Value::Float(4.25)));
+        assert_eq!(read(&mut s, false, "Charges"), Some(Value::Int(12)));
+        s.world.get_mut(npc).unwrap().abilities.insert(102);
+        assert_eq!(read(&mut s, true, "Range"), Some(Value::Float(4.0)));
+        assert_eq!(read(&mut s, false, "Charges"), Some(Value::Int(11)));
+    }
+
+    #[test]
+    fn da2_upgradable_numbers_require_a_creature_and_respect_missing_metadata() {
+        let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 7);
+        s.world.tables().insert(
+            "#1",
+            &["Value", "#d300f4d9"],
+            vec![
+                (100, vec![Cell::Int(7), Cell::Int(101)]),
+                (101, vec![Cell::Int(99)]),
+            ],
+        );
+        let creature = s.world.spawn(ObjectKind::Creature, "creature");
+        let item = s.world.spawn(ObjectKind::Item, "item");
+        s.world.get_mut(creature).unwrap().abilities.insert(101);
+        let column = Value::Int(thedas_formats::gda::column_hash("Value") as i32);
+        for (id, expected) in [(creature, 7), (item, 0), (OBJECT_INVALID, 0)] {
+            assert_eq!(
+                run(
+                    &mut s,
+                    creature,
+                    "GetUpgradableAbilityHashedM2DAInt",
+                    &[Value::Object(id), column.clone(), Value::Int(100)]
+                ),
+                Some(Value::Int(expected))
+            );
+            assert_eq!(
+                run(
+                    &mut s,
+                    creature,
+                    "GetUpgradableAbilityHashedM2DAFloat",
+                    &[Value::Object(id), column.clone(), Value::Int(100)]
+                ),
+                Some(Value::Float(expected as f32))
+            );
+        }
+        assert_eq!(
+            run(
+                &mut s,
+                creature,
+                "GetUpgradableAbilityHashedM2DAInt",
+                &[Value::Object(creature), column, Value::Int(999)]
+            ),
+            Some(Value::Int(0))
         );
     }
 
