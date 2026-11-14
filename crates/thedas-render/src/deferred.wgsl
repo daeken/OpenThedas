@@ -243,7 +243,8 @@ fn fs_env(in: VsOut) -> @location(0) vec4<f32> {
         let lm = textureSample(lightmap_tex, clamp_smp, in.uv_lm);
         let to_eye = in.world - frame.eye.xyz;
         let fog = max(min(exp(-dot(to_eye, to_eye) * frame.fog.x), 1.0), frame.fog.y);
-        let reflection = env * m.specular.rgb * (0.75 * lm.a + 0.25) * s.falloff;
+        let shade = sun_visibility(in.world, s.n);
+        let reflection = env * m.specular.rgb * (0.75 * shade * lm.a + 0.25) * s.falloff;
         return vec4<f32>((reflection + m.albedo.rgb * draw.terrain.tint.rgb) * fog, 1.0);
     }
     let s = surface(in);
@@ -302,6 +303,70 @@ struct Light {
 @group(1) @binding(4) var g_depth: texture_2d<f32>;
 // The shadow slots' faces: distance from the light to the nearest caster.
 @group(1) @binding(5) var shadow_maps: texture_2d_array<f32>;
+struct Sun {
+    data: array<vec4<f32>, 9>,
+    direction: vec4<f32>,
+    enabled: vec4<u32>,
+};
+@group(2) @binding(0) var<uniform> sun: Sun;
+@group(2) @binding(1) var sun_near: texture_2d<f32>;
+@group(2) @binding(2) var sun_far: texture_2d<f32>;
+@group(2) @binding(3) var sun_sampler: sampler;
+
+fn sun_sample(uv: vec2<f32>, near: bool) -> vec4<f32> {
+    // The original uses a white border. Keep off-map taps lit on backends without
+    // clamp-to-border samplers (including GL).
+    if (any(uv < vec2<f32>(0.0)) || any(uv > vec2<f32>(1.0))) {
+        return vec4<f32>(1.0);
+    }
+    if (near) {
+        return textureSampleLevel(sun_near, sun_sampler, uv, 0.0);
+    }
+    return textureSampleLevel(sun_far, sun_sampler, uv, 0.0);
+}
+
+// Static1's original five-tap near filter (red depth, blurred green coverage),
+// four-tap far PCF, distance fade and grazing-angle floor. The faithful pass owns
+// both maps, their caster selection, quality, fitting and temporal smoothing.
+fn sun_visibility(p: vec3<f32>, n: vec3<f32>) -> f32 {
+    if (sun.enabled.x == 0u || sun.direction.w < 0.5) {
+        return 1.0;
+    }
+    let q = vec4<f32>(p, 1.0);
+    let sd = sun.data;
+    let plane = dot(sd[8], q);
+    let offsets = array<vec2<f32>, 4>(
+        vec2<f32>(-0.00141302, -0.000598593),
+        vec2<f32>(0.00141838, -0.00115336),
+        vec2<f32>(-0.000141276, -0.00139408),
+        vec2<f32>(0.000517439, 0.000440816));
+    var shade = 1.0;
+    if (plane > 0.0) {
+        let t = vec3<f32>(dot(sd[0], q), dot(sd[1], q), dot(sd[2], q)) / dot(sd[3], q);
+        if (all(t.xy >= vec2<f32>(0.0)) && all(t.xy <= vec2<f32>(1.0))) {
+            let centre = sun_sample(t.xy, true);
+            var green = centre.y;
+            for (var k = 0u; k < 4u; k = k + 1u) {
+                green += sun_sample(t.xy + offsets[k], true).y;
+            }
+            shade = select(green * 0.2, 1.0, t.z <= centre.x);
+        }
+    } else {
+        // sd[7].w holds near reach minus far reach, not a matrix element.
+        let t = vec3<f32>(dot(sd[4], q), dot(sd[5], q), dot(sd[6], q))
+            / dot(vec4<f32>(sd[7].xyz, 1.0), q);
+        if (all(t.xy >= vec2<f32>(0.0)) && all(t.xy <= vec2<f32>(1.0))) {
+            var lit = select(0.0, 1.0, t.z <= sun_sample(t.xy, false).x);
+            // The original uses the centre and the first three offsets here.
+            for (var k = 0u; k < 3u; k = k + 1u) {
+                lit += select(0.0, 1.0, t.z <= sun_sample(t.xy + offsets[k], false).x);
+            }
+            let fade = clamp((sd[7].w - plane) / (0.25 * sd[7].w), 0.0, 1.0);
+            shade = mix(1.0, lit * 0.25, fade);
+        }
+    }
+    return clamp(max(shade, 1.0 - 10.0 * dot(n, -sun.direction.xyz)), 0.0, 1.0);
+}
 
 // How much of a point light at `lp` (shadow slot `slot`) reaches `p` (normal `n`): its
 // cube face by the major axis of the direction, a bilinear 2×2 comparison of distances.
@@ -370,7 +435,9 @@ fn fs_lighting(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     if (depth >= 1.0) {
         discard;
     }
-    let ndc = vec2<f32>(frag.x / lighting.size.x * 2.0 - 1.0, 1.0 - frag.y / lighting.size.y * 2.0);
+    // Undo the D3D9 half-pixel fix-up used by vs_gbuffer before reconstructing
+    // world position, so shadow comparisons refer to the actual surface.
+    let ndc = vec2<f32>((frag.x - 0.5) / lighting.size.x * 2.0 - 1.0, 1.0 - (frag.y - 0.5) / lighting.size.y * 2.0);
     let w = lighting.inv_view_proj * vec4<f32>(ndc, depth, 1.0);
     let p = w.xyz / w.w;
 
@@ -443,11 +510,15 @@ fn fs_lighting(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
             spec_s = spec_s + pow(ndh, power) * lighting.sun_colour.rgb;
         }
     }
-    // No real-time shadow yet: Static1's shadow term is 1, so its lightmap blend is too.
+    let sun_shade = sun_visibility(p, n);
+    // Static1: alpha masks baked direct visibility once; RGB is baked bounce,
+    // dimmed by only 15% in a runtime shadow (exploration camera w = 0).
+    // Dynamic lights have their own visibility and never take this sun mask.
     // Terrain1 masks static diffuse twice with baked alpha; Static1 only once.
-    let diffuse = diff_s * select(lm.a, lm.a * lm.a, terrain) + lm.rgb + diff_d;
-    let specular = select((spec_s * max(lm.a, 0.2) + spec_d) * 3.0,
-        (spec_s + spec_d) * 3.0 * (0.75 * lm.a + 0.25), terrain);
+    let diffuse = diff_s * sun_shade * select(lm.a, lm.a * lm.a, terrain)
+        + lm.rgb * mix(1.0, sun_shade, 0.15) + diff_d;
+    let specular = select((spec_s * sun_shade * max(lm.a, 0.2) + spec_d) * 3.0,
+        (spec_s * (0.75 * sun_shade * lm.a + 0.25) + spec_d) * 3.0, terrain);
     var colour = albedo * diffuse + spec.rgb * specular * falloff;
     switch lighting.counts.y {
         case 1u: { return vec4<f32>(albedo, 1.0); }
@@ -456,6 +527,7 @@ fn fs_lighting(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
         case 4u: { return vec4<f32>(vec3<f32>(lm.a), 1.0); }
         case 5u: { return vec4<f32>(diffuse * 0.5, 1.0); }
         case 6u: { return vec4<f32>(spec.rgb * specular * falloff, 1.0); }
+        case 11u: { return vec4<f32>(vec3<f32>(sun_shade), 1.0); }
         default: {}
     }
 

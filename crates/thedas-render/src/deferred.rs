@@ -117,6 +117,14 @@ struct LightingUniforms {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct SunUniforms {
+    data: [[f32; 4]; 9],
+    direction: [f32; 4],
+    enabled: [u32; 4],
+}
+
+#[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 struct GpuLight {
     position: [f32; 4],
@@ -181,6 +189,11 @@ struct Gpu {
     light_buffer: wgpu::Buffer,
     /// The shadowed lights' maps, and their faces' view-projections for the lighting.
     shadows: crate::deferred_shadow::ShadowPool,
+    sun_fallback: wgpu::TextureView,
+    sun_sampler: wgpu::Sampler,
+    sun_buffer: wgpu::Buffer,
+    sun_layout: wgpu::BindGroupLayout,
+    sun_group: Option<wgpu::BindGroup>,
     faces_buffer: wgpu::Buffer,
     lighting_group: wgpu::BindGroup,
     targets_layout: wgpu::BindGroupLayout,
@@ -558,9 +571,27 @@ impl DeferredPass {
                 },
             ],
         });
+        let sun_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("deferred sun visibility"),
+            entries: &[
+                buffer_entry(0, f, uniform),
+                tex(1, true),
+                tex(2, true),
+                smp(3),
+            ],
+        });
         let gbuffer_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("deferred g-buffer"),
             bind_group_layouts: &[Some(&scene_layout), Some(&material_layout)],
+            immediate_size: 0,
+        });
+        let env_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("deferred reflection"),
+            bind_group_layouts: &[
+                Some(&scene_layout),
+                Some(&material_layout),
+                Some(&sun_layout),
+            ],
             immediate_size: 0,
         });
         let gbuffer_targets: Vec<Option<wgpu::ColorTargetState>> = GBUFFER
@@ -616,7 +647,7 @@ impl DeferredPass {
         let env = [None, Some(wgpu::Face::Back), Some(wgpu::Face::Front)].map(|cull| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some("deferred reflection"),
-                layout: Some(&gbuffer_layout),
+                layout: Some(&env_layout),
                 vertex: wgpu::VertexState {
                     module: &module,
                     entry_point: Some("vs_gbuffer"),
@@ -669,7 +700,11 @@ impl DeferredPass {
         let lighting_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("deferred lighting"),
-                bind_group_layouts: &[Some(&lighting_layout), Some(&targets_layout)],
+                bind_group_layouts: &[
+                    Some(&lighting_layout),
+                    Some(&targets_layout),
+                    Some(&sun_layout),
+                ],
                 immediate_size: 0,
             });
         let lighting = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -867,6 +902,38 @@ impl DeferredPass {
             lighting_buffer,
             light_buffer,
             shadows: crate::deferred_shadow::ShadowPool::new(device),
+            sun_fallback: device
+                .create_texture(&wgpu::TextureDescriptor {
+                    label: Some("deferred unused sun partition"),
+                    size: wgpu::Extent3d {
+                        width: 1,
+                        height: 1,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: crate::d3d_gpu::SHADOW_FORMAT,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
+                })
+                .create_view(&Default::default()),
+            sun_sampler: device.create_sampler(&wgpu::SamplerDescriptor {
+                label: Some("deferred sun partitions"),
+                address_mode_u: wgpu::AddressMode::ClampToEdge,
+                address_mode_v: wgpu::AddressMode::ClampToEdge,
+                mag_filter: wgpu::FilterMode::Linear,
+                min_filter: wgpu::FilterMode::Linear,
+                ..Default::default()
+            }),
+            sun_buffer: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("deferred sun visibility"),
+                size: std::mem::size_of::<SunUniforms>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+            sun_layout,
+            sun_group: None,
             faces_buffer,
             lighting_group,
             targets_layout,
@@ -954,6 +1021,7 @@ impl DeferredPass {
                     .create_view(&wgpu::TextureViewDescriptor::default())
             });
             // Targets 0-3 at bindings 0-3, the depth at 4, the shadow maps at 5.
+            let sun_views = d3d.sun_shadows().map(|(_, views)| views);
             let entries: Vec<wgpu::BindGroupEntry> = [
                 &views[0],
                 &views[1],
@@ -969,6 +1037,32 @@ impl DeferredPass {
                 resource: wgpu::BindingResource::TextureView(v),
             })
             .collect();
+            gpu.sun_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("deferred sun visibility"),
+                layout: &gpu.sun_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: gpu.sun_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(
+                            sun_views.map_or(&gpu.sun_fallback, |v| &v[0]),
+                        ),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(
+                            sun_views.map_or(&gpu.sun_fallback, |v| &v[1]),
+                        ),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::Sampler(&gpu.sun_sampler),
+                    },
+                ],
+            }));
             let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("deferred g-buffer"),
                 layout: &gpu.targets_layout,
@@ -1046,6 +1140,23 @@ impl DeferredPass {
             counts: [gpu.lights.len() as u32, debug_view(), 0, 0],
             size: [width as f32, height as f32, 0.0, 0.0],
         };
+        let sun = SunUniforms {
+            data: d3d
+                .sun_shadows()
+                .map_or(crate::d3d::NO_SHADOW_DATA, |(data, _)| data),
+            direction: sun_dir.to_array(),
+            enabled: [
+                u32::from(
+                    d3d.sun_shadows().is_some()
+                        && std::env::var("THEDAS_DEFERRED_SUN_SHADOWS").as_deref() != Ok("0"),
+                ),
+                0,
+                0,
+                0,
+            ],
+        };
+        ctx.queue
+            .write_buffer(&gpu.sun_buffer, 0, bytemuck::bytes_of(&sun));
         ctx.queue
             .write_buffer(&gpu.lighting_buffer, 0, bytemuck::bytes_of(&lighting));
 
@@ -1127,6 +1238,7 @@ impl DeferredPass {
             pass.set_pipeline(&gpu.lighting);
             pass.set_bind_group(0, &gpu.lighting_group, &[]);
             pass.set_bind_group(1, &targets.group, &[]);
+            pass.set_bind_group(2, gpu.sun_group.as_ref().expect("sun targets"), &[]);
             pass.draw(0..3, 0..1);
         }
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -1152,6 +1264,7 @@ impl DeferredPass {
             occlusion_query_set: None,
             multiview_mask: None,
         });
+        pass.set_bind_group(2, gpu.sun_group.as_ref().expect("sun targets"), &[]);
         draw_all(&self.draws, &mut pass, gpu, &gpu.env, d3d, meshes);
         true
     }
@@ -1316,6 +1429,7 @@ fn debug_view() -> u32 {
             "flat" => 8,
             "wrap" => 9,
             "shadows" => 10,
+            "sun-shadows" => 11,
             _ => 0,
         }
     })
