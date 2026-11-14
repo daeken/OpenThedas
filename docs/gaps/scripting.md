@@ -73,7 +73,7 @@ adds inferred signatures for three of them, and the sim session loads them with 
 4088 of 4158 scripts finish. The rest fail as follows: 58 exhaust the instruction budget of 2,000,000 (looping test/debug scripts such as zz_*), 4 call
 unknown ids, 2 IsInTrigger with 0 args, 2 SetFacingPosition with 1 arg, 2 division by zero, 1 bad stack offset.
 
-### Unimplemented functions scripts call (all 69, by static call count)
+### Unimplemented functions scripts call (all 66, by static call count)
 
 Static call sites / distinct scripts. The debug and console ones (DEBUG_ConsoleCommand, GetDebugHelpersEnabled,
 SetCheatUsedFlag, Screenshot, SendOnlineTelemetry) matter less. InteractWithObject, ShowAsAllyOnMap,
@@ -111,12 +111,10 @@ SetPartyLeader, CloseQuestGroup, the trap-difficulty getters and the item functi
 | GetAILevel | 221 | 5 | 5 |
 | SetCanChangeEquipment | 391 | 5 | 4 |
 | GetMeleeRingPosition | 606 | 5 | 5 |
-| SetEffectAnimation | 611 | 5 | 2 |
 | RemoveAllItemVisualEffects | 783 | 5 | 2 |
 | SetFacingPosition | 23 | 4 | 4 |
 | SetReactionOverride | 471 | 4 | 4 |
 | StopSoundObject | 481 | 4 | 4 |
-| SetEffectFlags | 609 | 4 | 4 |
 | OpenItemUpgradeGUI | 636 | 4 | 4 |
 | GetMapPinState | 653 | 4 | 4 |
 | BuyDownload | 831 | 4 | 4 |
@@ -142,7 +140,6 @@ SetPartyLeader, CloseQuestGroup, the trap-difficulty getters and the item functi
 | GetVisualEffectLocation | 186 | 1 | 1 |
 | ToggleGamePause | 188 | 1 | 1 |
 | SetCreatureStamina | 239 | 1 | 1 |
-| ClearCurrentCommand | 540 | 1 | 1 |
 | ResetAtmosphere | 802 | 1 | 1 |
 | Screenshot | 820 | 1 | 1 |
 | GetPlayTime | 830 | 1 | 1 |
