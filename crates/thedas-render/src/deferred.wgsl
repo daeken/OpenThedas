@@ -195,7 +195,9 @@ fn terrain_material(uv: vec2<f32>) -> TerrainMaterial {
         let tile = vec2<f32>(column, row) * t.dimensions.xy + t.parameters.xy;
         let coord = fract(uv * scale) * t.parameters.zw + tile;
         result.albedo += weight * textureSampleGrad(terrain_diffuse, clamp_smp, coord, dx * scale, dy * scale);
-        result.normal += weight * textureSampleGrad(terrain_normal, clamp_smp, coord, dx * scale, dy * scale);
+        if (draw.room.w < 0.5) {
+            result.normal += weight * textureSampleGrad(terrain_normal, clamp_smp, coord, dx * scale, dy * scale);
+        }
         total += weight;
     }
     result.albedo /= max(total, 1e-6);
@@ -213,7 +215,7 @@ fn fs_gbuffer(in: VsOut) -> GBuffer {
         let m = terrain_material(in.uv0);
         let s = surface_normal(in, m.normal);
         var out: GBuffer;
-        out.albedo = vec4<f32>(m.albedo.rgb, 1.0);
+        out.albedo = vec4<f32>(m.albedo.rgb, select(1.0, 0.5, draw.room.w > 0.5));
         out.specular = m.specular;
         out.normal = vec4<f32>(oct_encode(s.n), draw.room.x, s.falloff);
         out.lightmap = textureSample(lightmap_tex, clamp_smp, in.uv_lm);
@@ -243,7 +245,7 @@ fn fs_env(in: VsOut) -> @location(0) vec4<f32> {
         let lm = textureSample(lightmap_tex, clamp_smp, in.uv_lm);
         let to_eye = in.world - frame.eye.xyz;
         let fog = max(min(exp(-dot(to_eye, to_eye) * frame.fog.x), 1.0), frame.fog.y);
-        let shade = sun_visibility(in.world, s.n);
+        let shade = sun_visibility(in.world, s.n, draw.room.w < 0.5);
         let reflection = env * m.specular.rgb * (0.75 * shade * lm.a + 0.25) * s.falloff;
         return vec4<f32>((reflection + m.albedo.rgb * draw.terrain.tint.rgb) * fog, 1.0);
     }
@@ -328,7 +330,7 @@ fn sun_sample(uv: vec2<f32>, near: bool) -> vec4<f32> {
 // Static1's original five-tap near filter (red depth, blurred green coverage),
 // four-tap far PCF, distance fade and grazing-angle floor. The faithful pass owns
 // both maps, their caster selection, quality, fitting and temporal smoothing.
-fn sun_visibility(p: vec3<f32>, n: vec3<f32>) -> f32 {
+fn sun_visibility(p: vec3<f32>, n: vec3<f32>, grazing_floor: bool) -> f32 {
     if (sun.enabled.x == 0u || sun.direction.w < 0.5) {
         return 1.0;
     }
@@ -365,7 +367,7 @@ fn sun_visibility(p: vec3<f32>, n: vec3<f32>) -> f32 {
             shade = mix(1.0, lit * 0.25, fade);
         }
     }
-    return clamp(max(shade, 1.0 - 10.0 * dot(n, -sun.direction.xyz)), 0.0, 1.0);
+    return clamp(select(shade, max(shade, 1.0 - 10.0 * dot(n, -sun.direction.xyz)), grazing_floor), 0.0, 1.0);
 }
 
 // How much of a point light at `lp` (shadow slot `slot`) reaches `p` (normal `n`): its
@@ -443,7 +445,8 @@ fn fs_lighting(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 
     let ga = textureLoad(g_albedo, px, 0);
     let albedo = ga.rgb;
-    let terrain = ga.a > 0.5;
+    let terrain = ga.a > 0.25;
+    let terrain_low = terrain && ga.a < 0.75;
     let spec = textureLoad(g_specular, px, 0);
     let gn = textureLoad(g_normal, px, 0);
     let lm = textureLoad(g_lightmap, px, 0);
@@ -510,12 +513,12 @@ fn fs_lighting(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
             spec_s = spec_s + pow(ndh, power) * lighting.sun_colour.rgb;
         }
     }
-    let sun_shade = sun_visibility(p, n);
+    let sun_shade = sun_visibility(p, n, !terrain_low);
     // Static1: alpha masks baked direct visibility once; RGB is baked bounce,
     // dimmed by only 15% in a runtime shadow (exploration camera w = 0).
     // Dynamic lights have their own visibility and never take this sun mask.
-    // Terrain1 masks static diffuse twice with baked alpha; Static1 only once.
-    let diffuse = diff_s * sun_shade * select(lm.a, lm.a * lm.a, terrain)
+    // Terrain1 masks static diffuse twice; Static1 and Low's Terrain3 only once.
+    let diffuse = diff_s * sun_shade * select(lm.a, lm.a * lm.a, terrain && !terrain_low)
         + lm.rgb * mix(1.0, sun_shade, 0.15) + diff_d;
     let specular = select((spec_s * sun_shade * max(lm.a, 0.2) + spec_d) * 3.0,
         (spec_s * (0.75 * sun_shade * lm.a + 0.25) + spec_d) * 3.0, terrain);

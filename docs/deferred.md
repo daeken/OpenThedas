@@ -28,7 +28,7 @@ lightmaps. It is not parity work; where the two differ, the faithful path is rig
 
    | target | format | contents |
    |---|---|---|
-   | 0 | `Rgba8Unorm` | albedo rgb, alpha marks terrain (1) or Static1 (0) |
+   | 0 | `Rgba8Unorm` | albedo rgb; alpha: Static1 (0), Low terrain (0.5), other terrain (1) |
    | 1 | `Rgba8Unorm` | specular mask rgb (`mml_tSpecularMask`), specular power code (its alpha) |
    | 2 | `Rgba16Float` | normal (octahedral xy, world space, from `mml_tNormalMap` through a derivative-built tangent frame), room index, specular falloff (`mml_vFalloffParams`, as Static1's vertex shader works it out) |
    | 3 | `Rgba8Unorm` | lightmap texel (rgb baked light, a: the baked visibility Static1 multiplies the sun and lights by) |
@@ -74,9 +74,10 @@ normal-map palette at Medium/High, vertex normals and no specular at Low, and th
 vertex-interpolated specular distance factor. As with Static1, its tangent frame comes from
 screen derivatives rather than the raw mesh tangents.
 
-The lighting keeps Terrain1's `lm.a²` static diffuse mask and
+The lighting keeps Terrain1's `lm.a²` static diffuse mask (Terrain3 at Low uses `lm.a` once) and
 `0.75 * runtime_visibility * lm.a + 0.25` specular mask; bounce uses the same 15% shadow
-blend as Static1. Terrain reflections use this visibility too, via shared read-only sun
+blend as Static1. Low uses Terrain3's shadow filter without the grazing-angle floor.
+Terrain reflections use this visibility too, via shared read-only sun
 bindings, and the material's additive tint is added with the reflection pass. Point lights
 are evaluated per pixel with the deferred radius cutoff, so illumination near fires can
 differ from the faithful per-vertex single A/D lights. `THEDAS_DEFERRED_TERRAIN=0` keeps
