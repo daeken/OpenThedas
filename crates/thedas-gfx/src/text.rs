@@ -1168,6 +1168,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn focused_caret_blink_resets_without_discarding_layout() {
+        let mut t = TextField::new(Arc::new(EditText::default()), None);
+        t.set_text("ab");
+        t.layout = Some(Layout::default());
+        t.set_selection(2, 2);
+        assert!(!t.advance_caret(499.0));
+        assert!(t.advance_caret(1.0));
+        assert!(!t.caret_visible);
+        t.set_selection(2, 2);
+        assert!(t.caret_visible);
+        t.set_selection(0, 2);
+        assert!(!t.advance_caret(600.0));
+        assert!(t.layout.is_some());
+    }
+
+    #[test]
     fn html_subset() {
         let base = Format::default();
         let s = parse_html(
@@ -1251,21 +1267,5 @@ mod tests {
         );
         assert_eq!(l.caret_position(3), Some((1, 7.0)));
         assert_eq!(l.caret_position(7).unwrap().0, 3);
-    }
-
-    #[test]
-    fn focused_caret_blink_resets_without_discarding_layout() {
-        let mut t = TextField::new(Arc::new(EditText::default()), None);
-        t.set_text("ab");
-        t.layout = Some(Layout::default());
-        t.set_selection(2, 2);
-        assert!(!t.advance_caret(499.0));
-        assert!(t.advance_caret(1.0));
-        assert!(!t.caret_visible);
-        t.set_selection(2, 2);
-        assert!(t.caret_visible);
-        t.set_selection(0, 2);
-        assert!(!t.advance_caret(600.0));
-        assert!(t.layout.is_some());
     }
 }
