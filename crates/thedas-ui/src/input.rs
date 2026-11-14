@@ -471,18 +471,19 @@ pub fn query(sim: &Sim, name: &str, args: &[String]) -> UiValue {
                     .get(who)
                     .is_some_and(|o| o.abilities.contains(&(int(1) as i32))),
         ),
-        // `CreatureCanUseItem(item, creature)`: whether the creature may use the item;
-        // inventory.gfx dims the rows of items it cannot (`ItemEquippable_mc`). The exe
-        // answers with its check (0x6ae8b0); here the answer the simulation worked out when
-        // the screen opened ([`Sim::item_usable`], restriction scripts included). An item
-        // with no answer (picked up since) counts as usable.
+        // `CreatureCanUseItem`: whether the creature may use the item; inventory.gfx dims
+        // the rows of items it cannot (`ItemEquippable_mc`). The fscommand carries the
+        // creature, then the item ("124 161": the movie's function sends its second argument
+        // first). The exe answers with its check (0x6ae8b0); here the answer the simulation
+        // worked out when the screen opened ([`Sim::item_usable`], restriction scripts
+        // included). An item with no answer (picked up since) counts as usable.
         "CreatureCanUseItem" => {
-            let creature = u32::try_from(int(1)).ok();
+            let item = u32::try_from(int(1)).ok();
             UiValue::Bool(
                 sim.world.get(who).is_some()
-                    && creature.is_some_and(|c| {
-                        sim.world.get(c).is_some()
-                            && sim.item_usable.get(&(c, who)).copied().unwrap_or(true)
+                    && item.is_some_and(|i| {
+                        sim.world.get(i).is_some()
+                            && sim.item_usable.get(&(who, i)).copied().unwrap_or(true)
                     }),
             )
         }
@@ -546,6 +547,31 @@ pub fn handler_for(sim: Arc<Mutex<Sim>>, shown: Arc<Mutex<Presentation>>) -> Mes
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn can_use_item_reads_the_creature_then_the_item() {
+        use thedas_sim::world::ObjectKind;
+        let mut sim = Sim::new(
+            std::sync::Arc::new(thedas_vfs::Vfs::new()),
+            std::sync::Arc::new(thedas_script::EngineTable::default()),
+            1,
+        );
+        let hero = sim.world.spawn(ObjectKind::Creature, "hero");
+        let sword = sim.world.spawn(ObjectKind::Item, "sword");
+        let staff = sim.world.spawn(ObjectKind::Item, "staff");
+        sim.item_usable.insert((hero, sword), true);
+        sim.item_usable.insert((hero, staff), false);
+        // As inventory.gfx sends it: "124 161", the creature then the item.
+        let ask = |item: u32| {
+            query(
+                &sim,
+                "CreatureCanUseItem",
+                &[hero.to_string(), item.to_string()],
+            )
+        };
+        assert_eq!(ask(sword), UiValue::Bool(true));
+        assert_eq!(ask(staff), UiValue::Bool(false));
+    }
 
     #[test]
     fn a_gift_goes_to_the_follower_as_gift_item() {
