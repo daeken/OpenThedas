@@ -2776,6 +2776,8 @@ pub fn call(
                 approach: None,
                 ring_wait: false,
                 after_impact_ms: None,
+                cancellable_at: None,
+                cancellable: false,
                 impacted: false,
                 arrived: false,
                 path: Vec::new(),
@@ -2899,6 +2901,16 @@ pub fn call(
             };
             let target = obj(a, 0);
             let front = int(a, 2) != 0;
+            if front
+                && h.sim.game == thedas_vfs::Game::DragonAge2
+                && h.sim.world.get(target).is_some_and(|o| {
+                    o.commands
+                        .first()
+                        .is_some_and(|c| c.cancellable && c.name == "CommandUseAbility")
+                })
+            {
+                h.sim.finish_chained_ability(target);
+            }
             h.sim.world.trace.push(TraceEntry::Command {
                 t,
                 object: target,
@@ -5430,6 +5442,19 @@ pub(crate) fn cooldown_key(ability: i32, item: &str) -> String {
 /// to Closed_Unlocked). Provisional: only the default action is known to move the state;
 /// other actions leave it.
 fn placeable_transition(sim: &Sim, id: ObjectId, action: i32, variation: bool) -> Option<i32> {
+    if sim.game == thedas_vfs::Game::DragonAge2 {
+        let (table, state) = da2_placeable_controller(sim, id)?;
+        let int = |hash| match table.cell_by_hash(hash, state)? {
+            Cell::Int(n) => Some(*n as i32),
+            _ => None,
+        };
+        if int(0x52be_3c5e)? != action {
+            return None;
+        }
+        let next = int(if variation { 0x5ad0_780d } else { 0xa2b4_782c })?;
+        // Native controller records store -1 as the absent transition sentinel.
+        return (next >= 0).then_some(next);
+    }
     let o = sim.world.get(id)?;
     let appearance = *o.fields.get("Appearance")? as i64;
     let state = o
@@ -5466,6 +5491,13 @@ fn placeable_transition(sim: &Sim, id: ObjectId, action: i32, variation: bool) -
 /// `placeable_types.gda` (the ninth column names the controller table) and the controller's
 /// action column (hash 0x52be3c5e) at the row of the placeable's state. Provisional.
 pub(crate) fn placeable_default_action(sim: &Sim, id: ObjectId) -> Option<i32> {
+    if sim.game == thedas_vfs::Game::DragonAge2 {
+        let (table, state) = da2_placeable_controller(sim, id)?;
+        return match table.cell_by_hash(0x52be_3c5e, state)? {
+            Cell::Int(action) if *action > 0 => Some(*action as i32),
+            _ => None,
+        };
+    }
     let o = sim.world.get(id)?;
     let appearance = *o.fields.get("Appearance")? as i64;
     let state = o
@@ -5493,6 +5525,35 @@ pub(crate) fn placeable_default_action(sim: &Sim, id: ObjectId) -> Option<i32> {
         Cell::Int(v) if *v > 0 => Some(*v as i32),
         _ => None,
     }
+}
+
+/// DA2 selects its controller independently of appearance. Native 0x8c73e0 reads
+/// M2DA 11100's TableIndex, then loads that table's state/action records. The
+/// headless use command resolves its default action rather than caching a cursor
+/// choice in the native placeable's action field (GetPlaceableAction, 0x4e9820).
+fn da2_placeable_controller(
+    sim: &Sim,
+    id: ObjectId,
+) -> Option<(std::sync::Arc<crate::m2da::Table>, i64)> {
+    let object = sim.world.get(id)?;
+    if object.kind != crate::world::ObjectKind::Placeable {
+        return None;
+    }
+    let controller = i64::from(*object.fields.get("StateController")?);
+    let state = i64::from(
+        object
+            .fields
+            .get("State")
+            .or_else(|| object.fields.get("AnimContState"))
+            .copied()
+            .unwrap_or(0),
+    );
+    let tables = sim.world.tables();
+    let registry = tables.get(11100, "")?;
+    let Cell::Int(index) = registry.cell_by_hash(0x8f29_1c52, controller)? else {
+        return None;
+    };
+    Some((tables.get(i32::try_from(*index).ok()?, "")?, state))
 }
 
 impl Sim {
@@ -8237,6 +8298,55 @@ mod tests {
     }
 
     #[test]
+    fn da2_containers_resolve_actions_by_controller_and_preserve_absent_transitions() {
+        let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
+        let mut sim = Sim::new(Arc::new(Vfs::new()), table, 1);
+        sim.game = thedas_vfs::Game::DragonAge2;
+        let tables = crate::m2da::Tables::empty();
+        tables.insert(
+            "#11100",
+            &["ID", "#8f291c52"],
+            vec![(5, vec![Cell::Int(5), Cell::Int(11004)])],
+        );
+        let row = |state, action, next| {
+            (
+                state,
+                vec![
+                    Cell::Int(state),
+                    Cell::Int(action),
+                    Cell::Int(next),
+                    Cell::Int(-1),
+                ],
+            )
+        };
+        tables.insert(
+            "#11004",
+            &["ID", "#52be3c5e", "#a2b4782c", "#5ad0780d"],
+            vec![row(0, 11, -1), row(1, 3, 0)],
+        );
+        sim.world.tables = Arc::new(tables);
+        let corpse = sim.world.spawn(ObjectKind::Placeable, "supplies");
+        sim.world.get_mut(corpse).unwrap().fields.extend([
+            ("StateController".into(), 5),
+            ("AnimContState".into(), 0),
+            ("Appearance".into(), 999),
+        ]);
+        assert_eq!(placeable_default_action(&sim, corpse), Some(11));
+        assert_eq!(placeable_transition(&sim, corpse, 11, false), None);
+        sim.world
+            .get_mut(corpse)
+            .unwrap()
+            .fields
+            .insert("State".into(), 1);
+        assert_eq!(placeable_default_action(&sim, corpse), Some(3));
+        assert_eq!(placeable_transition(&sim, corpse, 11, false), None);
+        assert_eq!(placeable_transition(&sim, corpse, 3, false), Some(0));
+        assert_eq!(placeable_transition(&sim, corpse, 3, true), None);
+        sim.game = thedas_vfs::Game::Origins;
+        assert_eq!(placeable_default_action(&sim, corpse), None);
+    }
+
+    #[test]
     fn a_successful_action_moves_a_placeable_along_its_state_controller() {
         use thedas_formats::gda::Cell;
         let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
@@ -9162,6 +9272,8 @@ mod tests {
                 approach: None,
                 ring_wait: false,
                 after_impact_ms: None,
+                cancellable_at: None,
+                cancellable: false,
                 impacted: false,
                 arrived: false,
                 path: vec![],

@@ -325,6 +325,12 @@ pub struct Command {
     /// `Sim::ability_timing`): what is left of the command once the impact is due.
     #[serde(default)]
     pub after_impact_ms: Option<u64>,
+    /// DA2's animation-command elapsed deadline for event 112. Kept on the
+    /// command so an interrupted animation cannot notify a later ability.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancellable_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cancellable: bool,
     /// The ability's impact has been dealt; the command runs on to its end.
     #[serde(default)]
     pub impacted: bool,

@@ -1787,6 +1787,7 @@ impl Server {
             let sim = st.sim.as_mut().ok_or("no sim")?;
             let hero = sim.world.hero.ok_or("no hero")?;
             let target = resolve(sim, &a.object).ok_or("no such object")?;
+            let previous = sim.world.get(hero).and_then(|h| h.combat.previous_command.clone());
             sim.order_attack(hero, target);
             // Until the swing resolves (walking up first if out of reach), at most 10 s.
             for _ in 0..100 {
@@ -1798,10 +1799,18 @@ impl Server {
                         // advances the entire ten seconds after a single swing, leaving
                         // the hero idle while followers and enemies keep attacking.
                         || (sim.game == thedas_vfs::Game::DragonAge2
-                            && h.commands.first().is_none_or(|c| {
-                                !matches!(c.name.as_str(), "CommandAttack" | "CommandUseAbility")
-                                    || c.target != Some(target)
-                            }))
+                            && (h.commands.first().is_none_or(|c| {
+                                    !matches!(c.name.as_str(), "CommandAttack" | "CommandUseAbility")
+                                        || c.target != Some(target)
+                                })
+                                // Cancellable notifications can start the next attack on
+                                // the same target immediately. The previous command still
+                                // proves that the requested swing has completed.
+                                || (h.combat.previous_command != previous
+                                    && h.combat.previous_command.as_ref().is_some_and(|c| {
+                                        matches!(c.name.as_str(), "CommandAttack" | "CommandUseAbility")
+                                            && c.target == Some(target)
+                                    }))))
                 }) {
                     break;
                 }
@@ -1930,6 +1939,8 @@ impl Server {
                 approach: None,
                 ring_wait: false,
                 after_impact_ms: None,
+                cancellable_at: None,
+                cancellable: false,
                 impacted: false,
                 arrived: false,
                 path: Vec::new(),

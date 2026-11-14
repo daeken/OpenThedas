@@ -128,6 +128,7 @@ pub struct Sim {
     pub(crate) attack_lengths: HashMap<String, Vec<u64>>,
     /// Ability animations by `tree|action` (see `Sim::ability_timing`).
     pub(crate) ability_anims: HashMap<String, Option<crate::combat::AbilityAnimLen>>,
+    pub(crate) da2_animation_data: HashMap<String, Option<crate::da2_animation::AnimationSample>>,
     /// Each area's doors and their doorways' grid cells (doors do not move; see
     /// `Sim::closed_doors`).
     pub(crate) door_cells: HashMap<ObjectId, Arc<Vec<crate::nav::Doorway>>>,
@@ -626,6 +627,7 @@ impl Sim {
             fire_lengths: HashMap::new(),
             attack_lengths: HashMap::new(),
             ability_anims: HashMap::new(),
+            da2_animation_data: HashMap::new(),
             save_issues: Vec::new(),
             door_cells: HashMap::new(),
             route_approach: Vec::new(),
@@ -1130,6 +1132,30 @@ impl Sim {
                     self.world.time_ms = self.world.time_ms.max(due);
                     self.advance_movers();
                     let da2 = self.game == thedas_vfs::Game::DragonAge2;
+                    let cancellable = self
+                        .world
+                        .get_mut(id)
+                        .and_then(|o| o.commands.first_mut())
+                        .filter(|c| da2 && c.cancellable_at == Some(due))
+                        .map(|c| {
+                            c.cancellable_at = None;
+                            c.cancellable = true;
+                            c.clone()
+                        });
+                    if let Some(cmd) = cancellable {
+                        self.da2_animation_cancellable(id, &cmd);
+                        continue;
+                    }
+                    if da2
+                        && self.world.get(id).is_some_and(|o| {
+                            o.commands.len() > 1
+                                && o.commands[0].cancellable
+                                && o.commands[0].name == "CommandUseAbility"
+                        })
+                    {
+                        self.finish_chained_ability(id);
+                        continue;
+                    }
                     let approached = self
                         .world
                         .get_mut(id)
@@ -2363,6 +2389,8 @@ impl Sim {
                 approach: None,
                 ring_wait: false,
                 after_impact_ms: None,
+                cancellable_at: None,
+                cancellable: false,
                 impacted: false,
                 arrived: false,
                 path: Vec::new(),
@@ -3285,7 +3313,20 @@ impl Sim {
         let mut best: Option<(u64, ObjectId)> = None;
         for (id, mut cmd) in fronts {
             let due = match cmd.due {
-                Some(d) => d,
+                Some(d) => {
+                    if self.game == thedas_vfs::Game::DragonAge2 {
+                        if cmd.cancellable
+                            && cmd.name == "CommandUseAbility"
+                            && self.world.get(id).is_some_and(|o| o.commands.len() > 1)
+                        {
+                            now
+                        } else {
+                            cmd.cancellable_at.map_or(d, |ready| ready.min(d))
+                        }
+                    } else {
+                        d
+                    }
+                }
                 None => {
                     if self.game == thedas_vfs::Game::DragonAge2
                         && cmd.name == "CommandUseAbility"
@@ -3448,6 +3489,7 @@ impl Sim {
                                 self.world.get_mut(id).and_then(|o| o.commands.first_mut())
                             {
                                 c.after_impact_ms = Some(t.end_ms.saturating_sub(t.impact_ms));
+                                c.cancellable_at = t.cancel_ms.map(|ms| now.saturating_add(ms));
                             }
                         }
                         let unset = unset.or(timing.map(|t| t.impact_ms));
@@ -3543,7 +3585,11 @@ impl Sim {
                             c.path = path;
                         }
                     }
-                    d
+                    self.world
+                        .get(id)
+                        .and_then(|o| o.commands.first())
+                        .and_then(|c| c.cancellable_at)
+                        .map_or(d, |ready| ready.min(d))
                 }
             };
             if best.is_none_or(|(b, bid)| (due, id) < (b, bid)) {
@@ -3607,6 +3653,21 @@ impl Sim {
             None if self.nav_grid(area).is_none() => Some((spot, facing, area)),
             None => None,
         }
+    }
+
+    /// Completes an object's front command: applies its movement and tells the object.
+    pub(crate) fn finish_chained_ability(&mut self, id: ObjectId) {
+        let Some(c) = self
+            .world
+            .get_mut(id)
+            .and_then(|o| o.commands.first_mut())
+            .filter(|c| c.cancellable && c.name == "CommandUseAbility")
+        else {
+            return;
+        };
+        // Cancelling before an impact marker must not deliver that future impact.
+        c.impacted = true;
+        self.finish_command(id);
     }
 
     /// Completes an object's front command: applies its movement and tells the object.
@@ -5229,6 +5290,8 @@ mod tests {
             approach: None,
             ring_wait: false,
             after_impact_ms: None,
+            cancellable_at: None,
+            cancellable: false,
             impacted: false,
             arrived: false,
             path: Vec::new(),
@@ -5748,6 +5811,8 @@ mod tests {
             approach: None,
             ring_wait: false,
             after_impact_ms: None,
+            cancellable_at: None,
+            cancellable: false,
             impacted: false,
             arrived: false,
             path: Vec::new(),
@@ -5838,6 +5903,8 @@ mod tests {
             approach: None,
             ring_wait: false,
             after_impact_ms: None,
+            cancellable_at: None,
+            cancellable: false,
             impacted: false,
             arrived: false,
             path: Vec::new(),
@@ -5878,6 +5945,8 @@ mod tests {
             approach: None,
             ring_wait: false,
             after_impact_ms: None,
+            cancellable_at: None,
+            cancellable: false,
             impacted: false,
             arrived: false,
             path: Vec::new(),
@@ -5913,6 +5982,8 @@ mod tests {
             approach: None,
             ring_wait: false,
             after_impact_ms: None,
+            cancellable_at: None,
+            cancellable: false,
             impacted: false,
             arrived: false,
             path: Vec::new(),
@@ -6024,6 +6095,8 @@ mod tests {
                 approach: None,
                 ring_wait: false,
                 after_impact_ms: None,
+                cancellable_at: None,
+                cancellable: false,
                 impacted: false,
                 arrived: false,
                 path: Vec::new(),
@@ -6072,6 +6145,8 @@ mod tests {
             approach: None,
             ring_wait: false,
             after_impact_ms: None,
+            cancellable_at: None,
+            cancellable: false,
             impacted: false,
             arrived: false,
             path: Vec::new(),
@@ -6214,6 +6289,8 @@ mod tests {
             approach: None,
             ring_wait: false,
             after_impact_ms: None,
+            cancellable_at: None,
+            cancellable: false,
             impacted: false,
             arrived: false,
             path: Vec::new(),
@@ -6278,6 +6355,8 @@ mod tests {
             approach: None,
             ring_wait: false,
             after_impact_ms: None,
+            cancellable_at: None,
+            cancellable: false,
             impacted: false,
             arrived: false,
             path: Vec::new(),
@@ -6326,6 +6405,8 @@ mod tests {
             approach: None,
             ring_wait: false,
             after_impact_ms: None,
+            cancellable_at: None,
+            cancellable: false,
             impacted: false,
             arrived: false,
             path: Vec::new(),
@@ -6550,6 +6631,8 @@ mod tests {
                 approach: None,
                 ring_wait: false,
                 after_impact_ms: None,
+                cancellable_at: None,
+                cancellable: false,
                 impacted: false,
                 arrived: false,
                 path: Vec::new(),
@@ -6574,6 +6657,8 @@ mod tests {
             approach: None,
             ring_wait: false,
             after_impact_ms: None,
+            cancellable_at: None,
+            cancellable: false,
             impacted: false,
             arrived: false,
             path: Vec::new(),
@@ -6652,6 +6737,8 @@ mod tests {
             approach: None,
             ring_wait: false,
             after_impact_ms: None,
+            cancellable_at: None,
+            cancellable: false,
             impacted: false,
             arrived: false,
             path: Vec::new(),
@@ -6714,6 +6801,8 @@ mod tests {
             approach: None,
             ring_wait: false,
             after_impact_ms: None,
+            cancellable_at: None,
+            cancellable: false,
             impacted: false,
             arrived: false,
             path: Vec::new(),
@@ -6937,6 +7026,8 @@ mod tests {
             approach: None,
             ring_wait: false,
             after_impact_ms: None,
+            cancellable_at: None,
+            cancellable: false,
             impacted: false,
             arrived: false,
             path: Vec::new(),
