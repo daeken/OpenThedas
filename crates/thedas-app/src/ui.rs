@@ -1867,7 +1867,7 @@ impl UiLayer {
         };
         let mut sim = sim.lock().unwrap_or_else(|p| p.into_inner());
         // No saving during a training tutorial (script.ldf's SetTrainingMode).
-        if sim.training_paused() {
+        if sim.saving_blocked().is_some() {
             log::warn!("ui: no saving during a training tutorial");
             return false;
         }
