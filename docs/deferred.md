@@ -140,8 +140,22 @@ a tangent frame from screen derivatives).
 
 **Deferred draws**: the level's own opaque draws with Static1's shaders
 (`Static1.psh`, or `Static1_Fast.psh` at Low; no alpha test, no blending), not
-SpeedTree or cut away; and Origins terrain (`Terrain2.vsh` + `Terrain1.psh`, or
+the far SpeedTree billboards; and Origins terrain (`Terrain2.vsh` + `Terrain1.psh`, or
 `Terrain3` at Low detail).
+
+Supported cutaway meshes use the G-buffer while fully opaque, including Static1,
+Static1 punch and props. Any runtime opacity below one hands colour back to the
+faithful forward phase and removes the mesh from the point-caster set. Opacity zero
+draws nothing; returning to one restores deferred coverage and invalidates affected
+shadow cubes. `THEDAS_DEFERRED_CUTAWAY=0` restores the blanket cutaway exclusion from
+both the G-buffer and the independent cutout-caster plan. The control is read once.
+
+Rigid, single-pass Origins `Black` geometry also shares deferred depth. Its dedicated
+material remains constant opaque black under lighting, fog, probes and diagnostic
+views, and has no reflection redraw or texture sampling. Normal/depth data remains
+available to AO. It respects the scene's point-casting flag and runtime fades.
+`THEDAS_DEFERRED_BLACK=0` keeps it forward; this control is also read once. The current
+single-sample G-buffer limitation still applies to its silhouette under MSAA.
 
 Single-pass `Static1_Punch` also enters the G-buffer, retaining diffuse alpha times
 `mml_fOpacityMultiplier`, the shader's extra 0.3 clip, and its authored comparison/reference
@@ -151,7 +165,7 @@ G-buffer values nor depth, so SSAO and later forward geometry see through them. 
 opacity maps keep the faithful fallback. `THEDAS_DEFERRED_PUNCH=0` keeps these draws
 forward. Alpha coverage is binary at the G-buffer's single sample, including with MSAA.
 Cutout point shadows use the independent textured-caster plan; these cards never enter
-the opaque cube-shadow pipeline. Prop punch, eyelashes, hair, trees and blended materials
+the opaque cube-shadow pipeline. Prop punch, eyelashes, hair and other blended materials
 retain their own forward equations.
 
 Single-pass, depth-writing `Char1` / `Ch1Alph` character cutouts also share the G-buffer
@@ -391,9 +405,15 @@ slices, with a reconstruction margin, and invalid bounds reach every slice. The 
 and depth masks together occupy 5,120 bytes of portable uniform storage. `wrap` expands
 both masks to twice the radius. `THEDAS_DEFERRED_DEPTH_LIGHTS=0` omits the depth
 intersection. `THEDAS_DEFERRED_EARLY_LIGHT_REJECT=0` omits the conservative squared-radius
-test before full light evaluation. The original distance cutoff remains, and normal
-rejection precedes trigonometric falloff. Light accumulation order and shadow equations
-are preserved.
+and back-face tests before full light evaluation. Back-face rejection uses the
+unnormalized light vector, retaining a tangent-plane margin of 0.00001 times the
+light's reach for floating-point rounding. The original distance and normalized-normal
+cutoffs remain. Light accumulation order and shadow equations are preserved.
+
+G-buffer draw uniforms retain their allocation and refresh only visible, unfaded
+draws. A draw re-entering the view or returning to full opacity refreshes its slot
+before drawing. Point shadows retain their independent world and skin streams, so
+offscreen casters still update. Changed slots upload in one buffer write.
 
 ## Capture profiling
 

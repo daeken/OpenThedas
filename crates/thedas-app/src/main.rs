@@ -3487,6 +3487,20 @@ impl App {
     /// so the key is the game's. Provisional: the game forwards keys and characters to its
     /// movies (Scaleform key and char events) by rules not traced here.
     fn text_key(&mut self, code: KeyCode, text: Option<&str>) -> bool {
+        // Let the window's normal key-state path record modifier presses even
+        // while typing. Swallowing these here breaks Ctrl/Cmd+A and Shift selection
+        // when the modifier is first pressed after the field gains focus.
+        if matches!(
+            code,
+            KeyCode::ShiftLeft
+                | KeyCode::ShiftRight
+                | KeyCode::ControlLeft
+                | KeyCode::ControlRight
+                | KeyCode::SuperLeft
+                | KeyCode::SuperRight
+        ) {
+            return false;
+        }
         let Some(g) = self.gfx.as_mut() else {
             return false;
         };
@@ -3503,19 +3517,9 @@ impl App {
                     | KeyCode::SuperRight
             )
         });
-        let key = match code {
-            KeyCode::Backspace => Some(UiKey::Backspace),
-            KeyCode::Delete => Some(UiKey::Delete),
-            KeyCode::Enter | KeyCode::NumpadEnter => Some(UiKey::Enter),
-            KeyCode::Escape => Some(UiKey::Escape),
-            KeyCode::Tab => Some(UiKey::Tab),
-            KeyCode::ArrowLeft => Some(UiKey::Left),
-            KeyCode::ArrowRight => Some(UiKey::Right),
-            KeyCode::Home => Some(UiKey::Home),
-            KeyCode::End => Some(UiKey::End),
-            KeyCode::KeyA if command => Some(UiKey::SelectAll),
-            _ => None,
-        };
+        let shift =
+            self.keys.contains(&KeyCode::ShiftLeft) || self.keys.contains(&KeyCode::ShiftRight);
+        let key = text_edit_key(code, command, shift);
         match key {
             Some(k) => {
                 g.ui.key(k);
@@ -6043,6 +6047,25 @@ fn game_screen_up(s: &screens::Screens) -> bool {
         })
 }
 
+/// A physical text edit, retaining the modifiers held when it was pressed.
+fn text_edit_key(code: KeyCode, command: bool, shift: bool) -> Option<thedas_ui::UiKey> {
+    use thedas_ui::UiKey;
+    let key = match code {
+        KeyCode::Backspace => UiKey::Backspace,
+        KeyCode::Delete => UiKey::Delete,
+        KeyCode::Enter | KeyCode::NumpadEnter => UiKey::Enter,
+        KeyCode::Escape => UiKey::Escape,
+        KeyCode::Tab => UiKey::Tab,
+        KeyCode::ArrowLeft => UiKey::Left,
+        KeyCode::ArrowRight => UiKey::Right,
+        KeyCode::Home => UiKey::Home,
+        KeyCode::End => UiKey::End,
+        KeyCode::KeyA if command => UiKey::SelectAll,
+        _ => return None,
+    };
+    Some(if shift { key.with_shift() } else { key })
+}
+
 /// A `key` step's text-field key, by name.
 fn text_key(name: &str) -> Option<thedas_ui::UiKey> {
     use thedas_ui::UiKey;
@@ -6056,6 +6079,10 @@ fn text_key(name: &str) -> Option<thedas_ui::UiKey> {
         "right" => UiKey::Right,
         "home" => UiKey::Home,
         "end" => UiKey::End,
+        "shift+left" => UiKey::SelectLeft,
+        "shift+right" => UiKey::SelectRight,
+        "shift+home" => UiKey::SelectHome,
+        "shift+end" => UiKey::SelectEnd,
         "ctrl+a" => UiKey::SelectAll,
         _ => return None,
     })
@@ -7539,6 +7566,38 @@ mod tests {
         assert_eq!((small.width, small.height), (2, 1));
         assert_eq!(&small.pixels[..4], &[100, 50, 0, 255]);
         assert_eq!(shrink(&img, 1).pixels, img.pixels);
+    }
+
+    #[test]
+    fn native_and_scripted_text_edits_preserve_shift() {
+        use thedas_ui::UiKey;
+        for (physical, name, plain, selected) in [
+            (KeyCode::ArrowLeft, "left", UiKey::Left, UiKey::SelectLeft),
+            (
+                KeyCode::ArrowRight,
+                "right",
+                UiKey::Right,
+                UiKey::SelectRight,
+            ),
+            (KeyCode::Home, "home", UiKey::Home, UiKey::SelectHome),
+            (KeyCode::End, "end", UiKey::End, UiKey::SelectEnd),
+        ] {
+            assert_eq!(text_edit_key(physical, false, false), Some(plain));
+            assert_eq!(text_edit_key(physical, false, true), Some(selected));
+            assert_eq!(
+                parse_steps(&format!("key shift+{name}")).unwrap(),
+                vec![Step::TextKey(selected)]
+            );
+        }
+        assert_eq!(
+            text_edit_key(KeyCode::KeyA, true, false),
+            Some(UiKey::SelectAll)
+        );
+        assert_eq!(
+            text_edit_key(KeyCode::KeyA, true, true),
+            Some(UiKey::SelectAll)
+        );
+        assert_eq!(text_edit_key(KeyCode::KeyA, false, false), None);
     }
 
     #[test]

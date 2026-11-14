@@ -23,7 +23,7 @@ impl ProgramSource for Colours {
     }
 }
 
-fn scene(x: f32, semantic: &str) -> AreaScene {
+pub(super) fn scene(x: f32, semantic: &str) -> AreaScene {
     AreaScene {
         meshes: vec![SceneMesh {
             key: format!("triangle-{x}"),
