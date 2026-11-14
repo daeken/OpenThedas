@@ -599,7 +599,7 @@ impl ModMode {
         let Some((primitives, ppp)) = self.shapes.as_ref() else {
             return;
         };
-        let textures = std::mem::take(&mut self.textures);
+        let mut textures = std::mem::take(&mut self.textures);
         for (id, deltas) in &textures.set {
             for delta in deltas {
                 self.renderer.update_texture(device, queue, *id, delta);
@@ -632,6 +632,8 @@ impl ModMode {
         for id in &textures.free {
             self.renderer.free_texture(id);
         }
+        // Handled: egui asserts (in debug builds) that a delta is not dropped unapplied.
+        textures.clear();
     }
 }
 

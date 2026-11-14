@@ -464,6 +464,245 @@ fn read_chunk(gff: &Gff4, c: StructId) -> TypedResult<MeshChunk> {
 }
 
 /// IEEE 754 half precision to single precision.
+impl DeclType {
+    /// Encodes four floats as this type stores them: the inverse of [`DeclType::decode`],
+    /// each value rounded and clamped to what the type holds, components the type lacks
+    /// dropped. Writes [`Self::size`] bytes at the start of `out`; does nothing if `out` is
+    /// shorter.
+    pub fn encode(self, v: [f32; 4], out: &mut [u8]) {
+        use DeclType::*;
+        if out.len() < self.size() as usize {
+            return;
+        }
+        let f = |x: f32| if x.is_finite() { x } else { 0.0 };
+        let mut put = |at: usize, b: &[u8]| out[at..at + b.len()].copy_from_slice(b);
+        let un8 = |x: f32| (f(x).clamp(0.0, 1.0) * 255.0).round() as u8;
+        let u8i = |x: f32| f(x).round().clamp(0.0, 255.0) as u8;
+        let i16i = |x: f32| f(x).round().clamp(-32768.0, 32767.0) as i16;
+        let sn16 = |x: f32| (f(x).clamp(-1.0, 1.0) * 32767.0).round() as i16;
+        let un16 = |x: f32| (f(x).clamp(0.0, 1.0) * 65535.0).round() as u16;
+        match self {
+            Float1 | Float2 | Float3 | Float4 => {
+                let n = self.size() as usize / 4;
+                for (i, x) in v.iter().take(n).enumerate() {
+                    put(i * 4, &f(*x).to_le_bytes());
+                }
+            }
+            // Stored B, G, R, A.
+            D3dColor => put(0, &[un8(v[2]), un8(v[1]), un8(v[0]), un8(v[3])]),
+            Ubyte4 => put(0, &[u8i(v[0]), u8i(v[1]), u8i(v[2]), u8i(v[3])]),
+            Ubyte4N => put(0, &[un8(v[0]), un8(v[1]), un8(v[2]), un8(v[3])]),
+            Short2 | Short4 => {
+                let n = self.size() as usize / 2;
+                for (i, x) in v.iter().take(n).enumerate() {
+                    put(i * 2, &i16i(*x).to_le_bytes());
+                }
+            }
+            Short2N | Short4N => {
+                let n = self.size() as usize / 2;
+                for (i, x) in v.iter().take(n).enumerate() {
+                    put(i * 2, &sn16(*x).to_le_bytes());
+                }
+            }
+            Ushort2N | Ushort4N => {
+                let n = self.size() as usize / 2;
+                for (i, x) in v.iter().take(n).enumerate() {
+                    put(i * 2, &un16(*x).to_le_bytes());
+                }
+            }
+            Udec3 => {
+                let c = |x: f32| (f(x).round().clamp(0.0, 1023.0) as u32) & 0x3ff;
+                put(0, &(c(v[0]) | c(v[1]) << 10 | c(v[2]) << 20).to_le_bytes());
+            }
+            Dec3N => {
+                let c = |x: f32| ((f(x).clamp(-1.0, 1.0) * 511.0).round() as i32 as u32) & 0x3ff;
+                put(0, &(c(v[0]) | c(v[1]) << 10 | c(v[2]) << 20).to_le_bytes());
+            }
+            Float16x2 | Float16x4 => {
+                let n = self.size() as usize / 2;
+                for (i, x) in v.iter().take(n).enumerate() {
+                    put(i * 2, &f32_to_f16(f(*x)).to_le_bytes());
+                }
+            }
+        }
+    }
+}
+
+/// A float as a half (round to nearest even; past the range, infinity; below, zero or a
+/// subnormal).
+pub fn f32_to_f16(x: f32) -> u16 {
+    let b = x.to_bits();
+    let sign = ((b >> 16) & 0x8000) as u16;
+    let exp = ((b >> 23) & 0xff) as i32;
+    let mant = b & 0x7f_ffff;
+    if exp == 0xff {
+        return sign | 0x7c00 | if mant != 0 { 0x200 } else { 0 };
+    }
+    let e = exp - 127 + 15;
+    if e >= 0x1f {
+        return sign | 0x7c00;
+    }
+    if e <= 0 {
+        if e < -10 {
+            return sign;
+        }
+        // Subnormal: shift the mantissa with its implied bit, rounding to nearest even.
+        let m = mant | 0x80_0000;
+        let shift = (14 - e) as u32;
+        let half = 1 << (shift - 1);
+        let rest = m & ((1 << shift) - 1);
+        let mut h = m >> shift;
+        if rest > half || (rest == half && h & 1 == 1) {
+            h += 1;
+        }
+        return sign | h as u16;
+    }
+    let mut h = ((e as u32) << 10) | (mant >> 13);
+    let rest = mant & 0x1fff;
+    if rest > 0x1000 || (rest == 0x1000 && h & 1 == 1) {
+        h += 1; // may carry into the exponent, which is right
+    }
+    sign | h as u16
+}
+
+/// New contents for a chunk of a `.msh` (see [`rewrite`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ChunkData {
+    /// The chunk's name.
+    pub name: String,
+    /// The vertices in the chunk's own layout (its declaration and stride).
+    pub vertices: Vec<u8>,
+    /// Triangle-list indices, relative to the chunk's first vertex.
+    pub indices: Vec<u32>,
+    pub bounds: Option<([f32; 3], [f32; 3])>,
+}
+
+/// A `.msh` with some chunks' vertices and indices replaced, as written by
+/// [`crate::gff4::Gff4::write`]. Other chunks keep their bytes where they were; a replaced
+/// chunk's data is appended to the vertex and index blobs (its old bytes stay, unused). A
+/// chunk whose indices pass 65535 switches to 32-bit indices. `base_vertex` is kept as it
+/// was (provisional, as the reader is: it is 0 in the files this was tried on).
+pub fn rewrite(data: &[u8], chunks: &[ChunkData]) -> TypedResult<Vec<u8>> {
+    use crate::gff4::{List, Value};
+    let mut gff = Gff4::parse(data)?;
+    let msh = Msh::from_gff4(&gff)?;
+    let ids = Doc::new(&gff, "msh").structs(gff.root, field::CHUNKS)?;
+    let mut vertices = msh.vertex_data.clone();
+    let mut indices = msh.index_data.clone();
+    let invalid = |m: String| TypedError::Invalid(m);
+    for new in chunks {
+        let Some(i) = msh
+            .chunks
+            .iter()
+            .position(|c| c.name.eq_ignore_ascii_case(&new.name))
+        else {
+            return Err(invalid(format!("msh: no chunk {}", new.name)));
+        };
+        let (c, id) = (&msh.chunks[i], ids[i]);
+        let stride = c.vertex_size as usize;
+        if stride == 0 || new.vertices.len() % stride != 0 {
+            return Err(invalid(format!("msh chunk {}: vertices not whole", c.name)));
+        }
+        let count = new.vertices.len() / stride;
+        if new.indices.len() % 3 != 0 || new.indices.iter().any(|&x| x as usize >= count) {
+            return Err(invalid(format!(
+                "msh chunk {}: indices past the vertices",
+                c.name
+            )));
+        }
+        while vertices.len() % 16 != 0 || vertices.len() % stride != 0 {
+            vertices.push(0);
+        }
+        let offset = vertices.len();
+        vertices.extend_from_slice(&new.vertices);
+        let wide = c.index_format == IndexFormat::U32 || count > 65536;
+        let size = if wide { 4 } else { 2 };
+        while indices.len() % size != 0 {
+            indices.push(0);
+        }
+        let start = indices.len() / size;
+        for &x in &new.indices {
+            if wide {
+                indices.extend_from_slice(&x.to_le_bytes());
+            } else {
+                indices.extend_from_slice(&(x as u16).to_le_bytes());
+            }
+        }
+        let name = &c.name;
+        let mut set = |label: u32, n: usize| -> TypedResult<()> {
+            match field_mut(&mut gff, id, label) {
+                Some(v) => set_int(v, n as i64)
+                    .ok_or_else(|| invalid(format!("msh chunk {name}: field {label} overflows"))),
+                None if n == 0 => Ok(()),
+                None => Err(invalid(format!(
+                    "msh chunk {name}: no field {label} to set"
+                ))),
+            }
+        };
+        set(field::VERTEX_COUNT, count)?;
+        set(field::INDEX_COUNT, new.indices.len())?;
+        set(field::VERTEX_OFFSET, offset)?;
+        set(field::START_INDEX, start)?;
+        set(field::INDEX_FORMAT, wide as usize)?;
+        if let (Some((lo, hi)), Some(&b)) = (
+            new.bounds,
+            Doc::new(&gff, "msh chunk")
+                .structs(id, field::BOUNDS)?
+                .first(),
+        ) {
+            for (label, v) in [(field::BOUNDS_MIN, lo), (field::BOUNDS_MAX, hi)] {
+                match field_mut(&mut gff, b, label) {
+                    Some(Value::Vec3(x)) => *x = v,
+                    Some(Value::Vec4(x)) => *x = [v[0], v[1], v[2], x[3]],
+                    _ => {}
+                }
+            }
+        }
+    }
+    let root = gff.root;
+    for (label, blob) in [(field::VERTEX_DATA, vertices), (field::INDEX_DATA, indices)] {
+        match field_mut(&mut gff, root, label) {
+            Some(v) => *v = Value::List(Some(List::U8(blob))),
+            None => return Err(invalid(format!("msh: no field {label} to set"))),
+        }
+    }
+    Ok(gff.write()?)
+}
+
+/// A struct's field value to change (inside a generic slot if it is one).
+fn field_mut(gff: &mut Gff4, id: StructId, label: u32) -> Option<&mut crate::gff4::Value> {
+    use crate::gff4::Value;
+    let t = gff.structs.get(id.0)?.template as usize;
+    let i = gff
+        .templates
+        .get(t)?
+        .fields
+        .iter()
+        .position(|f| f.label == label)?;
+    match gff.structs.get_mut(id.0)?.values.get_mut(i)? {
+        Value::Absent => None,
+        Value::Generic(slot) => slot.value.as_mut(),
+        v => Some(v),
+    }
+}
+
+/// Sets an integer value of whatever width it has; `None` if `n` does not fit it.
+fn set_int(v: &mut crate::gff4::Value, n: i64) -> Option<()> {
+    use crate::gff4::Value;
+    match v {
+        Value::U8(x) => *x = u8::try_from(n).ok()?,
+        Value::I8(x) => *x = i8::try_from(n).ok()?,
+        Value::U16(x) => *x = u16::try_from(n).ok()?,
+        Value::I16(x) => *x = i16::try_from(n).ok()?,
+        Value::U32(x) => *x = u32::try_from(n).ok()?,
+        Value::I32(x) => *x = i32::try_from(n).ok()?,
+        Value::U64(x) => *x = u64::try_from(n).ok()?,
+        Value::I64(x) => *x = n,
+        _ => return None,
+    }
+    Some(())
+}
+
 pub fn f16_to_f32(h: u16) -> f32 {
     let sign = ((h >> 15) as u32) << 31;
     let exp = ((h >> 10) & 0x1f) as u32;
@@ -510,6 +749,174 @@ mod tests {
                 (field::DECL_USAGE_INDEX, Value::U32(index)),
             ],
         )
+    }
+
+    #[test]
+    fn every_type_encodes_back_to_what_it_decodes() {
+        use DeclType::*;
+        let v = [0.25, -0.5, 0.75, 1.0];
+        for t in [
+            Float1, Float2, Float3, Float4, D3dColor, Ubyte4N, Short2N, Short4N, Ushort2N,
+            Ushort4N, Dec3N, Float16x2, Float16x4,
+        ] {
+            let mut b = vec![0u8; t.size() as usize];
+            t.encode(v, &mut b);
+            let back = t.decode(&b);
+            let n = match t {
+                Float1 => 1,
+                Float2 | Short2N | Ushort2N | Float16x2 => 2,
+                Float3 | Dec3N => 3,
+                _ => 4,
+            };
+            for i in 0..n {
+                // Unsigned normalized types hold 0..1: -0.5 comes back as 0.
+                let want = match t {
+                    D3dColor | Ubyte4N | Ushort2N | Ushort4N => v[i].clamp(0.0, 1.0),
+                    _ => v[i],
+                };
+                assert!(
+                    (back[i] - want).abs() < 0.01,
+                    "{t:?}[{i}]: {} vs {want}",
+                    back[i]
+                );
+            }
+            let mut again = vec![0u8; t.size() as usize];
+            t.encode(back, &mut again);
+            assert_eq!(again, b, "{t:?} is not stable");
+        }
+        let mut b = [0u8; 4];
+        Ubyte4.encode([3.0, 7.0, 300.0, -1.0], &mut b);
+        assert_eq!(b, [3, 7, 255, 0]);
+        Udec3.encode([1.0, 2.0, 3.0, 0.0], &mut b);
+        assert_eq!(Udec3.decode(&b), [1.0, 2.0, 3.0, 1.0]);
+    }
+
+    #[test]
+    fn halves_round_trip() {
+        for x in [0.0f32, 1.0, -2.5, 0.333, 65504.0, 6.1e-5, 1e-7, 1e9] {
+            let h = f32_to_f16(x);
+            let back = f16_to_f32(h);
+            assert_eq!(f32_to_f16(back), h);
+            if x.abs() <= 65504.0 && x.abs() >= 6.1e-5 {
+                assert!((back - x).abs() <= x.abs() * 1e-3, "{x} -> {back}");
+            }
+        }
+        assert_eq!(f16_to_f32(f32_to_f16(1e9)), f32::INFINITY);
+    }
+
+    #[test]
+    fn a_rewritten_chunk_reads_back_and_the_others_keep_their_bytes() {
+        let data = writable(sample(&[0, 1, 2, 2, 1, 0])).write().unwrap();
+        let before = Msh::parse(&data).unwrap();
+        let b_before = before
+            .vertex_bytes(before.chunk("B").unwrap())
+            .unwrap()
+            .to_vec();
+        let mut verts = vec![0u8; 16 * 4];
+        for (i, v) in verts.chunks_exact_mut(16).enumerate() {
+            DeclType::Float3.encode([i as f32, 9.0, 9.0, 1.0], v);
+        }
+        let out = rewrite(
+            &data,
+            &[ChunkData {
+                name: "a".into(),
+                vertices: verts,
+                indices: vec![0, 1, 2, 2, 3, 0],
+                bounds: None,
+            }],
+        )
+        .unwrap();
+        let after = Msh::parse(&out).unwrap();
+        let a = after.chunk("A").unwrap();
+        assert_eq!(a.vertex_count, 4);
+        assert_eq!(after.indices(a).unwrap(), vec![0, 1, 2, 2, 3, 0]);
+        let pos = after.attribute(a, DeclUsage::Position, 0).unwrap().unwrap();
+        assert_eq!(pos[3], [3.0, 9.0, 9.0, 1.0]);
+        let b = after.chunk("B").unwrap();
+        assert_eq!(after.vertex_bytes(b).unwrap(), b_before.as_slice());
+        assert_eq!(
+            after.indices(b).unwrap(),
+            before.indices(before.chunk("B").unwrap()).unwrap()
+        );
+        // Indices past the vertices, or a chunk it lacks, are refused.
+        let bad = ChunkData {
+            name: "A".into(),
+            vertices: vec![0; 16],
+            indices: vec![0, 1, 2],
+            bounds: None,
+        };
+        assert!(rewrite(&data, &[bad]).is_err());
+        let none = ChunkData {
+            name: "Z".into(),
+            vertices: vec![],
+            indices: vec![],
+            bounds: None,
+        };
+        assert!(rewrite(&data, &[none]).is_err());
+    }
+
+    /// The test builder's document made as a real file has it, for the writer: one template
+    /// per struct label (the root's first), and type codes and flags from the values.
+    fn writable(g: Gff4) -> Gff4 {
+        use crate::gff4::StructTemplate;
+        let mut labels: Vec<crate::gff4::FourCC> =
+            vec![g.templates[g.structs[g.root.0].template as usize].label];
+        for t in &g.templates {
+            if !labels.contains(&t.label) {
+                labels.push(t.label);
+            }
+        }
+        let of = |t: u32| {
+            labels
+                .iter()
+                .position(|l| *l == g.templates[t as usize].label)
+                .unwrap()
+        };
+        let mut out = g.clone();
+        out.templates = labels
+            .iter()
+            .map(|&label| StructTemplate {
+                label,
+                fields: Vec::new(),
+                size: 0,
+            })
+            .collect();
+        for (st, orig) in out.structs.iter_mut().zip(&g.structs) {
+            let t = of(orig.template);
+            st.template = t as u32;
+            if !out.templates[t].fields.is_empty() {
+                continue;
+            }
+            let src = &g.templates[orig.template as usize];
+            out.templates[t].fields = src
+                .fields
+                .iter()
+                .zip(&orig.values)
+                .enumerate()
+                .map(|(i, (f, v))| {
+                    let (type_code, flags) = match v {
+                        Value::U32(_) => (4, 0),
+                        Value::I32(_) => (5, 0),
+                        Value::String(_) => (14, 0),
+                        Value::List(Some(List::U8(_))) => (0, 0x8000),
+                        Value::List(Some(List::Struct(ids))) => {
+                            let e = ids[0].unwrap();
+                            (of(g.structs[e.0].template) as u16, 0x8000 | 0x4000 | 0x2000)
+                        }
+                        other => panic!("no type for {other:?}"),
+                    };
+                    // Every field here takes four bytes: a 32-bit value or a reference.
+                    crate::gff4::FieldDef {
+                        label: f.label,
+                        type_code,
+                        flags,
+                        offset: 4 * i as u32,
+                    }
+                })
+                .collect();
+            out.templates[t].size = 4 * out.templates[t].fields.len() as u32;
+        }
+        out
     }
 
     /// Two chunks: a padded first chunk and a second one starting at index 3.

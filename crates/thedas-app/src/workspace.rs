@@ -7,7 +7,10 @@
 //!   shipped as a mod as it is.
 //! - `workspace/blender/<tag>/`: an export: `<tag>.glb`, its textures as PNGs and
 //!   `manifest.json`. A PNG saved after its export (or after the texture it last made) is
-//!   turned into the texture it came from, under the original's name, in `override/`.
+//!   turned into the texture it came from, under the original's name, in `override/`. The
+//!   `.glb` saved after its export (or its last import) is imported (see [`crate::glb_in`]):
+//!   its meshes become the `.msh` files they came from, in `override/`, and `.imported`
+//!   in the export's folder says when and what came of it.
 //!
 //! The textures are written uncompressed (8-bit BGRA with a full mip chain), which the game
 //! reads as it reads the originals' compressed ones. Mounted only by mod mode's "Live
@@ -117,6 +120,82 @@ pub fn changes(blender: &Path, overrides: &Path) -> Vec<Change> {
         }
     }
     out
+}
+
+/// Exports whose `.glb` was saved since the export or since its last import.
+pub fn glb_changes(blender: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Ok(rd) = std::fs::read_dir(blender) else {
+        return out;
+    };
+    for export in rd.flatten().map(|e| e.path()).filter(|p| p.is_dir()) {
+        let Some(exported) = modified(&export.join("manifest.json")) else {
+            continue;
+        };
+        let since = modified(&export.join(".imported"))
+            .unwrap_or(exported)
+            .max(exported);
+        let Ok(files) = std::fs::read_dir(&export) else {
+            continue;
+        };
+        for f in files.flatten().map(|e| e.path()) {
+            let glb = f.extension().is_some_and(|e| e.eq_ignore_ascii_case("glb"));
+            if glb && modified(&f).is_some_and(|m| m > since) {
+                out.push(f);
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// Imports a saved `.glb` beside its `manifest.json`, writing the meshes into `overrides`
+/// and a note in `.imported`. Returns the `.msh` files written, and what came of each with
+/// the warnings (or the error).
+pub fn import_glb(
+    glb: &Path,
+    overrides: &Path,
+    read: &dyn Fn(&str) -> Option<crate::glb::Read>,
+) -> Result<(Vec<String>, Vec<String>), String> {
+    let dir = glb.parent().ok_or("no folder")?;
+    let result = (|| {
+        let manifest: serde_json::Value = std::fs::read(dir.join("manifest.json"))
+            .map_err(|e| format!("manifest.json: {e}"))
+            .and_then(|b| serde_json::from_slice(&b).map_err(|e| format!("manifest.json: {e}")))?;
+        let bytes = std::fs::read(glb).map_err(|e| format!("{}: {e}", glb.display()))?;
+        let imp = crate::glb_in::import(&bytes, &manifest, read)?;
+        std::fs::create_dir_all(overrides).map_err(|e| e.to_string())?;
+        let mut written = Vec::new();
+        let mut warnings = imp.warnings;
+        for m in &imp.meshes {
+            if m.msh.contains(['/', '\\']) || m.msh.starts_with('.') {
+                continue;
+            }
+            std::fs::write(overrides.join(&m.msh), &m.data).map_err(|e| e.to_string())?;
+            written.push(m.msh.clone());
+            warnings.push(format!(
+                "{}: {} chunk(s) rewritten{}",
+                m.msh,
+                m.chunks.len(),
+                if m.emptied.is_empty() {
+                    String::new()
+                } else {
+                    format!(", {} emptied ({})", m.emptied.len(), m.emptied.join(", "))
+                }
+            ));
+        }
+        Ok((written, warnings))
+    })();
+    // Noted whatever came of it, so a file that fails is not tried again until saved again.
+    let note = match &result {
+        Ok((w, warn)) => serde_json::json!({"written": w, "warnings": warn}),
+        Err(e) => serde_json::json!({"error": e}),
+    };
+    let _ = std::fs::write(
+        dir.join(".imported"),
+        serde_json::to_vec_pretty(&note).unwrap_or_default(),
+    );
+    result
 }
 
 /// Writes each change's texture into `overrides`. Returns the textures written, and what
