@@ -2888,7 +2888,9 @@ impl Sim {
                 Some(t) if cmd.name == "CommandAttack" => (self.attack_reach(id)
                     <= crate::combat::MELEE_REACH)
                     .then(|| self.reach_to(id, t)),
-                Some(t) if self.abi_int(cmd.ints.first().copied().unwrap_or(0), "range") == 0 => {
+                Some(t)
+                    if self.ability_range_class(cmd.ints.first().copied().unwrap_or(0)) == 0 =>
+                {
                     Some(self.body_radius(id) + self.body_radius(t) + MELEE_TALENT_REACH)
                 }
                 _ => None,
@@ -3057,7 +3059,7 @@ impl Sim {
         let Some(me) = self.world.get(id) else {
             return Approach::InReach;
         };
-        if self.abi_int(ability, "range") == 0 {
+        if self.ability_range_class(ability) == 0 {
             let target = cmd
                 .target
                 .filter(|&t| t != id && t != OBJECT_INVALID)
@@ -6221,6 +6223,68 @@ mod tests {
                 .first()
                 .is_some_and(|c| c.approach.is_none() && c.due.is_some())
         );
+    }
+
+    #[test]
+    fn da2_ranged_abilities_keep_their_native_range_during_approach() {
+        use thedas_formats::gda::Cell;
+        let mut s = sim();
+        let tables = crate::m2da::Tables::empty();
+        tables.insert(
+            "#1",
+            &["#a7fa7789"],
+            vec![
+                (5510, vec![Cell::Int(6)]),
+                (7000, vec![Cell::Int(0)]),
+                (7001, vec![Cell::Int(8)]),
+                (7002, vec![Cell::Int(99)]),
+            ],
+        );
+        tables.insert(
+            "#301",
+            &["#814f8b88"],
+            vec![
+                (6, vec![Cell::Float(35.)]),
+                (8, vec![Cell::Float(f64::NAN)]),
+            ],
+        );
+        // The unrelated Origins worksheet must not turn the DA2 staff shot
+        // into a touch-range cast.
+        tables.insert("ABI_base", &["Range"], vec![(5510, vec![Cell::Int(1)])]);
+        tables.insert(
+            "#134",
+            &["PrimaryRange"],
+            vec![(1, vec![Cell::Float(2.25)])],
+        );
+        s.world.tables = Arc::new(tables);
+        let area = s.world.spawn(ObjectKind::Area, "arena");
+        let caster = s.world.spawn(ObjectKind::Creature, "mage");
+        let target = s.world.spawn(ObjectKind::Creature, "target");
+        s.world.get_mut(caster).unwrap().area = Some(area);
+        s.world.get_mut(target).unwrap().area = Some(area);
+        s.world.get_mut(target).unwrap().position = [20., 0., 0.];
+        s.order_ability(caster, 5510, target, "");
+        let cmd = s.world.get(caster).unwrap().commands[0].clone();
+        assert_eq!(s.ability_range(5510), Some(2.25));
+        assert!(matches!(
+            s.ability_approach(caster, &cmd),
+            Approach::Walk(..)
+        ));
+        s.game = thedas_vfs::Game::DragonAge2;
+        assert_eq!(s.ability_range_class(5510), 6);
+        assert_eq!(s.ability_range(5510), Some(35.));
+        assert!(matches!(
+            s.ability_approach(caster, &cmd),
+            Approach::InReach
+        ));
+        for ability in [7000, 7001, 7002, 9999] {
+            assert_eq!(s.ability_range(ability), None);
+        }
+        s.world.get_mut(target).unwrap().position = [40., 0., 0.];
+        assert!(matches!(
+            s.ability_approach(caster, &cmd),
+            Approach::Walk(..)
+        ));
     }
 
     #[test]
