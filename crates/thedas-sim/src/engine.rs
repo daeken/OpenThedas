@@ -5288,7 +5288,8 @@ mod tests {
 
     #[test]
     fn da2_encounter_commands_read_template_case_and_update_membership() {
-        let mut s = sim();
+        let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
         s.game = thedas_vfs::Game::DragonAge2;
         let area = s.world.spawn(ObjectKind::Area, "area");
         s.world.area = Some(area);
