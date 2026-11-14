@@ -219,14 +219,14 @@ call to the exe's event constructor 0x69bac0):
 
 | Constructor | Call sites (scripts) | Note |
 | --- | --- | --- |
-| `CommandMoveAwayFromObject` | 1,010 (169) | now walks (provisional); type number invented (`SCR-057`) |
+| `CommandMoveAwayFromObject` | 1,010 (169) | now walks (provisional); Origins runtime type 21 traced |
 | `CommandPlayAnimation` | 829 (386) | |
 | `CommandFly` | 353 (176) | DLC scripts pass a second integer |
-| `CommandMoveToMultiLocations` | 323 (295) | now walks its list (provisional); type number invented |
-| `CommandTurn` | 221 (214) | now turns (provisional); type number invented |
-| `CommandSheatheWeapons` | 14 (14) | type number invented |
+| `CommandMoveToMultiLocations` | 323 (295) | now walks its list (provisional); Origins runtime type 22 traced |
+| `CommandTurn` | 221 (214) | now turns (provisional); Origins runtime type 41 traced |
+| `CommandSheatheWeapons` | 14 (14) | Origins runtime type 39 traced; executor missing |
 | `CommandDeathBlow` | 3 (3) | |
-| `CommandUnsheatheWeapons` | 2 (1) | type number invented |
+| `CommandUnsheatheWeapons` | 2 (1) | Origins runtime type 39 traced; executor missing |
 
 `CommandEquipItem` and `CommandUnequipItem` are declared and never called. Scripts compare
 `GetCommandType` almost only with INVALID (5,042 sites), ATTACK (195) and WAIT (194).
