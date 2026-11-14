@@ -9573,10 +9573,22 @@ mod coverage_tests {
             assert_eq!(s.world.get(mage).unwrap().properties[&10].1, current);
         }
         assert_eq!(s.world.get(mage).unwrap().properties[&8], (999.0, 998.0));
-        s.world.get_mut(mage).unwrap().properties.insert(11, (25.0, 0.0));
-        run(&mut s, mage, "SetCreatureStamina", &[Value::Object(mage), Value::Int(90)]);
+        s.world
+            .get_mut(mage)
+            .unwrap()
+            .properties
+            .insert(11, (25.0, 0.0));
+        run(
+            &mut s,
+            mage,
+            "SetCreatureStamina",
+            &[Value::Object(mage), Value::Int(90)],
+        );
         assert_eq!(s.world.get(mage).unwrap().properties[&10].1, 40.125);
-        assert_eq!(get(&mut s, "GetCreatureMaxStamina", mage), Some(Value::Int(53)));
+        assert_eq!(
+            get(&mut s, "GetCreatureMaxStamina", mage),
+            Some(Value::Int(53))
+        );
         for id in [chest, OBJECT_INVALID] {
             assert_eq!(get(&mut s, "GetCreatureStamina", id), Some(Value::Int(-1)));
             assert_eq!(
