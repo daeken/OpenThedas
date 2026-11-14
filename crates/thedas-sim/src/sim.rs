@@ -1366,6 +1366,23 @@ impl Sim {
         let Some(module) = self.world.module else {
             return;
         };
+        // DA2's cutscene names its own completion script (CUT field 5001). The
+        // voyage's script runs the common cleanup and requests the Gallows transition;
+        // consuming only the cleanup locals here silently loses that continuation.
+        // Provisional context: run on the module, as the shared cleanup does. The loader
+        // is traced, but the native completion caller/context is not yet established.
+        if self.game == thedas_vfs::Game::DragonAge2 {
+            let script = self
+                .vfs
+                .read(&crate::cutscene::Cutscene::resource(name))
+                .ok()
+                .and_then(|(data, _)| thedas_formats::Gff4::parse(&data).ok())
+                .and_then(|g| crate::cutscene::end_script(&g));
+            if let Some(script) = script {
+                self.run_script(&script, module, None);
+                return;
+            }
+        }
         let (plot, flag, speaker) = match self.world.get_mut(module) {
             Some(m) => {
                 let l = &mut m.locals;
@@ -5112,6 +5129,84 @@ mod tests {
         assert_eq!(s.world.plots.get(&("ABC".to_string(), 13)), Some(&true));
         let l = &s.world.get(m).unwrap().locals;
         assert!(!l.strings.contains_key("CUTSCENE_SET_PLOT"));
+    }
+
+    #[test]
+    fn da2_cutscene_completion_runs_its_script_for_skip_play_and_reload() {
+        use thedas_formats::gff4::{
+            FieldDef, FourCC, Gff4, StructData, StructId, StructTemplate, Version,
+        };
+        let dir = std::env::temp_dir().join(format!("thedas-cut-end-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("intro.cut");
+        let g = Gff4 {
+            version: Version::V40,
+            platform: FourCC::new(b"PC  "),
+            file_type: FourCC::new(b"CUT "),
+            file_version: FourCC::new(b"V1.0"),
+            templates: vec![StructTemplate {
+                label: FourCC::new(b"CUT "),
+                fields: vec![
+                    FieldDef {
+                        label: 5000,
+                        type_code: 8,
+                        flags: 0,
+                        offset: 0,
+                    },
+                    FieldDef {
+                        label: 5001,
+                        type_code: 14,
+                        flags: 0,
+                        offset: 4,
+                    },
+                ],
+                size: 8,
+            }],
+            structs: vec![StructData {
+                template: 0,
+                values: vec![
+                    thedas_formats::gff4::Value::F32(1.0),
+                    thedas_formats::gff4::Value::String(Some("counter\0".into())),
+                ],
+            }],
+            root: StructId(0),
+            shared_strings: None,
+        };
+        std::fs::write(&file, g.write().unwrap()).unwrap();
+        for mode in 0..4 {
+            let mut s = sim();
+            let mut vfs = Vfs::new();
+            vfs.push_files(std::slice::from_ref(&file), "test");
+            s.vfs = Arc::new(vfs);
+            s.game = thedas_vfs::Game::DragonAge2;
+            let m = with_module(&mut s);
+            if mode == 0 {
+                // The headless policy completes a queued cutscene immediately.
+                s.world.cutscenes.push("intro".into());
+                s.tick(0);
+            } else {
+                s.cutscene_policy = CutscenePolicy::Play;
+                s.world.cutscenes.push("intro".into());
+                s.tick(0);
+                assert!(s.world.cutscene.is_some());
+                assert!(!s.world.get(m).unwrap().locals.ints.contains_key("n"));
+                if mode == 3 {
+                    let saved = serde_json::to_string(&s.world).unwrap();
+                    s.world = serde_json::from_str(&saved).unwrap();
+                }
+                if mode == 1 {
+                    s.skip_cutscene();
+                } else {
+                    s.tick(1000);
+                }
+            }
+            assert_eq!(s.world.get(m).unwrap().locals.ints.get("n"), Some(&1));
+            s.tick(2000);
+            s.skip_cutscene();
+            assert_eq!(s.world.get(m).unwrap().locals.ints.get("n"), Some(&1));
+            assert!(s.world.cutscene.is_none() && s.world.cutscenes.is_empty());
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
