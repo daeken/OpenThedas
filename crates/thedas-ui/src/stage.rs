@@ -256,6 +256,69 @@ const OFF_STAGE: (f64, f64) = (-10_000.0, -10_000.0);
 /// The context the popup layer pushes while a dialog box is up.
 const POPUP_CONTEXT: &str = "GUIPopup";
 
+/// Time each movie's tick takes, logged every few hundred ticks when `THEDAS_UI_PROFILE` is
+/// set: its token sync (the engine's values pushed in) and its player tick (scripts, frames
+/// and Ruffle's mouse picking).
+mod profile {
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    /// Ticks between reports.
+    const EVERY: u32 = 300;
+
+    /// Each movie's summed sync and tick time.
+    type ByMovie = BTreeMap<String, (Duration, Duration)>;
+
+    /// The ticks counted and the times summed since the last report.
+    static TIMES: Mutex<Option<(u32, ByMovie)>> = Mutex::new(None);
+
+    fn on() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("THEDAS_UI_PROFILE").is_some())
+    }
+
+    pub fn note(movie: &str, sync: Duration, tick: Duration) {
+        if !on() {
+            return;
+        }
+        let Ok(mut t) = TIMES.lock() else { return };
+        let (_, by) = t.get_or_insert_with(Default::default);
+        let e = by.entry(movie.to_string()).or_default();
+        e.0 += sync;
+        e.1 += tick;
+    }
+
+    /// One stage tick done: every [`EVERY`], the averages are logged and start again.
+    pub fn tick_done() {
+        if !on() {
+            return;
+        }
+        let Ok(mut t) = TIMES.lock() else { return };
+        let (n, by) = t.get_or_insert_with(Default::default);
+        *n += 1;
+        if *n < EVERY {
+            return;
+        }
+        let per = |d: Duration| d.as_secs_f64() * 1000.0 / f64::from(*n);
+        let mut rows: Vec<_> = by
+            .iter()
+            .map(|(m, (s, k))| (per(*s) + per(*k), m, per(*s), per(*k)))
+            .collect();
+        rows.sort_by(|a, b| b.0.total_cmp(&a.0));
+        let total: f64 = rows.iter().map(|r| r.0).sum();
+        let line: Vec<String> = rows
+            .iter()
+            .map(|(_, m, s, k)| format!("{m} {s:.2}+{k:.2}"))
+            .collect();
+        log::info!(
+            "ui profile: {total:.2} ms a tick (sync+tick): {}",
+            line.join(", ")
+        );
+        *t = None;
+    }
+}
+
 pub struct Stage {
     pub movies: Vec<UiMovie>,
     /// Where the mouse is (stage pixels), which a movie is told as it opens: a player takes
@@ -429,7 +492,9 @@ impl Stage {
         )?;
         m.set_scale9(rep.scale9.clone());
         m.set_slots(rep.slots.clone());
-        m.mouse_move(self.mouse.0, self.mouse.1);
+        if self.mouse != OFF_STAGE {
+            m.mouse_move(self.mouse.0, self.mouse.1);
+        }
         for (name, url) in &self.engine_images {
             m.set_engine_image(name, Some(url));
         }
@@ -514,9 +579,12 @@ impl Stage {
         let bridge = self.bridge.clone();
         let mut finished = Vec::new();
         for m in &mut self.movies {
+            let started = std::time::Instant::now();
             let missing = m.sync_tokens(&|t| bridge.value(t));
             bridge.note_unanswered(missing);
+            let synced = started.elapsed();
             m.tick(dt_ms);
+            profile::note(&m.name, synced, started.elapsed() - synced);
             // quickbar.gfx's first frame places its expansion handle before the handle's
             // own init (Ruffle runs the clips' init in another order than Scaleform): the
             // handle sits at its authored place, the bar's full width, and the movie writes
@@ -577,6 +645,7 @@ impl Stage {
             }
         }
         self.movies.retain(|m| !finished.contains(&m.name));
+        profile::tick_done();
         out
     }
 
@@ -623,7 +692,18 @@ impl Stage {
             .collect()
     }
 
+    /// The mouse left the window (see `UiMovie::mouse_leave`).
+    pub fn mouse_leave(&mut self) {
+        self.mouse = OFF_STAGE;
+        for m in &mut self.movies {
+            m.mouse_leave();
+        }
+    }
+
     pub fn mouse_move(&mut self, x: f64, y: f64) {
+        if self.mouse == OFF_STAGE {
+            log::debug!("ui: the mouse is in the window at {x:.0},{y:.0}");
+        }
         self.mouse = (x, y);
         for m in self.input_movies() {
             m.mouse_move(x, y);

@@ -4737,6 +4737,11 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::CursorMoved { position, .. } => self.cursor_to(position.x, position.y),
+            WindowEvent::CursorLeft { .. } => {
+                if let Some(g) = self.gfx.as_mut() {
+                    g.ui.mouse_leave();
+                }
+            }
             WindowEvent::MouseInput {
                 state,
                 button: MouseButton::Left,
@@ -4996,6 +5001,7 @@ fn audio_state(
                         }),
                     placeable: (o.kind == thedas_sim::world::ObjectKind::Placeable)
                         .then_some(o.appearance as i64),
+                    height: Some(live::appearance_height(&sim, *id)),
                 },
             );
         }
