@@ -30,15 +30,16 @@ pub struct SaveMeta {
     pub level: i32,
     #[serde(default)]
     pub class: i32,
-    /// The kind of save ([`KIND_SLOT`], [`KIND_QUICK`]).
+    /// The kind of save ([`KIND_SLOT`], [`KIND_AUTO`], [`KIND_QUICK`]).
     #[serde(default)]
     pub kind: i32,
 }
 
 /// The kinds of save, as DAOrigins.exe names their folders (0x642c70): a save the player
-/// made on the save screen (`Slot_`), and the quick save (`QuickSave_`). (1 is `AutoSave_`,
-/// 3 `PostCampaign_`.)
+/// made on the save screen (`Slot_`), the autosave (`AutoSave_`) and the quick save
+/// (`QuickSave_`). (3 is `PostCampaign_`.)
 pub const KIND_SLOT: i32 = 0;
+pub const KIND_AUTO: i32 = 1;
 pub const KIND_QUICK: i32 = 2;
 
 /// The player's own folder for the game's saves and settings. On Windows it is
@@ -149,6 +150,15 @@ impl SaveStore {
         self.list()
             .iter()
             .find(|s| s.kind == KIND_QUICK)
+            .map(|s| s.slot)
+    }
+
+    /// The autosave's slot, when there is one. Provisional: one autosave is kept and
+    /// written over; how many the original keeps is not traced.
+    pub fn auto_slot(&self) -> Option<i32> {
+        self.list()
+            .iter()
+            .find(|s| s.kind == KIND_AUTO)
             .map(|s| s.slot)
     }
 

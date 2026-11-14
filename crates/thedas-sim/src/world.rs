@@ -748,6 +748,10 @@ pub struct World {
     /// [`AmbientLine`]). Output only: nothing in the simulation reads it.
     #[serde(skip)]
     pub ambient_lines: Vec<AmbientLine>,
+    /// A script asked for an autosave (`DoAutoSave`) that the presentation has not made
+    /// yet. Output only.
+    #[serde(skip)]
+    pub autosave_requested: bool,
     /// The commands given to the simulation from outside it (mod mode, the MCP server,
     /// test harnesses) and what each did, oldest first (see [`crate::commands`]). Saved:
     /// mod mode's entries are its edit history.
@@ -894,6 +898,7 @@ impl World {
             floaties: Vec::new(),
             portrait_messages: Vec::new(),
             ambient_lines: Vec::new(),
+            autosave_requested: false,
             command_journal: Vec::new(),
             status_messages: Vec::new(),
             sounds: Vec::new(),
