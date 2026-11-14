@@ -620,7 +620,10 @@ impl Sim {
                 }
             }
         } else {
-            dlg.trim_end_matches(".dlg").to_string()
+            // Dragon Age II names its conversations with their `.cnv` extension.
+            dlg.trim_end_matches(".dlg")
+                .trim_end_matches(".cnv")
+                .to_string()
         };
         let Some(d) = self
             .vfs
