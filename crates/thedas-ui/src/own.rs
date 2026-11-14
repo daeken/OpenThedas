@@ -1,8 +1,4 @@
-//! The movies on our own Scaleform player (`thedas-gfx`) instead of Ruffle.
-//!
-//! Chosen at run time with `THEDAS_UI_PLAYER`: `ruffle` (the default), `own` for every movie,
-//! or `own:mainmenu,quickbar` for the named movies only. The rest of [`crate::UiMovie`] (token
-//! observers, calls by path through the injected glue) is shared by both players.
+//! The movies and their renderers on our Scaleform player (`thedas-gfx`).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -14,26 +10,6 @@ use thedas_gfx::{Host, HostValue, Player};
 use crate::atlas::ImageSource;
 use crate::navigator::ResourceLookup;
 use crate::{Gpu, Rgba, UiKey, UiValue};
-
-/// Whether the movie `name` (`mainmenu.gfx`) plays on our player.
-pub fn wanted(name: &str) -> bool {
-    let Ok(v) = std::env::var("THEDAS_UI_PLAYER") else {
-        return false;
-    };
-    let v = v.trim().to_ascii_lowercase();
-    if v == "own" {
-        return true;
-    }
-    let Some(list) = v.strip_prefix("own:") else {
-        return false;
-    };
-    let stem = name
-        .to_ascii_lowercase()
-        .trim_end_matches(".gfx")
-        .to_string();
-    list.split(',')
-        .any(|m| m.trim().trim_end_matches(".gfx") == stem)
-}
 
 pub fn to_host(v: &UiValue) -> HostValue {
     match v {
@@ -202,7 +178,7 @@ impl thedas_gfx::text::Fonts for FontSet {
     }
 }
 
-/// The engine side of a movie's calls, as for Ruffle (see `crate::Bridge`).
+/// The engine side of a movie's calls, (see `crate::Bridge`).
 pub(crate) struct OwnHost {
     pub(crate) bridge: crate::Bridge,
     pub images: ImageFetch,
@@ -250,11 +226,8 @@ impl OwnMovie {
             bridge,
             images: images.clone(),
         };
-        let mut player = Player::new(data, name, Box::new(host), fonts, Some(glue))
+        let player = Player::new(data, name, Box::new(host), fonts, Some(glue))
             .map_err(|e| crate::UiError::Swf(e.to_string()))?;
-        // The Ruffle-era glue takes the button from a global the host sets; until it goes,
-        // press handlers get no button from the player.
-        player.pass_buttons = false;
         let mut renderer = Renderer::new(&gpu.device, &gpu.queue, wgpu::TextureFormat::Rgba8Unorm);
         for name in crate::ENGINE_IMAGES {
             renderer.set_engine_image(name, None);
@@ -346,10 +319,10 @@ impl OwnMovie {
         self.player.mouse_wheel(x, y, lines);
     }
 
-    pub fn mouse_button(&mut self, x: f64, y: f64, down: bool) {
+    pub fn mouse_button(&mut self, x: f64, y: f64, button: f64, down: bool) {
         let (x, y) = self.to_stage(x, y);
         self.player
-            .mouse_button(x, y, thedas_gfx::player::MOUSE_LEFT, down, false);
+            .mouse_button(x, y, button as u8 & 3, down, button >= 5.0);
     }
 
     pub fn key(&mut self, key: UiKey) {

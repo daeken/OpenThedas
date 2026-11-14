@@ -880,8 +880,6 @@ impl UiLayer {
     /// Loads the movies at `size`; failures are logged and the movie is skipped.
     pub fn new(ctx: &GpuContext, vfs: &Arc<Vfs>, names: &[String], size: (u32, u32)) -> Self {
         let gpu = Gpu {
-            instance: ctx.instance.clone(),
-            adapter: ctx.adapter.clone(),
             device: ctx.device.clone(),
             queue: ctx.queue.clone(),
         };
