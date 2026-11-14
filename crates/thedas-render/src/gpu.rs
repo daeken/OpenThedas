@@ -1091,6 +1091,26 @@ impl AreaRenderer {
         }
     }
 
+    /// The lights its glowing particle emitters give the deferred path this frame (see
+    /// [`crate::deferred::emitter_light`]); the faithful path has none of these.
+    pub fn emitter_lights(&self) -> Vec<crate::scene::SceneLight> {
+        self.d3d
+            .glowing_emitters()
+            .into_iter()
+            .filter_map(|i| self.emitters.get(i))
+            .filter_map(crate::deferred::emitter_light)
+            .collect()
+    }
+
+    /// Gives the deferred path `lights` beside the scene's for the next frames (the
+    /// emitters' of every renderer drawn over this one); a renderer that cannot draw
+    /// deferred ignores them.
+    pub fn set_effect_lights(&mut self, lights: Vec<crate::scene::SceneLight>) {
+        if let Some(d) = self.deferred.as_mut() {
+            d.set_effect_lights(lights);
+        }
+    }
+
     /// Whether this renderer can draw deferred: it is the level's, has draws the deferred
     /// pass takes, and the GPU has not refused that pass.
     pub fn can_defer(&self) -> bool {
