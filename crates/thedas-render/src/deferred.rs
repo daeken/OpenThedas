@@ -825,7 +825,12 @@ impl DeferredPass {
             }
         }
         let mut lights = self.lights(camera, width, height, d3d);
-        let shadowed = shadow_slots(&mut lights, camera.position);
+        // Keep a capture/benchmark switch for comparing only the shadow contribution.
+        let shadowed = if std::env::var("THEDAS_DEFERRED_POINT_SHADOWS").as_deref() == Ok("0") {
+            Vec::new()
+        } else {
+            shadow_slots(&mut lights, camera.position)
+        };
         if std::env::var_os("THEDAS_DEFERRED_LOG_LIGHTS").is_some() {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| {
@@ -875,13 +880,13 @@ impl DeferredPass {
                 depth,
                 &gpu.shadows.view,
             ]
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, v)| wgpu::BindGroupEntry {
-                        binding: i as u32,
-                        resource: wgpu::BindingResource::TextureView(v),
-                    })
-                    .collect();
+            .into_iter()
+            .enumerate()
+            .map(|(i, v)| wgpu::BindGroupEntry {
+                binding: i as u32,
+                resource: wgpu::BindingResource::TextureView(v),
+            })
+            .collect();
             let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("deferred g-buffer"),
                 layout: &gpu.targets_layout,
@@ -1367,6 +1372,41 @@ mod tests {
         // Hidden (a cut-away model's), it gives none.
         e.opacity = 0.0;
         assert_eq!(emitter_light(&e), None);
+    }
+
+    #[test]
+    fn shadow_pool_prioritizes_dynamic_lights_and_caps_the_slots() {
+        let light = |distance: f32, brightness: f32, is_static: bool| GpuLight {
+            position: [distance, 0.0, 0.0, 5.0],
+            colour: [
+                brightness,
+                brightness,
+                brightness,
+                if is_static { 1.0 } else { 0.0 },
+            ],
+            rooms: [u32::MAX; 8],
+            shadow: [-1.0, 0.0, 0.0, 0.0],
+        };
+        let mut lights = vec![
+            light(1.0, 100.0, true),
+            light(1.0, 1.0, false),
+            light(2.0, 1.0, false),
+            light(3.0, 1.0, false),
+            light(4.0, 1.0, false),
+            light(100.0, 1.0, false),
+        ];
+        let slots = shadow_slots(&mut lights, Vec3::ZERO);
+        assert_eq!(slots.len(), crate::deferred_shadow::SLOTS);
+        assert_eq!(
+            lights[0].shadow[0], -1.0,
+            "baked lights keep baked visibility"
+        );
+        assert_eq!(lights[1].shadow[0], 0.0, "nearest dynamic light wins");
+        assert_eq!(lights[5].shadow[0], -1.0, "the pool has a fixed budget");
+        for (slot, (position, radius)) in slots.into_iter().enumerate() {
+            assert_eq!(position.x, (slot + 1) as f32);
+            assert_eq!(radius, 5.0);
+        }
     }
 
     #[test]

@@ -211,6 +211,11 @@ struct Light {
 fn shadowed(slot: i32, lp: vec3<f32>, p: vec3<f32>, n: vec3<f32>) -> f32 {
     let v = p + n * 0.04 - lp;
     let a = abs(v);
+    // Inside the cube's near planes there is no caster. In particular, do not divide
+    // by a zero projection w when a receiver coincides with the light.
+    if (max(max(a.x, a.y), a.z) < 0.35) {
+        return 1.0;
+    }
     var face = 0;
     if (a.x >= a.y && a.x >= a.z) {
         face = select(1, 0, v.x > 0.0);
