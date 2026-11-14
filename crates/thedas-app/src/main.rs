@@ -2033,6 +2033,25 @@ impl App {
         for a in actions {
             match a {
                 modmode::Action::Report(note) => self.report(Some(note), None),
+                modmode::Action::ListActions(id) => {
+                    let list = self
+                        .live
+                        .as_mut()
+                        .map(|l| l.creature_actions(id))
+                        .unwrap_or_default();
+                    if let Some(m) = self.mod_mode.as_mut() {
+                        m.actions_list = Some((id, list));
+                    }
+                }
+                modmode::Action::PlayAnimation { id, action } => {
+                    let played = self
+                        .live
+                        .as_mut()
+                        .is_some_and(|l| l.play_action(id, &action));
+                    if !played && let Some(m) = self.mod_mode.as_mut() {
+                        m.scrub = None;
+                    }
+                }
                 modmode::Action::Conv(a) => self.mod_mode_conv(a),
                 modmode::Action::World(a) => self.mod_mode_world(a),
                 modmode::Action::Fly(on) => self.set_fly(on),
@@ -3921,6 +3940,43 @@ impl App {
                     None => "modspawn: the view meets no ground".into(),
                 });
             }
+            Step::ModAnims => {
+                let id = self.mod_mode.as_ref().and_then(|m| m.selected);
+                log.push(match (id, self.live.as_mut()) {
+                    (Some(id), Some(l)) => {
+                        let list = l.creature_actions(id);
+                        let first: Vec<&str> = list.iter().take(5).map(|a| a.0.as_str()).collect();
+                        format!("modanims: {} actions ({} …)", list.len(), first.join(", "))
+                    }
+                    _ => "modanims: nothing inspected".into(),
+                });
+            }
+            Step::ModAnim(action) => {
+                let id = self.mod_mode.as_ref().and_then(|m| m.selected);
+                let played = match (id, self.live.as_mut()) {
+                    (Some(id), Some(l)) => l.play_action(id, action).then_some(id),
+                    _ => None,
+                };
+                if let (Some(id), Some(m)) = (played, self.mod_mode.as_mut()) {
+                    m.scrub = Some(modmode::Scrub {
+                        id,
+                        time: 0.0,
+                        length: 1.0,
+                        playing: true,
+                        speed: 1.0,
+                        range: None,
+                    });
+                }
+                log.push(format!(
+                    "modanim {action}: {}",
+                    if played.is_some() {
+                        "playing"
+                    } else {
+                        "not drawn with a tree"
+                    }
+                ));
+            }
+            &Step::ModConvAt(n) => log.push(self.mod_mode_command(modconv::ConvAction::StartAt(n))),
             Step::ModRemove => log.push(match self.mod_mode.as_ref().and_then(|m| m.selected) {
                 Some(id) => self.mod_mode_place(
                     thedas_sim::commands::SimCommand::DestroyObject { target: id },
@@ -5472,6 +5528,12 @@ enum Step {
     ModSpawn(bool, String),
     /// The inspected object is removed (`modremove`).
     ModRemove,
+    /// The inspected creature's animation actions are listed (`modanims`).
+    ModAnims,
+    /// The inspected creature plays this action of its tree, held (`modanim ACTION`).
+    ModAnim(String),
+    /// The picked conversation starts at this line (`modconvat N`).
+    ModConvAt(usize),
     /// A variable set from the world-state browser (`modlocal WHO NAME TYPE VALUE`, WHO
     /// `module`, `area` or an object's tag; TYPE `int`, `float`, `string`, `object` or
     /// `resource`, or `remove` with no value).
@@ -5899,6 +5961,9 @@ fn parse_step(s: &str) -> Result<Step> {
             _ => bail!("modspawn takes creature|placeable TEMPLATE"),
         },
         "modremove" => Step::ModRemove,
+        "modanims" => Step::ModAnims,
+        "modanim" if !arg.is_empty() => Step::ModAnim(arg.to_string()),
+        "modconvat" => Step::ModConvAt(arg.parse().context("modconvat takes a line number")?),
         "modlocal" => {
             let mut w = arg.splitn(4, ' ');
             let (Some(who), Some(name), Some(kind)) = (w.next(), w.next(), w.next()) else {
@@ -6237,6 +6302,9 @@ fn main() -> Result<()> {
                     | Step::ModMoveView
                     | Step::ModSpawn(..)
                     | Step::ModRemove
+                    | Step::ModAnims
+                    | Step::ModAnim(_)
+                    | Step::ModConvAt(_)
                     | Step::ModLocal(..) => {
                         println!("mod mode: windowed only")
                     }
