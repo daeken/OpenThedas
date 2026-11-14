@@ -34,6 +34,7 @@ pub mod dialog;
 mod encounter;
 pub mod engine;
 pub mod fmath;
+mod heartbeat;
 pub mod inventory;
 pub mod journal;
 pub mod levelup;

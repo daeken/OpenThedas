@@ -192,6 +192,10 @@ pub struct Object {
     /// loaded meanwhile); restored when the party comes back.
     #[serde(default)]
     pub parked: Option<bool>,
+    /// Origins' scripted heartbeat interval and elapsed seconds. Our deterministic
+    /// snapshots retain elapsed too; the original save format only retains interval.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heartbeat: Option<Heartbeat>,
     pub effects: Vec<Effect>,
     /// Combat bookkeeping (perception, threat, the pending attack); see `combat`.
     #[serde(default)]
@@ -264,6 +268,7 @@ impl Object {
             escorts: Vec::new(),
             stored: BTreeMap::new(),
             parked: None,
+            heartbeat: None,
             effects: Vec::new(),
             combat: Default::default(),
             abilities: std::collections::BTreeSet::new(),
@@ -276,6 +281,19 @@ impl Object {
             aoe: None,
             item_properties: None,
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Heartbeat {
+    /// Raw float bits let JSON snapshots retain disabled NaN/infinite intervals.
+    pub interval_bits: u32,
+    pub elapsed: f32,
+}
+
+impl Heartbeat {
+    pub fn interval(&self) -> f32 {
+        f32::from_bits(self.interval_bits)
     }
 }
 
