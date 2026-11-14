@@ -200,29 +200,37 @@ impl DaoInstall {
     /// describes it, enabled or not.
     fn addins_with(&self, registries: &[PathBuf]) -> Result<Vec<AddIn>> {
         let dir = join_ci(&self.root, "Addins");
+        self.addins_at(&dir, registries)
+    }
+
+    /// Resolve either install or user AddIns folders through the same registry gates.
+    fn addins_at(&self, dir: &Path, registries: &[PathBuf]) -> Result<Vec<AddIn>> {
         let mut out: Vec<AddIn> = Vec::new();
         let install_registry = join_ci(&self.root, "__support/userdocs/AddIns.xml");
         let game_version = self.game_version();
+        let mut rank = 0;
         for registry in registries.iter().chain([&install_registry]) {
             let Ok(bytes) = std::fs::read(registry) else {
                 continue;
             };
             for (item, left_out) in registry_items(&String::from_utf8_lossy(&bytes), game_version) {
+                let item_rank = rank;
+                rank += 1;
                 let known = out.iter().any(|a| a.uid.eq_ignore_ascii_case(&item.uid));
-                let folder = resolve_ci(&dir, &item.uid).filter(|d| d.is_dir());
+                let folder = resolve_ci(dir, &item.uid).filter(|d| d.is_dir());
                 if let (false, Some(folder)) = (known, folder) {
                     if let Some(why) = left_out {
                         log_left_out(&item.uid, &why);
                     }
                     out.push(AddIn {
                         dir: folder,
-                        rank: Some(out.len()),
+                        rank: Some(item_rank),
                         ..item
                     });
                 }
             }
         }
-        for addin in addins_in(&dir)? {
+        for addin in addins_in(dir)? {
             let known = |a: &AddIn| a.dir == addin.dir || a.uid.eq_ignore_ascii_case(&addin.uid);
             if !out.iter().any(known) {
                 out.push(addin);
@@ -369,7 +377,10 @@ impl DaoInstall {
     /// Add-ins installed in the player's documents folder (`AddIns/` under `user`), in
     /// [`DaoInstall::addins`]' order. The original installs `.dazip` packages there.
     pub fn user_addins(&self, user: &Path) -> Result<Vec<AddIn>> {
-        addins_in(&join_ci(user, "AddIns"))
+        self.addins_at(
+            &join_ci(user, "AddIns"),
+            &[join_ci(user, "Settings/AddIns.xml")],
+        )
     }
 
     /// Builds the stack, lowest layer first. `user` is the original's folder in the player's
@@ -439,15 +450,14 @@ impl DaoInstall {
         )?;
         if let Some(user) = user {
             let user_core = join_ci(user, "packages/core");
-            push_package(&mut vfs, &user_core, quality, game, false, &player)?;
-            push_package(
-                &mut vfs,
-                &join_ci(user, &campaign),
-                quality,
-                game,
-                true,
-                &player,
-            )?;
+            let user_campaign = join_ci(user, &campaign);
+            if game == Game::Origins {
+                push_user_package(&mut vfs, &user_core, false, &player)?;
+                push_user_package(&mut vfs, &user_campaign, true, &player)?;
+            } else {
+                push_package(&mut vfs, &user_core, quality, game, false, &player)?;
+                push_package(&mut vfs, &user_campaign, quality, game, true, &player)?;
+            }
         }
         let registries: Vec<PathBuf> = user
             .map(|u| join_ci(u, "Settings/AddIns.xml"))
@@ -510,6 +520,34 @@ impl DaoInstall {
         }
         Ok(vfs)
     }
+}
+
+/// Origins' writable folders, in ascending stack order. The campaign's toolset, data,
+/// locale, patch and override have priorities 20004..20000 (0x5fd458..0x5fd6a5).
+/// Writable core data, locale and patch are 20007..20005 (0x40e1f8/0x40e485/0x40e2f9);
+/// its override is the separate priority-0 overlay. Locale registers the current language
+/// child. English is the language used by the engine's existing resource readers.
+fn push_user_package(
+    vfs: &mut Vfs,
+    dir: &Path,
+    campaign: bool,
+    label: &dyn Fn(&Path) -> String,
+) -> Result<()> {
+    for (sub, enabled) in [
+        ("toolset", campaign),
+        ("data", true),
+        ("locale/en-us", true),
+        ("patch", true),
+        ("override", campaign),
+    ] {
+        let folder = join_ci(dir, sub);
+        if enabled && folder.is_dir() {
+            for problem in vfs.push_folder(&folder, label)? {
+                log::warn!("user package: {problem}");
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Pushes one package folder's layers. `with_override` also pushes its `override` folder
@@ -795,18 +833,26 @@ impl DaoInstall {
     /// a mod's new areas are found. Provisional, like the global order.
     pub fn env_dirs(&self) -> Result<Vec<PathBuf>> {
         let mut player = Vec::new();
+        let mut registries = Vec::new();
         if crate::mods::default_list_file().is_some() {
             if let Some(user) = crate::mods::original_user_dir(self.game()) {
+                registries.push(join_ci(&user, "Settings/AddIns.xml"));
                 player.extend(self.user_addins(&user).unwrap_or_default());
             }
             player.extend(crate::mods::default_list_addins());
         }
-        self.env_dirs_with(player)
+        let requested: Vec<String> = player
+            .iter()
+            .filter(|a| a.enabled)
+            .map(|a| a.uid.clone())
+            .collect();
+        let mut addins = self.addins_with(&registries)?;
+        addins.extend(player);
+        self.env_dirs_of(addins, &requested)
     }
 
     /// [`DaoInstall::env_dirs`] with `player`'s add-ins among the install's.
     pub fn env_dirs_with(&self, player: Vec<AddIn>) -> Result<Vec<PathBuf>> {
-        let mut dirs = vec![join_ci(&self.root, "packages/core/env")];
         let mut addins: Vec<AddIn> = self.addins()?;
         let requested: Vec<String> = player
             .iter()
@@ -814,8 +860,13 @@ impl DaoInstall {
             .map(|a| a.uid.clone())
             .collect();
         addins.extend(player);
+        self.env_dirs_of(addins, &requested)
+    }
+
+    fn env_dirs_of(&self, mut addins: Vec<AddIn>, requested: &[String]) -> Result<Vec<PathBuf>> {
+        let mut dirs = vec![join_ci(&self.root, "packages/core/env")];
         let version = self.game_version();
-        enable_prerequisites(&mut addins, &requested, version);
+        enable_prerequisites(&mut addins, requested, version);
         let mut addins: Vec<AddIn> = addins
             .into_iter()
             .filter(|a| compatible(a, version))
@@ -1642,6 +1693,131 @@ mod tests {
         // A level mounted later does not hide the override folder.
         assert_eq!(vfs.overlay().map(|o| o.layers().len()), Some(1));
         std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn user_packages_include_locale_and_campaign_toolset_in_priority_order() {
+        let base = std::env::temp_dir().join(format!("thedas-user-sources-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let write = |rel: &str| {
+            let p = base.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, rel.as_bytes()).unwrap();
+        };
+        write("install/packages/core/data/source.txt");
+        write("install/modules/single player/data/source.txt");
+        for folder in [
+            "packages/core/data",
+            "packages/core/locale/en-us",
+            "packages/core/patch",
+            "modules/single player/toolset",
+            "modules/single player/data",
+            "modules/single player/locale/en-us",
+            "modules/single player/patch",
+            "modules/single player/override",
+        ] {
+            write(&format!("user/{folder}/source.txt"));
+        }
+        write("user/packages/core/locale/fr-fr/wrong_language.txt");
+        write("user/packages/core/toolset/not_registered.txt");
+        write("user/modules/single player/patch/nested/nested.txt");
+        let install = DaoInstall::open(base.join("install")).unwrap();
+        let vfs = install
+            .stack(TextureQuality::High, Some(&base.join("user")), vec![])
+            .unwrap();
+        let labels: Vec<String> = vfs
+            .hits("source.txt")
+            .into_iter()
+            .map(|h| h.layer_label)
+            .collect();
+        assert_eq!(
+            labels,
+            [
+                "user:modules/single player/override",
+                "user:modules/single player/patch",
+                "user:modules/single player/locale/en-us",
+                "user:modules/single player/data",
+                "user:modules/single player/toolset",
+                "user:packages/core/patch",
+                "user:packages/core/locale/en-us",
+                "user:packages/core/data",
+                "modules/single player/data",
+                "packages/core/data",
+            ]
+        );
+        assert!(vfs.lookup("nested.txt").is_some());
+        assert!(vfs.lookup("wrong_language.txt").is_none());
+        assert!(vfs.lookup("not_registered.txt").is_none());
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn user_addins_obey_registry_gates_without_needing_a_manifest() {
+        let base =
+            std::env::temp_dir().join(format!("thedas-user-registry-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let write = |rel: &str, bytes: &[u8]| {
+            let p = base.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, bytes).unwrap();
+        };
+        write("install/packages/core/data/base.txt", b"base");
+        write(
+            "install/bin_ship/DAOrigins.exe",
+            &exe_with_version("1.05.13263.0"),
+        );
+        for uid in ["ON", "OFF", "NEW", "TYPE", "FALLBACK"] {
+            write(
+                &format!("user/AddIns/{uid}/core/data/{uid}.txt"),
+                b"resource",
+            );
+        }
+        write(
+            "user/AddIns/OFF/Manifest.xml",
+            br#"<AddInItem UID="OFF" Enabled="1"/>"#,
+        );
+        write(
+            "user/Settings/AddIns.xml",
+            br#"<AddInsList>
+          <AddInItem UID="ON" Enabled="1"><Type>2</Type></AddInItem>
+          <AddInItem UID="missing" Enabled="1"><Type>2</Type></AddInItem>
+          <AddInItem UID="OFF" Enabled="0"><Type>2</Type></AddInItem>
+          <AddInItem UID="NEW" Enabled="1"><Type>2</Type><GameVersion>1.06</GameVersion></AddInItem>
+          <AddInItem UID="TYPE" Enabled="1"><Type>3</Type></AddInItem>
+        </AddInsList>"#,
+        );
+        write(
+            "install/__support/userdocs/AddIns.xml",
+            br#"<AddInsList>
+          <AddInItem UID="OFF" Enabled="1"><Type>2</Type></AddInItem>
+          <AddInItem UID="FALLBACK" Enabled="1"><Type>1</Type></AddInItem>
+        </AddInsList>"#,
+        );
+        let install = DaoInstall::open(base.join("install")).unwrap();
+        let user = base.join("user");
+        let addins = install.user_addins(&user).unwrap();
+        assert_eq!(addins.len(), 5);
+        let on = addins.iter().find(|a| a.uid == "ON").unwrap();
+        let off = addins.iter().find(|a| a.uid == "OFF").unwrap();
+        assert_eq!((on.rank, off.rank), (Some(0), Some(2)));
+        let dirs = install.env_dirs_of(addins, &[]).unwrap();
+        assert!(dirs.iter().any(|d| d.ends_with("ON/core/env")));
+        for uid in ["OFF", "NEW", "TYPE"] {
+            assert!(
+                !dirs
+                    .iter()
+                    .any(|d| d.starts_with(user.join("AddIns").join(uid)))
+            );
+        }
+        let vfs = install
+            .stack(TextureQuality::High, Some(&user), vec![])
+            .unwrap();
+        assert!(vfs.addin_enabled("ON") && vfs.addin_enabled("FALLBACK"));
+        for uid in ["OFF", "NEW", "TYPE"] {
+            assert!(!vfs.addin_enabled(uid));
+            assert!(vfs.lookup(&format!("{uid}.txt")).is_none());
+        }
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     #[test]
