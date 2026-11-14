@@ -162,7 +162,7 @@ The player lives in `crates/thedas-gfx`:
   window. `bench` warms the player, waits for GPU completion per frame, and reports
   mean/median/p95/max tick+render time; movies closing without engine context are
   explicitly skipped. `fuzz` exercises the player in a debug build with seeded
-  clicks, drags, wheel, focus, text and key input,
+  left/right/double clicks, drags, wheel, focus, text and key input,
   targeting both discovered controls and random coordinates and rendering every 25
   events. Omit `--release` for this debug assertion sweep. It reports actual event
   counts and new warnings relative to startup, reopening a closed movie at most

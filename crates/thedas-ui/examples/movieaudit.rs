@@ -115,10 +115,16 @@ fn main() {
                 };
                 stage.mouse_move(x, y);
                 match r % 10 {
-                    0..=2 => {
+                    0 => {
                         stage.mouse_button(x, y, true);
                         stage.mouse_button(x, y, false);
                     }
+                    1 => stage.click_as(thedas_ui::avm1::MOUSE_RIGHT, x, y),
+                    2 => stage.click_as(
+                        thedas_ui::avm1::MOUSE_LEFT + thedas_ui::avm1::DOUBLE_CLICK,
+                        x,
+                        y,
+                    ),
                     3 => {
                         stage.mouse_button(x, y, true);
                         stage.mouse_move(x + 20.0, y + 20.0);
