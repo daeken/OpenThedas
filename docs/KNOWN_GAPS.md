@@ -81,8 +81,8 @@ these, so they are the places where one person or stream can take a large, separ
 - **Cutscene tracks.** A handful of track kinds are read; effects, fades, props, time dilation
   and facial tracks are dropped, and `LinkToActor` cameras are not followed (`SIM-140`,
   `SIM-141`).
-- **Saves are our own format.** Original `.das` saves cannot be read or written, there is no
-  autosave, and character import is ignored (`SIM-160`, `SIM-161`, `SIM-112`, `FMT-019`).
+- **Saves are our own format.** Original `.das` saves cannot be read or written, and
+  character import is ignored (`SIM-160`, `SIM-112`, `FMT-019`).
 - **Beyond the prelude is largely unexercised.** All six origins play past their openings and
   the Human Noble chain reaches Lothering. The world map, party camp and later companions have
   only that one chain behind them; the Landsmeet, the final battle, the DLC campaigns, Awakening
