@@ -1367,7 +1367,10 @@ impl Ui {
                     if let Some(f) = self.pick(
                         rfd::FileDialog::new()
                             .set_title("Choose a mod archive")
-                            .add_filter("Mod archives", &["zip", "dazip", "7z", "erf", "rim"]),
+                            .add_filter(
+                                "Mod archives",
+                                &["zip", "dazip", "7z", "rar", "erf", "rim"],
+                            ),
                         false,
                     ) {
                         self.mods.add(&f.to_string_lossy());
