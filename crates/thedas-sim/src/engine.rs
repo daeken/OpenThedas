@@ -4741,6 +4741,10 @@ pub fn call(
         // DAOrigins.exe (0x665570, 0x7556d0) adds up the power of every one of the item's
         // properties with that id, then, with bIncludeSubItems, its sub-items' (runes) the
         // same way; 0 for what is not an item. Provisional: items hold no sub-items.
+        "GetItemPropertyPower" if h.sim.game == thedas_vfs::Game::DragonAge2 => ok(Value::Float(
+            h.sim
+                .da2_item_property_power(obj(a, 0), int(a, 1), int(a, 3) != 0),
+        )),
         "GetItemPropertyPower" => {
             let (item, p) = (obj(a, 0), int(a, 1));
             let power = if h.object(item).is_some_and(|o| o.kind == ObjectKind::Item) {
@@ -4757,6 +4761,15 @@ pub fn call(
         }
         // The item's property ids, in order (DAOrigins.exe 0x674260). Provisional: the
         // order and, with bIncludeSubItems, sub-items' (items hold none yet).
+        "GetItemProperties" if h.sim.game == thedas_vfs::Game::DragonAge2 => ok(Value::Array {
+            elem: Type::Int,
+            items: h
+                .sim
+                .da2_item_property_ids(obj(a, 0), if a.get(2).is_some() { int(a, 2) } else { -1 })
+                .into_iter()
+                .map(Value::Int)
+                .collect(),
+        }),
         "GetItemProperties" => ok(Value::Array {
             elem: Type::Int,
             items: if h
@@ -10963,6 +10976,60 @@ mod coverage_tests {
                 }
             ]
         );
+    }
+
+    #[test]
+    fn da2_item_queries_filter_types_and_return_float_power() {
+        use thedas_formats::gda::Cell;
+        let table = Arc::new(EngineTable::parse(b"int[] GetItemProperties(object o, int sub, int desired = -1) = 316;\nfloat GetItemPropertyPower(object o, int p, int sub, int scale = 0) = 784;").unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        let tables = crate::m2da::Tables::empty();
+        tables.insert(
+            "#12001",
+            &["#12a02374"],
+            vec![(100, vec![Cell::Int(10)]), (200, vec![Cell::Int(5)])],
+        );
+        s.world.tables = Arc::new(tables);
+        let item = s.world.spawn(ObjectKind::Item, "weapon");
+        s.world.get_mut(item).unwrap().item_properties = Some(vec![(100, 1), (200, 8), (100, 2)]);
+        let args = [Value::Object(item), Value::Int(0), Value::Int(5)];
+        let ids = |values: &[i32]| {
+            Some(Value::Array {
+                elem: Type::Int,
+                items: values.iter().copied().map(Value::Int).collect(),
+            })
+        };
+        // Origins retains its integer sum and existing unfiltered enumeration.
+        assert_eq!(
+            run(&mut s, item, "GetItemProperties", &args),
+            ids(&[100, 200, 100])
+        );
+        s.game = thedas_vfs::Game::DragonAge2;
+        assert_eq!(run(&mut s, item, "GetItemProperties", &args), ids(&[200]));
+        assert_eq!(
+            run(&mut s, item, "GetItemProperties", &args[..2]),
+            ids(&[100, 200])
+        );
+        assert_eq!(
+            run(
+                &mut s,
+                item,
+                "GetItemPropertyPower",
+                &[Value::Object(item), Value::Int(200), Value::Int(0)]
+            ),
+            Some(Value::Float(8.))
+        );
+        // DA2 takes the first local property, rather than adding duplicate records.
+        assert_eq!(
+            run(
+                &mut s,
+                item,
+                "GetItemPropertyPower",
+                &[Value::Object(item), Value::Int(100), Value::Int(0)]
+            ),
+            Some(Value::Float(1.))
+        );
+        assert!(s.da2_item_property_ids(OBJECT_INVALID, -1).is_empty());
     }
 
     #[test]
