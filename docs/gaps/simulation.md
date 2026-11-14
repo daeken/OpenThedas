@@ -25,7 +25,7 @@ Each entry gives what the original does, what we do, evidence, a rough size (S <
 3. **Path follower details.** The exe's path follower (0xa63xxx–0xa64xxx) is not traced: goal handling, corner cutting, re-path on a moving target, timeouts. Ours uses provisional APPROACH_REPLAN 1 m and grid A*. Size M (trace) plus M (apply).
 4. **Melee ring** (#293): slots sit at fixed world angles; the exe may turn them with the target's facing (untraced). Slots are held by "heading for or standing on" rather than an explicit reservation (0x7cb0e0). The ring offset column 0xed58b0c9 and the boss meleering1..9 rings (High Dragon, Archdemon, Spirit Apparatus) are not read. Size S–M.
 5. **Attack start step's 60° facing test** (0x7a87c0). Ours turns attackers to face instantly. Turn rate and timing are not traced, nor whether the exe's turn costs time. Size S (trace) plus S.
-6. **CommandJumpToLocation, CommandFly, SetFacingPosition, GetSafeLocation, IsMoving, ClearCurrentCommand, GetRoamLocation** are not implemented (static call counts 137, 353, 4, 50, 2, 1, 2). CommandFly is mostly in flyby/cutscene scripts. Size S each.
+6. **CommandJumpToLocation, CommandFly, SetFacingPosition, IsMoving, ClearCurrentCommand, GetRoamLocation** are not implemented (static call counts 137, 353, 4, 2, 1, 2). CommandFly is mostly in flyby/cutscene scripts. Size S each.
 7. **SetPhysicsController** (52 calls) is not implemented. It turns a creature's controller on or off, which matters once blocking lands. Size S. Deps: A1.
 8. **Personal space and overlap at spawn**: creatures placed overlapping are not pushed apart (the exe's capsule grows in 0.1 steps "while there is room"). Size S.
 
