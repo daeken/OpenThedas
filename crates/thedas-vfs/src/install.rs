@@ -1173,7 +1173,7 @@ mod tests {
             &erf_v20(&[("ep_seller.ncs", b"x")]),
         );
         // The game's version, as `game_version` reads it.
-        let exe: Vec<u8> = "FileVersion\01.05.13263.0\0"
+        let exe: Vec<u8> = "FileVersion\u{0}1.05.13263.0\u{0}"
             .encode_utf16()
             .flat_map(|u| u.to_le_bytes())
             .collect();
