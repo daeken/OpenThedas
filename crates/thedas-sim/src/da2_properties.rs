@@ -17,6 +17,214 @@ fn number(cell: Option<&Cell>) -> Option<f32> {
 }
 
 impl Sim {
+    fn da2_stat_cell(&self, table: i32, column: u32, row: i32) -> Option<f32> {
+        self.world
+            .tables
+            .get(table, "")
+            .and_then(|t| number(t.cell_by_hash(column, i64::from(row))))
+    }
+
+    /// Repair snapshots made before DA2 race/stat initialization. Derived ratings remain
+    /// computed on query; do not bake their totals into bases or replay SPAWN/hire events
+    /// (which also change equipment, commands, locals and plot state).
+    pub(crate) fn repair_da2_stats(&mut self) {
+        use crate::world::ObjectKind;
+        if self.game != thedas_vfs::Game::DragonAge2 {
+            return;
+        }
+        let ids: Vec<_> = self
+            .world
+            .objects
+            .values()
+            .filter(|o| o.kind == ObjectKind::Creature)
+            .map(|o| o.id)
+            .collect();
+        for &id in &ids {
+            let o = self.world.get(id).unwrap();
+            let race = o.fields.get("Race").copied().unwrap_or(0);
+            let package = o.fields.get("Package").copied().unwrap_or(0);
+            let class = self.da2_stat_cell(163, 0xe02e_9b49, package).unwrap_or(0.) as i32;
+            // AS_ScaleCreature's PC path requires both a PC race and a PC class. A
+            // monster's zero attributes are intentional; a PC's six zero bases are not.
+            if self.da2_stat_cell(5, 0xb6bc_e25c, race) != Some(1.)
+                || self.da2_stat_cell(3, 0x7612_4935, class) != Some(1.)
+                || !(1..=6).all(|p| o.properties.get(&p).is_none_or(|v| v.0 <= 0.))
+            {
+                continue;
+            }
+            let fractions: Vec<_> = [7, 10]
+                .into_iter()
+                .map(|p| {
+                    let current = o.properties.get(&p).map_or(0., |v| v.1);
+                    let max = self.property_total(id, p);
+                    (
+                        p,
+                        if max > 0. {
+                            (current / max).clamp(0., 1.)
+                        } else {
+                            1.
+                        },
+                    )
+                })
+                .collect();
+            // AS_InitProperties: defaults in merged properties (98), not its minima.
+            let defaults: Vec<_> = self
+                .world
+                .tables
+                .get(98, "")
+                .map(|t| {
+                    t.order
+                        .iter()
+                        .filter_map(|&p| {
+                            Some((
+                                i32::try_from(p).ok()?,
+                                number(t.cell_by_hash(0xaacd_a048, p))?,
+                            ))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            if defaults.is_empty() {
+                continue;
+            }
+            let mut abilities = vec![100, 101]; // AS_InitProperties' party basics.
+            for column in [0x233f_a0bd, 0xa19d_eb47, 0x8ab0_b884] {
+                if let Some(a) = self.da2_stat_cell(5, column, race) {
+                    abilities.push(a as i32);
+                }
+            }
+            if let Some(a) = self.da2_stat_cell(3, 0x5193_4b39, class) {
+                abilities.push(a as i32);
+            }
+            // AS_SetClass: the package may replace the class's starter ability list.
+            let list = self
+                .da2_stat_cell(163, 0xe4fc_3a39, package)
+                .filter(|n| *n > 0.)
+                .or_else(|| self.da2_stat_cell(3, 0xc9c3_0b3c, class))
+                .unwrap_or(0.) as i32;
+            if let Some(t) = self.world.tables.get(list, "").filter(|_| list > 0) {
+                abilities.extend(t.order.iter().filter_map(|&a| i32::try_from(a).ok()));
+            }
+            abilities.retain(|&a| self.ability_known(a));
+            let primary = self.da2_stat_cell(3, 0xb59a_e9c3, class);
+            let old_xp = self.property_total(id, 35);
+            let xp = if old_xp > 0. {
+                old_xp
+            } else {
+                let fixed = self.da2_stat_cell(163, 0x6acc_4c10, package).unwrap_or(-1.);
+                if fixed >= 0. {
+                    fixed
+                } else {
+                    self.world.hero.map_or(0., |h| self.property_total(h, 35))
+                        + self.da2_stat_cell(163, 0xd777_aa10, package).unwrap_or(0.)
+                }
+                .max(0.)
+            };
+            let level = self.da2_level_for_xp(xp);
+            let o = self.world.get_mut(id).unwrap();
+            for (p, base) in defaults {
+                if (1..=6).contains(&p)
+                    || [7, 10, 50].contains(&p)
+                    || !o.properties.contains_key(&p)
+                {
+                    o.properties.insert(p, (base, 0.));
+                }
+            }
+            o.abilities.extend(abilities);
+            if let Some(primary) = primary {
+                o.properties.insert(50, (primary, 0.));
+            }
+            if o.properties.get(&35).is_none_or(|v| v.0 <= 0.) {
+                o.properties.insert(35, (xp, 0.));
+            }
+            if o.properties.get(&36).is_none_or(|v| v.0 <= 0.) {
+                o.properties.insert(36, (level as f32, 0.));
+            }
+            for (p, fraction) in fractions {
+                let current = fraction * self.property_total(id, p);
+                if let Some(v) = self.world.get_mut(id).unwrap().properties.get_mut(&p) {
+                    v.1 = current;
+                }
+            }
+        }
+        for id in ids {
+            let o = self.world.get(id).unwrap();
+            // Zero before first perception is the normal NPC spawn state. Only repair
+            // actors whose saved perception/combat state proves that step already ran.
+            if !o.active
+                || o.dead
+                || o.rank <= 0
+                || o.rank == 100
+                || o.fields.get("Combatant").copied().unwrap_or(0) != 0
+                || self.property_total(id, 36) > 0.
+                || !(o.combat.in_combat || o.combat.perceived.iter().any(|&p| self.hostile(id, p)))
+            {
+                continue;
+            }
+            if let Some(level) = self.da2_encounter_level(id) {
+                self.world
+                    .get_mut(id)
+                    .unwrap()
+                    .properties
+                    .insert(36, (level as f32, 0.));
+            }
+        }
+    }
+
+    fn da2_level_for_xp(&self, xp: f32) -> i32 {
+        self.world
+            .tables
+            .get(164, "")
+            .map(|t| {
+                t.order
+                    .iter()
+                    .filter(|&&row| {
+                        row > 0
+                            && number(t.cell_by_hash(0xa0f0_2e99, row))
+                                .is_some_and(|n| n >= 0. && n <= xp)
+                    })
+                    .copied()
+                    .max()
+                    .unwrap_or(1) as i32
+            })
+            .unwrap_or(1)
+    }
+
+    /// rules_core's post-spawn perception path (0x2b0c -> 0x699c -> 0x6a2e):
+    /// party level rounded down below half the XP interval, area bounds, APR ceiling.
+    /// Used only to repair a missing value in old saves; ordinary play runs that script.
+    fn da2_encounter_level(&self, id: ObjectId) -> Option<i32> {
+        let hero = self.world.hero?;
+        let area = self.world.get(hero)?.area?;
+        let key = crate::engine::local_name(self, area, &[thedas_script::vm::Value::Int(37)], 0);
+        let group = self
+            .world
+            .get(area)?
+            .locals
+            .ints
+            .get(&key)
+            .copied()
+            .unwrap_or(0);
+        let min = (self.da2_stat_cell(225, 0x7443_cc93, group)? as i32).max(1);
+        let max = self.da2_stat_cell(225, 0xa43f_9ab9, group)? as i32;
+        let mut level = self.property_total(hero, 36) as i32;
+        let lo = self.da2_stat_cell(164, 0xa0f0_2e99, level)? as i32;
+        let hi = self.da2_stat_cell(164, 0xa0f0_2e99, level.saturating_add(1))? as i32;
+        if (hi - lo) / 2 > self.property_total(hero, 35) as i32 - lo {
+            level -= 1;
+        }
+        level = level.min(max).max(min);
+        if self.da2_stat_cell(225, 0x75c4_4589, group).unwrap_or(0.) == 0. {
+            let cap = self
+                .da2_stat_cell(2, 0xd0c4_5555, self.world.get(id)?.appearance)
+                .unwrap_or(0.) as i32;
+            if cap > 0 {
+                level = level.min(cap);
+            }
+        }
+        Some(level)
+    }
+
     /// Native AddAbility (0x5909c0 -> 0x56dfe0) applies up to ten stat modifiers
     /// from table 117. Compute this contribution from known abilities, so grants,
     /// removals and older saves share one source and never apply it twice.
@@ -342,5 +550,181 @@ mod tests {
         assert!(!s.world.get(id).unwrap().fields.contains_key("Race"));
         s.world.get_mut(id).unwrap().abilities.insert(123);
         assert_eq!(s.da2_ability_property_bonus(id, 3), 0.);
+    }
+
+    #[test]
+    fn old_da2_pc_stats_rebuild_from_tables_once_without_replaying_events() {
+        let (mut s, hero) = sim();
+        s.world.hero = Some(hero);
+        s.world
+            .get_mut(hero)
+            .unwrap()
+            .properties
+            .insert(35, (400., 0.));
+        s.world.tables.insert(
+            "#98",
+            &[
+                "#baf55bcf",
+                "#f00a1048",
+                "#98377833",
+                "#b48bff62",
+                "#aacda048",
+            ],
+            [1, 2, 3, 4, 5, 6, 7, 10, 13, 24, 36, 50]
+                .into_iter()
+                .map(|p| {
+                    let (ty, deriv, default) = match p {
+                        1..=6 => (1, 0, 10.),
+                        7 => (3, 1, 50.),
+                        10 => (3, 2, 50.),
+                        13 => (1, 3, 0.),
+                        24 => (1, 5, 0.),
+                        _ => (2, 0, 0.),
+                    };
+                    (
+                        p,
+                        vec![
+                            Cell::Int(ty),
+                            Cell::Int(deriv),
+                            Cell::Float(0.),
+                            Cell::Float(10000.),
+                            Cell::Float(default),
+                        ],
+                    )
+                })
+                .collect(),
+        );
+        s.world.tables.insert(
+            "#163",
+            &["#e02e9b49", "#e4fc3a39", "#6acc4c10", "#d777aa10"],
+            vec![(
+                42,
+                vec![Cell::Int(8), Cell::Int(555), Cell::Int(-1), Cell::Int(-100)],
+            )],
+        );
+        s.world.tables.insert(
+            "#5",
+            &["#b6bce25c", "#233fa0bd"],
+            vec![(7, vec![Cell::Int(1), Cell::Int(200)])],
+        );
+        s.world.tables.insert(
+            "#3",
+            &["#76124935", "#51934b39", "#b59ae9c3"],
+            vec![(8, vec![Cell::Int(1), Cell::Int(300), Cell::Int(3)])],
+        );
+        s.world
+            .tables
+            .insert("#555", &["ID"], vec![(400, vec![Cell::Int(400)])]);
+        s.world.tables.insert(
+            "#1",
+            &["#b647b38b"],
+            [100, 101, 200, 300, 400]
+                .into_iter()
+                .map(|a| (a, vec![Cell::Int(if a == 300 { 800 } else { 0 })]))
+                .collect(),
+        );
+        s.world.tables.insert(
+            "#117",
+            &["#50120e24", "#28d12c72", "#ca5fbbe9"],
+            vec![(800, vec![Cell::Int(3), Cell::Float(3.), Cell::Int(0)])],
+        );
+        s.world.tables.insert(
+            "#164",
+            &["#a0f02e99"],
+            vec![(1, vec![Cell::Int(0)]), (2, vec![Cell::Int(500)])],
+        );
+        let id = s.world.spawn(ObjectKind::Creature, "old follower");
+        let o = s.world.get_mut(id).unwrap();
+        o.fields
+            .extend([("Race".into(), 7), ("Package".into(), 42)]);
+        o.properties
+            .extend([(7, (100., 40.)), (36, (0., 0.)), (51, (12., 0.))]);
+        o.abilities.insert(400);
+        o.locals.ints.insert("already_hired".into(), 1);
+        let rng = serde_json::to_value(&s.world.rng).unwrap();
+        let mut old = s.save_game();
+        old.revision = 8;
+        s.load_game(old).unwrap();
+        assert_eq!(s.property_total(id, 3), 13.);
+        assert_eq!(s.property_total(id, 13), 60.);
+        assert_eq!(s.property_total(id, 35), 300.);
+        assert_eq!(s.property_total(id, 36), 1.);
+        assert_eq!(s.property_total(id, 51), 12.);
+        assert_eq!(s.world.get(id).unwrap().properties[&7], (50., 40.));
+        assert_eq!(s.world.get(id).unwrap().locals.ints["already_hired"], 1);
+        assert_eq!(s.world.get(id).unwrap().abilities.len(), 5);
+        assert_eq!(serde_json::to_value(&s.world.rng).unwrap(), rng);
+        let properties = s.world.get(id).unwrap().properties.clone();
+        let save = s.save_json().unwrap();
+        s.load_json(&save).unwrap();
+        assert_eq!(s.world.get(id).unwrap().properties, properties);
+        assert_eq!(s.world.get(id).unwrap().abilities.len(), 5);
+        // An intact PC and Origins' saves must not be reconstructed.
+        s.world.get_mut(id).unwrap().properties.insert(3, (19., 0.));
+        s.repair_da2_stats();
+        assert_eq!(s.world.get(id).unwrap().properties[&3].0, 19.);
+        s.game = Game::Origins;
+        s.world.get_mut(id).unwrap().properties.clear();
+        s.repair_da2_stats();
+        assert!(s.world.get(id).unwrap().properties.is_empty());
+    }
+
+    #[test]
+    fn old_npc_levels_follow_area_bounds_xp_rounding_and_appearance_cap() {
+        let (mut s, hero) = sim();
+        let area = s.world.spawn(ObjectKind::Area, "area");
+        s.world
+            .get_mut(area)
+            .unwrap()
+            .locals
+            .ints
+            .insert("37".into(), 42);
+        s.world.hero = Some(hero);
+        let o = s.world.get_mut(hero).unwrap();
+        o.area = Some(area);
+        o.properties.extend([(35, (2000., 0.)), (36, (5., 0.))]);
+        s.world.tables.insert(
+            "#164",
+            &["#a0f02e99"],
+            vec![(5, vec![Cell::Int(1800)]), (6, vec![Cell::Int(2400)])],
+        );
+        s.world.tables.insert(
+            "#225",
+            &["#7443cc93", "#a43f9ab9", "#75c44589"],
+            vec![(42, vec![Cell::Int(3), Cell::Int(9), Cell::Int(0)])],
+        );
+        s.world
+            .tables
+            .insert("#2", &["#d0c45555"], vec![(12, vec![Cell::Int(8)])]);
+        let npc = s.world.spawn(ObjectKind::Creature, "npc");
+        let o = s.world.get_mut(npc).unwrap();
+        o.appearance = 12;
+        o.rank = 1;
+        assert_eq!(s.da2_encounter_level(npc), Some(4));
+        // A not-yet-perceived NPC's zero level is intentional.
+        s.repair_da2_stats();
+        assert_eq!(s.property_total(npc, 36), 0.);
+        s.world.get_mut(npc).unwrap().combat.in_combat = true;
+        s.repair_da2_stats();
+        assert_eq!(s.property_total(npc, 36), 4.);
+        assert_eq!(s.property_total(npc, 1), 0., "monster attributes stay zero");
+        s.world
+            .get_mut(hero)
+            .unwrap()
+            .properties
+            .insert(35, (2100., 0.));
+        assert_eq!(s.da2_encounter_level(npc), Some(5));
+        s.world
+            .tables
+            .insert("#2", &["#d0c45555"], vec![(12, vec![Cell::Int(2)])]);
+        assert_eq!(s.da2_encounter_level(npc), Some(2));
+        s.world.tables.insert(
+            "#225",
+            &["#7443cc93", "#a43f9ab9", "#75c44589"],
+            vec![(42, vec![Cell::Int(7), Cell::Int(9), Cell::Int(1)])],
+        );
+        assert_eq!(s.da2_encounter_level(npc), Some(7));
+        s.repair_da2_stats();
+        assert_eq!(s.property_total(npc, 36), 4., "preserve an assigned level");
     }
 }
