@@ -14,15 +14,16 @@
 //! offered), and its one child the target line. A link without a paraphrase points straight
 //! at its target line, which the walker says next on its own.
 //!
-//! Provisional throughout: the fields are read from the shipped files (see
-//! `OpenThedas-testdata/notes/da2-conversations.md`), not traced in DragonAge2.exe. Field
+//! The graph was first read from the shipped files (see
+//! `OpenThedas-testdata/notes/da2-conversations.md`). Native eligibility/history tracing
+//! is recorded in `docs/notes/da2-conversation-history.md`. Field
 //! 30200 is a set of flags, not a speaker: bit 0 marks a line of the other side and bit 1 a
 //! line of the player (over 30,000 lines of 250 conversations, every line a wheel choice
-//! leads to has bit 1 and every other line bit 0, without exception). Its other bits (2, 3,
-//! 5, 6, 8) are not worked out. Which creature says a line of the other side is not in the
+//! leads to has bit 1 and every other line bit 0, without exception). Bits 4/5 filter
+//! local/global spoken history. Ambient/interactive presentation is not fully modeled.
+//! Which creature says a line of the other side is not in the
 //! conversation file: its performance names it ([`performance_speaker`], [`apply_speakers`]). Not carried yet: the wheel icon, the
-//! conversation-level condition (30003), fields 30301 and 30303, and whether a line is
-//! ambient (no such field is known).
+//! conversation-level condition (30003) and field 30301.
 
 use thedas_formats::gff4::{FourCC, List};
 use thedas_formats::{Gff4, StructId, Value};
@@ -104,6 +105,7 @@ pub fn dlg_from_cnv(g: &Gff4, name: &str) -> Option<Dlg> {
             action: plotref(g, l, 30203),
             children: Vec::new(),
             show_once: 0,
+            cnv_flags: Some(int(g, l, 30200).unwrap_or(0) as u16),
             ambient: false,
             cutscene: None,
         })
@@ -128,6 +130,7 @@ pub fn dlg_from_cnv(g: &Gff4, name: &str) -> Option<Dlg> {
                     action: PlotRef::default(),
                     children: vec![target],
                     show_once: 0,
+                    cnv_flags: None,
                     ambient: false,
                     cutscene: None,
                 });
@@ -365,9 +368,11 @@ mod tests {
         assert!(!line0.reply);
         assert_eq!(line0.strref, Some(100));
         assert_eq!(line0.speaker, "OWNER");
+        assert_eq!(line0.cnv_flags, Some(0x101));
         assert_eq!(line0.children, vec![4, 5]);
         let (a, b) = (&d.nodes[4], &d.nodes[5]);
         assert!(a.reply && b.reply);
+        assert_eq!((a.cnv_flags, b.cnv_flags), (None, None));
         assert_eq!((a.strref, a.children.clone()), (Some(200), vec![1]));
         assert_eq!((b.strref, b.children.clone()), (Some(201), vec![2]));
         // A choice is gated by its line's condition.
