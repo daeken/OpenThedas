@@ -1593,10 +1593,19 @@ impl AreaRenderer {
             Some((_, _, single)) => (single.clone(), single_depth.clone()),
             None => (target.clone(), depth.clone()),
         };
-        let deferred = over.is_none()
+        let deferred_now = over.is_none()
             && self.only_draws.is_none()
-            && self.path == crate::deferred::RenderPath::Deferred
+            && self.path == crate::deferred::RenderPath::Deferred;
+        // Its own glowing emitters light the deferred draws, beside what other renderers
+        // gave (`set_effect_lights`).
+        let own = if deferred_now && self.deferred.is_some() {
+            self.emitter_lights()
+        } else {
+            Vec::new()
+        };
+        let deferred = deferred_now
             && self.deferred.as_mut().is_some_and(|p| {
+                p.set_own_lights(own);
                 p.encode(
                     ctx,
                     encoder,
