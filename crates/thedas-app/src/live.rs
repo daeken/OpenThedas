@@ -1528,6 +1528,13 @@ impl Live {
     /// are drawn anew with them. The level keeps what it has (see `workspace`).
     pub fn reload(&mut self, names: &[String]) {
         self.cache.forget(names);
+        // A model's skeleton may have changed: its rest poses are worked out again.
+        if names
+            .iter()
+            .any(|n| n.to_ascii_lowercase().ends_with(".mmh"))
+        {
+            self.animator = Animator::default();
+        }
         // Rebuilt in place at the next sync, as when a creature comes or goes (dropping
         // them would show the loading screen).
         if let Some(o) = self.objects.as_mut() {
