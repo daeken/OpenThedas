@@ -380,7 +380,9 @@ impl DeferredPass {
                         ..
                     } = l
                     {
-                        log::info!("effect light {name} at {position} colour {color} reach {radius}");
+                        log::info!(
+                            "effect light {name} at {position} colour {color} reach {radius}"
+                        );
                     }
                 }
             });
