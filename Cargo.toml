@@ -18,6 +18,7 @@ thedas-script = { path = "crates/thedas-script" }
 thedas-sim = { path = "crates/thedas-sim" }
 thedas-ui = { path = "crates/thedas-ui" }
 thedas-audio = { path = "crates/thedas-audio", default-features = false }
+thedas-video = { path = "crates/thedas-video" }
 thedas-launcher = { path = "crates/thedas-launcher" }
 thedas-store = { path = "crates/thedas-store" }
 thiserror = "2"

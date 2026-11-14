@@ -2,20 +2,19 @@
 //! (0x5ec247, filled by 0x5dd870) is `dragon_age_ea_logo.bik` then `dragon_age_main.bik`,
 //! from `packages/core/data/movies`.
 //!
-//! Provisional: the Bink frames are decoded by an `ffmpeg` beside the game or on the PATH
-//! (Homebrew's, on the Mac) until there is a Bink decoder of our own; without one the movies
-//! are skipped. They
-//! play silent (there is no audio yet). A key, a click or the pad's A, B or Start skips the
-//! movie playing (the exe's skip input is not traced). The options' `DisableIntroMovies`
-//! (and the exe's `FirstRun` gate) are not read; `--no-intro` skips them.
+//! The Bink movies are decoded by our own decoder ([`thedas_video::bink`]); their sound
+//! plays from [`crate::audio`]. A key, a click or the pad's A, B or
+//! Start skips the movie playing (the exe's skip input is not traced). The options'
+//! `DisableIntroMovies` (and the exe's `FirstRun` gate) are not read; `--no-intro` skips
+//! them.
 //!
 //! The same player shows the movies cutscenes play ([`CutsceneMovies`]).
 
 use std::collections::VecDeque;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{Receiver, TryRecvError, sync_channel};
+use thedas_video::bink::{Movie, VideoDecoder};
 
 use crate::ui::Composite;
 
@@ -67,10 +66,6 @@ impl BinkHeader {
     pub fn frame_at(&self, ms: f64) -> u64 {
         (ms.max(0.0) / 1000.0 * self.fps()).floor() as u64
     }
-
-    fn frame_bytes(&self) -> usize {
-        self.width as usize * self.height as usize * 4
-    }
 }
 
 /// Where a `w`×`h` frame sits in a `size` window: as large as fits, its shape kept, centred
@@ -95,45 +90,13 @@ pub fn movie_path(vfs: &thedas_vfs::Vfs, install: &Path, name: &str) -> PathBuf 
     }
 }
 
-/// The `ffmpeg` that decodes the movies, if there is one: beside our own executable first
-/// (where a Windows player would drop `ffmpeg.exe`), then beside the program the player
-/// started (a build an update fetched runs from a folder of its own, see
-/// `update::PROGRAM_DIR`), then in the player's data folder, then on the PATH, then, on the
-/// Mac, in Homebrew's folders (an app started from Finder does not get the shell's PATH).
-pub fn find_ffmpeg() -> Option<PathBuf> {
-    let beside = std::env::current_exe()
-        .ok()
-        .and_then(|exe| exe.parent().map(Path::to_path_buf))
-        .into_iter()
-        .chain(std::env::var_os(crate::update::PROGRAM_DIR).map(PathBuf::from))
-        .chain([crate::saves::data_dir()]);
-    let path = std::env::var_os("PATH")
-        .map(|p| std::env::split_paths(&p).collect::<Vec<_>>())
-        .unwrap_or_default();
-    let homebrew: &[&str] = if cfg!(target_os = "macos") {
-        &["/opt/homebrew/bin", "/usr/local/bin"]
-    } else {
-        &[]
-    };
-    ffmpeg_in(beside.chain(path).chain(homebrew.iter().map(PathBuf::from)))
-}
-
-/// The first of `dirs` that holds an `ffmpeg` executable under this platform's name
-/// (`ffmpeg.exe` on Windows).
-fn ffmpeg_in(dirs: impl IntoIterator<Item = PathBuf>) -> Option<PathBuf> {
-    let name = format!("ffmpeg{}", std::env::consts::EXE_SUFFIX);
-    dirs.into_iter()
-        .map(|d| d.join(&name))
-        .find(|p| p.is_file())
-}
-
 /// A movie decoding as it plays.
 pub(crate) struct Playing {
     name: String,
     /// The movie file (its sound is decoded separately; see [`crate::audio`]).
     path: PathBuf,
     header: BinkHeader,
-    child: Child,
+    /// Decoded frames (RGBA), from the decoding thread; it stops once this is dropped.
     frames: Receiver<Vec<u8>>,
     /// Milliseconds played.
     ms: f64,
@@ -149,7 +112,7 @@ pub(crate) struct Playing {
 const DECODE_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 impl Playing {
-    pub(crate) fn start(ffmpeg: &Path, path: &Path) -> Option<Self> {
+    pub(crate) fn start(path: &Path) -> Option<Self> {
         let name = path.file_name()?.to_string_lossy().into_owned();
         let mut head = [0u8; 64];
         let header = std::fs::File::open(path)
@@ -160,26 +123,44 @@ impl Playing {
             log::warn!("movie: {} is missing or not a Bink movie", path.display());
             return None;
         };
-        let mut child = Command::new(ffmpeg)
-            .args(["-nostdin", "-v", "error", "-i"])
-            .arg(path)
-            .args(["-an", "-f", "rawvideo", "-pix_fmt", "rgba", "-"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .map_err(|e| log::warn!("movie: {} could not start: {e}", ffmpeg.display()))
-            .ok()?;
-        let mut out = child.stdout.take()?;
-        let bytes = header.frame_bytes();
+        let opened = Movie::open(path).and_then(|m| {
+            let d = VideoDecoder::new(&m.header)?;
+            Ok((m, d))
+        });
+        let (mut movie, mut video) = match opened {
+            Ok(v) => v,
+            Err(e) => {
+                log::warn!("movie: {} cannot play: {e}", path.display());
+                return None;
+            }
+        };
         // A few frames ahead; the decoder waits when the player falls behind.
         let (tx, frames) = sync_channel(6);
+        let thread_name = name.clone();
         std::thread::Builder::new()
             .name(format!("movie {name}"))
             .spawn(move || {
-                loop {
-                    let mut f = vec![0u8; bytes];
-                    if out.read_exact(&mut f).is_err() || tx.send(f).is_err() {
+                let mut warned = false;
+                for i in 0..movie.frames() {
+                    let mut rgba = Vec::new();
+                    let p = match movie.packets(i) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            log::warn!("movie: {thread_name} frame {i}: {e}");
+                            break;
+                        }
+                    };
+                    match video.decode(&p.video) {
+                        Ok(f) => f.write_rgba(&mut rgba),
+                        Err(e) => {
+                            // Shown as far as it decoded; the next frame builds on it.
+                            if !std::mem::replace(&mut warned, true) {
+                                log::warn!("movie: {thread_name} frame {i}: {e}");
+                            }
+                            video.last().write_rgba(&mut rgba);
+                        }
+                    }
+                    if tx.send(rgba).is_err() {
                         break;
                     }
                 }
@@ -196,7 +177,6 @@ impl Playing {
             name,
             path: path.to_path_buf(),
             header,
-            child,
             frames,
             ms: 0.0,
             taken: 0,
@@ -373,13 +353,6 @@ fn blit_letterboxed(frame: &[u8], fsize: (u32, u32), out: &mut [u8], size: (u32,
     }
 }
 
-impl Drop for Playing {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
 /// A render pass over `target` cleared to black.
 fn black_pass<'e>(
     encoder: &'e mut wgpu::CommandEncoder,
@@ -403,20 +376,14 @@ fn black_pass<'e>(
 
 /// The boot movies, played in turn.
 pub struct Intro {
-    ffmpeg: PathBuf,
     queue: VecDeque<PathBuf>,
     playing: Option<Playing>,
     composite: Option<Composite>,
 }
 
 impl Intro {
-    /// The boot movies of the install at `install`; None when they cannot play (no
-    /// `ffmpeg`, or none of them there).
+    /// The boot movies of the install at `install`; None when none of them are there.
     pub fn boot(install: &Path) -> Option<Self> {
-        let Some(ffmpeg) = find_ffmpeg() else {
-            log::warn!("intro: no ffmpeg on the PATH, so the intro movies are skipped");
-            return None;
-        };
         let queue: VecDeque<PathBuf> = BOOT_MOVIES
             .iter()
             .map(|m| install.join(MOVIES_DIR).join(m))
@@ -430,7 +397,6 @@ impl Intro {
             return None;
         }
         Some(Self {
-            ffmpeg,
             queue,
             playing: None,
             composite: None,
@@ -451,7 +417,7 @@ impl Intro {
             let Some(next) = self.queue.pop_front() else {
                 return false;
             };
-            self.playing = Playing::start(&self.ffmpeg, &next);
+            self.playing = Playing::start(&next);
         }
     }
 
@@ -516,7 +482,7 @@ pub enum MovieState {
     None,
     /// A movie is due: it is drawn instead of the world.
     Showing,
-    /// A movie is due that cannot play (no `ffmpeg`, the movie missing or undecodable):
+    /// A movie is due that cannot play (the movie missing or undecodable):
     /// the cutscene should end now rather than show the world standing still.
     CannotPlay,
 }
@@ -583,10 +549,10 @@ impl CutsceneMovies {
         if self.playing.as_ref().map(|p| p.0) != Some(i) {
             let track = &self.tracks[i];
             let path = movie_path(vfs, install, &format!("{}.bik", track.name));
-            let Some(p) = find_ffmpeg().and_then(|f| Playing::start(&f, &path)) else {
+            let Some(p) = Playing::start(&path) else {
                 log::warn!(
-                    "cutscene {name}: movie {} cannot play (no ffmpeg, or the movie is \
-                     missing), so the cutscene ends",
+                    "cutscene {name}: movie {} cannot play (missing or undecodable), so the \
+                     cutscene ends",
                     path.display()
                 );
                 self.playing = None;
@@ -667,37 +633,6 @@ mod tests {
         b
     }
 
-    /// `ffmpeg` is found under the platform's executable name (`ffmpeg.exe` on Windows), in
-    /// the first folder that has it; a folder of that name does not count.
-    #[test]
-    fn ffmpeg_is_found_by_the_platforms_name_in_the_first_folder_that_has_it() {
-        let root = std::env::temp_dir().join(format!("thedas-ffmpeg-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let name = format!("ffmpeg{}", std::env::consts::EXE_SUFFIX);
-        let dirs: Vec<PathBuf> = ["empty", "folder", "first", "second"]
-            .iter()
-            .map(|d| root.join(d))
-            .collect();
-        for d in &dirs {
-            std::fs::create_dir_all(d).unwrap();
-        }
-        std::fs::create_dir(dirs[1].join(&name)).unwrap();
-        std::fs::write(dirs[2].join(&name), b"").unwrap();
-        std::fs::write(dirs[3].join(&name), b"").unwrap();
-        // The other platform's name is never taken.
-        let other = if cfg!(windows) {
-            "ffmpeg"
-        } else {
-            "ffmpeg.exe"
-        };
-        std::fs::write(dirs[0].join(other), b"").unwrap();
-
-        assert_eq!(ffmpeg_in(dirs.clone()), Some(dirs[2].join(&name)));
-        assert_eq!(ffmpeg_in(dirs[..2].to_vec()), None);
-        assert_eq!(ffmpeg_in(Vec::new()), None);
-        std::fs::remove_dir_all(&root).unwrap();
-    }
-
     #[test]
     fn the_bink_header_gives_the_size_and_rate() {
         let h = BinkHeader::parse(&header(260, 1280, 720, 5_000_000, 166_833)).unwrap();
@@ -730,13 +665,13 @@ mod tests {
         );
     }
 
-    /// Against a real install (`THEDAS_INSTALL`) and `ffmpeg`: both movies decode whole and
-    /// play to the end at their frame rate.
+    /// Against a real install (`THEDAS_INSTALL`): both movies decode whole and play to the
+    /// end at their frame rate.
     #[test]
     #[ignore]
     fn the_installs_boot_movies_play_through() {
         let install = PathBuf::from(std::env::var_os("THEDAS_INSTALL").expect("THEDAS_INSTALL"));
-        let mut intro = Intro::boot(&install).expect("ffmpeg and the movies");
+        let mut intro = Intro::boot(&install).expect("the movies");
         let mut ms = 0.0;
         let mut seen = Vec::new();
         while intro.advance(1000.0 / 60.0) {

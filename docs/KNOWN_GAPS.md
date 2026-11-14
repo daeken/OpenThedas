@@ -147,7 +147,6 @@ these, so they are the places where one person or stream can take a large, separ
 
 ### Platform, formats and project
 
-- **Movies need an external `ffmpeg`** beside the game or on the PATH (`CAM-029`).
 - **DA:O DLC passwords on editions other than GOG are found by a search** over the archive's
   digest (a few seconds once, then kept in the player's data folder), not yet tried on a real
   non-GOG install. DA2 DLC needs the player's keys file, and the XOR reader is checked only

@@ -218,7 +218,7 @@ Found by reading the code at main on 2026-11-12: provisional markers, stubs, ign
 ### Cutscene and movie sound
 
 - **AUD-055** **Cutscene sound tracks joined late are skipped.** Original: not traced. Ours: an `ACSP` track whose start was missed does not play. Evidence: `crates/thedas-app/src/audio.rs:1304`. Size: S. Depends: none. Kind: provisional.
-- **AUD-056** **Movie sound bypasses categories and needs ffmpeg.** Original: not traced. Ours: only boot movies' sound plays, decoded by an external `ffmpeg` at full volume outside the categories (the dialog/music sliders do not apply). Evidence: `crates/thedas-app/src/audio.rs:130`, `crates/thedas-app/src/audio.rs:1039`. Size: M. Depends: CAM-029. Kind: provisional.
+- **AUD-056** **Movie sound bypasses categories.** Original: not traced. Ours: only boot movies' sound plays, decoded natively, at full volume outside the categories (the dialog/music sliders do not apply). Evidence: `crates/thedas-app/src/audio.rs:130`, `crates/thedas-app/src/audio.rs:1039`. Size: M. Depends: none. Kind: provisional.
 
 ### Codecs
 
