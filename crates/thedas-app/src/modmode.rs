@@ -177,6 +177,8 @@ pub struct ModMode {
     pub fly: bool,
     /// What the last export wrote, or why it failed.
     pub exported: Option<String>,
+    /// Exports carry every animation of the creature's tree, not only the one it plays.
+    pub export_animations: bool,
     /// Whether live edits are mounted (the app keeps this up to date).
     pub live: bool,
     /// What live edits last did.
@@ -226,6 +228,7 @@ impl ModMode {
             world: Default::default(),
             fly: false,
             exported: None,
+            export_animations: false,
             live: false,
             live_note: None,
             place: None,
@@ -441,6 +444,13 @@ impl ModMode {
                         ui.label("Nothing picked.");
                     }
                     Some(o) => self.inspector(ui, o),
+                }
+                if inspected.is_some() {
+                    ui.checkbox(
+                        &mut self.export_animations,
+                        "Export with all its animations",
+                    )
+                    .on_hover_text("Else an export carries only the animation it is playing");
                 }
                 if let Some(note) = &self.exported {
                     ui.separator();

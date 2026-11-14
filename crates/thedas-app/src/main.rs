@@ -219,6 +219,11 @@ struct Args {
     /// video option: `on` or `off`.
     #[arg(long, default_value = "on", value_parser = ["on", "off"])]
     frame_effects: String,
+    /// How the level is drawn: `faithful` (every material through the original's own
+    /// shaders, the reference) or `deferred` (our renderer: the level's static geometry lit
+    /// per pixel by every light in reach; see docs/deferred.md). F11 flips between them.
+    #[arg(long, default_value = "faithful", value_parser = ["faithful", "deferred"])]
+    renderer: String,
     /// The original's "Graphics Detail" video option, which picks the materials' techniques
     /// and the bloom's blur: `low`, `medium` or `high` (High's materials draw as Medium's; its
     /// sun shadows are 1024 texels a side and reach further).
@@ -316,6 +321,8 @@ struct Loaded {
     shaders: String,
     /// Whether frames get the level's frame buffer effects (`--frame-effects`).
     frame_effects: bool,
+    /// How the level is drawn (`--renderer`, F11).
+    render_path: thedas_render::RenderPath,
 }
 
 impl Loaded {
@@ -386,6 +393,7 @@ fn load(
             scene: None,
             shaders: shaders.to_string(),
             frame_effects: true,
+            render_path: Default::default(),
         });
     }
     let level = match install.mount_level(&mut vfs, area) {
@@ -425,6 +433,7 @@ fn load(
         scene: Some(scene),
         shaders: shaders.to_string(),
         frame_effects: true,
+        render_path: Default::default(),
     })
 }
 
@@ -492,7 +501,7 @@ fn capture(
     shader_time: f64,
     (overlay, pointer): (Vec<[glam::Vec2; 2]>, Vec<[glam::Vec2; 2]>),
 ) -> Result<()> {
-    let mut reticle = overlay;
+    let reticle = overlay;
     let pixels = if let Some(live) = live {
         live.frame_size = (w, h);
         live.sync(ctx, thedas_render::gpu::CAPTURE_FORMAT)?;
@@ -504,7 +513,8 @@ fn capture(
         if let Some(l) = live.level.as_ref() {
             log_stats(&l.renderer);
         }
-        reticle.extend(live.reticle(&camera, (w, h), cursor));
+        // The aiming reticle is drawn with the world, under the creatures.
+        live.cursor = cursor;
         // THEDAS_BENCH_FRAMES=n: draws the frame n more times first and reports how long
         // each took (with its read back to memory), for comparing builds.
         if let Some(n) = std::env::var("THEDAS_BENCH_FRAMES")
@@ -541,6 +551,7 @@ fn capture(
                     thedas_render::gpu::CAPTURE_FORMAT,
                 );
                 renderer.frame_effects = loaded.frame_effects;
+                renderer.path = loaded.render_path;
                 renderer.set_time(shader_time);
                 log_stats(&renderer);
                 renderer.capture(ctx, &camera, w, h)?
@@ -1234,6 +1245,7 @@ impl App {
                     config.format,
                 );
                 r.frame_effects = self.loaded.frame_effects;
+                r.path = self.loaded.render_path;
                 log_stats(&r);
                 println!("camera {}", self.camera.spec());
                 Some(r)
@@ -1531,7 +1543,10 @@ impl App {
         }
         let size = (g.config.width, g.config.height);
         let drawn = match (self.live.as_mut(), g.renderer.as_mut()) {
-            (Some(live), _) => live.render(&g.ctx, &mut encoder, &view, size, &self.camera),
+            (Some(live), _) => {
+                live.cursor = self.cursor;
+                live.render(&g.ctx, &mut encoder, &view, size, &self.camera)
+            }
             (None, Some(r)) => {
                 r.advance_time(dt / 1000.0);
                 r.render(&g.ctx, &mut encoder, &view, size.0, size.1, &self.camera);
@@ -1654,13 +1669,13 @@ impl App {
                 a.text
             );
         }
-        // An ability aimed at a place shows where it would land, under the interface.
+        // The pad's marks on the world, under the interface (an ability aimed at a place
+        // shows where it would land with the world itself: see `Live::render`).
         if let Some(live) = self.live.as_mut() {
-            let mut lines = live.reticle(&self.camera, size, self.cursor);
             let ctx = self
                 .pad
                 .context_for(self.screens.as_ref(), g.ui.stage.dialog_up());
-            lines.extend(self.pad.overlay(Some(&*live), &self.camera, size, ctx));
+            let lines = self.pad.overlay(Some(&*live), &self.camera, size, ctx);
             g.reticle
                 .draw(&g.ctx.device, &mut encoder, &view, size, &lines);
         }
@@ -2280,7 +2295,26 @@ impl App {
                 entry: p.entry,
             })
         };
-        let mut e = glb::export(&read, &subject, &drawn.models);
+        // Its animations: every action of its tree, or the one it is playing.
+        let all = self.mod_mode.as_ref().is_some_and(|m| m.export_animations);
+        let actions: Vec<(String, String)> = match self.live.as_mut() {
+            Some(l) if all => l.creature_actions(id),
+            Some(l) => l
+                .inspect(id)
+                .and_then(|o| o.animations.into_iter().next())
+                .and_then(|a| Some((a.action, a.animation?)))
+                .into_iter()
+                .collect(),
+            None => Vec::new(),
+        };
+        let clips: Vec<(String, thedas_formats::anim::Animation)> = actions
+            .into_iter()
+            .filter_map(|(action, ani)| {
+                let (data, _) = vfs.read(&ani).ok()?;
+                Some((action, thedas_formats::anim::Animation::parse(&data).ok()?))
+            })
+            .collect();
+        let mut e = glb::export_with(&read, &subject, &drawn.models, &clips);
         e.manifest["left_out"] = serde_json::json!({
             "attached": drawn.attached.iter().map(|a| [&a.model, &a.node]).collect::<Vec<_>>(),
             "morph": drawn.morph,
@@ -2314,10 +2348,11 @@ impl App {
             Ok(()) => {
                 let meshes = glb::check(&e.glb).unwrap_or(0);
                 let note = format!(
-                    "Exported {} ({} models, {meshes} meshes, {} textures{}) to {}",
+                    "Exported {} ({} models, {meshes} meshes, {} textures, {} animations{}) to {}",
                     subject.tag,
                     drawn.models.len(),
                     e.images.len(),
+                    e.manifest["animations"].as_array().map_or(0, |a| a.len()),
                     if e.warnings.is_empty() {
                         String::new()
                     } else {
@@ -3305,6 +3340,35 @@ impl App {
         true
     }
 
+    /// Draws the level the way `path` says, or the other way than now for `None` (F11),
+    /// from the next frame; returns the way it is drawn now.
+    fn set_render_path(
+        &mut self,
+        path: Option<thedas_render::RenderPath>,
+    ) -> thedas_render::RenderPath {
+        let path = path.unwrap_or(self.loaded.render_path.toggled());
+        self.loaded.render_path = path;
+        if let Some(l) = self.live.as_mut() {
+            l.render_path = path;
+        }
+        let renderer = match (self.live.as_ref(), self.gfx.as_mut()) {
+            (Some(l), _) => l.level.as_ref().map(|l| &l.renderer),
+            (None, Some(g)) => g.renderer.as_mut().map(|r| {
+                r.path = path;
+                &*r
+            }),
+            _ => None,
+        };
+        let can = renderer.is_some_and(|r| r.can_defer());
+        match path {
+            thedas_render::RenderPath::Deferred if !can => log::warn!(
+                "renderer: deferred chosen, but this level has nothing it can draw deferred (or the GPU refused it): drawn faithfully"
+            ),
+            p => log::info!("renderer: {}", p.name()),
+        }
+        path
+    }
+
     /// A key pressed (not a repeat). Returns whether the game should close.
     fn key_down(&mut self, code: KeyCode) -> bool {
         self.recorder.input(format!("key {code:?}"));
@@ -3411,6 +3475,10 @@ impl App {
                     live.toggle_pause();
                     println!("{}", if live.paused { "paused" } else { "running" });
                 }
+            }
+            // Ours: the faithful renderer and the deferred one, flipped at once.
+            KeyCode::F11 => {
+                self.set_render_path(None);
             }
             KeyCode::F12 => {
                 if let Err(e) = self.save_capture() {
@@ -3623,6 +3691,10 @@ impl App {
             Step::Report => {
                 self.key_down(KeyCode::F8);
                 log.push("key f8".into());
+            }
+            &Step::Renderer(path) => {
+                let now = self.set_render_path(path);
+                log.push(format!("renderer {}", now.name()));
             }
             &Step::Saves(mode) => {
                 if let (Some(g), Some(s)) = (self.gfx.as_mut(), self.screens.as_mut()) {
@@ -4265,7 +4337,7 @@ impl App {
         let mut reticle = Vec::new();
         let pixels = match (self.live.as_mut(), g.renderer.as_mut()) {
             (Some(live), _) => {
-                reticle = live.reticle(&self.camera, (w, h), self.cursor);
+                live.cursor = self.cursor;
                 let ctx = self
                     .pad
                     .context_for(self.screens.as_ref(), g.ui.stage.dialog_up());
@@ -4479,6 +4551,7 @@ impl App {
     fn install_live(&mut self, mut l: live::Live) {
         if let Some(g) = self.gfx.as_mut() {
             l.frame_effects = self.loaded.frame_effects;
+            l.render_path = self.loaded.render_path;
             g.ui.close_all();
             g.ui.attach(&l.sim);
             seed_client_options(&l, &g.ui);
@@ -5520,6 +5593,9 @@ enum Step {
     /// The party picker opens as a script's `ShowPartyPickerGUI` opens it (for trying the
     /// picker headless).
     Picker,
+    /// `renderer faithful`, `renderer deferred` or `renderer toggle` (F11): how the level is
+    /// drawn.
+    Renderer(Option<thedas_render::RenderPath>),
     /// `key f5` or `key f9`: the save screen (1) or the load screen (2) opens (the keys
     /// themselves quick save and quick load, see `Quick`).
     Saves(i32),
@@ -6079,6 +6155,14 @@ fn parse_step(s: &str) -> Result<Step> {
         "use" if !arg.is_empty() => Step::Use(arg.to_string()),
         "rebuild" => Step::Rebuild,
         "picker" => Step::Picker,
+        "renderer" => Step::Renderer(match arg {
+            "toggle" => None,
+            a => Some(
+                thedas_render::RenderPath::parse(a)
+                    .context("renderer takes faithful, deferred or toggle")?,
+            ),
+        }),
+        "key" if arg.eq_ignore_ascii_case("f11") => Step::Renderer(None),
         "wipe" => Step::Wipe,
         "type" => Step::Type(arg.to_string()),
         "key" if text_key(arg).is_some() => {
@@ -6237,8 +6321,10 @@ fn main() -> Result<()> {
     let detail = thedas_render::scene::Detail::parse(&args.detail).unwrap_or_default();
     let mut loaded = load(&install, area, &args.shaders, &[], detail)?;
     loaded.frame_effects = args.frame_effects == "on";
+    loaded.render_path = thedas_render::RenderPath::parse(&args.renderer).unwrap_or_default();
     if let Some(l) = live.as_mut() {
         l.frame_effects = loaded.frame_effects;
+        l.render_path = loaded.render_path;
         l.detail = detail;
     }
     let hero = live.as_ref().and_then(|l| l.hero());
@@ -6344,6 +6430,10 @@ fn main() -> Result<()> {
                         Some(tag) => println!("leading with {tag}"),
                         None => println!("no party member {}", n + 1),
                     },
+                    &Step::Renderer(path) => {
+                        l.render_path = path.unwrap_or(l.render_path.toggled());
+                        println!("renderer {}", l.render_path.name());
+                    }
                     &Step::ClickAs(button, x, y) => {
                         if let Some((layer, _)) = played.as_mut() {
                             layer.click_as(button, x, y);
@@ -7083,6 +7173,7 @@ fn main() -> Result<()> {
             "shaders": args.shaders,
             "detail": args.detail,
             "frame_effects": args.frame_effects,
+            "renderer": args.renderer,
             "language": args.language,
             "module": args.module,
             "install": report::install_info(&install, &args.language),

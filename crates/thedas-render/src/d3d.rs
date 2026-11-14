@@ -973,6 +973,43 @@ fn find_param<'a>(m: &'a SceneMaterial, name: &str) -> Option<&'a Parameter> {
     parameters(m).find(|p| p.name.eq_ignore_ascii_case(name))
 }
 
+/// A material's vector parameter `name`: the material object's value, else the parameter's
+/// default in the definition (missing components zero).
+pub(crate) fn material_vector(m: &SceneMaterial, name: &str) -> Option<[f32; 4]> {
+    let mao = &m.object;
+    let given = mao
+        .vectors
+        .iter()
+        .find(|(n, _)| n.eq_ignore_ascii_case(name))
+        .map(|(_, v)| v.to_vec())
+        .or_else(|| {
+            mao.floats
+                .iter()
+                .find(|(n, _)| n.eq_ignore_ascii_case(name))
+                .map(|(_, f)| vec![*f])
+        })
+        .or_else(|| {
+            find_param(m, name)
+                .and_then(|p| p.default.as_deref())
+                .map(parse_floats)
+                .filter(|v| !v.is_empty())
+        })?;
+    let mut out = [0.0; 4];
+    for (o, v) in out.iter_mut().zip(given) {
+        *o = v;
+    }
+    Some(out)
+}
+
+/// The default texture a material's texture parameter `name` names in its definition, as a
+/// resource (`default_flatnm.dds`).
+pub(crate) fn texture_default(m: &SceneMaterial, name: &str) -> Option<String> {
+    find_param(m, name)
+        .and_then(|p| p.default.as_deref())
+        .filter(|d| !d.is_empty())
+        .map(|d| format!("{}.dds", d.to_ascii_lowercase()))
+}
+
 /// A parameter's default (its material definition's `Default`) as four-float vectors.
 pub(crate) fn default_vectors(m: &SceneMaterial, name: &str) -> Option<Vec<[f32; 4]>> {
     let f = parse_floats(find_param(m, name)?.default.as_deref()?);
