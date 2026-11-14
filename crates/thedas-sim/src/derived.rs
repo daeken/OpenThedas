@@ -42,9 +42,15 @@ impl Sim {
             .get(id)
             .and_then(|o| o.properties.get(&property))
             .map_or(0.0, |v| v.0);
-        base + self.equipment_bonus(id, property)
+        let max = base
+            + self.equipment_bonus(id, property)
             + self.attribute_bonus(id, property)
-            + self.effect_modifier(id, property)
+            + self.effect_modifier(id, property);
+        if self.game == thedas_vfs::Game::DragonAge2 {
+            max + self.da2_ability_property_bonus(id, property)
+        } else {
+            max
+        }
     }
 
     /// A property's total, as `GetCreatureProperty` gives `PROPERTY_VALUE_TOTAL`
@@ -73,7 +79,12 @@ impl Sim {
     /// A property's modifiers (`PROPERTY_VALUE_MODIFIER`): what worn items' stats and
     /// effects add.
     pub fn property_modifier(&self, id: ObjectId, property: i32) -> f32 {
-        self.equipment_bonus(id, property) + self.effect_modifier(id, property)
+        let modifier = self.equipment_bonus(id, property) + self.effect_modifier(id, property);
+        if self.game == thedas_vfs::Game::DragonAge2 {
+            modifier + self.da2_ability_property_bonus(id, property)
+        } else {
+            modifier
+        }
     }
 
     /// Keeps a depletable's current value within its total (as the executable does when
@@ -101,6 +112,9 @@ impl Sim {
     /// What a creature's attributes add to `property`'s total (0 for a property without a
     /// derivation): see the module docs.
     pub fn attribute_bonus(&self, id: ObjectId, property: i32) -> f32 {
+        if self.game == thedas_vfs::Game::DragonAge2 {
+            return self.da2_attribute_bonus(id, property);
+        }
         let Some(o) = self.world.get(id) else {
             return 0.0;
         };
