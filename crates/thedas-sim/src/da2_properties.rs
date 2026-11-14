@@ -161,7 +161,11 @@ impl Sim {
             // actors whose saved perception/combat state proves that step already ran.
             if !o.active
                 || o.dead
-                || o.area != self.world.hero.and_then(|h| self.world.get(h)?.area)
+                || o.area
+                    != self
+                        .world
+                        .controlled()
+                        .and_then(|h| self.world.get(h)?.area)
                 || o.rank <= 0
                 || o.rank == 100
                 || o.fields.get("Combatant").copied().unwrap_or(0) != 0
@@ -203,8 +207,8 @@ impl Sim {
     /// party level rounded down below half the XP interval, area bounds, APR ceiling.
     /// Used only to repair a missing value in old saves; ordinary play runs that script.
     fn da2_encounter_level(&self, id: ObjectId) -> Option<i32> {
-        let hero = self.world.hero?;
-        let area = self.world.get(hero)?.area?;
+        let leader = self.world.controlled()?; // GetPartyLeader, as in rules_core.
+        let area = self.world.get(leader)?.area?;
         let key = crate::engine::local_name(self, area, &[thedas_script::vm::Value::Int(37)], 0);
         let group = self
             .world
@@ -216,10 +220,10 @@ impl Sim {
             .unwrap_or(0);
         let min = (self.da2_stat_cell(225, 0x7443_cc93, group)? as i32).max(1);
         let max = self.da2_stat_cell(225, 0xa43f_9ab9, group)? as i32;
-        let mut level = self.property_total(hero, 36) as i32;
+        let mut level = self.property_total(leader, 36) as i32;
         let lo = self.da2_stat_cell(164, 0xa0f0_2e99, level)? as i32;
         let hi = self.da2_stat_cell(164, 0xa0f0_2e99, level.saturating_add(1))? as i32;
-        if (hi - lo) / 2 > self.property_total(hero, 35) as i32 - lo {
+        if (hi - lo) / 2 > self.property_total(leader, 35) as i32 - lo {
             level -= 1;
         }
         level = level.min(max).max(min);
@@ -747,6 +751,18 @@ mod tests {
             .properties
             .insert(35, (2100., 0.));
         assert_eq!(s.da2_encounter_level(npc), Some(5));
+        let leader = s.world.spawn(ObjectKind::Creature, "controlled follower");
+        let o = s.world.get_mut(leader).unwrap();
+        o.area = Some(area);
+        o.properties.extend([(35, (2000., 0.)), (36, (5., 0.))]);
+        s.world.get_mut(hero).unwrap().followers.push(leader);
+        s.world.controlled = Some(leader);
+        assert_eq!(
+            s.da2_encounter_level(npc),
+            Some(4),
+            "scaling follows GetPartyLeader rather than always reading the hero"
+        );
+        s.world.controlled = None;
         s.world
             .tables
             .insert("#2", &["#d0c45555"], vec![(12, vec![Cell::Int(2)])]);
