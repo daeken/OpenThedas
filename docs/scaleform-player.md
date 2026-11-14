@@ -122,6 +122,9 @@ The player lives in `crates/thedas-gfx`:
 - Every movie opened by `thedas-ui::Stage` uses `thedas-gfx` directly from its GFx bytes.
   There is no backend selector or fallback player.
 - Unknown opcodes, tags or built-ins are logged once per movie.
+- Display `_x`/`_y` writes truncate to whole twips (1/20 pixel) toward zero.
+  Rounding each fractional credits-scroll update instead compounds a position
+  difference over time, despite matching the movie's timer rate.
 - Compare hidden-window captures of the menu, chargen, HUD, inventory and conversation
   against the previous own-player build. Exercise the dwarf commoner and human noble
   chargen click-through as well as the simulation gates.
@@ -165,3 +168,16 @@ The player lives in `crates/thedas-gfx`:
   `thedas-gfx` examples: `gfxscan` (parse), `gfxrun` (headless run; `GFX_RENDER=1` times
   rendering, `GFX_TRACE_CALLS=1` logs calls, `GFX_SHOW=paths` prints values), `gfxdis`
   (disassemble ActionScript), `gfxshape` (print a character).
+- `cargo run --release -p thedas-ui --example movieaudit -- INSTALL MOVIE_DIRECTORY
+  bench|fuzz [ITERATIONS] [SEED] [movie,...]` audits the non-font movies without a
+  window. `bench` warms the player, waits for GPU completion per frame, and reports
+  mean/median/p95/max tick+render time; movies closing without engine context are
+  explicitly skipped. `fuzz` exercises the player in a debug build with seeded
+  left/right/double clicks, drags, wheel, focus, text and key input,
+  targeting both discovered controls and random coordinates and rendering every 25
+  events. Omit `--release` for this debug assertion sweep. It reports actual event
+  counts and new warnings relative to startup, reopening a closed movie at most
+  three times. Execution-limit and uncaught-throw warnings are counted separately
+  and cause a nonzero exit. Use an external process/time/memory cap per movie when sweeping a
+  corpus. Bridge requests are recorded but never dispatched to the app: isolated
+  success does not certify a populated gameplay flow.
