@@ -133,6 +133,7 @@ when their pass alpha-tests without blending. The ordinary, NoTint, MulTint, Arm
 and corresponding emissive variants retain the existing character probe, tint and lighting
 equations. Coverage uses diffuse alpha times the authored opacity multiplier and the
 pass's rounded 8-bit comparison/reference. This family has no additional shader clip.
+Its G-buffer coverage is single-sampled and binary, including under MSAA.
 The same sampled coverage supplies posed point-shadow casters. Missing opacity maps,
 multi-pass materials, runtime fades and unsupported palettes retain the forward fallback.
 `THEDAS_DEFERRED_CHARACTER_CUTOUTS=0` disables both additions for comparison.
