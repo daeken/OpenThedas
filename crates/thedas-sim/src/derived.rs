@@ -27,6 +27,7 @@ use thedas_script::vm::ObjectId;
 use thedas_formats::gda::Cell;
 
 use crate::sim::Sim;
+use crate::world::ObjectKind;
 
 /// The score attributes are counted from (0xae7d48).
 pub const ATTRIBUTE_BASE: f32 = 10.0;
@@ -104,16 +105,46 @@ impl Sim {
         }
     }
 
-    /// Keeps a depletable's current value within its total (as the executable does when
-    /// its base or modifiers change, 0x79c860, 0x79c890).
+    /// Origins' depletable current setter (0x79c8d0): floor first, then total,
+    /// including a total below the floor or unordered. Only health's floor is
+    /// changed by SetImmortal; the flag alone does not establish that floor.
+    pub(crate) fn clamped_current(&self, id: ObjectId, property: i32, value: f32) -> f32 {
+        if self.game == thedas_vfs::Game::Origins {
+            let total = self.property_total(id, property);
+            let floor = if property == 7
+                && self
+                    .world
+                    .get(id)
+                    .is_some_and(|o| o.kind == ObjectKind::Creature && o.health_floor_one)
+            {
+                1.0
+            } else {
+                0.0
+            };
+            let floored = if value > floor { value } else { floor };
+            if total > floored { floored } else { total }
+        } else {
+            value.clamp(0.0, self.depletable_current_ceiling(id, property))
+        }
+    }
+
+    /// Reclamps current after a base or modifier changes (0x79c860, 0x79c890).
     pub fn clamp_current(&mut self, id: ObjectId, property: i32) {
-        let max = self.depletable_current_ceiling(id, property);
+        let Some(current) = self
+            .world
+            .get(id)
+            .and_then(|o| o.properties.get(&property))
+            .map(|v| v.1)
+        else {
+            return;
+        };
+        let current = self.clamped_current(id, property, current);
         if let Some(v) = self
             .world
             .get_mut(id)
             .and_then(|o| o.properties.get_mut(&property))
         {
-            v.1 = v.1.clamp(0.0, max);
+            v.1 = current;
         }
     }
 
