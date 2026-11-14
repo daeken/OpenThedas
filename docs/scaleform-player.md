@@ -114,6 +114,9 @@ The player lives in `crates/thedas-gfx`:
 - Every movie opened by `thedas-ui::Stage` uses `thedas-gfx` directly from its GFx bytes.
   There is no backend selector or fallback player.
 - Unknown opcodes, tags or built-ins are logged once per movie.
+- Display `_x`/`_y` writes truncate to whole twips (1/20 pixel) toward zero.
+  Rounding each fractional credits-scroll update instead compounds a position
+  difference over time, despite matching the movie's timer rate.
 - Compare hidden-window captures of the menu, chargen, HUD, inventory and conversation
   against the previous own-player build. Exercise the dwarf commoner and human noble
   chargen click-through as well as the simulation gates.
