@@ -89,3 +89,22 @@ A new crate, `crates/thedas-gfx`, with no Ruffle dependency:
   a pixel diff, before that movie leaves the list. Order: mainmenu, startmenu2, HUD
   (portraits, quickbar, minimap), conversation, then the book screens.
 - Unknown opcodes, tags or built-ins are logged once per movie, never panics.
+
+## Status and how to try it (2026-11-14)
+
+- `THEDAS_UI_PLAYER=own` plays every movie on `thedas-gfx`; `own:mainmenu,portraits` only
+  those. Unset (or `ruffle`) keeps Ruffle.
+- Matching Ruffle side by side, with no engine state: mainmenu, startmenu2 (its logo's multiply
+  now matches the original game, which Ruffle loses), portraits, quickbar, minimap,
+  optionsmenu, newgame. All 66 movies start and run headless without errors.
+- Release build, idle: 10 µs to 9 ms of script per frame per movie (quickbar 0.27 ms against
+  Ruffle's 2.1 ms); a movie that did not change is not drawn again.
+- Not yet: Glow and DropShadow filters (3 uses), text `shadowStyle`, overlay / hard light /
+  difference / invert / erase blends (drawn normal), `setMask`, inline `<img>` in text, the
+  engine-drawn paperdoll image, and movies checked with real engine state (book screens,
+  popups, conversation).
+- Tools: `cargo run -p thedas-ui --example sidebyside -- INSTALL OUT.png MOVIES [FRAMES]
+  [WxH] [ORIGINAL.png]` (Ruffle and ours, optionally after a shot of the original);
+  `thedas-gfx` examples `gfxscan` (parse), `gfxrun` (run headless; `GFX_RENDER=1` times
+  rendering, `GFX_TRACE_CALLS=1` logs calls, `GFX_SHOW=paths` prints values), `gfxdis`
+  (disassemble ActionScript), `gfxshape` (print a character).

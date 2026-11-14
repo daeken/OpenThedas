@@ -631,7 +631,11 @@ impl Vm {
             _ => obj.clone(),
         };
         if !matches!(&f, Value::Object(fo) if self.is_function(*fo)) {
-            self.warn_once(format!("call to missing method {name}"));
+            let on = match self.display_of(obj) {
+                Some(d) => self.display.path(d, true),
+                None => obj.type_name().to_string(),
+            };
+            self.warn_once(format!("call to missing method {name} on {on}"));
             return Value::Undefined;
         }
         self.call_with_base(&f, this, args, base)

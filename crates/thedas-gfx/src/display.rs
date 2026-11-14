@@ -20,12 +20,15 @@ pub struct DisplayId {
 /// Timeline depths are stored shifted down by this (Flash reports them so from `getDepth`).
 pub const DEPTH_OFFSET: i32 = -16384;
 
+/// A filled polygon of the drawing API: RGBA and points (twips).
+pub type DrawnFill = ([u8; 4], Vec<(f32, f32)>);
+
 /// Vector drawing made with the drawing API (`beginFill`, `lineTo`, ...).
 #[derive(Clone, Debug, Default)]
 pub struct Drawing {
     /// Closed fills: colour (RGBA) and polygon points in twips.
-    pub fills: Vec<([u8; 4], Vec<(f32, f32)>)>,
-    pub current: Option<([u8; 4], Vec<(f32, f32)>)>,
+    pub fills: Vec<DrawnFill>,
+    pub current: Option<DrawnFill>,
     pub pen: (f32, f32),
 }
 

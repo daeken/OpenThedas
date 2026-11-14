@@ -1055,15 +1055,23 @@ mod tests {
             &base,
             true,
         );
-        assert_eq!(s.len(), 3);
+        let text: String = s
+            .iter()
+            .map(|x| match &x.piece {
+                Piece::Text(t) => t.as_str(),
+                Piece::Image(_) => "",
+            })
+            .collect();
+        assert_eq!(text, "Hi & bye\rx");
         assert_eq!(s[0].piece, Piece::Text("Hi & ".into()));
         assert_eq!(s[0].format.color, [255, 0, 0]);
         assert_eq!(s[0].format.size, 20.0);
         assert_eq!(s[0].format.align, TextAlign::Center);
         assert!(s[1].format.bold);
-        assert_eq!(s[1].piece, Piece::Text("bye\r".into()));
-        assert_eq!(s[2].piece, Piece::Text("x".into()));
-        assert!(!s[2].format.bold);
+        assert_eq!(s[1].piece, Piece::Text("bye".into()));
+        let last = s.last().unwrap_or_else(|| unreachable!());
+        assert_eq!(last.piece, Piece::Text("x".into()));
+        assert!(!last.format.bold);
     }
 
     struct NoFonts;

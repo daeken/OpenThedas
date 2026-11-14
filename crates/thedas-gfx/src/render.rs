@@ -190,6 +190,13 @@ struct Op {
     reference: u32,
 }
 
+/// A shape's mesh on the CPU (for scaling grids) and on the GPU.
+type CpuShape = (Arc<Mesh>, Arc<GpuMesh>);
+/// A glyph's triangles in EM units.
+type GlyphMesh = (Vec<[f32; 2]>, Vec<u32>);
+/// An uploaded image: its binding and size.
+type Bitmap = (Arc<wgpu::BindGroup>, f32, f32);
+
 pub struct Renderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -204,12 +211,12 @@ pub struct Renderer {
     clamp: wgpu::Sampler,
     repeat: wgpu::Sampler,
     shapes: HashMap<(u16, u16), Vec<Arc<GpuMesh>>>,
-    cpu_shapes: HashMap<(u16, u16), Vec<(Arc<Mesh>, Arc<GpuMesh>)>>,
+    cpu_shapes: HashMap<(u16, u16), Vec<CpuShape>>,
     scale9: HashMap<(DisplayId, [u32; 8]), Vec<Arc<GpuMesh>>>,
-    glyphs: HashMap<(usize, usize), Arc<(Vec<[f32; 2]>, Vec<u32>)>>,
+    glyphs: HashMap<(usize, usize), Arc<GlyphMesh>>,
     texts: HashMap<DisplayId, (u64, Vec<Arc<GpuMesh>>)>,
     drawings: HashMap<DisplayId, Vec<Arc<GpuMesh>>>,
-    bitmaps: HashMap<(String, bool), Option<(Arc<wgpu::BindGroup>, f32, f32)>>,
+    bitmaps: HashMap<(String, bool), Option<Bitmap>>,
     targets: Option<Targets>,
     /// Draws in the last frame.
     pub draws: usize,
@@ -595,12 +602,7 @@ impl Renderer {
         }))
     }
 
-    fn bitmap(
-        &mut self,
-        images: &mut dyn Images,
-        name: &str,
-        repeat: bool,
-    ) -> Option<(Arc<wgpu::BindGroup>, f32, f32)> {
+    fn bitmap(&mut self, images: &mut dyn Images, name: &str, repeat: bool) -> Option<Bitmap> {
         let key = (name.to_string(), repeat);
         if let Some(b) = self.bitmaps.get(&key) {
             return b.clone();
@@ -712,6 +714,7 @@ impl Renderer {
     /// corners keep their size, the edges stretch one way and the middle both
     /// (`DefineScalingGrid`). `place` maps the child's space into the clip's, `remap` the
     /// clip's unscaled space to its scaled one.
+    #[allow(clippy::too_many_arguments)]
     fn scale9_meshes(
         &mut self,
         player: &Player,
@@ -739,11 +742,7 @@ impl Renderer {
         out
     }
 
-    fn glyph(
-        &mut self,
-        font: &Arc<crate::swf::Font>,
-        index: usize,
-    ) -> Arc<(Vec<[f32; 2]>, Vec<u32>)> {
+    fn glyph(&mut self, font: &Arc<crate::swf::Font>, index: usize) -> Arc<GlyphMesh> {
         let key = (Arc::as_ptr(font) as usize, index);
         self.glyphs
             .entry(key)
@@ -1046,7 +1045,7 @@ impl Renderer {
             o.visible = v;
         }
         b.uniforms = tmp.uniforms;
-        let reference = if mode == Stencil::Push { level } else { level };
+        let reference = level;
         for mut op in tmp.ops {
             op.stencil = mode;
             op.reference = reference;

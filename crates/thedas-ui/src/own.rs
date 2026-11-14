@@ -63,13 +63,16 @@ pub fn from_host(v: &HostValue) -> UiValue {
     }
 }
 
+/// Image sizes by URL (`None`: not found).
+type SizeCache = HashMap<String, Option<(u32, u32)>>;
+
 /// Images by name for the renderer and the player: atlas images (`*.dds`), then pictures the
 /// engine made (PNG) from the resources.
 #[derive(Clone)]
 pub struct ImageFetch {
     pub lookup: ResourceLookup,
     pub atlas: Arc<Mutex<ImageSource>>,
-    sizes: Arc<Mutex<HashMap<String, Option<(u32, u32)>>>>,
+    sizes: Arc<Mutex<SizeCache>>,
 }
 
 impl ImageFetch {

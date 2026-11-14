@@ -83,6 +83,13 @@ pub fn call_code(
         vm.log
             .push(format!("call {name} ({} args) {n}", args.len()));
     }
+    // Called without a known holder (a plain call, `apply`, `call`): `super` starts from
+    // `this`'s own prototype, as Flash does.
+    let base = base.or_else(|| {
+        this.as_object()
+            .and_then(|o| vm.heap.get(o))
+            .and_then(|o| o.proto)
+    });
     let act = vm.alloc(None, Kind::Plain);
     let target = code
         .target
@@ -419,7 +426,7 @@ fn exec(vm: &mut Vm, f: &mut Frame) -> Value {
             0x06 => crate::player::set_playing(vm, f.target, true),
             0x07 => crate::player::set_playing(vm, f.target, false),
             0x08 | 0x09 => {}
-            0x0A | 0x0B | 0x0C | 0x0D | 0x0E | 0x0F => {
+            0x0A..=0x0F => {
                 let b = f.pop();
                 let a = f.pop();
                 let (x, y) = (vm.to_number(&a), vm.to_number(&b));

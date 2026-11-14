@@ -1071,9 +1071,9 @@ fn color_set_rgb(vm: &mut Vm, this: Value, args: &[Value]) -> Value {
     let c = to_rgb(vm.to_number(&arg(args, 0)));
     if let Some(d) = color_target(vm, &this) {
         if let Some(o) = vm.display.get_mut(d) {
-            for i in 0..3 {
+            for (i, v) in c.iter().enumerate() {
                 o.color.mul[i] = 0.0;
-                o.color.add[i] = c[i] as f32;
+                o.color.add[i] = *v as f32;
             }
         }
         vm.dirty = true;
