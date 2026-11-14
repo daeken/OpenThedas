@@ -17,6 +17,68 @@ fn number(cell: Option<&Cell>) -> Option<f32> {
 }
 
 impl Sim {
+    /// DragonAge2.exe 0x55ff60 selects a combat_style record, whose id is returned
+    /// by GetWeaponStyle (0x4dd1e0 -> 0x52ec60). These are DA2 ids, not DAO's enum.
+    pub(crate) fn da2_combat_style(&self, id: ObjectId) -> i32 {
+        let Some(o) = self
+            .world
+            .get(id)
+            .filter(|o| o.kind == crate::world::ObjectKind::Creature)
+        else {
+            return 0;
+        };
+        let Some(styles) = self.world.tables.get(300, "") else {
+            return 0;
+        };
+        let valid = |style: i32| style != 0 && styles.rows.contains_key(&i64::from(style));
+        let package = o.fields.get("Package").copied().unwrap_or(0);
+        let override_style = self.da2_stat_cell(163, 0x9ebe_3727, package).unwrap_or(0.) as i32;
+        if override_style > 0 && valid(override_style) {
+            return override_style;
+        }
+        // The native inventory query takes hand 0, then hand 1 only when absent.
+        let item = ["INVENTORY_SLOT_MAIN", "INVENTORY_SLOT_OFFHAND"]
+            .into_iter()
+            .find_map(|slot| {
+                o.equipment
+                    .get(&crate::sim::constant(&self.table, slot))
+                    .and_then(|id| self.world.get(*id))
+            });
+        if let Some(item) = item {
+            let row = item.fields.get("BaseItem").copied().unwrap_or(0);
+            let style = self.da2_stat_cell(12000, 0x93b9_42d7, row).unwrap_or(0.) as i32;
+            if valid(style) {
+                return style;
+            }
+        }
+        styles
+            .order
+            .iter()
+            .enumerate()
+            .skip(1)
+            .find_map(|(index, &row)| {
+                let ability = number(styles.cell_by_hash(0x5d74_e7ea, row)).unwrap_or(0.) as i32;
+                // Native 0x5600f8 looks up the scan index, not the row's ID.
+                // An absent registry key creates the default (id zero) record.
+                (ability != 0 && o.abilities.contains(&ability)).then(|| {
+                    let style = index as i32;
+                    if valid(style) { style } else { 0 }
+                })
+            })
+            .unwrap_or(0)
+    }
+
+    fn da2_modifier_state(&self, id: ObjectId) -> i32 {
+        // 0x52f7c0. Neutral/unknown 255 must never enable every conditional mask.
+        match self.da2_combat_style(id) {
+            1 => 8,
+            2 | 5 | 10 => 16,
+            3 => 4,
+            4 => 2,
+            _ => 255,
+        }
+    }
+
     fn da2_stat_cell(&self, table: i32, column: u32, row: i32) -> Option<f32> {
         self.world
             .tables
@@ -248,9 +310,6 @@ impl Sim {
         let Some(o) = self.world.get(id) else {
             return 0.0;
         };
-        let Some(abilities) = self.world.tables.get(1, "") else {
-            return 0.0;
-        };
         let Some(modifiers) = self.world.tables.get(117, "") else {
             return 0.0;
         };
@@ -267,13 +326,14 @@ impl Sim {
             0x1480_31fd,
         ];
         let mut bonus = 0.0;
+        let state = self.da2_modifier_state(id);
         for &ability in &o.abilities {
             for column in columns {
-                let Some(row) =
-                    number(abilities.cell_by_hash(column, ability as i64)).filter(|n| *n != 0.0)
-                else {
+                // 0x56e067 resolves the modifier row through the upgraded int getter.
+                let row = crate::engine::upgradable_ability_int(self, id, column, ability);
+                if row == 0 {
                     break;
-                };
+                }
                 let row = row as i64;
                 if number(modifiers.cell_by_hash(0x5012_0e24, row)).unwrap_or(0.0) as i32
                     != property
@@ -281,10 +341,7 @@ impl Sim {
                     continue;
                 }
                 let flags = number(modifiers.cell_by_hash(0xca5f_bbe9, row)).unwrap_or(0.0) as i32;
-                // Class/race/spawn bonuses have no equipment condition. Conditional
-                // rows need the DA2 weapon-mode mask (0x52f7c0), which is separate
-                // from the simulator's existing weapon-style enum.
-                if flags == 0 {
+                if flags == 0 || (matches!(state, 1 | 2 | 4 | 8 | 16) && flags & state != 0) {
                     bonus += number(modifiers.cell_by_hash(0x28d1_2c72, row)).unwrap_or(0.0);
                 }
             }
@@ -469,6 +526,220 @@ mod tests {
         }
         s.world.get_mut(id).unwrap().properties.insert(50, (3., 0.));
         (s, id)
+    }
+
+    #[test]
+    fn combat_styles_prefer_package_then_first_hand_then_learned_style() {
+        let (mut s, id) = sim();
+        s.table = Arc::new(
+            EngineTable::parse(b"int INVENTORY_SLOT_MAIN = 0;\nint INVENTORY_SLOT_OFFHAND = 1;\n")
+                .unwrap(),
+        );
+        s.world.tables.insert(
+            "#300",
+            &["#5d74e7ea"],
+            vec![
+                (0, vec![Cell::Int(0)]),
+                (1, vec![Cell::Int(201000)]),
+                (2, vec![Cell::Int(202000)]),
+                (3, vec![Cell::Int(102000)]),
+                (4, vec![Cell::Int(101000)]),
+                (5, vec![Cell::Int(301000)]),
+                (10, vec![Cell::Int(202000)]),
+                (100, vec![Cell::Int(999000)]),
+            ],
+        );
+        s.world.tables.insert(
+            "#163",
+            &["#9ebe3727"],
+            vec![(1, vec![Cell::Int(100)]), (2, vec![Cell::Int(999)])],
+        );
+        s.world.tables.insert(
+            "#12000",
+            &["#93b942d7"],
+            vec![
+                (1001, vec![Cell::Int(3)]),
+                (1200, vec![Cell::Int(5)]),
+                (1300, vec![Cell::Int(10)]),
+            ],
+        );
+        s.world
+            .get_mut(id)
+            .unwrap()
+            .abilities
+            .extend([201000, 202000]);
+        assert_eq!(s.weapon_style(id), 1, "first learned style in table order");
+        s.world.get_mut(id).unwrap().abilities.remove(&201000);
+        assert_eq!(
+            s.weapon_style(id),
+            2,
+            "the later style10 shares the bow ability"
+        );
+        let main = s.world.spawn(ObjectKind::Item, "greatsword");
+        let off = s.world.spawn(ObjectKind::Item, "staff");
+        s.world
+            .get_mut(main)
+            .unwrap()
+            .fields
+            .insert("BaseItem".into(), 1001);
+        s.world
+            .get_mut(off)
+            .unwrap()
+            .fields
+            .insert("BaseItem".into(), 1200);
+        s.world
+            .get_mut(id)
+            .unwrap()
+            .equipment
+            .extend([(0, main), (1, off)]);
+        assert_eq!(s.weapon_style(id), 3, "the first present hand wins");
+        s.world
+            .get_mut(id)
+            .unwrap()
+            .fields
+            .insert("Package".into(), 1);
+        assert_eq!(s.weapon_style(id), 100, "native NPC package override");
+        s.world
+            .get_mut(id)
+            .unwrap()
+            .fields
+            .insert("Package".into(), 2);
+        assert_eq!(s.weapon_style(id), 3, "invalid overrides fall through");
+        s.world.get_mut(id).unwrap().equipment.remove(&0);
+        assert_eq!(s.weapon_style(id), 5, "offhand only when main is absent");
+        s.world
+            .get_mut(off)
+            .unwrap()
+            .fields
+            .insert("BaseItem".into(), 1300);
+        assert_eq!(
+            s.weapon_style(id),
+            10,
+            "an item can select style10 directly"
+        );
+        s.world
+            .get_mut(off)
+            .unwrap()
+            .fields
+            .insert("BaseItem".into(), 999);
+        assert_eq!(
+            s.weapon_style(id),
+            2,
+            "unknown item style uses learned fallback"
+        );
+        s.world.get_mut(id).unwrap().abilities.clear();
+        s.world.get_mut(id).unwrap().abilities.insert(999000);
+        assert_eq!(
+            s.weapon_style(id),
+            0,
+            "native sparse fallback uses scan index 7, not row ID 100"
+        );
+        s.world.get_mut(id).unwrap().abilities.clear();
+        assert_eq!(s.weapon_style(id), 0);
+        assert_eq!(s.weapon_style(0x7f000000), 0);
+    }
+
+    #[test]
+    fn conditional_passives_follow_da2_styles_and_never_match_neutral_255() {
+        let (mut s, id) = sim();
+        s.world.tables.insert(
+            "#300",
+            &["#5d74e7ea"],
+            [0, 1, 2, 3, 4, 5, 10, 100]
+                .into_iter()
+                .map(|i| (i, vec![Cell::Int(0)]))
+                .collect(),
+        );
+        s.world.tables.insert(
+            "#1",
+            &[
+                "#b647b38b",
+                "#9d6ae048",
+                "#8471d109",
+                "#cb3047ce",
+                "#d22b768f",
+            ],
+            vec![(
+                100,
+                vec![
+                    Cell::Int(11),
+                    Cell::Int(12),
+                    Cell::Int(13),
+                    Cell::Int(14),
+                    Cell::Int(15),
+                ],
+            )],
+        );
+        s.world.tables.insert(
+            "#117",
+            &["#50120e24", "#28d12c72", "#ca5fbbe9"],
+            vec![
+                (11, vec![Cell::Int(15), Cell::Float(10.), Cell::Int(4)]),
+                (12, vec![Cell::Int(15), Cell::Float(7.), Cell::Int(8)]),
+                (13, vec![Cell::Int(15), Cell::Float(2.), Cell::Int(255)]),
+                (14, vec![Cell::Int(15), Cell::Float(4.), Cell::Int(0)]),
+                (15, vec![Cell::Int(15), Cell::Float(99.), Cell::Int(1)]),
+            ],
+        );
+        s.world.get_mut(id).unwrap().abilities.insert(100);
+        s.world.get_mut(id).unwrap().properties.insert(15, (3., 0.));
+        s.world
+            .get_mut(id)
+            .unwrap()
+            .fields
+            .insert("Package".into(), 1);
+        for (style, expected) in [
+            (1, 16.),
+            (2, 9.),
+            (3, 19.),
+            (4, 9.),
+            (5, 9.),
+            (10, 9.),
+            (100, 7.),
+            (0, 7.),
+        ] {
+            s.world
+                .tables
+                .insert("#163", &["#9ebe3727"], vec![(1, vec![Cell::Int(style)])]);
+            let before = s.save_json().unwrap();
+            assert_eq!(s.property_total(id, 15), expected, "style {style}");
+            assert_eq!(
+                s.save_json().unwrap(),
+                before,
+                "queries never bake in bonuses"
+            );
+        }
+        s.game = Game::Origins;
+        assert_eq!(s.da2_ability_property_bonus(id, 15), 0.);
+    }
+
+    #[test]
+    fn learned_upgrades_select_the_passives_modifier_row() {
+        let (mut s, id) = sim();
+        s.world.tables.insert(
+            "#1",
+            &["#b647b38b", "#d300f4d9"],
+            vec![
+                (0, vec![Cell::Int(1)]),
+                (100, vec![Cell::Int(10), Cell::Int(101)]),
+                (101, vec![Cell::Int(1)]),
+            ],
+        );
+        s.world.tables.insert(
+            "#117",
+            &["#50120e24", "#28d12c72", "#ca5fbbe9"],
+            vec![
+                (10, vec![Cell::Int(15), Cell::Float(5.), Cell::Int(0)]),
+                (11, vec![Cell::Int(15), Cell::Float(9.), Cell::Int(0)]),
+            ],
+        );
+        s.world.get_mut(id).unwrap().properties.insert(15, (3., 0.));
+        s.world.get_mut(id).unwrap().abilities.insert(100);
+        assert_eq!(s.property_total(id, 15), 8.);
+        s.world.get_mut(id).unwrap().abilities.insert(101);
+        assert_eq!(s.property_total(id, 15), 12.);
+        s.world.get_mut(id).unwrap().abilities.remove(&101);
+        assert_eq!(s.property_total(id, 15), 8.);
     }
 
     #[test]

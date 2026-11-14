@@ -92,26 +92,6 @@ pub fn talk_table(vfs: &Vfs) -> crate::protocol::StringLookup {
     Arc::new(move |id| map.get(&id).cloned())
 }
 
-/// Serves the movies' loads: images they ask for by `.dds` name (`img://name.dds`, how
-/// Scaleform games hand textures to `loadMovie`) come from the GUI atlases or the resource
-/// stack, converted to PNG, which the player can decode; everything else is passed through.
-pub fn image_lookup(
-    lookup: ResourceLookup,
-    images: Arc<std::sync::Mutex<ImageSource>>,
-) -> ResourceLookup {
-    Arc::new(move |name: &str| {
-        if name.ends_with(".dds") || name.ends_with(".tga") {
-            if let Some(img) = images.lock().ok()?.image(name) {
-                return encode_png(&img);
-            }
-            // A picture the engine made under a texture's name (map.gfx's `mapmask`), served
-            // as made (see [`Stage::set_image`]).
-            return lookup(name).filter(|b| b.starts_with(b"\x89PNG"));
-        }
-        lookup(name)
-    })
-}
-
 /// RGBA8 to PNG bytes.
 pub fn encode_png(img: &Rgba) -> Option<Vec<u8>> {
     let mut out = Vec::new();
@@ -207,8 +187,8 @@ pub const BOOK_SCREENS: &[&str] = &[
 pub const BOOK_IMAGE: &str = "BookBack_I3.dds";
 
 /// Puts the book under a book screen's own clips, inside its movie, so that its multiply
-/// images blend with the pages as they did over the game's book movie (Ruffle's multiply over
-/// a transparent target leaves them white). Both movies have a 1024x768 stage, so the image
+/// images blend with the pages as they did over the game's book movie. Both movies have a
+/// 1024x768 stage, so the image
 /// sits at the stage origin at its own size. Provisional: the black is drawn whenever the
 /// book is (the exe's `GUIBookback.ShowBlack` setter, 0x716a00, is not traced to its callers),
 /// and the book's opening and closing animations are not played.
@@ -258,7 +238,7 @@ const POPUP_CONTEXT: &str = "GUIPopup";
 
 /// Time each movie's tick takes, logged every few hundred ticks when `THEDAS_UI_PROFILE` is
 /// set: its token sync (the engine's values pushed in) and its player tick (scripts, frames
-/// and Ruffle's mouse picking).
+/// and mouse picking).
 mod profile {
     use std::collections::BTreeMap;
     use std::sync::Mutex;
@@ -453,39 +433,7 @@ impl Stage {
         }
     }
 
-    /// A movie on Ruffle: rewritten to a plain SWF with its images inlined.
-    fn open_ruffle(&mut self, name: &str) -> Result<UiMovie, UiError> {
-        let (swf, rep) = {
-            let mut images = self
-                .images
-                .lock()
-                .map_err(|_| UiError::Render("image source poisoned".into()))?;
-            crate::load_movie(name, &self.lookup, &mut images)?
-        };
-        log::info!(
-            "ui: {name}: {} images inlined, {} missing, Scaleform tags dropped {:?}",
-            rep.images_inlined.len(),
-            rep.images_missing.len(),
-            rep.dropped
-        );
-        for m in &rep.images_missing {
-            log::warn!("ui: {name}: image {m} not found");
-        }
-        let mut m = UiMovie::new(
-            &self.gpu,
-            name,
-            &swf,
-            self.size,
-            image_lookup(self.lookup.clone(), self.images.clone()),
-            Some(self.bridge.responder()),
-        )?;
-        m.set_scale9(rep.scale9.clone());
-        m.set_slots(rep.slots.clone());
-        Ok(m)
-    }
-
-    /// Loads a movie (`mainmenu.gfx`) on top of the others and starts it, on Ruffle or on
-    /// our own player (see [`crate::own::wanted`]).
+    /// Loads a movie (`mainmenu.gfx`) on top of the others and starts it.
     pub fn open(&mut self, name: &str) -> Result<(), UiError> {
         // A popup layer loaded anew has no dialog box up, whatever the one before it left
         // on the context stack.
@@ -498,22 +446,16 @@ impl Stage {
                 .value(QUICKBAR_EXPAND_VALUE)
                 .map(|v| (v, QUICKBAR_SETTLE_MS));
         }
-        let mut m = if crate::own::wanted(name) {
-            let gfx = (self.lookup)(name).ok_or_else(|| UiError::NotFound(name.to_string()))?;
-            log::info!("ui: {name}: on our own player");
-            UiMovie::new_own(
-                &self.gpu,
-                name,
-                &gfx,
-                self.size,
-                self.lookup.clone(),
-                self.images.clone(),
-                Some(self.bridge.responder()),
-            )?
-        } else {
-            self.open_ruffle(name)?
-        };
-        let swf = (self.lookup)(name).unwrap_or_default();
+        let gfx = (self.lookup)(name).ok_or_else(|| UiError::NotFound(name.to_string()))?;
+        let mut m = UiMovie::new(
+            &self.gpu,
+            name,
+            &gfx,
+            self.size,
+            self.lookup.clone(),
+            self.images.clone(),
+            Some(self.bridge.responder()),
+        )?;
         if self.mouse != OFF_STAGE {
             m.mouse_move(self.mouse.0, self.mouse.1);
         }
@@ -530,7 +472,7 @@ impl Stage {
         }
         // StartSceneFromFlash records the authored stage size; when the game starts the movie
         // it sets the size itself, and layout depends on it.
-        if let Some((w, h)) = crate::gfx::Movie::parse(&swf)
+        if let Some((w, h)) = crate::gfx::Movie::parse(&gfx)
             .ok()
             .and_then(|x| x.stage_size())
         {
@@ -608,8 +550,7 @@ impl Stage {
             m.tick(dt_ms);
             profile::note(&m.name, synced, started.elapsed() - synced);
             // quickbar.gfx's first frame places its expansion handle before the handle's
-            // own init (Ruffle runs the clips' init in another order than Scaleform): the
-            // handle sits at its authored place, the bar's full width, and the movie writes
+            // own init: the handle sits at its authored place, the bar's full width, and the movie writes
             // that back as the player's choice. While the movie settles, the engine's value
             // is put back and the bar laid out again whenever the movie has changed it. The
             // window is the movie's own time: a tick does not always play a frame (a short
@@ -864,50 +805,36 @@ impl Stage {
 
     /// A whole click (press and release) at (`x`, `y`) that the movies see as Scaleform
     /// `button` ([`crate::avm1::MOUSE_RIGHT`], or a button + [`crate::avm1::DOUBLE_CLICK`]
-    /// for a double click), delivered as an ordinary click with the button set aside (see
-    /// [`crate::avm1::BUTTON_VAR`]).
+    /// for a double click).
     pub fn click_as(&mut self, button: f64, x: f64, y: f64) {
         let mut released = None;
         for m in self.input_movies() {
-            m.set(crate::avm1::BUTTON_VAR, UiValue::Number(button));
             m.mouse_move(x, y);
             released = released.or(release_text_focus(m));
-            m.mouse_button(x, y, true);
-            m.mouse_button(x, y, false);
-            m.set(crate::avm1::BUTTON_VAR, UiValue::Undefined);
+            m.button_as(button, x, y, true);
+            m.button_as(button, x, y, false);
         }
         self.after_click(released, true);
     }
 
     /// A press (`down`) or release at (`x`, `y`) that the movies see as Scaleform `button`
-    /// ([`crate::avm1::MOUSE_RIGHT`]), delivered as the left button with the button set
-    /// aside (see [`crate::avm1::BUTTON_VAR`]): a right press opens an item's radial menu,
+    /// ([`crate::avm1::MOUSE_RIGHT`]): a right press opens an item's radial menu,
     /// and its release picks the action under the mouse.
     pub fn button_as(&mut self, button: f64, x: f64, y: f64, down: bool) {
         let mut released = None;
         for m in self.input_movies() {
-            m.set(crate::avm1::BUTTON_VAR, UiValue::Number(button));
             m.mouse_move(x, y);
             if down {
                 released = released.or(release_text_focus(m));
             }
-            m.mouse_button(x, y, down);
-            m.set(crate::avm1::BUTTON_VAR, UiValue::Undefined);
+            m.button_as(button, x, y, down);
         }
         self.after_click(released, !down);
     }
 
-    /// Loads that failed, by movie.
+    /// Failed loads reported by the movie loader. The current player logs these directly.
     pub fn failed_loads(&self) -> Vec<(String, String)> {
-        self.movies
-            .iter()
-            .flat_map(|m| {
-                m.fetches()
-                    .into_iter()
-                    .filter(|(_, ok)| !ok)
-                    .map(|(u, _)| (m.name.clone(), u))
-            })
-            .collect()
+        Vec::new()
     }
 
     /// Renders every movie and blends the frames over `base` (straight RGBA) on the CPU.
@@ -975,25 +902,6 @@ mod tests {
             vec!["quickbar.gfx", "x.swf"]
         );
         assert_eq!(movie_names("hud").len(), 3);
-    }
-
-    #[test]
-    fn images_become_png_and_other_loads_pass_through() {
-        let lookup: ResourceLookup = Arc::new(|n: &str| (n == "lib.gfx").then(|| b"GFX".to_vec()));
-        let images = Arc::new(std::sync::Mutex::new(ImageSource::new(
-            lookup.clone(),
-            Vec::<String>::new(),
-        )));
-        let l = image_lookup(lookup, images);
-        assert_eq!(l("lib.gfx"), Some(b"GFX".to_vec()));
-        assert_eq!(l("missing.dds"), None);
-        let png = encode_png(&Rgba {
-            width: 1,
-            height: 1,
-            pixels: vec![1, 2, 3, 4],
-        })
-        .unwrap();
-        assert_eq!(&png[1..4], b"PNG");
     }
 
     #[test]

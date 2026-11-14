@@ -58,7 +58,7 @@ original scene before selecting `path = RenderPath::Deferred`.
    through walls into rooms the original never lit. Tiled or clustered culling replaces
    the per-pixel loop over all of them when light counts call for it.
 4. Everything not deferred draws forward with its original shaders over that colour and
-   depth: blended, alpha-tested and multi-pass materials, water, sky, trees,
+   depth: blended, unsupported alpha-tested and multi-pass materials, water, sky, trees,
    unsupported character materials, cut-away meshes and particles. Then frame effects as now.
 
 Debug views in place of the lit frame: `THEDAS_DEFERRED_VIEW=albedo|normal|lightmap|
@@ -75,6 +75,17 @@ a tangent frame from screen derivatives).
 (`Static1.psh`, or `Static1_Fast.psh` at Low; no alpha test, no blending), not
 SpeedTree or cut away; and Origins terrain (`Terrain2.vsh` + `Terrain1.psh`, or
 `Terrain3` at Low detail).
+
+Single-pass `Static1_Punch` also enters the G-buffer, retaining diffuse alpha times
+`mml_fOpacityMultiplier`, the shader's extra 0.3 clip, and its authored comparison/reference
+on rounded saturated 8-bit alpha. Its diffuse sampler retains addressing, min/mag/mip
+filtering and border fallback. The same coverage masks reflections; holes write neither
+G-buffer values nor depth, so SSAO and later forward geometry see through them. Missing
+opacity maps keep the faithful fallback. `THEDAS_DEFERRED_PUNCH=0` keeps these draws
+forward. Alpha coverage is binary at the G-buffer's single sample, including with MSAA.
+Cutout point shadows use the independent textured-caster plan; these cards never enter
+the opaque cube-shadow pipeline. Prop punch, eyelashes, hair, trees and blended materials
+retain their own forward equations.
 
 **Objects and characters**: opaque, single-pass `Prop1`, `Weapon1`, `Cloth1`, and
 `Char1` with `Ch1`, its NoTint, MulTint and ArmourTint variants, and their emissive
@@ -115,7 +126,7 @@ room indices, SSAO depth and posed point-shadow geometry with the bodies.
 
 This is our deferred material approximation, not shader parity: character rim lighting,
 skin scattering, gore/heraldry and remote-material effects are not represented yet. Hair,
-alpha-tested and blended materials, lower-detail Char2 and other unsupported families
+unsupported alpha-tested and blended materials, lower-detail Char2 and other unsupported families
 still draw forward; they also remain absent from deferred point-shadow casters. Tangent
 frames still come from derivatives. Probe assignments remain those made at scene load.
 The float lightmap target may change baked-image rounding slightly.

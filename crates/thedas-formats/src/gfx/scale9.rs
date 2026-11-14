@@ -1,9 +1,9 @@
 //! Nine-slice scaling (`DefineScalingGrid`) for players that ignore it.
 //!
 //! A sprite with a scaling grid keeps its corners at their size when it is scaled: only the
-//! middle stretches. Ruffle stores the grid but draws the sprite scaled as a whole, so a
+//! middle stretches. A consumer that scales a grid sprite as a whole leaves a
 //! panel built from a small framed image (optionsmenu.gfx's background, 87 by 103 pixels
-//! stretched over the screen) came out as a smear of its border. [`plan`] finds the grid
+//! stretched over the screen) smeared across its border. [`plan`] finds the grid
 //! sprites whose only content is one placed shape and [`Plan::rewrite_sprite`] splits each
 //! into nine pieces: each piece shows the shape through a rectangular mask over one cell of
 //! the grid. The host lays the pieces out as the sprite's scale changes ([`layout`]): the
