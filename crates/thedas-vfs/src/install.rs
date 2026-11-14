@@ -383,7 +383,8 @@ impl DaoInstall {
         user: Option<&Path>,
         packaged: Vec<AddIn>,
     ) -> Result<Vfs> {
-        let campaign = format!("modules/{}", self.game().campaign_module());
+        let game = self.game();
+        let campaign = format!("modules/{}", game.campaign_module());
         let mut vfs = Vfs::new();
         let core = join_ci(&self.root, "packages/core");
         let install = |p: &Path| self.relative(p).into_owned();
@@ -402,6 +403,7 @@ impl DaoInstall {
                     &mut vfs,
                     &join_ci(&offer.dir, "module"),
                     quality,
+                    game,
                     true,
                     &install,
                 )?;
@@ -411,6 +413,7 @@ impl DaoInstall {
                 &mut vfs,
                 &join_ci(&offer.dir, "core"),
                 quality,
+                game,
                 false,
                 &install,
             )?;
@@ -424,18 +427,26 @@ impl DaoInstall {
                 .replace(std::path::MAIN_SEPARATOR, "/");
             format!("{}{rel}", crate::mods::USER_LABEL)
         };
-        push_package(&mut vfs, &core, quality, false, &install)?;
+        push_package(&mut vfs, &core, quality, game, false, &install)?;
         push_package(
             &mut vfs,
             &join_ci(&self.root, &campaign),
             quality,
+            game,
             true,
             &install,
         )?;
         if let Some(user) = user {
             let user_core = join_ci(user, "packages/core");
-            push_package(&mut vfs, &user_core, quality, false, &player)?;
-            push_package(&mut vfs, &join_ci(user, &campaign), quality, true, &player)?;
+            push_package(&mut vfs, &user_core, quality, game, false, &player)?;
+            push_package(
+                &mut vfs,
+                &join_ci(user, &campaign),
+                quality,
+                game,
+                true,
+                &player,
+            )?;
         }
         let registries: Vec<PathBuf> = user
             .map(|u| join_ci(u, "Settings/AddIns.xml"))
@@ -458,12 +469,20 @@ impl DaoInstall {
             } else {
                 &crate::mods::cache_label
             };
-            push_package(&mut vfs, &join_ci(&addin.dir, "core"), quality, true, label)?;
+            push_package(
+                &mut vfs,
+                &join_ci(&addin.dir, "core"),
+                quality,
+                game,
+                true,
+                label,
+            )?;
             if addin.extends_base_campaign() {
                 push_package(
                     &mut vfs,
                     &join_ci(&addin.dir, "module"),
                     quality,
+                    game,
                     true,
                     label,
                 )?;
@@ -472,7 +491,10 @@ impl DaoInstall {
         let over = join_ci(&core, "override");
         if over.is_dir() {
             let mut overlay = Vfs::new();
-            overlay.push_directory(&over, true, self.relative(&over).into_owned())?;
+            let label = |p: &Path| self.relative(p).into_owned();
+            for problem in overlay.push_folder(&over, &label)? {
+                log::warn!("install override folder: {problem}");
+            }
             vfs.set_overlay(overlay);
         }
         Ok(vfs)
@@ -485,43 +507,105 @@ fn push_package(
     vfs: &mut Vfs,
     dir: &Path,
     quality: TextureQuality,
+    game: Game,
     with_override: bool,
     label: &dyn Fn(&Path) -> String,
 ) -> Result<()> {
     if !dir.is_dir() {
         return Ok(());
     }
-    // Loose files first (lowest), as xoreos does.
-    for (sub, recursive) in [
-        ("data", false),
-        ("data/abilities", false),
-        ("data/movies", false),
-        ("data/talktables", false),
-        ("data/cursors", false),
-        ("textures", true),
-        ("audio", true),
-        ("patch", false),
-    ] {
-        let d = join_ci(dir, sub);
-        if d.is_dir() {
-            vfs.push_directory(&d, recursive, label(&d))?;
+    if game == Game::Origins {
+        push_origins_package(vfs, dir, quality, label)?;
+    } else {
+        // Loose files first (lowest), as xoreos does.
+        for (sub, recursive) in [
+            ("data", false),
+            ("data/abilities", false),
+            ("data/movies", false),
+            ("data/talktables", false),
+            ("data/cursors", false),
+            ("textures", true),
+            ("audio", true),
+            ("patch", false),
+        ] {
+            let d = join_ci(dir, sub);
+            if d.is_dir() {
+                vfs.push_directory(&d, recursive, label(&d))?;
+            }
         }
-    }
-    for sub in [
-        "data",
-        "data/abilities",
-        &format!("textures/{}", quality.dir()),
-        "patch",
-    ] {
-        for archive in archives_in(&join_ci(dir, sub))? {
-            let l = label(&archive);
-            vfs.push_archive(&archive, l)?;
+        for sub in [
+            "data",
+            "data/abilities",
+            &format!("textures/{}", quality.dir()),
+            "patch",
+        ] {
+            for archive in archives_in(&join_ci(dir, sub))? {
+                let l = label(&archive);
+                vfs.push_archive(&archive, l)?;
+            }
         }
     }
     let over = join_ci(dir, "override");
     if with_override && over.is_dir() {
-        vfs.push_directory(&over, true, label(&over))?;
+        for problem in vfs.push_folder(&over, label)? {
+            log::warn!("override folder: {problem}");
+        }
     }
+    Ok(())
+}
+
+/// One package folder's layers in the original's order (Dragon Age: Origins), lowest first.
+///
+/// Traced (priorities in `notes/resource-priority-trace.md`; the folder indexer 0x4cf690 and
+/// the container order 0x4e6660): the package's folders are sources at their own priority
+/// numbers, lowest number winning: `override`, then `patch`, `locale`, `env`, `textures`,
+/// `data`, then audio. A folder registered to hold archives (`data`, `patch`, `textures`...)
+/// contributes its loose files as a source of rank 1 and each `.erf` in it as a source of a
+/// higher rank at the same priority, and of two sources of one priority the lower rank wins:
+/// a loose file beats an archive of the same folder, and archives of one folder go by path,
+/// the greater path winning. So here: audio, then `data` (its archives, then its loose
+/// files, and the loose `abilities`, `movies`, `talktables` and `cursors` folders with them),
+/// then `textures`, then `patch`.
+///
+/// Provisional: that the loose `data` subfolders sit at `data`'s priority (the original
+/// registers other folders for them that were not traced), and that `.rim` archives sort
+/// with the `.erf` ones (the original hands a `.rim` to another registry, 0x4c7b00).
+fn push_origins_package(
+    vfs: &mut Vfs,
+    dir: &Path,
+    quality: TextureQuality,
+    label: &dyn Fn(&Path) -> String,
+) -> Result<()> {
+    let loose = |vfs: &mut Vfs, sub: &str, recursive: bool| -> Result<()> {
+        let d = join_ci(dir, sub);
+        if d.is_dir() {
+            vfs.push_directory(&d, recursive, label(&d))?;
+        }
+        Ok(())
+    };
+    let archives = |vfs: &mut Vfs, sub: &str| -> Result<()> {
+        for archive in archives_in(&join_ci(dir, sub))? {
+            let l = label(&archive);
+            vfs.push_archive(&archive, l)?;
+        }
+        Ok(())
+    };
+    loose(vfs, "audio", true)?;
+    archives(vfs, "data")?;
+    archives(vfs, "data/abilities")?;
+    for sub in [
+        "data",
+        "data/abilities",
+        "data/movies",
+        "data/talktables",
+        "data/cursors",
+    ] {
+        loose(vfs, sub, false)?;
+    }
+    archives(vfs, &format!("textures/{}", quality.dir()))?;
+    loose(vfs, "textures", true)?;
+    archives(vfs, "patch")?;
+    loose(vfs, "patch", false)?;
     Ok(())
 }
 
@@ -1098,6 +1182,121 @@ mod tests {
         assert_eq!(vfs.read("sp_core.uti").unwrap().0, b"sp core");
         assert_eq!(vfs.read("sword.uti").unwrap().0, b"dlc sword");
         assert!(vfs.lookup("sp_only.utc").is_some());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Inside one package the original's order: `patch` over `textures` over `data`, and in
+    /// each folder the loose files over its archives, the greater archive path winning.
+    #[test]
+    fn a_package_is_ordered_as_the_original_orders_it() {
+        let root = std::env::temp_dir().join(format!("thedas-package-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let write = |rel: &str, bytes: &[u8]| {
+            let p = root.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, bytes).unwrap();
+        };
+        let core = "packages/core";
+        write(
+            &format!("{core}/data/d1.erf"),
+            &erf_v20(&[
+                ("a.gda", b"data d1"),
+                ("b.gda", b"data d1"),
+                ("c.gda", b"data d1"),
+            ]),
+        );
+        write(
+            &format!("{core}/data/d2.erf"),
+            &erf_v20(&[("a.gda", b"data d2")]),
+        );
+        write(&format!("{core}/data/b.gda"), b"data loose");
+        write(&format!("{core}/data/c.gda"), b"data loose");
+        write(
+            &format!("{core}/patch/p0.erf"),
+            &erf_v20(&[("c.gda", b"patch p0"), ("d.gda", b"patch p0")]),
+        );
+        write(&format!("{core}/patch/c.gda"), b"patch loose");
+        let install = DaoInstall::open(&root).unwrap();
+        let vfs = install.global_vfs(TextureQuality::High).unwrap();
+        let read = |n: &str| String::from_utf8(vfs.read(n).unwrap().0).unwrap();
+        assert_eq!(read("a.gda"), "data d2", "the greater archive path wins");
+        assert_eq!(
+            read("b.gda"),
+            "data loose",
+            "loose beats the folder's archives"
+        );
+        assert_eq!(
+            read("c.gda"),
+            "patch loose",
+            "patch beats data; loose beats archive"
+        );
+        assert_eq!(read("d.gda"), "patch p0");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// An override folder as the original scans it: every subfolder is a source of its own
+    /// and every `.erf` an archive, all at one priority; loose files beat archives, and of two
+    /// folders or two archives the one with the greater path (case counts) wins.
+    #[test]
+    fn an_override_folder_is_ordered_as_the_original_orders_it() {
+        let root = std::env::temp_dir().join(format!("thedas-override-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let write = |rel: &str, bytes: &[u8]| {
+            let p = root.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, bytes).unwrap();
+        };
+        write(
+            "packages/core/data/core.erf",
+            &erf_v20(&[("core.gda", b"core")]),
+        );
+        let over = "packages/core/override";
+        // Loose files: the root's, and two subfolders' (`b` is greater than `a`).
+        write(&format!("{over}/both.gda"), b"root loose");
+        write(&format!("{over}/a/both.gda"), b"a loose");
+        write(&format!("{over}/b/both.gda"), b"b loose");
+        write(&format!("{over}/a/only_a.gda"), b"a only");
+        // Archives: one in the root, one in each subfolder. An archive never beats a loose
+        // file, whatever its path; between archives the greater path wins.
+        write(
+            &format!("{over}/0.erf"),
+            &erf_v20(&[
+                ("both.gda", b"root erf"),
+                ("arch.gda", b"root erf"),
+                ("core.gda", b"root erf"),
+            ]),
+        );
+        write(
+            &format!("{over}/a/a.erf"),
+            &erf_v20(&[("arch.gda", b"a erf"), ("only_erf_a.gda", b"a erf")]),
+        );
+        write(
+            &format!("{over}/b/b.erf"),
+            &erf_v20(&[("arch.gda", b"b erf")]),
+        );
+        // Case counts: `Z` is below `a` as UTF-16 code units (a case-blind order puts it above).
+        write(
+            &format!("{over}/Z/up.erf"),
+            &erf_v20(&[("case.gda", b"Z erf")]),
+        );
+        write(
+            &format!("{over}/a/low.erf"),
+            &erf_v20(&[("case.gda", b"a erf")]),
+        );
+        let install = DaoInstall::open(&root).unwrap();
+        let vfs = install.global_vfs(TextureQuality::High).unwrap();
+        let read = |n: &str| String::from_utf8(vfs.read(n).unwrap().0).unwrap();
+        // Subfolders beat the root, the greater subfolder beats the lesser, loose beats erf.
+        assert_eq!(read("both.gda"), "b loose");
+        assert_eq!(read("only_a.gda"), "a only");
+        // Archives: the greater path wins (`\\b\\b.erf` over `\\a\\a.erf` over `\\0.erf`, since
+        // the root's `\zzz.erf` is below every subfolder's `\x\...`).
+        assert_eq!(read("arch.gda"), "b erf");
+        assert_eq!(read("only_erf_a.gda"), "a erf");
+        // An override archive beats the core package's.
+        assert_eq!(read("core.gda"), "root erf");
+        // Case counts: `\a\low.erf` is above `\Z\up.erf`.
+        assert_eq!(read("case.gda"), "a erf");
         std::fs::remove_dir_all(&root).unwrap();
     }
 
