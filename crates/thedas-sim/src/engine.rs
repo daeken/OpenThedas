@@ -1921,7 +1921,13 @@ pub fn call(
                 PROPERTY_MANA_STAMINA
             };
             if h.object(id).is_some_and(|o| o.kind == ObjectKind::Creature) {
-                let max = h.sim.property_total(id, p);
+                let mut max = h.sim.property_total(id, p);
+                if name == "SetCreatureStamina" {
+                    // Depletable current setter 0x5bd800 caps usable stamina by its
+                    // reserved percentage (property 11), while GetMax returns nominal total.
+                    let reserved = h.sim.property_total(id, 11).clamp(0.0, 100.0);
+                    max *= 1.0 - reserved * 0.01;
+                }
                 if let Some(o) = h.sim.world.get_mut(id) {
                     o.properties.entry(p).or_insert((0.0, 0.0)).1 =
                         (int(a, 1) as f32).clamp(0.0, max.max(0.0));
@@ -9567,6 +9573,10 @@ mod coverage_tests {
             assert_eq!(s.world.get(mage).unwrap().properties[&10].1, current);
         }
         assert_eq!(s.world.get(mage).unwrap().properties[&8], (999.0, 998.0));
+        s.world.get_mut(mage).unwrap().properties.insert(11, (25.0, 0.0));
+        run(&mut s, mage, "SetCreatureStamina", &[Value::Object(mage), Value::Int(90)]);
+        assert_eq!(s.world.get(mage).unwrap().properties[&10].1, 40.125);
+        assert_eq!(get(&mut s, "GetCreatureMaxStamina", mage), Some(Value::Int(53)));
         for id in [chest, OBJECT_INVALID] {
             assert_eq!(get(&mut s, "GetCreatureStamina", id), Some(Value::Int(-1)));
             assert_eq!(
