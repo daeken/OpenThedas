@@ -4193,6 +4193,18 @@ pub fn call(
         // Dragon Age II presentation calls (a sound parameter, blood decals on the ground):
         // nothing in the simulation changes.
         "SetAudioGameParameter" | "SpawnRandomDecals" => void(),
+        // Dragon Age II: the creature's head morph (`.mor`, named without its extension), as
+        // character creation sets the hero's (`hm_iconicmale` for the default Hawke, after
+        // clearing it with ""). An empty name leaves the template's. Provisional: from
+        // DA2's script.ldf declaration and sys_chargen's calls.
+        "SetHeadMorphName" => {
+            let name = string(a, 1);
+            let name = name.trim().trim_end_matches(".mor").to_ascii_lowercase();
+            if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
+                o.head_morph = (!name.is_empty()).then_some(name);
+            }
+            void()
+        }
         // The player's profile unlocks, the cross-game vault and the GUI attribute tree are
         // not kept: none is set.
         "GetGlobalUnlock" | "GetVaultInt" | "GetAttributeBool" => ok(Value::Int(0)),
@@ -5027,6 +5039,7 @@ mod tests {
         int GetLocalInt(object o, int n) = 993;\n\
         void PlayCutscene(resource r) = 994;\n\
         int hasflag(int nInt, int nFlag) = 420;\n\
+        void SetHeadMorphName(object o, string s) = 887;\n\
         int GetUpgradableAbilityHashedM2DAInt(object o, int nColumnHash, int nAbilityId) = 875;\n\
         float GetUpgradableAbilityHashedM2DAFloat(object o, int nColumnHash, int nAbilityId) = 876;\n";
 
@@ -5097,6 +5110,23 @@ mod tests {
             ),
             Some(Value::Int(0))
         );
+        run(
+            &mut s,
+            1,
+            "SetHeadMorphName",
+            &[o(npc), Value::String("HM_IconicMale.mor".into())],
+        );
+        assert_eq!(
+            s.world.get(npc).unwrap().head_morph.as_deref(),
+            Some("hm_iconicmale")
+        );
+        run(
+            &mut s,
+            1,
+            "SetHeadMorphName",
+            &[o(npc), Value::String(String::new())],
+        );
+        assert_eq!(s.world.get(npc).unwrap().head_morph, None);
     }
 
     #[test]

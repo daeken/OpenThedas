@@ -34,6 +34,10 @@ Start the game. That is all.
 Rules for the list:
 
 - A later line beats an earlier one when both have the same file.
+- Inside one mod, the game's own rule for its override folder applies: file names alone count
+  (folders do not), a loose file beats a file inside an `.erf` of the same mod, and between two
+  loose files, or two `.erf` files, the one in the folder whose path sorts later wins (capital
+  letters sort before lower-case ones). If two files in one mod fight, rename a folder.
 - Blank lines and lines starting with `#` are ignored.
 - A path that is not absolute is relative to the folder `mods.txt` is in. `~/` is your home folder.
 - Letter case never matters, in the list or inside a mod.
