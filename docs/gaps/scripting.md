@@ -394,6 +394,7 @@ Dispatch summary: `engine::call` (`crates/thedas-sim/src/engine.rs:483`) matches
 - 2DA access from scripts (GetM2DAInt/Float/String/Resource, GetHashedM2DAInt, GetM2DARows, GetM2DARowIdFromRowIndex), with missing tables and columns counted.
 - Plot flags (GetPartyPlotFlag, SetPartyPlotFlag, defined flags answered by the plot script, GET_PLOT/SET_PLOT events, GetPlotGUID/ResRef/FlagName/EntryName/FlagRewardId).
 - Creature properties (Get/Set/UpdateCreatureProperty by value type, attribute/simple/depletable/derived kinds, GetCreaturePropertyType, mana getters), traced against the exe.
+- SCR-053 `SetCreatureMana` preserves an absent property and applies its initialized zero floor before the total ceiling, including negative or unordered totals ([trace](../notes/mana-property-floor.md)).
 - Effect constructors and accessors (Effect, Get/SetEffect*, GetHasEffects, GetEffects, RemoveEffect, RemoveAllEffects, RemoveEffectsByParameters, GetCurrentEffect, SetIsCurrentEffectValid, Engine_ApplyEffectOnObject, Engine_ApplyEffectOnParty).
 - Location functions (Location, GetLocation, SetLocationPosition/Facing, Get*FromLocation, IsLocationValid, GetDistanceBetweenLocations, AngleToVector, VectorToAngle, VectorToString).
 - Trigger enter/exit on movement and area entry.
