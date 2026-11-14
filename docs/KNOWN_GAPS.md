@@ -68,7 +68,7 @@ these, so they are the places where one person or stream can take a large, separ
   [gaps/scripting.md](gaps/scripting.md)).
 - **Missing engine functions fail silently.** A function with no implementation returns a
   default and the script carries on down the "nothing there" branch (`SCR-001`). Measured against
-  a real install, 71 functions that game scripts call are unhandled, at 2,062 call sites; the
+  a real install, 70 functions that game scripts call are unhandled, at 2,012 call sites; the
   full list by call count is in [gaps/scripting.md](gaps/scripting.md).
 - **Movement is a timed path, not the original's physics controller.** No step offset, slope
   limit or wall sliding, and the pathfinder is an untraced grid search (`SIM-011` to `SIM-013`).
@@ -104,8 +104,9 @@ these, so they are the places where one person or stream can take a large, separ
   (`RND-094`).
 - **Animation blending.** No blend weights, crossfades, inverse kinematics or root motion
   (`RND-064` to `RND-068`).
-- **Faces.** No facial animation or lip sync anywhere, and head-morph bone offsets are read but
-  not applied (`RND-050`, `RND-069`, `RND-070`, `FMT-027`, `AUD-052`, `CAM-013`).
+- **Faces.** Conversation lines are lip synced (FaceFX), but cutscene lines and lines said in
+  passing are not, animations' morph tracks are skipped, and head-morph bone offsets are read
+  but not applied (`RND-050`, `RND-069`, `RND-070`, `FMT-027`, `AUD-052`, `CAM-013`).
 - **Lighting.** Level geometry still uses an older light-picking rule; spot lights, animated
   lights and point or spot shadows are missing (`RND-025` to `RND-030`, `RND-046`).
 - **Visibility and detail.** Frustum culling only; no occlusion culling, mesh level of detail or
@@ -170,7 +171,7 @@ Concrete defects found during the code read. Each is small and independent.
 | --- | --- |
 | `SCR-059` | A command pushed to the front leaves the displaced command with its old timer |
 | `SCR-074` | Comparing two effects, locations or events compares handles, so equal values differ |
-| `SIM-148` | The module's start position is parsed and never used |
+| `SIM-148` | The module's start position is parsed and never used (barely visible: single player's start area is left at once) |
 | `RND-043` | Alpha-tested casters are skipped, so foliage, fences and hair cast no sun shadow |
 | `RND-095` | Location effects with an instant duration are discarded and never drawn |
 | `RND-139` | Compressed textures lose their smallest mip levels |

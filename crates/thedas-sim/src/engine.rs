@@ -1041,6 +1041,23 @@ pub fn call(
                 handle: Some(hd),
             })
         }
+        // DAOrigins.exe 0x65b0d0: the location moved to a safe spot by the safe-location
+        // search (see [`Sim::safe_location`]); an invalid location comes back as it is.
+        "GetSafeLocation" => {
+            let l = match h.sim.world.handle(handle(a, 0)) {
+                Some(EngineData::Location(l)) => h.sim.safe_location(*l),
+                _ => Location {
+                    area: OBJECT_INVALID,
+                    position: [0.0; 3],
+                    facing: 0.0,
+                },
+            };
+            let hd = h.sim.world.store(EngineData::Location(l));
+            ok(Value::Engine {
+                ty: ty.location,
+                handle: Some(hd),
+            })
+        }
         "GetPositionFromLocation"
         | "GetAreaFromLocation"
         | "GetFacingFromLocation"
