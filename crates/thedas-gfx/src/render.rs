@@ -220,6 +220,8 @@ pub struct Renderer {
     targets: Option<Targets>,
     /// Draws in the last frame.
     pub draws: usize,
+    /// Drawing a filter's copies (filters inside are not applied again).
+    in_filter: bool,
 }
 
 struct Targets {
@@ -310,6 +312,7 @@ impl Renderer {
             bitmaps: HashMap::new(),
             targets: None,
             draws: 0,
+            in_filter: false,
         }
     }
 
@@ -874,6 +877,39 @@ impl Renderer {
         if !o.visible {
             return;
         }
+        // Glow and drop shadow filters: the object drawn again in the filter's colour
+        // around (or offset from) itself, before it. Provisional: an approximation of the
+        // blur by copies on a ring, not Scaleform's filter.
+        if !o.filters.is_empty() && !self.in_filter {
+            let filters = o.filters.clone();
+            let k = view.k * 20.0;
+            for f in &filters {
+                let copies = filter_copies(f);
+                if copies.is_empty() {
+                    continue;
+                }
+                self.in_filter = true;
+                for (dx, dy, tint) in copies {
+                    // Offsets are in screen pixels: undo the view's scale.
+                    let shift = Matrix::translate(dx * 20.0 / k, dy * 20.0 / k);
+                    self.walk(
+                        player,
+                        images,
+                        d,
+                        shift.mul(&parent),
+                        tint.concat(&parent_cx),
+                        parent_blend,
+                        view,
+                        stencil,
+                        b,
+                    );
+                }
+                self.in_filter = false;
+            }
+        }
+        let Some(o) = player.vm.display.get(d) else {
+            return;
+        };
         let world = parent.mul(&o.matrix);
         let cx = parent_cx.concat(&o.color);
         let blend = if o.blend == BlendMode::Normal {
@@ -1151,6 +1187,62 @@ impl Renderer {
     /// Forgets cached drawings of `d` (the drawing API changed it).
     pub fn forget_drawing(&mut self, d: DisplayId) {
         self.drawings.remove(&d);
+    }
+}
+
+/// A filter as copies of the object: offset (screen pixels) and the colour transform each is
+/// drawn with.
+fn filter_copies(f: &crate::swf::Filter) -> Vec<(f32, f32, ColorTransform)> {
+    use crate::swf::Filter;
+    let tint = |c: &crate::swf::Color, alpha: f32| ColorTransform {
+        mul: [0.0, 0.0, 0.0, alpha],
+        add: [c.r as f32, c.g as f32, c.b as f32, 0.0],
+    };
+    let ring = |cx: f32, cy: f32, r: f32, n: usize| -> Vec<(f32, f32)> {
+        if r < 0.5 {
+            return vec![(cx, cy)];
+        }
+        (0..n)
+            .map(|i| {
+                let a = i as f32 / n as f32 * std::f32::consts::TAU;
+                (cx + a.cos() * r, cy + a.sin() * r)
+            })
+            .collect()
+    };
+    match f {
+        Filter::Glow {
+            color,
+            blur,
+            strength,
+            inner: false,
+            ..
+        } => {
+            let r = (blur.0 + blur.1) / 4.0;
+            let a = color.a as f32 / 255.0 * strength.min(2.0) * 0.3;
+            let mut pts = ring(0.0, 0.0, r, 12);
+            pts.extend(ring(0.0, 0.0, r * 0.5, 8));
+            pts.into_iter()
+                .map(|(x, y)| (x, y, tint(color, a)))
+                .collect()
+        }
+        Filter::DropShadow {
+            color,
+            blur,
+            angle,
+            distance,
+            strength,
+            inner: false,
+            ..
+        } => {
+            let (cx, cy) = (angle.cos() * distance, angle.sin() * distance);
+            let r = (blur.0 + blur.1) / 4.0;
+            let pts = ring(cx, cy, r, 8);
+            let a = color.a as f32 / 255.0 * strength.min(2.0) / (pts.len() as f32).sqrt();
+            pts.into_iter()
+                .map(|(x, y)| (x, y, tint(color, a)))
+                .collect()
+        }
+        _ => Vec::new(),
     }
 }
 
