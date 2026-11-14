@@ -3,8 +3,8 @@
 //! A movie names such an image as an external image the game substitutes: inventory.gfx and
 //! characterrecord.gfx fill a 270 by 459 rectangle with `paperdoll.dds`, a 16 by 16
 //! placeholder the exporter left, which DAOrigins.exe replaces with the render target of its
-//! paperdoll scene (`GUIPaperdoll`, which names the target `paperdoll`, 0x7bc659). Ruffle
-//! cannot have a bitmap's pixels changed by the host, so [`Slots`] turns each shape filled
+//! paperdoll scene (`GUIPaperdoll`, which names the target `paperdoll`, 0x7bc659). For offline
+//! SWF consumers without mutable engine bitmaps, [`Slots`] turns each shape filled
 //! only with such an image into an empty sprite of the same id (a slot) that registers itself
 //! (`_global.thedas_slots`, the image's name as `thedas_image`); the host loads the engine's
 //! drawing into it as an image (see [`Slot`]).

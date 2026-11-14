@@ -1,8 +1,7 @@
-//! The game's Scaleform GFx interface, played by Ruffle on the renderer's wgpu device.
+//! The game's Scaleform GFx interface, played by [`thedas_gfx`] on the renderer's wgpu device.
 //!
-//! Each [`UiMovie`] owns one Ruffle player rendering into an offscreen RGBA texture that the
-//! application composites over the scene. Movies are rewritten to plain SWF first
-//! ([`gfx::rewrite`]) so images the exporter moved into texture atlases are inlined.
+//! Each [`UiMovie`] owns one player rendering into an offscreen RGBA texture that the
+//! application composites over the scene. Movies load directly from the game's GFx files.
 //!
 //! The interface reads simulation state and never writes it: calls the movie makes through
 //! `fscommand` and `ExternalInterface.call` are queued as [`UiCall`]s for the application to
@@ -28,19 +27,6 @@ pub mod own;
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
-
-use ruffle_core::backend::navigator::NullExecutor;
-use ruffle_core::context::UpdateContext;
-use ruffle_core::events::{
-    KeyDescriptor, KeyLocation, LogicalKey, MouseButton, NamedKey, PhysicalKey, PlayerEvent,
-    TextControlCode,
-};
-use ruffle_core::external::{ExternalInterfaceProvider, FsCommandProvider, Value as RValue};
-use ruffle_core::tag_utils::SwfMovieData;
-use ruffle_core::{FloatDuration, Player, PlayerBuilder, StageScaleMode};
-use ruffle_render_wgpu::backend::WgpuRenderBackend;
-use ruffle_render_wgpu::descriptors::Descriptors;
-use ruffle_render_wgpu::target::TextureTarget;
 
 pub use atlas::ImageSource;
 pub use gfx::{Inventory, RewriteReport, Rgba};
@@ -75,92 +61,6 @@ pub enum UiKey {
     SelectAll,
 }
 
-impl UiKey {
-    fn descriptor(self) -> (PhysicalKey, LogicalKey) {
-        let named = |p, n| (p, LogicalKey::Named(n));
-        match self {
-            UiKey::Char(c) => (char_physical(c), LogicalKey::Character(c)),
-            UiKey::Backspace => named(PhysicalKey::Backspace, NamedKey::Backspace),
-            UiKey::Delete => named(PhysicalKey::Delete, NamedKey::Delete),
-            UiKey::Enter => named(PhysicalKey::Enter, NamedKey::Enter),
-            UiKey::Escape => named(PhysicalKey::Escape, NamedKey::Escape),
-            UiKey::Tab => named(PhysicalKey::Tab, NamedKey::Tab),
-            UiKey::Left => named(PhysicalKey::ArrowLeft, NamedKey::ArrowLeft),
-            UiKey::Right => named(PhysicalKey::ArrowRight, NamedKey::ArrowRight),
-            UiKey::Home => named(PhysicalKey::Home, NamedKey::Home),
-            UiKey::End => named(PhysicalKey::End, NamedKey::End),
-            UiKey::SelectAll => (PhysicalKey::KeyA, LogicalKey::Character('a')),
-        }
-    }
-
-    /// The edit a text field makes for the key.
-    fn text_control(self) -> Option<TextControlCode> {
-        Some(match self {
-            UiKey::Backspace => TextControlCode::Backspace,
-            UiKey::Delete => TextControlCode::Delete,
-            UiKey::Enter => TextControlCode::Enter,
-            UiKey::Left => TextControlCode::MoveLeft,
-            UiKey::Right => TextControlCode::MoveRight,
-            UiKey::Home => TextControlCode::MoveLeftDocument,
-            UiKey::End => TextControlCode::MoveRightDocument,
-            UiKey::SelectAll => TextControlCode::SelectAll,
-            _ => return None,
-        })
-    }
-}
-
-/// The physical key that types a character on a US layout (Unknown for others).
-fn char_physical(c: char) -> PhysicalKey {
-    use PhysicalKey as P;
-    const LETTERS: [PhysicalKey; 26] = [
-        P::KeyA,
-        P::KeyB,
-        P::KeyC,
-        P::KeyD,
-        P::KeyE,
-        P::KeyF,
-        P::KeyG,
-        P::KeyH,
-        P::KeyI,
-        P::KeyJ,
-        P::KeyK,
-        P::KeyL,
-        P::KeyM,
-        P::KeyN,
-        P::KeyO,
-        P::KeyP,
-        P::KeyQ,
-        P::KeyR,
-        P::KeyS,
-        P::KeyT,
-        P::KeyU,
-        P::KeyV,
-        P::KeyW,
-        P::KeyX,
-        P::KeyY,
-        P::KeyZ,
-    ];
-    const DIGITS: [PhysicalKey; 10] = [
-        P::Digit0,
-        P::Digit1,
-        P::Digit2,
-        P::Digit3,
-        P::Digit4,
-        P::Digit5,
-        P::Digit6,
-        P::Digit7,
-        P::Digit8,
-        P::Digit9,
-    ];
-    match c {
-        'a'..='z' => LETTERS[c as usize - 'a' as usize],
-        'A'..='Z' => LETTERS[c as usize - 'A' as usize],
-        '0'..='9' => DIGITS[c as usize - '0' as usize],
-        ' ' => P::Space,
-        _ => P::Unknown,
-    }
-}
-
 /// A value passed between a movie and the application.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub enum UiValue {
@@ -172,41 +72,6 @@ pub enum UiValue {
     String(String),
     List(Vec<UiValue>),
     Object(BTreeMap<String, UiValue>),
-}
-
-impl From<&RValue> for UiValue {
-    fn from(v: &RValue) -> Self {
-        match v {
-            RValue::Undefined => Self::Undefined,
-            RValue::Null => Self::Null,
-            RValue::Bool(b) => Self::Bool(*b),
-            RValue::Number(n) => Self::Number(*n),
-            RValue::String(s) if s == avm1::EMPTY => Self::String(String::new()),
-            RValue::String(s) => Self::String(s.clone()),
-            RValue::List(l) => Self::List(l.iter().map(Into::into).collect()),
-            RValue::Object(o) => {
-                Self::Object(o.iter().map(|(k, v)| (k.clone(), v.into())).collect())
-            }
-        }
-    }
-}
-
-impl From<&UiValue> for RValue {
-    fn from(v: &UiValue) -> Self {
-        match v {
-            UiValue::Undefined => Self::Undefined,
-            UiValue::Null => Self::Null,
-            UiValue::Bool(b) => Self::Bool(*b),
-            UiValue::Number(n) => Self::Number(*n),
-            // See `avm1::EMPTY`.
-            UiValue::String(s) if s.is_empty() => Self::String(avm1::EMPTY.to_string()),
-            UiValue::String(s) => Self::String(s.clone()),
-            UiValue::List(l) => Self::List(l.iter().map(Into::into).collect()),
-            UiValue::Object(o) => {
-                Self::Object(o.iter().map(|(k, v)| (k.clone(), v.into())).collect())
-            }
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -232,8 +97,6 @@ struct Shared {
     calls: Mutex<Vec<UiCall>>,
     /// The answer to the last fscommand, fetched by the wrapped `ExternalCommands` functions.
     retval: Mutex<UiValue>,
-    callbacks: Mutex<Vec<String>>,
-    log: Mutex<Vec<String>>,
     /// Observers registered through `ExternalInterface.call("AddTokenObserver", ...)`
     /// (callback id, token), for [`UiMovie::sync_tokens`] to take up.
     called_observers: Mutex<Vec<(String, String)>>,
@@ -316,130 +179,18 @@ impl Bridge {
     }
 }
 
-impl FsCommandProvider for Bridge {
-    fn on_fs_command(&self, command: &str, args: &str) -> bool {
-        self.fs_command(command, args);
-        true
-    }
-}
-
-impl ExternalInterfaceProvider for Bridge {
-    fn call_method(&self, _: &mut UpdateContext<'_>, name: &str, args: &[RValue]) -> RValue {
-        let r = self.external_call(name, args.iter().map(Into::into).collect());
-        (&r).into()
-    }
-
-    fn on_callback_available(&self, name: &str) {
-        if let Ok(mut c) = self.shared.callbacks.lock() {
-            c.push(name.to_string());
-        }
-    }
-
-    fn get_id(&self) -> Option<String> {
-        None
-    }
-}
-
-struct Log(Arc<Shared>);
-
-impl ruffle_core::backend::log::LogBackend for Log {
-    fn avm_trace(&self, message: &str) {
-        log::debug!("ui trace: {message}");
-        if let Ok(mut l) = self.0.log.lock() {
-            l.push(format!("trace: {message}"));
-        }
-    }
-
-    fn avm_warning(&self, message: &str) {
-        log::debug!("ui warning: {message}");
-        if let Ok(mut l) = self.0.log.lock() {
-            l.push(format!("warning: {message}"));
-        }
-    }
-}
-
 /// The wgpu handles the movie renders with; clones of the renderer's.
 #[derive(Clone)]
 pub struct Gpu {
-    pub instance: wgpu::Instance,
-    pub adapter: wgpu::Adapter,
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
 }
 
-/// Loads `name` (e.g. `mainmenu.gfx`) and rewrites it to a plain SWF with atlas images inlined.
-pub fn load_movie(
-    name: &str,
-    lookup: &ResourceLookup,
-    images: &mut ImageSource,
-) -> Result<(Vec<u8>, RewriteReport), UiError> {
-    let data = lookup(name).ok_or_else(|| UiError::NotFound(name.to_string()))?;
-    let inject = avm1::register_invoke();
-    let fonts = font_library(lookup);
-    let (mut swf, report) = gfx::rewrite_with_slots(
-        &data,
-        &mut |e| images.image(&e.file),
-        fonts.as_ref(),
-        Some(&inject),
-        ENGINE_IMAGES,
-    )?;
-    if name.eq_ignore_ascii_case(stage::POPUP_LAYER) {
-        allow_spaces_in_typed_names(&mut swf);
-    }
-    Ok((swf, report))
-}
-
-/// The restrict popuplayer.gfx's text input sets (`TextInput_mc_init`: `restrict = "^ /t"`,
-/// in its constant pool), as it appears there.
-const POPUP_RESTRICT: &[u8] = b"restrict\0^ /t\0";
-/// What it is replaced with: `/` alone excluded (the same length, so the pool is unchanged).
-const POPUP_RESTRICT_ALLOWED: &[u8] = b"restrict\0^///\0";
-
-/// Lets the save dialog's name field take spaces and a lowercase `t`.
-///
-/// A deliberate deviation, asked for by the project owner, not traced in DAOrigins.exe. The
-/// movie's own restrict excludes space, `/` and `t` in Flash's syntax, so Ruffle drops spaces
-/// and, as Flash does, types `t` as `T` ("Before the Tower" became "BeforeTheTower"). The
-/// engine adds no character filter of its own: `FilterKeyboardInput` (handler 0x51c760 →
-/// 0x5110f0) only enters or leaves the "GUITextInput" input context. How Scaleform read this
-/// restrict is not verified; the owner believes the original allows spaces, and wants them
-/// either way. `/` stays excluded, as the movie asks.
-fn allow_spaces_in_typed_names(swf: &mut [u8]) {
-    if let Some(i) = swf
-        .windows(POPUP_RESTRICT.len())
-        .position(|w| w == POPUP_RESTRICT)
-    {
-        swf[i..i + POPUP_RESTRICT.len()].copy_from_slice(POPUP_RESTRICT_ALLOWED);
-    }
-}
-
-/// Images the engine draws into the movies while they run (Scaleform render targets): the
-/// paperdoll (DAOrigins.exe's `GUIPaperdoll` names its target `paperdoll`, 0x7bc659).
+/// Images the engine renders into the movies.
 pub const ENGINE_IMAGES: &[&str] = &["paperdoll"];
 
 /// The font library the game installs for Scaleform (see [`gfx::FontLibrary`]).
 pub const FONT_LIBRARY: &str = "fonts_en-us.gfx";
-
-/// The font library's fonts, if the resources have it.
-pub fn font_library(lookup: &ResourceLookup) -> Option<gfx::FontLibrary> {
-    let lib = gfx::FontLibrary::from_movie(&lookup(FONT_LIBRARY)?).ok()?;
-    (!lib.is_empty()).then_some(lib)
-}
-
-/// Pre-rewrites imported libraries (`gfxfontlib.swf`) the same way when they are fetched.
-fn rewriting_lookup(lookup: ResourceLookup) -> ResourceLookup {
-    let fonts = std::sync::OnceLock::new();
-    Arc::new(move |name: &str| {
-        let data = lookup(name)?;
-        if name.ends_with(".gfx") {
-            let fonts = fonts.get_or_init(|| font_library(&lookup));
-            if let Ok((swf, _)) = gfx::rewrite(&data, &mut |_| None, fonts.as_ref(), None) {
-                return Some(swf);
-            }
-        }
-        Some(data)
-    })
-}
 
 /// How many window pixels one stage pixel takes: the movie's authored size fitted inside the
 /// window (`size`), whole, centred.
@@ -450,7 +201,7 @@ fn rewriting_lookup(lookup: ResourceLookup) -> ResourceLookup {
 /// `Stage.width`/`height` then report the whole visible area in stage units, wider than the
 /// authored stage on a wide window; the movies anchor to that rectangle
 /// (`SceneManager.SetSafeZone`: `sm_rScreenRect` is `Stage.width` x `Stage.height` at
-/// `((OriginalStageWidth - Stage.width) / 2, ...)`). Flash (and Ruffle) report the authored
+/// `((OriginalStageWidth - Stage.width) / 2, ...)`). Flash reports the authored
 /// size under show-all, so the stage runs in no-scale mode with this scale factor instead:
 /// the same picture, with `Stage.width`/`height` the visible area. Provisional: the
 /// visible-area reading of `Stage.width` is inferred from the movies' code, not checked
@@ -513,21 +264,11 @@ pub fn parse_focus_list(list: &str, scale: f64, offset: (f64, f64)) -> Vec<Focus
         .collect()
 }
 
-/// The player a movie runs on.
-enum Backend {
-    Ruffle {
-        player: Arc<Mutex<Player>>,
-        executor: NullExecutor,
-    },
-    Own(Box<own::OwnMovie>),
-}
-
 /// One Scaleform movie playing into an offscreen texture.
 pub struct UiMovie {
     pub name: String,
-    backend: Backend,
+    player: own::OwnMovie,
     shared: Arc<Shared>,
-    fetches: navigator::FetchLog,
     size: (u32, u32),
     /// The movie's authored stage size (pixels), which [`stage_scale`] fits to the window.
     authored: (f64, f64),
@@ -539,15 +280,6 @@ pub struct UiMovie {
     sent: std::collections::HashMap<String, UiValue>,
     /// Observers registered since the last push, heard from on the next one.
     fresh: Vec<String>,
-    /// The movie's scaling-grid sprites (see `gfx::Scale9`), by sprite id, and the scale each
-    /// registered one was last laid out for.
-    scale9: BTreeMap<u16, gfx::Scale9>,
-    scale9_laid: Vec<(f64, f64)>,
-    /// The movie's engine-image slots (see `gfx::Slot`), by image name; the engine's current
-    /// drawing of each image (its URL); the URL each registered slot last loaded.
-    slots: BTreeMap<String, gfx::Slot>,
-    engine_images: BTreeMap<String, String>,
-    slots_loaded: Vec<String>,
     /// How many inline images each text field (by its index, see `avm1::IMG_TAKE`) shows.
     inline_images: std::collections::HashMap<u32, usize>,
     /// Clips the movie blends with `multiply` onto the game's picture, drawn in a pass of
@@ -556,10 +288,6 @@ pub struct UiMovie {
     multiply_texture: Option<wgpu::Texture>,
     above_texture: Option<wgpu::Texture>,
     own_texture: Option<wgpu::Texture>,
-    /// The mouse is in the window (see [`UiMovie::mouse_move`]).
-    mouse_in: bool,
-    /// The mouse moved, or a button or the wheel was used, since the last tick.
-    mouse_stirred: bool,
 }
 
 /// Clips a movie draws with the `multiply` blend onto what is under the interface (the
@@ -680,97 +408,6 @@ fn callback_key(v: &UiValue) -> Option<String> {
 }
 
 impl UiMovie {
-    /// Starts a movie from SWF bytes (see [`load_movie`]). `lookup` serves the movie's own
-    /// loads and imports.
-    pub fn new(
-        gpu: &Gpu,
-        name: &str,
-        swf: &[u8],
-        size: (u32, u32),
-        lookup: ResourceLookup,
-        responder: Option<Responder>,
-    ) -> Result<Self, UiError> {
-        let descriptors = Arc::new(Descriptors::new(
-            gpu.instance.clone(),
-            gpu.adapter.clone(),
-            gpu.device.clone(),
-            gpu.queue.clone(),
-        ));
-        let target =
-            TextureTarget::new(&gpu.device, size).map_err(|e| UiError::Render(e.to_string()))?;
-        let backend = WgpuRenderBackend::new(descriptors, target)
-            .map_err(|e| UiError::Render(e.to_string()))?;
-        let url = format!("{}{name}", navigator::BASE_URL);
-        let movie = SwfMovieData::from_data(swf, url, None, None)
-            .map_err(|e| UiError::Swf(e.to_string()))?;
-        let authored = (movie.width().to_pixels(), movie.height().to_pixels());
-        let shared = Arc::new(Shared::default());
-        let executor = NullExecutor::new();
-        let fetches = navigator::FetchLog::default();
-        let nav =
-            navigator::ResourceNavigator::new(rewriting_lookup(lookup), &executor, fetches.clone());
-        let bridge = || Bridge {
-            movie: name.to_string(),
-            shared: shared.clone(),
-            responder: responder.clone(),
-        };
-        let player = PlayerBuilder::new()
-            .with_renderer(backend)
-            .with_navigator(nav)
-            .with_log(Log(shared.clone()))
-            .with_fs_commands(Box::new(bridge()))
-            .with_external_interface(Box::new(bridge()))
-            .with_viewport_dimensions(size.0, size.1, stage_scale(size, authored))
-            .with_scale_mode(StageScaleMode::NoScale, true)
-            .with_autoplay(true)
-            // The whole movie is loaded before its first frame runs. Ruffle otherwise loads
-            // it a frame's worth of time at a go; on a slow start (a debug build, a busy
-            // machine) frame one was not in by the time the game starts the scene, the
-            // start call found nothing to call, and the movie then started itself as in a
-            // standalone Flash player: label names for text, test content (popuplayer.gfx's
-            // "Sell how many items?" box) and art left where it was authored.
-            .with_load_behavior(ruffle_core::LoadBehavior::Blocking)
-            // No script timeout. Ruffle's release default stops a movie's scripts for good
-            // once one update has run for 15 seconds (a browser's guard against a runaway
-            // movie), and it counts everything the update waits on: on a very slow start (a
-            // software renderer, a cold disk) conversation.gfx's first update took far
-            // longer, its scripts were halted, and the conversation showed the movie as it
-            // was authored (letterbox bars at the 4:3 stage's width, sample text in the
-            // subtitle) until it was closed. The game's own movies are trusted and the
-            // original has no such limit.
-            .with_max_execution_duration(std::time::Duration::MAX)
-            .with_movie(movie)
-            .build();
-        if let Ok(mut p) = player.lock() {
-            p.set_window_mode("transparent");
-            // Not in the window until the mouse moves (see `UiMovie::mouse_move`).
-            p.set_mouse_in_stage(false);
-        }
-        Ok(Self {
-            name: name.to_string(),
-            backend: Backend::Ruffle { player, executor },
-            shared,
-            fetches,
-            size,
-            authored,
-            observers: Default::default(),
-            sent: Default::default(),
-            fresh: Vec::new(),
-            scale9: BTreeMap::new(),
-            scale9_laid: Vec::new(),
-            slots: BTreeMap::new(),
-            engine_images: BTreeMap::new(),
-            slots_loaded: Vec::new(),
-            inline_images: Default::default(),
-            multiply_pass: None,
-            multiply_texture: None,
-            above_texture: None,
-            own_texture: None,
-            mouse_in: false,
-            mouse_stirred: false,
-        })
-    }
-
     pub fn size(&self) -> (u32, u32) {
         self.size
     }
@@ -779,48 +416,12 @@ impl UiMovie {
     pub fn resize(&mut self, (w, h): (u32, u32)) {
         let size = (w.clamp(1, 8192), h.clamp(1, 8192));
         self.size = size;
-        let scale_factor = stage_scale(size, self.authored);
-        if let Some(o) = self.own() {
-            o.resize(size);
-            return;
-        }
-        self.with_player(|p| {
-            p.set_viewport_dimensions(ruffle_core::ViewportDimensions {
-                width: size.0,
-                height: size.1,
-                scale_factor,
-            })
-        });
+        self.player.resize(size);
     }
 
-    fn with_player<R>(&self, f: impl FnOnce(&mut Player) -> R) -> Option<R> {
-        match &self.backend {
-            Backend::Ruffle { player, .. } => player.lock().ok().map(|mut p| f(&mut p)),
-            Backend::Own(_) => None,
-        }
-    }
-
-    fn run_executor(&mut self) {
-        if let Backend::Ruffle { executor, .. } = &mut self.backend {
-            executor.run();
-        }
-    }
-
-    fn own(&mut self) -> Option<&mut own::OwnMovie> {
-        match &mut self.backend {
-            Backend::Own(o) => Some(o),
-            Backend::Ruffle { .. } => None,
-        }
-    }
-
-    /// Whether the movie plays on our own player (see [`own`]).
-    pub fn is_own(&self) -> bool {
-        matches!(self.backend, Backend::Own(_))
-    }
-
-    /// Starts a movie on our own player from its GFx file as the game ships it.
+    /// Starts a movie from its GFx file as the game ships it.
     #[allow(clippy::too_many_arguments)]
-    pub fn new_own(
+    pub fn new(
         gpu: &Gpu,
         name: &str,
         gfx: &[u8],
@@ -851,127 +452,31 @@ impl UiMovie {
         };
         Ok(Self {
             name: name.to_string(),
-            backend: Backend::Own(Box::new(m)),
+            player: m,
             shared,
-            fetches: navigator::FetchLog::default(),
             size,
             authored,
             observers: Default::default(),
             sent: Default::default(),
             fresh: Vec::new(),
-            scale9: BTreeMap::new(),
-            scale9_laid: Vec::new(),
-            slots: BTreeMap::new(),
-            engine_images: BTreeMap::new(),
-            slots_loaded: Vec::new(),
             inline_images: Default::default(),
             multiply_pass: None,
             multiply_texture: None,
             above_texture: None,
             own_texture: None,
-            mouse_in: false,
-            mouse_stirred: false,
         })
-    }
-
-    /// The movie's scaling-grid sprites, from its rewrite (`RewriteReport::scale9`).
-    pub fn set_scale9(&mut self, scale9: BTreeMap<u16, gfx::Scale9>) {
-        self.scale9 = scale9;
-    }
-
-    /// Lays out the pieces of the scaling-grid sprites whose scale changed since they were
-    /// last laid out (see `gfx::scale9_layout`): Ruffle draws a grid sprite scaled as a whole.
-    fn layout_scale9(&mut self) {
-        if self.scale9.is_empty() {
-            return;
-        }
-        let UiValue::List(v) = self.call(avm1::SCALE9_SCALES, &[]) else {
-            return;
-        };
-        let num = |x: Option<&UiValue>| match x {
-            Some(UiValue::Number(n)) => Some(*n),
-            _ => None,
-        };
-        for (i, t) in v.chunks(3).enumerate() {
-            let (Some(id), Some(xs), Some(ys)) = (num(t.first()), num(t.get(1)), num(t.get(2)))
-            else {
-                continue;
-            };
-            if self.scale9_laid.len() <= i {
-                self.scale9_laid.resize(i + 1, (f64::NAN, f64::NAN));
-            }
-            if self.scale9_laid[i] == (xs, ys) {
-                continue;
-            }
-            self.scale9_laid[i] = (xs, ys);
-            let Some(grid) = self.scale9.get(&(id as u16)).copied() else {
-                continue;
-            };
-            for (k, [x, y, a, b]) in gfx::scale9_layout(&grid, xs / 100.0, ys / 100.0)
-                .into_iter()
-                .enumerate()
-            {
-                let args = [i as f64, k as f64, x, y, a, b].map(UiValue::Number);
-                self.call(avm1::SCALE9_SET, &args);
-            }
-        }
-    }
-
-    /// The movie's engine-image slots, from its rewrite (`RewriteReport::slots`).
-    pub fn set_slots(&mut self, slots: BTreeMap<String, gfx::Slot>) {
-        self.slots = slots;
     }
 
     /// The engine's drawing of image `name` (`paperdoll`) is now at `url`
     /// (`img://thedas_paperdoll_3.png`), or there is none.
     pub fn set_engine_image(&mut self, name: &str, url: Option<&str>) {
-        if let Backend::Own(m) = &mut self.backend {
-            m.set_engine_image(name, url);
-        }
-        match url {
-            Some(u) => self.engine_images.insert(name.to_string(), u.to_string()),
-            None => self.engine_images.remove(name),
-        };
-    }
-
-    /// Loads the engine's drawings into the slots showing an older one (or none).
-    fn fill_slots(&mut self) {
-        if self.slots.is_empty() {
-            return;
-        }
-        let UiValue::List(names) = self.call(avm1::SLOT_NAMES, &[]) else {
-            return;
-        };
-        for (i, n) in names.iter().enumerate() {
-            let UiValue::String(name) = n else { continue };
-            let (Some(url), Some(slot)) = (self.engine_images.get(name), self.slots.get(name))
-            else {
-                continue;
-            };
-            if self.slots_loaded.len() <= i {
-                self.slots_loaded.resize(i + 1, String::new());
-            }
-            if self.slots_loaded[i] == *url {
-                continue;
-            }
-            self.slots_loaded[i] = url.clone();
-            let [x, y, _, _] = slot.rect;
-            let args = [
-                UiValue::Number(i as f64),
-                UiValue::String(url.clone()),
-                UiValue::Number(x),
-                UiValue::Number(y),
-            ];
-            self.call(avm1::SLOT_LOAD, &args);
-        }
+        self.player.set_engine_image(name, url);
     }
 
     /// Runs what the movies put off past the host's last step: post-load functions, then
-    /// the scaling-grid layout and the engine's images.
+    /// inline-image layout.
     fn after_step(&mut self) {
         self.call(avm1::POST_LOAD_RUN, &[]);
-        self.layout_scale9();
-        self.fill_slots();
         self.layout_inline_images();
     }
 
@@ -1108,55 +613,19 @@ impl UiMovie {
 
     /// Advances the movie by `dt_ms` of wall time and runs pending loads.
     pub fn tick(&mut self, dt_ms: f64) {
-        self.run_executor();
-        if let Some(o) = self.own() {
-            o.tick(dt_ms);
-        }
-        let pick = self.picks();
-        self.with_player(|p| {
-            p.set_mouse_in_stage(pick);
-            p.tick(FloatDuration::from_millis(dt_ms));
-        });
+        self.player.tick(dt_ms);
         self.after_step();
-        self.run_executor();
     }
 
     /// Runs exactly one movie frame, independent of time.
     pub fn run_frame(&mut self) {
-        self.run_executor();
-        if let Some(o) = self.own() {
-            o.run_frame();
-        }
-        let pick = self.picks();
-        self.with_player(|p| {
-            p.set_mouse_in_stage(pick);
-            p.run_frame();
-        });
+        self.player.run_frame();
         self.after_step();
-        self.run_executor();
-    }
-
-    /// Whether the player should look for what the mouse is over as it runs frames: it
-    /// does after every frame (Ruffle's `update_mouse_state`, a walk of every clip, most of
-    /// a HUD movie's time), but with the mouse outside the window there is nothing to find,
-    /// and with the mouse still since the last tick, while something is hovered, the player
-    /// keeps that hover without looking (it skips hover changes then; a hovered clip that
-    /// is hidden still loses it). So it looks only on a tick after the mouse stirred, or
-    /// after the engine pushed the movie a value or the movie placed observers (clips
-    /// placed or taken away under a still mouse: a tooltip stayed up over an item taken from
-    /// a chest). Provisional: a clip that comes under a still mouse, with nothing hovered before, is
-    /// hovered only once the mouse moves (Flash would hover it on its next frame).
-    fn picks(&mut self) -> bool {
-        self.mouse_in && std::mem::take(&mut self.mouse_stirred)
     }
 
     /// Renders the current frame into the texture.
     pub fn render(&mut self) {
-        if let Some(o) = self.own() {
-            o.render();
-            return;
-        }
-        self.with_player(|p| p.render());
+        self.player.render();
     }
 
     /// Whether the movie has a multiply pass (see [`MultiplyPass`]).
@@ -1268,24 +737,8 @@ impl UiMovie {
     /// A copy of the frame just rendered, kept in one of the movie's pass textures: the
     /// movie renders the next pass into the same target.
     fn copy_rendered(&mut self, which: PassCopy) -> Option<wgpu::Texture> {
-        let own = self.own().and_then(|o| {
-            let (d, q) = o.device();
-            o.texture().map(|t| (t, d, q))
-        });
-        let (texture, device, queue) = own.or_else(|| {
-            self.with_player(|p| {
-                let r: &mut dyn std::any::Any = p.renderer_mut();
-                r.downcast_mut::<WgpuRenderBackend<TextureTarget>>()
-                    .map(|b| {
-                        (
-                            b.target().texture.clone(),
-                            b.descriptors().device.clone(),
-                            b.descriptors().queue.clone(),
-                        )
-                    })
-            })
-            .flatten()
-        })?;
+        let texture = self.player.texture()?;
+        let (device, queue) = self.player.device();
         let slot = match which {
             PassCopy::Multiply => &mut self.multiply_texture,
             PassCopy::Above => &mut self.above_texture,
@@ -1338,158 +791,42 @@ impl UiMovie {
 
     /// The texture the movie renders into (RGBA8, premultiplied alpha).
     pub fn texture(&self) -> Option<wgpu::Texture> {
-        if let Backend::Own(o) = &self.backend {
-            return o.texture();
-        }
-        self.with_player(|p| {
-            let r: &mut dyn std::any::Any = p.renderer_mut();
-            r.downcast_mut::<WgpuRenderBackend<TextureTarget>>()
-                .map(|b| b.target().texture.clone())
-        })
-        .flatten()
+        self.player.texture()
     }
 
     /// Reads the last rendered frame back to the CPU (RGBA8, premultiplied alpha).
     pub fn capture(&mut self) -> Option<Rgba> {
-        if let Some(o) = self.own() {
-            return o.capture();
-        }
-        self.with_player(|p| {
-            let r: &mut dyn std::any::Any = p.renderer_mut();
-            r.downcast_mut::<WgpuRenderBackend<TextureTarget>>()
-                .and_then(|b| b.capture_frame())
-                .map(|img| {
-                    let (width, height) = (img.width(), img.height());
-                    // Ruffle hands the frame back unmultiplied (it divides by alpha for
-                    // export); blending wants it premultiplied, as the GPU texture is.
-                    // Blended unmultiplied, a nearly clear pixel's full colour was added:
-                    // the minimap lens's orange rim and the headers' smoke glowed in
-                    // captures (the window's GPU composite was right).
-                    let mut pixels = img.into_raw();
-                    premultiply(&mut pixels);
-                    Rgba {
-                        width,
-                        height,
-                        pixels,
-                    }
-                })
-        })
-        .flatten()
+        self.player.capture()
     }
 
     pub fn mouse_move(&mut self, x: f64, y: f64) {
-        if let Some(o) = self.own() {
-            o.mouse_move(x, y);
-            return;
-        }
-        self.with_player(|p| {
-            // In the window: the player looks for what the mouse is over (see
-            // `UiMovie::picks`).
-            p.set_mouse_in_stage(true);
-            p.handle_event(PlayerEvent::MouseMove { x, y })
-        });
-        self.mouse_in = true;
-        self.mouse_stirred = true;
+        self.player.mouse_move(x, y);
     }
 
-    /// The mouse left the window: what it was over hears it leave (`onRollOut`), and the
-    /// player stops looking for what it is over until it comes back.
+    /// The mouse left the window. The current player keeps its last pointer position.
     pub fn mouse_leave(&mut self) {
-        self.with_player(|p| {
-            p.handle_event(PlayerEvent::MouseLeave);
-            p.set_mouse_in_stage(false);
-        });
-        self.mouse_in = false;
+        // Window leave has no movie event in the current player.
     }
 
     /// The mouse wheel turned `lines` (up positive) with the mouse at (`x`, `y`): the movie's
     /// `onMouseWheel` listeners and the scrollable under the mouse hear it.
     pub fn mouse_wheel(&mut self, x: f64, y: f64, lines: f64) {
-        self.mouse_in = true;
-        self.mouse_stirred = true;
-        if let Some(o) = self.own() {
-            o.mouse_wheel(x, y, lines);
-            return;
-        }
-        self.with_player(|p| {
-            p.set_mouse_in_stage(true);
-            p.handle_event(PlayerEvent::MouseMove { x, y });
-            p.handle_event(PlayerEvent::MouseWheel {
-                delta: ruffle_core::events::MouseWheelDelta::Lines(lines),
-            });
-        });
+        self.player.mouse_wheel(x, y, lines);
     }
 
     /// A key pressed and released: the movie's key listeners hear it (`Key.getCode`), and a
     /// focused text field takes the character or the edit.
     pub fn key(&mut self, key: UiKey) {
-        if let Some(o) = self.own() {
-            o.key(key);
-            return;
-        }
-        let (physical, logical) = key.descriptor();
-        let descriptor = || KeyDescriptor {
-            physical_key: physical,
-            logical_key: logical,
-            key_location: KeyLocation::Standard,
-        };
-        self.with_player(|p| {
-            p.handle_event(PlayerEvent::KeyDown { key: descriptor() });
-            match key {
-                UiKey::Char(c) => {
-                    p.handle_event(PlayerEvent::TextInput { codepoint: c });
-                }
-                _ => {
-                    if let Some(code) = key.text_control() {
-                        p.handle_event(PlayerEvent::TextControl { code });
-                    }
-                }
-            }
-            p.handle_event(PlayerEvent::KeyUp { key: descriptor() });
-        });
+        self.player.key(key);
     }
 
     pub fn mouse_button(&mut self, x: f64, y: f64, down: bool) {
-        let button = MouseButton::Left;
-        self.mouse_in = true;
-        self.mouse_stirred = true;
-        if self.is_own() {
-            if !down {
-                self.set(avm1::HIDE_LATER, UiValue::List(Vec::new()));
-            }
-            if let Some(o) = self.own() {
-                o.mouse_button(x, y, down);
-            }
-            if !down {
-                self.call(avm1::HIDE_FLUSH, &[]);
-            }
-            self.after_step();
-            return;
-        }
-        if down {
-            let ev = PlayerEvent::MouseDown {
-                x,
-                y,
-                button,
-                index: None,
-            };
-            self.with_player(|p| {
-                // A press is where the mouse is, in the window (a click sent with no move
-                // before it: the pad, the control steps).
-                p.set_mouse_in_stage(true);
-                p.handle_event(ev)
-            });
-            self.after_step();
-            return;
-        }
-        // The button under the mouse is released before the movies' mouse-up handlers hide
-        // anything (see `avm1::HIDE_LATER`).
-        self.set(avm1::HIDE_LATER, UiValue::List(Vec::new()));
-        self.with_player(|p| {
-            p.set_mouse_in_stage(true);
-            p.handle_event(PlayerEvent::MouseUp { x, y, button })
-        });
-        self.call(avm1::HIDE_FLUSH, &[]);
+        self.button_as(avm1::MOUSE_LEFT, x, y, down);
+    }
+
+    /// A press or release with Scaleform's button code (button + 4 for a double click).
+    pub fn button_as(&mut self, button: f64, x: f64, y: f64, down: bool) {
+        self.player.mouse_button(x, y, button, down);
         self.after_step();
     }
 
@@ -1510,8 +847,6 @@ impl UiMovie {
             _ => Vec::new(),
         };
         let added = take(self, "AddTokenObserverBatchData");
-        // Clips placed or removed since the last tick: a hover may have lost its clip.
-        self.mouse_stirred |= !added.is_empty();
         for t in added.chunks(3) {
             if let (Some(id), Some(UiValue::String(token))) =
                 (t.first().and_then(callback_key), t.get(1))
@@ -1564,8 +899,6 @@ impl UiMovie {
                             std::slice::from_ref(&v),
                         );
                         self.sent.insert(id, v);
-                        // A value may have removed or placed clips under a still mouse.
-                        self.mouse_stirred = true;
                     }
                 }
                 None => missing.push(token),
@@ -1585,7 +918,7 @@ impl UiMovie {
     }
 
     /// Calls a movie function by path, as Scaleform's `Invoke` does
-    /// (`_global.GUISystem.StartSceneFromGame`). Needs a movie from [`load_movie`].
+    /// (`_global.GUISystem.StartSceneFromGame`).
     pub fn call(&mut self, path: &str, args: &[UiValue]) -> UiValue {
         let Some((object, method)) = path.rsplit_once('.') else {
             return UiValue::Undefined;
@@ -1601,7 +934,7 @@ impl UiMovie {
     }
 
     /// Sets a movie variable by path (`_global.GUISystem.OriginalStageWidth`), as Scaleform's
-    /// `SetVariable` does. Needs a movie from [`load_movie`].
+    /// `SetVariable` does.
     pub fn set(&mut self, path: &str, value: UiValue) {
         if let Some((object, member)) = path.rsplit_once('.') {
             self.invoke(
@@ -1623,7 +956,7 @@ impl UiMovie {
         };
         // The stage plays unscaled (`NoScale`) at `stage_scale`, its authored rectangle
         // centred in the window. Provisional: read from where the start menu's buttons and
-        // its login panel are drawn, not from Ruffle's view matrix (which is not exposed).
+        // its login panel are drawn, in the authored movie.
         let scale = stage_scale(self.size, self.authored);
         let (w, h) = (f64::from(self.size.0), f64::from(self.size.1));
         let offset = (
@@ -1655,14 +988,7 @@ impl UiMovie {
 
     /// Calls a function the movie registered with `ExternalInterface.addCallback`.
     pub fn invoke(&mut self, name: &str, args: &[UiValue]) -> UiValue {
-        if let Some(o) = self.own() {
-            return o.invoke(name, args);
-        }
-        self.with_player(|p| {
-            let r = p.call_internal_interface(name, args.iter().map(Into::into));
-            UiValue::from(&r)
-        })
-        .unwrap_or(UiValue::Undefined)
+        self.player.invoke(name, args)
     }
 
     /// Calls the movie made since the last drain.
@@ -1676,60 +1002,12 @@ impl UiMovie {
 
     /// Names the movie registered with `ExternalInterface.addCallback`.
     pub fn callbacks(&self) -> Vec<String> {
-        if let Backend::Own(o) = &self.backend {
-            return o.callbacks();
-        }
-        self.shared
-            .callbacks
-            .lock()
-            .map(|c| c.clone())
-            .unwrap_or_default()
+        self.player.callbacks()
     }
 
     /// AVM traces and warnings since the last drain.
     pub fn drain_log(&mut self) -> Vec<String> {
-        if let Some(o) = self.own() {
-            return o.drain_log();
-        }
-        self.shared
-            .log
-            .lock()
-            .map(|mut c| std::mem::take(&mut *c))
-            .unwrap_or_default()
-    }
-
-    /// Every URL the movie fetched, with whether a resource served it.
-    pub fn fetches(&self) -> Vec<(String, bool)> {
-        self.fetches.lock().map(|f| f.clone()).unwrap_or_default()
-    }
-}
-
-#[cfg(test)]
-mod key_tests {
-    use super::*;
-
-    #[test]
-    fn keys_reach_the_player_as_its_key_and_text_events() {
-        assert_eq!(
-            UiKey::Char('a').descriptor(),
-            (PhysicalKey::KeyA, LogicalKey::Character('a'))
-        );
-        assert_eq!(
-            UiKey::Char('R').descriptor(),
-            (PhysicalKey::KeyR, LogicalKey::Character('R'))
-        );
-        assert_eq!(UiKey::Char('é').descriptor().0, PhysicalKey::Unknown);
-        assert_eq!(
-            UiKey::Enter.descriptor(),
-            (PhysicalKey::Enter, LogicalKey::Named(NamedKey::Enter))
-        );
-        assert_eq!(UiKey::Enter.text_control(), Some(TextControlCode::Enter));
-        assert_eq!(
-            UiKey::SelectAll.text_control(),
-            Some(TextControlCode::SelectAll)
-        );
-        assert_eq!(UiKey::Char('x').text_control(), None);
-        assert_eq!(UiKey::Escape.text_control(), None);
+        self.player.drain_log()
     }
 }
 
@@ -1769,22 +1047,6 @@ mod inline_image_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn the_save_name_field_lets_spaces_through_and_keeps_its_length() {
-        let mut swf =
-            b"FWS\x08....\x88pool\0TextInput_mc_init\0restrict\0^ /t\0maxChars\0".to_vec();
-        let len = swf.len();
-        allow_spaces_in_typed_names(&mut swf);
-        assert_eq!(swf.len(), len, "the constant pool keeps its size");
-        let s = String::from_utf8_lossy(&swf);
-        assert!(s.contains("restrict\0^///\0maxChars"), "{s:?}");
-        // Anything else is left alone.
-        let mut other = b"FWS\x08restrict\0abc\0".to_vec();
-        let before = other.clone();
-        allow_spaces_in_typed_names(&mut other);
-        assert_eq!(other, before);
-    }
 
     #[test]
     fn the_stage_fits_the_authored_movie_whole_and_reports_the_visible_area() {

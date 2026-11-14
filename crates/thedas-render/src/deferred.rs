@@ -36,6 +36,10 @@ mod object_gpu_tests;
 #[path = "deferred_gpu_tests.rs"]
 mod gpu_tests;
 
+#[cfg(test)]
+#[path = "deferred_alpha_tests.rs"]
+mod alpha_gpu_tests;
+
 /// How the level is drawn.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum RenderPath {
@@ -120,6 +124,7 @@ struct DrawData {
     material: [f32; 4],
     tint_color: [f32; 4],
     character: crate::deferred_character::CharacterData,
+    alpha: [f32; 4],
 }
 
 #[repr(C)]
@@ -181,6 +186,7 @@ pub(crate) struct DeferredPass {
     data: Vec<DrawData>,
     /// Diffuse, normal, specular, lightmap, cube, terrain masks, tint and emissive.
     groups: Vec<[wgpu::TextureView; 12]>,
+    group_samplers: Vec<Option<wgpu::Sampler>>,
     vertices: HashMap<usize, Vec<DeferredVertex>>,
     skin_count: usize,
     /// Per faithful draw (index into [`D3dPass::draws`]): whether this pass draws it.
@@ -283,8 +289,16 @@ fn cull_index(c: Option<wgpu::Face>) -> usize {
 /// depth and test no alpha.
 fn static1(program: &crate::d3d::D3dProgram) -> bool {
     let p = &program.pass;
-    program.name.starts_with("static1.vsh+static1")
-        && !program.instanced
+    matches!(
+        (
+            program.name.split('+').next(),
+            program.name.split('+').nth(1)
+        ),
+        (
+            Some("static1.vsh"),
+            Some("static1.psh" | "static1_fast.psh")
+        )
+    ) && !program.instanced
         && p.blend.is_none()
         && p.alpha_test.is_none()
         && p.z_enable
@@ -344,6 +358,22 @@ impl DeferredPass {
         cache: &mut TextureCache,
     ) -> Option<DeferredPass> {
         let started = std::time::Instant::now();
+        let punch_enabled = std::env::var("THEDAS_DEFERRED_PUNCH").as_deref() != Ok("0");
+        let punch: HashMap<usize, _> = if punch_enabled {
+            d3d.draws
+                .iter()
+                .enumerate()
+                .filter_map(|(k, d)| {
+                    let m = scene.materials.get(scene.draws.get(d.draw)?.material)?;
+                    Some((
+                        k,
+                        crate::deferred_alpha::material(ctx, vfs, cache, m, d3d.program(d))?,
+                    ))
+                })
+                .collect()
+        } else {
+            HashMap::new()
+        };
         let mut texture = |names: &[Option<String>], ty: TextureType, fallback: [u8; 4]| {
             names
                 .iter()
@@ -353,8 +383,9 @@ impl DeferredPass {
         };
         let tex2d = TextureType::Tex2D;
         let mut rooms: HashMap<i64, u32> = HashMap::new();
-        let mut group_of: HashMap<(usize, String, Option<usize>), usize> = HashMap::new();
+        let mut group_of: HashMap<(usize, String, Option<usize>, String), usize> = HashMap::new();
         let mut groups = Vec::new();
+        let mut group_samplers = Vec::new();
         let mut draws = Vec::new();
         let mut data = Vec::new();
         let mut takes = vec![false; d3d.draws.len()];
@@ -368,6 +399,7 @@ impl DeferredPass {
             let Some(item) = scene.draws.get(d.draw) else {
                 continue;
             };
+            let alpha = punch.get(&k);
             let taken = !d3d.is_blended(d)
                 && !d.multipass
                 && (faces_enabled
@@ -375,7 +407,8 @@ impl DeferredPass {
                 && (objects_enabled || (d.draw < scene.static_draws && item.skin.is_none()))
                 && (static1(program)
                     || (terrain_enabled && terrain(program))
-                    || (objects_enabled && object_material(program)))
+                    || (objects_enabled && object_material(program))
+                    || alpha.is_some())
                 && item
                     .skin
                     .as_ref()
@@ -410,19 +443,23 @@ impl DeferredPass {
                     item.material,
                     lightmap.clone().unwrap_or_default(),
                     item.probe,
+                    program.name.clone(),
                 ))
                 .or_insert_with(|| {
                     let param = |p: &str| [m.texture(p), crate::d3d::texture_default(m, p)];
+                    group_samplers.push(alpha.map(|a| a.sampler.clone()));
                     groups.push([
-                        texture(
-                            &param(if is_terrain {
-                                "palette"
-                            } else {
-                                "mml_tDiffuse"
-                            }),
-                            tex2d,
-                            [128, 128, 128, 255],
-                        ),
+                        alpha.map(|a| a.diffuse.clone()).unwrap_or_else(|| {
+                            texture(
+                                &param(if is_terrain {
+                                    "palette"
+                                } else {
+                                    "mml_tDiffuse"
+                                }),
+                                tex2d,
+                                [128, 128, 128, 255],
+                            )
+                        }),
                         // A flat normal in DXT5nm's channels (x in alpha, y in green).
                         texture(
                             &param(if is_terrain {
@@ -553,7 +590,9 @@ impl DeferredPass {
                 } else {
                     0
                 },
-                casts: item.cast_shadow != Some(false),
+                // Textured cutouts use the independent forward-cutout caster plan;
+                // never submit their full card through the opaque cube pipeline.
+                casts: item.cast_shadow != Some(false) && alpha.is_none(),
             });
             data.push(DrawData {
                 lightmap: item.lightmap.as_ref().map_or([0.0, 0.0, 1.0, 1.0], |l| {
@@ -643,6 +682,7 @@ impl DeferredPass {
                 ],
                 tint_color: crate::d3d::material_vector(m, "mml_vTintColor").unwrap_or([0.0; 4]),
                 character: crate::deferred_character::CharacterData::new(m),
+                alpha: alpha.map_or([0.0; 4], |a| a.test),
             });
         }
         let (cutouts, cutout_materials) = crate::deferred_cutout::plan(
@@ -665,12 +705,17 @@ impl DeferredPass {
             started.elapsed().as_secs_f64() * 1000.0,
             scene.static_draws,
         );
+        log::info!(
+            "deferred: {} punch G-buffer draws",
+            data.iter().filter(|d| d.alpha[0] > 0.5).count()
+        );
         (!draws.is_empty() || !cutouts.is_empty()).then(|| DeferredPass {
             draws,
             cutouts,
             cutout_materials,
             data,
             groups,
+            group_samplers,
             vertices,
             skin_count,
             takes,
@@ -1078,82 +1123,87 @@ impl DeferredPass {
         let material_groups = self
             .groups
             .iter()
-            .map(|[d, n, s, l, e, mv, ma, ma2, tint, emissive, td, tn]| {
-                device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("deferred material"),
-                    layout: &material_layout,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: wgpu::BindingResource::TextureView(d),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: wgpu::BindingResource::TextureView(n),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 2,
-                            resource: wgpu::BindingResource::TextureView(s),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 3,
-                            resource: wgpu::BindingResource::Sampler(&wrap),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 4,
-                            resource: wgpu::BindingResource::TextureView(l),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 5,
-                            resource: wgpu::BindingResource::Sampler(&clamp),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 6,
-                            resource: wgpu::BindingResource::TextureView(e),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 7,
-                            resource: wgpu::BindingResource::TextureView(mv),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 8,
-                            resource: wgpu::BindingResource::TextureView(ma),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 9,
-                            resource: wgpu::BindingResource::TextureView(ma2),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 10,
-                            resource: wgpu::BindingResource::Sampler(&point),
-                        },
-                        // Separate bindings keep GL's one-sampler-per-image restriction:
-                        // static textures wrap; terrain palette textures clamp.
-                        wgpu::BindGroupEntry {
-                            binding: 11,
-                            resource: wgpu::BindingResource::TextureView(td),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 12,
-                            resource: wgpu::BindingResource::TextureView(tn),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 13,
-                            resource: wgpu::BindingResource::TextureView(tint),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 14,
-                            resource: wgpu::BindingResource::TextureView(emissive),
-                        },
-                        // Face age diffuse needs linear sampling; terrain's MaskV uses
-                        // a separate image binding with nearest sampling for portable GL.
-                        wgpu::BindGroupEntry {
-                            binding: 15,
-                            resource: wgpu::BindingResource::TextureView(mv),
-                        },
-                    ],
-                })
-            })
+            .zip(&self.group_samplers)
+            .map(
+                |([d, n, s, l, e, mv, ma, ma2, tint, emissive, td, tn], sampler)| {
+                    device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("deferred material"),
+                        layout: &material_layout,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: wgpu::BindingResource::TextureView(d),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: wgpu::BindingResource::TextureView(n),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: wgpu::BindingResource::TextureView(s),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 3,
+                                resource: wgpu::BindingResource::Sampler(
+                                    sampler.as_ref().unwrap_or(&wrap),
+                                ),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 4,
+                                resource: wgpu::BindingResource::TextureView(l),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 5,
+                                resource: wgpu::BindingResource::Sampler(&clamp),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 6,
+                                resource: wgpu::BindingResource::TextureView(e),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 7,
+                                resource: wgpu::BindingResource::TextureView(mv),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 8,
+                                resource: wgpu::BindingResource::TextureView(ma),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 9,
+                                resource: wgpu::BindingResource::TextureView(ma2),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 10,
+                                resource: wgpu::BindingResource::Sampler(&point),
+                            },
+                            // Separate bindings keep GL's one-sampler-per-image restriction:
+                            // static textures wrap; terrain palette textures clamp.
+                            wgpu::BindGroupEntry {
+                                binding: 11,
+                                resource: wgpu::BindingResource::TextureView(td),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 12,
+                                resource: wgpu::BindingResource::TextureView(tn),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 13,
+                                resource: wgpu::BindingResource::TextureView(tint),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 14,
+                                resource: wgpu::BindingResource::TextureView(emissive),
+                            },
+                            // Face age diffuse needs linear sampling; terrain's MaskV uses
+                            // a separate image binding with nearest sampling for portable GL.
+                            wgpu::BindGroupEntry {
+                                binding: 15,
+                                resource: wgpu::BindingResource::TextureView(mv),
+                            },
+                        ],
+                    })
+                },
+            )
             .collect();
         let lighting_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("deferred lighting"),
