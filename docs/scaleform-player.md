@@ -101,6 +101,9 @@ A new crate, `crates/thedas-gfx`, with no Ruffle dependency:
    Dirty mouse picking is refreshed after frame/interval actions and wheel listeners, so
    clips moved or hidden beneath a stationary pointer receive the corresponding rollover
    changes. Unchanged display lists skip the pick walk.
+   Native topmost-entity queries include a clip's own dynamic fills beneath its children,
+   in world coordinates, while respecting timeline and script masks. Transparent fills
+   are still entities; decorative drawings do not gain button events or text focus.
 
 ## Switch and parity
 
