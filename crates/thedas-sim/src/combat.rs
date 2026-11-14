@@ -1345,7 +1345,7 @@ impl Sim {
                 .unwrap_or(0);
             let pos = o.map(|o| o.position).unwrap_or([0.0; 3]);
             let (x, y) = (point[0] - pos[0], point[1] - pos[1]);
-            let length = (x * x + y * y).dsqrt();
+            let length = (x * x + y * y).sqrt();
             ev.vectors = vec![if length > 0.0 {
                 [x / length, y / length, 0.0]
             } else {
