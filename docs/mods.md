@@ -101,6 +101,15 @@ and from the list.
 Set the environment variable `THEDAS_MODS=none` to run with no mods and none of your
 Documents folders, or `THEDAS_MODS=<path to another list>` to use a different list.
 
+To use an original-game user folder from another machine or a Wine prefix, set
+`THEDAS_USER_DIR` to the `BioWare/Dragon Age` folder itself (`Dragon Age 2` for DA2).
+The default remains your own Documents folder. An explicit path that does not exist
+is reported and left out. Origins reads your core data, English locale and patch,
+your campaign's toolset, data, English locale, patch and override, and your core
+override above everything else. User add-ins follow `Settings/AddIns.xml`, including
+disabled entries and minimum game versions; they do not need their own manifest.
+See the [writable-folder trace](notes/user-resource-folders.md) for the ordering.
+
 ## The mod cache
 
 `.7z`, `.rar` and `.dazip` files are unpacked once into `mod-cache` inside your data folder, and used
