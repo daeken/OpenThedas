@@ -1046,9 +1046,19 @@ pub fn call(
             }
             void()
         }
+        // DAOrigins.exe 0x666450 -> 0x6a25a0 -> 0x69f030: a creature's
+        // 16-bit appearance indexes table 2, column 0xde80b418 (combat tree).
+        // The predicate is a case-sensitive substring search, not a creature-kind test
+        // or an exact match of the whole resource name.
         "IsHumanoid" => ok(b(h
             .object(obj(a, 0))
-            .is_some_and(|o| o.kind == ObjectKind::Creature))),
+            .filter(|o| o.kind == ObjectKind::Creature)
+            .is_some_and(|o| {
+                h.sim.world.tables.get(2, "").is_some_and(|t| {
+                    matches!(t.cell_by_hash(0xde80b418, i64::from(o.appearance as u16)),
+                        Some(Cell::String(s)) if clean(s).contains("combat_humanoid"))
+                })
+            }))),
         "GetAppearanceType" => ok(Value::Int(h.object(obj(a, 0)).map_or(0, |o| o.appearance))),
         "GetCreatureRank" => ok(Value::Int(h.object(obj(a, 0)).map_or(0, |o| o.rank))),
         "GetGroupId" => ok(Value::Int(h.object(obj(a, 0)).map_or(0, |o| o.group))),
@@ -3030,11 +3040,9 @@ pub fn call(
             }
             void()
         }
-        // Whether the conversation line whose condition or action is running is ambient:
-        // DAOrigins.exe (0x65dc00) returns the flag the conversation sets from the line's
-        // field 12207 before running its scripts (0x7f04ca). Provisional: another path
-        // (0x7eee00) sets it from a flag of the conversation itself, not traced; here it is
-        // always the line's.
+        // DAOrigins.exe 0x65dc00 reads the script context: conditions use the line's
+        // field 12207 (0x7f04ca), actions the conversation's ambient state (0x7eee00).
+        // dialog.rs sets the appropriate context before each script.
         "DialogIsAmbient" => ok(b(h.sim.dialog_ambient)),
         // DAOrigins.exe (0x6510f0) stops the ambient lines still to be spoken by an object
         // (all of them for OBJECT_INVALID) and returns TRUE.
@@ -4005,16 +4013,14 @@ pub fn call(
                 .map_or(OBJECT_INVALID, |&b| b as ObjectId),
         )),
         // DAOrigins.exe (0x65d0c0, 0x67c230) switches the current area's sound objects with
-        // that tag on or off (0x7c2190). Kept as the objects' active flag; there is no
-        // audio yet. Provisional: tags are compared ignoring case.
+        // that tag on or off (0x7c2190). The comparison at 0x67c2a4 calls 0x4c0de0 ->
+        // 0x414170 -> 0x413800: an exact, case-sensitive UTF-16 comparison. The app's
+        // audio snapshot already carries these objects' active flags to the mixer.
         "ActivateSoundByTag" => {
             let (tag, on) = (string(a, 0), int(a, 1) != 0);
             let area = h.sim.world.area;
             for o in h.sim.world.objects.values_mut() {
-                if o.kind == ObjectKind::Sound
-                    && o.area.is_some()
-                    && o.area == area
-                    && o.tag.eq_ignore_ascii_case(&tag)
+                if o.kind == ObjectKind::Sound && o.area.is_some() && o.area == area && o.tag == tag
                 {
                     o.active = on;
                 }
@@ -4071,17 +4077,31 @@ pub fn call(
         }
         "CountItemsByTag" => {
             let tag = string(a, 1);
+            let origins = h.sim.game == thedas_vfs::Game::Origins;
+            // Origins 0x666210 -> 0x7615f0: exact tag match, adding stack counts only
+            // for stackable items excluding default ammunition (0x753c60). DA2 is untraced.
             let n = h
                 .object(obj(a, 0))
                 .map(|o| o.inventory.clone())
                 .unwrap_or_default()
                 .into_iter()
-                .filter(|i| {
-                    h.object(*i)
-                        .is_some_and(|x| x.tag.eq_ignore_ascii_case(&tag))
+                .filter_map(|i| {
+                    let x = h.object(i)?;
+                    if !origins {
+                        return x.tag.eq_ignore_ascii_case(&tag).then_some(1_i32);
+                    }
+                    (x.kind == ObjectKind::Item && x.tag == tag).then(|| {
+                        if h.sim.max_stack(i) > 1
+                            && x.fields.get("DefaultAmmo").copied().unwrap_or(0) == 0
+                        {
+                            h.sim.stack_count(i)
+                        } else {
+                            1
+                        }
+                    })
                 })
-                .count();
-            ok(Value::Int(n as i32))
+                .fold(0_i32, i32::wrapping_add);
+            ok(Value::Int(n))
         }
         // DAOrigins.exe's SetCanLevelUp (0x662ea0 -> 0x6aca10) ignores its value: whether a
         // creature can level up is whether it has points to spend (attribute, skill and
@@ -4528,15 +4548,27 @@ pub fn call(
         }),
         "GetItemEquipSlot" => {
             let item = obj(a, 0);
-            let slot = h.sim.world.objects.values().find_map(|o| {
-                o.equipment
-                    .iter()
-                    .find(|(_, i)| **i == item)
-                    .map(|(s, _)| *s)
-            });
-            ok(Value::Int(slot.unwrap_or_else(|| {
-                constant(&h.sim.table, "INVENTORY_SLOT_INVALID")
-            })))
+            let origins = h.sim.game == thedas_vfs::Game::Origins;
+            let invalid = constant(&h.sim.table, "INVENTORY_SLOT_INVALID");
+            if origins && !h.object(item).is_some_and(|i| i.kind == ObjectKind::Item) {
+                return ok(Value::Int(invalid));
+            }
+            // Origins 0x665410 -> 0x797c80: an item's creature owner searches the
+            // active slots, then every weapon set. The returned slot omits the set id.
+            let slot = h
+                .sim
+                .world
+                .objects
+                .values()
+                .filter(|o| !origins || o.kind == ObjectKind::Creature)
+                .find_map(|o| {
+                    o.equipment
+                        .iter()
+                        .chain(o.other_set.iter().filter(|_| origins))
+                        .find(|(_, i)| **i == item)
+                        .map(|(s, _)| *s)
+                });
+            ok(Value::Int(slot.unwrap_or(invalid)))
         }
         "GetWeaponStyle" => ok(Value::Int(h.sim.weapon_style(obj(a, 0)))),
         // Followers fight on their own; the member the player controls is the player's.
@@ -5173,6 +5205,8 @@ mod tests {
         int GetPlotActionState(int a) = 20;\n\
         int EquipItem(object o, object i, int s = 255, int w = -1) = 21;\n\
         object GetItemInEquipSlot(int s, object o, int w = -1) = 22;\n\
+        int CountItemsByTag(object o, string s) = 380;\n\
+        int GetItemEquipSlot(object o) = 358;\n\
         int INVENTORY_SLOT_INVALID = 255;\n\
         object[] GetPartyPoolList() = 23;\n\
         void SetPlaceableActionResult(object o, int a, int s, int v = FALSE) = 24;\n\
@@ -5771,6 +5805,56 @@ mod tests {
     }
 
     #[test]
+    fn humanoids_are_identified_by_the_appearances_combat_tree() {
+        let table = Arc::new(EngineTable::parse(b"int IsHumanoid(object o) = 363;").unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        let tables = crate::m2da::Tables::empty();
+        tables.insert(
+            "#2",
+            &["ID", "#de80b418"],
+            [
+                "combat_humanoid.anb",
+                "combat_wolf.anb",
+                "Combat_Humanoid.anb",
+                "prefix_combat_humanoid_variant.anb",
+                "",
+            ]
+            .into_iter()
+            .enumerate()
+            .map(|(i, tree)| {
+                (
+                    (i + 1) as i64,
+                    vec![Cell::Int((i + 1) as i64), Cell::String(tree.into())],
+                )
+            })
+            .collect(),
+        );
+        s.world.tables = Arc::new(tables);
+        let creature = s.world.spawn(ObjectKind::Creature, "creature");
+        for (appearance, expected) in [(1, 1), (2, 0), (3, 0), (4, 1), (5, 0), (6, 0), (65537, 1)] {
+            s.world.get_mut(creature).unwrap().appearance = appearance;
+            assert_eq!(
+                run(&mut s, creature, "IsHumanoid", &[Value::Object(creature)]),
+                Some(Value::Int(expected)),
+                "appearance {appearance}"
+            );
+        }
+        let placeable = s.world.spawn(ObjectKind::Placeable, "placeable");
+        s.world.get_mut(placeable).unwrap().appearance = 1;
+        for target in [placeable, OBJECT_INVALID] {
+            assert_eq!(
+                run(&mut s, creature, "IsHumanoid", &[Value::Object(target)]),
+                Some(Value::Int(0))
+            );
+        }
+        s.world.tables = Arc::new(crate::m2da::Tables::empty());
+        assert_eq!(
+            run(&mut s, creature, "IsHumanoid", &[Value::Object(creature)]),
+            Some(Value::Int(0))
+        );
+    }
+
+    #[test]
     fn clear_current_command_ends_only_the_running_command() {
         let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
         let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
@@ -6343,14 +6427,74 @@ mod tests {
         // The bow went to the second set; the dagger is in hand.
         assert_eq!(main(&mut s, -1), Some(o(dagger)));
         assert_eq!(main(&mut s, 1), Some(o(bow)));
+        let slot = |s: &mut Sim, item| run(s, c, "GetItemEquipSlot", &[o(item)]);
+        assert_eq!(slot(&mut s, dagger), Some(Value::Int(0)));
+        assert_eq!(slot(&mut s, bow), Some(Value::Int(0)));
+        assert_eq!(slot(&mut s, armour), Some(Value::Int(4)));
         run(&mut s, c, "SwitchWeaponSet", &[o(c), Value::Int(1)]);
         assert_eq!(main(&mut s, -1), Some(o(bow)));
         assert_eq!(main(&mut s, 0), Some(o(dagger)));
+        assert_eq!(slot(&mut s, dagger), Some(Value::Int(0)));
+        assert_eq!(slot(&mut s, bow), Some(Value::Int(0)));
+        assert!(s.unequip(c, dagger));
+        assert_eq!(slot(&mut s, dagger), Some(Value::Int(255)));
+        assert_eq!(slot(&mut s, OBJECT_INVALID), Some(Value::Int(255)));
+        assert_eq!(slot(&mut s, c), Some(Value::Int(255)));
+        // Preserve DA2's previous active-set-only lookup pending a DA2 trace.
+        s.game = thedas_vfs::Game::DragonAge2;
+        s.world.get_mut(c).unwrap().other_set.insert(0, dagger);
+        assert_eq!(slot(&mut s, dagger), Some(Value::Int(255)));
         assert_eq!(
             s.world.get(c).unwrap().equipment.get(&4),
             Some(&armour),
             "armour stays"
         );
+    }
+
+    #[test]
+    fn tag_counts_use_stacks_but_not_default_ammunition() {
+        let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        s.world.tables().insert(
+            "bitm_base",
+            &["#39974122"],
+            vec![(25, vec![Cell::Int(99)]), (2, vec![Cell::Int(1)])],
+        );
+        let owner = s.world.spawn(ObjectKind::Creature, "owner");
+        let elsewhere = s.world.spawn(ObjectKind::Placeable, "chest");
+        for (holder, tag, base, size, ammo) in [
+            (owner, "poultice", 25, 4, 0),
+            (owner, "poultice", 25, 2, 0),
+            (owner, "poultice", 2, 99, 0),
+            (owner, "poultice", 25, 20, 1),
+            (owner, "Poultice", 25, 3, 0),
+            (elsewhere, "poultice", 25, 7, 0),
+        ] {
+            let item = s.world.spawn(ObjectKind::Item, tag);
+            let f = &mut s.world.get_mut(item).unwrap().fields;
+            f.insert("BaseItem".into(), base);
+            f.insert("StackSize".into(), size);
+            f.insert("DefaultAmmo".into(), ammo);
+            s.world.get_mut(holder).unwrap().inventory.push(item);
+        }
+        let count = |s: &mut Sim, holder, tag: &str| {
+            run(
+                s,
+                owner,
+                "CountItemsByTag",
+                &[Value::Object(holder), Value::String(tag.into())],
+            )
+        };
+        assert_eq!(count(&mut s, owner, "poultice"), Some(Value::Int(8)));
+        assert_eq!(count(&mut s, owner, "Poultice"), Some(Value::Int(3)));
+        assert_eq!(count(&mut s, elsewhere, "poultice"), Some(Value::Int(7)));
+        assert_eq!(
+            count(&mut s, OBJECT_INVALID, "poultice"),
+            Some(Value::Int(0))
+        );
+        assert_eq!(count(&mut s, owner, "missing"), Some(Value::Int(0)));
+        s.game = thedas_vfs::Game::DragonAge2;
+        assert_eq!(count(&mut s, owner, "poultice"), Some(Value::Int(5)));
     }
 
     #[test]
@@ -8405,6 +8549,8 @@ mod coverage_tests {
             o
         };
         let bells = sound(&mut s, here, "snd_bells");
+        let duplicate = sound(&mut s, here, "snd_bells");
+        let upper = sound(&mut s, here, "SND_BELLS");
         let other = sound(&mut s, here, "snd_wind");
         let far = sound(&mut s, there, "snd_bells");
         run(
@@ -8414,14 +8560,24 @@ mod coverage_tests {
             &[Value::String("snd_bells".into()), Value::Int(0)],
         );
         let active = |s: &Sim, o: ObjectId| s.world.get(o).unwrap().active;
-        assert!(!active(&s, bells) && active(&s, other) && active(&s, far));
+        assert!(!active(&s, bells) && !active(&s, duplicate));
+        assert!(active(&s, upper) && active(&s, other) && active(&s, far));
+        s.world.get_mut(upper).unwrap().active = false;
         run(
             &mut s,
             1,
             "ActivateSoundByTag",
             &[Value::String("SND_BELLS".into()), Value::Int(1)],
         );
-        assert!(active(&s, bells));
+        assert!(active(&s, upper));
+        assert!(!active(&s, bells) && !active(&s, duplicate));
+        run(
+            &mut s,
+            1,
+            "ActivateSoundByTag",
+            &[Value::String("snd_bells".into()), Value::Int(-1)],
+        );
+        assert!(active(&s, bells) && active(&s, duplicate));
     }
 
     #[test]

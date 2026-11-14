@@ -80,6 +80,10 @@ pub struct Object {
     pub blend: BlendMode,
     pub filters: Vec<Filter>,
     pub clip_depth: Option<i32>,
+    /// Script mask, in its own place in the display tree (not this object's space).
+    pub mask: Option<DisplayId>,
+    /// The object using this as a script mask. A mask is not drawn/picked normally.
+    pub mask_for: Option<DisplayId>,
     pub ratio: u16,
     pub children: BTreeMap<i32, DisplayId>,
     pub script: Option<ObjId>,
@@ -105,6 +109,8 @@ impl Object {
             blend: BlendMode::Normal,
             filters: Vec::new(),
             clip_depth: None,
+            mask: None,
+            mask_for: None,
             ratio: 0,
             children: BTreeMap::new(),
             script: None,
@@ -214,6 +220,10 @@ impl Display {
         let mut gone = Vec::new();
         let mut stack = vec![id];
         while let Some(i) = stack.pop() {
+            if let Some(target) = self.get(i).and_then(|o| o.mask_for) {
+                self.set_mask(target, None);
+            }
+            self.set_mask(i, None);
             if let Some((g, slot)) = self.slots.get_mut(i.index as usize) {
                 if *g != i.generation {
                     continue;
@@ -226,6 +236,33 @@ impl Display {
             }
         }
         gone
+    }
+
+    /// A script mask has one owner. Reassignment and removal sever both old links.
+    pub fn set_mask(&mut self, target: DisplayId, mask: Option<DisplayId>) -> bool {
+        if self.get(target).is_none() || mask.is_some_and(|m| m == target || self.get(m).is_none())
+        {
+            return false;
+        }
+        if let Some(old) = self.get(target).and_then(|o| o.mask)
+            && let Some(o) = self.get_mut(old)
+        {
+            o.mask_for = None;
+        }
+        if let Some(mask) = mask {
+            if let Some(old) = self.get(mask).and_then(|o| o.mask_for)
+                && let Some(o) = self.get_mut(old)
+            {
+                o.mask = None;
+            }
+            let o = self.get_mut(mask).unwrap();
+            o.mask_for = Some(target);
+            o.clip_depth = None;
+        }
+        let o = self.get_mut(target).unwrap();
+        o.mask = mask;
+        o.clip_depth = None;
+        true
     }
 
     pub fn ids(&self) -> impl Iterator<Item = DisplayId> + '_ {
