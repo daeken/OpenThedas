@@ -1260,11 +1260,16 @@ impl Server {
                     let id = resolve(sim, t).ok_or("no such object")?;
                     let o = sim.world.get(id).ok_or("no such object")?;
                     let (mut to, area) = (o.position, o.area);
-                    // A walk up to a creature stops against it, as the player's click does,
-                    // not on its spot: short of it by the two bodies, on the line from the
-                    // hero.
+                    // In DA2, approach a living, active creature's capsule rather than
+                    // its centre, on the line from the hero. Keep DA:O's harness paths
+                    // unchanged; corpses and inactive creatures do not block movement.
                     let here = sim.world.get(hero).map(|h| (h.position, h.area));
-                    if o.kind == ObjectKind::Creature && id != hero {
+                    if sim.game == thedas_vfs::Game::DragonAge2
+                        && o.kind == ObjectKind::Creature
+                        && o.active
+                        && !o.dead
+                        && id != hero
+                    {
                         if let Some((h, _)) = here.filter(|(_, a)| *a == area) {
                             let (dx, dy) = (h[0] - to[0], h[1] - to[1]);
                             let d = (dx * dx + dy * dy).sqrt();
