@@ -99,6 +99,9 @@ A new crate, `crates/thedas-gfx`, with no Ruffle dependency:
   optionsmenu, newgame. All 66 movies start and run headless without errors.
 - Release build, idle: 10 µs to 9 ms of script per frame per movie (quickbar 0.27 ms against
   Ruffle's 2.1 ms); a movie that did not change is not drawn again.
+- Timeline-placed registered classes construct parents before descendants. This preserves
+  the GUI framework's last-created element and associates post-load callbacks with the
+  intended child, including popup centring before the text resizes its box.
 - Glow/DropShadow/Blur filters flatten the subtree, repeat separable box blur by quality,
   then composite premultiplied colour with strength, inner/knockout and source visibility.
   Parent stencil masks clip the result; nested filters and ordered filter lists are supported.
