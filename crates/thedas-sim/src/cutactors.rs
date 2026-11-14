@@ -125,6 +125,23 @@ pub fn line_cuts(g: &Gff4) -> Vec<LineCut> {
 }
 
 impl Sim {
+    /// The party members a playing cutscene does not cast, which presentation should not
+    /// draw while it plays (empty when no cutscene plays). Provisional: in DAOrigins.exe the
+    /// Dwarf Commoner's hero starts on the slums waypoint `start` (background_defaults,
+    /// M2DA 1001), inside the hanging brazier, and does not show during `bdccs_intro.cut`,
+    /// which does not cast him (QA capture,
+    /// OpenThedas-testdata/reference/original/triage/dc_intro_beraht); the code that hides
+    /// him is not traced, and the rule is read from that one cutscene.
+    pub fn cutscene_hidden_party(&self) -> Vec<ObjectId> {
+        let Some(c) = &self.world.cutscene else {
+            return Vec::new();
+        };
+        crate::engine::party_of(self)
+            .into_iter()
+            .filter(|m| !c.bound.iter().any(|b| b.object == *m))
+            .collect()
+    }
+
     /// The staging of conversation `dlg`'s lines (read once and kept).
     pub fn conversation_line_cuts(&mut self, dlg: &str) -> Arc<Vec<LineCut>> {
         let key = dlg.to_ascii_lowercase();
@@ -315,6 +332,35 @@ mod tests {
 
     use super::*;
     use crate::cuttracks::Actor;
+
+    #[test]
+    fn party_members_a_cutscene_does_not_cast_are_hidden_while_it_plays() {
+        let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(EngineTable::default()), 1);
+        let hero = s.world.spawn(ObjectKind::Creature, "player");
+        let cast = s.world.spawn(ObjectKind::Creature, "leske");
+        let follower = s.world.spawn(ObjectKind::Creature, "follower");
+        s.world.hero = Some(hero);
+        s.world.get_mut(hero).unwrap().followers = vec![cast, follower];
+        assert!(s.cutscene_hidden_party().is_empty(), "no cutscene");
+        s.world.cutscene = Some(crate::cutscene::Cutscene {
+            name: "bdccs_intro.cut".into(),
+            seconds: 1.0,
+            lines: Vec::new(),
+            elapsed_ms: 0,
+            from_dialog: false,
+            bound: vec![Bound {
+                object: cast,
+                actor: 0,
+                position: [0.0; 3],
+                facing: 0.0,
+                end: None,
+                restore: false,
+                snaps: false,
+            }],
+            placement: None,
+        });
+        assert_eq!(s.cutscene_hidden_party(), vec![hero, follower]);
+    }
 
     fn actor(tag: &str, end: [f32; 3], turn: f32) -> Actor {
         let (s, w) = crate::fmath::DetMath::dsin_cos(turn.to_radians() * 0.5);

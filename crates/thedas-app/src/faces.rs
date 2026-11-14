@@ -12,10 +12,17 @@
 //! are laid over the speaker's pose as an additive layer, so they move the face bones of
 //! whichever of its models has them (the head).
 //!
-//! Provisional: the animation runs from when the line comes up, on the frame clock, not
-//! the voice's own playback; which of a creature's models names its rig in the original is
-//! not traced (the race's base head is taken); lines of cutscenes and lines said in passing
-//! are not animated; the animation's blend in and out are not applied.
+//! The lines animated: the open conversation's, a cutscene's own voiced lines (said by the
+//! object drawn for the line's actor), and lines said in passing, each by its speaker at
+//! once, until its animation's last key.
+//!
+//! The open conversation's or the cutscene's line runs on its voice-over's own clock (how
+//! far into its sample the voice is) once the voice plays, and on the frame clock from when
+//! the line comes up before that and without sound.
+//!
+//! Provisional: lines said in passing run on the frame clock; which of a creature's models names its rig in the original is
+//! not traced (the race's base head is taken); the animation's blend in and out are not
+//! applied.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -56,7 +63,12 @@ pub struct Faces {
     /// By race prefix (`hm`): its rig's name.
     rigs: HashMap<String, Option<String>>,
     playing: Option<Playing>,
+    /// Lines said in passing, each by its own speaker.
+    passing: Vec<Playing>,
 }
+
+/// How long a line said in passing stays animated after its last key (seconds).
+const PASSING_TAIL: f32 = 0.5;
 
 /// What a line asks of the faces: who says it, and its voice sample's two names.
 pub struct SpokenLine {
@@ -94,9 +106,15 @@ fn archives(install: &Path, module: &str, language: &str) -> Vfs {
 }
 
 impl Faces {
-    /// Follows the line on screen (`None` when no voiced conversation line is), `dt`
-    /// seconds on.
+    /// Follows the line on screen (`None` when no voiced conversation or cutscene line is),
+    /// and the lines said in passing, `dt` seconds on.
     pub fn step(&mut self, install: &Path, module: &str, line: Option<SpokenLine>, dt: f32) {
+        for p in &mut self.passing {
+            p.time += dt;
+        }
+        // A line said in passing lasts as long as its animation (or a moment without one).
+        self.passing
+            .retain(|p| p.time <= p.anim.as_ref().map_or(0.0, |a| a.length()) + PASSING_TAIL);
         let Some(line) = line else {
             self.playing = None;
             return;
@@ -108,6 +126,32 @@ impl Faces {
             p.time += dt;
             return;
         }
+        self.playing = Some(self.start(install, module, &line));
+    }
+
+    /// Where the voice-over playing is (its line's talk-table reference, seconds into its
+    /// sample): the line animated with that reference takes that time, so its mouth keeps
+    /// to the voice (a voice that starts late, or a frame clock that runs unevenly).
+    pub fn voice_at(&mut self, at: Option<(u32, f64)>) {
+        if let (Some((strref, t)), Some(p)) = (at, self.playing.as_mut())
+            && p.key.1 == strref
+            && t.is_finite()
+        {
+            p.time = t as f32;
+        }
+    }
+
+    /// A line said in passing (`SpokenLine::speaker` says it at once), animated beside the
+    /// open conversation's, replacing what that speaker was saying.
+    pub fn say(&mut self, install: &Path, module: &str, line: &SpokenLine) {
+        let started = self.start(install, module, line);
+        self.passing.retain(|p| p.key.2 != line.speaker);
+        self.passing.push(started);
+    }
+
+    /// A line's animation, read, from its start.
+    fn start(&mut self, install: &Path, module: &str, line: &SpokenLine) -> Playing {
+        let key = (line.dialog.to_ascii_lowercase(), line.strref, line.speaker);
         let archives = self.archives.get_or_insert_with(|| {
             let language = LANGUAGE.get().map_or("en-us", String::as_str);
             archives(install, module, language)
@@ -132,11 +176,11 @@ impl Faces {
             line.speaker,
             anim.as_ref().map_or("no animation", |a| a.name.as_str())
         );
-        self.playing = Some(Playing {
+        Playing {
             key,
             anim,
             time: 0.0,
-        });
+        }
     }
 
     /// The face layer for creature `id`, whose head morph and models are `models` (the
@@ -148,7 +192,11 @@ impl Faces {
         id: ObjectId,
         models: impl IntoIterator<Item = &'a String>,
     ) -> Option<Clip> {
-        let p = self.playing.as_ref().filter(|p| p.key.2 == id)?;
+        let p = self
+            .playing
+            .iter()
+            .chain(&self.passing)
+            .find(|p| p.key.2 == id)?;
         let anim = p.anim.clone()?;
         let time = p.time;
         let actor = models.into_iter().find_map(|m| self.actor(vfs, m));
