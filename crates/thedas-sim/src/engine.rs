@@ -5101,9 +5101,11 @@ pub fn call(
             }
             void()
         }
-        // Ability results only steer animations, which the simulation does not play.
-        // Reports the target's resistance roll (made by the scripts themselves) and the node a
-        // projectile aims at: presentation for the simulation.
+        "SetAbilityResult" if h.sim.game == thedas_vfs::Game::DragonAge2 => {
+            h.sim.remember_ability_result(obj(a, 0), int(a, 1));
+            void()
+        }
+        // Origins' ability result remains presentation-only here.
         "SetAbilityResult" => {
             *h.sim
                 .world

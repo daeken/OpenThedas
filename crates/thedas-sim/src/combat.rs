@@ -99,6 +99,9 @@ pub struct CombatData {
     pub attack: Option<AttackResult>,
     /// `SetAttackDuration` for the attack in progress.
     pub attack_ms: Option<u64>,
+    /// DA2's `SetAbilityResult`: the command and result captured for the later impact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ability_cast: Option<AbilityCast>,
     /// Milliseconds gathered towards the next regeneration pass (see `Sim::regenerate`).
     #[serde(default)]
     pub regen_ms: u64,
@@ -130,6 +133,18 @@ pub struct CombatData {
     /// with the stealthed flag), without perceiving them.
     #[serde(default)]
     pub noticed_stealthed: Vec<ObjectId>,
+}
+
+/// DA2's active ability context (native 0x4dd360 / 0x5b0380), separate from the
+/// creature's mutable command result. The projectile target is a node selector.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AbilityCast {
+    pub ability: i32,
+    pub target: ObjectId,
+    pub item: ObjectId,
+    pub point: [f32; 3],
+    pub result: i32,
+    pub projectile_target: i32,
 }
 
 /// One tactics slot: when `condition` holds for a target of `target` type, do `command`.
@@ -1209,12 +1224,42 @@ impl Sim {
         self.party_item(id, tag).unwrap_or(OBJECT_INVALID)
     }
 
+    /// Native SetAbilityResult (0x4dd360): copy the front command's integer 0,
+    /// objects 0/1 and vector 0, plus the creature's current command result. The
+    /// result must survive other commands changing that creature field before impact.
+    pub(crate) fn remember_ability_result(&mut self, id: ObjectId, projectile_target: i32) {
+        let Some(o) = self
+            .world
+            .get(id)
+            .filter(|o| o.kind == ObjectKind::Creature)
+        else {
+            return;
+        };
+        let Some(cmd) = o.commands.first() else {
+            return;
+        };
+        let cast = AbilityCast {
+            ability: cmd.ints.first().copied().unwrap_or(0),
+            target: cmd.target.unwrap_or(OBJECT_INVALID),
+            item: self.ability_item(id, cmd),
+            point: cmd.location.map(|l| l.position).unwrap_or([0.0; 3]),
+            result: o.fields.get("CommandResult").copied().unwrap_or(0),
+            projectile_target,
+        };
+        self.world.get_mut(id).unwrap().combat.ability_cast = Some(cast);
+    }
+
     /// The front `CommandUseAbility` started: the owner's script vets it
     /// (`COMMAND_PENDING`: objects owner, target, item; integers command type, ability), then
     /// `ability_core` hears `ABILITY_CAST_START`.
     /// Provisional: the pending event's third object is inferred from `ability_core`, which
     /// reads it as the item.
     pub(crate) fn start_ability(&mut self, id: ObjectId, cmd: &crate::world::Command) {
+        if self.game == thedas_vfs::Game::DragonAge2
+            && let Some(o) = self.world.get_mut(id)
+        {
+            o.combat.ability_cast = None;
+        }
         let target = cmd.target.unwrap_or(OBJECT_INVALID);
         let ability = cmd.ints.first().copied().unwrap_or(0);
         let item = self.ability_item(id, cmd);
@@ -1238,8 +1283,8 @@ impl Sim {
 
     /// `ABILITY_CAST_START` or `ABILITY_CAST_IMPACT` to `ability_core`, which the original
     /// executable names directly (the rules scripts do not handle these events): objects
-    /// caster, item, target; integers ability, then three the script reads but we leave 0.
-    /// Provisional: the layout is read from `ability_core`'s bytecode, the zeros are guesses.
+    /// caster, item, target. DA2's result and vector come from its native active context;
+    /// Origins' trailing integer zeros remain provisional.
     fn ability_event(
         &mut self,
         name: &str,
@@ -1252,6 +1297,9 @@ impl Sim {
         let mut ev = self.new_event(name, Some(id));
         ev.objects = vec![id, item, target];
         ev.ints = vec![ability, 0, 0, 0];
+        if self.game == thedas_vfs::Game::DragonAge2 {
+            self.da2_ability_event(&mut ev, name, id, cmd);
+        }
         ev.strings = cmd.strings.clone();
         if let Some(l) = cmd.location {
             ev.locations = vec![l];
@@ -1263,6 +1311,47 @@ impl Sim {
             text: format!("{name} {id} -> {target}: ability {ability}"),
         });
         self.run_script(ABILITY_SCRIPT, id, Some(ev));
+    }
+
+    /// Native modern executor 0x6d7ec0: START (0x6d80f4) has the pending
+    /// command's result and horizontal direction; IMPACT (0x6d8715) has the
+    /// saved result and target point from SetAbilityResult.
+    fn da2_ability_event(
+        &self,
+        ev: &mut crate::world::Event,
+        name: &str,
+        id: ObjectId,
+        cmd: &crate::world::Command,
+    ) {
+        let o = self.world.get(id);
+        if name == "ABILITY_CAST_IMPACT"
+            && let Some(c) = o.and_then(|o| o.combat.ability_cast.as_ref())
+        {
+            ev.objects = vec![id, c.item, c.target];
+            ev.ints = vec![c.ability, c.result];
+            ev.vectors = vec![c.point];
+        } else {
+            ev.ints.truncate(2);
+            let point = cmd.location.map(|l| l.position).unwrap_or([0.0; 3]);
+            if name == "ABILITY_CAST_IMPACT" {
+                // Old snapshots/scripts without a captured context retain their prior
+                // zero result. Native allocation defaults are not established yet.
+                ev.vectors = vec![point];
+                return;
+            }
+            ev.ints[1] = o
+                .and_then(|o| o.fields.get("CommandResult"))
+                .copied()
+                .unwrap_or(0);
+            let pos = o.map(|o| o.position).unwrap_or([0.0; 3]);
+            let (x, y) = (point[0] - pos[0], point[1] - pos[1]);
+            let length = (x * x + y * y).dsqrt();
+            ev.vectors = vec![if length > 0.0 {
+                [x / length, y / length, 0.0]
+            } else {
+                [1.0, 0.0, 0.0]
+            }];
+        }
     }
 
     /// The ability's casting time is up: `ABILITY_CAST_IMPACT` to its owner. An ability
@@ -2110,6 +2199,86 @@ mod tests {
     fn sim() -> Sim {
         let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
         Sim::new(Arc::new(Vfs::new()), table, 3)
+    }
+
+    #[test]
+    fn da2_ability_impact_keeps_the_cast_result_across_commands_and_reload() {
+        use crate::world::{Event, Location};
+        use thedas_script::vm::Value;
+        let mut s = sim();
+        s.game = thedas_vfs::Game::DragonAge2;
+        let who = s.world.spawn(ObjectKind::Creature, "caster");
+        let target = s.world.spawn(ObjectKind::Creature, "target");
+        let item = s.world.spawn(ObjectKind::Item, "potion");
+        s.world.get_mut(who).unwrap().inventory.push(item);
+        s.order_ability(who, 3110, target, "potion");
+        let o = s.world.get_mut(who).unwrap();
+        o.fields.insert("CommandResult".into(), 1);
+        o.commands[0].location = Some(Location {
+            area: OBJECT_INVALID,
+            position: [3.0, 4.0, 99.0],
+            facing: 0.0,
+        });
+        let cmd = o.commands[0].clone();
+        let mut start = Event {
+            objects: vec![who, item, target],
+            ints: vec![3110, 0, 0, 0],
+            ..Default::default()
+        };
+        s.da2_ability_event(&mut start, "ABILITY_CAST_START", who, &cmd);
+        assert_eq!(start.ints, [3110, 1]);
+        assert_eq!(start.vectors, [[0.6, 0.8, 0.0]]);
+        let table = EngineTable::parse(
+            b"void SetAbilityResult(object oUser, int nProjectileTarget) = 715;",
+        )
+        .unwrap();
+        let f = table.function_by_name("SetAbilityResult").unwrap();
+        assert_eq!(
+            crate::engine::call(
+                &mut crate::sim::ScriptHost {
+                    sim: &mut s,
+                    event: None,
+                    script: "test".into()
+                },
+                who,
+                f,
+                &[Value::Object(who), Value::Int(2)]
+            ),
+            Some(Ok(None))
+        );
+        let cast = s
+            .world
+            .get(who)
+            .unwrap()
+            .combat
+            .ability_cast
+            .clone()
+            .unwrap();
+        assert_eq!(cast.projectile_target, 2);
+        // A later command changes both the target and the pending result. The impact
+        // belongs to the cast that took the snapshot, including after restoring it.
+        s.order_ability(who, 999, who, "");
+        s.world
+            .get_mut(who)
+            .unwrap()
+            .fields
+            .insert("CommandResult".into(), -2);
+        let saved = serde_json::to_string(&s.world).unwrap();
+        s.world = serde_json::from_str(&saved).unwrap();
+        let mut impact = Event::default();
+        s.da2_ability_event(&mut impact, "ABILITY_CAST_IMPACT", who, &cmd);
+        assert_eq!(impact.objects, [who, item, target]);
+        assert_eq!(impact.ints, [3110, 1]);
+        assert_eq!(impact.vectors, [[3.0, 4.0, 99.0]]);
+        assert_eq!(
+            s.world.get(who).unwrap().combat.ability_cast.as_ref(),
+            Some(&cast)
+        );
+        // A coincident target has the native +X fallback direction.
+        let o = s.world.get_mut(who).unwrap();
+        o.position = [3.0, 4.0, 0.0];
+        s.da2_ability_event(&mut start, "ABILITY_CAST_START", who, &cmd);
+        assert_eq!(start.vectors, [[1.0, 0.0, 0.0]]);
     }
 
     #[test]
