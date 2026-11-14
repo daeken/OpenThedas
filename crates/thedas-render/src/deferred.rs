@@ -4,7 +4,7 @@
 //! Eligible level, terrain, object and skinned character draws share a G-buffer; one pass lights them
 //! per pixel with every light in reach: the sum Static1.psh works out per object for three
 //! lights (`notes/frame-gamma-lightmap-trace.md`), over all of them. Everything else (water,
-//! sky, trees, unsupported character, blended and multi-pass materials, particles) is drawn
+//! sky, tree billboards, unsupported character, blended and multi-pass materials, particles) is drawn
 //! afterwards by the faithful pass, with its original shaders, over that colour and depth.
 //!
 //! Nothing here changes how the faithful path draws: with [`RenderPath::Faithful`] this
@@ -26,8 +26,8 @@ use crate::scene::{AreaScene, DOMAIN_CHARACTERS, DOMAIN_LEVEL, SceneLight};
 #[path = "deferred_light_masks.rs"]
 mod light_masks;
 
-#[path = "deferred_fronds.rs"]
-mod fronds;
+#[path = "deferred_trees.rs"]
+mod trees;
 
 pub const DEFERRED_WGSL: &str = concat!(
     include_str!("deferred_skin.wgsl"),
@@ -208,7 +208,7 @@ struct PlanDraw {
 /// renderer is made, and its GPU objects, made the first time a frame is drawn deferred.
 pub(crate) struct DeferredPass {
     draws: Vec<PlanDraw>,
-    fronds: fronds::Plan,
+    trees: trees::Plan,
     cutouts: Vec<crate::deferred_cutout::Draw>,
     cutout_materials: Vec<crate::deferred_cutout::Material>,
     data: Vec<DrawData>,
@@ -254,7 +254,7 @@ pub(crate) struct Contributor<'a> {
 }
 
 struct Gpu {
-    fronds: fronds::Gpu,
+    trees: trees::Gpu,
     /// By cull mode: none, back, front.
     gbuffer: [wgpu::RenderPipeline; 3],
     gbuffer_opaque: [wgpu::RenderPipeline; 3],
@@ -756,7 +756,7 @@ impl DeferredPass {
             &mut vertices,
             &mut skin_count,
         );
-        let fronds = fronds::Plan::new(scene, d3d, &mut takes);
+        let trees = trees::Plan::new(scene, d3d, &mut takes);
         if crate::config::CONFIG.log_materials {
             // Count planned faithful passes, including offscreen and inactive LODs.
             // Keep this at load time so even large foliage scenes pay once.
@@ -808,14 +808,14 @@ impl DeferredPass {
             }
         }
         log::info!(
-            "deferred: {} of {} draws ({} terrain, {} props, {} character materials, {} skinned, {} fronds), planned in {:.1} ms ({} static draws)",
-            draws.len() + fronds.len(),
+            "deferred: {} of {} draws ({} terrain, {} props, {} character materials, {} skinned, {} tree materials), planned in {:.1} ms ({} static draws)",
+            draws.len() + trees.len(),
             d3d.draws.len(),
             data.iter().filter(|d| d.room[2] > 0.5).count(),
             data.iter().filter(|d| d.material[0] == 1.0).count(),
             data.iter().filter(|d| d.material[0] == 2.0).count(),
             draws.iter().filter(|d| d.skin_slot > 0).count(),
-            fronds.len(),
+            trees.len(),
             started.elapsed().as_secs_f64() * 1000.0,
             scene.static_draws,
         );
@@ -829,9 +829,9 @@ impl DeferredPass {
                 .filter(|d| d.material[0] > 0.5 && d.alpha[0] > 0.5)
                 .count()
         );
-        (!draws.is_empty() || !cutouts.is_empty() || !fronds.is_empty()).then(|| DeferredPass {
+        (!draws.is_empty() || !cutouts.is_empty() || !trees.is_empty()).then(|| DeferredPass {
             draws,
-            fronds,
+            trees,
             cutouts,
             cutout_materials,
             data,
@@ -903,8 +903,14 @@ impl DeferredPass {
         self.direct_terrain_layers = enabled;
     }
 
+    pub(crate) fn set_tree_materials(&mut self, enabled: Option<bool>) {
+        for family in trees::Family::NEW {
+            self.trees.set_enabled(family, enabled);
+        }
+    }
+
     pub(crate) fn set_fronds(&mut self, enabled: Option<bool>) {
-        self.fronds.set_enabled(enabled);
+        self.trees.set_enabled(trees::Family::Fronds, enabled);
     }
 
     /// Sets the lights only this pass draws (see [`DeferredPass::effect_lights`]).
@@ -1468,7 +1474,7 @@ impl DeferredPass {
             (cull_index(d.cull), d.group, d.mesh)
         });
         Gpu {
-            fronds: self.fronds.build(device, &frame_buffer),
+            trees: self.trees.build(device, &frame_buffer),
             gbuffer,
             gbuffer_opaque,
             gbuffer_static,
@@ -1560,7 +1566,7 @@ impl DeferredPass {
         if self.refused {
             return false;
         }
-        self.fronds.prepare(d3d, &mut self.takes);
+        self.trees.prepare(d3d, &mut self.takes);
         if crate::config::CONFIG.log_materials && !self.logged_materials {
             self.logged_materials = true;
             let mut counts: HashMap<&str, [usize; 2]> = HashMap::new();
@@ -2074,10 +2080,10 @@ impl DeferredPass {
                     );
                 }
             }
-            self.fronds.draw(&gpu.fronds, &mut pass, d3d, meshes);
+            self.trees.draw(&gpu.trees, &mut pass, d3d, meshes);
             for c in contributors.iter() {
                 if let Some(g) = c.pass.gpu.as_ref() {
-                    c.pass.fronds.draw(&g.fronds, &mut pass, c.d3d, c.meshes);
+                    c.pass.trees.draw(&g.trees, &mut pass, c.d3d, c.meshes);
                 }
             }
         }
