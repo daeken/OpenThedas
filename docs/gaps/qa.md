@@ -40,7 +40,7 @@ in each run folder's `.log` files).
 | # | Original | Ours | Evidence | Status |
 |---|---|---|---|---|
 | U1 | Inventory screen shows a stack count on the item | Count shown in the store, not on the inventory row | run13/inv_main.png | confirmed |
-| U2 | Store prices right-aligned per coin | Coins float left (Ruffle inline images) | run18/store.png | parked (known cosmetic) |
+| U2 | Store prices right-aligned per coin | Historical coin placement issue; recheck own-player inline helper | run18/store.png | parked (known cosmetic) |
 | U3 | Save thumbnails | Sunburst placeholder (the original shows the same for some saves: reference/original/load_game_screen.png) | run30/f5.png | open item, partly parity |
 | U4 | In-game Options: "Log In" bar shown? | We show it | run21/opts.png | question; no reference |
 | U5 | Item names readable | Item names low-contrast grey in lists | run13/inv_main.png | suspected |
