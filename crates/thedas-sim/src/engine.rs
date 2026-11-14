@@ -4604,7 +4604,13 @@ pub fn call(
                 .and_then(|o| o.fields.get("TreasureCategory").copied())
                 .unwrap_or(0),
         )),
-        "GetPlaceableTreasureRank" => ok(Value::Int(h.object(obj(a, 0)).map_or(0, |o| o.rank))),
+        // 0x65f220 resolves a placeable and reads +0x6bc. That member is Rank:
+        // binary field 0x3f7d at 0x74ff4b and named Rank at 0x75098e.
+        "GetPlaceableTreasureRank" => ok(Value::Int(
+            h.object(obj(a, 0))
+                .filter(|o| o.kind == ObjectKind::Placeable)
+                .map_or(0, |o| o.rank),
+        )),
         "GetCreatureTreasureCategory" => ok(Value::Int(
             h.object(obj(a, 0))
                 .and_then(|o| o.fields.get("TreasureCategory").copied())
@@ -5756,6 +5762,41 @@ mod tests {
             script: "test".into(),
         };
         call(&mut h, caller, &f, a).unwrap().unwrap()
+    }
+
+    #[test]
+    fn treasure_rank_reads_only_a_placeables_rank() {
+        let table =
+            Arc::new(EngineTable::parse(b"int GetPlaceableTreasureRank(object o) = 818;").unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        let placeable = s.world.spawn(ObjectKind::Placeable, "chest");
+        for rank in [0, 7, -1] {
+            s.world.get_mut(placeable).unwrap().rank = rank;
+            assert_eq!(
+                run(
+                    &mut s,
+                    placeable,
+                    "GetPlaceableTreasureRank",
+                    &[Value::Object(placeable)]
+                ),
+                Some(Value::Int(rank))
+            );
+        }
+        let creature = s.world.spawn(ObjectKind::Creature, "creature");
+        s.world.get_mut(creature).unwrap().rank = 7;
+        let item = s.world.spawn(ObjectKind::Item, "item");
+        s.world.get_mut(item).unwrap().rank = 7;
+        for target in [creature, item, OBJECT_INVALID] {
+            assert_eq!(
+                run(
+                    &mut s,
+                    placeable,
+                    "GetPlaceableTreasureRank",
+                    &[Value::Object(target)]
+                ),
+                Some(Value::Int(0))
+            );
+        }
     }
 
     #[test]
