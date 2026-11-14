@@ -8,6 +8,12 @@ The NWScript-style VM and the engine functions, events, commands and effects tha
 
 Gathered 2026-11-12 on main 1eb844a, from the release `thedas` binary and source. No game text.
 
+The [complete unanswered-function inventory](../notes/unanswered-script-functions.md)
+was measured again on 2026-11-14 at main `e67af2e3`: 168 of 676 declarations
+fall through Origins dispatch, including 63 called functions and 105 with no
+static call site. It includes a runtime dispatch audit and supersedes the older
+coverage counts below; the older sections remain the historical measurement.
+
 ### Method
 
 - `thedas script stats <install> --report stats.json` on the GOG 1.05 install (DAODecomp/gamedata).
@@ -262,7 +268,6 @@ Dispatch summary: `engine::call` (`crates/thedas-sim/src/engine.rs:483`) matches
 ### Engine-function dispatch and fallback
 
 - **SCR-001** **Unknown engine functions silently return defaults.** Original: not traced. Ours: any function without a match arm returns the default of its return type (0, 0.0, "", OBJECT_INVALID, empty array, invalid engine handle) and the script keeps running; only the trace records it. Scripts that branch on such results take the "nothing there" path without error. Evidence: `crates/thedas-sim/src/engine.rs:4289`, `crates/thedas-sim/src/sim.rs:3604`, `crates/thedas-script/src/vm.rs:739`. Size: L. Depends: none. Kind: missing.
-- **SCR-002** **No inventory of which script.ldf functions are unimplemented is kept in the repository.** Original: not applicable. Ours: the set of unanswered functions is known only by running `thedas script stats` / the trace against a real install; nothing in the tree lists the gap, so this document cannot enumerate the missing names. Evidence: `crates/thedas-sim/src/engine.rs:1-4`, `crates/thedas-sim/src/trace.rs:119`. Size: S. Depends: none. Kind: missing.
 - **SCR-003** **Declared parameter defaults are never applied.** Original: not traced (compiled scripts may always push every argument). Ours: `Param::default` is parsed as text and never evaluated; the VM accepts `argc` down to the required count and the host reads missing arguments as 0 / "" / OBJECT_INVALID through `int()`, `string()`, `obj()`, not as the declared default. Only a few functions special-case `a.len()` (e.g. `FloatToString`, `GetObjectByTag`, `RemoveAllEffects`, `CreateItemOnObject`). Evidence: `crates/thedas-script/src/ldf.rs:74`, `crates/thedas-script/src/vm.rs:329`, `crates/thedas-sim/src/engine.rs:19-47`. Size: M. Depends: none. Kind: unverified.
 - **SCR-004** **Argument type confusion is coerced rather than reported.** Original: not traced. Ours: `int()` truncates a float, `float()` widens an int, and a wrong-typed or missing argument becomes 0/""/OBJECT_INVALID with no trace entry, hiding script/host mismatches. Evidence: `crates/thedas-sim/src/engine.rs:19-47`. Size: S. Depends: none. Kind: provisional.
 
