@@ -1,10 +1,10 @@
 //! The deferred renderer: ours, not the original's, chosen at run time with
 //! [`RenderPath`] (see `docs/deferred.md`).
 //!
-//! The level's opaque Static1 and terrain draws go into a G-buffer, and one full-screen pass lights them
+//! Eligible level, terrain, object and skinned character draws share a G-buffer; one pass lights them
 //! per pixel with every light in reach: the sum Static1.psh works out per object for three
 //! lights (`notes/frame-gamma-lightmap-trace.md`), over all of them. Everything else (water,
-//! sky, trees, blended and multi-pass materials, the objects, particles) is drawn
+//! sky, trees, unsupported character, blended and multi-pass materials, particles) is drawn
 //! afterwards by the faithful pass, with its original shaders, over that colour and depth.
 //!
 //! Nothing here changes how the faithful path draws: with [`RenderPath::Faithful`] this
@@ -19,10 +19,18 @@ use thedas_vfs::Vfs;
 
 use crate::camera::Camera;
 use crate::d3d_gpu::D3dPass;
+use crate::deferred_mesh::{DeferredVertex, ROWS, SKIN_STRIDE};
 use crate::gpu::{DEPTH_FORMAT, GpuContext, GpuMesh, TextureCache, checked};
-use crate::scene::{AreaScene, DOMAIN_LEVEL, SceneLight, Vertex};
+use crate::scene::{AreaScene, DOMAIN_CHARACTERS, DOMAIN_LEVEL, SceneLight};
 
-pub const DEFERRED_WGSL: &str = include_str!("deferred.wgsl");
+pub const DEFERRED_WGSL: &str = concat!(
+    include_str!("deferred_skin.wgsl"),
+    include_str!("deferred.wgsl")
+);
+
+#[cfg(test)]
+#[path = "deferred_object_tests.rs"]
+mod gpu_tests;
 
 /// How the level is drawn.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -30,7 +38,7 @@ pub enum RenderPath {
     /// Every material through its original shaders (the default, and the reference).
     #[default]
     Faithful,
-    /// Ours: the level's static geometry lit per pixel from a G-buffer.
+    /// Ours: eligible world geometry lit per pixel from a shared G-buffer.
     Deferred,
 }
 
@@ -63,7 +71,7 @@ impl RenderPath {
 /// array, at most 16 KiB, which every backend can bind.
 const MAX_LIGHTS: usize = 192;
 /// Dynamic uniform offsets must be multiples of this on every backend.
-const DRAW_STRIDE: usize = 512;
+const DRAW_STRIDE: usize = 768;
 /// Room indices the lights' room sets can name; rooms past it are lit by every light.
 const MAX_ROOMS: u32 = 255;
 
@@ -74,7 +82,7 @@ const GBUFFER: [wgpu::TextureFormat; 4] = [
     wgpu::TextureFormat::Rgba8Unorm,
     wgpu::TextureFormat::Rgba8Unorm,
     wgpu::TextureFormat::Rgba16Float,
-    wgpu::TextureFormat::Rgba8Unorm,
+    wgpu::TextureFormat::Rgba16Float,
 ];
 
 #[repr(C)]
@@ -101,6 +109,11 @@ struct DrawData {
     falloff: [f32; 4],
     room: [f32; 4],
     terrain: crate::deferred_terrain::TerrainData,
+    probe: [[f32; 4]; 12],
+    tint: [[f32; 4]; 10],
+    /// x: 0 level, 1 prop, 2 character; y: emissive; z: tint mode; w reserved.
+    material: [f32; 4],
+    tint_color: [f32; 4],
 }
 
 #[repr(C)]
@@ -147,15 +160,20 @@ struct PlanDraw {
     cull: Option<wgpu::Face>,
     /// Its world bounding sphere as placed, for picking shadow casters.
     sphere: (Vec3, f32),
+    room: Option<i64>,
+    skin_slot: usize,
+    casts: bool,
 }
 
-/// The deferred pass of one renderer (the level's own): what it draws, worked out when the
+/// The deferred geometry of one renderer: what it draws, worked out when the
 /// renderer is made, and its GPU objects, made the first time a frame is drawn deferred.
 pub(crate) struct DeferredPass {
     draws: Vec<PlanDraw>,
     data: Vec<DrawData>,
-    /// Diffuse, normal, specular, lightmap, probe cube and the three terrain masks.
-    groups: Vec<[wgpu::TextureView; 8]>,
+    /// Diffuse, normal, specular, lightmap, cube, terrain masks, tint and emissive.
+    groups: Vec<[wgpu::TextureView; 10]>,
+    vertices: HashMap<usize, Vec<DeferredVertex>>,
+    skin_count: usize,
     /// Per faithful draw (index into [`D3dPass::draws`]): whether this pass draws it.
     takes: Vec<bool>,
     /// The index each room id has in the lights' room sets (1 on; 0 is "no room").
@@ -171,6 +189,12 @@ pub(crate) struct DeferredPass {
     refused: bool,
 }
 
+pub(crate) struct Contributor<'a> {
+    pub pass: &'a mut DeferredPass,
+    pub d3d: &'a D3dPass,
+    pub meshes: &'a [GpuMesh],
+}
+
 struct Gpu {
     /// By cull mode: none, back, front.
     gbuffer: [wgpu::RenderPipeline; 3],
@@ -182,13 +206,16 @@ struct Gpu {
     /// Every draw's [`DrawUniforms`], [`DRAW_STRIDE`] apart, rewritten each frame.
     draw_buffer: wgpu::Buffer,
     scene_group: wgpu::BindGroup,
+    vertices: HashMap<usize, wgpu::Buffer>,
+    skin_buffer: wgpu::Buffer,
+    skin_slots: Vec<u8>,
     /// The draw slots as last written.
     slots: Vec<u8>,
     material_groups: Vec<wgpu::BindGroup>,
     lighting_buffer: wgpu::Buffer,
     light_buffer: wgpu::Buffer,
     /// The shadowed lights' maps, and their faces' view-projections for the lighting.
-    shadows: crate::deferred_shadow::ShadowPool,
+    shadows: Option<crate::deferred_shadow::ShadowPool>,
     sun_fallback: wgpu::TextureView,
     sun_sampler: wgpu::Sampler,
     sun_buffer: wgpu::Buffer,
@@ -263,8 +290,37 @@ fn terrain(program: &crate::d3d::D3dProgram) -> bool {
         && p.z_write
 }
 
+/// Only these single-pass Origins material equations are represented in the G-buffer.
+/// Faces, hair, eyes, alpha-tested and remote-material variants stay forward.
+fn object_material(program: &crate::d3d::D3dProgram) -> bool {
+    let mut names = program.name.split('+');
+    matches!(
+        (names.next(), names.next()),
+        (Some("prop1.vsh"), Some("prop1.psh"))
+            | (Some("weapon1.vsh"), Some("weapon1.psh"))
+            | (Some("cloth1.vsh"), Some("cloth1.psh"))
+            | (
+                Some("char1.vsh"),
+                Some(
+                    "ch1.psh"
+                        | "ch1notnt.psh"
+                        | "ch1multnt.psh"
+                        | "ch1armtnt.psh"
+                        | "ch1em.psh"
+                        | "ch1emnotnt.psh"
+                        | "ch1emmultnt.psh"
+                        | "ch1emarmtnt.psh"
+                )
+            )
+    ) && !program.instanced
+        && program.pass.blend.is_none()
+        && program.pass.alpha_test.is_none()
+        && program.pass.z_enable
+        && program.pass.z_write
+}
+
 impl DeferredPass {
-    /// What a renderer of `scene` (the level's own meshes) draws deferred, with the
+    /// What a renderer of `scene` draws deferred, with the
     /// textures it reads; `None` when nothing qualifies.
     pub(crate) fn plan(
         ctx: &GpuContext,
@@ -287,23 +343,41 @@ impl DeferredPass {
         let mut draws = Vec::new();
         let mut data = Vec::new();
         let mut takes = vec![false; d3d.draws.len()];
+        let mut vertices = HashMap::new();
+        let mut skin_count = 1; // Slot zero is identity for rigid meshes.
+        let objects_enabled = std::env::var("THEDAS_DEFERRED_OBJECTS").as_deref() != Ok("0");
         let terrain_enabled = std::env::var("THEDAS_DEFERRED_TERRAIN").as_deref() != Ok("0");
         for (k, d) in d3d.draws.iter().enumerate() {
             let program = d3d.program(d);
             let Some(item) = scene.draws.get(d.draw) else {
                 continue;
             };
-            let taken = d.draw < scene.static_draws
-                && !d3d.is_blended(d)
+            let taken = !d3d.is_blended(d)
                 && !d.multipass
-                && (static1(program) || (terrain_enabled && terrain(program)))
-                && item.skin.is_none()
+                && (objects_enabled || (d.draw < scene.static_draws && item.skin.is_none()))
+                && (static1(program)
+                    || (terrain_enabled && terrain(program))
+                    || (objects_enabled && object_material(program)))
+                && item
+                    .skin
+                    .as_ref()
+                    .is_none_or(|s| s.palette.len() <= crate::deferred_mesh::BONES)
                 && item.lod.is_none()
                 && !scene.cut_away.contains(&d.draw)
                 && item.lightmap.as_ref().is_none_or(|l| l.planes().is_none());
             let Some(m) = taken.then(|| scene.materials.get(item.material)).flatten() else {
                 continue;
             };
+            if let std::collections::hash_map::Entry::Vacant(entry) = vertices.entry(d.mesh) {
+                let Some(v) = scene
+                    .meshes
+                    .get(d.mesh)
+                    .and_then(|m| crate::deferred_mesh::vertices(m, item.skin.is_some()))
+                else {
+                    continue;
+                };
+                entry.insert(v);
+            }
             let lightmap = item.lightmap.as_ref().map(|l| l.texture.clone());
             let is_terrain = terrain(program);
             // The probe's cubemap as the faithful pass binds it (see `d3d::sampler_texture`).
@@ -353,6 +427,8 @@ impl DeferredPass {
                         texture(&param("MaskV"), tex2d, [0, 0, 0, 255]),
                         texture(&param("MaskA"), tex2d, [255, 0, 0, 0]),
                         texture(&param("MaskA2"), tex2d, [0, 0, 0, 0]),
+                        texture(&param("mml_tTintMask"), tex2d, [0, 0, 0, 0]),
+                        texture(&param("mml_tEmissiveMask"), tex2d, [0, 0, 0, 0]),
                     ]);
                     groups.len() - 1
                 });
@@ -385,6 +461,15 @@ impl DeferredPass {
                 group,
                 cull: cull_of(program.pass.cull),
                 sphere: item.sphere,
+                room: item.room_id,
+                skin_slot: if item.skin.is_some() {
+                    let i = skin_count;
+                    skin_count += 1;
+                    i
+                } else {
+                    0
+                },
+                casts: item.cast_shadow != Some(false),
             });
             data.push(DrawData {
                 lightmap: item.lightmap.as_ref().map_or([0.0, 0.0, 1.0, 1.0], |l| {
@@ -402,18 +487,88 @@ impl DeferredPass {
                     },
                 ],
                 terrain: crate::deferred_terrain::TerrainData::new(m),
+                probe: item
+                    .probe
+                    .and_then(|i| scene.probes.get(i))
+                    .map(|p| p.probe.rows())
+                    .unwrap_or_else(|| {
+                        thedas_formats::probe::IrradianceProbe::uniform(
+                            crate::d3d::NO_PROBE_IRRADIANCE,
+                        )
+                        .rows()
+                    }),
+                tint: {
+                    let values = m
+                        .object
+                        .vector_arrays
+                        .iter()
+                        .find(|(n, _)| n.eq_ignore_ascii_case(crate::scene::TINT_PARAMETER))
+                        .map(|(_, v)| {
+                            v.chunks(4)
+                                .map(|v| {
+                                    let mut row = [0.0; 4];
+                                    for (d, s) in row.iter_mut().zip(v) {
+                                        *d = *s;
+                                    }
+                                    row
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                        .or_else(|| crate::d3d::default_vectors(m, crate::scene::TINT_PARAMETER))
+                        .unwrap_or_default();
+                    std::array::from_fn(|i| {
+                        values
+                            .get(i)
+                            .copied()
+                            .unwrap_or(if i < 2 { [0.0; 4] } else { [1.0; 4] })
+                    })
+                },
+                material: [
+                    if object_material(program) {
+                        if crate::d3d::LightClass::of(m.render_class.as_deref())
+                            == crate::d3d::LightClass::Character
+                        {
+                            2.0
+                        } else {
+                            1.0
+                        }
+                    } else {
+                        0.0
+                    },
+                    if program.name.contains("ch1em") || program.name.starts_with("prop1.") {
+                        1.0
+                    } else {
+                        0.0
+                    },
+                    if program.name.contains("notnt") {
+                        0.0
+                    } else if program.name.contains("multnt") {
+                        2.0
+                    } else if program.name.contains("armtnt") {
+                        3.0
+                    } else {
+                        1.0
+                    },
+                    0.0,
+                ],
+                tint_color: crate::d3d::material_vector(m, "mml_vTintColor").unwrap_or([0.0; 4]),
             });
         }
         log::info!(
-            "deferred: {} of the level's {} drawn meshes can be drawn deferred ({} terrain)",
+            "deferred: {} of {} draws ({} terrain, {} props, {} character materials, {} skinned)",
             draws.len(),
             d3d.draws.len(),
-            data.iter().filter(|d| d.room[2] > 0.5).count()
+            data.iter().filter(|d| d.room[2] > 0.5).count(),
+            data.iter().filter(|d| d.material[0] == 1.0).count(),
+            data.iter().filter(|d| d.material[0] == 2.0).count(),
+            skin_count - 1,
         );
         (!draws.is_empty()).then(|| DeferredPass {
             draws,
             data,
             groups,
+            vertices,
+            skin_count,
             takes,
             rooms,
             light_rooms: scene.light_rooms.clone(),
@@ -465,6 +620,10 @@ impl DeferredPass {
         self.refused
     }
 
+    pub(crate) fn ready(&self) -> bool {
+        self.gpu.is_some() && !self.refused
+    }
+
     fn build(&self, ctx: &GpuContext, color_format: wgpu::TextureFormat) -> Gpu {
         let device = &ctx.device;
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -491,6 +650,16 @@ impl DeferredPass {
                 wgpu::BindGroupLayoutEntry {
                     binding: 1,
                     visibility: vf,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: uniform,
+                        has_dynamic_offset: true,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::VERTEX,
                     ty: wgpu::BindingType::Buffer {
                         ty: uniform,
                         has_dynamic_offset: true,
@@ -541,6 +710,8 @@ impl DeferredPass {
                 smp(10),
                 tex(11, true),
                 tex(12, true),
+                tex(13, true),
+                tex(14, true),
             ],
         });
         let lighting_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -613,10 +784,10 @@ impl DeferredPass {
                     entry_point: Some("vs_gbuffer"),
                     compilation_options: Default::default(),
                     buffers: &[Some(wgpu::VertexBufferLayout {
-                        array_stride: std::mem::size_of::<Vertex>() as u64,
+                        array_stride: std::mem::size_of::<DeferredVertex>() as u64,
                         step_mode: wgpu::VertexStepMode::Vertex,
                         attributes: &wgpu::vertex_attr_array![
-                            0 => Float32x3, 1 => Float32x3, 2 => Float32x2, 3 => Float32x2
+                            0 => Float32x3, 1 => Float32x3, 2 => Float32x2, 3 => Float32x2, 4 => Float32x4, 5 => Float32x4
                         ],
                     })],
                 },
@@ -653,10 +824,10 @@ impl DeferredPass {
                     entry_point: Some("vs_gbuffer"),
                     compilation_options: Default::default(),
                     buffers: &[Some(wgpu::VertexBufferLayout {
-                        array_stride: std::mem::size_of::<Vertex>() as u64,
+                        array_stride: std::mem::size_of::<DeferredVertex>() as u64,
                         step_mode: wgpu::VertexStepMode::Vertex,
                         attributes: &wgpu::vertex_attr_array![
-                            0 => Float32x3, 1 => Float32x3, 2 => Float32x2, 3 => Float32x2
+                            0 => Float32x3, 1 => Float32x3, 2 => Float32x2, 3 => Float32x2, 4 => Float32x4, 5 => Float32x4
                         ],
                     })],
                 },
@@ -745,6 +916,12 @@ impl DeferredPass {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let skin_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("deferred skin palettes"),
+            size: (self.skin_count * SKIN_STRIDE) as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let scene_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("deferred scene"),
             layout: &scene_layout,
@@ -759,6 +936,14 @@ impl DeferredPass {
                         buffer: &draw_buffer,
                         offset: 0,
                         size: wgpu::BufferSize::new(std::mem::size_of::<DrawUniforms>() as u64),
+                    }),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &skin_buffer,
+                        offset: 0,
+                        size: wgpu::BufferSize::new((ROWS * 16) as u64),
                     }),
                 },
             ],
@@ -786,7 +971,7 @@ impl DeferredPass {
         let material_groups = self
             .groups
             .iter()
-            .map(|[d, n, s, l, e, mv, ma, ma2]| {
+            .map(|[d, n, s, l, e, mv, ma, ma2, tint, emissive]| {
                 device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("deferred material"),
                     layout: &material_layout,
@@ -845,6 +1030,14 @@ impl DeferredPass {
                             binding: 12,
                             resource: wgpu::BindingResource::TextureView(n),
                         },
+                        wgpu::BindGroupEntry {
+                            binding: 13,
+                            resource: wgpu::BindingResource::TextureView(tint),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 14,
+                            resource: wgpu::BindingResource::TextureView(emissive),
+                        },
                     ],
                 })
             })
@@ -897,11 +1090,28 @@ impl DeferredPass {
             frame_buffer,
             draw_buffer,
             scene_group,
+            vertices: self
+                .vertices
+                .iter()
+                .map(|(&i, vertices)| {
+                    use wgpu::util::DeviceExt;
+                    (
+                        i,
+                        device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                            label: Some("deferred vertices"),
+                            contents: bytemuck::cast_slice(vertices),
+                            usage: wgpu::BufferUsages::VERTEX,
+                        }),
+                    )
+                })
+                .collect(),
+            skin_buffer,
+            skin_slots: Vec::new(),
             slots: Vec::new(),
             material_groups,
             lighting_buffer,
             light_buffer,
-            shadows: crate::deferred_shadow::ShadowPool::new(device),
+            shadows: None,
             sun_fallback: device
                 .create_texture(&wgpu::TextureDescriptor {
                     label: Some("deferred unused sun partition"),
@@ -943,6 +1153,96 @@ impl DeferredPass {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn prepare(
+        &mut self,
+        ctx: &GpuContext,
+        color_format: wgpu::TextureFormat,
+        (width, height): (u32, u32),
+        camera: &Camera,
+        d3d: &D3dPass,
+        rooms: &HashMap<i64, u32>,
+    ) -> bool {
+        if self.refused {
+            return false;
+        }
+        if self.gpu.is_none() {
+            self.gpu = checked(&ctx.device, "the deferred renderer", || {
+                self.build(ctx, color_format)
+            });
+            if self.gpu.is_none() {
+                self.refused = true;
+                return false;
+            }
+        }
+        let gpu = self.gpu.as_mut().expect("prepared GPU");
+        let aspect = width as f32 / height.max(1) as f32;
+        let (view, projection) = (camera.view(), camera.projection(aspect));
+        // One write of every slot (many small writes are slow), when anything changed.
+        let mut slots = vec![0u8; DRAW_STRIDE * self.draws.len()];
+        for ((d, data), slot) in self
+            .draws
+            .iter()
+            .zip(&self.data)
+            .zip(slots.chunks_exact_mut(DRAW_STRIDE))
+        {
+            let world = d3d.world(d.draw).unwrap_or(Mat4::IDENTITY);
+            let world_view = view * world;
+            let mut data = *data;
+            data.room[0] = d.room.and_then(|r| rooms.get(&r)).copied().unwrap_or(0) as f32;
+            if data.material[0] == 1.0 {
+                let ambient = crate::d3d::ambient_of(d3d.lights(), crate::d3d::LightClass::Prop);
+                for c in 0..3 {
+                    data.probe[c * 4 + 3][3] += ambient[c];
+                }
+            }
+            let u = DrawUniforms {
+                mvp: (projection * world_view).to_cols_array_2d(),
+                world: world.to_cols_array_2d(),
+                data,
+            };
+            slot[..std::mem::size_of::<DrawUniforms>()].copy_from_slice(bytemuck::bytes_of(&u));
+        }
+        if slots != gpu.slots {
+            ctx.queue.write_buffer(&gpu.draw_buffer, 0, &slots);
+            gpu.slots = slots;
+        }
+        let fog = d3d.fog();
+        let frame = FrameUniforms {
+            eye: camera.position.extend(1.0).to_array(),
+            fixup: [
+                1.0 / width.max(1) as f32,
+                1.0 / height.max(1) as f32,
+                0.0,
+                0.0,
+            ],
+            fog: [
+                fog[0][3],
+                fog[1][0],
+                if debug_view() == 8 { 1.0 } else { 0.0 },
+                0.0,
+            ],
+        };
+        ctx.queue
+            .write_buffer(&gpu.frame_buffer, 0, bytemuck::bytes_of(&frame));
+        let mut skins = vec![0u8; self.skin_count * SKIN_STRIDE];
+        crate::deferred_mesh::write_palette(&mut skins[..SKIN_STRIDE], &[]);
+        for d in &self.draws {
+            if d.skin_slot > 0 {
+                let start = d.skin_slot * SKIN_STRIDE;
+                crate::deferred_mesh::write_palette(
+                    &mut skins[start..start + SKIN_STRIDE],
+                    d3d.bones(d.draw),
+                );
+            }
+        }
+        if skins != gpu.skin_slots {
+            ctx.queue.write_buffer(&gpu.skin_buffer, 0, &skins);
+            gpu.skin_slots = skins;
+        }
+        true
+    }
+
     /// Records the G-buffer and lighting passes for this frame into `encoder`: the lit
     /// deferred draws into `target` (cleared to `clear` first) and their depth into
     /// `depth` (cleared first), for the faithful pass to draw the rest over. Returns false,
@@ -960,20 +1260,52 @@ impl DeferredPass {
         d3d: &D3dPass,
         meshes: &[GpuMesh],
         clear: wgpu::Color,
+        contributors: &mut [Contributor<'_>],
     ) -> bool {
-        if self.refused {
-            return false;
-        }
-        if self.gpu.is_none() {
-            self.gpu = checked(&ctx.device, "the deferred renderer", || {
-                self.build(ctx, color_format)
-            });
-            if self.gpu.is_none() {
-                self.refused = true;
-                return false;
+        for c in contributors.iter() {
+            for &room in c.pass.rooms.keys() {
+                let next = self.rooms.len() as u32 + 1;
+                if next <= MAX_ROOMS {
+                    self.rooms.entry(room).or_insert(next);
+                }
             }
         }
-        let mut lights = self.lights(camera, width, height, d3d);
+        if !self.prepare(
+            ctx,
+            color_format,
+            (width, height),
+            camera,
+            d3d,
+            &self.rooms.clone(),
+        ) {
+            return false;
+        }
+        for c in contributors.iter_mut() {
+            c.pass.prepare(
+                ctx,
+                color_format,
+                (width, height),
+                camera,
+                c.d3d,
+                &self.rooms,
+            );
+        }
+        let characters = self.data.iter().any(|d| d.material[0] > 1.5)
+            || contributors
+                .iter()
+                .any(|c| c.pass.data.iter().any(|d| d.material[0] > 1.5));
+        if self.gpu.as_ref().is_some_and(|g| g.shadows.is_none()) {
+            let pool = checked(&ctx.device, "deferred point shadows", || {
+                crate::deferred_shadow::ShadowPool::new(&ctx.device)
+            });
+            if pool.is_none() {
+                self.refused = true;
+                self.gpu = None;
+                return false;
+            }
+            self.gpu.as_mut().expect("prepared GPU").shadows = pool;
+        }
+        let mut lights = self.lights(camera, width, height, d3d, characters);
         // Keep a capture/benchmark switch for comparing only the shadow contribution.
         let shadowed = if std::env::var("THEDAS_DEFERRED_POINT_SHADOWS").as_deref() == Ok("0") {
             Vec::new()
@@ -1028,7 +1360,7 @@ impl DeferredPass {
                 &views[2],
                 &views[3],
                 depth,
-                &gpu.shadows.view,
+                &gpu.shadows.as_ref().expect("point shadows").view,
             ]
             .into_iter()
             .enumerate()
@@ -1076,49 +1408,9 @@ impl DeferredPass {
             });
         }
 
-        // This frame's constants: per draw its matrices (as the faithful pass works them
-        // out: projection · (view · world)), then the lighting's.
         let aspect = width as f32 / height.max(1) as f32;
         let (view, projection) = (camera.view(), camera.projection(aspect));
-        // One write of every slot (many small writes are slow), when anything changed.
-        let mut slots = vec![0u8; DRAW_STRIDE * self.draws.len()];
-        for ((d, data), slot) in self
-            .draws
-            .iter()
-            .zip(&self.data)
-            .zip(slots.chunks_exact_mut(DRAW_STRIDE))
-        {
-            let world = d3d.world(d.draw).unwrap_or(Mat4::IDENTITY);
-            let world_view = view * world;
-            let u = DrawUniforms {
-                mvp: (projection * world_view).to_cols_array_2d(),
-                world: world.to_cols_array_2d(),
-                data: *data,
-            };
-            slot[..std::mem::size_of::<DrawUniforms>()].copy_from_slice(bytemuck::bytes_of(&u));
-        }
-        if slots != gpu.slots {
-            ctx.queue.write_buffer(&gpu.draw_buffer, 0, &slots);
-            gpu.slots = slots;
-        }
         let fog = d3d.fog();
-        let frame = FrameUniforms {
-            eye: camera.position.extend(1.0).to_array(),
-            fixup: [
-                1.0 / width.max(1) as f32,
-                1.0 / height.max(1) as f32,
-                0.0,
-                0.0,
-            ],
-            fog: [
-                fog[0][3],
-                fog[1][0],
-                if debug_view() == 8 { 1.0 } else { 0.0 },
-                0.0,
-            ],
-        };
-        ctx.queue
-            .write_buffer(&gpu.frame_buffer, 0, bytemuck::bytes_of(&frame));
         if lights != gpu.lights {
             if !lights.is_empty() {
                 ctx.queue
@@ -1169,17 +1461,16 @@ impl DeferredPass {
         }
         if !faces.is_empty() {
             ctx.queue.write_buffer(&gpu.faces_buffer, 0, &faces);
-            let casters: Vec<crate::deferred_shadow::Caster> = self
-                .draws
-                .iter()
-                .map(|d| crate::deferred_shadow::Caster {
-                    mesh: d.mesh,
-                    world: d3d.world(d.draw).unwrap_or(Mat4::IDENTITY),
-                    sphere: d.sphere,
-                })
-                .collect();
+            let mut casters = casters(&self.draws, d3d, meshes, &gpu.vertices, &gpu.skin_buffer);
+            for c in contributors.iter() {
+                if let Some(g) = c.pass.gpu.as_ref() {
+                    casters.extend(casters_for_contributor(c, g));
+                }
+            }
             gpu.shadows
-                .encode(device, &ctx.queue, encoder, &shadowed, &casters, meshes);
+                .as_mut()
+                .expect("point shadows")
+                .encode(device, &ctx.queue, encoder, &shadowed, &casters);
         }
 
         let Some(targets) = gpu.targets.as_ref() else {
@@ -1217,6 +1508,11 @@ impl DeferredPass {
                 multiview_mask: None,
             });
             draw_all(&self.draws, &mut pass, gpu, &gpu.gbuffer, d3d, meshes);
+            for c in contributors.iter() {
+                if let Some(g) = c.pass.gpu.as_ref() {
+                    draw_all(&c.pass.draws, &mut pass, g, &g.gbuffer, c.d3d, c.meshes);
+                }
+            }
         }
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -1266,20 +1562,32 @@ impl DeferredPass {
         });
         pass.set_bind_group(2, gpu.sun_group.as_ref().expect("sun targets"), &[]);
         draw_all(&self.draws, &mut pass, gpu, &gpu.env, d3d, meshes);
+        for c in contributors.iter() {
+            if let Some(g) = c.pass.gpu.as_ref() {
+                draw_all(&c.pass.draws, &mut pass, g, &g.env, c.d3d, c.meshes);
+            }
+        }
         true
     }
 
     /// The lights for a frame seen by `camera`: every point light of the scene's (and those
     /// added since) that lights the level and reaches into the view, nearest first past
     /// [`MAX_LIGHTS`].
-    fn lights(&self, camera: &Camera, width: u32, height: u32, d3d: &D3dPass) -> Vec<GpuLight> {
+    fn lights(
+        &self,
+        camera: &Camera,
+        width: u32,
+        height: u32,
+        d3d: &D3dPass,
+        characters: bool,
+    ) -> Vec<GpuLight> {
         let planes = frustum(camera.view_proj(width as f32 / height.max(1) as f32));
         let mut out: Vec<(f32, GpuLight)> = d3d
             .lights()
             .iter()
             .chain(&self.effect_lights)
             .chain(&self.own_lights)
-            .filter_map(|l| self.light(l, &planes, camera.position))
+            .filter_map(|l| self.light(l, &planes, camera.position, characters))
             .collect();
         if out.len() > MAX_LIGHTS {
             out.sort_by(|a, b| a.0.total_cmp(&b.0));
@@ -1288,7 +1596,13 @@ impl DeferredPass {
         out.into_iter().map(|(_, l)| l).collect()
     }
 
-    fn light(&self, l: &SceneLight, planes: &[Vec4; 6], eye: Vec3) -> Option<(f32, GpuLight)> {
+    fn light(
+        &self,
+        l: &SceneLight,
+        planes: &[Vec4; 6],
+        eye: Vec3,
+        characters: bool,
+    ) -> Option<(f32, GpuLight)> {
         let SceneLight::Point {
             position,
             color,
@@ -1297,6 +1611,7 @@ impl DeferredPass {
             is_static,
             intensity,
             room,
+            name,
             ..
         } = l
         else {
@@ -1308,7 +1623,8 @@ impl DeferredPass {
             .all(|p| p.truncate().dot(*position) + p.w >= -*radius);
         // As the faithful pass picks the level's lights (`d3d::pick_level_lights`): an affect
         // domain, read as a mask, that leaves the level out excludes the light.
-        if domain.is_some_and(|m| m & DOMAIN_LEVEL == 0)
+        let character = *domain == Some(DOMAIN_CHARACTERS);
+        if (domain.is_some_and(|m| m & DOMAIN_LEVEL == 0) && !(characters && character))
             || radius.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater)
             || colour.max_element() <= 0.0
             || !visible
@@ -1320,7 +1636,18 @@ impl DeferredPass {
             GpuLight {
                 position: position.extend(*radius).to_array(),
                 colour: colour.extend(if *is_static { 1.0 } else { 0.0 }).to_array(),
-                shadow: [-1.0, 0.0, 0.0, 0.0],
+                shadow: [
+                    -1.0,
+                    if name.starts_with("emitter ") {
+                        3.0
+                    } else if character {
+                        2.0
+                    } else {
+                        1.0
+                    },
+                    0.0,
+                    0.0,
+                ],
                 // A light of no room (an object's, an emitter's) reaches every room: placed by
                 // the rooms' boxes it missed the floors around Ishal's torches, whose boxes
                 // overlap; the nearest of them get shadow maps instead.
@@ -1347,6 +1674,42 @@ impl DeferredPass {
     }
 }
 
+fn casters_for_contributor<'a>(
+    c: &'a Contributor<'_>,
+    gpu: &'a Gpu,
+) -> Vec<crate::deferred_shadow::Caster<'a>> {
+    casters(
+        &c.pass.draws,
+        c.d3d,
+        c.meshes,
+        &gpu.vertices,
+        &gpu.skin_buffer,
+    )
+}
+
+fn casters<'a>(
+    draws: &[PlanDraw],
+    d3d: &D3dPass,
+    meshes: &'a [GpuMesh],
+    vertices: &'a HashMap<usize, wgpu::Buffer>,
+    bones: &'a wgpu::Buffer,
+) -> Vec<crate::deferred_shadow::Caster<'a>> {
+    draws
+        .iter()
+        .filter(|d| d.casts && !d3d.is_faded(&d3d.draws[d.k]))
+        .filter_map(|d| {
+            Some(crate::deferred_shadow::Caster {
+                mesh: meshes.get(d.mesh)?,
+                vertices: vertices.get(&d.mesh)?,
+                bones,
+                bone_offset: (d.skin_slot * SKIN_STRIDE) as u32,
+                world: d3d.world(d.draw).unwrap_or(Mat4::IDENTITY),
+                sphere: d3d.draw_sphere(&d3d.draws[d.k]).unwrap_or(d.sphere),
+            })
+        })
+        .collect()
+}
+
 /// Draws the deferred draws in view with `pipelines` (by cull mode).
 fn draw_all(
     draws: &[PlanDraw],
@@ -1359,7 +1722,7 @@ fn draw_all(
     let (mut pipeline, mut group) = (usize::MAX, usize::MAX);
     for &i in &gpu.order {
         let d = &draws[i];
-        if !d3d.in_view(d.k) {
+        if !d3d.in_view(d.k) || d3d.is_faded(&d3d.draws[d.k]) {
             continue;
         }
         let Some(mesh) = meshes.get(d.mesh) else {
@@ -1374,8 +1737,12 @@ fn draw_all(
             pass.set_bind_group(1, &gpu.material_groups[d.group], &[]);
             group = d.group;
         }
-        pass.set_bind_group(0, &gpu.scene_group, &[(i * DRAW_STRIDE) as u32]);
-        pass.set_vertex_buffer(0, mesh.vertices.slice(..));
+        pass.set_bind_group(
+            0,
+            &gpu.scene_group,
+            &[(i * DRAW_STRIDE) as u32, (d.skin_slot * SKIN_STRIDE) as u32],
+        );
+        pass.set_vertex_buffer(0, gpu.vertices[&d.mesh].slice(..));
         pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
         pass.draw_indexed(0..mesh.count, 0, 0..1);
     }
@@ -1507,6 +1874,23 @@ fn frustum(m: Mat4) -> [Vec4; 6] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn material_and_skin_uniforms_fit_portable_limits() {
+        assert!(std::mem::size_of::<DrawUniforms>() <= DRAW_STRIDE);
+        assert_eq!(DRAW_STRIDE % 256, 0);
+        assert_eq!(SKIN_STRIDE % 256, 0);
+        const {
+            assert!(ROWS * 16 <= 16 * 1024);
+        }
+        assert!(
+            GBUFFER
+                .iter()
+                .map(|f| f.target_pixel_byte_cost().unwrap())
+                .sum::<u32>()
+                <= 32
+        );
+    }
 
     #[test]
     fn deferred_shaders_translate_everywhere() {

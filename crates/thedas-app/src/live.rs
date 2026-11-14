@@ -2365,6 +2365,9 @@ impl Live {
         if let Some(l) = self.level.as_mut() {
             l.renderer.path = path;
         }
+        if let Some(o) = self.objects.as_mut() {
+            o.renderer.path = path;
+        }
         if path != thedas_render::RenderPath::Deferred {
             return;
         }
@@ -2427,9 +2430,17 @@ impl Live {
             o.renderer.encode_shadows(encoder, false);
         }
         level.renderer.finish_shadows(encoder);
-        level
-            .renderer
-            .render_main(ctx, encoder, target, width, height, camera);
+        let mut contributors: Vec<_> = self.objects.iter_mut().map(|o| &mut o.renderer).collect();
+        level.renderer.render_main_with(
+            ctx,
+            encoder,
+            target,
+            width,
+            height,
+            camera,
+            &mut contributors,
+        );
+        drop(contributors);
         // The rest goes over the level's frame: multisampled, its own targets (see
         // `thedas_render::msaa`), resolved into `target` at the end.
         let frame = level
