@@ -15,6 +15,14 @@ searched in table order after the default row. Otherwise the default is zero.
 The original installs the selected record at 0x58502b through 0x758470.
 OpenThedas derives the selection from these inputs on query.
 
+The registry loader at 0x5cd984 reads the row's ID (0x66fbc936), then stores
+that value as both registry key and the record's first integer at 0x5cd9b8.
+The learned-ability fallback has a native quirk: 0x5600f8 selects the scan index,
+not that row ID. An absent registry key yields the default zero record. The
+shipped learned styles 1 through 5 have matching indices and IDs; sparse NPC
+styles have no learned ability. Tests preserve the distinction for authored
+sparse tables.
+
 Real prologue data selects style 3 for Hawke/Carver's item 1001, style 5 for
 Bethany's item 1200, and NPC styles 100/101 through hurlock packages 20100/20101.
 Styles 2 and 10 share learned ability 202000; fallback reaches 2 first, while an

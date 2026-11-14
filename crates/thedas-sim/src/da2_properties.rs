@@ -30,10 +30,10 @@ impl Sim {
         let Some(styles) = self.world.tables.get(300, "") else {
             return 0;
         };
-        let valid = |style: i32| style > 0 && styles.rows.contains_key(&i64::from(style));
+        let valid = |style: i32| style != 0 && styles.rows.contains_key(&i64::from(style));
         let package = o.fields.get("Package").copied().unwrap_or(0);
         let override_style = self.da2_stat_cell(163, 0x9ebe_3727, package).unwrap_or(0.) as i32;
-        if valid(override_style) {
+        if override_style > 0 && valid(override_style) {
             return override_style;
         }
         // The native inventory query takes hand 0, then hand 1 only when absent.
@@ -54,10 +54,16 @@ impl Sim {
         styles
             .order
             .iter()
+            .enumerate()
             .skip(1)
-            .find_map(|&row| {
+            .find_map(|(index, &row)| {
                 let ability = number(styles.cell_by_hash(0x5d74_e7ea, row)).unwrap_or(0.) as i32;
-                (ability != 0 && o.abilities.contains(&ability)).then_some(row as i32)
+                // Native 0x5600f8 looks up the scan index, not the row's ID.
+                // An absent registry key creates the default (id zero) record.
+                (ability != 0 && o.abilities.contains(&ability)).then(|| {
+                    let style = index as i32;
+                    if valid(style) { style } else { 0 }
+                })
             })
             .unwrap_or(0)
     }
@@ -540,7 +546,7 @@ mod tests {
                 (4, vec![Cell::Int(101000)]),
                 (5, vec![Cell::Int(301000)]),
                 (10, vec![Cell::Int(202000)]),
-                (100, vec![Cell::Int(0)]),
+                (100, vec![Cell::Int(999000)]),
             ],
         );
         s.world.tables.insert(
@@ -620,6 +626,13 @@ mod tests {
             s.weapon_style(id),
             2,
             "unknown item style uses learned fallback"
+        );
+        s.world.get_mut(id).unwrap().abilities.clear();
+        s.world.get_mut(id).unwrap().abilities.insert(999000);
+        assert_eq!(
+            s.weapon_style(id),
+            0,
+            "native sparse fallback uses scan index 7, not row ID 100"
         );
         s.world.get_mut(id).unwrap().abilities.clear();
         assert_eq!(s.weapon_style(id), 0);
