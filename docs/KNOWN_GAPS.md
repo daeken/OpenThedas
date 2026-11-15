@@ -169,7 +169,7 @@ Concrete defects found during the code read. Each is small and independent.
 
 | ID | What |
 | --- | --- |
-| `SCR-074` | Comparing two effects, locations or events compares handles, so equal values differ |
+| `SCR-074` | Commands and unmodelled engine structures still compare handles; Origins effect/location/event equality is traced and fixed |
 | `SIM-148` | The module's start position is parsed and never used (barely visible: single player's start area is left at once) |
 | `RND-043` | Alpha-tested casters are skipped, so foliage, fences and hair cast no sun shadow |
 | `RND-095` | Location effects with an instant duration are discarded and never drawn |
