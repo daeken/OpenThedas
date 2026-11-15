@@ -57,18 +57,19 @@ an asset-backed fallback, rather than a claim of complete native picker parity.
 The asset-dependent regression can be run headlessly with a DAO install:
 
 ```sh
-THEDAS_INSTALL=/path/to/game cargo test -p thedas-app \
+THEDAS_INSTALL=/path/to/game cargo test -j 2 -p thedas-app \
   dust_towns_invisible_exit_has_a_pick_volume_without_rendered_meshes -- --ignored
 ```
 
-The hidden-window MCP candidate repro uses the saved Dwarf Commoner state with
-the hero at `[347, 278, 9.3]`, facing the exit. In a 1280×720 physical window,
+The hidden-window MCP candidate repro on merged main `9234241d` uses the saved
+Dwarf Commoner state with the hero at `[347, 278, 9.3]`, facing the exit. In a
+1280×720 physical window,
 `hover 640,290; click 640,290; run 200` selects the `area_transition` cursor,
-moves the hero to `[345.899, 278.220, 9.344]`, and queues
+moves the hero to `[346.006, 278.706, 9.326]`, and queues
 `CommandMoveToLocation` followed by `CommandUseObject`. After running on and
 waiting for loading to finish, the hero is in `bdc100ar_commons` at
-`[301.065, 345.524, 12.724]`, with an empty command queue. A further ground
-click moves him 1.94 m to `[302.483, 346.841, 12.688]`. The run uses original
+`[301.065, 345.524, 12.688]`, with an empty command queue. A further ground
+click moves him 1.93 m to `[302.483, 346.840, 12.688]`. The run uses original
 shaders and `THEDAS_HIDDEN_WINDOW=1`; it never runs the original game.
 
 No game assets, native bytes or disassembly are included here.

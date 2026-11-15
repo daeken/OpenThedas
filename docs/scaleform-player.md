@@ -117,13 +117,21 @@ The player lives in `crates/thedas-gfx`:
    TextField `_x` and `_y` include the scaled authored bounds origin. Reads and writes
    retain that origin, so helpers place inline tooltip dividers at the field's actual
    position, including fields whose edit-text bounds start at negative coordinates.
-5. **`render`**: wgpu. Shapes are tessellated once per character (lyon) into cached vertex
-   buffers; bitmaps (atlas DDS pages) uploaded once; scale9 drawn natively. Colour transform
-   and blend mode per draw; multiply and the few other modes against the scene picture,
-   with host multiply passes retained for the existing scene composite.
+5. **`render`**: wgpu. Shapes are tessellated once per character (lyon) into one vertex
+   arena; bitmaps (atlas DDS pages) uploaded once into a texture slot table (bindless where
+   the adapter allows); scale9 drawn natively. Each object is a record (transform, colour
+   transform, paint, clip rectangle) in a storage buffer and the vertex shader pulls its
+   vertices, so consecutive objects with the same blend and stencil use are one draw call.
+   Text draws from a glyph atlas rasterised at the drawn size. Vector edges carry a
+   one-pixel fringe for anti-aliasing, so nothing is multisampled (`THEDAS_UI_MSAA=2|4`
+   brings it back).
+   Movies draw straight into the frame, in order, over the game's picture, as the
+   original's did: `multiply` and the rarer blends act on what is already there (the
+   destination blends copy the frame first). `THEDAS_UI_DIRECT=0` renders each movie into
+   a texture of its own instead, composited by the app with its multiply passes.
 6. **Change tracking**: any change to a display property, frame, text, or the display list
-   marks the movie dirty. A tick that changes nothing does no rendering and the texture is
-   reused. Static subtrees can be cached to a texture later if profiling asks for it.
+   marks the movie dirty. Only then is the movie walked and its draw list (records and
+   vertex stream) uploaded again; an unchanged movie costs its few draw calls a frame.
    Dirty mouse picking is refreshed after frame/interval actions and wheel listeners, so
    clips moved or hidden beneath a stationary pointer receive the corresponding rollover
    changes. Unchanged display lists skip the pick walk.

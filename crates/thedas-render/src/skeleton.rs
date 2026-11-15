@@ -158,7 +158,8 @@ impl Skeleton {
     /// layer's turn and shift (the head tracking's pose animations; see [`crate::look`]):
     /// its rotation key is taken that far from no turn at all, its translation key times
     /// the weight. Provisional: the executable scales each additive clip by its instance's
-    /// weight (+0xc of its blend entry), but how is not traced. Other layers ignore it.
+    /// weight (+0xc of its blend entry), but how is not traced. A posed layer of weight
+    /// below 1 is blended into the layers before it (see `sample_into`).
     pub fn pose_weighted(&self, layers: &[(&Animation, f32, bool, f32)]) -> Vec<Mat4> {
         let nodes: Vec<Vec<Option<usize>>> =
             layers.iter().map(|(a, ..)| self.track_nodes(a)).collect();
@@ -251,6 +252,10 @@ impl Skeleton {
     ) {
         let anim = layer.anim;
         let t = layer.time.clamp(0.0, anim.length.max(0.0));
+        // A layer of weight below 1 is blended into what the layers before it posed (bones
+        // they left unset blend from rest): a crossfade between full-body clips.
+        let w = layer.weight.clamp(0.0, 1.0);
+        let blend = w < 1.0;
         for (track, node) in anim.tracks.iter().zip(layer.nodes) {
             let Some(i) = *node else {
                 continue;
@@ -259,7 +264,13 @@ impl Skeleton {
                 Channel::Rotation => {
                     if let Some(r) = sample_rotation(&track.keys, t) {
                         if let Some(slot) = rot.get_mut(i) {
-                            *slot = Some(r);
+                            *slot = Some(if blend {
+                                let from = slot.unwrap_or(self.bones[i].rest_rotation);
+                                let r = if from.dot(r) < 0.0 { -r } else { r };
+                                from.slerp(r, w).normalize()
+                            } else {
+                                r
+                            });
                         }
                     }
                 }
@@ -273,7 +284,11 @@ impl Skeleton {
                         .zip(first)
                         .map(|(v, f)| self.bones[i].rest_translation + (v - f));
                     if let (Some(p), Some(slot)) = (p, pos.get_mut(i)) {
-                        *slot = Some(p);
+                        *slot = Some(if blend {
+                            slot.unwrap_or(self.bones[i].rest_translation).lerp(p, w)
+                        } else {
+                            p
+                        });
                     }
                 }
             }
