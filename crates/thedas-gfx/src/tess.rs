@@ -147,6 +147,16 @@ pub fn tessellate_shape(
     records: &[Record],
     size: &dyn Fn(u16) -> Option<(f32, f32)>,
 ) -> Vec<Mesh> {
+    tessellate_shape_with_rule(fills, lines, records, size, FillRule::EvenOdd)
+}
+
+fn tessellate_shape_with_rule(
+    fills: &[Fill],
+    lines: &[Line],
+    records: &[Record],
+    size: &dyn Fn(u16) -> Option<(f32, f32)>,
+    fill_rule: FillRule,
+) -> Vec<Mesh> {
     // Edges per (style set, fill index); line segments per (style set, line index).
     let mut fill_edges: Vec<(Vec<Fill>, Vec<Vec<Edge>>)> = Vec::new();
     let mut line_paths: Vec<(Line, Vec<Edge>)> = Vec::new();
@@ -242,7 +252,7 @@ pub fn tessellate_shape(
     };
     let mut out = Vec::new();
     let mut tess = FillTessellator::new();
-    let opts = FillOptions::tolerance(TOLERANCE).with_fill_rule(FillRule::EvenOdd);
+    let opts = FillOptions::tolerance(TOLERANCE).with_fill_rule(fill_rule);
     for (styles, per_fill) in fill_edges {
         for (i, edges) in per_fill.into_iter().enumerate() {
             if edges.is_empty() {
@@ -417,8 +427,8 @@ pub fn tessellate_glyph(records: &[Record]) -> (Vec<[f32; 2]>, Vec<u32>) {
         b: 255,
         a: 255,
     })];
-    // Glyph shapes use fill 1 on one side; make sure a fill is set.
-    let meshes = tessellate_shape(&fills, &[], records, &|_| None);
+    // Font contours use nonzero winding, including overlapping parts of one glyph.
+    let meshes = tessellate_shape_with_rule(&fills, &[], records, &|_| None, FillRule::NonZero);
     match meshes.into_iter().next() {
         Some(m) => (m.vertices.iter().map(|v| v.pos).collect(), m.indices),
         None => (Vec::new(), Vec::new()),
@@ -511,6 +521,59 @@ mod tests {
                 sides.iter().all(|s| *s >= 0.0) || sides.iter().all(|s| *s <= 0.0)
             })
         })
+    }
+
+    fn glyph_mesh(records: &[Record]) -> Vec<Mesh> {
+        let (vertices, indices) = tessellate_glyph(records);
+        vec![Mesh {
+            paint: Paint::Solid,
+            vertices: vertices
+                .into_iter()
+                .map(|pos| Vertex {
+                    pos,
+                    ..Default::default()
+                })
+                .collect(),
+            indices,
+        }]
+    }
+
+    fn contour(points: &[(i32, i32)]) -> Vec<Record> {
+        let mut records = vec![Record::Style {
+            move_to: Some(points[0]),
+            fill0: None,
+            fill1: Some(1),
+            line: None,
+            new_styles: None,
+        }];
+        records.extend(points[1..].iter().map(|to| Record::Line { to: *to }));
+        records.push(Record::Line { to: points[0] });
+        records
+    }
+
+    #[test]
+    fn glyph_overlapping_contours_keep_their_fill() {
+        let mut records = contour(&[(0, 0), (100, 0), (100, 100), (0, 100)]);
+        records.extend(contour(&[(50, 50), (150, 50), (150, 150), (50, 150)]));
+        let glyph = glyph_mesh(&records);
+        for point in [[25.0, 25.0], [75.0, 75.0], [125.0, 125.0]] {
+            assert!(covers(&glyph, point), "{point:?}");
+        }
+        assert!(!covers(&glyph, [125.0, 25.0]));
+
+        let shapes = tessellate_shape(&[Fill::Solid(Color::default())], &[], &records, &|_| None);
+        assert!(covers(&shapes, [25.0, 25.0]));
+        assert!(!covers(&shapes, [75.0, 75.0]));
+    }
+
+    #[test]
+    fn glyph_opposite_contours_keep_counters_open() {
+        let mut records = contour(&[(0, 0), (100, 0), (100, 100), (0, 100)]);
+        records.extend(contour(&[(25, 25), (25, 75), (75, 75), (75, 25)]));
+        let glyph = glyph_mesh(&records);
+        assert!(covers(&glyph, [12.0, 50.0]));
+        assert!(!covers(&glyph, [50.0, 50.0]));
+        assert!(!covers(&glyph_mesh(&[]), [0.0, 0.0]));
     }
 
     #[test]
