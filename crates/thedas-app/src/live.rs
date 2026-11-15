@@ -2049,12 +2049,24 @@ impl Live {
                 self.travel = false;
             }
         }
+        // Each creature's appearance scales its clips' translations (a dwarf sits lower than
+        // the human clip's drop; see `thedas_render::skeleton::Layer::scale`).
+        let scales: std::collections::HashMap<ObjectId, [f32; 3]> = {
+            let sim = self.sim();
+            models
+                .iter()
+                .filter_map(|m| thedas_ui::models::translation_scale(&sim, m.id).map(|s| (m.id, s)))
+                .collect()
+        };
         let (Some(level), Some(objects)) = (self.level.as_ref(), self.objects.as_mut()) else {
             return Ok(());
         };
         let mut posed: Vec<(Mat4, Option<Clip>)> = Vec::with_capacity(models.len());
         for m in &models {
             let mut c = m.motion.as_ref().map(clip);
+            if let Some(c) = c.as_mut() {
+                c.translation_scale = Some(scales.get(&m.id).copied().unwrap_or([1.0; 3]));
+            }
             let none = Vec::new();
             let held = kept.get(&m.id).unwrap_or(&none);
             let (at, facing) = match posing.get(&m.id) {
