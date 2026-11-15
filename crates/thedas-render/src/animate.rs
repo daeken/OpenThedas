@@ -500,10 +500,10 @@ impl Animator {
         // (and its attachments and effects with it) and is seen when it comes into view.
         for (i, ((transform, _), poses)) in props.iter().zip(by_prop).enumerate() {
             if posing[i] {
-                renderer.pose_prop(ctx, scene, i, *transform, &poses);
+                renderer.pose_prop(ctx, scene, i, *transform, &poses, true);
                 self.last_poses[i] = Some((shapes[i], poses));
             } else if let Some((_, kept)) = &self.last_poses[i] {
-                renderer.pose_prop(ctx, scene, i, *transform, kept);
+                renderer.pose_prop(ctx, scene, i, *transform, kept, false);
             }
         }
     }
@@ -570,6 +570,7 @@ mod tests {
             length: 1.0,
             additive: false,
             scalars: Default::default(),
+            colors: Vec::new(),
             tracks: vec![
                 track(hashed("elbow_rotation"), Channel::Rotation),
                 // A bone this skeleton does not have stays hashed.
@@ -611,6 +612,7 @@ mod tests {
             length: 1.0,
             additive: false,
             scalars: Vec::new(),
+            colors: Vec::new(),
             tracks: vec![Track {
                 bone: "elbow".into(),
                 channel: Channel::Translation,

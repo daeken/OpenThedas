@@ -157,6 +157,11 @@ pub struct EmitterState {
     /// Birthrate and its range set by an animation of the emitter's model (a visual
     /// effect's exported `<emitter>_birthrate` parameters), over the emitter's own.
     pub rate: Option<(f32, f32)>,
+    /// The age map colour multiplier set by an animation of the emitter's model (a visual
+    /// effect's exported `<emitter>_agemapcolormultiplier`), over the emitter's own.
+    pub color: Option<[f32; 4]>,
+    /// The age map size multipliers (x, y) set so (`<emitter>_agemapscalexmultiplier`).
+    pub scale: Option<[f32; 2]>,
 }
 
 impl EmitterState {
@@ -171,6 +176,8 @@ impl EmitterState {
             burst_done: false,
             opacity: 1.0,
             rate: None,
+            color: None,
+            scale: None,
         }
     }
 
@@ -335,12 +342,10 @@ impl EmitterState {
         let e = &self.blueprint;
         let t = (p.age * p.inv_life).clamp(0.0, 1.0);
         let (color, size) = age_map(&e.age_map, t);
+        let scale = self.scale.unwrap_or(e.age_scale_multiplier);
         Look {
-            color: color * Vec4::from_array(e.age_color_multiplier),
-            size: [
-                size[0] * e.age_scale_multiplier[0] * p.scale,
-                size[1] * e.age_scale_multiplier[1] * p.scale,
-            ],
+            color: color * Vec4::from_array(self.color.unwrap_or(e.age_color_multiplier)),
+            size: [size[0] * scale[0] * p.scale, size[1] * scale[1] * p.scale],
         }
     }
 

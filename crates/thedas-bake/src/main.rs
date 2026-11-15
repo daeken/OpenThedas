@@ -39,12 +39,17 @@ struct Args {
     /// Experimental shadow pass min(1, k·Σ falloff·cos)^e, as "k,e".
     #[arg(long, value_parser = parse_ke)]
     shadow_intensity: Option<(f32, f32)>,
-    /// Experimental fitted occlusion model "length,exponent,lo,power".
+    /// Experimental fitted occlusion model "length,exponent,lo,power[,hi]".
     #[arg(long)]
     ao_model: Option<String>,
     /// Experimental soft shadows for point lights: "radius,samples".
     #[arg(long, value_parser = parse_ke)]
     light_size: Option<(f32, f32)>,
+    /// The settings that best reproduce the shipped atlases (docs/lightmaps/baker-spec.md §6):
+    /// the fitted occlusion model and a one-texel dilation, over the toolset's monochrome
+    /// shadow pass. Use with `--use-fit` for the lights, bake radii and ambients.
+    #[arg(long)]
+    shipped: bool,
     /// Grow each part's covered area by this many texels.
     #[arg(long, default_value_t = 0)]
     dilate: u32,
@@ -142,17 +147,26 @@ fn main() -> Result<()> {
         ao_rays: args.ao_rays,
         ao_length: args.ao_length,
         ao_converged: args.ao_converged,
-        dilate: args.dilate,
+        dilate: if args.shipped && args.dilate == 0 {
+            1
+        } else {
+            args.dilate
+        },
         light_size: args.light_size.map(|(r, n)| (r, n as u32)),
-        ao_model: args.ao_model.as_deref().map(|s| {
-            let v: Vec<f32> = s.split(',').filter_map(|x| x.trim().parse().ok()).collect();
-            thedas_bake::bake::AoModel {
-                length: v.first().copied().unwrap_or(1.5),
-                exponent: v.get(1).copied().unwrap_or(2.0),
-                lo: v.get(2).copied().unwrap_or(-1.0),
-                power: v.get(3).copied().unwrap_or(1.0),
-            }
-        }),
+        ao_model: args
+            .ao_model
+            .as_deref()
+            .or(args.shipped.then_some("1.5,2,-1,1,1"))
+            .map(|s| {
+                let v: Vec<f32> = s.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+                thedas_bake::bake::AoModel {
+                    length: v.first().copied().unwrap_or(1.5),
+                    exponent: v.get(1).copied().unwrap_or(2.0),
+                    lo: v.get(2).copied().unwrap_or(-1.0),
+                    power: v.get(3).copied().unwrap_or(1.0),
+                    hi: v.get(4).copied().unwrap_or(1.0),
+                }
+            }),
         shadow_model: match args.shadow_intensity {
             Some((k, e)) => thedas_bake::bake::ShadowModel::Intensity { k, e },
             None => thedas_bake::bake::ShadowModel::Monochrome,
@@ -186,6 +200,7 @@ fn main() -> Result<()> {
                     brightness: args.brightness,
                     in_lightmap: !args.no_point_rgb,
                     cast_shadows: true,
+                    shadow_reach: 1.0,
                 }
             }),
             SceneLight::Ambient { color, room, .. } => {
@@ -202,6 +217,7 @@ fn main() -> Result<()> {
             brightness: 1.0,
             in_lightmap: !args.no_point_rgb,
             cast_shadows: true,
+            shadow_reach: 1.0,
         });
     }
 
@@ -228,8 +244,15 @@ fn main() -> Result<()> {
                         brightness: 1.0,
                         in_lightmap: true,
                         cast_shadows: false,
+                        shadow_reach: 1.0,
                     });
                     names.push("found".into());
+                }
+                ["radius", i, reach] => {
+                    let (i, reach): (usize, f32) = (i.parse()?, reach.parse()?);
+                    if let Some(l) = points.get_mut(i) {
+                        l.shadow_reach = reach;
+                    }
                 }
                 ["noshadow", i] => {
                     let i: usize = i.parse()?;
@@ -305,6 +328,7 @@ fn main() -> Result<()> {
                     brightness: 1.0,
                     in_lightmap: true,
                     cast_shadows: false,
+                    shadow_reach: 1.0,
                 });
             }
             if let Some((px, py)) = args.probe {
@@ -1095,6 +1119,119 @@ fn fit(
             out.push_str(&format!("noshadow {i}\n"));
         }
     }
+    // Monochrome shadow pass with per-light bake radii: on texels that one shadow-casting
+    // light alone reaches, the share of its radius that best splits lit from dark alpha.
+    let mut reach_of = vec![1.0f32; lights.len()];
+    {
+        let mut per: BTreeMap<usize, Vec<(f32, bool)>> = BTreeMap::new();
+        for r in &rows {
+            if let [(i, q)] = r.reach.as_slice()
+                && lights[*i as usize].cast_shadows
+            {
+                per.entry(*i as usize)
+                    .or_default()
+                    .push((*q, r.shipped[3] >= 8));
+            }
+        }
+        for (i, pts) in per {
+            if pts.len() < 50 {
+                continue;
+            }
+            let (mut best, mut best_ok) = (1.0f32, 0usize);
+            for k in 6..=20 {
+                let s = k as f32 * 0.05;
+                let ok = pts.iter().filter(|(q, lit)| (*q < s) == *lit).count();
+                if ok > best_ok {
+                    (best, best_ok) = (s, ok);
+                }
+            }
+            println!(
+                "  bake radius {:28} {:.2} of the exported one ({best_ok}/{} texels agree)",
+                names.get(i).map(String::as_str).unwrap_or("?"),
+                best,
+                pts.len()
+            );
+            reach_of[i] = best;
+            if best < 1.0 {
+                out.push_str(&format!("radius {i} {best}\n"));
+            }
+        }
+    }
+    // Occlusion on texels the monochrome shadow pass fully lights: alpha there is the
+    // occlusion pass alone.
+    {
+        let lit: Vec<&fit::Row> = rows
+            .iter()
+            .filter(|r| {
+                r.shipped[3] >= 4
+                    && r.reach
+                        .iter()
+                        .any(|&(i, q)| lights[i as usize].cast_shadows && q < reach_of[i as usize])
+            })
+            .collect();
+        let mut results = Vec::new();
+        for (wname, wi) in [("binary", 0), ("(1-t/L)", 1), ("(1-t/L)^2", 2)] {
+            for li in [1.0f32, 1.5, 2.0, 3.0, 4.0, 5.0] {
+                let occ: Vec<f32> = lit
+                    .iter()
+                    .map(|r| {
+                        r.ao_cos
+                            .iter()
+                            .map(|&t| {
+                                if t >= li {
+                                    0.0
+                                } else {
+                                    let x = 1.0 - t / li;
+                                    match wi {
+                                        0 => 1.0,
+                                        1 => x,
+                                        _ => x * x,
+                                    }
+                                }
+                            })
+                            .sum::<f32>()
+                            / r.ao_cos.len() as f32
+                    })
+                    .collect();
+                for lo in [0.0f32, -0.25, -0.5, -1.0, -1.5, -2.0] {
+                    for pw in [0.5f32, 1.0 / 1.5, 1.0, 1.5, 2.0] {
+                        for hi in [1.0f32, 0.95, 0.9, 0.86, 0.8] {
+                            let mut se = 0.0f64;
+                            for (r, o) in lit.iter().zip(&occ) {
+                                let v = (lo + (1.0 - lo) * (1.0 - o)).clamp(0.0, 1.0);
+                                let d = 255.0 * (hi * v.powf(pw)) as f64 - r.shipped[3] as f64;
+                                se += d * d;
+                            }
+                            results.push((
+                                (se / lit.len().max(1) as f64).sqrt(),
+                                wname,
+                                wi,
+                                li,
+                                lo,
+                                pw,
+                                hi,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        results.sort_by(|a, b| a.0.total_cmp(&b.0));
+        println!("  occlusion fit over {} monochrome-lit texels:", lit.len());
+        for r in results.iter().take(6) {
+            println!(
+                "    RMSE {:.2}: {} L {} lo {} power {:.3} hi {}",
+                r.0, r.1, r.3, r.4, r.5, r.6
+            );
+        }
+        if let Some(b) = results.first() {
+            let exponent = [0.0, 1.0, 2.0][b.2];
+            out.push_str(&format!(
+                "aomodel {} {} {} {} {}\n",
+                b.3, exponent, b.4, b.5, b.6
+            ));
+        }
+    }
     std::fs::create_dir_all(&args.out)?;
     std::fs::write(args.out.join("fit.txt"), out)?;
     Ok(())
@@ -1113,6 +1250,7 @@ fn lightset(
     let mut rooms: BTreeMap<String, (Vec3, u32)> = BTreeMap::new();
     let mut scale: Vec<(f64, u32)> = vec![(0.0, 0); points.len()];
     let mut noshadow: Vec<u32> = vec![0; points.len()];
+    let mut reach: Vec<(f64, u32)> = vec![(0.0, 0); points.len()];
     let mut atlases = 0u32;
     let mut found = Vec::new();
     for entry in std::fs::read_dir(dir)? {
@@ -1149,6 +1287,12 @@ fn lightset(
                         *e += 1;
                     }
                 }
+                ["radius", i, r] => {
+                    if let Some(e) = reach.get_mut(i.parse::<usize>()?) {
+                        e.0 += r.parse::<f64>()?;
+                        e.1 += 1;
+                    }
+                }
                 ["found", x, y, z, r, cr, cg, cb] => found.push(json!({
                     "position": [x.parse::<f32>()?, y.parse::<f32>()?, z.parse::<f32>()?],
                     "radius": r.parse::<f32>()?,
@@ -1178,6 +1322,7 @@ fn lightset(
                 "baked_brightness": if n > 0 { Some(sum / n as f64) } else { None },
                 "fitted_atlases": n,
                 "in_alpha": noshadow[i] == 0,
+                "shadow_reach": if reach[i].1 > 0 { reach[i].0 / reach[i].1 as f64 } else { 1.0 },
             })
         })
         .collect();

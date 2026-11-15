@@ -73,6 +73,15 @@ pub struct Gda {
 
 /// The hash Dragon Age stores for a column name.
 pub fn column_hash(name: &str) -> u32 {
+    // The common case (every shipped column name), hashed as it is read: the lookups run
+    // per creature per frame.
+    if name.is_ascii() {
+        let mut h = crc32fast::Hasher::new();
+        for b in name.bytes() {
+            h.update(&[b.to_ascii_lowercase(), 0]);
+        }
+        return h.finalize();
+    }
     let lower = name.to_lowercase();
     let bytes: Vec<u8> = lower.encode_utf16().flat_map(u16::to_le_bytes).collect();
     crc32fast::hash(&bytes)
@@ -185,5 +194,16 @@ mod tests {
         // CRC-32 of "id" as UTF-16LE (69 00 64 00).
         assert_eq!(column_hash("ID"), crc32fast::hash(&[0x69, 0, 0x64, 0]));
         assert_eq!(column_hash("Label"), column_hash("label"));
+        let slow = |n: &str| {
+            let b: Vec<u8> = n
+                .to_lowercase()
+                .encode_utf16()
+                .flat_map(u16::to_le_bytes)
+                .collect();
+            crc32fast::hash(&b)
+        };
+        for n in ["MovementTree", "CombatMoveTree", "#43b54707", "Ä_Label"] {
+            assert_eq!(column_hash(n), slow(n), "{n}");
+        }
     }
 }
