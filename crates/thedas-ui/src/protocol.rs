@@ -195,6 +195,16 @@ fn parse_value(s: &str) -> UiValue {
     }
 }
 
+fn written_value(name: &str, text: &str) -> UiValue {
+    // A popup answer is text even when it looks numeric. Parsing it would lose
+    // leading zeroes (and the app would discard a number where it expects a note).
+    if name == "GUIPopupLayer.InputText" {
+        UiValue::String(text.into())
+    } else {
+        parse_value(text)
+    }
+}
+
 impl GameBridge {
     pub fn new(strings: StringLookup) -> Self {
         let mut state = State::default();
@@ -489,7 +499,7 @@ impl GameBridge {
                 let text = call.args.first().map(as_string).unwrap_or_default();
                 let (k, v) = text.split_once(' ').unwrap_or((&text, ""));
                 if let Ok(mut s) = self.state.lock() {
-                    s.put(k, parse_value(v));
+                    s.put(k, written_value(k, v));
                 }
                 UiValue::Undefined
             }
@@ -740,7 +750,7 @@ impl GameBridge {
         match call.name.as_str() {
             "SetValue" | "SetValueUnicode" => {
                 let (k, v) = text.split_once(' ').unwrap_or((&text, ""));
-                s.put(k, parse_value(v));
+                s.put(k, written_value(k, v));
                 // The journal's own attributes are game state: a movie writing one (journal.gfx
                 // clearing a quest's `Updated` as it is read) is passed on to the game, as are
                 // the tactics screen's (tactics.gfx writing a slot's target, condition, command
@@ -793,6 +803,24 @@ impl GameBridge {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn popup_text_keeps_numeric_spelling_when_sent_and_drained() {
+        let b = bridge();
+        for command in ["SetValue", "SetValueUnicode"] {
+            for text in ["000123", "1e3", "NaN"] {
+                let args = format!("GUIPopupLayer.InputText {text}");
+                let event = call(CallKind::FsCommand, command, &[&args]);
+                b.respond(&event);
+                let expected = Some(UiValue::String(text.into()));
+                assert_eq!(b.value("GUIPopupLayer.InputText"), expected);
+                b.handle(event);
+                assert_eq!(b.value("GUIPopupLayer.InputText"), expected);
+            }
+        }
+        b.handle(call(CallKind::FsCommand, "SetValue", &["GUI.Page 123"]));
+        assert_eq!(b.value("GUI.Page"), Some(UiValue::Number(123.0)));
+    }
 
     #[test]
     fn dialog_tags_become_their_html() {
