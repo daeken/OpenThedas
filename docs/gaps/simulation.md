@@ -340,6 +340,7 @@ modules, not that the scripts cannot do it.
 
 ### Checked and looks complete
 
+- Origins full-cutscene party visibility (0x692980, 0x7e3f76, 0x67c980, 0x7e409f): unbound moving-party members are hidden, bound actors are shown, and exit restores normal visibility. The separate inline-dialogue presentation path remains unverified; see [visibility trace](../notes/cutscene-party-visibility.md).
 - Derived attribute contributions to property totals (ten derivation functions, 0x79c760): `crates/thedas-sim/src/derived.rs:1-23`.
 - Health and mana/stamina regeneration by combat state and period (0x71b0e0): `crates/thedas-sim/src/combat.rs:409-421`.
 - Threat decay, proximity term and table size of five (0x6ab620, 0x741d80), apart from tie order (SIM-060): `crates/thedas-sim/src/threat.rs:1-18`.
