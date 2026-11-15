@@ -1,6 +1,11 @@
 [workspace]
 resolver = "3"
 members = ["crates/*"]
+exclude = ["vendor/accesskit_macos"]
+
+[patch.crates-io]
+# Native heading and disclosure-state mappings; see the vendored PATCHES.md.
+accesskit_macos = { path = "vendor/accesskit_macos" }
 
 [workspace.package]
 version = "0.1.0"
