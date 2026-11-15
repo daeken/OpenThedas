@@ -118,7 +118,7 @@ impl LogRing {
     }
 }
 
-/// Logs as `builder` would, keeping the last [`LOG_LINES`] lines it prints for reports.
+/// Logs as `builder` would, retaining a bounded session log for reports.
 pub fn init_logging(mut builder: env_logger::Builder) {
     let inner = builder.build();
     let max = inner.filter();

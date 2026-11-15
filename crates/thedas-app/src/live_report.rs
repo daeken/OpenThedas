@@ -33,6 +33,7 @@ impl Live {
                 let forward = world.transform_vector3(glam::Vec3::Y);
                 Some(json!({
                     "id": id, "tag": object.map(|o| o.tag.as_str()).unwrap_or(&prop.label),
+                    "models": objects.key.get(i).map(|(_, models)| models),
                     "kind": object.map(|o| format!("{:?}", o.kind)),
                     "seen_in_view_or_shadow": prop.draws.clone().any(|d| seen.get(d).copied().unwrap_or(true)),
                     "sim_position": position.map(|p| p.to_array()), "sim_facing_degrees": object.map(|o| o.facing),
@@ -89,6 +90,12 @@ impl Live {
             "visibility": "scene candidates with nonzero opacity; seen flag includes shadow casters",
             "emitters": { "radius_m": 50, "limit": 512, "total_near": total_near, "items": emitters },
             "active_vfx": self.effects.as_ref().map(|e| &e.key),
+            "location_vfx_near_camera": sim.world.location_vfx.iter()
+                .filter(|v| Some(v.area) == sim.world.area && glam::Vec3::from_array(v.position).distance_squared(eye) <= 50.0 * 50.0)
+                .take(512).collect::<Vec<_>>(),
+            "instant_location_vfx_near_camera": sim.world.instant_location_vfx.iter()
+                .filter(|v| Some(v.area) == sim.world.area && glam::Vec3::from_array(v.position).distance_squared(eye) <= 50.0 * 50.0)
+                .take(512).collect::<Vec<_>>(),
             "cutaway_opacity": self.cutaway.0.shown(),
         })
     }

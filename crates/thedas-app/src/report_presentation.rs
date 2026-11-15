@@ -103,6 +103,7 @@ pub fn clip_snapshot(animator: &Animator, clip: &Clip) -> J {
         "trees": clip.trees, "actions": clip.actions, "resource": resolved.as_ref().map(|(name, _)| name),
         "inline": clip.inline.is_some(), "clock_s": clip.time, "time_s": time,
         "frame_30fps": time.map(|t| t * 30.0), "length_s": animation.map(|a| a.length),
+        "length_frames_30fps": animation.map(|a| a.length * 30.0),
         "looping": clip.looping, "blend_weight": clip.weight, "absolute": clip.absolute,
         "additive": animation.map(|a| a.additive), "phase": clip.phase,
         "layers": clip.layers.iter().map(|c| clip_snapshot(animator, c)).collect::<Vec<_>>(),
