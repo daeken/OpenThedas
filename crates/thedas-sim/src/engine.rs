@@ -2162,6 +2162,14 @@ pub fn call(
             );
             void()
         }
+        "CloseQuestGroup" if h.sim.game == thedas_vfs::Game::Origins => {
+            h.sim.close_quest_group(&string(a, 0));
+            void()
+        }
+        "RemoveQuest" if h.sim.game == thedas_vfs::Game::Origins => {
+            h.sim.remove_quest(&string(a, 0));
+            void()
+        }
         "GetPlotFlagRewardId" => {
             let p = h.sim.plot_info(&string(a, 0));
             ok(Value::Int(
