@@ -521,6 +521,9 @@ fn capture(
 ) -> Result<()> {
     let reticle = overlay;
     let pixels = if let Some(live) = live {
+        if let Some(layer) = played.as_ref() {
+            live.set_chargen_pose(layer.paperdoll_pose());
+        }
         live.frame_size = (w, h);
         live.sync(ctx, thedas_render::gpu::CAPTURE_FORMAT)?;
         // A load still building on its worker (THEDAS_ASYNC_LOADS) finishes first.
@@ -1723,6 +1726,7 @@ impl App {
                 live.advance_presentation(dt);
             }
             live.frame_size = (g.config.width, g.config.height);
+            live.set_chargen_pose(g.ui.paperdoll_pose());
             live.sync(&g.ctx, g.config.format)?;
             if self.screens.is_some() {
                 loading_screen(live, &mut g.ui, &mut self.load_screen_up);
@@ -1961,6 +1965,7 @@ impl App {
                 live.advance_presentation(dt);
             }
             live.frame_size = (g.config.width, g.config.height);
+            live.set_chargen_pose(g.ui.paperdoll_pose());
             live.sync(&g.ctx, g.config.format)?;
             if self.screens.is_some() {
                 loading_screen(live, &mut g.ui, &mut self.load_screen_up);
@@ -6889,6 +6894,9 @@ fn main() -> Result<()> {
                                 l.step(dt);
                             }
                             l.advance_presentation(dt);
+                            if let Some((layer, _)) = played.as_ref() {
+                                l.set_chargen_pose(layer.paperdoll_pose());
+                            }
                             // As the window does: the drawn scenes follow the world (objects
                             // that come and go are rebuilt).
                             l.sync(&ctx, thedas_render::gpu::CAPTURE_FORMAT)?;
@@ -7356,6 +7364,9 @@ fn main() -> Result<()> {
             let preset = played
                 .as_ref()
                 .map_or(0, |(layer, _)| layer.paperdoll_preset());
+            if let Some((layer, _)) = played.as_ref() {
+                l.set_chargen_pose(layer.paperdoll_pose());
+            }
             if follow.is_some()
                 && let Some(c) = l.chargen_camera(&camera, preset)
             {

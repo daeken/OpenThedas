@@ -282,9 +282,10 @@ pub const ITEM_EXAMINE_SCREEN: &str = "ItemExamine";
 /// `RotatePaperdollLeftMessage` and `RotatePaperdollRightMessage`, handled by `GUIPaperdoll`).
 pub const PAPERDOLL_LEFT: &str = "Paperdoll.RotatePaperdollLeft";
 pub const PAPERDOLL_RIGHT: &str = "Paperdoll.RotatePaperdollRight";
-/// The paperdoll dragged with the mouse: inventory.gfx sends the drag's horizontal and
-/// vertical movement times -0.8 (`RotatePaperdollCameraMessage`). Provisional: taken as
-/// degrees about the member; the vertical part (the camera's pitch) is not used.
+/// Inventory and chargen send the drag's horizontal and vertical movement times -0.8
+/// (`RotatePaperdollCameraMessage`), in degrees: the creature turns by the negative
+/// horizontal argument (0x7b24c3).
+/// Mode 1 also tilts the camera, clamped to -60..10 degrees (0x7b2512).
 pub const PAPERDOLL_DRAG: &str = "Paperdoll.RotatePaperdollCamera";
 /// The paperdoll's camera preset chosen (chargen.gfx: 1 on the appearance page), and the
 /// portrait asked to be drawn again (see [`crate::binding::Presentation`]).
@@ -342,9 +343,20 @@ pub fn present(shown: &mut Presentation, name: &str, args: &[String]) -> bool {
                 .unwrap_or(0.0);
             shown.paperdoll_yaw =
                 (shown.paperdoll_yaw + degrees.to_radians()) % std::f32::consts::TAU;
+            if shown.paperdoll_preset == 1 {
+                let vertical = args
+                    .get(1)
+                    .and_then(|a| a.parse::<f32>().ok())
+                    .filter(|d| d.is_finite())
+                    .unwrap_or(0.0);
+                shown.paperdoll_pitch =
+                    (shown.paperdoll_pitch - 10.0 + vertical).clamp(-60.0, 10.0) + 10.0;
+            }
+            shown.paperdoll_drags = shown.paperdoll_drags.wrapping_add(1);
             true
         }
         PAPERDOLL_PRESET => {
+            shown.paperdoll_pitch = 0.0;
             shown.paperdoll_preset = args
                 .first()
                 .and_then(|a| a.trim().parse::<f64>().ok())
@@ -358,6 +370,9 @@ pub fn present(shown: &mut Presentation, name: &str, args: &[String]) -> bool {
         }
         CHARGEN_START => {
             shown.paperdoll_preset = 0;
+            shown.paperdoll_yaw = 0.0;
+            shown.paperdoll_pitch = 0.0;
+            shown.paperdoll_drags = 0;
             false
         }
         SET_ITEM_FILTER => {
@@ -671,6 +686,24 @@ mod tests {
         assert!(present(&mut p, PAPERDOLL_LEFT, &[]));
         assert!(present(&mut p, PAPERDOLL_DRAG, &a(&["-8", "4"])));
         assert!((p.paperdoll_yaw + 8f32.to_radians()).abs() < 1e-6);
+    }
+
+    #[test]
+    fn chargen_tilt_is_face_only_clamped_and_reset_by_a_preset() {
+        let mut p = Presentation::default();
+        let a = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        present(&mut p, PAPERDOLL_DRAG, &a(&["-80", "80"]));
+        assert_eq!(p.paperdoll_pitch, 0.0);
+        assert_eq!(p.paperdoll_drags, 1);
+        present(&mut p, PAPERDOLL_PRESET, &a(&["1"]));
+        present(&mut p, PAPERDOLL_DRAG, &a(&["0", "1000"]));
+        assert_eq!(p.paperdoll_pitch - 10.0, 10.0);
+        present(&mut p, PAPERDOLL_DRAG, &a(&["0", "-1000"]));
+        assert_eq!(p.paperdoll_pitch - 10.0, -60.0);
+        present(&mut p, PAPERDOLL_PRESET, &a(&["0"]));
+        assert_eq!(p.paperdoll_pitch, 0.0);
+        present(&mut p, CHARGEN_START, &[]);
+        assert_eq!((p.paperdoll_yaw, p.paperdoll_drags), (0.0, 0));
     }
 
     #[test]
