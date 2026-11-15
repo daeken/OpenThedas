@@ -2012,6 +2012,19 @@ impl Sim {
         // Level-up (mode 1) only starts when someone asked for it (`request_level_up`), so
         // it is left for them to finish.
         if self.chargen_policy == ChargenPolicy::QuickStart && mode == 0 {
+            if self.game == thedas_vfs::Game::DragonAge2
+                && let Some([gender, race, class, background]) = self.da2_chargen_preset(creature)
+            {
+                // sys_chargen rebuilds the selected class, then applies the preset's
+                // background/variant and its equipment from chargen_dae. Exit 1 keeps
+                // that choice; exit 0 would replace it with the generic starter gear.
+                self.chargen_event("CHARGEN_SELECT_GENDER", vec![gender, 1], Vec::new());
+                self.chargen_event("CHARGEN_SELECT_RACE", vec![race, 0], Vec::new());
+                self.chargen_event("CHARGEN_SELECT_CLASS", vec![class, 0], Vec::new());
+                self.chargen_event("CHARGEN_SELECT_BACKGROUND", vec![background], Vec::new());
+                self.chargen_event("CHARGEN_END", vec![mode, 1], Vec::new());
+                return;
+            }
             // Dragon Age II's `sys_chargen` gives the hero no class when creation simply
             // ends, and its prologue reads the class from the class abilities that choosing
             // one grants. So the quick start chooses as a player would: male (gender 1),
