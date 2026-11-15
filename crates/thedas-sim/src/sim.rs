@@ -4943,7 +4943,9 @@ impl Sim {
             });
             return;
         };
-        if replace {
+        if self.game == thedas_vfs::Game::DragonAge2 {
+            self.discard_da2_template_inventory(id, replace);
+        } else if replace {
             let old = self
                 .world
                 .get_mut(id)
