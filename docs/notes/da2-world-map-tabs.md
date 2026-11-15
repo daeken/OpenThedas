@@ -28,3 +28,28 @@ DA2-only message and keeps its existing temporary swap behavior.
 
 This fixes selection and pin routing. It does not fix the movie's existing
 placeholder/template rendering, localization or full world-map presentation.
+
+## Validation and route continuation
+
+The regression covers DA2 selection, invalid tags, Origins isolation, preserved
+secondary map, snapshot round-trip, pin-index travel and close/arrival persistence.
+The local installed-resource replay starts at the existing Darktown exit at
+t=1303942. Invoking the movie's own night-button method changes the binding to
+type 7 and `MAP_NIGHT_1280X1024`; the active Hightown night pin has full-list index
+3. Its normal travel event reaches `dae120ar_hightown_nt` at t=1304942. Selection
+leaves object data, pin statuses, plots and RNG identical; GUI message dispatch
+also drains already-due events, advancing handle bookkeeping without world time.
+
+Walking to Anders and accepting entry at the Chantry reaches `and121ar_chantry`
+at t=1314315. Karl's dialogue sets Tranquility flag 7 at t=1316415. The authored
+plot script finds all five members of team 104000 and changes their groups, but
+they remain inactive, so the fight does not begin. The continuation stops there
+at t=1326515 with no script errors. It does not claim quest completion or force
+the team's activation. Plot area-state actions and cinematic activation remain
+separate work.
+
+On main 623396b9 plus this patch: fmt and workspace all-target clippy with warnings
+denied pass; debug workspace tests pass (1,171 passed, 16 ignored). The DAO s01-s13
+gate has 26 successful runs, identical story logs and plot sequences, and 15
+identical JSON checkpoints. Four DAO 600-tick repeat/reload checks and a DA2
+600-tick repeat/reload check are identical.
