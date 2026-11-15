@@ -1762,6 +1762,13 @@ impl AreaRenderer {
         self.updated = true;
     }
 
+    /// This frame's sun texture matrices/partition plane and map size, for capture
+    /// diagnostics. Reading these does not advance the fit or its smoothing history.
+    pub fn sun_shadow_data(&self) -> Option<([[f32; 4]; 9], u32)> {
+        let (data, _) = self.d3d.sun_shadows()?;
+        Some((data, self.d3d.shadows.as_ref()?.size()))
+    }
+
     /// Records this renderer's shadow casters into the partitions: `clear` for the first
     /// renderer of a frame (the level's), not for the objects drawn over it. Nothing is
     /// drawn when no renderer's casters, nor the partitions, changed since they were last

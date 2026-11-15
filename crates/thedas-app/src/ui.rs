@@ -502,8 +502,7 @@ pub struct UiLayer {
     /// it has waited for its values to reach the popup layer (see
     /// [`UiLayer::show_script_popup`]).
     script_popup: Option<((i32, i32, u32), u8)>,
-    /// The engine's own text box up (see [`UiLayer::ask_text`]): its id and the frames
-    /// since its values were set, and the answers not yet taken.
+    /// The engine's pending or displayed question (see [`UiLayer::ask_text`]).
     text_popup: Option<TextPopup>,
     /// The game menu's online-features button has been relabelled "Report Issue" since
     /// mainmenu.gfx was loaded (see `UiLayer::report_button`).
@@ -1191,21 +1190,32 @@ impl UiLayer {
             "GUI.GoToCodex" => true,
             _ => return false,
         };
-        let Some(resref) = args
+        // The plot's resource, with or without its `plt_` (a notification's carries it; a
+        // tutorial popup's Codex button sends the plot's name without it: `tut_plot_map`),
+        // among numbers such as whether the quest is done.
+        let Some(arg) = args
             .iter()
             .map(|a| a.trim())
-            .find(|a| a.starts_with("plt_"))
+            .find(|a| !a.is_empty() && a.parse::<f64>().is_err())
         else {
             return true;
         };
+        let bare = arg.trim_start_matches("plt_");
+        let resref = format!("plt_{bare}");
+        let resref = resref.as_str();
         let view = sim.lock().unwrap_or_else(|p| p.into_inner()).journal();
         let focus = if codex {
             view.codex
                 .iter()
-                .find(|g| g.entries.iter().any(|e| e.resref == resref))
-                .map(|g| thedas_ui::binding::JournalFocus {
+                .find_map(|g| {
+                    g.entries
+                        .iter()
+                        .find(|e| e.resref == resref)
+                        .map(|e| (g, e))
+                })
+                .map(|(g, e)| thedas_ui::binding::JournalFocus {
                     codex: true,
-                    resref: resref.to_string(),
+                    resref: e.resref.clone(),
                     group: g.kind.to_string(),
                     completed: false,
                 })
@@ -1680,9 +1690,8 @@ impl UiLayer {
     /// as a script's `ShowPopup` with a text field shows it): `prompt` over a text field
     /// holding `text`, and OK / Cancel buttons (`ok`, `cancel`; the pad's A and B press
     /// them). Nothing goes through the simulation; the answer comes back from
-    /// [`UiLayer::take_text_answers`] with `id`. It shows once its values have reached the
-    /// movie, two frames on, and waits for an existing dialog to close. Needs the popup
-    /// layer (the HUD).
+    /// [`UiLayer::take_text_answers`] with `id`. It waits for the popup movie to initialize
+    /// and for an existing dialog to close. Needs the popup layer (the HUD).
     pub fn ask_text(&mut self, id: u32, prompt: &str, text: &str, ok: &str, cancel: &str) {
         self.ask(id, prompt, Some(text), ok, cancel);
     }
@@ -1883,7 +1892,7 @@ impl UiLayer {
         self.mod_button_added = true;
     }
 
-    /// Shows the engine's own text box once its values have reached the movie.
+    /// Shows a pending engine question once the popup layer is free.
     fn show_text_popup(&mut self) {
         let Some(popup) = self.text_popup.as_mut() else {
             return;
@@ -1895,9 +1904,6 @@ impl UiLayer {
                 && self.stage.dialog_prompt().as_deref() == Some(&popup.prompt)
             {
                 popup.frames += 1;
-                if popup.free_text {
-                    self.stage.allow_dialog_free_text();
-                }
                 self.stage.focus_dialog_field();
             }
             return;
@@ -1921,6 +1927,20 @@ impl UiLayer {
                 log::warn!("ui: a text box with no popup layer up");
                 self.text_popup = None;
             }
+        }
+    }
+
+    /// The movie initializes its field during the tick. Apply the report policy
+    /// afterward, before rendering or accepting input on the first visible frame.
+    fn allow_free_text_popup(&mut self) {
+        let Some(popup) = self.text_popup.as_ref() else {
+            return;
+        };
+        if popup.free_text
+            && (2..FOCUS_FRAMES).contains(&popup.frames)
+            && self.stage.dialog_prompt().as_deref() == Some(&popup.prompt)
+        {
+            self.stage.allow_dialog_free_text();
         }
     }
 
@@ -2433,6 +2453,7 @@ impl UiLayer {
         self.loading_frame(dt_ms);
         self.travel_map_frame();
         let mut messages = self.stage.tick(dt_ms);
+        self.allow_free_text_popup();
         // A script message box's answer carries the text typed into it, which the box set
         // as `GUIPopupLayer.InputText` just before (popuplayer.gfx's `OnButtonAction`); the
         // exe passes it on as the result event's string 0 (0x709971).
@@ -3508,7 +3529,9 @@ impl UiLayer {
 
     pub fn tick(&mut self, dt_ms: f64) -> Vec<GameMessage> {
         self.loading_stains(dt_ms);
-        self.stage.tick(dt_ms)
+        let messages = self.stage.tick(dt_ms);
+        self.allow_free_text_popup();
+        messages
     }
 
     pub fn resize(&mut self, size: (u32, u32)) {
@@ -3818,6 +3841,7 @@ mod tests {
             for _ in 0..20 {
                 ui.show_text_popup();
                 ui.stage.tick(1000.0 / 30.0);
+                ui.allow_free_text_popup();
             }
         };
         let close = |ui: &mut UiLayer| {
@@ -3830,6 +3854,7 @@ mod tests {
             // callbacks from the preceding input event.
             ui.show_text_popup();
             ui.stage.tick(1000.0 / 30.0);
+            ui.allow_free_text_popup();
         };
         let field = "_global.PopupLayer.ms_mcPopup.TextInput_mc.TextField";
         for n in 0..3 {
@@ -3862,7 +3887,12 @@ mod tests {
                     Some(thedas_ui::UiValue::String("Rowan".into()))
                 );
             }
-            pump(&mut ui);
+            // Type as soon as the question opens, before the following focus frames.
+            for _ in 0..2 {
+                ui.show_text_popup();
+                ui.stage.tick(1000.0 / 30.0);
+                ui.allow_free_text_popup();
+            }
             assert!(crate::box_shows(&mut ui, "Report"));
             let note = format!("Sera's report {n}: \"wrong\", 123. #$% ").repeat(30);
             assert!(ui.type_text(&note));

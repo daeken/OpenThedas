@@ -13,6 +13,11 @@ virtual key code. Apostrophe therefore acted as Right, period as Delete, and
 without an editing-key code. The synthetic-field unit test covers punctuation,
 long text, and continued enforcement of name-style limits and restrictions.
 
+The bridge also keeps `GUIPopupLayer.InputText` as a string when the movie writes
+it. Numeric coercion previously lost leading zeroes and made a numeric-only note
+look like a missing string to the app. Other numeric properties retain their
+existing parsing.
+
 `PopupLayer.ShowDialogBox` refuses a new dialog while `ms_mcPopup` is occupied.
 The shared bridge values describe a requested question, not necessarily the box
 on screen. In a hidden-window replay, an existing dog-name prompt took the report
