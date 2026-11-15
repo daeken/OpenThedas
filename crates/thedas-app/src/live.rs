@@ -2116,7 +2116,15 @@ impl Live {
                     }
                     (at, show.facing)
                 }
-                None => (m.position, m.facing),
+                None => {
+                    let mut at = m.position;
+                    if m.kind == thedas_sim::world::ObjectKind::Creature
+                        && let Some(z) = floor_under(&level.collider, at)
+                    {
+                        at[2] = z;
+                    }
+                    (at, m.facing)
+                }
             };
             // Head tracking: the pose animations of a creature that looks at another, or is
             // turning back from it.
@@ -2997,6 +3005,25 @@ fn creature_shapes(
             )
         })
         .clone()
+}
+
+/// How far above or below its position a creature's drawn feet look for the floor
+/// (metres; see [`floor_under`]).
+pub const FLOOR_REACH: f32 = 0.25;
+
+/// The level's floor under a creature standing at `at`, within [`FLOOR_REACH`] of its
+/// height: DAOrigins.exe keeps movers on the physics floor (its ground helper 0x685430),
+/// which lies on the drawn floor, while the simulation keeps the pathing grid's quantized
+/// height, a centimetre or two below it (report 985: soles in the floor). Presentation
+/// only; the simulation's position is unchanged. A seat or table above the window (a
+/// sitter's chair) is not taken. Provisional: the window.
+fn floor_under(collider: &thedas_render::collide::Collider, at: [f32; 3]) -> Option<f32> {
+    let p = glam::Vec3::from_array(at);
+    let (from, to) = (
+        p + glam::Vec3::Z * FLOOR_REACH,
+        p - glam::Vec3::Z * FLOOR_REACH,
+    );
+    collider.first_hit(from, to).map(|f| from.lerp(to, f).z)
 }
 
 /// Creatures are picked as upright cylinders this tall (metres). Provisional.
