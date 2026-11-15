@@ -54,6 +54,7 @@ click Play Dragon Age
 run 300
 expect launch dragon age origins
 expect launch --language
+expect launch --lighting
 expect message Would start
 expect no text Dragon Age is no longer
 
