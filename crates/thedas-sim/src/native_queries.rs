@@ -68,13 +68,15 @@ impl Sim {
         }
         let appearance = i64::from(o.appearance as u16);
         if index != 0 {
-            // Native construction stops at the first table without this row.
+            // Native construction stops at the first missing integer anchor cell.
             for ring in 1..=index {
                 if !self
                     .world
                     .tables()
                     .get(0, &format!("meleering{ring}"))
-                    .is_some_and(|t| t.rows.contains_key(&appearance))
+                    .is_some_and(|t| {
+                        matches!(t.cell_by_hash(0x0cc5_4d0c, appearance), Some(Cell::Int(_)))
+                    })
                 {
                     return [0.0; 3];
                 }
@@ -183,13 +185,17 @@ mod tests {
         let mut s = sim();
         let c = s.world.spawn(ObjectKind::Creature, "c");
         s.world.get_mut(c).unwrap().position = [10.0, 2.0, 3.0];
-        s.world
-            .tables
-            .insert("meleering2", &["ID"], vec![(0, vec![Cell::Int(0)])]);
+        s.world.tables.insert(
+            "meleering2",
+            &["ID", "#0cc54d0c"],
+            vec![(0, vec![Cell::Int(0), Cell::Int(0)])],
+        );
         assert_eq!(s.melee_ring_position(c, 2), [0.0; 3]);
-        s.world
-            .tables
-            .insert("meleering1", &["ID"], vec![(0, vec![Cell::Int(0)])]);
+        s.world.tables.insert(
+            "meleering1",
+            &["ID", "#0cc54d0c"],
+            vec![(0, vec![Cell::Int(0), Cell::Int(0)])],
+        );
         assert_eq!(s.melee_ring_position(c, 1), [10.0, 2.0, 3.0]);
         assert_eq!(s.melee_ring_position(c, 2), [10.0, 2.0, 3.0]);
         assert_eq!(s.melee_ring_position(c, 3), [0.0; 3]);
