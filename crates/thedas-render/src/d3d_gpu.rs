@@ -2401,6 +2401,10 @@ impl D3dPass {
         &self.pipelines[d.pipeline].program
     }
 
+    pub(crate) fn samples(&self) -> u32 {
+        self.samples
+    }
+
     pub(crate) fn particle_program(&self, d: &ParticleDraw) -> &D3dProgram {
         &self.pipelines[d.pipeline].program
     }

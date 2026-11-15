@@ -15,6 +15,10 @@ mod forward_transparency_tests;
 #[path = "deferred_cutaway_tests.rs"]
 mod deferred_cutaway_tests;
 
+#[cfg(test)]
+#[path = "deferred_forward_tests.rs"]
+mod deferred_forward_tests;
+
 use crate::camera::Camera;
 use crate::material::{BlendMode, MaterialProgram, Program, ProgramRegistry, Resolved};
 use crate::scene::{AreaScene, Vertex};
@@ -1272,6 +1276,12 @@ impl AreaRenderer {
         }
     }
 
+    pub fn set_deferred_forward_lighting(&mut self, enabled: Option<bool>) {
+        if let Some(d) = &mut self.deferred {
+            d.set_forward_lighting(enabled);
+        }
+    }
+
     /// Diagnostic override for squared-distance rejection before point-light shading.
     pub fn set_deferred_early_light_reject(&mut self, enabled: Option<bool>) {
         if let Some(d) = &mut self.deferred {
@@ -1914,7 +1924,7 @@ impl AreaRenderer {
         if over.is_none() {
             self.late_transparency = late;
         }
-        self.deferred_frame = deferred;
+        self.deferred_frame = deferred || contributed;
         for o in objects.iter_mut() {
             o.late_transparency = late;
             o.deferred_in_frame = deferred
@@ -2014,7 +2024,7 @@ impl AreaRenderer {
             occlusion_query_set: None,
             multiview_mask: None,
         });
-        self.draw_forward(&mut pass, false, true, false);
+        self.draw_forward(&mut pass, false, true, self.deferred_frame);
     }
 
     fn draw_forward(
@@ -2051,6 +2061,14 @@ impl AreaRenderer {
                     }
                     let d = &self.d3d.draws[i];
                     let mesh = &self.meshes[d.mesh];
+                    if (deferred || self.deferred_frame)
+                        && self
+                            .deferred
+                            .as_ref()
+                            .is_some_and(|p| p.draw_forward(pass, i, &self.d3d, mesh))
+                    {
+                        continue;
+                    }
                     self.d3d.draw(pass, d, &mesh.indices, mesh.count);
                     continue;
                 }

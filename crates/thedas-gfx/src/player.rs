@@ -109,6 +109,7 @@ impl Player {
             selection,
             stage_size: (stage_size.0 as f64, stage_size.1 as f64),
             mouse_pos: (-1e6, -1e6),
+            mouse_in_stage: false,
             keys_down: HashSet::new(),
             last_key: 0,
             focus: None,
@@ -467,9 +468,10 @@ impl Player {
 
     /// The mouse moved to `(x, y)` in stage pixels.
     pub fn mouse_move(&mut self, x: f64, y: f64) {
-        if self.vm.mouse_pos == (x, y) {
+        if self.vm.mouse_in_stage && self.vm.mouse_pos == (x, y) {
             return;
         }
+        self.vm.mouse_in_stage = true;
         self.vm.mouse_pos = (x, y);
         if let Some(d) = self.text_drag.filter(|d| self.vm.focus == Some(*d)) {
             self.place_text_caret(d, x, y, true);
@@ -480,6 +482,15 @@ impl Player {
         let mouse = self.vm.mouse;
         display_api::broadcast(&mut self.vm, mouse, "onMouseMove", &[]);
         self.clip_mouse_event("onMouseMove", clip_event::MOUSE_MOVE, &[]);
+        self.vm.pick_dirty = true;
+        self.update_hover();
+        self.run_queue();
+    }
+
+    /// The pointer left the window. Clear rollover/drag-over without inventing
+    /// mouse motion, changing text focus or losing a captured button's release.
+    pub fn mouse_leave(&mut self) {
+        self.vm.mouse_in_stage = false;
         self.vm.pick_dirty = true;
         self.update_hover();
         self.run_queue();
@@ -498,7 +509,11 @@ impl Player {
         }
         self.vm.pick_dirty = false;
         let (x, y) = self.vm.mouse_pos;
-        let hit = pick(&self.vm, (x * 20.0) as f32, (y * 20.0) as f32);
+        let hit = self
+            .vm
+            .mouse_in_stage
+            .then(|| pick(&self.vm, (x * 20.0) as f32, (y * 20.0) as f32))
+            .flatten();
         if hit == self.hover {
             return;
         }
@@ -558,6 +573,9 @@ impl Player {
     /// A mouse button changed. `button` is [`MOUSE_LEFT`], [`MOUSE_RIGHT`] or
     /// [`MOUSE_MIDDLE`]; `double` marks a double click's second press.
     pub fn mouse_button(&mut self, x: f64, y: f64, button: u8, down: bool, double: bool) {
+        if down {
+            self.vm.mouse_in_stage = true;
+        }
         self.vm.mouse_pos = (x, y);
         self.vm.pick_dirty = true;
         self.update_hover();
@@ -569,7 +587,10 @@ impl Player {
             button + if double { 4 } else { 0 },
         ))];
         let top = self
-            .topmost_at(x, y)
+            .vm
+            .mouse_in_stage
+            .then(|| self.topmost_at(x, y))
+            .flatten()
             .map(|d| display_api::display_value(&mut self.vm, d))
             .unwrap_or_default();
         let mouse = self.vm.mouse;
@@ -655,7 +676,9 @@ impl Player {
     }
 
     pub fn mouse_wheel(&mut self, x: f64, y: f64, delta: f64) {
+        self.vm.mouse_in_stage = true;
         self.vm.mouse_pos = (x, y);
+        self.vm.pick_dirty = true;
         let top = self
             .topmost_at(x, y)
             .map(|d| display_api::display_value(&mut self.vm, d))
@@ -2146,6 +2169,9 @@ pub fn clip_actions(vm: &Vm, d: DisplayId) -> Vec<ClipAction> {
 
 /// `Mouse.getTopMostEntity`: the clip (or text field) under the mouse.
 pub fn topmost(vm: &Vm) -> Option<DisplayId> {
+    if !vm.mouse_in_stage {
+        return None;
+    }
     pick_any(
         vm,
         vm.root,
@@ -2157,6 +2183,9 @@ pub fn topmost(vm: &Vm) -> Option<DisplayId> {
 /// `Mouse.getTopMostEntity(false)` considers clips with mouse handlers; `true`
 /// includes noninteractive geometry and text fields as well.
 pub(crate) fn topmost_entity(vm: &Vm, test_all: bool) -> Option<DisplayId> {
+    if !vm.mouse_in_stage {
+        return None;
+    }
     if test_all {
         return topmost(vm);
     }
@@ -2743,6 +2772,129 @@ mod queue_tests {
             vm.call_method(&value, method, &[Value::Number(x), Value::Number(y)]);
         }
         vm.call_method(&value, "endFill", &[]);
+    }
+
+    #[test]
+    fn window_leave_clears_hover_until_same_position_reentry_and_releases_outside() {
+        let (mut p, _) = input_player();
+        let root = p.vm.root;
+        let button = create_empty(&mut p.vm, root, "button", 2).unwrap();
+        draw_pick_rect(&mut p.vm, button, 100.0, 40.0);
+        let value = p.vm.display_object(button);
+        let handlers: [(&str, crate::avm1::object::NativeFn); 7] = [
+            ("onRollOver", |vm, _, _| {
+                vm.log.push("onRollOver".into());
+                Value::Undefined
+            }),
+            ("onRollOut", |vm, _, _| {
+                vm.log.push("onRollOut".into());
+                Value::Undefined
+            }),
+            ("onDragOver", |vm, _, _| {
+                vm.log.push("onDragOver".into());
+                Value::Undefined
+            }),
+            ("onDragOut", |vm, _, _| {
+                vm.log.push("onDragOut".into());
+                Value::Undefined
+            }),
+            ("onPress", |vm, _, _| {
+                vm.log.push("onPress".into());
+                Value::Undefined
+            }),
+            ("onRelease", |vm, _, _| {
+                vm.log.push("onRelease".into());
+                Value::Undefined
+            }),
+            ("onReleaseOutside", |vm, _, _| {
+                vm.log.push("onReleaseOutside".into());
+                Value::Undefined
+            }),
+        ];
+        for (event, handler) in handlers {
+            let handler = p.vm.new_native(handler);
+            p.vm.set(&value, event, Value::Object(handler));
+        }
+        let moved = p.vm.new_native(|vm, _, _| {
+            vm.log.push("onMouseMove".into());
+            Value::Undefined
+        });
+        let listener = Value::Object(p.vm.new_object());
+        p.vm.set(&listener, "onMouseMove", Value::Object(moved));
+        let mouse = Value::Object(p.vm.mouse);
+        p.vm.call_method(&mouse, "addListener", &[listener]);
+        p.mouse_move(10.0, 10.0);
+        assert_eq!(p.drain_log(), ["onMouseMove", "onRollOver"]);
+        p.mouse_leave();
+        p.mouse_leave();
+        assert_eq!(p.drain_log(), ["onRollOut"]);
+        assert_eq!(p.vm.mouse_pos, (10.0, 10.0));
+        // Layout and frame actions must not restore a hover at the stale coordinates.
+        p.vm.set(&value, "_x", Value::Number(1.0));
+        p.tick(100.0);
+        assert!(p.drain_log().is_empty());
+        assert_eq!(p.hover, None);
+        for all in [false, true] {
+            assert_eq!(
+                p.vm.call_method(&mouse, "getTopMostEntity", &[Value::Bool(all)]),
+                Value::Undefined
+            );
+        }
+        p.mouse_move(10.0, 10.0);
+        assert_eq!(p.drain_log(), ["onMouseMove", "onRollOver"]);
+        p.mouse_button(10.0, 10.0, MOUSE_LEFT, true, false);
+        assert_eq!(p.drain_log(), ["onPress"]);
+        p.mouse_leave();
+        assert_eq!(p.drain_log(), ["onDragOut"]);
+        p.mouse_move(10.0, 10.0);
+        assert_eq!(p.drain_log(), ["onMouseMove", "onDragOver"]);
+        p.mouse_leave();
+        assert_eq!(p.drain_log(), ["onDragOut"]);
+        // A captured release after leaving must not re-enter or activate the button.
+        p.mouse_button(10.0, 10.0, MOUSE_LEFT, false, false);
+        assert_eq!(p.drain_log(), ["onReleaseOutside"]);
+        assert_eq!(p.pressed, None);
+        p.mouse_move(10.0, 10.0);
+        assert_eq!(p.drain_log(), ["onMouseMove", "onRollOver"]);
+        p.mouse_leave();
+        p.drain_log();
+        // Wheel and press events also establish pointer presence without a move first.
+        p.mouse_wheel(10.0, 10.0, 1.0);
+        assert_eq!(p.drain_log(), ["onRollOver"]);
+        p.mouse_leave();
+        p.drain_log();
+        p.mouse_button(10.0, 10.0, MOUSE_LEFT, true, false);
+        assert_eq!(p.drain_log(), ["onRollOver", "onPress"]);
+    }
+
+    #[test]
+    fn window_leave_preserves_text_selection_and_focus_without_a_synthetic_drag() {
+        let (mut p, field) = input_player();
+        let text = p.vm.display.get_mut(field).unwrap().text_mut().unwrap();
+        text.bounds = (0.0, 0.0, 100.0, 20.0);
+        text.default_format.size = 10.0;
+        text.input = true;
+        text.selectable = true;
+        let value = p.vm.display_object(field);
+        p.vm.set(&value, "text", Value::from("Rowan"));
+        p.mouse_button(8.0, 5.0, MOUSE_LEFT, true, false);
+        p.mouse_move(20.0, 5.0);
+        let selection = p.vm.display.get(field).unwrap().text().unwrap().selection();
+        assert_ne!(selection.0, selection.1);
+        p.mouse_leave();
+        p.tick(100.0);
+        assert_eq!(p.vm.focus, Some(field));
+        assert_eq!(
+            p.vm.display.get(field).unwrap().text().unwrap().selection(),
+            selection
+        );
+        p.mouse_button(20.0, 5.0, MOUSE_LEFT, false, false);
+        p.mouse_move(40.0, 5.0);
+        assert_eq!(
+            p.vm.display.get(field).unwrap().text().unwrap().selection(),
+            selection
+        );
+        assert_eq!(p.text_drag, None);
     }
 
     #[test]

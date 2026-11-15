@@ -277,13 +277,15 @@ pub struct Renderer {
     white: Arc<wgpu::BindGroup>,
     clamp: wgpu::Sampler,
     repeat: wgpu::Sampler,
+    clamp_nearest: wgpu::Sampler,
+    repeat_nearest: wgpu::Sampler,
     shapes: HashMap<(u16, u16, bool), Vec<Arc<GpuMesh>>>,
     cpu_shapes: HashMap<(u16, u16), Vec<CpuShape>>,
     scale9: HashMap<(DisplayId, [u32; 8]), Vec<Arc<GpuMesh>>>,
     glyphs: HashMap<(usize, usize), Arc<GlyphMesh>>,
     texts: HashMap<DisplayId, (u64, Vec<Arc<GpuMesh>>)>,
     drawings: HashMap<DisplayId, Vec<Arc<GpuMesh>>>,
-    bitmaps: HashMap<(String, bool), Option<Bitmap>>,
+    bitmaps: HashMap<(String, bool, bool), Option<Bitmap>>,
     engine_images: HashMap<String, Option<EngineImage>>,
     targets: Option<Targets>,
     /// Draws in the last frame.
@@ -349,18 +351,20 @@ impl Renderer {
             ],
             immediate_size: 0,
         });
-        let sampler = |mode| {
+        let sampler = |mode, filter| {
             device.create_sampler(&wgpu::SamplerDescriptor {
                 label: Some("gfx"),
                 address_mode_u: mode,
                 address_mode_v: mode,
-                mag_filter: wgpu::FilterMode::Linear,
-                min_filter: wgpu::FilterMode::Linear,
+                mag_filter: filter,
+                min_filter: filter,
                 ..Default::default()
             })
         };
-        let clamp = sampler(wgpu::AddressMode::ClampToEdge);
-        let repeat = sampler(wgpu::AddressMode::Repeat);
+        let clamp = sampler(wgpu::AddressMode::ClampToEdge, wgpu::FilterMode::Linear);
+        let repeat = sampler(wgpu::AddressMode::Repeat, wgpu::FilterMode::Linear);
+        let clamp_nearest = sampler(wgpu::AddressMode::ClampToEdge, wgpu::FilterMode::Nearest);
+        let repeat_nearest = sampler(wgpu::AddressMode::Repeat, wgpu::FilterMode::Nearest);
         let white_tex = upload_texture(device, queue, 1, 1, &[255, 255, 255, 255]);
         let white = Arc::new(texture_binding(device, &texture_layout, &white_tex, &clamp));
         Self {
@@ -376,6 +380,8 @@ impl Renderer {
             white,
             clamp,
             repeat,
+            clamp_nearest,
+            repeat_nearest,
             shapes: HashMap::new(),
             cpu_shapes: HashMap::new(),
             scale9: HashMap::new(),
@@ -810,15 +816,26 @@ impl Renderer {
         }))
     }
 
-    fn bitmap(&mut self, images: &mut dyn Images, name: &str, repeat: bool) -> Option<Bitmap> {
-        let key = (name.to_string(), repeat);
+    fn bitmap(
+        &mut self,
+        images: &mut dyn Images,
+        name: &str,
+        repeat: bool,
+        smooth: bool,
+    ) -> Option<Bitmap> {
+        let key = (name.to_string(), repeat, smooth);
         if let Some(b) = self.bitmaps.get(&key) {
             return b.clone();
         }
         let r = images.image(name).map(|(w, h, mut px)| {
             premultiply(&mut px);
             let t = upload_texture(&self.device, &self.queue, w, h, &px);
-            let s = if repeat { &self.repeat } else { &self.clamp };
+            let s = match (repeat, smooth) {
+                (false, false) => &self.clamp_nearest,
+                (true, false) => &self.repeat_nearest,
+                (false, true) => &self.clamp,
+                (true, true) => &self.repeat,
+            };
             (
                 Arc::new(texture_binding(&self.device, &self.texture_layout, &t, s)),
                 w as f32,
@@ -899,13 +916,15 @@ impl Renderer {
             let g = match &m.paint {
                 Paint::Solid => self.upload(&m, None, 0.0, Matrix::IDENTITY),
                 Paint::Bitmap {
-                    id: bid, repeat, ..
+                    id: bid,
+                    repeat,
+                    smooth,
                 } => {
                     let file = match movie.characters.get(bid) {
                         Some(Character::Image(img)) => img.file.clone(),
                         _ => String::new(),
                     };
-                    let tex = self.bitmap(images, &file, *repeat);
+                    let tex = self.bitmap(images, &file, *repeat, *smooth);
                     match tex {
                         Some((bg, _, _)) => self.upload(&m, Some(bg), 1.0, Matrix::IDENTITY),
                         None => {
@@ -1390,7 +1409,7 @@ impl Renderer {
             Kind::Text(_) => self.text_meshes(player, d),
             Kind::Bitmap { url, width, height } => {
                 let (url, w, h) = (url.clone(), *width, *height);
-                match self.bitmap(images, &url, false) {
+                match self.bitmap(images, &url, false, true) {
                     Some((bg, _, _)) => {
                         let mut m = Mesh {
                             paint: Paint::Solid,
@@ -2172,6 +2191,113 @@ mod shadow_tests {
             ..Default::default()
         });
         id
+    }
+
+    #[test]
+    fn bitmap_fills_keep_authored_sampling_and_cache_each_mode() {
+        use crate::display::{Kind, Object};
+        use crate::swf::{ExternalImage, Fill, Shape};
+
+        struct Pixels;
+        impl Images for Pixels {
+            fn image(&mut self, _: &str) -> Option<(u32, u32, Vec<u8>)> {
+                Some((2, 1, vec![255, 0, 0, 255, 0, 0, 255, 255]))
+            }
+        }
+        let instance =
+            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+        let adapter = pollster::block_on(instance.request_adapter(&Default::default())).unwrap();
+        let (device, queue) =
+            pollster::block_on(adapter.request_device(&Default::default())).unwrap();
+        let mut player = blend_player();
+        let root = player.vm.root;
+        let bounds = Rect {
+            x_max: 640,
+            y_max: 160,
+            ..Default::default()
+        };
+        let modes = [(false, false), (false, true), (true, false), (true, true)];
+        let mut movie = Movie {
+            stage: player.vm.movie.stage,
+            ..Default::default()
+        };
+        movie.characters.insert(
+            1,
+            Character::Image(ExternalImage {
+                file: "same-sampling-image".into(),
+                width: 2,
+                height: 1,
+                format: 0,
+                export_name: String::new(),
+            }),
+        );
+        for (row, (repeat, smooth)) in modes.into_iter().enumerate() {
+            let id = row as u16 + 2;
+            let shape = Arc::new(Shape {
+                bounds,
+                fills: vec![Fill::Bitmap {
+                    id: 1,
+                    repeat,
+                    smooth,
+                    matrix: Matrix {
+                        a: 160.0,
+                        d: 160.0,
+                        ..Matrix::IDENTITY
+                    },
+                }],
+                records: vec![
+                    Record::Style {
+                        move_to: Some((0, 0)),
+                        fill0: None,
+                        fill1: Some(1),
+                        line: None,
+                        new_styles: None,
+                    },
+                    Record::Line { to: (640, 0) },
+                    Record::Line { to: (640, 160) },
+                    Record::Line { to: (0, 160) },
+                    Record::Line { to: (0, 0) },
+                ],
+                ..Default::default()
+            });
+            movie.characters.insert(id, Character::Shape(shape.clone()));
+            let mut object = Object::new(Kind::Shape(shape, id));
+            object.parent = Some(root);
+            object.matrix.ty = row as f32 * 160.0;
+            let display = player.vm.display.add(object);
+            player
+                .vm
+                .display
+                .get_mut(root)
+                .unwrap()
+                .children
+                .insert(row as i32, display);
+        }
+        player.vm.movie = Arc::new(movie);
+        let mut renderer = Renderer::new(&device, &queue, wgpu::TextureFormat::Rgba8Unorm);
+        renderer.render(&mut player, &mut Pixels, (32, 32));
+        let (_, _, pixels) = renderer.capture().unwrap();
+        let pixel = |x: usize, row: usize| {
+            &pixels[((row * 8 + 4) * 32 + x) * 4..((row * 8 + 4) * 32 + x + 1) * 4]
+        };
+        for row in [0, 2] {
+            assert_eq!(pixel(7, row), [255, 0, 0, 255]);
+            assert_eq!(pixel(8, row), [0, 0, 255, 255]);
+        }
+        for row in [1, 3] {
+            let blended = pixel(7, row);
+            assert!(blended[0] > 100 && blended[0] < 200, "{blended:?}");
+            assert!(blended[2] > 50 && blended[2] < 150, "{blended:?}");
+            assert_eq!(blended[3], 255);
+        }
+        assert_eq!(pixel(19, 0), [0, 0, 255, 255]);
+        assert_eq!(pixel(19, 2), [255, 0, 0, 255]);
+        assert_eq!(pixel(0, 1), [255, 0, 0, 255]);
+        assert!(pixel(0, 3)[2] > 50);
+        assert_eq!(renderer.bitmaps.len(), 4);
+        // The cached bindings retain their individual samplers on later renders.
+        renderer.render(&mut player, &mut Pixels, (32, 32));
+        assert_eq!(renderer.capture().unwrap().2, pixels);
     }
 
     #[test]

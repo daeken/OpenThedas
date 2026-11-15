@@ -877,10 +877,6 @@ fn fs_lighting_baked(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f3
 }
 
 fn lighting_pixel(frag: vec4<f32>, baked: bool) -> vec4<f32> {
-    let view = select(lighting.counts.y, 0u, baked);
-    let membership = baked || lighting.counts.z != 0u;
-    let mode = select(lighting.counts.w, 0u, baked);
-    let rejection = select(u32(lighting.size.w), 3u, baked);
     let px = vec2<i32>(frag.xy);
     let depth = textureLoad(g_depth, px, 0).x;
     let p = world_at(px, depth);
@@ -896,6 +892,49 @@ fn lighting_pixel(frag: vec4<f32>, baked: bool) -> vec4<f32> {
     }
 
     let ga = textureLoad(g_albedo, px, 0);
+    // Keep unlit Black out of material loads and probe/AO work, as before the
+    // surface evaluator was shared with ordered forward receivers.
+    if (u32(round(ga.a * 255.0)) == 32u) { return vec4<f32>(0.0, 0.0, 0.0, 1.0); }
+    let spec = textureLoad(g_specular, px, 0);
+    let gn = textureLoad(g_normal, px, 0);
+    let lm = textureLoad(g_lightmap, px, 0);
+    var ao = 1.0;
+    if (!baked) {
+        let n = oct_decode(gn.xy);
+        let plane_n = geometric * inverseSqrt(max(dot(geometric, geometric), 1e-20));
+        let oriented_n = select(-plane_n, plane_n, dot(plane_n, n) >= 0.0);
+        ao = ambient_visibility(p, select(n, oriented_n, dot(geometric, geometric) > 1e-20));
+    }
+    return light_surface(frag, p, ga, spec, gn, lm, ao, baked, HairLight(), baked || lighting.size.z > 0.5);
+}
+
+struct HairLight {
+    tangent: vec3<f32>,
+    parameters: vec4<f32>,
+    secondary: vec3<f32>,
+};
+
+fn highlight(n: vec3<f32>, h: vec3<f32>, power: f32, hair: HairLight) -> vec3<f32> {
+    if (dot(hair.tangent, hair.tangent) > 0.5) {
+        let th = dot(hair.tangent, h);
+        let strand = sqrt(max(1.0 - th * th, 0.0));
+        // Hair's primary strand lobe is sharpened by three squarings; the second
+        // retains its own authored power and tint. Undo the ordinary 3x Blinn scale.
+        return (vec3<f32>(hair.parameters.x * pow(strand, hair.parameters.y * 8.0))
+            + hair.secondary * pow(strand, hair.parameters.z)) / 3.0;
+    }
+    return vec3<f32>(pow(max(dot(n, h), 1e-6), power));
+}
+
+// Both opaque pixels and ordered forward materials use this light list, membership,
+// falloff and visibility. Forward receivers supply their own position/material and
+// ambient visibility, so they never sample the opaque G-buffer as their surface.
+fn light_surface(frag: vec4<f32>, p: vec3<f32>, ga: vec4<f32>, spec: vec4<f32>,
+    gn: vec4<f32>, lm: vec4<f32>, ao: f32, baked: bool, hair: HairLight, fused: bool) -> vec4<f32> {
+    let view = select(lighting.counts.y, 0u, baked);
+    let membership = baked || lighting.counts.z != 0u;
+    let mode = select(lighting.counts.w, 0u, baked);
+    let rejection = select(u32(lighting.size.w), 3u, baked);
     let albedo = ga.rgb;
     let material = u32(round(ga.a * 255.0));
     if (material == 32u) { return vec4<f32>(0.0, 0.0, 0.0, 1.0); }
@@ -903,15 +942,13 @@ fn lighting_pixel(frag: vec4<f32>, baked: bool) -> vec4<f32> {
     let terrain_low = material == 128u;
     let character = material == 192u;
     let object = material == 64u || character;
-    let spec = textureLoad(g_specular, px, 0);
-    let gn = textureLoad(g_normal, px, 0);
-    let lm = textureLoad(g_lightmap, px, 0);
     let n = oct_decode(gn.xy);
     let room = u32(gn.z + 0.5);
     let falloff = gn.w;
     let power = spec.a * 255.0 + 1.0;
     let v = normalize(lighting.eye.xyz - p);
     let compute_specular = !baked || any(spec.rgb != vec3<f32>(0.0));
+    let strands = dot(hair.tangent, hair.tangent) > 0.5;
 
     // Static lights and the sun (the original's lights A-C and its directional light,
     // masked by the lightmap's alpha), and the others (its D and E).
@@ -962,7 +999,7 @@ fn lighting_pixel(frag: vec4<f32>, baked: bool) -> vec4<f32> {
             // Reject clear back faces before the remaining light loads and sqrt.
             // Keep a margin at the tangent plane for the later normalized dot's
             // rounding; it remains the authority for near-zero contributions.
-            if (dot(n, to) < -0.00001 * reach) { continue; }
+            if (!strands && dot(n, to) < -0.00001 * reach) { continue; }
         }
         let light_colour = lights[i].colour;
         let light_shadow = lights[i].shadow;
@@ -984,7 +1021,7 @@ fn lighting_pixel(frag: vec4<f32>, baked: bool) -> vec4<f32> {
         }
         let ln = to / d;
         let ndl = dot(n, ln);
-        if (ndl < 0.0) {
+        if (!strands && ndl < 0.0) {
             continue;
         }
         let c = cos(d / position.w * PI * 0.5);
@@ -996,12 +1033,12 @@ fn lighting_pixel(frag: vec4<f32>, baked: bool) -> vec4<f32> {
                 return vec4<f32>(shade, att, 0.0, 1.0);
             }
         }
-        let dif = att * ndl * light_colour.rgb * shade;
+        let diffuse_response = select(ndl, max(ndl * 0.75 + 0.25, 0.0), strands);
+        let dif = att * diffuse_response * light_colour.rgb * shade;
         var sp = vec3<f32>(0.0);
         if (compute_specular) {
             let h = normalize(v + ln);
-            let ndh = max(dot(n, h), 1e-6);
-            sp = att * pow(ndh, power) * light_colour.rgb * shade;
+            sp = att * highlight(n, h, power, hair) * light_colour.rgb * shade;
         }
         // Objects have no baked direct visibility. Their point lights use their own
         // cube visibility, never the sun's mask or Static1's grazing-angle floor.
@@ -1017,22 +1054,16 @@ fn lighting_pixel(frag: vec4<f32>, baked: bool) -> vec4<f32> {
     if (lighting.sun_dir.w > 0.5) {
         let ls = -lighting.sun_dir.xyz;
         let ndl = dot(n, ls);
-        if (ndl >= 0.0) {
-            diff_s = diff_s + ndl * lighting.sun_colour.rgb;
+        if (strands || ndl >= 0.0) {
+            let diffuse_response = select(ndl, max(ndl * 0.75 + 0.25, 0.0), strands);
+            diff_s = diff_s + diffuse_response * lighting.sun_colour.rgb;
             if (compute_specular) {
                 let h = normalize(v + ls);
-                let ndh = max(dot(n, h), 1e-6);
-                spec_s = spec_s + pow(ndh, power) * lighting.sun_colour.rgb;
+                spec_s = spec_s + highlight(n, h, power, hair) * lighting.sun_colour.rgb;
             }
         }
     }
     let sun_shade = sun_visibility(p, n, !terrain_low && !object);
-    var ao = 1.0;
-    if (!baked) {
-        let plane_n = geometric * inverseSqrt(max(dot(geometric, geometric), 1e-20));
-        let oriented_n = select(-plane_n, plane_n, dot(plane_n, n) >= 0.0);
-        ao = ambient_visibility(p, select(n, oriented_n, dot(geometric, geometric) > 1e-20));
-    }
     // Static1: alpha masks baked direct visibility once; RGB is baked bounce,
     // dimmed by only 15% in a runtime shadow (exploration camera w = 0).
     // Dynamic lights have their own visibility and never take this sun mask.
@@ -1043,7 +1074,7 @@ fn lighting_pixel(frag: vec4<f32>, baked: bool) -> vec4<f32> {
     let specular = select((spec_s * sun_shade * max(lm.a, 0.2) + spec_d) * 3.0,
         (spec_s * (0.75 * sun_shade * lm.a + 0.25) + spec_d) * 3.0, terrain);
     var colour = albedo * diffuse + spec.rgb * specular * falloff;
-    if (baked || lighting.size.z > 0.5) {
+    if (fused) {
         colour = albedo * (static_diffuse + diff_d) + spec.rgb * specular * falloff + lm.rgb;
     }
     switch view {
