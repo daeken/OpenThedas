@@ -187,6 +187,35 @@ fn dist(a: [f32; 3], b: [f32; 3]) -> f32 {
     ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt()
 }
 
+/// Perception's sight-line memo: the area and collision it was made for (area, solid,
+/// placeables, by pointer), and per ordered pair of creatures their positions (as bits)
+/// and whether the line was blocked.
+#[derive(Default)]
+pub struct SightMemo {
+    /// The area and the geometry the lines were worked out against. The geometry is held,
+    /// not just named, so a newer copy at a reused address can never pass for it.
+    made_for: Option<SightGeometry>,
+    lines: std::collections::HashMap<(ObjectId, ObjectId), SightLine>,
+}
+
+/// Where the two ends stood (as bits) and whether the line between them was blocked.
+type SightLine = ([u32; 3], [u32; 3], bool);
+
+type SightGeometry = (
+    ObjectId,
+    Option<std::sync::Arc<crate::collision::Collision>>,
+    Option<std::sync::Arc<crate::collision::Collision>>,
+    Option<std::sync::Arc<thedas_formats::level::NavGrid>>,
+);
+
+fn same_arc<T>(a: &Option<std::sync::Arc<T>>, b: &Option<std::sync::Arc<T>>) -> bool {
+    match (a, b) {
+        (Some(x), Some(y)) => std::sync::Arc::ptr_eq(x, y),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
 impl Sim {
     /// DA2 0x4dd1a0 reads the creature's combat record, including a stale/dead target;
     /// scripts validate the returned id themselves. Origins retains its queue-based view.
@@ -324,21 +353,28 @@ impl Sim {
     /// table's `SecondaryRange` (20 for the medium and monster rows, 30 for the long ones) is
     /// not used, its meaning not recovered.
     pub fn perception_range(&self, id: ObjectId) -> f32 {
-        let class = self
-            .world
+        let class = self.perception_class(id, &crate::engine::party_of(self));
+        self.perception_range_of_class(class)
+    }
+
+    /// The `ranges.gda` row a creature perceives with (see [`Sim::perception_range`]).
+    fn perception_class(&self, id: ObjectId, party: &[ObjectId]) -> i64 {
+        self.world
             .get(id)
             .and_then(|o| o.fields.get("PerceptionClass").copied())
             .filter(|&r| r > 0)
             .map(i64::from)
             .unwrap_or_else(|| {
-                let party =
-                    Some(id) == self.world.hero || crate::engine::party_of(self).contains(&id);
-                if party {
+                if Some(id) == self.world.hero || party.contains(&id) {
                     PERCEPTION_PLAYER
                 } else {
                     PERCEPTION_DEFAULT
                 }
-            });
+            })
+    }
+
+    /// The perception range of a `ranges.gda` row (see [`Sim::perception_range`]).
+    fn perception_range_of_class(&self, class: i64) -> f32 {
         self.world
             .tables()
             .get(RANGES_TABLE, "")
@@ -387,37 +423,58 @@ impl Sim {
         };
         let creatures: Vec<(ObjectId, [f32; 3])> = self
             .world
-            .objects
-            .values()
-            .filter(|o| o.kind == ObjectKind::Creature && o.area == Some(area))
+            .creature_ids()
+            .iter()
+            .filter_map(|&id| self.world.get(id))
+            .filter(|o| o.area == Some(area))
             .map(|o| (o.id, o.position))
             .collect();
         // What the pair test reads of each creature, looked up once a tick rather than once
         // a pair (the settled Ostagar camp has some hundreds of creatures): alive, group and
         // stealth, as `Sim::alive`, `Sim::hostile` and `Sim::hidden_from` read them.
-        let facts: std::collections::HashMap<ObjectId, (bool, i32, bool)> = creatures
+        // Indexed as `creatures`, so the pair test reads them without a map lookup.
+        let facts: Vec<(bool, i32, bool)> = creatures
             .iter()
-            .filter_map(|&(c, _)| {
-                let o = self.world.get(c)?;
-                Some((c, (o.active && !o.dead, o.group, o.combat.stealth)))
+            .map(|&(c, _)| {
+                self.world.get(c).map_or((false, 0, false), |o| {
+                    (o.active && !o.dead, o.group, o.combat.stealth)
+                })
             })
             .collect();
+        // Each creature's perception range (`Sim::perception_range`), by class: the party
+        // and the range table read once a tick, not once a creature.
+        let party = crate::engine::party_of(self);
+        let mut by_class: std::collections::HashMap<i64, f32> = Default::default();
+        let rings: Vec<f32> = creatures
+            .iter()
+            .map(|&(c, _)| {
+                let class = self.perception_class(c, &party);
+                *by_class
+                    .entry(class)
+                    .or_insert_with(|| self.perception_range_of_class(class))
+            })
+            .collect();
+        // Who can be near whom: the creatures in square cells as wide as the furthest any of
+        // them sees, so a creature only looks at the cells round its own. The candidates are
+        // sorted back into the world's order, so the result is what testing every pair gave.
+        let cell = rings.iter().fold(VISUAL_RANGE, |m, &r| m.max(r)).max(1.0);
+        let key = |p: [f32; 3]| ((p[0] / cell).floor() as i64, (p[1] / cell).floor() as i64);
+        let mut cells: std::collections::HashMap<(i64, i64), Vec<usize>> = Default::default();
+        for (j, &(_, p)) in creatures.iter().enumerate() {
+            cells.entry(key(p)).or_default().push(j);
+        }
         // (Perception only queues events, so none of this changes during the update.)
         let hostility = self.world.hostility.clone();
-        let hostile = |a: ObjectId, b: ObjectId| -> bool {
-            let (Some(&(_, g, _)), Some(&(_, h, _))) = (facts.get(&a), facts.get(&b)) else {
-                return false;
-            };
-            a != b
+        let hostile = |i: usize, j: usize| -> bool {
+            let (g, h) = (facts[i].1, facts[j].1);
+            i != j
                 && g != h
                 && hostility
                     .get(&(g.min(h), g.max(h)))
                     .copied()
                     .unwrap_or(false)
         };
-        let hidden = |who: ObjectId, seen: ObjectId| {
-            facts.get(&seen).is_some_and(|f| f.2) && hostile(who, seen)
-        };
+        let hidden = |who: usize, seen: usize| facts[seen].2 && hostile(who, seen);
         // Closed doors block sight (see `Sim::door_sight`).
         let doors = self.door_sight(area);
         let blocked = |a: [f32; 3], b: [f32; 3]| doors.blocks(a, b);
@@ -448,7 +505,20 @@ impl Sim {
                 .filter(|q| ((q[0] - p[0]).powi(2) + (q[1] - p[1]).powi(2)).sqrt() <= STAND_ASIDE)
                 .unwrap_or(p)
         };
-        let wall = |a: [f32; 3], b: [f32; 3]| match &solid {
+        // A sight line whose ends have not moved and whose geometry is the same as last
+        // time is answered from the memo (ambient creatures mostly stand still).
+        let mut memo = std::mem::take(&mut self.sight_memo);
+        let current = memo.made_for.as_ref().is_some_and(|m| {
+            m.0 == area && same_arc(&m.1, &solid) && same_arc(&m.2, &props) && same_arc(&m.3, &grid)
+        });
+        if !current {
+            memo = SightMemo {
+                made_for: Some((area, solid.clone(), props.clone(), grid.clone())),
+                lines: Default::default(),
+            };
+        }
+        let memo = std::cell::RefCell::new(memo);
+        let wall_raw = |a: [f32; 3], b: [f32; 3]| match &solid {
             Some(c) => {
                 let (a, b) = (stand(a), stand(b));
                 c.sight_blocked_standing(a, b)
@@ -460,8 +530,20 @@ impl Sim {
                 .as_ref()
                 .is_some_and(|g| crate::nav::wall_between(g, a, b)),
         };
-        for &(id, pos) in &creatures {
-            let alive = self.alive(id);
+        let bits = |p: [f32; 3]| p.map(f32::to_bits);
+        let wall = |x: ObjectId, y: ObjectId, a: [f32; 3], b: [f32; 3]| {
+            let (ka, kb) = (bits(a), bits(b));
+            if let Some(&(pa, pb, v)) = memo.borrow().lines.get(&(x, y)) {
+                if pa == ka && pb == kb {
+                    return v;
+                }
+            }
+            let v = wall_raw(a, b);
+            memo.borrow_mut().lines.insert((x, y), (ka, kb, v));
+            v
+        };
+        for (i, &(id, pos)) in creatures.iter().enumerate() {
+            let alive = facts[i].0;
             // A creature notices others within its perception range (see
             // `Sim::perception_range`) and keeps track of those it has noticed out to the
             // visual radius. DAOrigins.exe's perception update (0x6b89b0, from each
@@ -473,30 +555,42 @@ impl Sim {
             // the exe's room visibility for everyone; without the level's collision files a
             // wall of the pathing grid stands in for the ray, and the grid marks large
             // furniture and rubble the same way as walls, so those block hostiles too.
-            let ring = self.perception_range(id);
+            let ring = rings[i];
             let seen = self
                 .world
                 .get(id)
                 .map(|o| o.combat.perceived.clone())
                 .unwrap_or_default();
             let reach = ring.max(VISUAL_RANGE);
-            let in_view: Vec<ObjectId> = if alive {
-                creatures
-                    .iter()
-                    .filter(|&&(o, p)| {
+            let in_view: Vec<usize> = if alive {
+                let (cx, cy) = key(pos);
+                let mut near: Vec<usize> = Vec::new();
+                for dx in -1..=1 {
+                    for dy in -1..=1 {
+                        if let Some(v) = cells.get(&(cx + dx, cy + dy)) {
+                            near.extend_from_slice(v);
+                        }
+                    }
+                }
+                near.sort_unstable();
+                near.into_iter()
+                    .map(|j| (j, &creatures[j]))
+                    .filter(|&(j, &(o, p))| {
                         // Nothing beyond both ranges is seen; tested first as the cheapest.
                         let d = dist(pos, p);
-                        if d > reach || o == id || !facts.get(&o).is_some_and(|f| f.0) {
+                        if d > reach || o == id || !facts[j].0 {
                             return false;
                         }
-                        let tracked = seen.contains(&o) && !hidden(id, o);
+                        let tracked = seen.contains(&o) && !hidden(i, j);
                         if tracked {
                             d <= VISUAL_RANGE && !blocked(pos, p)
                         } else {
-                            d <= ring && !blocked(pos, p) && (!hostile(id, o) || !wall(pos, p))
+                            d <= ring
+                                && !blocked(pos, p)
+                                && (!hostile(i, j) || !wall(id, o, pos, p))
                         }
                     })
-                    .map(|&(o, _)| o)
+                    .map(|(j, _)| j)
                     .collect()
             } else {
                 Vec::new()
@@ -506,8 +600,15 @@ impl Sim {
             // detection check on it ("Perception check for ... detecting ...") without the AI
             // taking it on. Provisional: allies and neutrals see stealthed creatures, and the
             // notice is not repeated while the creature stays in range.
-            let (stealthed, now): (Vec<ObjectId>, Vec<ObjectId>) =
-                in_view.into_iter().partition(|&o| self.hidden_from(id, o));
+            let (stealthed, now): (Vec<usize>, Vec<usize>) =
+                in_view.into_iter().partition(|&j| hidden(i, j));
+            let now_hostile: Vec<ObjectId> = now
+                .iter()
+                .filter(|&&j| hostile(i, j))
+                .map(|&j| creatures[j].0)
+                .collect();
+            let stealthed: Vec<ObjectId> = stealthed.into_iter().map(|j| creatures[j].0).collect();
+            let now: Vec<ObjectId> = now.into_iter().map(|j| creatures[j].0).collect();
             let noticed = self
                 .world
                 .get(id)
@@ -529,11 +630,6 @@ impl Sim {
                     )
                 })
                 .unwrap_or_default();
-            let now_hostile: Vec<ObjectId> = now
-                .iter()
-                .copied()
-                .filter(|&o| self.hostile(id, o))
-                .collect();
             if now == before && now_hostile == before_hostile {
                 continue;
             }
@@ -557,6 +653,7 @@ impl Sim {
                 obj.combat.perceived_hostile = now_hostile;
             }
         }
+        self.sight_memo = std::mem::take(&mut *memo.borrow_mut());
         self.update_game_mode();
     }
 
@@ -683,9 +780,10 @@ impl Sim {
         let rates = [(health, regen(self, health)), (mana, regen(self, mana))];
         let living: Vec<ObjectId> = self
             .world
-            .objects
-            .values()
-            .filter(|o| o.kind == ObjectKind::Creature && !o.dead)
+            .creature_ids()
+            .iter()
+            .filter_map(|&id| self.world.get(id))
+            .filter(|o| !o.dead)
             .map(|o| o.id)
             .collect();
         for id in living {
@@ -1382,6 +1480,7 @@ impl Sim {
             target: Some(target),
             location: None,
             seconds: 0.0,
+            max_range: None,
             ints: Vec::new(),
             strings: Vec::new(),
             due: None,
@@ -1395,6 +1494,8 @@ impl Sim {
             arrived: false,
             da2_target_prepared: false,
             path: Vec::new(),
+            turned_at: None,
+            is_static: false,
         };
         self.da2_default_attack_command(&mut cmd);
         if let Some(o) = self.world.get_mut(attacker) {
@@ -1496,6 +1597,7 @@ impl Sim {
             target: None,
             location: None,
             seconds,
+            max_range: None,
             ints: Vec::new(),
             strings: Vec::new(),
             due: None,
@@ -1509,6 +1611,8 @@ impl Sim {
             arrived: false,
             da2_target_prepared: false,
             path: Vec::new(),
+            turned_at: None,
+            is_static: false,
         };
         if let Some(o) = self.world.get_mut(who).filter(|o| o.commands.is_empty()) {
             o.commands.push(cmd);
@@ -1576,7 +1680,13 @@ impl Sim {
             .world
             .get(id)
             .and_then(|o| o.commands.first())
-            .is_some_and(|c| c.name == cmd.name && c.ints == cmd.ints && c.target == cmd.target);
+            .is_some_and(|c| {
+                if self.game == thedas_vfs::Game::Origins {
+                    c == cmd
+                } else {
+                    c.name == cmd.name && c.ints == cmd.ints && c.target == cmd.target
+                }
+            });
         if !still {
             return;
         }
@@ -2381,9 +2491,10 @@ pub fn attack_tree(combat_tree: &str, main: &str, main_slots: i64, off: &str) ->
 impl Sim {
     /// `GetWeaponStyle`: `WEAPONSTYLE_NONE` without a main-hand weapon; with a melee one,
     /// `DUAL` beside an off-hand melee weapon, `TWOHANDED` for one that fits only the main
-    /// hand, else `SINGLE`; ranged weapons and wands `SINGLE`. Provisional: the executable
-    /// keeps the style in the creature's combat state (0x6a3c30); how it sets it is not
-    /// traced, so it is read from the weapons as [`attack_tree`] reads them.
+    /// hand, else `SINGLE`; ranged weapons and wands `SINGLE`. Origins' getter (0x6a3c30)
+    /// reads combat-state +0x5c. Its traced melee gear selector (0x7c3500) chooses OW/WS,
+    /// DW or TW, which 0x7c3600 maps to SINGLE, DUAL or TWOHANDED. We derive that choice
+    /// on query, as [`attack_tree`] does. Other weapon/appearance cases remain provisional.
     pub fn weapon_style(&self, id: ObjectId) -> i32 {
         if self.game == thedas_vfs::Game::DragonAge2 {
             return self.da2_combat_style(id);
@@ -3721,6 +3832,7 @@ mod tests {
                 target: Some(wolf),
                 location: None,
                 seconds: 0.0,
+                max_range: None,
                 ints: Vec::new(),
                 strings: Vec::new(),
                 due: None,
@@ -3734,6 +3846,8 @@ mod tests {
                 arrived: false,
                 da2_target_prepared: false,
                 path: Vec::new(),
+                turned_at: None,
+                is_static: false,
             });
         s.world.get_mut(rogue).unwrap().combat.attack = Some(AttackResult {
             results: [0, 2],

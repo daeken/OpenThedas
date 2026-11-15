@@ -226,6 +226,19 @@ struct Args {
     /// per pixel by every light in reach; see docs/deferred.md). F11 flips between them.
     #[arg(long, default_value = "faithful", value_parser = ["faithful", "deferred"])]
     renderer: String,
+    /// What the deferred renderer does with the baked lightmaps: `baked` (as the original),
+    /// `hybrid` (their bounce light kept, every light's shadows real-time) or `realtime`
+    /// (none: probe ambient, SSAO, real-time shadows; experimental). Defaults to
+    /// `THEDAS_DEFERRED_BAKED_LIGHTING`, else `baked`.
+    #[arg(long, value_parser = ["baked", "hybrid", "realtime"])]
+    lighting: Option<String>,
+    /// Viewer (`--area`): place visual effects in the level, `MODEL@X,Y,Z` separated by `;`
+    /// (`fxa_fireball_impact_p@10,4,0;fxa_storm_area_p@14,2,0`), each a model of the
+    /// game's VFX (`.mmh` without the extension) standing there, its emitters running from
+    /// the start (`--time` seconds into them at a capture). For looking at effects and their
+    /// light; ours, nothing the original offers.
+    #[arg(long, default_value = "")]
+    vfx: String,
     /// The original's "Graphics Detail" video option, which picks the materials' techniques
     /// and the bloom's blur: `low`, `medium` or `high` (High's materials draw as Medium's; its
     /// sun shadows are 1024 texels a side and reach further).
@@ -270,7 +283,8 @@ struct Args {
     #[arg(long)]
     audio: bool,
     /// Headless (`--steps`): record the game's sound to this WAV file (stereo, 48 kHz),
-    /// never to the speakers.
+    /// never to the speakers. In a windowed run (including `--control`) the sound runs
+    /// silently, for its log lines, and no WAV is written.
     #[arg(long)]
     audio_wav: Option<PathBuf>,
     /// Ask whether the problem reported in this report folder is fixed, once the game is up
@@ -320,6 +334,41 @@ fn hero_camera(pos: [f32; 3], facing: f32) -> Camera {
         yaw,
         -0.3,
     )
+}
+
+/// `--vfx`: `MODEL@X,Y,Z` separated by `;`, each as a prop showing that model.
+fn parse_vfx(spec: &str) -> Result<Vec<thedas_render::Prop>> {
+    spec.split(';')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .enumerate()
+        .map(|(i, item)| {
+            let (model, at) = item.split_once('@').context("--vfx takes MODEL@X,Y,Z")?;
+            let xyz: Vec<f32> = at
+                .split(',')
+                .map(|v| v.trim().parse::<f32>())
+                .collect::<std::result::Result<_, _>>()
+                .context("--vfx position must be X,Y,Z")?;
+            let [x, y, z] = xyz[..] else {
+                bail!("--vfx position must be X,Y,Z");
+            };
+            Ok(thedas_render::Prop {
+                label: format!("vfx{i}"),
+                models: Vec::new(),
+                attached: Vec::new(),
+                morph: None,
+                hide_hair: false,
+                tints: Vec::new(),
+                effects: vec![thedas_render::PropEffect {
+                    model: model.trim().trim_end_matches(".mmh").to_ascii_lowercase(),
+                    key: format!("vfx{i}"),
+                    age: 0.0,
+                    lasting: true,
+                }],
+                transform: thedas_render::Prop::placement([x, y, z], 0.0),
+            })
+        })
+        .collect()
 }
 
 fn parse_size(s: &str) -> Result<(u32, u32)> {
@@ -735,6 +784,9 @@ fn capture(
                     loaded.render_path,
                 );
                 renderer.frame_effects = loaded.frame_effects;
+                // `--vfx` effects play through their timelines up to the capture's time (no
+                // animator poses viewer props).
+                renderer.play_prop_effects(scene, shader_time);
                 renderer.set_time(shader_time);
                 log_stats(&renderer);
                 renderer.capture(ctx, &camera, w, h)?
@@ -967,7 +1019,7 @@ fn ask_report_note(ui: &mut ui::UiLayer, pad: bool) {
     // The box's OK wants some text, and the pad cannot type yet: a pad's report starts
     // with a line that can go as it is.
     let text = if pad { "(sent from a controller)" } else { "" };
-    ui.ask_text(report::NOTE_ID, prompt, text, ok, other);
+    ui.ask_free_text(report::NOTE_ID, prompt, text, ok, other);
 }
 
 /// What a report under way waits for.
@@ -997,6 +1049,8 @@ enum Marking {
     Off,
     /// The choice is asked: frames since asked (or seen up), and times it did not show.
     Offered(u32, u32),
+    /// A spot's note was answered: mark another, or go straight to the overall note.
+    More(u32, u32),
     /// Boxes are being drawn: the one being dragged (from, to), and the one whose note
     /// is being asked, with frames and tries as for the choice.
     On {
@@ -1016,6 +1070,9 @@ enum ResumeOffer {
 
 /// The ids of the offer to resume and of the box saying it failed.
 const RESUME_ID: u32 = 0x5245_5355;
+/// The question shown when the way back to the start menu fails (no answer is acted on).
+const RETURN_FAILED_ID: u32 = 0x5245_5446;
+
 const RESUME_FAILED_ID: u32 = RESUME_ID + 1;
 
 /// When `written` was, said as how long ago from `now`.
@@ -1069,7 +1126,7 @@ fn ask_mark_choice(ui: &mut ui::UiLayer, pad: bool) {
 }
 
 fn ask_region_note(ui: &mut ui::UiLayer) {
-    ui.ask_text(
+    ui.ask_free_text(
         report::REGION_ID,
         report::REGION_PROMPT,
         "",
@@ -1078,13 +1135,18 @@ fn ask_region_note(ui: &mut ui::UiLayer) {
     );
 }
 
+fn ask_more_marks(ui: &mut ui::UiLayer) {
+    ui.ask_choice(
+        report::MORE_MARKS_ID,
+        report::MORE_MARKS_PROMPT,
+        "Mark another spot",
+        "Done marking",
+    );
+}
+
 /// Whether the game's message box shows `prompt` now.
-fn box_shows(ui: &ui::UiLayer, prompt: &str) -> bool {
-    ui.stage.dialog_up()
-        && matches!(
-            ui.stage.bridge.value("GUIPopupLayer.DialogBoxText"),
-            Some(thedas_ui::UiValue::String(t)) if t == prompt
-        )
+fn box_shows(ui: &mut ui::UiLayer, prompt: &str) -> bool {
+    ui.stage.dialog_prompt().as_deref() == Some(prompt)
 }
 
 /// What the window's surface gave a redraw.
@@ -1434,6 +1496,7 @@ impl App {
                     self.loaded.render_path,
                 );
                 r.frame_effects = self.loaded.frame_effects;
+                r.start_prop_effects(scene, 0.25);
                 log_stats(&r);
                 println!("camera {}", self.camera.spec());
                 Some(r)
@@ -1452,7 +1515,7 @@ impl App {
         // The anti-aliasing slider offers what the device draws the world with; the choice
         // (4x unless the player chose) is the world's samples (see `sync_antialiasing`).
         ui.set_antialias_samples(
-            thedas_render::msaa::supported_samples(&ctx.adapter, config.format),
+            thedas_render::msaa::supported_samples(&ctx.adapter, &ctx.device, config.format),
             !upload::automated(),
         );
         if let (Some(live), Some(_)) = (&self.live, &self.screens) {
@@ -1840,7 +1903,11 @@ impl App {
                 self.update_answers.push(a);
                 continue;
             }
-            if (a.id == report::MARK_ID || a.id == report::REGION_ID) && self.recorder.busy() {
+            if matches!(
+                a.id,
+                report::MARK_ID | report::REGION_ID | report::MORE_MARKS_ID
+            ) && self.recorder.busy()
+            {
                 self.mark_answers.push(a);
                 continue;
             }
@@ -1887,7 +1954,7 @@ impl App {
             g.reticle
                 .draw(&g.ctx.device, &mut encoder, &view, size, &lines);
         }
-        g.ui.composite(&mut encoder, &view, g.config.format);
+        g.ui.composite(&mut encoder, &frame.texture, g.config.format);
         // The pad's pointer goes over the interface.
         let ctx = self
             .pad
@@ -2029,7 +2096,11 @@ impl App {
                 self.update_answers.push(a);
                 continue;
             }
-            if (a.id == report::MARK_ID || a.id == report::REGION_ID) && self.recorder.busy() {
+            if matches!(
+                a.id,
+                report::MARK_ID | report::REGION_ID | report::MORE_MARKS_ID
+            ) && self.recorder.busy()
+            {
                 self.mark_answers.push(a);
                 continue;
             }
@@ -2303,6 +2374,12 @@ impl App {
                 modmode::Action::FlyTo(id) => self.fly_to(id),
                 modmode::Action::LiveEdits(on) => {
                     let note = workspace::mount(on).unwrap_or_else(|e| e);
+                    if let Some(m) = self.mod_mode.as_mut() {
+                        m.live_note = Some(note);
+                    }
+                }
+                modmode::Action::PackMod(name) => {
+                    let note = pack_note(&name);
                     if let Some(m) = self.mod_mode.as_mut() {
                         m.live_note = Some(note);
                     }
@@ -2913,13 +2990,17 @@ impl App {
             return;
         };
         match (a.id, &mut w.marking) {
-            (report::MARK_ID, Marking::Offered(..)) if a.accepted => {
+            (report::MARK_ID, Marking::Offered(..))
+            | (report::MORE_MARKS_ID, Marking::More(..))
+                if a.accepted =>
+            {
                 w.marking = Marking::On {
                     drag: None,
                     asking: None,
                 };
             }
-            (report::MARK_ID, Marking::Offered(..)) => self.end_marking(),
+            (report::MARK_ID, Marking::Offered(..))
+            | (report::MORE_MARKS_ID, Marking::More(..)) => self.end_marking(),
             (report::REGION_ID, Marking::On { asking, .. }) => {
                 if let Some((rect, ..)) = asking.take() {
                     if a.accepted {
@@ -2927,6 +3008,10 @@ impl App {
                             rect,
                             note: a.text.trim().to_string(),
                         });
+                    }
+                    w.marking = Marking::More(0, 0);
+                    if let Some(g) = self.gfx.as_mut() {
+                        ask_more_marks(&mut g.ui);
                     }
                 }
             }
@@ -2942,11 +3027,18 @@ impl App {
             return;
         };
         let up = g.ui.stage.dialog_up();
+        let more = matches!(w.marking, Marking::More(..));
         match &mut w.marking {
             Marking::Off => {}
-            Marking::Offered(frames, tries) => {
+            Marking::Offered(frames, tries) | Marking::More(frames, tries) => {
                 *frames += 1;
-                if box_shows(&g.ui, report::MARK_PROMPT) || box_shows(&g.ui, MARK_PROMPT_PAD) {
+                let shown = if more {
+                    box_shows(&mut g.ui, report::MORE_MARKS_PROMPT)
+                } else {
+                    box_shows(&mut g.ui, report::MARK_PROMPT)
+                        || box_shows(&mut g.ui, MARK_PROMPT_PAD)
+                };
+                if shown {
                     *frames = 0;
                 } else if *frames > NOTE_REASK_FRAMES {
                     *frames = 0;
@@ -2954,20 +3046,25 @@ impl App {
                     if *tries > NOTE_TRIES {
                         self.end_marking();
                     } else if !up {
-                        ask_mark_choice(&mut g.ui, pad);
+                        if more {
+                            ask_more_marks(&mut g.ui);
+                        } else {
+                            ask_mark_choice(&mut g.ui, pad);
+                        }
                     }
                 }
             }
             Marking::On { asking, .. } => {
                 if let Some((_, frames, tries)) = asking.as_mut() {
                     *frames += 1;
-                    if box_shows(&g.ui, report::REGION_PROMPT) {
+                    if box_shows(&mut g.ui, report::REGION_PROMPT) {
                         *frames = 0;
                     } else if *frames > NOTE_REASK_FRAMES {
                         *frames = 0;
                         *tries += 1;
                         if *tries > NOTE_TRIES {
                             *asking = None;
+                            g.ui.cancel_text_popup(report::REGION_ID);
                         } else if !up {
                             ask_region_note(&mut g.ui);
                         }
@@ -3066,12 +3163,8 @@ impl App {
         // so the game never waits on it.
         if let (Some((frames, tries)), Some(g)) = (w.note_asked.as_mut(), self.gfx.as_mut()) {
             let up = g.ui.stage.dialog_up();
-            let ours = up
-                && matches!(
-                    g.ui.stage.bridge.value("GUIPopupLayer.DialogBoxText"),
-                    Some(thedas_ui::UiValue::String(t))
-                        if t == report::NOTE_PROMPT || t == report::NOTE_PROMPT_SEND
-                );
+            let ours = box_shows(&mut g.ui, report::NOTE_PROMPT)
+                || box_shows(&mut g.ui, report::NOTE_PROMPT_SEND);
             *frames += 1;
             if ours {
                 *frames = 0;
@@ -3081,6 +3174,7 @@ impl App {
                 if *tries > NOTE_TRIES {
                     log::warn!("report: the note could not be asked; kept without one");
                     w.note_asked = None;
+                    g.ui.cancel_text_popup(report::NOTE_ID);
                     self.recorder.note(Some(String::new()));
                 } else if !up {
                     ask_report_note(&mut g.ui, self.pad.used);
@@ -3093,6 +3187,16 @@ impl App {
         let Some(w) = self.report_wait.take() else {
             return;
         };
+        if let Some(g) = self.gfx.as_mut() {
+            for id in [
+                report::NOTE_ID,
+                report::MARK_ID,
+                report::REGION_ID,
+                report::MORE_MARKS_ID,
+            ] {
+                g.ui.cancel_text_popup(id);
+            }
+        }
         let reply = w.reply;
         if w.paused_it {
             if let Some(live) = self.live.as_mut() {
@@ -4213,6 +4317,7 @@ impl App {
             Step::ModWorld => log.push(self.mod_mode_world_step(None)),
             Step::ModPlot(name) => log.push(self.mod_mode_world_step(Some(name))),
             &Step::ModLive(on) => log.push(workspace::mount(on).unwrap_or_else(|e| e)),
+            Step::ModPack(name) => log.push(pack_note(name)),
             &Step::ModMove(position, facing) => {
                 log.push(match self.mod_mode.as_ref().and_then(|m| m.selected) {
                     Some(id) => self.mod_mode_place(
@@ -4655,7 +4760,18 @@ impl App {
             if matches!(r, ui::FrontEnd::StartMenu) {
                 match live::Live::open(&self.install, &self.module, start, &self.shaders) {
                     Ok(l) => self.install_live(l),
-                    Err(e) => log::warn!("front end: {r:?} failed: {e:#}"),
+                    Err(e) => {
+                        log::warn!("front end: {r:?} failed: {e:#}");
+                        // Say so: the game just carries on, which looks like a dead button.
+                        if let Some(g) = self.gfx.as_mut() {
+                            g.ui.ask_choice(
+                                RETURN_FAILED_ID,
+                                &format!("The start menu could not be opened: {e:#}"),
+                                "OK",
+                                "OK",
+                            );
+                        }
+                    }
                 }
                 continue;
             }
@@ -5917,6 +6033,7 @@ enum Step {
     ModExport,
     /// Live edits on or off (`modlive on`, `modlive off`).
     ModLive(bool),
+    ModPack(String),
     /// Live edits look for saved textures now (`modsync`).
     ModSync,
     /// The inspected object is put at a place, turned to a facing (`modmove X,Y,Z F`).
@@ -6365,6 +6482,7 @@ fn parse_step(s: &str) -> Result<Step> {
             "off" => false,
             _ => bail!("modlive takes on or off"),
         }),
+        "modpack" => Step::ModPack(arg.to_string()),
         "modsync" => Step::ModSync,
         "modmove" => {
             let (at, f) = arg.split_once(' ').context("modmove takes X,Y,Z FACING")?;
@@ -6491,6 +6609,13 @@ fn main() -> Result<()> {
         env_logger::Env::default().default_filter_or("info,wgpu=warn,naga=warn"),
     ));
     let mut args = Args::parse();
+    if let Some(mode) = args
+        .lighting
+        .as_deref()
+        .and_then(thedas_render::BakedLighting::parse)
+    {
+        thedas_render::set_baked_lighting(mode);
+    }
     faces::set_language(&args.language);
     live::ANTIALIASING.store(
         args.antialiasing.unwrap_or(1).max(1),
@@ -6641,7 +6766,8 @@ fn main() -> Result<()> {
         args.area.as_deref().unwrap_or(DEFAULT_AREA)
     };
     let detail = thedas_render::scene::Detail::parse(&args.detail).unwrap_or_default();
-    let mut loaded = load(&install, area, &args.shaders, &[], detail)?;
+    let vfx = parse_vfx(&args.vfx)?;
+    let mut loaded = load(&install, area, &args.shaders, &vfx, detail)?;
     loaded.frame_effects = args.frame_effects == "on";
     loaded.render_path = thedas_render::RenderPath::parse(&args.renderer).unwrap_or_default();
     if let Some(l) = live.as_mut() {
@@ -6803,6 +6929,7 @@ fn main() -> Result<()> {
                     | Step::ModPlot(_)
                     | Step::ModExport
                     | Step::ModLive(_)
+                    | Step::ModPack(_)
                     | Step::ModSync
                     | Step::ModMove(..)
                     | Step::ModMoveView
@@ -7519,6 +7646,7 @@ fn main() -> Result<()> {
             "detail": args.detail,
             "frame_effects": args.frame_effects,
             "renderer": args.renderer,
+            "lighting": args.lighting,
             "language": args.language,
             "module": args.module,
             "install": report::install_info(&install, &args.language),
@@ -7535,7 +7663,19 @@ fn main() -> Result<()> {
             let off = args.no_audio
                 || std::env::var_os("THEDAS_NO_AUDIO").is_some()
                 || (args.control.is_some() && !args.audio);
-            if off {
+            if args.audio_wav.is_some() {
+                // A windowed run with --audio-wav: the game's sound runs (its log lines
+                // say what it plays, e.g. "audio: voice starts") but never reaches the
+                // speakers. The WAV itself is written only by headless --steps runs.
+                log::info!("audio: silent (no speakers; --audio-wav in a windowed run)");
+                Some(audio::GameAudio::recording(
+                    &install,
+                    &args.module,
+                    &loaded_vfs,
+                    &args.language,
+                    48000,
+                ))
+            } else if off {
                 log::info!("audio: off");
                 None
             } else {
@@ -7553,8 +7693,38 @@ fn main() -> Result<()> {
     }
 }
 
+/// What packing the live edits into a mod called `name` did, for mod mode's note and the
+/// `modpack` step.
+fn pack_note(name: &str) -> String {
+    match workspace::pack(name) {
+        Ok(p) => format!(
+            "Packed {} file(s) ({} bytes): {} (add it to mods.txt to use it)",
+            p.files,
+            p.bytes,
+            p.path.display()
+        ),
+        Err(e) => e,
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn vfx_specs_parse_into_effect_props() {
+        let props = super::parse_vfx("fxa_fire_aoe_p@1,2,3; FXA_Ice_Cld_P.mmh @ -4.5,0,7").unwrap();
+        assert_eq!(props.len(), 2);
+        assert_eq!(props[0].effects[0].model, "fxa_fire_aoe_p");
+        assert_eq!(props[1].effects[0].model, "fxa_ice_cld_p");
+        assert!(props[0].effects[0].lasting && props[0].models.is_empty());
+        assert_eq!(
+            props[1].transform.w_axis.truncate(),
+            glam::Vec3::new(-4.5, 0.0, 7.0)
+        );
+        assert!(super::parse_vfx("").unwrap().is_empty());
+        assert!(super::parse_vfx("fxa_fire_aoe_p").is_err());
+        assert!(super::parse_vfx("fxa_fire_aoe_p@1,2").is_err());
+    }
+
     /// Against a real install (`THEDAS_INSTALL`), offscreen: the EA logo's frame
     /// two seconds in is drawn letterboxed in a taller window (written to `$INTRO_PNG` when
     /// set, to look at).

@@ -34,6 +34,13 @@ pub struct Training {
     /// The game holds still for it (it started in explore or combat).
     #[serde(default)]
     pub paused: bool,
+    /// The interface elements the step highlights (`HighlightGuiElement`, by
+    /// `GUI_HIGHLIGHT_*` index 0 to 7: a bit each), and each one's argument (a follower's or
+    /// slot's number).
+    #[serde(default)]
+    pub highlighted: u8,
+    #[serde(default)]
+    pub highlight_args: [i32; 8],
 }
 
 /// The script the training events run (on the module), not the module's own: DAOrigins.exe
@@ -85,6 +92,22 @@ impl Sim {
         t.arg = arg;
     }
 
+    /// `HighlightGuiElement`: the step points at interface element `element`
+    /// (`GUI_HIGHLIGHT_FOLLOWER` 0, `TACTICS` 1, `INVENTORY` 2, `HEALTH_POULTICE` 3,
+    /// `EMPTY_QBAR` 4, `TACTIC_PRESET` 5, `EQUIPMENT_SLOT` 6, `UNEQUIPPED_ITEM` 7; what the
+    /// movies read as `GUI.GuiHighlights.<n>.Highlight` and `.HighlightArg`) until the player does what the step asks.
+    /// step's event. Provisional: the exe's handler is not traced; the argument order is read
+    /// from the scripts' calls (the element is the first parameter), and the highlight is
+    /// taken to end when the player does what the step asks.
+    pub fn highlight_gui_element(&mut self, element: i32, arg: i32) {
+        if !(0..8).contains(&element) {
+            return;
+        }
+        let t = &mut self.world.training;
+        t.highlighted |= 1 << element;
+        t.highlight_args[element as usize] = arg;
+    }
+
     /// The player did a training action (`EVENT_TYPE_TRAINING_<name>`, with its argument):
     /// when the step under way waits for it, `genev_tutorial` gets it. Returns whether it did.
     pub fn training_event(&mut self, name: &str, arg: i32) -> bool {
@@ -98,6 +121,9 @@ impl Sim {
         // Provisional: the exe's 0x693290 does not clear it; a move order held down would
         // otherwise post the event every frame.
         self.world.training.expected = 0;
+        // What the step pointed at is let go: the player did it.
+        self.world.training.highlighted = 0;
+        self.world.training.highlight_args = [0; 8];
         // The step's events run on the main controlled creature, not the module
         // (0x693290 targets 0x5d5cc0(), the player's main creature), and only for the
         // event the step waits for (+0x9c, checked above).
@@ -108,7 +134,20 @@ impl Sim {
 
     /// Whether training holds the game paused (see the module's doc).
     pub fn training_paused(&self) -> bool {
-        self.world.training.mode != 0 && self.world.training.paused
+        self.world.training.mode != 0 && self.world.training.paused && !self.tutorials_held()
+    }
+
+    /// Tutorials wait for cinematic playback, including the handoff to a queued cut.
+    /// The native tutorial pause path only pauses explore/combat (0x6940cd), not
+    /// GameModeCutscene. Our cutscene clock is separate from `game_mode`.
+    pub fn tutorials_held(&self) -> bool {
+        self.game == thedas_vfs::Game::Origins
+            && (self.world.cutscene.is_some() || !self.world.cutscenes.is_empty())
+    }
+
+    /// A queued tutorial's pause becomes effective when its panel can be shown.
+    pub fn tutorial_paused(&self) -> bool {
+        self.world.tutorial_paused && !self.tutorials_held()
     }
 
     /// Why the game cannot be saved now, if it cannot: training mode disables saving
@@ -190,6 +229,42 @@ mod tests {
         assert_eq!(s.world.training.mode, 1);
         assert!(!s.training_paused(), "the conversation runs on");
         assert!(s.saving_blocked().is_some(), "saving is still refused");
+    }
+
+    #[test]
+    fn cinematic_playback_holds_tutorials_without_losing_the_pending_pause() {
+        let mut s = sim();
+        s.set_training_mode(1);
+        s.begin_training_step(1, 1065, 0);
+        s.world.tutorial_paused = true;
+        assert!(s.training_paused());
+        assert!(s.tutorial_paused());
+        let cut = crate::cutscene::Cutscene {
+            name: "intro.cut".into(),
+            seconds: 5.0,
+            lines: vec![],
+            elapsed_ms: 0,
+            from_dialog: false,
+            bound: vec![],
+            placement: None,
+        };
+        s.world.cutscenes.push(cut.name.clone());
+        assert!(s.tutorials_held(), "hold the queued handoff too");
+        assert!(!s.training_paused());
+        assert!(!s.tutorial_paused());
+        s.world.cutscenes.clear();
+        s.world.cutscene = Some(cut);
+        assert!(s.tutorials_held());
+        assert!(!s.training_paused());
+        assert!(!s.tutorial_paused());
+        assert!(s.saving_blocked().is_some());
+        s.game = thedas_vfs::Game::DragonAge2;
+        assert!(!s.tutorials_held(), "DA2 keeps its existing behavior");
+        s.game = thedas_vfs::Game::Origins;
+        s.world.cutscene = None;
+        assert_eq!(s.world.training.step, 1);
+        assert!(s.training_paused(), "the lesson resumes after the cut");
+        assert!(s.tutorial_paused());
     }
 
     #[test]
@@ -289,5 +364,22 @@ mod tests {
             e,
             crate::trace::TraceEntry::EventDelivered { ty: 1071, target, .. } if *target == hero
         )));
+    }
+
+    #[test]
+    fn a_step_highlights_interface_elements_until_the_next_step() {
+        let mut s = sim();
+        s.set_training_mode(2);
+        s.begin_training_step(3, 1063, 0);
+        s.highlight_gui_element(2, 0);
+        s.highlight_gui_element(6, 4);
+        let t = s.world.training;
+        assert_eq!(t.highlighted, 1 << 2 | 1 << 6);
+        assert_eq!(t.highlight_args[6], 4);
+        assert!(s.training_event("GUI_INVENTORY_OPENED", 0));
+        assert_eq!(s.world.training.highlighted, 0);
+        // An element out of range is ignored.
+        s.highlight_gui_element(9, 0);
+        assert_eq!(s.world.training.highlighted, 0);
     }
 }

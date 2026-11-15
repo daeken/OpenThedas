@@ -17,6 +17,12 @@ const CELL: f32 = 2.0;
 /// No grid is built past this many cells a side; larger levels use coarser cells.
 const MAX_CELLS: usize = 1024;
 
+thread_local! {
+    /// The triangles a [`Collider`] query has gathered so far, a bit each (kept clear
+    /// between queries).
+    static SEEN: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 /// Triangles in a grid over the ground plane: each cell lists those whose bounds reach it.
 #[derive(Default)]
 pub struct Collider {
@@ -179,9 +185,11 @@ impl Collider {
         // A step's neighbours too: the segment may graze a corner between steps, and a
         // sphere reaches past its centre's cell.
         let around = 1 + (reach / self.cell).ceil().clamp(0.0, 8.0) as i64;
-        // The triangles of the cells walked, each once (sorted, then tested); a triangle
-        // whose box is clear of the segment's box (widened by `reach`) cannot be met.
-        let mut near: Vec<u32> = Vec::new();
+        // The cells walked and their neighbours, each once; then their triangles, each once
+        // (marked in a reused bitset rather than sorted: a camera sweep gathers tens of
+        // thousands of repeats); a triangle whose box is clear of the segment's box (widened
+        // by `reach`) cannot be met.
+        let mut cells: Vec<usize> = Vec::new();
         let mut last = None;
         for s in 0..=steps {
             let p = from + d * (s as f32 / steps as f32);
@@ -196,15 +204,41 @@ impl Collider {
                     if x < 0 || y < 0 || x >= self.size[0] as i64 || y >= self.size[1] as i64 {
                         continue;
                     }
-                    let Some(list) = self.cells.get(y as usize * self.size[0] + x as usize) else {
-                        continue;
-                    };
-                    near.extend_from_slice(list);
+                    cells.push(y as usize * self.size[0] + x as usize);
                 }
             }
         }
-        near.sort_unstable();
-        near.dedup();
+        cells.sort_unstable();
+        cells.dedup();
+        let near = SEEN.with(|seen| {
+            let mut seen = seen.borrow_mut();
+            let words = self.triangles.len().div_ceil(64);
+            if seen.len() < words {
+                seen.resize(words, 0);
+            }
+            let mut near: Vec<u32> = Vec::new();
+            for &c in &cells {
+                let Some(list) = self.cells.get(c) else {
+                    continue;
+                };
+                for &i in list {
+                    let (w, b) = (i as usize / 64, 1u64 << (i % 64));
+                    if let Some(word) = seen.get_mut(w)
+                        && *word & b == 0
+                    {
+                        *word |= b;
+                        near.push(i);
+                    }
+                }
+            }
+            // Left clear for the next call.
+            for &i in &near {
+                if let Some(word) = seen.get_mut(i as usize / 64) {
+                    *word = 0;
+                }
+            }
+            near
+        });
         let lo = from.min(to) - Vec3::splat(reach);
         let hi = from.max(to) + Vec3::splat(reach);
         let mut best: Option<f32> = None;

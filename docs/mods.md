@@ -178,6 +178,13 @@ anywhere a mod goes) to keep your edits. Live edits are never mounted unless you
 not at all with `THEDAS_MODS=none`; while they are, reports name the `workspace:override`
 layer, so a report from an edited game is not taken for a bug in the original's behaviour.
 
+To share your edits, type a name and press **Save edits as a mod**: the files of
+`workspace/override/` are packed into `mods-made/<name>.zip` in your data folder (a
+`<name>.txt` beside it says what is in it and which line to add to `mods.txt`). The zip is an
+ordinary mod: list it like any other, send it to a friend, or unpack it into the original
+game's `packages/core/override`. Packing again with the same name replaces the zip. The
+control step `modpack NAME` does the same.
+
 Textures are written uncompressed for now (bigger files, same look). What was already
 loaded from an old file stays until it is read again: creatures and objects are redrawn at
 once; the level's own textures and meshes change on its next load.

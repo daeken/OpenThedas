@@ -134,6 +134,8 @@ pub enum Action {
     Export(ObjectId),
     /// Live edits on or off (see [`crate::workspace`]).
     LiveEdits(bool),
+    /// The live edits packed into a mod of this name (`workspace::pack`).
+    PackMod(String),
     /// An object put at a place and facing (degrees).
     Move {
         id: ObjectId,
@@ -179,6 +181,8 @@ pub struct ModMode {
     pub exported: Option<String>,
     /// Exports carry every animation of the creature's tree, not only the one it plays.
     pub export_animations: bool,
+    /// The name typed for "Save edits as a mod".
+    pub pack_name: String,
     /// Whether live edits are mounted (the app keeps this up to date).
     pub live: bool,
     /// What live edits last did.
@@ -229,6 +233,7 @@ impl ModMode {
             fly: false,
             exported: None,
             export_animations: false,
+            pack_name: String::new(),
             live: false,
             live_note: None,
             place: None,
@@ -434,6 +439,24 @@ impl ModMode {
                 {
                     self.actions.push(Action::LiveEdits(live));
                 }
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.pack_name)
+                            .hint_text("Mod name")
+                            .desired_width(110.0),
+                    );
+                    if ui
+                        .button("Save edits as a mod")
+                        .on_hover_text(
+                            "Packs workspace/override (the textures and models you saved back \
+                             from Blender) into mods-made/<name>.zip, a mod you can list in \
+                             mods.txt or share.",
+                        )
+                        .clicked()
+                    {
+                        self.actions.push(Action::PackMod(self.pack_name.clone()));
+                    }
+                });
                 if let Some(note) = &self.live_note {
                     ui.weak(note);
                 }

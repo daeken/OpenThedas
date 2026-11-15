@@ -4,9 +4,11 @@
 //! Animation tracks hold each bone's local rotation (absolute, not an offset from the rest
 //! pose: an idle's first keys sit a few degrees from the model's rest rotations; the
 //! animations keep `GOD` unrotated and turn `Root` by the half turn the models give `GOD`,
-//! which composes to the same thing). Translation keys are in a convention not yet worked
-//! out (the root's keys lack the hip height, other nodes' come out doubled), so they apply
-//! as offsets from the clip's first key on top of the rest translation (provisional).
+//! which composes to the same thing). Translation keys: DAOrigins.exe scales each by the
+//! creature's appearance's multipliers and adds it to the bone's own translation (see
+//! [`Layer::scale`]); that is followed for the root of ordinary clips, while other bones'
+//! keys (which taken whole come out doubled) and cutscenes' layers apply as offsets from
+//! the clip's first key on top of the rest translation (provisional).
 //! Nodes without a track keep their rest placement.
 //!
 //! An additive animation ([`Animation::additive`], field 4011: conversation gestures such as
@@ -43,6 +45,14 @@ pub struct Layer<'a> {
     pub against_base: bool,
     pub weight: f32,
     pub nodes: &'a [Option<usize>],
+    /// The creature's appearance's translation multipliers, for the convention
+    /// DAOrigins.exe plays ordinary clips with: a translation key times these is added to
+    /// the bone's own translation (0x811a60 scales the sample, 0x55e9d0 adds it to the
+    /// node's base; notes/nonhuman-clip-retarget-trace.md), so a dwarf playing a human
+    /// sitting clip drops by 0.73 of the human's drop. A clip marked
+    /// [`Animation::unscaled`] takes (1, 1, 1). `None`: the older convention (offsets from
+    /// the first key).
+    pub scale: Option<Vec3>,
 }
 
 /// Every node of a model, parents before children.
@@ -158,7 +168,8 @@ impl Skeleton {
     /// layer's turn and shift (the head tracking's pose animations; see [`crate::look`]):
     /// its rotation key is taken that far from no turn at all, its translation key times
     /// the weight. Provisional: the executable scales each additive clip by its instance's
-    /// weight (+0xc of its blend entry), but how is not traced. Other layers ignore it.
+    /// weight (+0xc of its blend entry), but how is not traced. A posed layer of weight
+    /// below 1 is blended into the layers before it (see `sample_into`).
     pub fn pose_weighted(&self, layers: &[(&Animation, f32, bool, f32)]) -> Vec<Mat4> {
         let nodes: Vec<Vec<Option<usize>>> =
             layers.iter().map(|(a, ..)| self.track_nodes(a)).collect();
@@ -171,6 +182,7 @@ impl Skeleton {
                 against_base,
                 weight,
                 nodes,
+                scale: None,
             })
             .collect();
         self.pose_mapped(&mapped)
@@ -235,6 +247,7 @@ impl Skeleton {
                     if let (Some(d), Some(slot)) =
                         (sample_translation(&track.keys, t), pos.get_mut(i))
                     {
+                        let d = d * layer_scale(layer);
                         *slot = Some(slot.unwrap_or(rest.rest_translation) + d * weight);
                     }
                 }
@@ -251,6 +264,10 @@ impl Skeleton {
     ) {
         let anim = layer.anim;
         let t = layer.time.clamp(0.0, anim.length.max(0.0));
+        // A layer of weight below 1 is blended into what the layers before it posed (bones
+        // they left unset blend from rest): a crossfade between full-body clips.
+        let w = layer.weight.clamp(0.0, 1.0);
+        let blend = w < 1.0;
         for (track, node) in anim.tracks.iter().zip(layer.nodes) {
             let Some(i) = *node else {
                 continue;
@@ -259,7 +276,13 @@ impl Skeleton {
                 Channel::Rotation => {
                     if let Some(r) = sample_rotation(&track.keys, t) {
                         if let Some(slot) = rot.get_mut(i) {
-                            *slot = Some(r);
+                            *slot = Some(if blend {
+                                let from = slot.unwrap_or(self.bones[i].rest_rotation);
+                                let r = if from.dot(r) < 0.0 { -r } else { r };
+                                from.slerp(r, w).normalize()
+                            } else {
+                                r
+                            });
                         }
                     }
                 }
@@ -269,15 +292,42 @@ impl Skeleton {
                         .first()
                         .map(|k| Vec3::new(k.value[0], k.value[1], k.value[2]));
                     let first = reference.and_then(|r| r.get(i).copied().flatten()).or(own);
-                    let p = sample_translation(&track.keys, t)
-                        .zip(first)
-                        .map(|(v, f)| self.bones[i].rest_translation + (v - f));
+                    let rest = self.bones[i].rest_translation;
+                    let p = match layer.scale {
+                        // The root takes the scaled key itself over its own translation
+                        // (the traced convention, see `Layer::scale`); other bones keep
+                        // offsets from their first key, scaled (provisional: taken whole,
+                        // their keys come out doubled).
+                        Some(_) if self.bones[i].name == "root" => {
+                            sample_translation(&track.keys, t)
+                                .map(|v| rest + v * layer_scale(layer))
+                        }
+                        Some(_) => sample_translation(&track.keys, t)
+                            .zip(own)
+                            .map(|(v, f)| rest + (v - f) * layer_scale(layer)),
+                        None => sample_translation(&track.keys, t)
+                            .zip(first)
+                            .map(|(v, f)| rest + (v - f)),
+                    };
                     if let (Some(p), Some(slot)) = (p, pos.get_mut(i)) {
-                        *slot = Some(p);
+                        *slot = Some(if blend {
+                            slot.unwrap_or(self.bones[i].rest_translation).lerp(p, w)
+                        } else {
+                            p
+                        });
                     }
                 }
             }
         }
+    }
+}
+
+/// A layer's translation multipliers: its appearance's (see [`Layer::scale`]), unless its
+/// clip is [`Animation::unscaled`] or there are none.
+fn layer_scale(layer: &Layer<'_>) -> Vec3 {
+    match layer.scale {
+        Some(s) if !layer.anim.unscaled => s,
+        _ => Vec3::ONE,
     }
 }
 
@@ -298,12 +348,12 @@ fn segment(keys: &[Key], t: f32) -> Option<(&Key, &Key, f32)> {
     Some((a, b, f.clamp(0.0, 1.0)))
 }
 
-fn sample_rotation(keys: &[Key], t: f32) -> Option<Quat> {
+pub(crate) fn sample_rotation(keys: &[Key], t: f32) -> Option<Quat> {
     let (a, b, f) = segment(keys, t)?;
     Some(quat(a.value).slerp(quat(b.value), f))
 }
 
-fn sample_translation(keys: &[Key], t: f32) -> Option<Vec3> {
+pub(crate) fn sample_translation(keys: &[Key], t: f32) -> Option<Vec3> {
     let (a, b, f) = segment(keys, t)?;
     let v = |k: &Key| Vec3::new(k.value[0], k.value[1], k.value[2]);
     Some(v(a).lerp(v(b), f))
@@ -319,14 +369,32 @@ pub fn palette_rows(
     palette: &[Option<usize>],
     mesh_node: Mat4,
 ) -> Vec<[f32; 4]> {
+    palette_rows_skinned(&skin_matrices(rest, pose), palette, mesh_node)
+}
+
+/// Each node's skinning matrix, from its rest to its posed model-space matrix (`pose ·
+/// rest⁻¹`): what [`palette_rows_skinned`] reads, shared by every mesh on the skeleton.
+pub fn skin_matrices(rest: &[Mat4], pose: &[Mat4]) -> Vec<Mat4> {
+    rest.iter()
+        .zip(pose)
+        .map(|(r, p)| *p * r.inverse())
+        .collect()
+}
+
+/// [`palette_rows`] from the skeleton's [`skin_matrices`].
+pub fn palette_rows_skinned(
+    skin: &[Mat4],
+    palette: &[Option<usize>],
+    mesh_node: Mat4,
+) -> Vec<[f32; 4]> {
+    let at_root = mesh_node == Mat4::IDENTITY;
     let inv_node = mesh_node.inverse();
     let mut rows = Vec::with_capacity(palette.len() * 3);
     for slot in palette {
-        let m = match slot {
-            Some(n) if *n < rest.len() && *n < pose.len() => {
-                inv_node * pose[*n] * rest[*n].inverse() * mesh_node
-            }
-            _ => Mat4::IDENTITY,
+        let m = match slot.and_then(|n| skin.get(n)) {
+            Some(m) if at_root => *m,
+            Some(m) => inv_node * *m * mesh_node,
+            None => Mat4::IDENTITY,
         };
         for r in 0..3 {
             rows.push(m.row(r).to_array());
@@ -384,7 +452,9 @@ mod tests {
             name: "t".into(),
             length: 1.0,
             additive: false,
+            unscaled: false,
             scalars: Vec::new(),
+            colors: Vec::new(),
             tracks: vec![Track {
                 bone: "shoulder".into(),
                 channel: Channel::Rotation,
@@ -429,7 +499,9 @@ mod tests {
             name: "t".into(),
             length: 1.0,
             additive,
+            unscaled: false,
             scalars: Vec::new(),
+            colors: Vec::new(),
             tracks: vec![Track {
                 bone: bone.into(),
                 channel: Channel::Rotation,
@@ -515,7 +587,9 @@ mod tests {
             name: "t".into(),
             length: 1.0,
             additive: true,
+            unscaled: false,
             scalars: Vec::new(),
+            colors: Vec::new(),
             tracks: vec![Track {
                 bone: "elbow".into(),
                 channel: Channel::Translation,
@@ -531,6 +605,48 @@ mod tests {
             (elbow - Vec3::new(1.0, 0.5, 1.0)).length() < 1e-5,
             "{elbow:?}"
         );
+    }
+
+    #[test]
+    fn an_appearance_scales_the_roots_translation_keys() {
+        let s = arm();
+        let sit = |unscaled| Animation {
+            name: "sit".into(),
+            length: 1.0,
+            additive: false,
+            unscaled,
+            scalars: Vec::new(),
+            colors: Vec::new(),
+            tracks: vec![Track {
+                bone: "root".into(),
+                channel: Channel::Translation,
+                keys: vec![Key {
+                    time: 0.0,
+                    value: [0.0, 0.0, -0.4, 0.0],
+                }],
+            }],
+        };
+        let root_z = |anim: &Animation, scale: Option<Vec3>| {
+            let nodes = s.track_nodes(anim);
+            let p = s.pose_mapped(&[Layer {
+                anim,
+                time: 0.0,
+                against_base: false,
+                weight: 1.0,
+                nodes: &nodes,
+                scale,
+            }]);
+            p[s.node("root").unwrap()].transform_point3(Vec3::ZERO).z
+        };
+        // A dwarf (0.73) keeps 0.73 of the human clip's drop.
+        let dwarf = Some(Vec3::splat(0.73));
+        assert!((root_z(&sit(false), dwarf) + 0.292).abs() < 1e-5);
+        assert!(
+            (root_z(&sit(true), dwarf) + 0.4).abs() < 1e-5,
+            "4040 keeps it whole"
+        );
+        // The older convention measures from the first key: no drop at all.
+        assert!(root_z(&sit(false), None).abs() < 1e-5);
     }
 
     #[test]

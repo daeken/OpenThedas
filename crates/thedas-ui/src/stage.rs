@@ -210,11 +210,21 @@ fn add_book_backdrop(m: &mut UiMovie) {
     );
     let black = format!("{ROOT}.black");
     m.call(&format!("{black}.beginFill"), &[n(0.0), n(100.0)]);
-    m.call(&format!("{black}.moveTo"), &[n(-4096.0), n(-4096.0)]);
-    for (x, y) in [(5120.0, -4096.0), (5120.0, 5120.0), (-4096.0, 5120.0)] {
+    // A square scaled up, not a polygon with far corners: the renderer left a triangle of the
+    // game showing at the screen's corner with those.
+    m.call(&format!("{black}.moveTo"), &[n(0.0), n(0.0)]);
+    for (x, y) in [(100.0, 0.0), (100.0, 100.0), (0.0, 100.0), (0.0, 0.0)] {
         m.call(&format!("{black}.lineTo"), &[n(x), n(y)]);
     }
     m.call(&format!("{black}.endFill"), &[]);
+    for (prop, v) in [
+        ("_x", -4096.0),
+        ("_y", -4096.0),
+        ("_width", 9216.0),
+        ("_height", 9216.0),
+    ] {
+        m.set(&format!("{black}.{prop}"), n(v));
+    }
     m.call(
         &format!("{ROOT}.createEmptyMovieClip"),
         &[s("page"), n(1.0)],
@@ -550,8 +560,10 @@ impl Stage {
         let mut finished = Vec::new();
         for m in &mut self.movies {
             let started = std::time::Instant::now();
-            let missing = m.sync_tokens(&|t| bridge.value(t));
-            bridge.note_unanswered(missing);
+            let missing = m.sync_tokens(&bridge);
+            if !missing.is_empty() {
+                bridge.note_unanswered(missing);
+            }
             let synced = started.elapsed();
             m.tick(dt_ms);
             profile::note(&m.name, synced, started.elapsed() - synced);
@@ -642,6 +654,23 @@ impl Stage {
             && self.movies.iter().any(|m| m.name == POPUP_LAYER)
     }
 
+    /// The prompt of the dialog the movie actually created. The bridge's
+    /// `GUIPopupLayer.DialogBoxText` can already hold the next question while
+    /// `ShowDialogBox` refuses it because another dialog is still open.
+    pub fn dialog_prompt(&mut self) -> Option<String> {
+        let m = self.movies.iter_mut().find(|m| m.name == POPUP_LAYER)?;
+        if !matches!(
+            m.call("_global.PopupLayer.ms_mcPopup.getDepth", &[]),
+            UiValue::Number(_)
+        ) {
+            return None;
+        }
+        match m.call("_global.PopupLayer.ms_sInitString.toString", &[]) {
+            UiValue::String(prompt) => Some(prompt),
+            _ => None,
+        }
+    }
+
     /// The movies that take the mouse: all of them, or only the popup layer while one of its
     /// dialogs is up (it pushes the `GUIPopup` context then and pops it when the dialog
     /// closes). Provisional: the game's context system decides which input reaches which
@@ -694,6 +723,27 @@ impl Stage {
         }
     }
 
+    /// The button was released while an item or ability was being dragged from one movie to
+    /// another (`GUI.Dragging`): the movie with a drop target under the mouse (the front
+    /// one) ends the drag, and takes the drop; with none under it, the front movie ends it,
+    /// and the drag is refused. The movies call the drag's callbacks themselves
+    /// (`GUI.InvokeCallback`). Provisional: the exe's handling is not traced; the movies'
+    /// own `StopExternalDrag` is what it is taken to call.
+    pub fn drop_external(&mut self) {
+        let mut target = None;
+        for (i, m) in self.movies.iter_mut().enumerate().rev() {
+            let probe = m.call(crate::avm1::DROP_PROBE, &[]);
+            if matches!(&probe, UiValue::String(t) if t != "undefined") {
+                target = Some(i);
+                break;
+            }
+        }
+        let i = target.unwrap_or(self.movies.len().saturating_sub(1));
+        if let Some(m) = self.movies.get_mut(i) {
+            m.call(crate::avm1::DROP_EXTERNAL, &[]);
+        }
+    }
+
     pub fn mouse_button(&mut self, x: f64, y: f64, down: bool) {
         let mut released = None;
         for m in self.input_movies() {
@@ -736,6 +786,23 @@ impl Stage {
                 focused_input_field(m).is_some()
             }
             None => false,
+        }
+    }
+
+    /// Report notes opt out of popuplayer.gfx's `TextInput_mc_init` name defaults
+    /// (`maxChars = 20`, `restrict` set even with `GUIPopupLayer.Filter = 0`). Apply
+    /// after that initializer runs, to this dialog instance only.
+    pub fn allow_dialog_free_text(&mut self) {
+        if !self.dialog_up() {
+            return;
+        }
+        let Some(m) = self.movies.iter_mut().find(|m| m.name == POPUP_LAYER) else {
+            return;
+        };
+        let field = "_global.PopupLayer.ms_mcPopup.TextInput_mc.TextField";
+        if m.call(&format!("{field}.type.toString"), &[]) == UiValue::String("input".into()) {
+            m.set(&format!("{field}.maxChars"), UiValue::Number(0.0));
+            m.set(&format!("{field}.restrict"), UiValue::Null);
         }
     }
 
@@ -851,8 +918,110 @@ impl Stage {
         Vec::new()
     }
 
-    /// Renders every movie and blends the frames over `base` (straight RGBA) on the CPU.
+    /// [`Stage::capture_over`] drawing straight onto `base` on the GPU.
+    fn capture_direct(&mut self, base: &mut Rgba) -> Result<(), UiError> {
+        let (device, queue) = (self.gpu.device.clone(), self.gpu.queue.clone());
+        let (w, h) = (base.width, base.height);
+        if w == 0 || h == 0 || base.pixels.len() != (w * h * 4) as usize {
+            return Err(UiError::Render("capture base size".into()));
+        }
+        let size = wgpu::Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        };
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("ui capture"),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let mut pixels = base.pixels.clone();
+        crate::premultiply(&mut pixels);
+        queue.write_texture(
+            texture.as_image_copy(),
+            &pixels,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(w * 4),
+                rows_per_image: Some(h),
+            },
+            size,
+        );
+        let row = (w * 4).div_ceil(256) * 256;
+        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("ui capture"),
+            size: u64::from(row) * u64::from(h),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = device.create_command_encoder(&Default::default());
+        self.draw_into(&mut encoder, &texture);
+        encoder.copy_texture_to_buffer(
+            texture.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(row),
+                    rows_per_image: Some(h),
+                },
+            },
+            size,
+        );
+        queue.submit(Some(encoder.finish()));
+        let (tx, rx) = std::sync::mpsc::channel();
+        buffer.slice(..).map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        rx.recv()
+            .ok()
+            .and_then(|r| r.ok())
+            .ok_or_else(|| UiError::Render("reading the capture back".into()))?;
+        let data = buffer
+            .slice(..)
+            .get_mapped_range()
+            .map_err(|e| UiError::Render(format!("reading the capture back: {e}")))?;
+        for y in 0..h as usize {
+            let s = y * row as usize;
+            let line = &data[s..s + (w * 4) as usize];
+            base.pixels[y * (w * 4) as usize..(y + 1) * (w * 4) as usize].copy_from_slice(line);
+        }
+        drop(data);
+        buffer.unmap();
+        // Back to straight alpha.
+        for p in base.pixels.chunks_exact_mut(4) {
+            let a = u32::from(p[3]);
+            if a > 0 && a < 255 {
+                for c in &mut p[..3] {
+                    *c = ((u32::from(*c) * 255 + a / 2) / a).min(255) as u8;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Draws every movie, in order, over `target` (the frame) into `encoder` (see
+    /// [`crate::direct`]).
+    pub fn draw_into(&mut self, encoder: &mut wgpu::CommandEncoder, target: &wgpu::Texture) {
+        for m in &mut self.movies {
+            m.draw_into(encoder, target);
+        }
+    }
+
+    /// Renders every movie and blends the frames over `base` (straight RGBA): drawn
+    /// straight onto it on the GPU (see [`crate::direct`]), or else blended on the CPU.
     pub fn capture_over(&mut self, base: &mut Rgba) -> Result<(), UiError> {
+        if crate::direct() {
+            return self.capture_direct(base);
+        }
         // The movies' multiplied clips first, onto the picture under the whole interface
         // (see `UiMovie::render_multiply`).
         for m in self.movies.iter_mut().filter(|m| !m.multiplies_over()) {

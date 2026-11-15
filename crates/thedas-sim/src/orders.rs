@@ -20,6 +20,7 @@ fn command(sim: &Sim, ty: &str, name: &str) -> Command {
         target: None,
         location: None,
         seconds: 0.0,
+        max_range: None,
         ints: Vec::new(),
         strings: Vec::new(),
         due: None,
@@ -33,6 +34,8 @@ fn command(sim: &Sim, ty: &str, name: &str) -> Command {
         arrived: false,
         da2_target_prepared: false,
         path: Vec::new(),
+        turned_at: None,
+        is_static: false,
     }
 }
 

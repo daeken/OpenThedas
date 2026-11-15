@@ -199,6 +199,52 @@ impl Host for OwnHost {
     }
 }
 
+/// Time a movie spends in script and rendering, logged every few seconds when
+/// `THEDAS_UI_PROFILE` is set (a development aid: `RUST_LOG=thedas_ui=info`).
+#[derive(Default)]
+struct Profile {
+    ticks: u64,
+    renders: u64,
+    script_us: u64,
+    render_us: u64,
+    build_us: u64,
+    submit_us: u64,
+    draws: u64,
+    uploads: u64,
+    texts: u64,
+    shapes: u64,
+    since: Option<std::time::Instant>,
+}
+
+impl Profile {
+    fn report(&mut self, movie: &str) {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var_os("THEDAS_UI_PROFILE").is_some()) {
+            return;
+        }
+        let since = *self.since.get_or_insert_with(std::time::Instant::now);
+        if since.elapsed().as_secs_f64() < 3.0 || self.ticks == 0 {
+            return;
+        }
+        let t = self.ticks as f64;
+        let r = self.renders.max(1) as f64;
+        log::info!(
+            "ui profile {movie}: {} ticks, {} renders; per tick script {:.2} ms, render {:.2} ms; per render build {:.2} ms, submit {:.2} ms, {:.0} draws, {:.1} uploads, {:.1} texts rebuilt, {:.1} shapes tessellated",
+            self.ticks,
+            self.renders,
+            self.script_us as f64 / t / 1000.0,
+            self.render_us as f64 / t / 1000.0,
+            self.build_us as f64 / r / 1000.0,
+            self.submit_us as f64 / r / 1000.0,
+            self.draws as f64 / r,
+            self.uploads as f64 / r,
+            self.texts as f64 / r,
+            self.shapes as f64 / r,
+        );
+        *self = Self::default();
+    }
+}
+
 /// A movie on our player, with its renderer.
 pub struct OwnMovie {
     pub player: Player,
@@ -206,6 +252,7 @@ pub struct OwnMovie {
     images: ImageFetch,
     size: (u32, u32),
     gpu: Gpu,
+    profile: Profile,
 }
 
 impl OwnMovie {
@@ -238,6 +285,7 @@ impl OwnMovie {
             images,
             size,
             gpu: gpu.clone(),
+            profile: Profile::default(),
         };
         m.resize(size);
         Ok(m)
@@ -264,7 +312,11 @@ impl OwnMovie {
     }
 
     pub fn tick(&mut self, dt_ms: f64) {
+        let started = std::time::Instant::now();
         self.player.tick(dt_ms);
+        self.profile.script_us += started.elapsed().as_micros() as u64;
+        self.profile.ticks += 1;
+        self.profile.report(&self.player.vm.name);
     }
 
     pub fn run_frame(&mut self) {
@@ -272,10 +324,30 @@ impl OwnMovie {
         self.player.run_queue();
     }
 
+    /// Brings the picture up to date when the movie changed: its own texture, or, drawing
+    /// straight into the frame ([`crate::direct`]), its draw list.
     pub fn render(&mut self) {
         let mut images = self.images.clone();
-        self.renderer
-            .render_if_dirty(&mut self.player, &mut images, self.size);
+        let started = std::time::Instant::now();
+        let drew = if crate::direct() {
+            self.renderer
+                .prepare_into(&mut self.player, &mut images, self.size)
+        } else {
+            self.renderer
+                .render_if_dirty(&mut self.player, &mut images, self.size)
+        };
+        if drew {
+            let r = &self.renderer.stats;
+            let p = &mut self.profile;
+            p.render_us += started.elapsed().as_micros() as u64;
+            p.renders += 1;
+            p.draws += r.draws as u64;
+            p.uploads += r.uploads as u64;
+            p.texts += r.texts_rebuilt as u64;
+            p.shapes += r.shapes_tessellated as u64;
+            p.build_us += r.build_us;
+            p.submit_us += r.submit_us;
+        }
     }
 
     pub fn set_engine_image(&mut self, name: &str, url: Option<&str>) {
@@ -293,13 +365,24 @@ impl OwnMovie {
         self.renderer.output().cloned()
     }
 
+    /// Draws the movie over `target` (the frame, of the movie's size) into `encoder`,
+    /// re-walking it only when it changed.
+    pub fn draw_into(&mut self, encoder: &mut wgpu::CommandEncoder, target: &wgpu::Texture) {
+        self.render();
+        self.renderer.draw_into(encoder, target);
+    }
+
     pub fn device(&self) -> (wgpu::Device, wgpu::Queue) {
         (self.gpu.device.clone(), self.gpu.queue.clone())
     }
 
     /// The last frame (RGBA8, premultiplied).
     pub fn capture(&mut self) -> Option<Rgba> {
-        let (width, height, mut pixels) = self.renderer.capture()?;
+        let (width, height, mut pixels) = if crate::direct() {
+            self.renderer.capture_prepared()?
+        } else {
+            self.renderer.capture()?
+        };
         crate::premultiply(&mut pixels);
         Some(Rgba {
             width,
@@ -327,6 +410,12 @@ impl OwnMovie {
         let (x, y) = self.to_stage(x, y);
         self.player
             .mouse_button(x, y, button as u8 & 3, down, button >= 5.0);
+    }
+
+    /// Whether any clip is under window pixel (`x`, `y`).
+    pub fn has_clip_at(&self, x: f64, y: f64) -> bool {
+        let (x, y) = self.to_stage(x, y);
+        self.player.topmost_at(x, y).is_some()
     }
 
     pub fn focused_text_at(&self, x: f64, y: f64) -> bool {
@@ -374,7 +463,9 @@ fn press_key(player: &mut Player, key: UiKey) {
     );
     let shift_was_down = player.vm.keys_down.contains(&16);
     let (code, ch) = match key {
-        UiKey::Char(c) => (c.to_ascii_uppercase() as u32, Some(c)),
+        // Text input is not a virtual key code: ASCII punctuation overlaps editing
+        // keys ('\'' = Right, '.' = Delete, '#' = End, '$' = Home, '%' = Left).
+        UiKey::Char(c) => (0, Some(c)),
         UiKey::Backspace => (8, None),
         UiKey::Delete => (46, None),
         UiKey::Enter => (13, None),
@@ -415,8 +506,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn host_shift_edits_extend_replace_and_release_the_modifier() {
+    fn input_player() -> (Player, Value) {
         let movie = b"FWS\x08\x12\0\0\0\x08\0\0\x1e\x01\0\x40\0\0\0";
         let mut player =
             Player::new(movie, "input", Box::new(Empty), Arc::new(Empty), None).unwrap();
@@ -437,6 +527,33 @@ mod tests {
         player
             .vm
             .call_method(&selection, "setFocus", std::slice::from_ref(&value));
+        (player, value)
+    }
+
+    #[test]
+    fn typed_punctuation_is_text_and_name_limits_still_apply() {
+        let (mut player, value) = input_player();
+        let note = "Sera's report: \"it's wrong\", 123. #$% & () [] / \\ !? +-= :; @".repeat(12);
+        press_key(&mut player, UiKey::SelectAll);
+        for c in note.chars() {
+            press_key(&mut player, UiKey::Char(c));
+        }
+        assert_eq!(player.vm.get(&value, "text"), Value::from(note));
+        assert!(player.vm.keys_down.is_empty());
+
+        player.vm.set(&value, "maxChars", Value::Number(5.0));
+        player.vm.set(&value, "restrict", Value::from("A-Za-z"));
+        press_key(&mut player, UiKey::SelectAll);
+        for c in "Sera123's!".chars() {
+            press_key(&mut player, UiKey::Char(c));
+        }
+        assert_eq!(player.vm.get(&value, "text"), Value::from("Seras"));
+    }
+
+    #[test]
+    fn host_shift_edits_extend_replace_and_release_the_modifier() {
+        let (mut player, value) = input_player();
+        let field = player.vm.display_of(&value).unwrap();
 
         let range = |p: &Player| p.vm.display.get(field).unwrap().text().unwrap().selection();
         press_key(&mut player, UiKey::End);

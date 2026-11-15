@@ -220,6 +220,9 @@ pub(crate) struct D3dPass {
     winds: std::sync::Mutex<Vec<thedas_formats::speedtree_gen::wind::Wind>>,
     /// The time the winds were last stepped to.
     wind_time: std::sync::Mutex<f32>,
+    /// Where the camera stood for the last frame's constants: transparent draws are sorted
+    /// by their distance from it.
+    camera_at: std::sync::Mutex<Vec3>,
     /// The level's sun (direction, colour), if it has one.
     sun: Option<(Vec3, Vec3)>,
     fog: [[f32; 4]; 2],
@@ -261,6 +264,8 @@ pub(crate) struct D3dPass {
     /// The scene's lights, then the lights added since ([`D3dPass::set_extra_lights`]), for
     /// re-picking the lights of objects that move.
     scene_lights: Vec<SceneLight>,
+    /// The flicker of `scene_lights` (see [`crate::flicker`]), stepped by each frame's clock.
+    flicker: std::sync::Mutex<crate::flicker::Flickers>,
     /// How many of `scene_lights` are the scene's own.
     own_lights: usize,
     /// Per scene draw, what its lights were picked by when the pass was made: its bounding
@@ -312,6 +317,61 @@ pub(crate) struct ParticleDraw {
     /// Drawn into the distortion mask, not the frame (a `DistortionMask.sta` program; see
     /// [`crate::distortion`]).
     distortion: bool,
+}
+
+/// The submission queue's groups for blended draws, in the order `dadefaultsub.sub.xml`
+/// draws them (DAOrigins.exe's default queue): `StaticBlendFlat`; the transparent character
+/// groups (`TransparentCharacterBodies`, `TransparentCharacterShader`) and the hair
+/// (`CharacterHairMultipass`); `WaterPlanes`; `FadingSpeedTrees`; `DistortionDiffuse_Water`;
+/// and `TransparentGeometry`, every other transparent draw with the particle emitters. The
+/// sorted groups (`sort by distance farthest`) draw back to front.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum TransparencyGroup {
+    StaticBlendFlat,
+    CharacterBodies,
+    Characters,
+    Hair,
+    Water,
+    Trees,
+    DistortionWater,
+    Geometry,
+}
+
+impl TransparencyGroup {
+    /// Whether the group draws back to front (`sort by distance farthest`); the others keep
+    /// the scene's order.
+    pub fn sorted(self) -> bool {
+        matches!(
+            self,
+            Self::CharacterBodies | Self::Characters | Self::Hair | Self::Geometry
+        )
+    }
+}
+
+/// The group a blended draw of render class `class` (a material's comma-separated
+/// `RenderClass`) is drawn in. Provisional: the queue's attribute tests (hidden, faded,
+/// LOD fades) are not mirrored, and the engine's own render classes (`multipassHair`) are
+/// read from the material's.
+pub fn transparency_group(class: Option<&str>) -> TransparencyGroup {
+    let has =
+        |k: &str| class.is_some_and(|c| c.split(',').any(|x| x.trim().eq_ignore_ascii_case(k)));
+    if has("staticblendflat") {
+        TransparencyGroup::StaticBlendFlat
+    } else if has("transparent_body") {
+        TransparencyGroup::CharacterBodies
+    } else if has("hair") || has("multipasshair") {
+        TransparencyGroup::Hair
+    } else if has("character") {
+        TransparencyGroup::Characters
+    } else if has("water") && !has("distortion_diffuse") {
+        TransparencyGroup::Water
+    } else if has("speedtree") {
+        TransparencyGroup::Trees
+    } else if has("water") {
+        TransparencyGroup::DistortionWater
+    } else {
+        TransparencyGroup::Geometry
+    }
 }
 
 /// The format of the shadow partitions: `PSSMStatic.psh` writes depth and its square into
@@ -1242,7 +1302,16 @@ fn fade_constants(
 /// Whether `program` draws into the distortion mask: `DADistortionMask.mat`'s passes, by
 /// their state.
 fn is_distortion(program: &D3dProgram) -> bool {
+    // Origins names the pass by its state file (`DistortionMask.sta`); Dragon Age II's
+    // compiled `vfx.mat` names it by its shaders (`vfx_distortionmask_p0.psh`), whose
+    // output is a distortion offset, not a colour: drawn into the frame, a heat haze shows
+    // as a flat olive disc.
     program.name.ends_with("+distortionmask.sta")
+        || program
+            .name
+            .split('+')
+            .nth(1)
+            .is_some_and(|ps| ps.starts_with("vfx_distortionmask_"))
 }
 
 /// The depth bias of a blended pass that tests depth without writing it: a hair's second
@@ -2050,6 +2119,7 @@ impl D3dPass {
             instance_buffer,
             instancing: std::sync::Mutex::new(Instancing::default()),
             wind_time: std::sync::Mutex::new(0.0),
+            camera_at: std::sync::Mutex::new(Vec3::ZERO),
             winds: std::sync::Mutex::new(match scene.wind {
                 Some((strength, direction)) if !scene.tree_constants.is_empty() => (0..5)
                     .map(|_| thedas_formats::speedtree_gen::wind::Wind::dao(strength, direction))
@@ -2110,6 +2180,7 @@ impl D3dPass {
             particle_buffer,
             quad_indices,
             scene_lights: scene.lights.clone(),
+            flicker: std::sync::Mutex::new(crate::flicker::Flickers::new(&scene.lights)),
             own_lights: scene.lights.len(),
             placed: scene
                 .draws
@@ -2188,6 +2259,7 @@ impl D3dPass {
                 partition: None,
                 tree: None,
                 winds: &[],
+                flicker: &[],
             };
             let mut data = vec![0u8; slot_size];
             for (table, base) in [(program.vs.ctab.as_ref(), 0), (program.ps.ctab.as_ref(), 3)] {
@@ -2213,6 +2285,56 @@ impl D3dPass {
 
     /// Draws the particle draws filled by [`D3dPass::update_particles`]: the frame's, or
     /// with `distortion` those of the distortion mask (see [`crate::distortion`]).
+    /// Where the camera stood for this frame (see [`D3dPass::update`]).
+    pub fn camera_at(&self) -> Vec3 {
+        *self.camera_at.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Draw `i`'s distance from this frame's camera (to its bounding sphere's centre), by
+    /// which transparent draws are sorted; 0 for one without bounds.
+    pub fn distance(&self, i: usize, camera: Vec3) -> f32 {
+        self.draws
+            .get(i)
+            .and_then(|d| self.world_sphere(d))
+            .map_or(0.0, |(c, _)| c.distance(camera))
+    }
+
+    /// The submission queue group (`dadefaultsub.sub.xml`) a blended draw is drawn in, by
+    /// its material's render class (see [`transparency_group`]).
+    pub fn transparency_group(&self, i: usize) -> TransparencyGroup {
+        let class = self
+            .draws
+            .get(i)
+            .and_then(|d| self.worlds.get(d.draw))
+            .and_then(|(_, _, m)| self.materials.get(*m))
+            .and_then(|m| m.render_class.as_deref());
+        transparency_group(class)
+    }
+
+    /// Particle draw `k`'s quads, if it has any this frame and is not a distortion one.
+    pub fn draw_particle(&self, pass: &mut wgpu::RenderPass<'_>, k: usize) {
+        let (Some(indices), Some(d)) = (&self.quad_indices, self.particles.get(k)) else {
+            return;
+        };
+        let count = d.count.load(std::sync::atomic::Ordering::Relaxed);
+        if count == 0 || d.distortion {
+            return;
+        }
+        pass.set_pipeline(&self.pipelines[d.pipeline].pipeline);
+        pass.set_bind_group(0, &d.consts, &[]);
+        pass.set_bind_group(1, &d.textures, &[]);
+        pass.set_vertex_buffer(0, d.vertices.slice(..));
+        pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
+        pass.draw_indexed(0..count, 0, 0..1);
+    }
+
+    /// Whether particle draw `k` has quads for the frame (not the distortion mask's).
+    pub fn particle_drawn(&self, k: usize) -> bool {
+        self.particles.get(k).is_some_and(|d| {
+            !d.distortion && d.count.load(std::sync::atomic::Ordering::Relaxed) > 0
+        })
+    }
+
     pub fn draw_particles(&self, pass: &mut wgpu::RenderPass<'_>, distortion: bool) {
         let Some(indices) = &self.quad_indices else {
             return;
@@ -2282,8 +2404,29 @@ impl D3dPass {
         if self.scene_lights[self.own_lights..] == *extra {
             return;
         }
+        // When the same lights stand but some changed (an effect's light brightening, its
+        // reach growing), only the draws within those lights' reach, before or after, can
+        // pick differently: a light out of reach weighs nothing.
+        let old = &self.scene_lights[self.own_lights..];
+        let near: Option<Vec<(Vec3, f32)>> = (old.len() == extra.len()).then(|| {
+            old.iter()
+                .zip(extra)
+                .filter(|(a, b)| a != b)
+                .flat_map(|(a, b)| [a, b])
+                .filter_map(|l| match l {
+                    SceneLight::Point {
+                        position, radius, ..
+                    } => Some((*position, *radius)),
+                    SceneLight::Ambient { .. } => None,
+                })
+                .collect()
+        });
         self.scene_lights.truncate(self.own_lights);
         self.scene_lights.extend_from_slice(extra);
+        self.flicker
+            .get_mut()
+            .unwrap_or_else(|e| e.into_inner())
+            .set_lights(&self.scene_lights);
         let relit = self.relit.get_mut().unwrap_or_else(|e| e.into_inner());
         relit.resize(self.draws.len(), None);
         self.extra_lit.resize(self.draws.len(), None);
@@ -2295,6 +2438,13 @@ impl D3dPass {
             let Some(&(sphere, room, level_own)) = self.placed.get(d.draw) else {
                 continue;
             };
+            if let Some(near) = &near
+                && !near
+                    .iter()
+                    .any(|(p, r)| p.distance_squared(sphere.0) <= (r + sphere.1).powi(2))
+            {
+                continue;
+            }
             let class = self
                 .classes
                 .get(d.draw)
@@ -2492,6 +2642,7 @@ impl D3dPass {
             partition: None,
             tree: Some(tree),
             winds,
+            flicker: &[],
         };
         let program = self.program(d);
         let mut constants = context.fill(program.vs.ctab.as_ref());
@@ -2615,6 +2766,9 @@ impl D3dPass {
         warm: bool,
     ) {
         let aspect = width as f32 / height.max(1) as f32;
+        if !warm {
+            *self.camera_at.lock().unwrap_or_else(|e| e.into_inner()) = camera.position;
+        }
         // The level's pass places this frame's partitions; the objects' pass reads them.
         let partitions = match (&self.shadows, self.sun) {
             _ if warm => None,
@@ -2788,6 +2942,10 @@ impl D3dPass {
         written.resize(self.draws.len(), None);
         let mut relit = self.relit.lock().unwrap_or_else(|e| e.into_inner());
         self.repick_lights(&in_view, &mut statics, &mut relit);
+        let mut flicker = self.flicker.lock().unwrap_or_else(|e| e.into_inner());
+        if !warm {
+            flicker.advance(time);
+        }
         // The per-frame registers of slots that are otherwise current: (offset, bytes).
         let mut partial: Vec<u8> = Vec::new();
         let mut partial_spans: Vec<(u64, std::ops::Range<usize>)> = Vec::new();
@@ -2843,6 +3001,12 @@ impl D3dPass {
                 partition: None,
                 tree: self.trees.get(d.draw).and_then(|t| t.as_ref()),
                 winds: &winds,
+                // A rig's lights are not the scene's: they hold steady.
+                flicker: if rigged.is_some() {
+                    &[]
+                } else {
+                    flicker.values()
+                },
             };
             // The constants that stay as the draw was made are filled once (see
             // [`ConstantContext::per_frame`]); each frame refills the rest over them.
@@ -3111,6 +3275,7 @@ impl D3dPass {
                     partition: Some(partitions[k].view_proj),
                     tree: None,
                     winds: &[],
+                    flicker: &[],
                 };
                 for (table, base) in [(program.vs.ctab.as_ref(), 0), (program.ps.ctab.as_ref(), 3)]
                 {
@@ -3217,6 +3382,28 @@ impl D3dPass {
         if let (Some(t), true, true) = (&self.shadows, self.places_partitions, self.blur_shadows) {
             t.blur_first(encoder);
         }
+    }
+
+    /// Which draws the last frame showed or cast a shadow from (in the view, or a sun
+    /// partition's caster): by index into `draws`. Empty before any update.
+    pub fn seen_draws(&self) -> Vec<bool> {
+        let mut seen = self
+            .in_view
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let casting = self
+            .caster_visible
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for (c, v) in self.casters.iter().zip(casting.iter()) {
+            if (v[0] || v[1])
+                && let Some(s) = seen.get_mut(c.draw)
+            {
+                *s = true;
+            }
+        }
+        seen
     }
 
     /// Whether draw `i` (an index into `draws`) is in this frame's view (see
@@ -3329,6 +3516,26 @@ impl D3dPass {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn blended_draws_fall_in_the_submission_queues_groups() {
+        use super::{TransparencyGroup as G, transparency_group as g};
+        assert_eq!(g(Some("Transparent")), G::Geometry);
+        assert_eq!(g(Some("Transparent,Additive,Emitter")), G::Geometry);
+        assert_eq!(g(None), G::Geometry);
+        assert_eq!(g(Some("Transparent, Water")), G::Water);
+        assert_eq!(g(Some("Distortion_Diffuse, Water")), G::DistortionWater);
+        assert_eq!(g(Some("Transparent,Hair,Character")), G::Hair);
+        assert_eq!(
+            g(Some("Transparent,Transparent_Body,Character,Closeup")),
+            G::CharacterBodies
+        );
+        assert_eq!(g(Some("Character,Transparent")), G::Characters);
+        assert_eq!(g(Some("StaticBlendFlat, Transparent")), G::StaticBlendFlat);
+        // The queue's order: characters, hair, water, then the rest with the particles.
+        assert!(G::Characters < G::Hair && G::Hair < G::Water && G::Water < G::Geometry);
+        assert!(G::Geometry.sorted() && !G::Water.sorted());
+    }
+
     use super::*;
 
     #[test]
@@ -3440,6 +3647,7 @@ mod tests {
     #[test]
     fn added_lights_join_a_draws_pick_by_its_class() {
         let light = |x: f32, domain: i64, intensity: f32| SceneLight::Point {
+            flicker: None,
             position: Vec3::new(x, 0.0, 0.0),
             color: Vec3::ONE,
             radius: 10.0,
@@ -3492,6 +3700,7 @@ mod tests {
             is_static: true,
             version: 0,
             intensity: 1.0,
+            flicker: None,
             room: None,
         };
         let lights = vec![light(0.0, "a"), light(20.0, "b")];

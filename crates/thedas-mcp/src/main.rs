@@ -1965,11 +1965,13 @@ impl Server {
             };
             let ty = thedas_sim::sim::constant(&sim.table, "COMMAND_TYPE_USE_ABILITY");
             let cmd = thedas_sim::world::Command {
+                is_static: false,
                 ty,
                 name: "CommandUseAbility".into(),
                 target: Some(target),
                 location: None,
                 seconds: 0.0,
+                max_range: None,
                 ints: vec![ability],
                 strings: vec![tag],
                 due: None,
@@ -1983,6 +1985,7 @@ impl Server {
                 arrived: false,
                 da2_target_prepared: false,
                 path: Vec::new(),
+                turned_at: None,
             };
             if let Some(o) = sim.world.get_mut(hero) {
                 o.commands.clear();

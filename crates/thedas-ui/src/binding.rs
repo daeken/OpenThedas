@@ -21,6 +21,8 @@ const NEW_SAVE: u32 = 336_242;
 /// The mage class (`CLASS_WIZARD`, `cla_base.gda` row 2; the scripts' constant, not the
 /// engine's).
 const CLASS_WIZARD: i32 = 2;
+/// `ItemUtils.ITEM_ABILITY_INVALID`: the ability id the movies take as none.
+const ITEM_ABILITY_INVALID: i32 = 200_000;
 
 fn num(v: impl Into<f64>) -> UiValue {
     UiValue::Number(v.into())
@@ -81,6 +83,12 @@ pub fn sim_values(sim: &Sim) -> BTreeMap<String, UiValue> {
 /// keeps for it.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Presentation {
+    /// Which screens are up (the app's screen numbers): a screen opening or closing makes the
+    /// values it reads be built again at once (see [`ValueCache`]).
+    pub screens: Vec<u32>,
+    /// An item or ability is being dragged between movies (`GUI.StartDragging` until the
+    /// button is released): `GUI.Dragging` reads 1, which the movies' drop targets look for.
+    pub dragging: bool,
     /// The inventory screen's item category tab (`GUIInventory.SetItemListFilter`, see
     /// [`ItemCategory`]); 0 shows every item.
     pub item_filter: i32,
@@ -287,8 +295,147 @@ pub fn item_category(sim: &Sim, item: u32) -> ItemCategory {
     }
 }
 
+/// What the interface keeps between frames to build its values faster (see
+/// [`sim_values_cached`]).
+#[derive(Default)]
+pub struct ValueCache {
+    /// By group (`Party.Members.0`, `Inventory`): what it was built for and when.
+    groups: std::collections::HashMap<String, Built>,
+    /// The groups this frame's values have.
+    seen: std::collections::HashSet<String>,
+    /// Groups to set until replaced: (group, rows), for
+    /// [`crate::protocol::GameBridge::bind_sticky`].
+    pub updates: Vec<(String, Vec<(String, UiValue)>)>,
+    /// Groups no longer shown.
+    pub drops: Vec<String>,
+    /// What the interface showed when the groups were built: a screen opening or a tab
+    /// picked changes what its values are, so every group is built again at once.
+    shown: Option<Presentation>,
+    /// The interface's own time (the frames' durations added up), which the groups age by:
+    /// real time in play, the steps' time when driven by a script.
+    now_ms: f64,
+}
+
+/// A group of values as set into the bridge: what it was built for (a creature, say), and when.
+struct Built {
+    token: u64,
+    at_ms: f64,
+    ttl_ms: f64,
+}
+
+impl ValueCache {
+    /// Moves the interface's time on by a frame.
+    pub fn advance(&mut self, dt_ms: f64) {
+        self.now_ms += dt_ms;
+    }
+
+    /// Notes what the interface shows now; a change makes every group stale.
+    fn see(&mut self, shown: &Presentation) {
+        if self.shown.as_ref() != Some(shown) {
+            self.shown = Some(shown.clone());
+            for b in self.groups.values_mut() {
+                b.at_ms = f64::NEG_INFINITY;
+            }
+        }
+    }
+
+    /// Whether `group` must be built again (not built yet, built for another `token`, or
+    /// older than its lifetime); notes it as shown.
+    fn stale(&mut self, group: &str, token: u64) -> bool {
+        self.seen.insert(group.to_string());
+        self.groups
+            .get(group)
+            .is_none_or(|b| b.token != token || self.now_ms - b.at_ms >= b.ttl_ms)
+    }
+
+    /// Hands over a built group, to stay until `ttl` has passed.
+    fn put(&mut self, group: &str, token: u64, ttl_ms: u64, rows: Vec<(String, UiValue)>) {
+        self.groups.insert(
+            group.to_string(),
+            Built {
+                token,
+                at_ms: self.now_ms,
+                ttl_ms: ttl_ms as f64,
+            },
+        );
+        self.updates.push((group.to_string(), rows));
+    }
+
+    /// Ends a frame: groups that were not shown go.
+    fn finish(&mut self) {
+        let (groups, seen, drops) = (&mut self.groups, &self.seen, &mut self.drops);
+        groups.retain(|k, _| {
+            let keep = seen.contains(k);
+            if !keep {
+                drops.push(k.clone());
+            }
+            keep
+        });
+        self.seen.clear();
+    }
+}
+
+/// How long a creature's derived properties are left as they are (milliseconds of the interface's time,
+/// which runs while the game is paused, so the inventory screen still shows an equipped
+/// item's effect): they come
+/// from its base properties, equipment and effects, which change a few times a minute, while
+/// building them for every property of every party member each frame was most of the cost of
+/// building the values. They are handed over once (in `updates`) and stay bound; the current
+/// values (health and mana bars) are built fresh each frame.
+const DERIVED_MS: u64 = 500;
+
+/// How long the inventory, quickbar and key bindings are left as they are (see
+/// [`DERIVED_MS`]).
+const SECTION_MS: u64 = 150;
+
+/// Builds a section of values with `build`, or leaves what the cache holds for it.
+fn section(
+    cache: &mut Option<&mut ValueCache>,
+    group: &str,
+    token: u64,
+    v: &mut BTreeMap<String, UiValue>,
+    build: impl FnOnce(&mut BTreeMap<String, UiValue>),
+) {
+    match cache.as_deref_mut() {
+        Some(c) => {
+            if c.stale(group, token) {
+                let mut rows = BTreeMap::new();
+                build(&mut rows);
+                c.put(group, token, SECTION_MS, rows.into_iter().collect());
+            }
+        }
+        None => build(v),
+    }
+}
+
+/// A section's token: a hash of what it is built for.
+fn token(key: &impl std::hash::Hash) -> u64 {
+    use std::hash::Hasher;
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    key.hash(&mut h);
+    h.finish()
+}
+
+/// [`sim_values_for`] reusing what [`ValueCache`] holds.
+pub fn sim_values_cached(
+    sim: &Sim,
+    shown: &Presentation,
+    cache: &mut ValueCache,
+) -> BTreeMap<String, UiValue> {
+    cache.see(shown);
+    sim_values_with(sim, shown, Some(cache))
+}
+
 /// [`sim_values`] with the interface's own choices.
 pub fn sim_values_for(sim: &Sim, shown: &Presentation) -> BTreeMap<String, UiValue> {
+    sim_values_with(sim, shown, None)
+}
+
+fn sim_values_with(
+    sim: &Sim,
+    shown: &Presentation,
+    mut cache: Option<&mut ValueCache>,
+) -> BTreeMap<String, UiValue> {
     let mut v = BTreeMap::new();
     let mut set = |k: String, x: UiValue| {
         v.insert(k, x);
@@ -317,7 +464,11 @@ pub fn sim_values_for(sim: &Sim, shown: &Presentation) -> BTreeMap<String, UiVal
         );
     }
     let tables = sim.world.tables();
-    let mut creature = |prefix: &str, id: u32| {
+    let creature = |v: &mut BTreeMap<String, UiValue>,
+                    cache: &mut Option<&mut ValueCache>,
+                    prefix: &str,
+                    id: u32,
+                    sticky: bool| {
         let Some(o) = sim.world.get(id) else { return };
         v.insert(prefix.to_string(), num(id));
         v.insert(format!("{prefix}.ID"), num(id));
@@ -378,19 +529,56 @@ pub fn sim_values_for(sim: &Sim, shown: &Presentation) -> BTreeMap<String, UiVal
         ];
         // The character record shows each attribute as its base and what gear and effects
         // add (`Base`, `Modifier`); `Total` is both, as the game's PROPERTY_VALUE_TOTAL.
-        for (p, (base, cur)) in &o.properties {
-            let total = if depletable.contains(p) && *p != 0 {
-                sim.depletable_max(id, *p)
-            } else {
-                sim.property_total(id, *p)
+        // Properties the creature has no value of (resistances, mostly) read as their total
+        // of nothing: what derivation, gear and effects give. Provisional: the character
+        // record's rows are taken to be properties 1 to 60.
+        let want = o.properties.len() + (1..=60).filter(|p| !o.properties.contains_key(p)).count();
+        let mut cache = if sticky { cache.as_deref_mut() } else { None };
+        let fresh = match cache.as_deref_mut() {
+            Some(c) => {
+                let stale = c.stale(prefix, u64::from(id) << 32 | want as u64);
+                // The current values change as the creature is hurt or tires.
+                for (p, (_, cur)) in &o.properties {
+                    v.insert(format!("{prefix}.Attributes.{p}.Current"), num(*cur));
+                }
+                !stale
+            }
+            None => false,
+        };
+        if !fresh {
+            let mut rows: Vec<(String, UiValue)> = Vec::with_capacity(want * 3);
+            let mut put = |p: i32, total: f32, base: f32, modifier: f32| {
+                rows.push((format!("{prefix}.Attributes.{p}.Total"), num(total)));
+                rows.push((format!("{prefix}.Attributes.{p}.Base"), num(base)));
+                rows.push((format!("{prefix}.Attributes.{p}.Modifier"), num(modifier)));
             };
-            v.insert(format!("{prefix}.Attributes.{p}.Current"), num(*cur));
-            v.insert(format!("{prefix}.Attributes.{p}.Total"), num(total));
-            v.insert(format!("{prefix}.Attributes.{p}.Base"), num(*base));
-            v.insert(
-                format!("{prefix}.Attributes.{p}.Modifier"),
-                num(sim.property_modifier(id, *p)),
-            );
+            for (p, (base, _)) in &o.properties {
+                let total = if depletable.contains(p) && *p != 0 {
+                    sim.depletable_max(id, *p)
+                } else {
+                    sim.property_total(id, *p)
+                };
+                put(*p, total, *base, sim.property_modifier(id, *p));
+            }
+            for p in 1..=60 {
+                if !o.properties.contains_key(&p) {
+                    put(
+                        p,
+                        sim.property_total(id, p),
+                        0.0,
+                        sim.property_modifier(id, p),
+                    );
+                }
+            }
+            match cache {
+                Some(c) => c.put(prefix, u64::from(id) << 32 | want as u64, DERIVED_MS, rows),
+                None => {
+                    for (p, (_, cur)) in &o.properties {
+                        v.insert(format!("{prefix}.Attributes.{p}.Current"), num(*cur));
+                    }
+                    v.extend(rows);
+                }
+            }
         }
         v.insert(
             format!("{prefix}.Stats.Race"),
@@ -399,63 +587,50 @@ pub fn sim_values_for(sim: &Sim, shown: &Presentation) -> BTreeMap<String, UiVal
         // The auto-level option is off (the player spends the points).
         v.insert(format!("{prefix}.Stats.AutoLevelUp"), num(0));
         v.insert(format!("{prefix}.InCombat"), num(o.combat.in_combat as u8));
-        // Properties the creature has no value of (resistances, mostly) read as their
-        // total of nothing: what derivation, gear and effects give. Provisional: the
-        // character record's rows are taken to be properties 1 to 60.
-        for p in 1..=60 {
-            if o.properties.contains_key(&p) {
-                continue;
-            }
-            v.insert(
-                format!("{prefix}.Attributes.{p}.Total"),
-                num(sim.property_total(id, p)),
-            );
-            v.insert(format!("{prefix}.Attributes.{p}.Base"), num(0));
-            v.insert(
-                format!("{prefix}.Attributes.{p}.Modifier"),
-                num(sim.property_modifier(id, p)),
-            );
-        }
     };
     for (i, id) in members.iter().enumerate() {
-        creature(&format!("Party.Members.{i}"), *id);
+        creature(&mut v, &mut cache, &format!("Party.Members.{i}"), *id, true);
     }
     if let Some(c) = controlled.or(hero) {
-        creature("GUI.SelectedChar", c);
+        creature(&mut v, &mut cache, "GUI.SelectedChar", c, true);
     }
     // The creature in character generation or level-up, as levelup.gfx reads it: its
     // attributes and points (34 attribute, 35 skill, 36 talent, 38 specialization), with
     // what equipment adds as each attribute's Modifier. The screen spends the points itself
     // unless the auto-level option (`Stats.AutoLevelUp`) is on; it is off. Provisional.
     if let Some(c) = sim.world.chargen {
-        creature("CharGenCreature", c);
-        if let Some(o) = sim.world.get(c) {
-            for (p, (base, _)) in &o.properties {
-                v.insert(
-                    format!("CharGenCreature.Attributes.{p}.Modifier"),
-                    num(sim.equipment_bonus(c, *p)),
-                );
-                // The points being spent go on the base, which the screen shows as Total
-                // (depletables keep their maximum).
-                let depletable = [
-                    "PROPERTY_DEPLETABLE_HEALTH",
-                    "PROPERTY_DEPLETABLE_MANA_STAMINA",
-                ]
-                .iter()
-                .any(|k| thedas_sim::sim::constant(&sim.table, k) == *p);
-                if !depletable {
-                    v.insert(format!("CharGenCreature.Attributes.{p}.Total"), num(*base));
+        section(&mut cache, "ChargenCreature", u64::from(c), &mut v, |v| {
+            creature(v, &mut None, "CharGenCreature", c, false);
+            if let Some(o) = sim.world.get(c) {
+                for (p, (base, _)) in &o.properties {
+                    v.insert(
+                        format!("CharGenCreature.Attributes.{p}.Modifier"),
+                        num(sim.equipment_bonus(c, *p)),
+                    );
+                    // The points being spent go on the base, which the screen shows as Total
+                    // (depletables keep their maximum).
+                    let depletable = [
+                        "PROPERTY_DEPLETABLE_HEALTH",
+                        "PROPERTY_DEPLETABLE_MANA_STAMINA",
+                    ]
+                    .iter()
+                    .any(|k| thedas_sim::sim::constant(&sim.table, k) == *p);
+                    if !depletable {
+                        v.insert(format!("CharGenCreature.Attributes.{p}.Total"), num(*base));
+                    }
                 }
             }
-        }
-        v.insert("CharGenCreature.Stats.AutoLevelUp".into(), num(0));
-        crate::chains::bind(
-            sim,
-            c,
-            "CharGenCreature.Stats",
-            crate::chains::DISPLAYMODE_LEVELUP,
-            &mut v,
-        );
+            v.insert("CharGenCreature.Stats.AutoLevelUp".into(), num(0));
+        });
+        section(&mut cache, "ChargenChains", u64::from(c), &mut v, |v| {
+            crate::chains::bind(
+                sim,
+                c,
+                "CharGenCreature.Stats",
+                crate::chains::DISPLAYMODE_LEVELUP,
+                v,
+            )
+        });
     }
     // The skills or spells/talents screen (abilities.gfx): which it shows, and the member's
     // abilities listed as the spellbook lists them.
@@ -464,13 +639,15 @@ pub fn sim_values_for(sim: &Sim, shown: &Presentation) -> BTreeMap<String, UiVal
             "GUI.AbilityScene".into(),
             num(f64::from(shown.ability_scene)),
         );
-        crate::chains::bind(
-            sim,
-            c,
-            "GUI.SelectedChar.Stats",
-            crate::chains::DISPLAYMODE_SPELLBOOK,
-            &mut v,
-        );
+        section(&mut cache, "SpellbookChains", u64::from(c), &mut v, |v| {
+            crate::chains::bind(
+                sim,
+                c,
+                "GUI.SelectedChar.Stats",
+                crate::chains::DISPLAYMODE_SPELLBOOK,
+                v,
+            )
+        });
     }
     // The portrait the engine drew of each member's head (portraits.gfx loads it).
     for (i, id) in members.iter().enumerate() {
@@ -481,6 +658,7 @@ pub fn sim_values_for(sim: &Sim, shown: &Presentation) -> BTreeMap<String, UiVal
             );
         }
     }
+    v.insert("GUI.Dragging".into(), num(shown.dragging as u8));
     v.insert("Paperdoll.CameraMode".into(), num(shown.paperdoll_preset));
     // The creature in character creation as its paperdoll shows it (chargen.gfx's
     // `Paperdoll.PaperCreature`), with the portrait drawn of it, which the appearance page's
@@ -697,18 +875,38 @@ pub fn sim_values_for(sim: &Sim, shown: &Presentation) -> BTreeMap<String, UiVal
         .filter(|o| o.kind == ObjectKind::Creature && o.active)
         .count();
     set("Area.CreatureCount".into(), num(creatures as f64));
-    inventory(sim, controlled.or(hero), shown.item_filter, &mut v);
-    store(sim, shown, &mut v);
-    party_picker(sim, shown, &mut v);
-    saves(sim, shown, &mut v);
-    journal(sim, shown, &mut v);
-    alerts(sim, shown, &mut v);
-    crate::options::values(
-        &shown.options,
-        shown.resolution,
-        (&shown.antialias_samples, shown.antialias_default_on),
+    let who = controlled.or(hero);
+    // A section's token names what it is built for, so opening a container, store or the
+    // party picker builds it again at once: the screen reads the panel to show (the
+    // footlocker's, say) as it opens, before the section's lifetime has run out.
+    section(
+        &mut cache,
+        "Inventory",
+        token(&(who, shown.item_filter, sim.world.container)),
         &mut v,
+        |v| inventory(sim, who, shown.item_filter, v),
     );
+    section(&mut cache, "Store", token(&sim.world.store), &mut v, |v| {
+        store(sim, shown, v)
+    });
+    section(
+        &mut cache,
+        "PartyPicker",
+        token(&sim.world.party_picker.is_some()),
+        &mut v,
+        |v| party_picker(sim, shown, v),
+    );
+    section(&mut cache, "Saves", 0, &mut v, |v| saves(sim, shown, v));
+    section(&mut cache, "Journal", 0, &mut v, |v| journal(sim, shown, v));
+    alerts(sim, shown, &mut v);
+    section(&mut cache, "Options", 0, &mut v, |v| {
+        crate::options::values(
+            &shown.options,
+            shown.resolution,
+            (&shown.antialias_samples, shown.antialias_default_on),
+            v,
+        )
+    });
     if let Some(e) = &shown.examine {
         v.insert(
             "GUIItemExamine.ItemToken".into(),
@@ -729,7 +927,7 @@ pub fn sim_values_for(sim: &Sim, shown: &Presentation) -> BTreeMap<String, UiVal
     // sets both; a tutorial that pauses the game sets only `Client.Paused`, as
     // DAOrigins.exe's TutorialControl does (0x6940ec: the client pause, 0x5d6740, with
     // its user flag off), so the border shows then too.
-    let paused = shown.paused || sim.world.tutorial_paused || sim.training_paused();
+    let paused = shown.paused || sim.tutorial_paused() || sim.training_paused();
     v.insert("Client.Paused".into(), num(u8::from(paused)));
     v.insert("Client.UserPaused".into(), num(u8::from(shown.paused)));
     if let Some(p) = shown.book_page {
@@ -751,7 +949,9 @@ pub fn sim_values_for(sim: &Sim, shown: &Presentation) -> BTreeMap<String, UiVal
             UiValue::String(key.into()),
         );
     }
-    key_mappings(sim, &mut v);
+    section(&mut cache, "KeyMappings", 0, &mut v, |v| {
+        key_mappings(sim, v)
+    });
     // The start menu (startmenu2.gfx): its buttons show (`GameMode.ShowStartMenuContents`),
     // no other campaigns are installed (`Client.ModuleInfoList`), and there is no online
     // account or welcome message about one. Provisional: the version string is this port's.
@@ -782,7 +982,13 @@ pub fn sim_values_for(sim: &Sim, shown: &Presentation) -> BTreeMap<String, UiVal
         "ClientOptions.GameOptions.DifficultyLevel".into(),
         num(sim.world.difficulty),
     );
-    chargen_screen(sim, &mut v);
+    section(
+        &mut cache,
+        "ChargenScreen",
+        u64::from(sim.world.chargen.unwrap_or(0)),
+        &mut v,
+        |v| chargen_screen(sim, v),
+    );
     // The tutorial popups waiting (popuplayer.gfx shows the first: its `Title`, `Text` and
     // the `CodexResRef` its Codex button opens; Next when more wait, else Close), with
     // tutorials on (`Tutorials.Enabled`). An empty list hides the panel.
@@ -791,7 +997,8 @@ pub fn sim_values_for(sim: &Sim, shown: &Presentation) -> BTreeMap<String, UiVal
     // Provisional: the original's rule for a tutorial waiting while a menu is up is not
     // traced; QA saw the panel over the options, save and game menus, where it does not
     // belong.
-    let tutorials: &[thedas_sim::journal::Tutorial] = if shown.menu_up {
+    let tutorials_held = shown.menu_up || sim.tutorials_held();
+    let tutorials: &[thedas_sim::journal::Tutorial] = if tutorials_held {
         &[]
     } else {
         &sim.world.tutorials
@@ -802,7 +1009,7 @@ pub fn sim_values_for(sim: &Sim, shown: &Presentation) -> BTreeMap<String, UiVal
             tutorials
                 .iter()
                 .map(|t| t.resref.as_str())
-                .chain(shown.pad_active.then_some("pad"))
+                .chain((shown.pad_active && !sim.tutorials_held()).then_some("pad"))
                 .collect::<Vec<_>>()
                 .join(","),
         ),
@@ -838,20 +1045,35 @@ pub fn sim_values_for(sim: &Sim, shown: &Presentation) -> BTreeMap<String, UiVal
     // The training step shown (`trainingsteps.gda`'s row; 0 none), see `thedas_sim::training`.
     v.insert(
         "Tutorials.TrainingStep".into(),
-        num(sim.world.training.step),
+        num(if sim.tutorials_held() {
+            0
+        } else {
+            sim.world.training.step
+        }),
     );
     // The tutorials' screen highlights (DAConstants `GUI_HIGHLIGHT_*`: 0 follower, 1
     // tactics, 2 inventory, 3 health poultice, 4 empty quickbar, 5 tactic preset, 6
-    // equipment slot, 7 unequipped item) are all off: no tutorial asks for one. A movie
-    // hearing nothing leaves its glow on (the portraits' halo, the quickbar's).
-    for i in 0..8 {
-        v.insert(format!("GUI.GuiHighlights.{i}"), num(i));
-        v.insert(format!("GUI.GuiHighlights.{i}.Highlight"), num(0));
+    // equipment slot, 7 unequipped item): on for what the training step under way points at
+    // (`HighlightGuiElement`), with its argument, off for the rest. A movie hearing nothing
+    // leaves its glow on (the portraits' halo, the quickbar's).
+    let training = sim.world.training;
+    for i in 0..8usize {
+        let on = training.highlighted & (1 << i) != 0;
+        v.insert(format!("GUI.GuiHighlights.{i}"), num(i as f64));
+        v.insert(format!("GUI.GuiHighlights.{i}.Highlight"), num(on as u8));
+        if on {
+            v.insert(
+                format!("GUI.GuiHighlights.{i}.HighlightArg"),
+                num(training.highlight_args[i]),
+            );
+        }
     }
     if let Some(who) = controlled.or(hero) {
-        tactics(sim, who, &mut v);
+        section(&mut cache, "Tactics", u64::from(who), &mut v, |v| {
+            tactics(sim, who, v)
+        });
     }
-    map_notes(sim, &mut v);
+    section(&mut cache, "MapNotes", 0, &mut v, |v| map_notes(sim, v));
     // The minimap, as minimap.gfx reads it: the picture, the world corners it spans
     // (`Left`/`Bottom` the lower, `Right`/`Top` the upper) and the share of the picture
     // they cover. Provisional: north is taken to be up (0).
@@ -870,10 +1092,15 @@ pub fn sim_values_for(sim: &Sim, shown: &Presentation) -> BTreeMap<String, UiVal
         v.insert("GUI.MinimapOpen".into(), num(1));
     }
     if let Some(who) = controlled.or(hero) {
-        quickbar(sim, who, &mut v);
+        section(&mut cache, "Quickbar", u64::from(who), &mut v, |v| {
+            quickbar(sim, who, v)
+        });
         heroic_stats(sim, who, hero.unwrap_or(who), &mut v);
     }
     script_popup(sim, &mut v);
+    if let Some(c) = cache {
+        c.finish();
+    }
     v
 }
 
@@ -1315,7 +1542,11 @@ fn item(sim: &Sim, prefix: &str, id: u32, v: &mut BTreeMap<String, UiValue>) {
     set("EquippableSlots", num(mask));
     set("StackSize", field("StackSize", 1));
     set("Cost", num(sim.item_value(id)));
-    set("AbilityID", field("AbilityID", -1));
+    // An item that gives no ability reads as `ItemUtils.ITEM_ABILITY_INVALID` (200000, in the
+    // movies' code): the inventory drags such items inside itself (to equip them), and the
+    // others out to the quickbar too.
+    let ability = o.fields.get("AbilityID").copied().filter(|a| *a > 0);
+    set("AbilityID", num(ability.unwrap_or(ITEM_ABILITY_INVALID)));
     set("RecipeID", field("CraftingRecipeID", 0));
     set("Unique", field("Unique", 0));
     set("Irremovable", num(o.plot as u8));
@@ -2032,6 +2263,79 @@ fn inventory(sim: &Sim, who: Option<u32>, filter: i32, v: &mut BTreeMap<String, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cinematic_tutorials_wait_and_reappear_with_their_pause() {
+        let mut sim = Sim::new(
+            std::sync::Arc::new(thedas_vfs::Vfs::new()),
+            std::sync::Arc::new(thedas_script::EngineTable::default()),
+            1,
+        );
+        sim.world.tutorials.push(thedas_sim::journal::Tutorial {
+            resref: "lesson".into(),
+            title: None,
+            text: None,
+            pauses: true,
+        });
+        sim.world.tutorial_paused = true;
+        sim.world.training.step = 7;
+        sim.world.cutscenes.push("intro.cut".into());
+        let shown = Presentation {
+            pad_active: true,
+            ..Default::default()
+        };
+        let v = sim_values_for(&sim, &shown);
+        assert_eq!(v["Tutorials.TutorialList"], UiValue::String(String::new()));
+        assert_eq!(v["Tutorials.TrainingStep"], num(0));
+        assert_eq!(v["Client.Paused"], num(0));
+        assert_eq!(sim.world.tutorials.len(), 1);
+        sim.world.cutscenes.clear();
+        let v = sim_values_for(&sim, &shown);
+        assert_eq!(
+            v["Tutorials.TutorialList"],
+            UiValue::String("lesson,pad".into())
+        );
+        assert_eq!(v["Tutorials.TrainingStep"], num(7));
+        assert_eq!(v["Client.Paused"], num(1));
+    }
+
+    #[test]
+    fn opening_a_container_rebuilds_the_cached_inventory_at_once() {
+        use thedas_sim::world::ObjectKind;
+        let mut sim = Sim::new(
+            std::sync::Arc::new(thedas_vfs::Vfs::new()),
+            std::sync::Arc::new(thedas_script::EngineTable::default()),
+            1,
+        );
+        let hero = sim.world.spawn(ObjectKind::Creature, "player");
+        sim.world.hero = Some(hero);
+        let chest = sim.world.spawn(ObjectKind::Placeable, "footlocker");
+        let shown = Presentation::default();
+        let mut cache = ValueCache::default();
+        let show = |cache: &mut ValueCache| {
+            cache
+                .updates
+                .iter()
+                .rev()
+                .find(|(g, _)| g == "Inventory")
+                .and_then(|(_, rows)| {
+                    rows.iter()
+                        .find(|(k, _)| k == "GUIInventory.ShowContainer")
+                        .map(|(_, v)| v.clone())
+                })
+        };
+        sim_values_cached(&sim, &shown, &mut cache);
+        assert_eq!(show(&mut cache), Some(num(0)));
+        cache.updates.clear();
+        // The same frame time: only the open container changed.
+        sim.open_container(chest);
+        sim_values_cached(&sim, &shown, &mut cache);
+        assert_eq!(show(&mut cache), Some(num(1)), "the footlocker panel shows");
+        cache.updates.clear();
+        sim.close_container();
+        sim_values_cached(&sim, &shown, &mut cache);
+        assert_eq!(show(&mut cache), Some(num(0)));
+    }
 
     #[test]
     fn empty_party_slots_read_as_no_creature() {

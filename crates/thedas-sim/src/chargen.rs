@@ -48,6 +48,36 @@ const HASH_DEFAULT_NAME_MALE: u32 = 2_407_608_778;
 const HASH_DEFAULT_NAME_FEMALE: u32 = 79_362_247;
 
 impl Sim {
+    /// DA2's selector (0x4974c0) finds the staged creatures through chargen_dae's
+    /// CreatureTag column. Quick start must select one of those authored presets,
+    /// rather than finish with sys_chargen's generic default character. The row's
+    /// gender/race/class/background digits follow the script's index helper.
+    /// Provisional: replaying the creation events stands in for the native selector.
+    pub(crate) fn da2_chargen_preset(&self, creature: ObjectId) -> Option<[i32; 4]> {
+        let area = self.world.get(creature)?.area?;
+        let table = self.world.tables().get(374, "")?;
+        table.order.iter().find_map(|&row| {
+            let row = i32::try_from(row).ok()?;
+            let tag = crate::engine::cell_string(table.cell("CreatureTag", i64::from(row)));
+            if tag.is_empty()
+                || !self.world.objects.values().any(|o| {
+                    o.kind == crate::world::ObjectKind::Creature
+                        && o.id != creature
+                        && o.area == Some(area)
+                        && o.tag.eq_ignore_ascii_case(&tag)
+                })
+            {
+                return None;
+            }
+            let choice = [row / 1000, row / 100 % 10, row / 10 % 10, row % 10];
+            ((1..=2).contains(&choice[0])
+                && choice[1] > 0
+                && (1..=3).contains(&choice[2])
+                && choice[3] >= 0)
+                .then_some(choice)
+        })
+    }
+
     /// The first name character creation offers a creature (the name entry starts with it):
     /// the background defaults table's row race × 1000 + class × 100 + background (chargen.gfx's
     /// `CreatureUtils.BackgroundDefaultsIndex`), its male or female default name (a talk-table
@@ -249,6 +279,68 @@ mod tests {
                 (59, vec![0, 0], vec![]),
             ]
         );
+    }
+
+    #[test]
+    fn dragon_age_2_quick_start_keeps_the_current_areas_staged_preset() {
+        use thedas_formats::gda::Cell;
+        let table = EngineTable::parse(LDF.as_bytes()).unwrap();
+        let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(table), 1);
+        s.game = thedas_vfs::Game::DragonAge2;
+        s.world.module = Some(s.world.spawn(ObjectKind::Module, "module"));
+        let area = s.world.spawn(ObjectKind::Area, "selection");
+        let other = s.world.spawn(ObjectKind::Area, "elsewhere");
+        let hero = s.world.spawn(ObjectKind::Creature, "player");
+        s.world.hero = Some(hero);
+        s.world.get_mut(hero).unwrap().area = Some(area);
+        s.world.tables().insert(
+            "#374",
+            &["CreatureTag"],
+            vec![
+                (1310, vec![Cell::String("ordinary_warrior".into())]),
+                (1311, vec![Cell::String("staged_warrior\0".into())]),
+                (2320, vec![Cell::String("staged_mage".into())]),
+            ],
+        );
+        let ordinary = s.world.spawn(ObjectKind::Creature, "ordinary_warrior");
+        s.world.get_mut(ordinary).unwrap().area = Some(other);
+        let staged = s.world.spawn(ObjectKind::Creature, "STAGED_WARRIOR");
+        s.world.get_mut(staged).unwrap().area = Some(area);
+        let mage = s.world.spawn(ObjectKind::Creature, "staged_mage");
+        s.world.get_mut(mage).unwrap().area = Some(other);
+        s.start_chargen(hero, 0, 0);
+        assert_eq!(
+            queued(&s),
+            vec![
+                (44, vec![0, 0], vec![]),
+                (54, vec![1, 1], vec![]),
+                (46, vec![3, 0], vec![]),
+                (47, vec![1, 0], vec![]),
+                (55, vec![1], vec![]),
+                (59, vec![0, 1], vec![]),
+            ]
+        );
+        // A subsequent creation scope uses its own area's ordinary preset. It must
+        // not pick the prologue's old staged actor, or replace a selected mage with
+        // the generic default warrior on exit.
+        s.world.get_mut(ordinary).unwrap().area = Some(area);
+        s.world.get_mut(hero).unwrap().area = Some(other);
+        s.world.queue.clear();
+        s.start_chargen(hero, 0, 0);
+        assert_eq!(
+            queued(&s),
+            vec![
+                (44, vec![0, 0], vec![]),
+                (54, vec![2, 1], vec![]),
+                (46, vec![3, 0], vec![]),
+                (47, vec![2, 0], vec![]),
+                (55, vec![0], vec![]),
+                (59, vec![0, 1], vec![]),
+            ]
+        );
+        s.world.queue.clear();
+        s.start_chargen(hero, 1, 0);
+        assert_eq!(queued(&s), vec![(44, vec![1, 0], vec![])]);
     }
 
     #[test]

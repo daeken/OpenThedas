@@ -170,7 +170,8 @@ impl Matrix {
         })
     }
 
-    /// The bounds of `rect` under this matrix.
+    /// Script-visible bounds round transformed points to the nearest twip,
+    /// with ties to even. Outward rounding inflates fractional placements.
     pub fn transform_rect(&self, r: &Rect) -> Rect {
         let pts = [
             self.apply(r.x_min as f32, r.y_min as f32),
@@ -186,10 +187,10 @@ impl Matrix {
             y1 = y1.max(y);
         }
         Rect {
-            x_min: x0.floor() as i32,
-            x_max: x1.ceil() as i32,
-            y_min: y0.floor() as i32,
-            y_max: y1.ceil() as i32,
+            x_min: x0.round_ties_even() as i32,
+            x_max: x1.round_ties_even() as i32,
+            y_min: y0.round_ties_even() as i32,
+            y_max: y1.round_ties_even() as i32,
         }
     }
 }
@@ -253,6 +254,38 @@ impl ColorTransform {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transformed_bounds_round_points_to_nearest_twips_with_even_ties() {
+        let bounds = Rect {
+            x_min: 0,
+            x_max: 2000,
+            y_min: 0,
+            y_max: 2000,
+        };
+        let matrix = Matrix {
+            a: -0.6000061,
+            d: -0.6000061,
+            ..Matrix::IDENTITY
+        };
+        let transformed = matrix.transform_rect(&bounds);
+        assert_eq!((transformed.width(), transformed.height()), (1200, 1200));
+        let point = Rect {
+            x_min: 1,
+            x_max: 2,
+            y_min: -2,
+            y_max: -1,
+        };
+        assert_eq!(
+            Matrix::translate(0.5, -0.5).transform_rect(&point),
+            Rect {
+                x_min: 2,
+                x_max: 2,
+                y_min: -2,
+                y_max: -2,
+            }
+        );
+    }
 
     #[test]
     fn matrix_inverse_round_trip() {

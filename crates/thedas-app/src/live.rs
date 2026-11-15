@@ -68,6 +68,7 @@ fn cut_scene_lights(
                     domain,
                     is_static,
                     version,
+                    flicker,
                     ..
                 } => Some(SceneLight::Point {
                     position: placed.transform_point3(*position),
@@ -78,6 +79,7 @@ fn cut_scene_lights(
                     is_static: *is_static,
                     version: *version,
                     intensity: l.show.intensity.unwrap_or(1.0),
+                    flicker: *flicker,
                     room: None,
                 }),
                 SceneLight::Ambient { .. } => None,
@@ -119,6 +121,8 @@ pub struct LiveObjects {
     /// Creatures' faces (their eyes', else their head's mesh centre), offset from the
     /// creature, from their draws when the scene was built: where portraits look.
     faces: std::collections::HashMap<ObjectId, glam::Vec3>,
+    /// Interaction volumes of invisible placeables, which have no draws to pick.
+    unseen_shapes: std::collections::HashMap<ObjectId, Vec<crate::camfade::Shape>>,
     /// The placeables' opaque surfaces as drawn (doors, furniture), which the game camera
     /// keeps on the near side of, as it does the level's.
     solid: thedas_render::collide::Collider,
@@ -263,6 +267,10 @@ pub struct Live {
     models: ModelCache,
     /// Placeables' state changes, for their swings (a door opening).
     swings: thedas_ui::models::PlaceableSwings,
+    /// Creatures' starts and stops (see [`thedas_ui::locomotion`]).
+    locomotion: thedas_ui::locomotion::Locomotion,
+    /// Crossfades between creatures' animations outside movement.
+    crossfade: thedas_ui::crossfade::Crossfade,
     /// Objects drawn faded, by id: their opacity (0..1; missing is 1). The camera fades a
     /// creature it is inside (DAOrigins.exe 0x6c4130 eases it to 0.05).
     pub opacity: std::collections::HashMap<ObjectId, f32>,
@@ -279,6 +287,8 @@ pub struct Live {
     pub detail: thedas_render::scene::Detail,
     /// The conversation camera's resources and current shot.
     talk_camera: crate::talkcam::TalkCamera,
+    /// The creature the conversation camera hides (see [`crate::talkcam::TalkCamera::hidden`]).
+    talk_hidden: Option<ObjectId>,
     /// The playing cutscene's camera tracks.
     cutscene_camera: crate::cutcam::CutsceneCamera,
     /// The creatures cutscenes and conversation lines pose (see [`crate::cutactors`]).
@@ -439,7 +449,7 @@ pub static ANTIALIASING_FORCED: std::sync::atomic::AtomicBool =
 
 /// The most samples a pixel at or under `wanted` that the adapter supports for `format`.
 fn supported_samples(ctx: &GpuContext, format: wgpu::TextureFormat, wanted: u32) -> u32 {
-    thedas_render::msaa::supported_samples(&ctx.adapter, format)
+    thedas_render::msaa::supported_samples(&ctx.adapter, &ctx.device, format)
         .into_iter()
         .filter(|&n| n <= wanted.max(1))
         .max()
@@ -741,6 +751,8 @@ impl Live {
             frozen: None,
             models: ModelCache::default(),
             swings: Default::default(),
+            locomotion: Default::default(),
+            crossfade: Default::default(),
             opacity: Default::default(),
             cache: RenderCache::default(),
             async_loads: false,
@@ -761,6 +773,7 @@ impl Live {
             render_path: Default::default(),
             detail: Default::default(),
             talk_camera: Default::default(),
+            talk_hidden: None,
             cutscene_camera: Default::default(),
             cut_actors: Default::default(),
             cut_light_model: None,
@@ -844,7 +857,7 @@ impl Live {
             return;
         }
         // A tutorial that pauses the game holds it until its popup is dismissed.
-        if self.sim().world.tutorial_paused {
+        if self.sim().tutorial_paused() {
             return;
         }
         self.owed_ms += dt_ms.clamp(0.0, MAX_STEP_MS);
@@ -1283,7 +1296,8 @@ impl Live {
     /// Rebuilds [`Live::opacity`] from every fade that sets one, multiplied together (a
     /// missing entry is opaque). Each source keeps its own values; add another fade (a
     /// corpse's decay) here rather than writing `opacity` directly. Sources: the game
-    /// camera's fade ([`crate::camfade`]).
+    /// camera's fade ([`crate::camfade`]), corpses' decay and the conversation listener the
+    /// default framing hides ([`crate::talkcam::TalkCamera::hidden`]).
     fn combine_opacity(&mut self) {
         self.opacity.clear();
         for (id, alpha) in self.camera_fade.faded() {
@@ -1293,6 +1307,10 @@ impl Live {
         let corpses = self.sim().corpse_fades();
         for (id, alpha) in corpses {
             *self.opacity.entry(id).or_insert(1.0) *= alpha;
+        }
+        // The listener a conversation's default framing hides.
+        if let Some(id) = self.talk_hidden {
+            self.opacity.insert(id, 0.0);
         }
         self.opacity.retain(|_, a| *a < 1.0);
     }
@@ -1426,6 +1444,14 @@ impl Live {
         &mut self,
         base: &thedas_render::Camera,
     ) -> Option<thedas_render::Camera> {
+        let view = self.conversation_view(base);
+        // The default framing hides its listener (see `TalkCamera::hidden`).
+        self.combine_opacity();
+        view
+    }
+
+    fn conversation_view(&mut self, base: &thedas_render::Camera) -> Option<thedas_render::Camera> {
+        self.talk_hidden = None;
         let sim = self.sim.lock().unwrap_or_else(|p| p.into_inner());
         // A cutscene that played over this line (the opening `start_wake.cut` over City
         // Elf's first line) leaves its last view for the rest of the line: the original
@@ -1456,8 +1482,11 @@ impl Live {
         let faces = self.objects.as_ref().map(|o| &o.faces);
         let face = |id| faces.and_then(|f| f.get(&id).copied());
         let posed = &self.posed;
-        self.talk_camera
-            .camera(&sim, base, &face, &|id| drawn_root(posed, id))
+        let view = self
+            .talk_camera
+            .camera(&sim, base, &face, &|id| drawn_root(posed, id));
+        self.talk_hidden = self.talk_camera.hidden();
+        view
     }
 
     /// The playing cutscene's camera (see [`crate::cutcam`]); `base` gives the clip planes.
@@ -1856,6 +1885,8 @@ impl Live {
             }
         };
         self.swings.apply(&sim, &mut models);
+        self.locomotion.apply(&sim, &mut models);
+        self.crossfade.apply(&sim, &mut models);
         let was = self.staged;
         self.staged = staged.map(|(id, s)| (id, s.mark, s.facing));
         if self.staged.map(|s| s.0) != was.map(|s| s.0) {
@@ -1879,6 +1910,23 @@ impl Live {
             models.push(m);
         }
         let kept = shown.kept;
+        // The next frame's locomotion leaves these creatures' standing pose to the cutscene:
+        // a playing cutscene's actors, and creatures a conversation line animates or that
+        // keep a cutscene's animations (a seated creature). A conversation line that only
+        // places and faces its speakers leaves them to locomotion, so they turn in place
+        // toward each other as #914 has them.
+        let cut_playing = sim.world.cutscene.is_some();
+        self.locomotion.hold(
+            posing
+                .iter()
+                .filter(|(_, show)| cut_playing || !show.animations.is_empty())
+                .map(|(id, _)| *id)
+                .chain(
+                    kept.iter()
+                        .filter(|(_, a)| !a.is_empty())
+                        .map(|(id, _)| *id),
+                ),
+        );
         // A cutscene's weapon draws and hidden actors.
         let mut hidden = std::collections::HashSet::new();
         // Party members the playing cutscene does not cast are not drawn while it plays
@@ -2024,12 +2072,24 @@ impl Live {
                 self.travel = false;
             }
         }
+        // Each creature's appearance scales its clips' translations (a dwarf sits lower than
+        // the human clip's drop; see `thedas_render::skeleton::Layer::scale`).
+        let scales: std::collections::HashMap<ObjectId, [f32; 3]> = {
+            let sim = self.sim();
+            models
+                .iter()
+                .filter_map(|m| thedas_ui::models::translation_scale(&sim, m.id).map(|s| (m.id, s)))
+                .collect()
+        };
         let (Some(level), Some(objects)) = (self.level.as_ref(), self.objects.as_mut()) else {
             return Ok(());
         };
         let mut posed: Vec<(Mat4, Option<Clip>)> = Vec::with_capacity(models.len());
         for m in &models {
             let mut c = m.motion.as_ref().map(clip);
+            if let Some(c) = c.as_mut() {
+                c.translation_scale = Some(scales.get(&m.id).copied().unwrap_or([1.0; 3]));
+            }
             let none = Vec::new();
             let held = kept.get(&m.id).unwrap_or(&none);
             let (at, facing) = match posing.get(&m.id) {
@@ -2075,7 +2135,15 @@ impl Live {
                     }
                     (at, show.facing)
                 }
-                None => (m.position, m.facing),
+                None => {
+                    let mut at = m.position;
+                    if m.kind == thedas_sim::world::ObjectKind::Creature
+                        && let Some(z) = floor_under(&level.collider, at)
+                    {
+                        at[2] = z;
+                    }
+                    (at, m.facing)
+                }
             };
             // Head tracking: the pose animations of a creature that looks at another, or is
             // turning back from it.
@@ -2131,8 +2199,12 @@ impl Live {
             };
             objects.renderer.set_prop_opacity(ctx, &objects.scene, i, o);
         }
-        // A cutscene's lights join the level's, for the level and for the objects.
-        let lights = cut_scene_lights(&mut self.cut_light_model, &level.vfs, &cut_lights);
+        // A cutscene's lights join the level's, for the level and for the objects, and so
+        // do the lights of the visual effects (as they stood last frame).
+        let mut lights = cut_scene_lights(&mut self.cut_light_model, &level.vfs, &cut_lights);
+        if let Some(e) = &self.effects {
+            lights.extend(e.renderer.effect_lights());
+        }
         objects.renderer.set_extra_lights(&lights);
         if let Some(level) = self.level.as_mut() {
             level.renderer.set_extra_lights(&lights);
@@ -2765,6 +2837,7 @@ impl Live {
         let mut bounds = std::collections::HashMap::new();
         let mut faces = std::collections::HashMap::new();
         let mut shapes = std::collections::HashMap::new();
+        let mut unseen_shapes = std::collections::HashMap::new();
         let mut placeable_draws = Vec::new();
         let mut moving = std::collections::HashMap::new();
         for (i, (m, p)) in models.iter().zip(&scene.props).enumerate() {
@@ -2795,6 +2868,14 @@ impl Live {
                     thedas_render::collide::Collider::from_draws(&scene, p.draws.clone(), false);
                 if !shape.is_empty() {
                     shapes.insert(m.id, shape);
+                }
+                if p.draws.is_empty()
+                    && let Some(level) = self.level.as_ref()
+                {
+                    let shapes = invisible_placeable_shapes(&level.vfs, &m.models);
+                    if !shapes.is_empty() {
+                        unseen_shapes.insert(m.id, shapes);
+                    }
                 }
             }
             // A creature's eyes (`_uem_` meshes) or head (`_uhm_`; Dragon Age II's heads are
@@ -2836,6 +2917,7 @@ impl Live {
             bounds,
             shapes,
             faces,
+            unseen_shapes,
             solid,
             moving,
             bodies: models
@@ -2865,6 +2947,61 @@ pub enum Pick {
     Ground([f32; 3]),
 }
 
+/// Invisible transition markers carry a PHY interaction volume even though their MMH
+/// has no mesh. Render bounds cannot represent these objects.
+fn invisible_placeable_shapes(
+    vfs: &thedas_vfs::Vfs,
+    models: &[String],
+) -> Vec<crate::camfade::Shape> {
+    models
+        .iter()
+        .flat_map(|model| {
+            let phy = vfs
+                .read(&format!("{model}.phy"))
+                .ok()
+                .and_then(|(data, _)| thedas_formats::phy::Phy::parse(&data).ok());
+            let mmh = vfs
+                .read(&format!("{model}.mmh"))
+                .ok()
+                .and_then(|(data, _)| thedas_formats::model::Mmh::parse(&data).ok());
+            phy.map(|phy| {
+                crate::camfade::model_shapes_in_mask(
+                    &phy,
+                    mmh.as_ref(),
+                    thedas_formats::phy::mask::PLACEABLES,
+                )
+            })
+            .unwrap_or_default()
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod invisible_pick_tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires THEDAS_INSTALL pointing at a DAO install"]
+    fn dust_towns_invisible_exit_has_a_pick_volume_without_rendered_meshes() {
+        let install =
+            DaoInstall::open(PathBuf::from(std::env::var_os("THEDAS_INSTALL").unwrap())).unwrap();
+        let vfs = install.play_vfs(TextureQuality::High).unwrap();
+        let model = "plc_invisowide_01_0";
+        let (data, _) = vfs.read(&format!("{model}.mmh")).unwrap();
+        let mmh = thedas_formats::model::Mmh::parse(&data).unwrap();
+        assert!(mmh.mesh_pieces().is_empty());
+        let shapes = invisible_placeable_shapes(&vfs, &[model.into()]);
+        assert!(!shapes.is_empty());
+        let placement = Prop::placement([342.92227, 280.8993, 9.373493], 245.0);
+        let point = placement.transform_point3(glam::Vec3::new(0.0, 0.0, 1.5));
+        let origin = placement.transform_point3(glam::Vec3::new(0.0, 3.0, 1.5));
+        assert!(shapes.iter().any(|s| {
+            s.ray(&placement, origin, (point - origin).normalize())
+                .is_some()
+        }));
+    }
+}
+
 /// A model's creature shapes (its `.phy`'s creatures group, see [`crate::camfade`]), read
 /// once per model and kept in `cache`.
 fn creature_shapes(
@@ -2887,6 +3024,25 @@ fn creature_shapes(
             )
         })
         .clone()
+}
+
+/// How far above or below its position a creature's drawn feet look for the floor
+/// (metres; see [`floor_under`]).
+pub const FLOOR_REACH: f32 = 0.25;
+
+/// The level's floor under a creature standing at `at`, within [`FLOOR_REACH`] of its
+/// height: DAOrigins.exe keeps movers on the physics floor (its ground helper 0x685430),
+/// which lies on the drawn floor, while the simulation keeps the pathing grid's quantized
+/// height, a centimetre or two below it (report 985: soles in the floor). Presentation
+/// only; the simulation's position is unchanged. A seat or table above the window (a
+/// sitter's chair) is not taken. Provisional: the window.
+fn floor_under(collider: &thedas_render::collide::Collider, at: [f32; 3]) -> Option<f32> {
+    let p = glam::Vec3::from_array(at);
+    let (from, to) = (
+        p + glam::Vec3::Z * FLOOR_REACH,
+        p - glam::Vec3::Z * FLOOR_REACH,
+    );
+    collider.first_hit(from, to).map(|f| from.lerp(to, f).z)
 }
 
 /// Creatures are picked as upright cylinders this tall (metres). Provisional.
@@ -2937,6 +3093,18 @@ impl Live {
         let mut sim = shared.lock().unwrap_or_else(|p| p.into_inner());
         let area = sim.world.area?;
         let leader = sim.world.controlled();
+        // Where the ray first meets the level's own surfaces (walls, floors, terrain).
+        let level_hit = self.level.as_ref().and_then(|l| {
+            let len = dir.length().max(1e-6);
+            l.collider
+                .first_hit(origin, origin + dir * (PICK_REACH / len))
+                .map(|f| f * PICK_REACH / len)
+        });
+        // The leader's middle: an invisible volume between the camera and the leader is one
+        // the camera has been pulled back through, standing beside it.
+        let leader_at = leader
+            .and_then(|l| sim.world.get(l))
+            .map(|o| glam::Vec3::from_array(o.position) + glam::Vec3::Z);
         let mut best: Option<(f32, ObjectId)> = None;
         for o in sim.world.objects.values() {
             if o.area != Some(area) || !o.active || Some(o.id) == leader {
@@ -2950,7 +3118,7 @@ impl Live {
                 }
                 // A placeable is picked where the click meets its surfaces (a door's
                 // bounding sphere reaches far past the door, over whoever stands by it);
-                // one with nothing drawn, by its bounds.
+                // one with nothing drawn, by its PHY interaction volume, then its bounds.
                 thedas_sim::world::ObjectKind::Placeable if o.interactive => {
                     let objects = self.objects.as_ref();
                     match objects.and_then(|s| s.shapes.get(&o.id)) {
@@ -2960,9 +3128,34 @@ impl Live {
                                 .first_hit(origin, origin + dir * (PICK_REACH / len))
                                 .map(|f| f * PICK_REACH / len)
                         }
-                        None => objects
-                            .and_then(|s| s.bounds.get(&o.id))
-                            .and_then(|&(off, r)| ray_sphere(origin, dir, p + off, r)),
+                        None => objects.and_then(|s| {
+                            if let Some(shapes) = s.unseen_shapes.get(&o.id) {
+                                // An invisible volume (an area transition's marker) is
+                                // picked only where it can be seen: not through a wall or
+                                // the floor in front of it (it was picked through the whole
+                                // level, so ground clicks near it, and its cursor from far
+                                // away, chose it), not from inside it, and not when it
+                                // stands between the camera and the leader (after arriving
+                                // through it, every click went back out).
+                                let placement = Prop::placement(o.position, o.facing);
+                                let behind = leader_at.is_some_and(|l| {
+                                    shapes.iter().any(|s| {
+                                        s.ray(&placement, origin, l - origin)
+                                            .is_some_and(|t| t <= 1.0)
+                                    })
+                                });
+                                shapes
+                                    .iter()
+                                    .filter(|_| !behind)
+                                    .filter_map(|s| s.ray(&placement, origin, dir))
+                                    .filter(|&t| t > 0.0 && level_hit.is_none_or(|w| t <= w))
+                                    .min_by(f32::total_cmp)
+                            } else {
+                                s.bounds
+                                    .get(&o.id)
+                                    .and_then(|&(off, r)| ray_sphere(origin, dir, p + off, r))
+                            }
+                        }),
                     }
                 }
                 _ => None,
@@ -3684,7 +3877,15 @@ pub fn clip(m: &thedas_ui::models::Motion) -> Clip {
         actions: m.actions.clone(),
         time: m.time,
         looping: m.looping,
-        layers: Vec::new(),
+        // Crossfaded over the base, each into what comes before it.
+        layers: m
+            .blend
+            .iter()
+            .map(|(b, w)| Clip {
+                weight: *w,
+                ..clip(b)
+            })
+            .collect(),
         absolute: false,
         ..Default::default()
     }

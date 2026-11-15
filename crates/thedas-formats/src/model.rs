@@ -32,6 +32,12 @@ pub mod field {
     pub const LIGHT_IS_STATIC: u32 = 6009;
     /// A point light's `Version` (0x5949ec), which picks its influence formula.
     pub const LIGHT_VERSION: u32 = 6345;
+    /// A point light's `IntensityVariation` (read into the blueprint at 0x594868).
+    pub const LIGHT_INTENSITY_VARIATION: u32 = 6249;
+    /// A point light's `IntensityPeriod` (0x59489f).
+    pub const LIGHT_INTENSITY_PERIOD: u32 = 6250;
+    /// A point light's `IntensityPeriodDelta` (0x5948d6).
+    pub const LIGHT_INTENSITY_PERIOD_DELTA: u32 = 6251;
     /// A skeleton node's bone index.
     pub const BONE_INDEX: u32 = 6254;
     /// A skinned mesh's palette: the bone index each of its vertices' blend indices names.
@@ -39,6 +45,12 @@ pub mod field {
     /// Whether a mesh casts the engine's run-time (shadow partition) shadows; xoreos's
     /// `MMHMeshCastRuntimeShadow`.
     pub const MESH_CAST_RUNTIME_SHADOW: u32 = 6176;
+    /// Whether a mesh casts shadows into the baked lightmaps (`MMHMeshCastBakedShadow`; read
+    /// by the toolset's LightMapper.py as `GFF_MMH_MESH_CAST_BAKED_SHADOW`).
+    pub const MESH_CAST_BAKED_SHADOW: u32 = 6177;
+    /// Whether a mesh receives a baked lightmap (`GFF_MMH_MESH_RECEIVE_BAKED_SHADOW` in the
+    /// toolset's LightMapper.py).
+    pub const MESH_RECEIVE_BAKED_SHADOW: u32 = 6301;
     /// Whether a mesh is cut away when the game camera is high (`CutAway`, named by
     /// DAOrigins.exe's XML-to-GFF property table; read by the mesh blueprint at 0x595025).
     pub const MESH_CUT_AWAY: u32 = 6193;
@@ -87,10 +99,24 @@ pub enum Light {
         is_static: Option<bool>,
         /// `Version` (6345); `None` when the node does not say.
         version: Option<i64>,
+        /// How its intensity flickers (6249-6251); `None` when the node gives no
+        /// `IntensityVariation` above zero, which is when the engine makes no flicker for it
+        /// (DAOrigins.exe 0x55fc08).
+        flicker: Option<Flicker>,
     },
     Ambient {
         color: [f32; 4],
     },
+}
+
+/// A point light's flicker (`IntensityVariation`, `IntensityPeriod`, `IntensityPeriodDelta`):
+/// the engine moves the light's intensity between random values within `1 ± variation`, each
+/// move lasting a random `period ± period_delta` seconds (see `thedas_render::flicker`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Flicker {
+    pub variation: f32,
+    pub period: f32,
+    pub period_delta: f32,
 }
 
 /// A palette entry naming no bone.
@@ -112,6 +138,11 @@ pub struct MeshRef {
     /// submission queue's shadow groups draw into the shadow partitions. `None` when the
     /// node does not say.
     pub cast_runtime_shadow: Option<bool>,
+    /// Whether the mesh casts shadows into the baked lightmaps (6177); `None` when the node
+    /// does not say.
+    pub cast_baked_shadow: Option<bool>,
+    /// Whether the mesh receives a baked lightmap (6301); `None` when the node does not say.
+    pub receive_baked_shadow: Option<bool>,
     /// Whether the mesh fades out and is cut away while the game camera is high above the
     /// party (6193, `CutAway`): ceilings and roofs.
     pub cut_away: bool,
@@ -440,6 +471,12 @@ fn finish_node(
                 cast_runtime_shadow: d
                     .opt_i64(id, field::MESH_CAST_RUNTIME_SHADOW)?
                     .map(|v| v != 0),
+                cast_baked_shadow: d
+                    .opt_i64(id, field::MESH_CAST_BAKED_SHADOW)?
+                    .map(|v| v != 0),
+                receive_baked_shadow: d
+                    .opt_i64(id, field::MESH_RECEIVE_BAKED_SHADOW)?
+                    .map(|v| v != 0),
                 cut_away: d.opt_i64(id, field::MESH_CUT_AWAY)?.is_some_and(|v| v != 0),
             }),
             None => None,
@@ -454,6 +491,16 @@ fn finish_node(
             affect_domain: d.opt_i64(id, field::LIGHT_AFFECT_DOMAIN)?,
             is_static: d.opt_i64(id, field::LIGHT_IS_STATIC)?.map(|v| v != 0),
             version: d.opt_i64(id, field::LIGHT_VERSION)?,
+            flicker: match d.opt_f32(id, field::LIGHT_INTENSITY_VARIATION)? {
+                Some(variation) if variation > 0.0 => Some(Flicker {
+                    variation,
+                    period: d.opt_f32(id, field::LIGHT_INTENSITY_PERIOD)?.unwrap_or(0.0),
+                    period_delta: d
+                        .opt_f32(id, field::LIGHT_INTENSITY_PERIOD_DELTA)?
+                        .unwrap_or(0.0),
+                }),
+                _ => None,
+            },
         })
     } else if kind == KIND_AMBIENT_LIGHT {
         Some(Light::Ambient {
@@ -919,6 +966,9 @@ mod tests {
                 (field::LIGHT_RADIUS, Value::F32(12.0)),
                 (field::LIGHT_AFFECT_DOMAIN, Value::I32(2)),
                 (field::LIGHT_IS_STATIC, Value::U8(1)),
+                (field::LIGHT_INTENSITY_VARIATION, Value::F32(0.2)),
+                (field::LIGHT_INTENSITY_PERIOD, Value::F32(0.075)),
+                (field::LIGHT_INTENSITY_PERIOD_DELTA, Value::F32(0.025)),
                 (field::CHILDREN, generic(&[t])),
             ],
         );
@@ -939,6 +989,11 @@ mod tests {
                 affect_domain: Some(2),
                 is_static: Some(true),
                 version: None,
+                flicker: Some(Flicker {
+                    variation: 0.2,
+                    period: 0.075,
+                    period_delta: 0.025,
+                }),
             }
         );
         assert_eq!(lights[0].chain[1].position, [1.0, 2.0, 3.0]);

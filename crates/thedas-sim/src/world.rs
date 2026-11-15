@@ -179,6 +179,10 @@ pub struct Object {
     /// creature +0xc8c).
     #[serde(default)]
     pub decay_forced: bool,
+    /// The ambient system's kick clock (milliseconds; the exe's creature +0xc84): runs
+    /// while the creature's ambient system is enabled (see [`crate::ambient`]). Saved.
+    #[serde(default, skip_serializing_if = "crate::ambient::is_zero")]
+    pub ambient_ms: f32,
     /// A head morph kept on the creature itself (`.mor` resource, no extension), as
     /// character creation leaves the player's face; others take theirs from their
     /// template's `Appearance Data`. Saved.
@@ -282,6 +286,7 @@ impl Object {
             died_at: None,
             decay_ms: 0,
             decay_forced: false,
+            ambient_ms: 0.0,
             head_morph: None,
             face_choices: BTreeMap::new(),
             immortal: false,
@@ -345,16 +350,23 @@ pub struct Event {
     pub vectors: Vec<[f32; 3]>,
 }
 
-/// A queued command (`AddCommand`). Provisional: commands complete as soon as the executor
-/// reaches them, except `Wait`, which lasts its duration.
+/// A command payload and its simulation execution state. An active command stays at the
+/// front of its object's vector; the remaining entries are the waiting queue.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Command {
     /// `COMMAND_TYPE_*`.
     pub ty: i32,
     pub name: String,
+    /// Origins' AddCommand bStatic: ordinary add behavior cannot clear this command.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_static: bool,
     pub target: Option<ObjectId>,
     pub location: Option<Location>,
     pub seconds: f32,
+    /// `CommandMoveToObject`'s fMaxRange, raised to fMinRange by its builder
+    /// (DAOrigins.exe 0x66f260). Older saves used only `seconds` (fMinRange).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_range: Option<f32>,
     pub ints: Vec<i32>,
     pub strings: Vec<String>,
     /// When the command finishes, set when it reaches the front of the queue.
@@ -364,6 +376,10 @@ pub struct Command {
     /// between is interpolated (see `Sim::advance_movers`).
     #[serde(default)]
     pub from: Option<([f32; 3], u64)>,
+    /// For a move: when its mover's body last turned toward the way it goes (see
+    /// `Sim::advance_movers` and `turn_toward`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turned_at: Option<u64>,
     /// For an attack whose target is out of reach: where the attacker is walking to first
     /// (see `Sim::attack_reach`).
     #[serde(default)]
@@ -475,9 +491,9 @@ pub struct LocationVfx {
 }
 
 /// An instant visual effect played on an object (an `EffectVisualEffect` applied with
-/// `EFFECT_DURATION_TYPE_INSTANT`): DAOrigins.exe applies such an effect and keeps nothing,
-/// so this is only a note for presentation that the effect was played, kept for
-/// [`INSTANT_VFX_MS`]. Not saved.
+/// `EFFECT_DURATION_TYPE_INSTANT`): the script's effect ends at once and the visual plays on
+/// by its animations (see [`crate::vfx`]), so this is a note for presentation that the
+/// effect was played, kept while it is shown (`ms`). Not saved.
 #[derive(Clone, Debug, PartialEq)]
 pub struct InstantVfx {
     pub target: ObjectId,
@@ -485,11 +501,33 @@ pub struct InstantVfx {
     pub vfx: i32,
     /// World time it was played.
     pub started_ms: u64,
+    /// How long it is shown, in milliseconds ([`crate::vfx::VfxTiming::ms`]).
+    pub ms: u64,
+    /// It loops a duration animation while shown ([`crate::vfx::VfxTiming::lasting`]).
+    pub lasting: bool,
 }
 
-/// How long an [`InstantVfx`] note is kept for presentation to pick up. Not the effect's
-/// length (the VFX resource has its own); provisional.
-pub const INSTANT_VFX_MS: u64 = 2_000;
+/// An instant visual effect played at a place (`Engine_ApplyEffectAtLocation` with an
+/// `EffectVisualEffect` of `EFFECT_DURATION_TYPE_INSTANT`: a spell's impact on the ground):
+/// as with [`InstantVfx`], the script's effect ends at once, so `GetEffects` never finds it;
+/// this note is for presentation, kept while the visual is shown. Not saved.
+#[derive(Clone, Debug, PartialEq)]
+pub struct InstantLocationVfx {
+    /// Tells it from the others while it is kept.
+    pub handle: u64,
+    /// The effect's `VFX_base` row (its integer 0).
+    pub vfx: i32,
+    pub area: ObjectId,
+    pub position: [f32; 3],
+    /// Degrees, as objects use.
+    pub facing: f32,
+    /// World time it was played.
+    pub started_ms: u64,
+    /// How long it is shown, in milliseconds ([`crate::vfx::VfxTiming::ms`]).
+    pub ms: u64,
+    /// It loops a duration animation while shown ([`crate::vfx::VfxTiming::lasting`]).
+    pub lasting: bool,
+}
 
 /// The open party picker: the followers picked so far (at most three), in order.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -642,6 +680,29 @@ pub enum SoundRequest {
     Music { name: String },
 }
 
+/// The ids of the world's creatures, of its creatures and placeables, and of its triggers, in
+/// id order: the
+/// per-tick updates that only look at creatures read these instead of walking every object
+/// (thousands of items and waypoints). Keyed by the object count and the next id, which
+/// every addition (`World::spawn`) and removal changes; an object's kind never changes.
+#[derive(Default)]
+struct KindIndex(std::sync::Mutex<Option<KindLists>>);
+
+/// (object count, next id, creatures, creatures and placeables, triggers)
+type KindLists = (
+    usize,
+    ObjectId,
+    Arc<Vec<ObjectId>>,
+    Arc<Vec<ObjectId>>,
+    Arc<Vec<ObjectId>>,
+);
+
+impl Clone for KindIndex {
+    fn clone(&self) -> Self {
+        KindIndex::default()
+    }
+}
+
 /// Everything a save holds. The trace and the tables are not saved: the trace starts afresh
 /// and the tables come from the resources of the simulation that loads the save.
 #[derive(Clone, Serialize, Deserialize)]
@@ -649,6 +710,10 @@ pub struct World {
     pub time_ms: u64,
     pub objects: BTreeMap<ObjectId, Object>,
     next_id: ObjectId,
+    /// The creatures and placeables, worked out from `objects` again whenever it has changed
+    /// size or gained an object (see [`World::creature_ids`]). Not saved.
+    #[serde(skip)]
+    kind_index: KindIndex,
     #[serde(with = "sorted")]
     pub handles: HashMap<u64, EngineData>,
     next_handle: u64,
@@ -833,6 +898,12 @@ pub struct World {
     /// Instant visual effects played on objects lately (see [`InstantVfx`]).
     #[serde(skip)]
     pub instant_vfx: Vec<InstantVfx>,
+    /// Instant visual effects played at places lately (see [`InstantLocationVfx`]).
+    #[serde(skip)]
+    pub instant_location_vfx: Vec<InstantLocationVfx>,
+    /// The next [`InstantLocationVfx::handle`].
+    #[serde(skip)]
+    pub next_instant_vfx: u64,
     /// The next [`LocationVfx::handle`].
     #[serde(default)]
     pub next_vfx: u64,
@@ -956,6 +1027,7 @@ impl World {
             time_ms: 0,
             objects: BTreeMap::new(),
             next_id: 1,
+            kind_index: KindIndex::default(),
             handles: HashMap::new(),
             next_handle: 1,
             next_effect_id: 0,
@@ -1013,6 +1085,8 @@ impl World {
             store: None,
             location_vfx: Vec::new(),
             instant_vfx: Vec::new(),
+            instant_location_vfx: Vec::new(),
+            next_instant_vfx: 0,
             next_vfx: 0,
             chanter_board: None,
             plot_actions: PlotActions::default(),
@@ -1043,6 +1117,56 @@ impl World {
                     .is_some_and(|h| h.followers.contains(&c))
         });
         chosen.or(hero)
+    }
+
+    fn kind_lists(&self) -> KindLists {
+        let key = (self.objects.len(), self.next_id);
+        let mut cache = self.kind_index.0.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(l) = cache.as_ref().filter(|l| (l.0, l.1) == key) {
+            return l.clone();
+        }
+        let creatures: Vec<ObjectId> = self
+            .objects
+            .values()
+            .filter(|o| o.kind == ObjectKind::Creature)
+            .map(|o| o.id)
+            .collect();
+        let actors: Vec<ObjectId> = self
+            .objects
+            .values()
+            .filter(|o| matches!(o.kind, ObjectKind::Creature | ObjectKind::Placeable))
+            .map(|o| o.id)
+            .collect();
+        let triggers: Vec<ObjectId> = self
+            .objects
+            .values()
+            .filter(|o| o.kind == ObjectKind::Trigger)
+            .map(|o| o.id)
+            .collect();
+        let l = (
+            key.0,
+            key.1,
+            Arc::new(creatures),
+            Arc::new(actors),
+            Arc::new(triggers),
+        );
+        *cache = Some(l.clone());
+        l
+    }
+
+    /// The world's creatures, in id order (the order `objects` iterates them).
+    pub fn creature_ids(&self) -> Arc<Vec<ObjectId>> {
+        self.kind_lists().2
+    }
+
+    /// The world's creatures and placeables, in id order.
+    pub fn actor_ids(&self) -> Arc<Vec<ObjectId>> {
+        self.kind_lists().3
+    }
+
+    /// The world's triggers, in id order.
+    pub fn trigger_ids(&self) -> Arc<Vec<ObjectId>> {
+        self.kind_lists().4
     }
 
     pub fn spawn(&mut self, kind: ObjectKind, tag: &str) -> ObjectId {
@@ -1249,6 +1373,26 @@ fn normal_difficulty() -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_creature_list_follows_spawns_and_removals() {
+        let mut w = World::new(Arc::new(crate::m2da::Tables::empty()), 1);
+        let a = w.spawn(ObjectKind::Creature, "a");
+        let _item = w.spawn(ObjectKind::Item, "i");
+        let p = w.spawn(ObjectKind::Placeable, "p");
+        let b = w.spawn(ObjectKind::Creature, "b");
+        assert_eq!(*w.creature_ids(), vec![a, b]);
+        assert_eq!(*w.actor_ids(), vec![a, p, b]);
+        let t = w.spawn(ObjectKind::Trigger, "t");
+        assert_eq!(*w.trigger_ids(), vec![t]);
+        // A removal, then an addition that brings the count back to what it was.
+        w.objects.remove(&a);
+        assert_eq!(*w.creature_ids(), vec![b]);
+        let c = w.spawn(ObjectKind::Creature, "c");
+        assert_eq!(*w.creature_ids(), vec![b, c]);
+        // A copy (a snapshot, a load) works it out afresh.
+        assert_eq!(*w.clone().creature_ids(), vec![b, c]);
+    }
 
     #[test]
     fn facings_are_rotations_with_models_looking_along_plus_y() {
