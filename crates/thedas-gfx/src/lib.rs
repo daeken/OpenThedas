@@ -7,6 +7,7 @@
 pub mod avm1;
 pub mod display;
 mod filters;
+pub mod glyphs;
 pub mod gpu;
 pub mod player;
 pub mod render;

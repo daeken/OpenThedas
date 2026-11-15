@@ -765,6 +765,9 @@ pub struct Motion {
     pub actions: Vec<String>,
     pub time: f32,
     pub looping: bool,
+    /// Animations crossfaded over this one, in order, each with its share of the blend
+    /// (see [`crate::locomotion`]): each is blended into what the ones before it give.
+    pub blend: Vec<(Motion, f32)>,
 }
 
 /// `apr_base.gda`'s animation trees: ambient and combat (column names not known), movement
@@ -831,6 +834,33 @@ pub fn motion(sim: &Sim, o: &Object) -> Option<Motion> {
     if o.kind == ObjectKind::Placeable {
         return placeable_motion(sim, o);
     }
+    creature_motion(sim, o, false)
+}
+
+/// What a creature standing would show (its pause), whatever it is doing: the pose a
+/// [`crate::locomotion`] start fades out of and a stop fades back into.
+pub fn standing_motion(sim: &Sim, o: &Object) -> Option<Motion> {
+    creature_motion(sim, o, true)
+}
+
+/// The trees a creature runs in (`apr_base.gda`'s `MovementTree`, then `CombatMoveTree`;
+/// the other way round while it fights), as [`motion`] gives a run.
+pub fn movement_trees(sim: &Sim, o: &Object) -> Vec<String> {
+    let Some(t) = sim.world.tables().get(0, "apr_base") else {
+        return Vec::new();
+    };
+    let app = o.appearance as i64;
+    let movement = text(t.cell("MovementTree", app)).map(|s| s.to_ascii_lowercase());
+    let combat_move = text(t.cell("CombatMoveTree", app)).map(|s| s.to_ascii_lowercase());
+    let list = if o.combat.in_combat {
+        [combat_move, movement]
+    } else {
+        [movement, combat_move]
+    };
+    list.into_iter().flatten().collect()
+}
+
+fn creature_motion(sim: &Sim, o: &Object, standing: bool) -> Option<Motion> {
     if o.kind != ObjectKind::Creature {
         return None;
     }
@@ -855,7 +885,7 @@ pub fn motion(sim: &Sim, o: &Object) -> Option<Motion> {
     };
     let fighting = o.combat.in_combat;
     let style = weapon_style(sim, o).map(|s| format!("{s}.anb"));
-    if o.dead {
+    if o.dead && !standing {
         // From when it died, held on the last frame; a death of unknown time (a save from
         // before deaths were timed) shows the last frame. Dragon Age II's creatures die in
         // their damage-reaction tree, whose deaths are named by the fall's direction; the
@@ -867,9 +897,10 @@ pub fn motion(sim: &Sim, o: &Object) -> Option<Motion> {
             actions: vec![action::DIE.into(), action::DA2_DIE.into()],
             time,
             looping: false,
+            blend: Vec::new(),
         });
     }
-    if let Some(c) = o.commands.first() {
+    if let Some(c) = o.commands.first().filter(|_| !standing) {
         if c.from.is_some() {
             let list = if fighting {
                 trees(&[&combat_move, &movement])
@@ -881,6 +912,7 @@ pub fn motion(sim: &Sim, o: &Object) -> Option<Motion> {
                 actions: vec![action::RUN.into()],
                 time: secs(now) + phase,
                 looping: true,
+                blend: Vec::new(),
             });
         }
         if c.name == "CommandPlayAnimation"
@@ -897,6 +929,7 @@ pub fn motion(sim: &Sim, o: &Object) -> Option<Motion> {
                     actions: attack_actions(sim, o, due),
                     time: secs(now.saturating_sub(start)),
                     looping: false,
+                    blend: Vec::new(),
                 });
             }
         }
@@ -910,6 +943,7 @@ pub fn motion(sim: &Sim, o: &Object) -> Option<Motion> {
         actions: vec![action::PAUSE.into()],
         time: secs(now) + phase,
         looping: true,
+        blend: Vec::new(),
     })
 }
 
@@ -963,6 +997,7 @@ fn placeable_motion(sim: &Sim, o: &Object) -> Option<Motion> {
         actions: vec![action],
         time: sim.world.time_ms as f32 / 1000.0 + (o.id % 97) as f32 * 0.37,
         looping: true,
+        blend: Vec::new(),
     })
 }
 
@@ -1000,6 +1035,7 @@ impl PlaceableSwings {
                     actions: vec![action],
                     time: now.saturating_sub(at) as f32 / 1000.0,
                     looping: false,
+                    blend: Vec::new(),
                 });
             }
         }
@@ -1044,6 +1080,7 @@ fn played_animation(
         actions: vec![action.to_ascii_lowercase(), action::PAUSE.into()],
         time,
         looping,
+        blend: Vec::new(),
     })
 }
 
