@@ -2852,6 +2852,7 @@ impl App {
             settings: self.settings.clone(),
             data_dir: saves::data_dir(),
         };
+        let presentation_ms = capture_started.elapsed().as_secs_f64() * 1000.0;
         let mut info = json!({
             "build": report::build_info(),
             "settings": self.started_with,
@@ -2886,6 +2887,9 @@ impl App {
         let mut trace = None;
         let mut journal = None;
         let mut pause = false;
+        let metadata_ms = capture_started.elapsed().as_secs_f64() * 1000.0 - presentation_ms;
+        let mut save_clone_ms = 0.0;
+        let mut trace_ms = 0.0;
         if let Some(live) = self.live.as_mut() {
             if !live.front_end {
                 journal = live.journal.as_mut().and_then(|j| j.files());
@@ -2894,13 +2898,19 @@ impl App {
                 info["game"]["hero"] = json!(sim.world.hero.map(|h| sim.display_name(h)));
                 info["game"]["area_name"] = json!(sim.world.area.map(|a| sim.display_name(a)));
                 info["game"]["coverage"] = sim.world.trace.coverage();
+                let stage = Instant::now();
                 now_save = Some(report::ReportSave::Game(Box::new(sim.save_game())));
+                save_clone_ms = stage.elapsed().as_secs_f64() * 1000.0;
+                let stage = Instant::now();
                 trace = serde_json::to_value(&sim.world.trace.recent).ok();
+                trace_ms = stage.elapsed().as_secs_f64() * 1000.0;
                 drop(sim);
                 pause = !live.paused;
             }
         }
         info["capture_ms"] = json!(capture_started.elapsed().as_secs_f64() * 1000.0);
+        info["capture_timings_ms"] = json!({ "presentation": presentation_ms, "metadata": metadata_ms,
+            "save_clone": save_clone_ms, "trace": trace_ms });
         let dir = self.recorder.start(now_save, trace, journal, info, capture);
         log::info!(
             "report: captured state in {:.2} ms; started in {}",

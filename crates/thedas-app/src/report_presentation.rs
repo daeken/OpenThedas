@@ -62,6 +62,7 @@ pub fn snapshot(app: &crate::App) -> J {
                 .movies
                 .iter()
                 .flat_map(|m| m.observed_tokens())
+                .take(4096)
                 .collect();
         let values =
             g.ui.stage
@@ -69,7 +70,7 @@ pub fn snapshot(app: &crate::App) -> J {
                 .inspect_values(|values| ui_values(values, &tokens));
         json!({
             "movies": g.ui.stage.movies.iter().map(|m| m.name.as_str()).collect::<Vec<_>>(),
-            "contexts": g.ui.stage.bridge.contexts(), "dialog_up": g.ui.stage.dialog_up(),
+            "contexts": g.ui.stage.bridge.contexts(), "dialog_up": g.ui.stage.dialog_up(), "observer_limit": 4096,
             "screens": context.screens, "values": values,
         })
     });
@@ -115,23 +116,27 @@ fn ui_values(values: &BTreeMap<String, UiValue>, observed: &BTreeSet<&str>) -> J
     const LIMIT: usize = 1024;
     let mut budget = 8192;
     let mut truncated = false;
-    let names: BTreeSet<&str> = values
-        .keys()
-        .map(String::as_str)
-        .filter(|k| {
-            observed.contains(k)
-                || k.starts_with("GUI.")
-                || k.starts_with("Party.")
-                || k.starts_with("ClientOptions.")
-        })
-        .filter(|k| !super::config::sensitive_key(k))
-        .collect();
+    // Range into the existing sorted map; never walk/sort the whole bridge. A large
+    // inventory or save list must bound capture work as well as the resulting JSON.
+    let names = observed.iter().copied().take(LIMIT).chain(
+        ["GUI.", "Party.", "ClientOptions."]
+            .into_iter()
+            .flat_map(|prefix| {
+                values
+                    .range(prefix.to_string()..)
+                    .take_while(move |(key, _)| key.starts_with(prefix))
+                    .map(|(key, _)| key.as_str())
+            })
+            .take(LIMIT * 2),
+    );
     let mut result = serde_json::Map::new();
+    let mut visited = 0;
     // Observed tokens first: a large inventory must not crowd out the HUD's values.
-    for name in observed.iter().copied().chain(names.iter().copied()) {
+    for name in names {
         if result.len() >= LIMIT || budget == 0 {
             break;
         }
+        visited += 1;
         if result.contains_key(name) || super::config::sensitive_key(name) {
             continue;
         }
@@ -143,8 +148,9 @@ fn ui_values(values: &BTreeMap<String, UiValue>, observed: &BTreeSet<&str>) -> J
         }
     }
     json!({ "limit": LIMIT, "node_limit": 8192, "string_limit": 512,
-        "candidate_count": names.len(), "captured_count": result.len(),
-        "truncated": truncated || result.len() < names.len() || budget == 0, "items": result })
+        "bridge_value_count": values.len(), "candidate_limit": LIMIT * 3, "visited_candidates": visited,
+        "captured_count": result.len(),
+        "truncated": truncated || result.len() < values.len() || budget == 0, "items": result })
 }
 
 fn ui_value(value: &UiValue, budget: &mut usize, depth: usize, truncated: &mut bool) -> J {
@@ -271,5 +277,19 @@ mod tests {
                 .count(),
             512
         );
+    }
+
+    #[test]
+    fn a_large_bridge_bounds_work_and_keeps_observed_tokens_first() {
+        let mut values: BTreeMap<_, _> = (0..10_000)
+            .map(|i| (format!("GUI.Row.{i:05}"), UiValue::Number(i as f64)))
+            .collect();
+        values.insert("ZZ.Health".into(), UiValue::Number(95.0));
+        let result = ui_values(&values, &BTreeSet::from(["ZZ.Health"]));
+        assert_eq!(result["items"]["ZZ.Health"], 95.0);
+        assert_eq!(result["captured_count"], 1024);
+        assert!(result["visited_candidates"].as_u64().unwrap() <= 3072);
+        assert_eq!(result["bridge_value_count"], 10_001);
+        assert_eq!(result["truncated"], true);
     }
 }
