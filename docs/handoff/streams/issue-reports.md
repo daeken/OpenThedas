@@ -194,8 +194,9 @@ thedas-app --install "$GAME" --save captures/replayed.json
   HOME for automated runs, and `THEDAS_HIDDEN_WINDOW=1` for any engine window.
 - The running CLI's commit must equal the journal header's build; refusal prints both.
   There is no bypass. To investigate an older report, check out its commit and transplant only
-  the replay CLI files/registration/build script and zip dependency, leaving its simulation,
-  script, resource and save code intact. Build there; do not relabel a current binary as old.
+  the replay CLI files/registration/build script, zip dependency and the additive
+  `thedas_sim::replay::load_checkpoint` helper, leaving its existing simulation, script,
+  resource and save logic intact. Build there; do not relabel a current binary as old.
 - `--until` is **absolute world time in milliseconds**, not elapsed time since the checkpoint.
   It stops before the first input that would exceed the limit, including within a repeat;
   it never shortens a tick. Commands at the same time still run (cutscenes can hold world time).

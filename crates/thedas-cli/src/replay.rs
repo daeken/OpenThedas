@@ -9,7 +9,7 @@ use anyhow::{Context, Result, bail, ensure};
 use serde_json::Value;
 use thedas_sim::Sim;
 use thedas_sim::commands::{InputEntry, SimCommand};
-use thedas_sim::replay::{JournalHeader, JournalLine, world_hash};
+use thedas_sim::replay::{JournalHeader, JournalLine, load_checkpoint, world_hash};
 use thedas_sim::save::{SAVE_FORMAT, SAVE_REVISION, SaveGame};
 
 const BUILD: &str = match option_env!("THEDAS_GIT_COMMIT") {
@@ -187,13 +187,6 @@ fn save(bytes: &[u8], name: &str) -> Result<SaveGame> {
         save.revision
     );
     Ok(save)
-}
-
-/// Restore a checkpoint verbatim: ordinary load_game deliberately clears panels, repairs
-/// saves and queues AREALOADSAVE events, none of which happened at a journal checkpoint.
-fn restore(sim: &mut Sim, mut checkpoint: SaveGame) {
-    checkpoint.world.tables = sim.world.tables.clone();
-    sim.restore((checkpoint.world, checkpoint.talk));
 }
 
 struct Progress {
@@ -397,7 +390,7 @@ pub fn run(
     .context("opening replay resources")?;
     // App::Live::open sets this before it starts a journal. It lives outside SaveGame.
     sim.party_picker_policy = thedas_sim::sim::PartyPickerPolicy::Player;
-    restore(&mut sim, checkpoint);
+    load_checkpoint(&mut sim, checkpoint)?;
     let progress = replay(&mut sim, &journal, until)?;
     if let Some(out) = out {
         std::fs::write(out, sim.save_json()?)
@@ -471,10 +464,37 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_load_keeps_resource_tables_and_saved_state_without_load_events() {
+        let mut live = sim();
+        live.world.time_ms = 123;
+        live.world.training.mode = 9;
+        let bytes = live.save_json().unwrap();
+        let expected: Value = serde_json::from_slice(&bytes).unwrap();
+        let mut again = sim();
+        let tables = again.world.tables();
+        load_checkpoint(&mut again, save(&bytes, "checkpoint").unwrap()).unwrap();
+        assert!(Arc::ptr_eq(&tables, &again.world.tables()));
+        assert_eq!(expected, serde_json::to_value(again.save_game()).unwrap());
+        assert_eq!(again.loads, 0);
+        for (format, revision, module) in [
+            (999, SAVE_REVISION, ""),
+            (SAVE_FORMAT, 999, ""),
+            (SAVE_FORMAT, SAVE_REVISION, "another module"),
+        ] {
+            let mut checkpoint = again.save_game();
+            checkpoint.format = format;
+            checkpoint.revision = revision;
+            checkpoint.module = module.into();
+            assert!(load_checkpoint(&mut again, checkpoint).is_err());
+            assert_eq!(expected, serde_json::to_value(again.save_game()).unwrap());
+        }
+    }
+
+    #[test]
     fn complete_report_matches_after_serialized_checkpoint_and_repeated_inputs() {
         let (checkpoint, log, expected) = fixture();
         let mut s = sim();
-        restore(&mut s, save(&checkpoint, "checkpoint").unwrap());
+        load_checkpoint(&mut s, save(&checkpoint, "checkpoint").unwrap()).unwrap();
         let journal = Journal::parse(&log, TEST_BUILD).unwrap();
         let result = replay(&mut s, &journal, None).unwrap();
         assert_eq!(result.applied, 6);
@@ -494,7 +514,7 @@ mod tests {
     fn until_stops_inside_repeat_without_splitting_tick() {
         let (checkpoint, log, _) = fixture();
         let mut s = sim();
-        restore(&mut s, save(&checkpoint, "checkpoint").unwrap());
+        load_checkpoint(&mut s, save(&checkpoint, "checkpoint").unwrap()).unwrap();
         let journal = Journal::parse(&log, TEST_BUILD).unwrap();
         let result = replay(&mut s, &journal, Some(250)).unwrap();
         assert_eq!(result.applied, 2);
@@ -517,12 +537,12 @@ mod tests {
             writer.take(&mut s).unwrap();
         }
         let journal = Journal::parse(&writer.into_inner(), TEST_BUILD).unwrap();
-        restore(&mut s, checkpoint);
+        load_checkpoint(&mut s, checkpoint).unwrap();
         let result = replay(&mut s, &journal, Some(0)).unwrap();
         assert_eq!(result.applied, 6);
         assert!(!result.stopped);
         let (checkpoint, log, _) = fixture();
-        restore(&mut s, save(&checkpoint, "checkpoint").unwrap());
+        load_checkpoint(&mut s, save(&checkpoint, "checkpoint").unwrap()).unwrap();
         let journal = Journal::parse(&log, TEST_BUILD).unwrap();
         let result = replay(&mut s, &journal, Some(1000)).unwrap();
         assert_eq!(result.applied, 6);
@@ -563,7 +583,7 @@ mod tests {
         let mut journal = Journal::parse(&log, TEST_BUILD).unwrap();
         s.world.time_ms = 1;
         assert!(replay(&mut s, &journal, None).is_err());
-        restore(&mut s, save(&checkpoint, "checkpoint").unwrap());
+        load_checkpoint(&mut s, save(&checkpoint, "checkpoint").unwrap()).unwrap();
         for line in &mut journal.lines {
             if let JournalLine::Check { hash, .. } = line {
                 *hash ^= 1;
