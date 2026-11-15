@@ -118,7 +118,7 @@ From `docs/deferred.md` and `docs/notes/deferred-*.md`:
 - Not yet in the G-buffer: hair (lit forward), unsupported alpha/blended families,
   Char2 (low detail), and far tree billboards. Character rim light, skin scattering,
   gore/heraldry and remote materials are not represented.
-- Point shadows: 4 slots × 6 faces at most; other point lights are unshadowed. Forward
+- Point shadows: 16 slots × 6 faces in six atlas sheets; other point lights are unshadowed. Forward
   families other than the listed cutouts and trees don't cast.
 - Lightmaps-off is experimental. Probes are the original's baked irradiance, SSAO is
   basic, and light leaks and probe discontinuities can occur.

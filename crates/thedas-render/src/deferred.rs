@@ -197,7 +197,8 @@ struct GpuLight {
     position: [f32; 4],
     colour: [f32; 4],
     rooms: [u32; 8],
-    /// x: its shadow slot ([`crate::deferred_shadow`]), −1 for none.
+    /// x: shadow slot ([`crate::deferred_shadow`]), −1 for none; y: lighting domain;
+    /// zw: atlas tile origin in texels, avoiding division in the per-pixel filter.
     shadow: [f32; 4],
 }
 
@@ -2089,7 +2090,11 @@ impl DeferredPass {
         let shadowed = if !crate::config::CONFIG.point_shadows {
             Vec::new()
         } else {
-            shadow_slots(&mut lights, camera.position)
+            shadow_slots(
+                &mut lights,
+                camera.position,
+                crate::config::CONFIG.shadow_slots,
+            )
         };
         if crate::config::CONFIG.log_lights {
             static ONCE: std::sync::Once = std::sync::Once::new();
@@ -2827,7 +2832,8 @@ fn draw_all(
 /// and all point lights in probe mode) that matter most from `eye`: their
 /// brightness times reach over their distance. Returns each slot's light (position,
 /// radius).
-fn shadow_slots(lights: &mut [GpuLight], eye: Vec3) -> Vec<(Vec3, f32)> {
+fn shadow_slots(lights: &mut [GpuLight], eye: Vec3, slots: usize) -> Vec<(Vec3, f32)> {
+    let columns = crate::deferred_shadow::atlas_columns(slots) as usize;
     let score = |l: &GpuLight| {
         let p = Vec3::from_slice(&l.position[..3]);
         let bright = l.colour[0].max(l.colour[1]).max(l.colour[2]);
@@ -2837,12 +2843,14 @@ fn shadow_slots(lights: &mut [GpuLight], eye: Vec3) -> Vec<(Vec3, f32)> {
         .filter(|&i| lights[i].colour[3] < 0.5 && lights[i].position[3] > 0.0)
         .collect();
     order.sort_by(|&a, &b| score(&lights[b]).total_cmp(&score(&lights[a])));
-    order.truncate(crate::deferred_shadow::SLOTS);
+    order.truncate(slots.min(crate::deferred_shadow::SLOTS));
     order
         .into_iter()
         .enumerate()
         .map(|(slot, i)| {
             lights[i].shadow[0] = slot as f32;
+            lights[i].shadow[2] = (slot % columns) as f32 * crate::deferred_shadow::SIZE as f32;
+            lights[i].shadow[3] = (slot / columns) as f32 * crate::deferred_shadow::SIZE as f32;
             let l = &lights[i];
             (Vec3::from_slice(&l.position[..3]), l.position[3])
         })
@@ -3118,8 +3126,8 @@ mod tests {
             light(4.0, 1.0, false),
             light(100.0, 1.0, false),
         ];
-        let slots = shadow_slots(&mut lights, Vec3::ZERO);
-        assert_eq!(slots.len(), crate::deferred_shadow::SLOTS);
+        let slots = shadow_slots(&mut lights, Vec3::ZERO, 4);
+        assert_eq!(slots.len(), 4);
         assert_eq!(
             lights[0].shadow[0], -1.0,
             "baked lights keep baked visibility"
@@ -3129,6 +3137,21 @@ mod tests {
         for (slot, (position, radius)) in slots.into_iter().enumerate() {
             assert_eq!(position.x, (slot + 1) as f32);
             assert_eq!(radius, 5.0);
+        }
+        let mut lights: Vec<_> = (1..=crate::deferred_shadow::SLOTS + 1)
+            .map(|i| light(i as f32, 1.0, false))
+            .collect();
+        let slots = shadow_slots(&mut lights, Vec3::ZERO, usize::MAX);
+        assert_eq!(slots.len(), crate::deferred_shadow::SLOTS);
+        for (i, light) in lights.iter().enumerate() {
+            assert_eq!(
+                light.shadow[0],
+                if i < slots.len() { i as f32 } else { -1.0 }
+            );
+            if i < slots.len() {
+                assert_eq!(light.shadow[2], (i % 4 * 512) as f32);
+                assert_eq!(light.shadow[3], (i / 4 * 512) as f32);
+            }
         }
     }
 

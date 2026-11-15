@@ -215,7 +215,7 @@ meshes explicitly marked not to cast shadows and faded objects do not enter thos
 The faithful renderer exposes only read-only palette and bound accessors to this path.
 
 The level and object renderers contribute before a single lighting pass, sharing room
-indices, depth, sun visibility and the four point-shadow slots. Their environment and
+indices, depth, sun visibility and the point-shadow atlas. Their environment and
 emissive terms are added afterwards. Objects interpolate their assigned SH probe's light
 from posed vertex normals; normal maps affect direct lighting. Placeables also
 take the brightest ambient node, while characters take no ambient nodes. Character-domain
@@ -294,7 +294,7 @@ debug views now include the ground. Terrain also joins the point-shadow caster l
   takes only `lerp(1, visibility, 0.15)`, the original exploration-camera blend; neither
   the whole lightmap nor dynamic emitter lights are multiplied by a second sun mask.
   World reconstruction undoes the G-buffer vertex shader's half-pixel fix-up.
-- Point and VFX lights: four cube shadow slots, allocated to dynamic lights by brightness
+- Point and VFX lights: up to sixteen cube shadow slots, allocated to dynamic lights by brightness
   times radius over distance from the camera. Each is six 512-square `R32Float` distance
   maps with a 0.35 m near plane to leave the flame's enclosing torch bowl out. Opaque
   eligible deferred meshes cast from both faces, including geometry outside the camera's
@@ -305,7 +305,18 @@ debug views now include the ground. Terrain also joins the point-shadow caster l
   comparisons. The lighting pass compares distances with a bilinear 2-by-2 filter, a 4 cm normal
   offset and 2 cm distance bias. Supported skinned objects and terrain cast too; forward
   materials do not, except for the trees and cutouts below. Static lights keep baked
-  visibility. At most 24 face passes per frame.
+  visibility. Six atlas sheets hold one 512-square tile per light, with one render pass
+  per dirty sheet (at most six per frame). Each pass clears only dirty colour tiles;
+  clean cubes retain their distances. A shared scratch depth sheet is cleared per pass.
+  The filter clamps its four taps to the selected tile before adding its atlas origin,
+  so adjacent lights cannot bleed into one another at face edges or corners. The CPU
+  packs that origin into spare light-uniform fields, avoiding per-pixel tile division.
+  `THEDAS_DEFERRED_SHADOW_SLOTS=4` retains the previous light budget for comparisons;
+  integer values clamp to 1–16, with sixteen as the default. This control is read once.
+  The sixteen-slot atlas is six 2048-square distance sheets (96 MiB) and one 2048-square
+  scratch depth sheet (16 MiB). Four slots use six 1024-square sheets and 4 MiB depth
+  (28 MiB total, versus the previous 48 MiB). Face matrices occupy 6 KiB of uniforms,
+  within the portable 16 KiB binding limit. No G-buffer attachment is added.
   `THEDAS_DEFERRED_POINT_SHADOWS=0` disables both rendering and sampling these maps for
   captures and cost comparisons; it does not change the faithful path.
 - Tree point casters: roomless rigid single-pass fronds, branches, mesh leaves and
@@ -361,7 +372,7 @@ switch. Choose it before loading an area. F11 still switches between faithful an
   to zero. The fourth G-buffer target uses `Rgba16Float` in this mode so bright probes
   survive above one; the four targets still meet the portable 32-byte attachment budget.
 - Baked visibility becomes one. The sun uses the existing partitions; each point light
-  uses its own cube shadow if it wins one of the four slots. Static point lights now
+  uses its own cube shadow if it wins one of the sixteen slots. Static point lights now
   compete with dynamic ones for those slots, and no point light takes the sun's mask.
   Other point lights remain unshadowed, with the existing room reach and radius cutoff.
 - A deterministic twelve-sample world-space hemisphere provides screen-space ambient
