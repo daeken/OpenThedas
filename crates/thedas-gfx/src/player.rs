@@ -2441,25 +2441,6 @@ mod queue_tests {
     }
 
     #[test]
-    fn fractional_child_transforms_keep_the_authored_map_viewport_size() {
-        let (mut p, field) = input_player();
-        remove_clip(&mut p.vm, field);
-        let root = p.vm.root;
-        let parent = create_empty(&mut p.vm, root, "viewport", 1).unwrap();
-        let child = create_empty(&mut p.vm, parent, "border", 1).unwrap();
-        draw_pick_rect(&mut p.vm, child, 837.0, 604.0);
-        p.vm.display.get_mut(child).unwrap().matrix = crate::swf::Matrix::translate(0.5, -0.5);
-        let value = p.vm.display_object(parent);
-        assert_eq!(p.vm.get(&value, "_width"), Value::Number(837.0));
-        assert_eq!(p.vm.get(&value, "_height"), Value::Number(604.0));
-        let size = display_api::local_bounds(&p.vm, parent).unwrap();
-        assert_eq!((size.width(), size.height()), (837 * 20, 604 * 20));
-        p.vm.display.get_mut(parent).unwrap().matrix = crate::swf::Matrix::translate(0.5, 0.5);
-        let size = display_api::local_bounds(&p.vm, root).unwrap();
-        assert_eq!((size.width(), size.height()), (837 * 20, 604 * 20));
-    }
-
-    #[test]
     fn mouse_caret_and_drag_selection_use_transformed_text_coordinates() {
         let (mut p, field) = input_player();
         let o = p.vm.display.get_mut(field).unwrap();
@@ -3038,6 +3019,25 @@ mod queue_tests {
         assert!(p.vm.display.set_mask(front, None));
         p.vm.display.get_mut(dynamic_mask).unwrap().visible = true;
         assert_eq!(p.topmost_at(5.0, 5.0), Some(dynamic_mask));
+    }
+
+    #[test]
+    fn fractional_child_transforms_keep_the_authored_map_viewport_size() {
+        let (mut p, field) = input_player();
+        remove_clip(&mut p.vm, field);
+        let root = p.vm.root;
+        let parent = create_empty(&mut p.vm, root, "viewport", 1).unwrap();
+        let child = create_empty(&mut p.vm, parent, "border", 1).unwrap();
+        draw_pick_rect(&mut p.vm, child, 837.0, 604.0);
+        p.vm.display.get_mut(child).unwrap().matrix = crate::swf::Matrix::translate(0.5, -0.5);
+        let value = p.vm.display_object(parent);
+        assert_eq!(p.vm.get(&value, "_width"), Value::Number(837.0));
+        assert_eq!(p.vm.get(&value, "_height"), Value::Number(604.0));
+        let size = display_api::local_bounds(&p.vm, parent).unwrap();
+        assert_eq!((size.width(), size.height()), (837 * 20, 604 * 20));
+        p.vm.display.get_mut(parent).unwrap().matrix = crate::swf::Matrix::translate(0.5, 0.5);
+        let size = display_api::local_bounds(&p.vm, root).unwrap();
+        assert_eq!((size.width(), size.height()), (837 * 20, 604 * 20));
     }
 
     #[test]
