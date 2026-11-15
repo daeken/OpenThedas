@@ -5253,6 +5253,7 @@ dependencies = [
  "glam",
  "log",
  "png",
+ "serde_json",
  "thedas-formats",
  "thedas-render",
  "thedas-vfs",
