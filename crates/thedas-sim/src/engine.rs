@@ -1435,8 +1435,28 @@ pub fn call(
             h.object(obj(a, 0)).map_or([0.0; 3], |o| o.position),
         )),
         "SetPosition" => {
-            if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
-                o.position = vector(a, 1);
+            let id = obj(a, 0);
+            let mut position = vector(a, 1);
+            // DAOrigins.exe 0x6554b0: a creature with bSafePosition set (default
+            // TRUE) searches within 5 m, check and snap on. Only result 1 moves it;
+            // non-creatures and bSafePosition FALSE use the requested point directly.
+            if (a.len() < 3 || int(a, 2) != 0)
+                && h.object(id).is_some_and(|o| o.kind == ObjectKind::Creature)
+            {
+                let area = h.object(id).and_then(|o| o.area).unwrap_or(OBJECT_INVALID);
+                let how = crate::nav::SafeSearch {
+                    radius: 5.0,
+                    body_radius: h.sim.capsule_radius(id),
+                    mover: Some(id),
+                    standable_keeps: true,
+                };
+                let Some(found) = h.sim.safe_search(area, position, how) else {
+                    return void();
+                };
+                position = found;
+            }
+            if let Some(o) = h.sim.world.get_mut(id) {
+                o.position = position;
             }
             void()
         }
@@ -7510,6 +7530,84 @@ mod tests {
             script: "test".into(),
         };
         call(&mut h, caller, &f, a).unwrap().unwrap()
+    }
+
+    #[test]
+    fn set_position_searches_only_safe_creature_moves_within_five_metres() {
+        let table = Arc::new(
+            EngineTable::parse(b"void SetPosition(object o, vector v, int safe = 1) = 22;\n")
+                .unwrap(),
+        );
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        let area = s.world.spawn(ObjectKind::Area, "a");
+        let creature = s.world.spawn(ObjectKind::Creature, "creature");
+        let placeable = s.world.spawn(ObjectKind::Placeable, "placeable");
+        for id in [creature, placeable] {
+            let o = s.world.get_mut(id).unwrap();
+            o.area = Some(area);
+            o.facing = 123.0;
+        }
+        s.area_layouts.insert(area, "open".into());
+        let mut data = vec![1; 64];
+        data[18] = 9;
+        s.nav_grids.insert(
+            "open".into(),
+            Some(Arc::new(thedas_formats::level::NavGrid {
+                columns: 8,
+                rows: 8,
+                cell_size: 0.5,
+                clearance: 2.0,
+                base: [10.0, 10.0, 0.0],
+                normal: [0.0, 0.0, 1.0],
+                data,
+                heights: vec![16.0; 64],
+                surfaces: Vec::new(),
+            })),
+        );
+        let before = [12.25, 12.25, 7.0];
+        for (id, requested, safe, succeeds, snaps) in [
+            (creature, [12.25, 12.25, 3.0], 1, true, true),
+            (creature, [11.25, 11.25, 3.0], 1, false, false),
+            (creature, [9.4, 12.0, 3.0], 1, true, true),
+            (creature, [4.0, 12.0, 3.0], 1, false, false),
+            (creature, [11.25, 11.25, 3.0], 0, true, false),
+            (placeable, [11.25, 11.25, 3.0], 1, true, false),
+        ] {
+            s.world.get_mut(id).unwrap().position = before;
+            run(
+                &mut s,
+                id,
+                "SetPosition",
+                &[
+                    Value::Object(id),
+                    Value::Vector(requested),
+                    Value::Int(safe),
+                ],
+            );
+            let o = s.world.get(id).unwrap();
+            assert_eq!((o.area, o.facing), (Some(area), 123.0));
+            if snaps {
+                assert_eq!(o.position[2], 1.0);
+                assert!(crate::nav::on_walkable(
+                    &s.loaded_nav_grid(area).unwrap(),
+                    o.position
+                ));
+            } else {
+                assert_eq!(o.position, if succeeds { requested } else { before });
+            }
+        }
+        // Default safe flag is on, and an occupied point is not search result 1.
+        let blocker = s.world.spawn(ObjectKind::Creature, "blocker");
+        s.world.get_mut(blocker).unwrap().area = Some(area);
+        s.world.get_mut(blocker).unwrap().position = [12.25, 12.25, 1.0];
+        s.world.get_mut(creature).unwrap().position = before;
+        run(
+            &mut s,
+            creature,
+            "SetPosition",
+            &[Value::Object(creature), Value::Vector([12.25, 12.25, 3.0])],
+        );
+        assert_eq!(s.world.get(creature).unwrap().position, before);
     }
 
     #[test]

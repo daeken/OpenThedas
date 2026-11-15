@@ -28,6 +28,7 @@ Each entry gives what the original does, what we do, evidence, a rough size (S <
 6. **CommandJumpToLocation, CommandFly, SetFacingPosition, IsMoving, GetRoamLocation** are not implemented (static call counts 137, 353, 4, 2, 2). CommandFly is mostly in flyby/cutscene scripts. Size S each.
 7. **SetPhysicsController** (52 calls) is not implemented. It turns a creature's controller on or off, which matters once blocking lands. Size S. Deps: A1.
 8. **Personal space and overlap at spawn**: creatures placed overlapping are not pushed apart (the exe's capsule grows in 0.1 steps "while there is room"). Size S.
+9. **SetPosition safe search** follows 0x6554b0: creatures with bSafePosition set use the 5 m search with check and snap on, moving only on result 1. Other objects and an unset flag use the exact point. The standable test remains the pathing-grid approximation; `SetLocation` still places exactly as traced at 0x65b3b0.
 
 ### B. Combat rules and timing
 
