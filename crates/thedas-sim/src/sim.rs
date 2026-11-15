@@ -1225,6 +1225,7 @@ impl Sim {
         self.advance_da2_projectiles();
         self.regenerate(elapsed);
         self.decay_corpses(elapsed);
+        self.kick_ambient_creatures(elapsed);
         self.advance_script_heartbeats(elapsed);
         self.update_threat(elapsed);
         self.expire_effects();
