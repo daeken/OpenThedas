@@ -324,21 +324,28 @@ impl Sim {
     /// table's `SecondaryRange` (20 for the medium and monster rows, 30 for the long ones) is
     /// not used, its meaning not recovered.
     pub fn perception_range(&self, id: ObjectId) -> f32 {
-        let class = self
-            .world
+        let class = self.perception_class(id, &crate::engine::party_of(self));
+        self.perception_range_of_class(class)
+    }
+
+    /// The `ranges.gda` row a creature perceives with (see [`Sim::perception_range`]).
+    fn perception_class(&self, id: ObjectId, party: &[ObjectId]) -> i64 {
+        self.world
             .get(id)
             .and_then(|o| o.fields.get("PerceptionClass").copied())
             .filter(|&r| r > 0)
             .map(i64::from)
             .unwrap_or_else(|| {
-                let party =
-                    Some(id) == self.world.hero || crate::engine::party_of(self).contains(&id);
-                if party {
+                if Some(id) == self.world.hero || party.contains(&id) {
                     PERCEPTION_PLAYER
                 } else {
                     PERCEPTION_DEFAULT
                 }
-            });
+            })
+    }
+
+    /// The perception range of a `ranges.gda` row (see [`Sim::perception_range`]).
+    fn perception_range_of_class(&self, class: i64) -> f32 {
         self.world
             .tables()
             .get(RANGES_TABLE, "")
@@ -405,6 +412,28 @@ impl Sim {
                 })
             })
             .collect();
+        // Each creature's perception range (`Sim::perception_range`), by class: the party
+        // and the range table read once a tick, not once a creature.
+        let party = crate::engine::party_of(self);
+        let mut by_class: std::collections::HashMap<i64, f32> = Default::default();
+        let rings: Vec<f32> = creatures
+            .iter()
+            .map(|&(c, _)| {
+                let class = self.perception_class(c, &party);
+                *by_class
+                    .entry(class)
+                    .or_insert_with(|| self.perception_range_of_class(class))
+            })
+            .collect();
+        // Who can be near whom: the creatures in square cells as wide as the furthest any of
+        // them sees, so a creature only looks at the cells round its own. The candidates are
+        // sorted back into the world's order, so the result is what testing every pair gave.
+        let cell = rings.iter().fold(VISUAL_RANGE, |m, &r| m.max(r)).max(1.0);
+        let key = |p: [f32; 3]| ((p[0] / cell).floor() as i64, (p[1] / cell).floor() as i64);
+        let mut cells: std::collections::HashMap<(i64, i64), Vec<usize>> = Default::default();
+        for (j, &(_, p)) in creatures.iter().enumerate() {
+            cells.entry(key(p)).or_default().push(j);
+        }
         // (Perception only queues events, so none of this changes during the update.)
         let hostility = self.world.hostility.clone();
         let hostile = |i: usize, j: usize| -> bool {
@@ -472,7 +501,7 @@ impl Sim {
             // the exe's room visibility for everyone; without the level's collision files a
             // wall of the pathing grid stands in for the ray, and the grid marks large
             // furniture and rubble the same way as walls, so those block hostiles too.
-            let ring = self.perception_range(id);
+            let ring = rings[i];
             let seen = self
                 .world
                 .get(id)
@@ -480,9 +509,18 @@ impl Sim {
                 .unwrap_or_default();
             let reach = ring.max(VISUAL_RANGE);
             let in_view: Vec<usize> = if alive {
-                creatures
-                    .iter()
-                    .enumerate()
+                let (cx, cy) = key(pos);
+                let mut near: Vec<usize> = Vec::new();
+                for dx in -1..=1 {
+                    for dy in -1..=1 {
+                        if let Some(v) = cells.get(&(cx + dx, cy + dy)) {
+                            near.extend_from_slice(v);
+                        }
+                    }
+                }
+                near.sort_unstable();
+                near.into_iter()
+                    .map(|j| (j, &creatures[j]))
                     .filter(|&(j, &(o, p))| {
                         // Nothing beyond both ranges is seen; tested first as the cheapest.
                         let d = dist(pos, p);
