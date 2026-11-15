@@ -3422,6 +3422,23 @@ pub fn call(
                 handle: Some(hd),
             })
         }
+        "GetTrapDetectionDifficulty" | "GetTrapDisarmDifficulty"
+            if h.sim.game == thedas_vfs::Game::Origins =>
+        {
+            // Native 411/413 share 0x668a20. Its placeable branch reads the
+            // signed members +0x644/+0x648 (GFF fields 0x3f84/0x3f85).
+            let field = if name == "GetTrapDetectionDifficulty" {
+                "TrapDetection"
+            } else {
+                "TrapDisarm"
+            };
+            ok(Value::Int(
+                h.object(obj(a, 0))
+                    .filter(|o| o.kind == ObjectKind::Placeable)
+                    .and_then(|o| o.fields.get(field).copied())
+                    .unwrap_or(0),
+            ))
+        }
         "SetTrapDetected" => {
             if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
                 o.fields.insert("TrapDetected".into(), int(a, 1));
@@ -6531,6 +6548,96 @@ mod tests {
             script: "test".into(),
         };
         assert!(call(&mut h, owner, &f, &[]).is_none());
+    }
+
+    fn trap_difficulty_sim() -> Sim {
+        let table = EngineTable::parse(b"int GetTrapDetectionDifficulty(object o) = 411;\nint GetTrapDisarmDifficulty(object o) = 413;\n").unwrap();
+        Sim::new(Arc::new(Vfs::new()), Arc::new(table), 1)
+    }
+
+    #[test]
+    fn trap_difficulty_getters_read_distinct_signed_placeable_fields_without_state_checks() {
+        let mut s = trap_difficulty_sim();
+        let trap = s.world.spawn(ObjectKind::Placeable, "trap");
+        assert_eq!(
+            run(
+                &mut s,
+                trap,
+                "GetTrapDetectionDifficulty",
+                &[Value::Object(trap)]
+            ),
+            Some(Value::Int(0))
+        );
+        for (detection, disarm) in [(17, 31), (-8, 0), (i32::MIN, i32::MAX)] {
+            let o = s.world.get_mut(trap).unwrap();
+            o.fields.insert("TrapDetection".into(), detection);
+            o.fields.insert("TrapDisarm".into(), disarm);
+            o.active = false;
+            o.dead = true;
+            o.fields.insert("Health".into(), 0);
+            assert_eq!(
+                run(
+                    &mut s,
+                    trap,
+                    "GetTrapDetectionDifficulty",
+                    &[Value::Object(trap)]
+                ),
+                Some(Value::Int(detection))
+            );
+            assert_eq!(
+                run(
+                    &mut s,
+                    trap,
+                    "GetTrapDisarmDifficulty",
+                    &[Value::Object(trap)]
+                ),
+                Some(Value::Int(disarm))
+            );
+        }
+    }
+
+    #[test]
+    fn trap_difficulty_getters_reject_other_kinds_even_with_matching_fields() {
+        let mut s = trap_difficulty_sim();
+        for kind in [
+            ObjectKind::Creature,
+            ObjectKind::Item,
+            ObjectKind::Trigger,
+            ObjectKind::Area,
+            ObjectKind::Module,
+            ObjectKind::Store,
+        ] {
+            let id = s.world.spawn(kind, "not_a_trap_placeable");
+            for field in ["TrapDetection", "TrapDisarm"] {
+                s.world.get_mut(id).unwrap().fields.insert(field.into(), 42);
+            }
+            for name in ["GetTrapDetectionDifficulty", "GetTrapDisarmDifficulty"] {
+                assert_eq!(
+                    run(&mut s, id, name, &[Value::Object(id)]),
+                    Some(Value::Int(0))
+                );
+                assert_eq!(
+                    run(&mut s, id, name, &[Value::Object(OBJECT_INVALID)]),
+                    Some(Value::Int(0))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn trap_difficulty_getters_leave_da2_dispatch_unchanged() {
+        let mut s = trap_difficulty_sim();
+        s.game = thedas_vfs::Game::DragonAge2;
+        let id = s.world.spawn(ObjectKind::Placeable, "trap");
+        for name in ["GetTrapDetectionDifficulty", "GetTrapDisarmDifficulty"] {
+            let f = s.table.function_by_name(name).unwrap().clone();
+            let mut h = ScriptHost {
+                sim: &mut s,
+                event: None,
+                script: "test".into(),
+            };
+            assert!(call(&mut h, id, &f, &[Value::Object(id)]).is_none());
+        }
     }
 
     #[test]
