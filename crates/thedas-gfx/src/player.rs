@@ -3332,15 +3332,14 @@ mod queue_tests {
             (24.0, 16.0)
         );
         p.vm.set(&value, "htmlText", Value::from("plain text"));
+        let fonts = p.vm.fonts.clone();
         assert!(
             p.vm.display
-                .get(field)
+                .get_mut(field)
                 .unwrap()
-                .text()
+                .text_mut()
                 .unwrap()
-                .layout
-                .as_ref()
-                .unwrap()
+                .layout(&*fonts)
                 .lines[0]
                 .images
                 .is_empty()
