@@ -29,7 +29,8 @@ Each entry gives what the original does, what we do, evidence, a rough size (S <
 6. **CommandFly, SetFacingPosition, IsMoving, GetRoamLocation** are not implemented (static call counts 353, 4, 2, 2). CommandFly is mostly in flyby/cutscene scripts. `CommandJumpToLocation` now uses the traced 0x7a4100 safe-location search (20 m, check on) and fails unless the search succeeds. The physics standable test remains the grid approximation documented in `nav.rs`. Size S each.
 7. **SetPhysicsController** (52 calls) is not implemented. It turns a creature's controller on or off, which matters once blocking lands. Size S. Deps: A1.
 8. **Personal space and overlap at spawn**: creatures placed overlapping are not pushed apart (the exe's capsule grows in 0.1 steps "while there is room"). Size S.
-9. **SetPosition safe search** follows 0x6554b0: creatures with bSafePosition set use the 5 m search with check and snap on, moving only on result 1. Other objects and an unset flag use the exact point. The standable test remains the pathing-grid approximation; `SetLocation` still places exactly as traced at 0x65b3b0.
+9. **Arrival placement** now follows 0x6c73c0: the controlled leader takes the waypoint, followers take compact formation slots (0x7605b0, flag 1), and each point passes through the 20 m safe-location search. The standable test still approximates physics with the pathing grid; formation mirroring and the random fallback past slot 10 remain unmodelled. Save loading keeps saved positions.
+10. **SetPosition safe search** follows 0x6554b0: creatures with bSafePosition set use the 5 m search with check and snap on, moving only on result 1. Other objects and an unset flag use the exact point. The standable test remains the pathing-grid approximation; `SetLocation` still places exactly as traced at 0x65b3b0.
 
 ### B. Combat rules and timing
 
