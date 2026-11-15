@@ -170,7 +170,9 @@ impl Matrix {
         })
     }
 
-    /// The bounds of `rect` under this matrix.
+    /// Script-visible bounds in whole twips. Both ends follow the transformed
+    /// coordinates' fixed-point rounding, so a fractional placement cannot grow
+    /// the measured width or height by rounding the far edge outwards.
     pub fn transform_rect(&self, r: &Rect) -> Rect {
         let pts = [
             self.apply(r.x_min as f32, r.y_min as f32),
@@ -187,9 +189,9 @@ impl Matrix {
         }
         Rect {
             x_min: x0.floor() as i32,
-            x_max: x1.ceil() as i32,
+            x_max: x1.floor() as i32,
             y_min: y0.floor() as i32,
-            y_max: y1.ceil() as i32,
+            y_max: y1.floor() as i32,
         }
     }
 }
