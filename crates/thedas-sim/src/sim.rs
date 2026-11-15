@@ -4271,6 +4271,7 @@ impl Sim {
             if let Some(t) = &tmpl {
                 apply_template(o, t);
             }
+            apply_placeable_useable(o, self.game);
         }
         if let Some(t) = &tmpl {
             match kind {
@@ -4516,6 +4517,7 @@ impl Sim {
             }
         }
         read_text_fields(o, inst);
+        apply_placeable_useable(o, self.game);
         // A waypoint's map note text (a talk-table id), which the area map shows.
         if let Some(s) = strref(inst, "MapNote") {
             o.fields.insert("MapNote".into(), s as i32);
@@ -4565,6 +4567,18 @@ impl Sim {
         }
         self.created(id);
         id
+    }
+}
+
+/// Origins loads a placeable's `Useable` byte through its interaction setter
+/// (0x7506f0..0x750705 -> 0x69ba70). Apply it after instance overrides too;
+/// scripts may subsequently change `interactive` independently of the template.
+pub(crate) fn apply_placeable_useable(o: &mut crate::world::Object, game: thedas_vfs::Game) {
+    if game == thedas_vfs::Game::Origins
+        && o.kind == ObjectKind::Placeable
+        && let Some(useable) = o.fields.get("Useable")
+    {
+        o.interactive = *useable != 0;
     }
 }
 
@@ -5396,6 +5410,39 @@ mod tests {
         let mut none = vec![args[0].clone()];
         assert_eq!(h.action_ref(1, &f("NoTwinRef"), &mut none).unwrap(), None);
         assert_eq!(none[0], args[0]);
+    }
+
+    #[test]
+    fn origins_placed_scenery_loads_its_useable_flag() {
+        use thedas_formats::gff3::Field;
+        for game in [thedas_vfs::Game::Origins, thedas_vfs::Game::DragonAge2] {
+            for useable in [None, Some(0), Some(1), Some(2)] {
+                let mut s = sim();
+                s.game = game;
+                let area = s.world.spawn(ObjectKind::Area, "dust_town");
+                let inst = Struct {
+                    id: 0,
+                    fields: useable
+                        .map(|v| Field {
+                            label: "Useable".into(),
+                            value: G3::Byte(v),
+                        })
+                        .into_iter()
+                        .collect(),
+                };
+                let are = Gff3 {
+                    file_type: *b"ARE ",
+                    file_version: *b"V3.2",
+                    structs: vec![inst.clone()],
+                };
+                let id = s.spawn_instance(&are, &inst, ObjectKind::Placeable, "", area);
+                assert_eq!(
+                    s.world.get(id).unwrap().interactive,
+                    game != thedas_vfs::Game::Origins || useable != Some(0),
+                    "{game:?}, Useable={useable:?}"
+                );
+            }
+        }
     }
 
     #[test]
