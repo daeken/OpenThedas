@@ -2266,6 +2266,7 @@ impl Sim {
         let routed = match self.route_and_approach(id, to) {
             (crate::nav::Routed::Path(p), _) => Some(p),
             (crate::nav::Routed::Straight, _) => None,
+            (crate::nav::Routed::InvalidPath, _) => return false,
             (crate::nav::Routed::Door(d), up_to) => {
                 door = Some(d);
                 if up_to.is_empty() {
@@ -2552,8 +2553,9 @@ impl Sim {
     /// that is replaced before it finishes so starts the next one from there, as continuous
     /// movement does, crossing the triggers on the way.
     /// The route a mover takes from where it is to `to` in its area: the area's pathing
-    /// grid's route (see `nav::route`), as waypoints ending at `to`; empty (a straight line)
-    /// when there is no grid, either end is off it or no route exists.
+    /// grid's route (see `nav::route`), as waypoints ending at `to`. A failed Origins grid
+    /// route with more than 0.5 m of height difference fails; the other unknown routes
+    /// still use the provisional straight-line fallback.
     ///
     /// Closed doors block the way (see `Sim::closed_doors`): when the only route passes
     /// through one, the result is that door (the original fails such a move with
@@ -2666,6 +2668,14 @@ impl Sim {
             crate::nav::route_avoiding(&g, from, to, &locked)
         };
         let Some(p) = unlocked_route.or_else(|| crate::nav::route(&g, from, to)) else {
+            // Origins 0x73ea80 tries a collision-tested direct path after a failed search
+            // only when |start.z - goal.z| <= 0.5 (0x73ee88, constant 0xb1b7b4).
+            // Status 5/8 then stops locomotion and returns INVALID_PATH (-4) in
+            // 0x7a9130. Do not turn a failed tall route into a walk through the level.
+            // The flat fallback's collision test and DA2's path failures remain untraced.
+            if self.game == thedas_vfs::Game::Origins && (from[2] - to[2]).abs() > 0.5 {
+                return Routed::InvalidPath;
+            }
             return Routed::Straight;
         };
         if blocked.is_empty() {
@@ -3546,6 +3556,10 @@ impl Sim {
                                 match self.route_to(id, stop) {
                                     crate::nav::Routed::Path(p) => p,
                                     crate::nav::Routed::Straight => Vec::new(),
+                                    crate::nav::Routed::InvalidPath => {
+                                        self.fail_front_command(id, "COMMAND_FAILED_INVALID_PATH");
+                                        continue;
+                                    }
                                     crate::nav::Routed::Door(door) => {
                                         self.fail_blocked(id, door);
                                         continue;
@@ -3718,6 +3732,10 @@ impl Sim {
                             } {
                                 crate::nav::Routed::Path(p) => p,
                                 crate::nav::Routed::Straight => Vec::new(),
+                                crate::nav::Routed::InvalidPath => {
+                                    self.fail_front_command(id, "COMMAND_FAILED_INVALID_PATH");
+                                    continue;
+                                }
                                 crate::nav::Routed::Door(door) => {
                                     self.fail_blocked(id, door);
                                     continue;
