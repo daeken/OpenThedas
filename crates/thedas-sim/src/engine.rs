@@ -48,7 +48,7 @@ fn obj(a: &[Value], i: usize) -> ObjectId {
 }
 
 /// The independent placeable current, retaining explicit currents from older saves.
-fn origins_placeable_health(o: &Object) -> i32 {
+pub(crate) fn origins_placeable_health(o: &Object) -> i32 {
     o.properties.get(&7).map_or_else(
         || i32::from(o.fields.get("Health").copied().unwrap_or(0) as i16),
         |p| p.1.round() as i32,
@@ -3140,19 +3140,7 @@ pub fn call(
         "SetPlaceableHealth" => {
             // 0x65a250 -> 0x74e8e0: signed-short current, independent of
             // maximum and object flags. The scripts send their own DEATH event.
-            let current = i32::from(int(a, 1) as i16);
-            if h.sim.game == thedas_vfs::Game::Origins
-                && let Some(o) = h.sim.world.get_mut(obj(a, 0))
-                && o.kind == ObjectKind::Placeable
-            {
-                o.fields.insert("Health".into(), current);
-                if let Some(p) = o.properties.get_mut(&7) {
-                    p.1 = current as f32;
-                }
-                if current <= 0 && o.inventory.is_empty() {
-                    o.interactive = false;
-                }
-            }
+            h.sim.set_placeable_health(obj(a, 0), int(a, 1));
             void()
         }
         "GetHealth" => {

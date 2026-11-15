@@ -40,6 +40,7 @@ pub mod levelup;
 pub mod m2da;
 pub mod nav;
 pub mod orders;
+mod placeable;
 pub mod plot;
 pub mod prcscr;
 pub mod quickbar;
