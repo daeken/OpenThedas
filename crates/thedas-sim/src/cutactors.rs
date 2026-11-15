@@ -358,11 +358,22 @@ impl Sim {
         };
         let owner = line.map(|l| l.owner);
         let mut out: Vec<Bound> = Vec::new();
+        let mut bindings = std::collections::HashMap::new();
         for (index, a) in tracks.actors.iter().enumerate() {
             let Some(name) = a.tag.as_deref() else {
                 continue;
             };
-            let Some(id) = self.cutscene_actor_object(name, owner, player) else {
+            let id = if self.game == thedas_vfs::Game::DragonAge2 {
+                // The native take path caches a binding name before claiming
+                // its object. A repeated FOLLOWER label must not consume another
+                // companion when a second resource actor uses that label.
+                *bindings
+                    .entry(name)
+                    .or_insert_with(|| self.bound_actor_object(name, owner, player, &out))
+            } else {
+                self.cutscene_actor_object(name, owner, player)
+            };
+            let Some(id) = id else {
                 continue;
             };
             if out.iter().any(|b| b.object == id) {
@@ -392,6 +403,33 @@ impl Sim {
             });
         }
         out
+    }
+
+    /// DA2 0x59bd80 resolves FOLLOWER aliases against the active party and the
+    /// objects already claimed by this performance. The label's number is not
+    /// a party index: each plain alias takes the first unclaimed non-hero.
+    fn bound_actor_object(
+        &self,
+        name: &str,
+        owner: Option<ObjectId>,
+        player: Option<ObjectId>,
+        claimed: &[Bound],
+    ) -> Option<ObjectId> {
+        let name = name.trim();
+        if self.game == thedas_vfs::Game::DragonAge2
+            && name.starts_with("FOLLOWER")
+            && name.encode_utf16().count() >= 10
+        {
+            let mut party = crate::engine::party_of(self)
+                .into_iter()
+                .filter(|id| Some(*id) != self.world.hero);
+            return if let Some(tag) = name.strip_prefix("FOLLOWER:") {
+                party.find(|id| self.world.get(*id).is_some_and(|o| o.tag == tag))
+            } else {
+                party.find(|id| !claimed.iter().any(|b| b.object == *id))
+            };
+        }
+        self.cutscene_actor_object(name, owner, player)
     }
 
     /// A cutscene ends: the objects it took are put back or left at their end poses (see
@@ -840,5 +878,69 @@ mod tests {
             s.conversation_placement(Some("none"), false, hunter, hero)
                 .is_none()
         );
+    }
+    #[test]
+    fn da2_follower_aliases_take_unclaimed_active_party_members_in_order() {
+        for game in [thedas_vfs::Game::Origins, thedas_vfs::Game::DragonAge2] {
+            let (mut s, hero, first, _) = sim();
+            s.game = game;
+            let second = s.world.spawn(ObjectKind::Creature, "second");
+            let third = s.world.spawn(ObjectKind::Creature, "third");
+            let reserve = s.world.spawn(ObjectKind::Creature, "reserve");
+            let area = s.world.area;
+            for id in [second, third, reserve] {
+                s.world.get_mut(id).unwrap().area = area;
+            }
+            s.world.get_mut(hero).unwrap().followers = vec![first, second, third];
+            let tracks = Tracks {
+                actors: vec![
+                    actor("second", [0.0; 3], 0.0),
+                    actor("PLAYER", [0.0; 3], 0.0),
+                    actor("FOLLOWER 99", [1.0; 3], 0.0),
+                    actor("FOLLOWER 99", [9.0; 3], 0.0),
+                    actor("FOLLOWER 1", [2.0; 3], 0.0),
+                    actor("FOLLOWER 2", [3.0; 3], 0.0),
+                    actor("FOLLOWER:second", [4.0; 3], 0.0),
+                    actor("FOLLOWER:reserve", [5.0; 3], 0.0),
+                ],
+                ..Tracks::default()
+            };
+            let bound = s.bind_cutscene_actors(
+                &tracks,
+                Some(LineContext {
+                    owner: first,
+                    player: hero,
+                    unstaged: false,
+                    placement: Placement::NONE,
+                }),
+            );
+            let expected = if game == thedas_vfs::Game::DragonAge2 {
+                vec![second, hero, first, third]
+            } else {
+                vec![second, hero]
+            };
+            assert_eq!(bound.iter().map(|b| b.object).collect::<Vec<_>>(), expected);
+            if game == thedas_vfs::Game::DragonAge2 {
+                assert_eq!(bound[2].actor, 2);
+                assert_eq!(bound[3].actor, 4);
+                assert_eq!(bound[2].end.unwrap().0, [1.0; 3]);
+                assert_eq!(bound[3].end.unwrap().0, [2.0; 3]);
+            }
+            let explicit = Tracks {
+                actors: vec![actor("FOLLOWER:third", [0.0; 3], 0.0)],
+                ..Tracks::default()
+            };
+            let explicit_bound = s.bind_cutscene_actors(&explicit, None);
+            assert_eq!(
+                explicit_bound.iter().map(|b| b.object).collect::<Vec<_>>(),
+                if game == thedas_vfs::Game::DragonAge2 {
+                    vec![third]
+                } else {
+                    vec![]
+                }
+            );
+            s.world.get_mut(hero).unwrap().followers.clear();
+            assert!(s.bind_cutscene_actors(&explicit, None).is_empty());
+        }
     }
 }
