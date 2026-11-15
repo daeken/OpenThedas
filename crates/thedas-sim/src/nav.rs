@@ -181,6 +181,9 @@ pub fn route_avoiding(
     let start = nearest_walkable(g, from)?;
     let goal = nearest_walkable(g, to)?;
     let idx = |c: (u32, u32)| (c.1 * g.columns + c.0) as usize;
+    // The cells a route may use: the search and the straightening of its route
+    // ([`straighten`]) both go by this, and step between cells by [`passable`].
+    let free = |c: (u32, u32)| walkable(g, c) && !blocked.contains(&idx(c));
     let h = |c: (u32, u32)| {
         let (dx, dy) = (
             (c.0 as f32 - goal.0 as f32).abs(),
@@ -213,7 +216,6 @@ pub fn route_avoiding(
                 .collect();
             pts.pop();
             pts.push(to);
-            let free = |c: (u32, u32)| walkable(g, c) && !blocked.contains(&idx(c));
             return Some(straighten(g, from, &pts, &free));
         }
         expanded += 1;
@@ -221,7 +223,6 @@ pub fn route_avoiding(
             return None;
         }
         let base = cost.get(&idx(c)).copied().unwrap_or(f32::MAX);
-        let hc = height(g, c);
         for (dx, dy) in [
             (-1, 0),
             (1, 0),
@@ -237,17 +238,8 @@ pub fn route_avoiding(
                 continue;
             }
             let n = (x as u32, y as u32);
-            let free = |c: (u32, u32)| walkable(g, c) && !blocked.contains(&idx(c));
-            if !free(n) || (height(g, n) - hc).abs() > MAX_STEP {
+            if !passable(g, c, n, &free) {
                 continue;
-            }
-            // No cutting corners past blocked cells.
-            if dx != 0 && dy != 0 {
-                let a = ((c.0 as i32 + dx) as u32, c.1);
-                let b = (c.0, (c.1 as i32 + dy) as u32);
-                if !free(a) || !free(b) {
-                    continue;
-                }
             }
             let step = if dx != 0 && dy != 0 {
                 std::f32::consts::SQRT_2
@@ -317,10 +309,21 @@ fn straighten(
     out
 }
 
-/// Whether a walker can go in a straight line from `a` to `b`: every cell the line crosses
-/// is `free`, it cuts no corner of a cell that is not, and no two cells it passes from one to
-/// the other differ in height by more than [`MAX_STEP`]. A line starting off the grid or on
-/// a cell that is not free is not straight-clear.
+/// Whether a walker can step from cell `c` to the neighbouring cell `n` (8-connected): `n`
+/// is `free`, their heights differ by at most [`MAX_STEP`], and a diagonal step cuts no
+/// corner of a cell that is not free. The route search and [`straight_clear`] both step by
+/// this, so a straightened route goes only where the search could have.
+fn passable(g: &NavGrid, c: (u32, u32), n: (u32, u32), free: &impl Fn((u32, u32)) -> bool) -> bool {
+    if !free(n) || (height(g, n) - height(g, c)).abs() > MAX_STEP {
+        return false;
+    }
+    c.0 == n.0 || c.1 == n.1 || (free((n.0, c.1)) && free((c.0, n.1)))
+}
+
+/// Whether a walker can go in a straight line from `a` to `b`: it starts on a `free` cell,
+/// and each cell the line passes into is one the route search could step to from the last
+/// ([`passable`]). A line starting off the grid or on a cell that is not free is not
+/// straight-clear.
 fn straight_clear(
     g: &NavGrid,
     a: [f32; 3],
@@ -343,10 +346,7 @@ fn straight_clear(
         if c == prev {
             continue;
         }
-        if !free(c) || (height(g, c) - height(g, prev)).abs() > MAX_STEP {
-            return false;
-        }
-        if c.0 != prev.0 && c.1 != prev.1 && !(free((c.0, prev.1)) && free((prev.0, c.1))) {
+        if !passable(g, prev, c, free) {
             return false;
         }
         prev = c;
@@ -1141,6 +1141,36 @@ mod tests {
         }
         // Points a cell apart, so the walk still follows the floor's height.
         assert!(p.len() >= 8, "{p:?}");
+    }
+
+    #[test]
+    fn a_straightened_route_does_not_cut_through_a_closed_doorway_beside_a_corner() {
+        // A wall down column 3 (rows 0 to 2) ends at a closed doorway (3,3), with open floor
+        // past it at (3,4): the route goes round by row 4, and no straight leg crosses the
+        // doorway's cell or clips its corner.
+        let mut g = floor(7, 5);
+        for y in 0..3 {
+            g.data[(y * 7 + 3) as usize] = 10;
+        }
+        let door = 3 * 7 + 3;
+        let blocked: std::collections::HashSet<usize> = [door as usize].into_iter().collect();
+        let from = [1.5, 1.5, 0.0];
+        let to = [5.5, 1.5, 0.0];
+        let p = route_avoiding(&g, from, to, &blocked).unwrap();
+        let mut at = from;
+        for q in &p {
+            for k in 0..=200 {
+                let f = k as f32 / 200.0;
+                let x = [at[0] + (q[0] - at[0]) * f, at[1] + (q[1] - at[1]) * f, 0.0];
+                let c = g.cell(x).unwrap();
+                assert!(
+                    walkable(&g, c) && (c.1 * 7 + c.0) != door,
+                    "{at:?} -> {q:?} crosses {c:?} in {p:?}"
+                );
+            }
+            at = *q;
+        }
+        assert!(p.iter().any(|q| q[1] > 4.0), "round by row 4: {p:?}");
     }
 
     #[test]
