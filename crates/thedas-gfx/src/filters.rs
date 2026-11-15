@@ -302,11 +302,7 @@ mod tests {
     /// copies, exercise premultiplied colour, and check both sides of the silhouette.
     #[test]
     fn filter_pixels() {
-        let instance =
-            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
-        let adapter = pollster::block_on(instance.request_adapter(&Default::default())).unwrap();
-        let (device, queue) =
-            pollster::block_on(adapter.request_device(&Default::default())).unwrap();
+        let (device, queue) = crate::gpu::test_device();
         let format = wgpu::TextureFormat::Rgba8Unorm;
         let filters = Filters::new(&device, format);
         let mut pixels = vec![0; 32 * 32 * 4];
