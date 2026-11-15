@@ -387,6 +387,14 @@ fn section(
     }
 }
 
+/// A section's token: a hash of what it is built for.
+fn token(key: &impl std::hash::Hash) -> u64 {
+    use std::hash::Hasher;
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    key.hash(&mut h);
+    h.finish()
+}
+
 /// [`sim_values_for`] reusing what [`ValueCache`] holds.
 pub fn sim_values_cached(
     sim: &Sim,
@@ -845,17 +853,26 @@ fn sim_values_with(
         .count();
     set("Area.CreatureCount".into(), num(creatures as f64));
     let who = controlled.or(hero);
+    // A section's token names what it is built for, so opening a container, store or the
+    // party picker builds it again at once: the screen reads the panel to show (the
+    // footlocker's, say) as it opens, before the section's lifetime has run out.
     section(
         &mut cache,
         "Inventory",
-        u64::from(who.unwrap_or(0)) << 8 | u64::from(shown.item_filter as u8),
+        token(&(who, shown.item_filter, sim.world.container)),
         &mut v,
         |v| inventory(sim, who, shown.item_filter, v),
     );
-    section(&mut cache, "Store", 0, &mut v, |v| store(sim, shown, v));
-    section(&mut cache, "PartyPicker", 0, &mut v, |v| {
-        party_picker(sim, shown, v)
+    section(&mut cache, "Store", token(&sim.world.store), &mut v, |v| {
+        store(sim, shown, v)
     });
+    section(
+        &mut cache,
+        "PartyPicker",
+        token(&sim.world.party_picker.is_some()),
+        &mut v,
+        |v| party_picker(sim, shown, v),
+    );
     section(&mut cache, "Saves", 0, &mut v, |v| saves(sim, shown, v));
     section(&mut cache, "Journal", 0, &mut v, |v| journal(sim, shown, v));
     alerts(sim, shown, &mut v);
@@ -2244,6 +2261,44 @@ mod tests {
         );
         assert_eq!(v["Tutorials.TrainingStep"], num(7));
         assert_eq!(v["Client.Paused"], num(1));
+    }
+
+    #[test]
+    fn opening_a_container_rebuilds_the_cached_inventory_at_once() {
+        use thedas_sim::world::ObjectKind;
+        let mut sim = Sim::new(
+            std::sync::Arc::new(thedas_vfs::Vfs::new()),
+            std::sync::Arc::new(thedas_script::EngineTable::default()),
+            1,
+        );
+        let hero = sim.world.spawn(ObjectKind::Creature, "player");
+        sim.world.hero = Some(hero);
+        let chest = sim.world.spawn(ObjectKind::Placeable, "footlocker");
+        let shown = Presentation::default();
+        let mut cache = ValueCache::default();
+        let show = |cache: &mut ValueCache| {
+            cache
+                .updates
+                .iter()
+                .rev()
+                .find(|(g, _)| g == "Inventory")
+                .and_then(|(_, rows)| {
+                    rows.iter()
+                        .find(|(k, _)| k == "GUIInventory.ShowContainer")
+                        .map(|(_, v)| v.clone())
+                })
+        };
+        sim_values_cached(&sim, &shown, &mut cache);
+        assert_eq!(show(&mut cache), Some(num(0)));
+        cache.updates.clear();
+        // The same frame time: only the open container changed.
+        sim.open_container(chest);
+        sim_values_cached(&sim, &shown, &mut cache);
+        assert_eq!(show(&mut cache), Some(num(1)), "the footlocker panel shows");
+        cache.updates.clear();
+        sim.close_container();
+        sim_values_cached(&sim, &shown, &mut cache);
+        assert_eq!(show(&mut cache), Some(num(0)));
     }
 
     #[test]
