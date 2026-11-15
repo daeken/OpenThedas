@@ -219,6 +219,39 @@ the original object light-count limit no longer applies to these receivers.
 Their fractional colour is not written to the opaque G-buffer or SSAO depth.
 Existing sampled eyelash/hair-core point casters remain independent and unchanged.
 
+## Remaining faithful lighting after ordered characters
+
+The five-scene inventory leaves **136 passes** using their translated faithful
+colour shaders (102 visible instances at the survey cameras). Their next steps
+are distinct from opaque G-buffer admission:
+
+| Family | Planned | Visible | Next requirement |
+|---|---:|---:|---|
+| Static1_Alpha | 70 | 38 | Shared forward surface lighting with baked lightmap, reflection and fractional alpha |
+| PropAlpha1 | 19 | 19 | Probe/direct light, normal/specular maps, emission, reflection and fractional alpha |
+| Prop1_Punch | 11 | 11 | Retain the 0.3 shader clip, authored 8-bit test and source-alpha blending |
+| Cloth1 | 3 | 2 | Cloth vertex and two-sided material equations |
+| Character_Alpha | 1 | 0 | Existing armour tint and skinning with fractional colour coverage |
+| Water0 | 18 | 18 | Authored water surface/depth equations |
+| Clouds / Sky | 8 | 8 | Background/scattering equations rather than ordinary surface lighting |
+| Far billboard passes | 6 | 6 | Coupled viewing LOD/fade and billboard geometry |
+
+The next surface batch is the first 100 passes. Keep them in the existing forward
+phases: source-alpha blending must not be converted to binary G-buffer coverage.
+Their shadow-caster plans remain independent. Admission must validate the actual
+pass state and texture/sampler inputs; unsupported states and runtime fades retain
+the complete faithful fallback.
+
+Local inspection confirms that PropAlpha1 declares a direct material tint colour
+and no tint-mask sampler. Reusing the ordinary Prop1 tint-mask equation for that
+family would add a material operation it does not author. Its tint is a
+post-lighting operation: clamp each colour channel after dividing by one minus
+the corresponding tint channel, then scale RGB by one minus tint alpha, before
+fog. Static1_Alpha uses that same transform. A diffuse-colour lerp would not
+represent it. Static1_Alpha also needs
+its assigned lightmap, unlike the current eyelash/hair forward admission rule that
+requires no lightmap. These are planning constraints, not implemented coverage.
+
 Runtime fades return the complete material family to its faithful controls for
 that frame. Missing or incompatible inputs retain the same fallback. The faithful
 renderer continues to use its own pipelines. `THEDAS_DEFERRED_FORWARD_LIGHTING=0`

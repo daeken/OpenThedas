@@ -556,6 +556,7 @@ fn capture(
                         | "lighting"
                         | "specialized-gbuffer"
                         | "specialized-lighting"
+                        | "sun-early-exit"
                         | "forward-lighting"
                         | "early-light-reject"
                         | "depth-lights"
@@ -567,7 +568,7 @@ fn capture(
                 )
             }) {
                 bail!(
-                    "THEDAS_BENCH_DEFERRED_COMPARE must be all, tiles, shadows, faithful, reflections, tile-frusta, light-masks, opaque-gbuffer, lighting, specialized-gbuffer, specialized-lighting, forward-lighting, early-light-reject, depth-lights, terrain-layers, pass-cost, fronds, trees or tree-shadows"
+                    "THEDAS_BENCH_DEFERRED_COMPARE must be all, tiles, shadows, faithful, reflections, tile-frusta, sun-early-exit, light-masks, opaque-gbuffer, lighting, specialized-gbuffer, specialized-lighting, forward-lighting, early-light-reject, depth-lights, terrain-layers, pass-cost, fronds, trees or tree-shadows"
                 );
             }
             let comparison = std::env::var("THEDAS_BENCH_SHADOW_COMPARE").ok();
@@ -606,6 +607,8 @@ fn capture(
                             level.renderer.set_deferred_tree_shadows(Some(enabled));
                         } else if compare == "tile-frusta" {
                             level.renderer.set_deferred_tight_tiles(Some(enabled));
+                        } else if compare == "sun-early-exit" {
+                            level.renderer.set_deferred_sun_early_exit(Some(enabled));
                         } else if compare == "light-masks" {
                             level.renderer.set_deferred_light_masks(Some(enabled));
                         } else if compare == "opaque-gbuffer" {
@@ -677,6 +680,7 @@ fn capture(
                     level.renderer.set_deferred_culling(None);
                     level.renderer.set_deferred_fused_reflections(None);
                     level.renderer.set_deferred_tight_tiles(None);
+                    level.renderer.set_deferred_sun_early_exit(None);
                     level.renderer.set_deferred_light_masks(None);
                     level.renderer.set_deferred_opaque_gbuffer(None);
                     level.renderer.set_deferred_specialized_gbuffer(None);
