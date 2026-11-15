@@ -2255,8 +2255,8 @@ impl DeferredPass {
                 .create_texture(&wgpu::TextureDescriptor {
                     label: Some("deferred bounce"),
                     size: wgpu::Extent3d {
-                        width: width.div_ceil(2).max(1),
-                        height: height.div_ceil(2).max(1),
+                        width: width.div_ceil(4).max(1),
+                        height: height.div_ceil(4).max(1),
                         depth_or_array_layers: 1,
                     },
                     mip_level_count: 1,
@@ -2601,7 +2601,11 @@ impl DeferredPass {
                     },
                 })],
                 depth_stencil_attachment: None,
-                timestamp_writes: None,
+                timestamp_writes: if bounce_flags != 0 {
+                    profile.as_deref_mut().and_then(|p| p.pass("bounce"))
+                } else {
+                    None
+                },
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
