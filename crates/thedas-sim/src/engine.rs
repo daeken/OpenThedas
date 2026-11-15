@@ -2830,31 +2830,22 @@ pub fn call(
                 _ => None,
             });
             let same = |x: &Effect, e: &Effect| if e.id != 0 { x.id == e.id } else { x == e };
-            let location = effect
-                .and_then(|e| {
-                    e.visual_location
-                        .or_else(|| e.visual_target.and_then(|id| h.location_of(id)))
-                        .or_else(|| {
-                            h.sim
-                                .world
-                                .location_vfx
-                                .iter()
-                                .find(|v| same(&v.effect, e))
-                                .map(|v| Location {
-                                    area: v.area,
-                                    position: v.position,
-                                    facing: v.facing,
-                                })
-                        })
-                        .or_else(|| {
-                            h.sim
-                                .world
-                                .objects
-                                .values()
-                                .find(|o| o.effects.iter().any(|x| same(x, e)))
-                                .and_then(|o| h.location_of(o.id))
-                        })
-                })
+            let location = effect.and_then(|e| {
+                if let Some(location) = e.visual_location {
+                    Some(location)
+                } else if let Some(target) = e.visual_target {
+                    // A removed explicit target stays invalid; another applied copy
+                    // with the same identity must not supply its location.
+                    h.location_of(target)
+                } else {
+                    // Older saves did not retain the application context.
+                    h.sim.world.location_vfx.iter().find(|v| same(&v.effect, e))
+                        .map(|v| Location { area: v.area, position: v.position, facing: v.facing })
+                        .or_else(|| h.sim.world.objects.values()
+                            .find(|o| o.effects.iter().any(|x| same(x, e)))
+                            .and_then(|o| h.location_of(o.id)))
+                }
+            })
                 .unwrap_or(Location {
                     area: OBJECT_INVALID,
                     position: [0.0; 3],
@@ -7936,6 +7927,13 @@ mod tests {
             panic!("location")
         };
         assert_eq!(s.world.handle(handle), Some(&EngineData::Location(at)));
+        // Copies attached to a destroyed object do not pick up another copy's pose.
+        let e = s.world.get(a).unwrap().effects[0].clone();
+        s.world.objects.remove(&a);
+        let eh = s.world.store(EngineData::Effect(e));
+        let Some(Value::Engine { handle, .. }) = run(&mut s, 0, "GetVisualEffectLocation",
+            &[Value::Engine { ty: s.types.effect, handle: Some(eh) }]) else { panic!("location") };
+        assert!(matches!(s.world.handle(handle), Some(EngineData::Location(l)) if l.area == OBJECT_INVALID));
     }
 
     #[test]
