@@ -313,12 +313,12 @@ fn segment(keys: &[Key], t: f32) -> Option<(&Key, &Key, f32)> {
     Some((a, b, f.clamp(0.0, 1.0)))
 }
 
-fn sample_rotation(keys: &[Key], t: f32) -> Option<Quat> {
+pub(crate) fn sample_rotation(keys: &[Key], t: f32) -> Option<Quat> {
     let (a, b, f) = segment(keys, t)?;
     Some(quat(a.value).slerp(quat(b.value), f))
 }
 
-fn sample_translation(keys: &[Key], t: f32) -> Option<Vec3> {
+pub(crate) fn sample_translation(keys: &[Key], t: f32) -> Option<Vec3> {
     let (a, b, f) = segment(keys, t)?;
     let v = |k: &Key| Vec3::new(k.value[0], k.value[1], k.value[2]);
     Some(v(a).lerp(v(b), f))
@@ -334,14 +334,32 @@ pub fn palette_rows(
     palette: &[Option<usize>],
     mesh_node: Mat4,
 ) -> Vec<[f32; 4]> {
+    palette_rows_skinned(&skin_matrices(rest, pose), palette, mesh_node)
+}
+
+/// Each node's skinning matrix, from its rest to its posed model-space matrix (`pose ·
+/// rest⁻¹`): what [`palette_rows_skinned`] reads, shared by every mesh on the skeleton.
+pub fn skin_matrices(rest: &[Mat4], pose: &[Mat4]) -> Vec<Mat4> {
+    rest.iter()
+        .zip(pose)
+        .map(|(r, p)| *p * r.inverse())
+        .collect()
+}
+
+/// [`palette_rows`] from the skeleton's [`skin_matrices`].
+pub fn palette_rows_skinned(
+    skin: &[Mat4],
+    palette: &[Option<usize>],
+    mesh_node: Mat4,
+) -> Vec<[f32; 4]> {
+    let at_root = mesh_node == Mat4::IDENTITY;
     let inv_node = mesh_node.inverse();
     let mut rows = Vec::with_capacity(palette.len() * 3);
     for slot in palette {
-        let m = match slot {
-            Some(n) if *n < rest.len() && *n < pose.len() => {
-                inv_node * pose[*n] * rest[*n].inverse() * mesh_node
-            }
-            _ => Mat4::IDENTITY,
+        let m = match slot.and_then(|n| skin.get(n)) {
+            Some(m) if at_root => *m,
+            Some(m) => inv_node * *m * mesh_node,
+            None => Mat4::IDENTITY,
         };
         for r in 0..3 {
             rows.push(m.row(r).to_array());
@@ -400,6 +418,7 @@ mod tests {
             length: 1.0,
             additive: false,
             scalars: Vec::new(),
+            colors: Vec::new(),
             tracks: vec![Track {
                 bone: "shoulder".into(),
                 channel: Channel::Rotation,
@@ -445,6 +464,7 @@ mod tests {
             length: 1.0,
             additive,
             scalars: Vec::new(),
+            colors: Vec::new(),
             tracks: vec![Track {
                 bone: bone.into(),
                 channel: Channel::Rotation,
@@ -531,6 +551,7 @@ mod tests {
             length: 1.0,
             additive: true,
             scalars: Vec::new(),
+            colors: Vec::new(),
             tracks: vec![Track {
                 bone: "elbow".into(),
                 channel: Channel::Translation,

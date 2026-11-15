@@ -276,6 +276,7 @@ fn hair_core_equal_colour_and_fractional_faces_share_lights_and_depth_at_one_and
                 domain: Some(domain),
                 version: 0,
                 intensity: 1.0,
+                flicker: None,
             };
             level.set_extra_lights(
                 &(0..8)
