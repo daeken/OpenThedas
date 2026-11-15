@@ -64,6 +64,10 @@ impl Launch {
                 };
             }
         }
+        // A hand-edited value the game would refuse (it exits on an unknown `--lighting`).
+        if !["baked", "hybrid", "realtime"].contains(&play.lighting.as_str()) {
+            play.lighting = "baked".into();
+        }
         Launch {
             install: install.root.clone(),
             args: play.args(),
@@ -2104,6 +2108,21 @@ mod tests {
         assert_eq!(l.install, PathBuf::from("/nowhere/dao"));
         assert!(l.args.iter().any(|a| a == "--no-intro"));
         assert_eq!(l.keys.as_deref(), Some(Path::new("/k/erfpasswords.txt")));
+        // A bad hand-edited lighting value falls back, a good one is kept.
+        cfg.play.lighting = "bogus".into();
+        assert!(
+            Launch::of(&cfg, &inst)
+                .args
+                .join(" ")
+                .contains("--lighting baked")
+        );
+        cfg.play.lighting = "hybrid".into();
+        assert!(
+            Launch::of(&cfg, &inst)
+                .args
+                .join(" ")
+                .contains("--lighting hybrid")
+        );
     }
 
     #[test]
