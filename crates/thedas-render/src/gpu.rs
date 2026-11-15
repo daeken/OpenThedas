@@ -1600,6 +1600,40 @@ impl AreaRenderer {
         }
     }
 
+    /// Starts the props' visual effects where no animator poses the props (the viewer's
+    /// `--vfx`): every effect emitter at its timeline's rate `at` seconds in, placed as built.
+    pub fn start_prop_effects(&mut self, scene: &AreaScene, at: f32) {
+        self.effects_epoch.get_or_insert(self.time);
+        for p in &scene.props {
+            for e in &p.emitters {
+                if let Some(state) = self.emitters.get_mut(e.emitter) {
+                    state.rate = e.rate.as_ref().and_then(|r| r.at(at));
+                }
+            }
+        }
+    }
+
+    /// Plays the props' visual effects for `seconds` where no animator poses the props (the
+    /// viewer's `--vfx` captures): in 30 steps a second, each effect emitter takes its
+    /// timeline's rate (impact, then the looping duration) before the clock advances.
+    pub fn play_prop_effects(&mut self, scene: &AreaScene, seconds: f64) {
+        let step: f64 = 1.0 / 30.0;
+        let start = self.time;
+        self.effects_epoch.get_or_insert(start);
+        let mut t = 0.0;
+        while t < seconds {
+            for p in &scene.props {
+                for e in &p.emitters {
+                    if let Some(state) = self.emitters.get_mut(e.emitter) {
+                        state.rate = e.rate.as_ref().and_then(|r| r.at(t as f32));
+                    }
+                }
+            }
+            self.advance_time(step.min(seconds - t));
+            t += step;
+        }
+    }
+
     /// Advances the shaders' clock (`ApplicationTime`) and the particle emitters by a
     /// frame's time, in seconds.
     pub fn advance_time(&mut self, seconds: f64) {
