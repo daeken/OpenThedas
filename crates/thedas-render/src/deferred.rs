@@ -3350,13 +3350,20 @@ mod tests {
             room: None,
         };
         let level = [point("lamp_001_RT", Vec3::new(0.0, 0.0, 2.0), true)];
-        let flame = point("emitter fx_firetorchfb_add", Vec3::new(0.3, 0.0, 2.2), false);
+        let flame = point(
+            "emitter fx_firetorchfb_add",
+            Vec3::new(0.3, 0.0, 2.2),
+            false,
+        );
         let spell = point("emitter Sum_Conj_04", Vec3::new(6.0, 0.0, 0.5), false);
         assert!(beside_level_light(&flame, &level));
         assert!(!beside_level_light(&spell, &level));
         // Only emitter lights are dropped, and only beside static lights.
         assert!(!beside_level_light(&level[0], &level));
-        assert!(!beside_level_light(&flame, &[point("x", Vec3::new(0.3, 0.0, 2.0), false)]));
+        assert!(!beside_level_light(
+            &flame,
+            &[point("x", Vec3::new(0.3, 0.0, 2.0), false)]
+        ));
     }
 
     #[test]
