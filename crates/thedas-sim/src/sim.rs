@@ -4288,6 +4288,36 @@ impl Sim {
         }
     }
 
+    /// Body bags saved before they were built from their template (no script, appearance or
+    /// fields; see [`Sim::spawn_body_bag`]) take it now, keeping what they hold and where
+    /// they lie, so the player can open the ones already lying in a saved game.
+    pub(crate) fn repair_body_bags(&mut self) {
+        let bags: Vec<ObjectId> = self
+            .world
+            .objects
+            .values()
+            .filter(|o| {
+                o.kind == ObjectKind::Placeable
+                    && o.template
+                        .eq_ignore_ascii_case(crate::inventory::BODY_BAG_TEMPLATE)
+                    && o.script.is_none()
+            })
+            .map(|o| o.id)
+            .collect();
+        if bags.is_empty() {
+            return;
+        }
+        let Ok(t) = self.read_gff3(&format!("{}.utp", crate::inventory::BODY_BAG_TEMPLATE)) else {
+            return;
+        };
+        for id in bags {
+            if let Some(o) = self.world.get_mut(id) {
+                apply_template(o, &t);
+                apply_placeable_useable(o, self.game);
+            }
+        }
+    }
+
     /// `CreateObject`: an object of `kind` built from its template (`.utc`, `.utp`, ...), as
     /// area loading builds them, in `area` at `position`. Creatures get their template's
     /// items. A missing template still makes the object, traced as missing.
