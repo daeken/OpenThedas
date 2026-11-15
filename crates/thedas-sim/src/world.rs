@@ -93,6 +93,25 @@ pub fn heading_of(facing: f32) -> f32 {
     facing + 90.0
 }
 
+/// The outstanding completion byte and active one-shot nodes of an Origins placeable.
+/// Outgoing nodes keep advancing even after their weight becomes zero.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct PlaceablePlayback {
+    pub pending: bool,
+    pub clips: Vec<PlaceableClip>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PlaceableClip {
+    pub tree: String,
+    pub action: String,
+    /// Native playback uses an unsigned-short normalized position.
+    pub phase: u16,
+    /// Rate 1 becomes 65535 / loaded duration, stored as a float by 0x813d70.
+    pub normalized_rate: f32,
+    pub updated_ms: u64,
+}
+
 /// The facing that looks along a direction (dx, dy).
 pub fn facing_toward(dx: f32, dy: f32) -> f32 {
     (dy.datan2(dx).to_degrees() - 90.0).rem_euclid(360.0)
@@ -120,6 +139,12 @@ pub struct Object {
     /// A placeable's runtime physics group override (Origins destruction writes 1).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub placeable_group: Option<u32>,
+    /// Origins state-controller playback, independent of a renderer observing the state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placeable_playback: Option<PlaceablePlayback>,
+    /// Time the completion callback targeted opacity zero. Active is independent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placeable_fade_at: Option<u64>,
     pub locals: Locals,
     /// The script that receives this object's events.
     pub script: Option<String>,
@@ -243,6 +268,8 @@ impl Object {
             position: [0.0; 3],
             facing: 0.0,
             placeable_group: None,
+            placeable_playback: None,
+            placeable_fade_at: None,
             active: true,
             locals: Locals::default(),
             script: None,
