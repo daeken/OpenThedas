@@ -87,6 +87,17 @@ fn main() -> Result<()> {
     let started = Instant::now();
     let scene = AreaScene::load(&vfs, &level)?;
     let bake = BakeScene::new(&scene, &vfs);
+    if let Ok(model) = std::env::var("THEDAS_BAKE_FIND") {
+        for (ri, r) in bake.regions.iter().enumerate() {
+            let d = &scene.draws[r.draw];
+            if d.model.eq_ignore_ascii_case(&model) {
+                eprintln!(
+                    "find: region {ri} draw {} {} room {} {:?} atlas {} offset {} scale {}",
+                    r.draw, scene.meshes[d.mesh].key, d.room, d.room_id, r.atlas, r.offset, r.scale
+                );
+            }
+        }
+    }
     if let Ok(near) = std::env::var("THEDAS_BAKE_NEAR") {
         let v: Vec<f32> = near.split(',').filter_map(|x| x.parse().ok()).collect();
         let p = Vec3::new(v[0], v[1], v[2]);
