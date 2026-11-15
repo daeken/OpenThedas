@@ -14,6 +14,9 @@ pub(crate) struct Config {
     pub mesh_leaves: bool,
     pub leaf_cards: bool,
     pub baked_lighting: bool,
+    /// `THEDAS_DEFERRED_BAKED_LIGHTING=bounce`: lightmaps keep only their baked bounce;
+    /// direct visibility is real-time (see `docs/deferred.md`).
+    pub realtime_direct: bool,
     pub ssao: bool,
     pub point_shadows: bool,
     pub shadow_slots: usize,
@@ -60,6 +63,8 @@ pub(crate) static CONFIG: LazyLock<Config> = LazyLock::new(|| {
         mesh_leaves: enabled("THEDAS_DEFERRED_MESH_LEAVES"),
         leaf_cards: enabled("THEDAS_DEFERRED_LEAF_CARDS"),
         baked_lighting: enabled("THEDAS_DEFERRED_BAKED_LIGHTING"),
+        realtime_direct: std::env::var("THEDAS_DEFERRED_BAKED_LIGHTING").as_deref()
+            == Ok("bounce"),
         ssao: enabled("THEDAS_DEFERRED_SSAO"),
         point_shadows: enabled("THEDAS_DEFERRED_POINT_SHADOWS"),
         shadow_slots: std::env::var("THEDAS_DEFERRED_SHADOW_SLOTS")

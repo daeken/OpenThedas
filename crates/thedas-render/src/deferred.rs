@@ -1184,6 +1184,12 @@ impl DeferredPass {
         self.culling = culling;
     }
 
+    /// The hybrid mode: baked lighting with real-time direct visibility
+    /// (`THEDAS_DEFERRED_BAKED_LIGHTING=bounce`).
+    fn realtime_direct(&self) -> bool {
+        self.baked_lighting && crate::config::CONFIG.realtime_direct
+    }
+
     /// Whether the GPU refused the pass.
     pub(crate) fn refused(&self) -> bool {
         self.refused
@@ -2090,11 +2096,22 @@ impl DeferredPass {
         let shadowed = if !crate::config::CONFIG.point_shadows {
             Vec::new()
         } else {
-            shadow_slots(
+            let slots = shadow_slots(
                 &mut lights,
                 camera.position,
                 crate::config::CONFIG.shadow_slots,
-            )
+                self.realtime_direct(),
+            );
+            if self.realtime_direct() {
+                // A static light with a cube of its own takes that visibility in place of
+                // the lightmap's baked mask; the rest keep the mask.
+                for light in &mut lights {
+                    if light.shadow[0] >= 0.0 {
+                        light.shadow[1] = 1.0;
+                    }
+                }
+            }
+            slots
         };
         if crate::config::CONFIG.log_lights {
             static ONCE: std::sync::Once = std::sync::Once::new();
@@ -2304,7 +2321,7 @@ impl DeferredPass {
                     self.sun_early_exit
                         .unwrap_or(crate::config::CONFIG.sun_early_exit),
                 ),
-                0,
+                u32::from(self.baked_lighting && crate::config::CONFIG.realtime_direct),
                 0,
             ],
         };
@@ -2829,10 +2846,15 @@ fn draw_all(
 }
 
 /// Gives the shadow slots to lights without baked visibility (emitters, moving lights,
-/// and all point lights in probe mode) that matter most from `eye`: their
-/// brightness times reach over their distance. Returns each slot's light (position,
-/// radius).
-fn shadow_slots(lights: &mut [GpuLight], eye: Vec3, slots: usize) -> Vec<(Vec3, f32)> {
+/// and all point lights in probe mode), and with `statics` the static ones too, that
+/// matter most from `eye`: their brightness times reach over their distance. Returns each
+/// slot's light (position, radius).
+fn shadow_slots(
+    lights: &mut [GpuLight],
+    eye: Vec3,
+    slots: usize,
+    statics: bool,
+) -> Vec<(Vec3, f32)> {
     let columns = crate::deferred_shadow::atlas_columns(slots) as usize;
     let score = |l: &GpuLight| {
         let p = Vec3::from_slice(&l.position[..3]);
@@ -2840,7 +2862,7 @@ fn shadow_slots(lights: &mut [GpuLight], eye: Vec3, slots: usize) -> Vec<(Vec3, 
         bright * l.position[3] / (1.0 + p.distance(eye))
     };
     let mut order: Vec<usize> = (0..lights.len())
-        .filter(|&i| lights[i].colour[3] < 0.5 && lights[i].position[3] > 0.0)
+        .filter(|&i| (statics || lights[i].colour[3] < 0.5) && lights[i].position[3] > 0.0)
         .collect();
     order.sort_by(|&a, &b| score(&lights[b]).total_cmp(&score(&lights[a])));
     order.truncate(slots.min(crate::deferred_shadow::SLOTS));
@@ -3126,7 +3148,7 @@ mod tests {
             light(4.0, 1.0, false),
             light(100.0, 1.0, false),
         ];
-        let slots = shadow_slots(&mut lights, Vec3::ZERO, 4);
+        let slots = shadow_slots(&mut lights, Vec3::ZERO, 4, false);
         assert_eq!(slots.len(), 4);
         assert_eq!(
             lights[0].shadow[0], -1.0,
@@ -3141,7 +3163,7 @@ mod tests {
         let mut lights: Vec<_> = (1..=crate::deferred_shadow::SLOTS + 1)
             .map(|i| light(i as f32, 1.0, false))
             .collect();
-        let slots = shadow_slots(&mut lights, Vec3::ZERO, usize::MAX);
+        let slots = shadow_slots(&mut lights, Vec3::ZERO, usize::MAX, false);
         assert_eq!(slots.len(), crate::deferred_shadow::SLOTS);
         for (i, light) in lights.iter().enumerate() {
             assert_eq!(
