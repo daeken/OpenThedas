@@ -291,22 +291,101 @@ pub fn item_category(sim: &Sim, item: u32) -> ItemCategory {
 /// [`sim_values_cached`]).
 #[derive(Default)]
 pub struct ValueCache {
-    derived: std::collections::HashMap<u32, Derived>,
+    /// By group (`Party.Members.0`, `Inventory`): what it was built for and when.
+    groups: std::collections::HashMap<String, Built>,
+    /// The groups this frame's values have.
+    seen: std::collections::HashSet<String>,
+    /// Groups to set until replaced: (group, rows), for
+    /// [`crate::protocol::GameBridge::bind_sticky`].
+    pub updates: Vec<(String, Vec<(String, UiValue)>)>,
+    /// Groups no longer shown.
+    pub drops: Vec<String>,
+    /// The interface's own time (the frames' durations added up), which the groups age by:
+    /// real time in play, the steps' time when driven by a script.
+    now_ms: f64,
 }
 
-/// A creature's derived properties (total and modifier by property) and the simulation time
-/// they were worked out at.
-struct Derived {
-    at_ms: u64,
-    rows: Vec<(i32, f32, f32)>,
+/// A group of values as set into the bridge: what it was built for (a creature, say), and when.
+struct Built {
+    token: u64,
+    at_ms: f64,
+    ttl_ms: f64,
 }
 
-/// How long a creature's derived properties are reused (simulation milliseconds): they come
+impl ValueCache {
+    /// Moves the interface's time on by a frame.
+    pub fn advance(&mut self, dt_ms: f64) {
+        self.now_ms += dt_ms;
+    }
+
+    /// Whether `group` must be built again (not built yet, built for another `token`, or
+    /// older than its lifetime); notes it as shown.
+    fn stale(&mut self, group: &str, token: u64) -> bool {
+        self.seen.insert(group.to_string());
+        self.groups
+            .get(group)
+            .is_none_or(|b| b.token != token || self.now_ms - b.at_ms >= b.ttl_ms)
+    }
+
+    /// Hands over a built group, to stay until `ttl` has passed.
+    fn put(&mut self, group: &str, token: u64, ttl_ms: u64, rows: Vec<(String, UiValue)>) {
+        self.groups.insert(
+            group.to_string(),
+            Built {
+                token,
+                at_ms: self.now_ms,
+                ttl_ms: ttl_ms as f64,
+            },
+        );
+        self.updates.push((group.to_string(), rows));
+    }
+
+    /// Ends a frame: groups that were not shown go.
+    fn finish(&mut self) {
+        let (groups, seen, drops) = (&mut self.groups, &self.seen, &mut self.drops);
+        groups.retain(|k, _| {
+            let keep = seen.contains(k);
+            if !keep {
+                drops.push(k.clone());
+            }
+            keep
+        });
+        self.seen.clear();
+    }
+}
+
+/// How long a creature's derived properties are left as they are (milliseconds of the interface's time,
+/// which runs while the game is paused, so the inventory screen still shows an equipped
+/// item's effect): they come
 /// from its base properties, equipment and effects, which change a few times a minute, while
-/// working them out for every property of every party member each frame was the biggest cost
-/// of building the values (half of it). The current values (health and mana bars) are read
-/// fresh each frame.
-const DERIVED_MS: u64 = 250;
+/// building them for every property of every party member each frame was most of the cost of
+/// building the values. They are handed over once (in `updates`) and stay bound; the current
+/// values (health and mana bars) are built fresh each frame.
+const DERIVED_MS: u64 = 500;
+
+/// How long the inventory, quickbar and key bindings are left as they are (see
+/// [`DERIVED_MS`]).
+const SECTION_MS: u64 = 150;
+
+/// Builds a section of values with `build`, or leaves what the cache holds for it.
+fn section(
+    cache: &mut Option<&mut ValueCache>,
+    group: &str,
+    token: u64,
+    v: &mut BTreeMap<String, UiValue>,
+    build: impl FnOnce(&mut BTreeMap<String, UiValue>),
+) {
+    match cache.as_deref_mut() {
+        Some(c) => {
+            if c.stale(group, token) {
+                let mut rows = BTreeMap::new();
+                build(&mut rows);
+                c.put(group, token, SECTION_MS, rows.into_iter().collect());
+            }
+        }
+        None => build(v),
+    }
+}
 
 /// [`sim_values_for`] reusing what [`ValueCache`] holds.
 pub fn sim_values_cached(
@@ -355,7 +434,11 @@ fn sim_values_with(
         );
     }
     let tables = sim.world.tables();
-    let mut creature = |prefix: &str, id: u32| {
+    let creature = |v: &mut BTreeMap<String, UiValue>,
+                    cache: &mut Option<&mut ValueCache>,
+                    prefix: &str,
+                    id: u32,
+                    sticky: bool| {
         let Some(o) = sim.world.get(id) else { return };
         v.insert(prefix.to_string(), num(id));
         v.insert(format!("{prefix}.ID"), num(id));
@@ -420,52 +503,50 @@ fn sim_values_with(
         // of nothing: what derivation, gear and effects give. Provisional: the character
         // record's rows are taken to be properties 1 to 60.
         let want = o.properties.len() + (1..=60).filter(|p| !o.properties.contains_key(p)).count();
-        let now = sim.world.time_ms;
-        let fresh =
-            |d: &Derived| d.rows.len() == want && d.at_ms <= now && now - d.at_ms < DERIVED_MS;
-        let cached = cache
-            .as_deref()
-            .and_then(|c| c.derived.get(&id))
-            .filter(|d| fresh(d))
-            .map(|d| d.rows.clone());
-        let rows = cached.unwrap_or_else(|| {
-            let mut rows = Vec::with_capacity(want);
-            for p in o.properties.keys() {
+        let mut cache = if sticky { cache.as_deref_mut() } else { None };
+        let fresh = match cache.as_deref_mut() {
+            Some(c) => {
+                let stale = c.stale(prefix, u64::from(id) << 32 | want as u64);
+                // The current values change as the creature is hurt or tires.
+                for (p, (_, cur)) in &o.properties {
+                    v.insert(format!("{prefix}.Attributes.{p}.Current"), num(*cur));
+                }
+                !stale
+            }
+            None => false,
+        };
+        if !fresh {
+            let mut rows: Vec<(String, UiValue)> = Vec::with_capacity(want * 3);
+            let mut put = |p: i32, total: f32, base: f32, modifier: f32| {
+                rows.push((format!("{prefix}.Attributes.{p}.Total"), num(total)));
+                rows.push((format!("{prefix}.Attributes.{p}.Base"), num(base)));
+                rows.push((format!("{prefix}.Attributes.{p}.Modifier"), num(modifier)));
+            };
+            for (p, (base, _)) in &o.properties {
                 let total = if depletable.contains(p) && *p != 0 {
                     sim.depletable_max(id, *p)
                 } else {
                     sim.property_total(id, *p)
                 };
-                rows.push((*p, total, sim.property_modifier(id, *p)));
+                put(*p, total, *base, sim.property_modifier(id, *p));
             }
             for p in 1..=60 {
                 if !o.properties.contains_key(&p) {
-                    rows.push((p, sim.property_total(id, p), sim.property_modifier(id, p)));
+                    put(
+                        p,
+                        sim.property_total(id, p),
+                        0.0,
+                        sim.property_modifier(id, p),
+                    );
                 }
             }
-            if let Some(c) = cache.as_deref_mut() {
-                c.derived.insert(
-                    id,
-                    Derived {
-                        at_ms: now,
-                        rows: rows.clone(),
-                    },
-                );
-            }
-            rows
-        });
-        for (p, total, modifier) in rows {
-            match o.properties.get(&p) {
-                Some((base, cur)) => {
-                    v.insert(format!("{prefix}.Attributes.{p}.Current"), num(*cur));
-                    v.insert(format!("{prefix}.Attributes.{p}.Total"), num(total));
-                    v.insert(format!("{prefix}.Attributes.{p}.Base"), num(*base));
-                    v.insert(format!("{prefix}.Attributes.{p}.Modifier"), num(modifier));
-                }
+            match cache {
+                Some(c) => c.put(prefix, u64::from(id) << 32 | want as u64, DERIVED_MS, rows),
                 None => {
-                    v.insert(format!("{prefix}.Attributes.{p}.Total"), num(total));
-                    v.insert(format!("{prefix}.Attributes.{p}.Base"), num(0));
-                    v.insert(format!("{prefix}.Attributes.{p}.Modifier"), num(modifier));
+                    for (p, (_, cur)) in &o.properties {
+                        v.insert(format!("{prefix}.Attributes.{p}.Current"), num(*cur));
+                    }
+                    v.extend(rows);
                 }
             }
         }
@@ -478,44 +559,48 @@ fn sim_values_with(
         v.insert(format!("{prefix}.InCombat"), num(o.combat.in_combat as u8));
     };
     for (i, id) in members.iter().enumerate() {
-        creature(&format!("Party.Members.{i}"), *id);
+        creature(&mut v, &mut cache, &format!("Party.Members.{i}"), *id, true);
     }
     if let Some(c) = controlled.or(hero) {
-        creature("GUI.SelectedChar", c);
+        creature(&mut v, &mut cache, "GUI.SelectedChar", c, true);
     }
     // The creature in character generation or level-up, as levelup.gfx reads it: its
     // attributes and points (34 attribute, 35 skill, 36 talent, 38 specialization), with
     // what equipment adds as each attribute's Modifier. The screen spends the points itself
     // unless the auto-level option (`Stats.AutoLevelUp`) is on; it is off. Provisional.
     if let Some(c) = sim.world.chargen {
-        creature("CharGenCreature", c);
-        if let Some(o) = sim.world.get(c) {
-            for (p, (base, _)) in &o.properties {
-                v.insert(
-                    format!("CharGenCreature.Attributes.{p}.Modifier"),
-                    num(sim.equipment_bonus(c, *p)),
-                );
-                // The points being spent go on the base, which the screen shows as Total
-                // (depletables keep their maximum).
-                let depletable = [
-                    "PROPERTY_DEPLETABLE_HEALTH",
-                    "PROPERTY_DEPLETABLE_MANA_STAMINA",
-                ]
-                .iter()
-                .any(|k| thedas_sim::sim::constant(&sim.table, k) == *p);
-                if !depletable {
-                    v.insert(format!("CharGenCreature.Attributes.{p}.Total"), num(*base));
+        section(&mut cache, "ChargenCreature", u64::from(c), &mut v, |v| {
+            creature(v, &mut None, "CharGenCreature", c, false);
+            if let Some(o) = sim.world.get(c) {
+                for (p, (base, _)) in &o.properties {
+                    v.insert(
+                        format!("CharGenCreature.Attributes.{p}.Modifier"),
+                        num(sim.equipment_bonus(c, *p)),
+                    );
+                    // The points being spent go on the base, which the screen shows as Total
+                    // (depletables keep their maximum).
+                    let depletable = [
+                        "PROPERTY_DEPLETABLE_HEALTH",
+                        "PROPERTY_DEPLETABLE_MANA_STAMINA",
+                    ]
+                    .iter()
+                    .any(|k| thedas_sim::sim::constant(&sim.table, k) == *p);
+                    if !depletable {
+                        v.insert(format!("CharGenCreature.Attributes.{p}.Total"), num(*base));
+                    }
                 }
             }
-        }
-        v.insert("CharGenCreature.Stats.AutoLevelUp".into(), num(0));
-        crate::chains::bind(
-            sim,
-            c,
-            "CharGenCreature.Stats",
-            crate::chains::DISPLAYMODE_LEVELUP,
-            &mut v,
-        );
+            v.insert("CharGenCreature.Stats.AutoLevelUp".into(), num(0));
+        });
+        section(&mut cache, "ChargenChains", u64::from(c), &mut v, |v| {
+            crate::chains::bind(
+                sim,
+                c,
+                "CharGenCreature.Stats",
+                crate::chains::DISPLAYMODE_LEVELUP,
+                v,
+            )
+        });
     }
     // The skills or spells/talents screen (abilities.gfx): which it shows, and the member's
     // abilities listed as the spellbook lists them.
@@ -524,13 +609,15 @@ fn sim_values_with(
             "GUI.AbilityScene".into(),
             num(f64::from(shown.ability_scene)),
         );
-        crate::chains::bind(
-            sim,
-            c,
-            "GUI.SelectedChar.Stats",
-            crate::chains::DISPLAYMODE_SPELLBOOK,
-            &mut v,
-        );
+        section(&mut cache, "SpellbookChains", u64::from(c), &mut v, |v| {
+            crate::chains::bind(
+                sim,
+                c,
+                "GUI.SelectedChar.Stats",
+                crate::chains::DISPLAYMODE_SPELLBOOK,
+                v,
+            )
+        });
     }
     // The portrait the engine drew of each member's head (portraits.gfx loads it).
     for (i, id) in members.iter().enumerate() {
@@ -757,18 +844,29 @@ fn sim_values_with(
         .filter(|o| o.kind == ObjectKind::Creature && o.active)
         .count();
     set("Area.CreatureCount".into(), num(creatures as f64));
-    inventory(sim, controlled.or(hero), shown.item_filter, &mut v);
-    store(sim, shown, &mut v);
-    party_picker(sim, shown, &mut v);
-    saves(sim, shown, &mut v);
-    journal(sim, shown, &mut v);
-    alerts(sim, shown, &mut v);
-    crate::options::values(
-        &shown.options,
-        shown.resolution,
-        (&shown.antialias_samples, shown.antialias_default_on),
+    let who = controlled.or(hero);
+    section(
+        &mut cache,
+        "Inventory",
+        u64::from(who.unwrap_or(0)) << 8 | u64::from(shown.item_filter as u8),
         &mut v,
+        |v| inventory(sim, who, shown.item_filter, v),
     );
+    section(&mut cache, "Store", 0, &mut v, |v| store(sim, shown, v));
+    section(&mut cache, "PartyPicker", 0, &mut v, |v| {
+        party_picker(sim, shown, v)
+    });
+    section(&mut cache, "Saves", 0, &mut v, |v| saves(sim, shown, v));
+    section(&mut cache, "Journal", 0, &mut v, |v| journal(sim, shown, v));
+    alerts(sim, shown, &mut v);
+    section(&mut cache, "Options", 0, &mut v, |v| {
+        crate::options::values(
+            &shown.options,
+            shown.resolution,
+            (&shown.antialias_samples, shown.antialias_default_on),
+            v,
+        )
+    });
     if let Some(e) = &shown.examine {
         v.insert(
             "GUIItemExamine.ItemToken".into(),
@@ -811,7 +909,9 @@ fn sim_values_with(
             UiValue::String(key.into()),
         );
     }
-    key_mappings(sim, &mut v);
+    section(&mut cache, "KeyMappings", 0, &mut v, |v| {
+        key_mappings(sim, v)
+    });
     // The start menu (startmenu2.gfx): its buttons show (`GameMode.ShowStartMenuContents`),
     // no other campaigns are installed (`Client.ModuleInfoList`), and there is no online
     // account or welcome message about one. Provisional: the version string is this port's.
@@ -842,7 +942,13 @@ fn sim_values_with(
         "ClientOptions.GameOptions.DifficultyLevel".into(),
         num(sim.world.difficulty),
     );
-    chargen_screen(sim, &mut v);
+    section(
+        &mut cache,
+        "ChargenScreen",
+        u64::from(sim.world.chargen.unwrap_or(0)),
+        &mut v,
+        |v| chargen_screen(sim, v),
+    );
     // The tutorial popups waiting (popuplayer.gfx shows the first: its `Title`, `Text` and
     // the `CodexResRef` its Codex button opens; Next when more wait, else Close), with
     // tutorials on (`Tutorials.Enabled`). An empty list hides the panel.
@@ -909,9 +1015,11 @@ fn sim_values_with(
         v.insert(format!("GUI.GuiHighlights.{i}.Highlight"), num(0));
     }
     if let Some(who) = controlled.or(hero) {
-        tactics(sim, who, &mut v);
+        section(&mut cache, "Tactics", u64::from(who), &mut v, |v| {
+            tactics(sim, who, v)
+        });
     }
-    map_notes(sim, &mut v);
+    section(&mut cache, "MapNotes", 0, &mut v, |v| map_notes(sim, v));
     // The minimap, as minimap.gfx reads it: the picture, the world corners it spans
     // (`Left`/`Bottom` the lower, `Right`/`Top` the upper) and the share of the picture
     // they cover. Provisional: north is taken to be up (0).
@@ -930,10 +1038,15 @@ fn sim_values_with(
         v.insert("GUI.MinimapOpen".into(), num(1));
     }
     if let Some(who) = controlled.or(hero) {
-        quickbar(sim, who, &mut v);
+        section(&mut cache, "Quickbar", u64::from(who), &mut v, |v| {
+            quickbar(sim, who, v)
+        });
         heroic_stats(sim, who, hero.unwrap_or(who), &mut v);
     }
     script_popup(sim, &mut v);
+    if let Some(c) = cache {
+        c.finish();
+    }
     v
 }
 

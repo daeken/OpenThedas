@@ -76,38 +76,76 @@ fn req<'a>(
     })
 }
 
-/// Parses one number, including the spellings MSVC's printf uses for non-finite values
-/// (`1.#INF00`, `-1.#QNAN0`, `-1.#IND00`), which appear in some exported material objects.
-fn parse_float(v: &str) -> Option<f32> {
-    if let Ok(f) = v.parse::<f32>() {
-        return Some(f);
+/// Reads one number as DAOrigins.exe's material XML reader does (0x508220 → the stream's
+/// float extraction 0x454300 → the numeric lexer 0x40c4e0): the longest prefix of sign,
+/// digits, decimal point and exponent. Returns the value and whether the token was read
+/// whole; `None` when no number starts it. The spellings MSVC's printf gives non-finite
+/// values (`-1.#QNAN0`, `1.#INF00`, `-1.#IND00`), which some exported material objects
+/// hold, read as their finite prefix (`-1.`) with the rest left unread.
+fn parse_float(v: &str) -> Option<(f32, bool)> {
+    if let Ok(f) = v.parse::<f32>()
+        && f.is_finite()
+    {
+        return Some((f, true));
     }
-    let upper = v.to_ascii_uppercase();
-    let negative = upper.starts_with('-');
-    if upper.contains("#INF") {
-        Some(if negative {
-            f32::NEG_INFINITY
-        } else {
-            f32::INFINITY
-        })
-    } else if upper.contains("#QNAN") || upper.contains("#SNAN") || upper.contains("#IND") {
-        Some(f32::NAN)
-    } else {
-        None
+    let b = v.as_bytes();
+    let mut i = 0;
+    if matches!(b.first(), Some(b'+' | b'-')) {
+        i += 1;
     }
+    let digits = |i: &mut usize| {
+        let start = *i;
+        while b.get(*i).is_some_and(u8::is_ascii_digit) {
+            *i += 1;
+        }
+        *i > start
+    };
+    let mut any = digits(&mut i);
+    if b.get(i) == Some(&b'.') {
+        i += 1;
+        any |= digits(&mut i);
+    }
+    if !any {
+        return None;
+    }
+    if matches!(b.get(i), Some(b'e' | b'E')) {
+        let mut j = i + 1;
+        if matches!(b.get(j), Some(b'+' | b'-')) {
+            j += 1;
+        }
+        if digits(&mut j) {
+            i = j;
+        }
+    }
+    let prefix = v[..i].trim_end_matches('.');
+    let f = prefix
+        .parse::<f32>()
+        .ok()
+        .or_else(|| v[..i].parse::<f32>().ok())?;
+    Some((f, i == v.len()))
 }
 
 fn floats(element: &'static str, name: &str, value: &str) -> Result<Vec<f32>> {
-    value
-        .split_whitespace()
-        .map(|v| {
-            parse_float(v).ok_or_else(|| MaterialError::BadValue {
-                element,
-                name: name.to_string(),
-                value: value.to_string(),
-            })
-        })
-        .collect()
+    // The original reads a value's numbers from one stream: a number read only in part
+    // (a non-finite spelling) leaves the stream failed, and every number after it keeps
+    // the zero it started at (0x50841e–0x50851d). Provisional: whether the array keeps its
+    // length after a failure is not traced; the count is kept.
+    let mut out = Vec::new();
+    let mut failed = false;
+    for v in value.split_whitespace() {
+        if failed {
+            out.push(0.0);
+            continue;
+        }
+        let (f, whole) = parse_float(v).ok_or_else(|| MaterialError::BadValue {
+            element,
+            name: name.to_string(),
+            value: value.to_string(),
+        })?;
+        out.push(f);
+        failed = !whole;
+    }
+    Ok(out)
 }
 
 /// A texture binding in a material object.
@@ -801,11 +839,27 @@ mod tests {
 
     #[test]
     fn accepts_msvc_non_finite_spellings() {
-        assert_eq!(parse_float("1.#INF00"), Some(f32::INFINITY));
-        assert_eq!(parse_float("-1.#INF00"), Some(f32::NEG_INFINITY));
-        assert!(parse_float("-1.#QNAN0").unwrap().is_nan());
-        assert!(parse_float("-1.#IND00").unwrap().is_nan());
+        assert_eq!(parse_float("1.#INF00"), Some((1.0, false)));
+        assert_eq!(parse_float("-1.#INF00"), Some((-1.0, false)));
+        assert_eq!(parse_float("-1.#QNAN0"), Some((-1.0, false)));
+        assert_eq!(parse_float("-1.#IND00"), Some((-1.0, false)));
+        assert_eq!(parse_float("0.5"), Some((0.5, true)));
+        assert_eq!(parse_float("-0"), Some((-0.0, true)));
+        assert_eq!(parse_float("2e3"), Some((2000.0, true)));
         assert_eq!(parse_float("x"), None);
+        // Orzammar's terrain: the malformed entry reads as -1 and stops the stream, so
+        // nothing after it reads (no NaN reaches the shaders).
+        let v = floats(
+            "Vector4fArray",
+            "mml_vSpecularColor",
+            "0.5 0.5 0.5 0.5 0 -0 -1.#QNAN0 0 0 0 0 0",
+        )
+        .unwrap();
+        assert_eq!(
+            v,
+            [0.5, 0.5, 0.5, 0.5, 0.0, -0.0, -1.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        );
+        assert!(v.iter().all(|f| f.is_finite()));
         let xml = br#"<MaterialObject><Material Name="a.mat"/><Vector4fArray Name="v" value="0.5 -1.#QNAN0 1.#INF00 0"/></MaterialObject>"#;
         let mao = MaterialObject::parse(xml).unwrap();
         assert_eq!(mao.vector_arrays[0].1.len(), 4);

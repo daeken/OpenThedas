@@ -430,6 +430,25 @@ fn formation_position(p: [f32; 3], facing: f32, [x, y]: [f32; 2]) -> [f32; 3] {
     [p[0] + x * rx + y * fx, p[1] + x * ry + y * fy, p[2]]
 }
 
+/// A mover's body facing (degrees) after turning `dt` seconds toward `want`, as
+/// DAOrigins.exe's body-yaw update turns it (0xa63b20-0xa63cd9): for the shortest signed
+/// difference `e`, it turns `min(|e|, 180·dt/T)` degrees that way, where
+/// `T = 0.4 - 0.28·|e|/180` s is worked out afresh from what is left each tick (0.4 at
+/// 0xae7128, 0.28 at 0xb596e8, 180 at 0xaf7ed8). So about 450°/s near the way it goes, 692°/s
+/// a quarter turn off and 1,500°/s turned right round, the same walking or running; it
+/// snaps once a step would pass the way. Differences under 1e-6° are left (0xb596b8). Not
+/// ported: the follower's filter on the asked-for way before this (0xa63fd7-0xa64026, a
+/// blend toward the route's way of `1 - 0.9^ceil(d / 0.075)` for a step of `d` metres).
+pub(crate) fn turn_toward(facing: f32, want: f32, dt: f32) -> f32 {
+    let e = (want - facing + 180.0).rem_euclid(360.0) - 180.0;
+    if e.abs() <= 1e-6 || dt <= 0.0 {
+        return facing;
+    }
+    let t = 0.4 - 0.28 * e.abs() / 180.0;
+    let step = e.abs().min(180.0 * dt / t);
+    (facing + step.copysign(e)).rem_euclid(360.0)
+}
+
 /// The horizontal direction of the leg of the route from `from` through `points` that a
 /// mover a share `f` of the way along it is on (the first leg at the start); `None` where
 /// the legs have no horizontal length.
@@ -2486,6 +2505,7 @@ impl Sim {
                 arrived: false,
                 da2_target_prepared: false,
                 path: Vec::new(),
+                turned_at: None,
             };
             // A follow move already under way goes on from where it has got to.
             if ours {
@@ -2514,14 +2534,10 @@ impl Sim {
         let (pos, area) = (o.position, o.area);
         let now: Vec<ObjectId> = self
             .world
-            .objects
-            .values()
-            .filter(|t| {
-                t.kind == ObjectKind::Trigger
-                    && t.active
-                    && t.area == area
-                    && crate::engine::in_trigger(pos, t)
-            })
+            .trigger_ids()
+            .iter()
+            .filter_map(|&t| self.world.get(t))
+            .filter(|t| t.active && t.area == area && crate::engine::in_trigger(pos, t))
             .map(|t| t.id)
             .collect();
         let before = self.world.in_triggers.get(&id).cloned().unwrap_or_default();
@@ -2830,24 +2846,26 @@ impl Sim {
         let now = self.world.time_ms;
         // (mover, start, start time, due, the points after the start)
         type Move = (ObjectId, [f32; 3], u64, u64, Vec<[f32; 3]>);
-        let moving: Vec<Move> =
-            self.world
-                .objects
-                .values()
-                .filter_map(|o| {
-                    let c = o.commands.first()?;
-                    let (from, t0) = c.from?;
-                    let due = c.due?;
-                    let points = if c.path.is_empty() {
+        // Only creatures and placeables carry commands that move (see `World::actor_ids`).
+        let actors = self.world.actor_ids();
+        let moving: Vec<Move> = actors
+            .iter()
+            .filter_map(|&id| self.world.get(id))
+            .filter_map(|o| {
+                let c = o.commands.first()?;
+                let (from, t0) = c.from?;
+                let due = c.due?;
+                let points =
+                    if c.path.is_empty() {
                         vec![c.approach.or(c.location.map(|l| l.position)).or_else(|| {
                             c.target.and_then(|t| self.world.get(t)).map(|t| t.position)
                         })?]
                     } else {
                         c.path.clone()
                     };
-                    Some((o.id, from, t0, due, points))
-                })
-                .collect();
+                Some((o.id, from, t0, due, points))
+            })
+            .collect();
         for (id, from, t0, due, points) in moving {
             if due <= t0 {
                 continue;
@@ -2914,10 +2932,22 @@ impl Sim {
                 }
                 self.update_triggers(id);
             }
+            let da2 = self.game == thedas_vfs::Game::DragonAge2;
             if let Some(o) = self.world.get_mut(id) {
                 o.position = p;
                 if let Some((dx, dy)) = dir {
-                    o.facing = crate::world::facing_toward(dx, dy);
+                    let want = crate::world::facing_toward(dx, dy);
+                    // Dragon Age II's follower is not traced: it faces the way at once.
+                    if da2 {
+                        o.facing = want;
+                    } else {
+                        let since = o.commands.first().and_then(|c| c.turned_at).unwrap_or(t0);
+                        let dt = now.saturating_sub(since) as f32 / 1000.0;
+                        o.facing = turn_toward(o.facing, want, dt);
+                        if let Some(c) = o.commands.first_mut() {
+                            c.turned_at = Some(now);
+                        }
+                    }
                 }
             }
             if was != p {
@@ -3462,14 +3492,31 @@ impl Sim {
     /// The earliest-finishing front command, starting the clock on fronts that have none.
     fn next_command(&mut self) -> Option<(u64, ObjectId)> {
         let now = self.world.time_ms;
-        let fronts: Vec<(ObjectId, Command)> = self
+        // A command under way in Origins is only its due time: copying every front command
+        // each pass (path, strings) cost a lot in busy areas. Commands to start, and every
+        // DA2 command, are copied as before.
+        let da2 = self.game == thedas_vfs::Game::DragonAge2;
+        let fronts: Vec<(ObjectId, Option<u64>, Option<Command>)> = self
             .world
             .objects
             .values()
-            .filter_map(|o| o.commands.first().map(|c| (o.id, c.clone())))
+            .filter_map(|o| {
+                let c = o.commands.first()?;
+                Some(match c.due {
+                    Some(d) if !da2 => (o.id, Some(d), None),
+                    _ => (o.id, None, Some(c.clone())),
+                })
+            })
             .collect();
         let mut best: Option<(u64, ObjectId)> = None;
-        for (id, mut cmd) in fronts {
+        for (id, under_way, cmd) in fronts {
+            if let Some(due) = under_way {
+                if best.is_none_or(|(b, bid)| (due, id) < (b, bid)) {
+                    best = Some((due, id));
+                }
+                continue;
+            }
+            let Some(mut cmd) = cmd else { continue };
             let due = match cmd.due {
                 Some(d) => {
                     if self.game == thedas_vfs::Game::DragonAge2 {
@@ -3959,10 +4006,19 @@ impl Sim {
                     self.move_object(id, p, Some(a));
                 }
             }
+            // A walk that was under way ends facing as the walker's body faces: DAOrigins.exe's
+            // ordinary arrival stops and resets the route (0x6a9430 -> 0xa63ac0) and sets no
+            // facing, so the bearing the order was given with (the player's click, a held
+            // stick's aim) does not snap onto the body at the end. Jumps, placements and
+            // Dragon Age II's moves (its follower not traced) take the location's facing.
+            let keeps_facing =
+                walked && cmd.from.is_some() && self.game != thedas_vfs::Game::DragonAge2;
             if let Some(obj) = self.world.get_mut(id) {
                 obj.position = l.position;
                 obj.area = Some(l.area);
-                obj.facing = l.facing;
+                if !keeps_facing {
+                    obj.facing = l.facing;
+                }
             }
         }
         self.da2_encounter_area_changed(id, before_area);
@@ -5283,6 +5339,28 @@ mod tests {
     }
 
     #[test]
+    fn a_movers_body_turns_at_the_exes_residual_rate() {
+        // DAOrigins.exe 0xa63b20: the first step of a turn at 33 ms.
+        // (Right round, either way is the short way.)
+        let off = |a: f32| (a + 180.0).rem_euclid(360.0) - 180.0;
+        for (e, step) in [(30.0, 16.81), (45.0, 18.0), (90.0, 22.85), (180.0, 49.5)] {
+            let got = off(turn_toward(0.0, e, 0.033));
+            assert!((got.abs() - step).abs() < 0.01, "{e}: {got} vs {step}");
+            if e < 180.0 {
+                assert!(got > 0.0, "{e}: {got}");
+                // The other way round too.
+                let back = off(turn_toward(0.0, -e, 0.033));
+                assert!((back + step).abs() < 0.01, "-{e}: {back}");
+            }
+        }
+        // Across north it takes the short way, and it snaps to the way once a step would
+        // pass it.
+        assert!((turn_toward(350.0, 10.0, 0.033) - 6.10).abs() < 0.01);
+        assert_eq!(turn_toward(100.0, 101.0, 0.1), 101.0);
+        assert_eq!(turn_toward(100.0, 180.0, 0.0), 100.0);
+    }
+
+    #[test]
     fn dragon_age_2_reference_functions_run_as_their_twins() {
         let ldf = "#define ENGINE_STRUCTURE_0 event\n\
             event Event(int nType) = 0;\n\
@@ -5552,6 +5630,7 @@ mod tests {
             arrived: false,
             da2_target_prepared: false,
             path: Vec::new(),
+            turned_at: None,
         });
         let t0 = s.world.time_ms;
         s.fail_front_command(c, "COMMAND_FAILED_PATH_ACTION_REQUIRED");
@@ -6186,6 +6265,7 @@ mod tests {
             arrived: false,
             da2_target_prepared: false,
             path: Vec::new(),
+            turned_at: None,
         });
         assert!(s.walk(hero, [10.0, 0.0, 0.0], None));
         let p = s.world.get(al).unwrap().position;
@@ -6280,6 +6360,7 @@ mod tests {
             arrived: false,
             da2_target_prepared: false,
             path: Vec::new(),
+            turned_at: None,
         };
         let o = s.world.get_mut(id).unwrap();
         o.commands.push(cmd("CommandPlayAnimation", 0.0));
@@ -6324,6 +6405,7 @@ mod tests {
             arrived: false,
             da2_target_prepared: false,
             path: Vec::new(),
+            turned_at: None,
         });
         s.tick(1);
         let o = s.world.get(id).unwrap();
@@ -6442,6 +6524,7 @@ mod tests {
             arrived: false,
             da2_target_prepared: false,
             path: Vec::new(),
+            turned_at: None,
         });
         s.tick(1);
         let o = s.world.get(id).unwrap();
@@ -6646,6 +6729,7 @@ mod tests {
                 arrived: false,
                 da2_target_prepared: false,
                 path: Vec::new(),
+                turned_at: None,
             });
         }
         s.tick(1);
@@ -6698,6 +6782,7 @@ mod tests {
             arrived: false,
             da2_target_prepared: false,
             path: Vec::new(),
+            turned_at: None,
         };
         s.world.get_mut(id).unwrap().commands.push(walk());
         // 5 m/s: two seconds in, ten metres along.
@@ -6844,6 +6929,7 @@ mod tests {
             arrived: false,
             da2_target_prepared: false,
             path: Vec::new(),
+            turned_at: None,
         };
         let blow = crate::world::Effect {
             ty: 1024,
@@ -6912,6 +6998,7 @@ mod tests {
             arrived: false,
             da2_target_prepared: false,
             path: Vec::new(),
+            turned_at: None,
         });
         // At 5 m/s: five metres after a second.
         s.tick(1000);
@@ -6964,6 +7051,7 @@ mod tests {
             arrived: false,
             da2_target_prepared: false,
             path: Vec::new(),
+            turned_at: None,
         };
         let walk = cmd(
             "CommandMoveToLocation",
@@ -7192,6 +7280,7 @@ mod tests {
                 arrived: false,
                 da2_target_prepared: false,
                 path: Vec::new(),
+                turned_at: None,
             });
             crowd.push(c);
         }
@@ -7220,6 +7309,7 @@ mod tests {
             arrived: false,
             da2_target_prepared: false,
             path: Vec::new(),
+            turned_at: None,
         });
         // It walks to just outside the crowd and waits; the ring is still full, so the
         // attack fails and its owner hears so.
@@ -7302,6 +7392,7 @@ mod tests {
             arrived: false,
             da2_target_prepared: false,
             path: Vec::new(),
+            turned_at: None,
         };
         // Away to 5 m from the target, on the line through the mover.
         let mut c = cmd("CommandMoveAwayFromObject");
@@ -7368,6 +7459,7 @@ mod tests {
             arrived: false,
             da2_target_prepared: false,
             path: Vec::new(),
+            turned_at: None,
         });
         let mut arrived = None;
         for k in 1..=400 {
@@ -7595,6 +7687,7 @@ mod tests {
             arrived: false,
             da2_target_prepared: false,
             path: Vec::new(),
+            turned_at: None,
         };
         assert_eq!(
             s.command_speed(human, &walk(0)),

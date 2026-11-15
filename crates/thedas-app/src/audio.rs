@@ -248,6 +248,8 @@ pub struct GameAudio {
     gui: Vec<Option<String>>,
     music: Option<(&'static str, EventHandle)>,
     voice: Option<(VoiceLine, Option<EventHandle>, Option<f64>)>,
+    /// A conversation line is waiting for the loading screen to go (logged once).
+    voice_held: bool,
     cutscene: Option<CutsceneSounds>,
     area: Option<AreaPlay>,
     /// The music of an area just left, kept playing until the next area says whether it
@@ -914,6 +916,7 @@ impl GameAudio {
             gui: gui_table(vfs),
             music: None,
             voice: None,
+            voice_held: false,
             cutscene: None,
             area: None,
             carried: None,
@@ -2290,7 +2293,19 @@ impl GameAudio {
         // it only once loading is over (0x6c73c0 places the party, then unpauses); its first
         // line spoke over the loading screen and was over by the time the dialog showed.
         // The line starts when the screen goes.
+        if state.loading
+            && state.line.is_some()
+            && self.voice.as_ref().map(|v| &v.0) != state.line.as_ref()
+            && !self.voice_held
+        {
+            log::info!("audio: voice held for the loading screen: {:?}", state.line);
+            self.voice_held = true;
+        }
         if !state.loading && self.voice.as_ref().map(|v| &v.0) != state.line.as_ref() {
+            self.voice_held = false;
+            if let Some(line) = &state.line {
+                log::info!("audio: voice starts: {line:?}");
+            }
             if let Some((_, Some(h), _)) = self.voice.take() {
                 self.engine.stop(h, true);
             }
