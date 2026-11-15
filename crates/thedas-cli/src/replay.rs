@@ -398,10 +398,11 @@ pub fn run(
         println!("saved {}", out.display());
     }
     let actual = serde_json::to_value(sim.save_game())?;
+    let f8_time = expected.world.time_ms;
     let expected = serde_json::to_value(expected)?;
     let diff = difference(&expected, &actual, "");
     println!(
-        "replayed {}/{} inputs; time {} ms; world hash {:016x}",
+        "replayed {}/{} inputs; time {} ms (F8 {f8_time} ms); world hash {:016x}",
         progress.applied,
         journal.inputs,
         sim.world.time_ms,
