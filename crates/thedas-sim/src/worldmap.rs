@@ -51,6 +51,8 @@ pub struct WorldMapState {
 pub const MSG_TRAVEL: &str = "GameModeController.AreaTransition";
 /// The world map screen's map toggle button.
 pub const MSG_SWAP: &str = "WorldMap.WorldMapSwapMaps";
+/// DA2's city day/night and Free Marches tabs.
+pub const MSG_SELECT_PRIMARY: &str = "WorldMap.WorldMapSetPrimaryMapByTag";
 /// The world map screen closing: 1 when it closed for travel (a pin was clicked), 0 when the
 /// player closed it.
 pub const MSG_CLOSED: &str = "WorldMap.WorldMapClosed";
@@ -173,6 +175,19 @@ impl Sim {
     /// one.
     pub(crate) fn world_map_message(&mut self, name: &str, args: &[String]) -> bool {
         match name {
+            MSG_SELECT_PRIMARY if self.game == thedas_vfs::Game::DragonAge2 => {
+                // Native 0x6ac6a0 resolves the first argument through the module's
+                // tag registry, then 0x6a66e0 updates the screen's primary binding.
+                let map = args.first().and_then(|tag| {
+                    self.world
+                        .objects
+                        .values()
+                        .find(|o| o.kind == ObjectKind::Map && o.tag.eq_ignore_ascii_case(tag))
+                });
+                let Some(map) = map else { return false };
+                self.world.world_map.primary = Some(map.id);
+                true
+            }
             MSG_TRAVEL => {
                 let index = args.get(1).and_then(|a| a.trim().parse::<f64>().ok());
                 let pin = match (index, self.shown_maps().0) {
@@ -412,6 +427,61 @@ impl Sim {
 mod tests {
     use super::*;
     use thedas_formats::gff4::{FieldDef, FourCC, StructData, StructTemplate, TlkString, Version};
+
+    #[test]
+    fn da2_map_tabs_select_authored_maps_and_route_their_pin_indices() {
+        use std::sync::Arc;
+        let mut s = Sim::new(
+            Arc::new(thedas_vfs::Vfs::new()),
+            Arc::new(thedas_script::EngineTable::default()),
+            1,
+        );
+        let day = s.world.spawn(ObjectKind::Map, "wm_city_day");
+        let night = s.world.spawn(ObjectKind::Map, "wm_city_night");
+        let marches = s.world.spawn(ObjectKind::Map, "wm_freemarches");
+        s.world.module = Some(s.world.spawn(ObjectKind::Module, "campaign_base"));
+        s.world.world_map.primary = Some(day);
+        s.world.world_map.secondary = Some(marches);
+        s.world.world_map.open = true;
+        let pin = s.world.spawn(ObjectKind::MapPin, "night_hightown");
+        let o = s.world.get_mut(pin).unwrap();
+        o.locals.objects.insert("WM_MAP".into(), night);
+        o.locals
+            .strings
+            .insert("WM_AREA".into(), "hightown_night".into());
+        o.fields.insert("WMStatus".into(), 0);
+        let select = |tag: &str| vec![tag.to_string()];
+
+        // Origins has no such message, even if the resources contain these tags.
+        assert!(!s.gui_message(MSG_SELECT_PRIMARY, &select("wm_city_night")));
+        assert_eq!(s.shown_maps(), (Some(day), Some(marches)));
+        s.game = thedas_vfs::Game::DragonAge2;
+        assert!(!s.gui_message(MSG_SELECT_PRIMARY, &[]));
+        assert!(!s.gui_message(MSG_SELECT_PRIMARY, &select("night_hightown")));
+        assert!(!s.gui_message(MSG_SELECT_PRIMARY, &select("absent_map")));
+        assert_eq!(s.world.world_map.primary, Some(day));
+        assert!(s.gui_message(MSG_SELECT_PRIMARY, &select("WM_CITY_NIGHT")));
+        assert_eq!(s.shown_maps(), (Some(night), Some(marches)));
+        assert_eq!(s.world.world_map.primary, Some(night));
+        assert_eq!(s.world.world_map.secondary, Some(marches));
+        assert!(s.world.queue.is_empty());
+        assert!(s.world.world_map.open);
+        let saved = serde_json::to_string(&s.world.world_map).unwrap();
+        s.world.world_map = serde_json::from_str(&saved).unwrap();
+        assert_eq!(s.shown_maps().0, Some(night));
+        assert!(s.gui_message(MSG_TRAVEL, &["darktown".into(), "0".into()]));
+        assert_eq!(s.world.world_map.travelling_to, Some(pin));
+        assert_eq!(
+            s.world.queue.values().next().unwrap().event.strings[1],
+            "hightown_night"
+        );
+        assert!(s.gui_message(MSG_CLOSED, &["1".into()]));
+        assert_eq!(s.shown_maps(), (Some(night), Some(marches)));
+        assert!(s.gui_message(MSG_SELECT_PRIMARY, &select("wm_freemarches")));
+        assert_eq!(s.shown_maps().0, Some(marches));
+        s.travel_arrived();
+        assert_eq!(s.shown_maps().0, Some(marches));
+    }
 
     #[test]
     fn entering_an_area_puts_the_party_on_its_pin_on_the_primary_map() {
