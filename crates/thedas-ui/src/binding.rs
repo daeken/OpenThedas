@@ -387,6 +387,14 @@ fn section(
     }
 }
 
+/// A section's token: a hash of what it is built for.
+fn token(key: &impl std::hash::Hash) -> u64 {
+    use std::hash::Hasher;
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    key.hash(&mut h);
+    h.finish()
+}
+
 /// [`sim_values_for`] reusing what [`ValueCache`] holds.
 pub fn sim_values_cached(
     sim: &Sim,
@@ -845,17 +853,26 @@ fn sim_values_with(
         .count();
     set("Area.CreatureCount".into(), num(creatures as f64));
     let who = controlled.or(hero);
+    // A section's token names what it is built for, so opening a container, store or the
+    // party picker builds it again at once: the screen reads the panel to show (the
+    // footlocker's, say) as it opens, before the section's lifetime has run out.
     section(
         &mut cache,
         "Inventory",
-        u64::from(who.unwrap_or(0)) << 8 | u64::from(shown.item_filter as u8),
+        token(&(who, shown.item_filter, sim.world.container)),
         &mut v,
         |v| inventory(sim, who, shown.item_filter, v),
     );
-    section(&mut cache, "Store", 0, &mut v, |v| store(sim, shown, v));
-    section(&mut cache, "PartyPicker", 0, &mut v, |v| {
-        party_picker(sim, shown, v)
+    section(&mut cache, "Store", token(&sim.world.store), &mut v, |v| {
+        store(sim, shown, v)
     });
+    section(
+        &mut cache,
+        "PartyPicker",
+        token(&sim.world.party_picker.is_some()),
+        &mut v,
+        |v| party_picker(sim, shown, v),
+    );
     section(&mut cache, "Saves", 0, &mut v, |v| saves(sim, shown, v));
     section(&mut cache, "Journal", 0, &mut v, |v| journal(sim, shown, v));
     alerts(sim, shown, &mut v);
@@ -887,7 +904,7 @@ fn sim_values_with(
     // sets both; a tutorial that pauses the game sets only `Client.Paused`, as
     // DAOrigins.exe's TutorialControl does (0x6940ec: the client pause, 0x5d6740, with
     // its user flag off), so the border shows then too.
-    let paused = shown.paused || sim.world.tutorial_paused || sim.training_paused();
+    let paused = shown.paused || sim.tutorial_paused() || sim.training_paused();
     v.insert("Client.Paused".into(), num(u8::from(paused)));
     v.insert("Client.UserPaused".into(), num(u8::from(shown.paused)));
     if let Some(p) = shown.book_page {
@@ -957,7 +974,8 @@ fn sim_values_with(
     // Provisional: the original's rule for a tutorial waiting while a menu is up is not
     // traced; QA saw the panel over the options, save and game menus, where it does not
     // belong.
-    let tutorials: &[thedas_sim::journal::Tutorial] = if shown.menu_up {
+    let tutorials_held = shown.menu_up || sim.tutorials_held();
+    let tutorials: &[thedas_sim::journal::Tutorial] = if tutorials_held {
         &[]
     } else {
         &sim.world.tutorials
@@ -968,7 +986,7 @@ fn sim_values_with(
             tutorials
                 .iter()
                 .map(|t| t.resref.as_str())
-                .chain(shown.pad_active.then_some("pad"))
+                .chain((shown.pad_active && !sim.tutorials_held()).then_some("pad"))
                 .collect::<Vec<_>>()
                 .join(","),
         ),
@@ -1004,7 +1022,11 @@ fn sim_values_with(
     // The training step shown (`trainingsteps.gda`'s row; 0 none), see `thedas_sim::training`.
     v.insert(
         "Tutorials.TrainingStep".into(),
-        num(sim.world.training.step),
+        num(if sim.tutorials_held() {
+            0
+        } else {
+            sim.world.training.step
+        }),
     );
     // The tutorials' screen highlights (DAConstants `GUI_HIGHLIGHT_*`: 0 follower, 1
     // tactics, 2 inventory, 3 health poultice, 4 empty quickbar, 5 tactic preset, 6
@@ -2205,6 +2227,79 @@ fn inventory(sim: &Sim, who: Option<u32>, filter: i32, v: &mut BTreeMap<String, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cinematic_tutorials_wait_and_reappear_with_their_pause() {
+        let mut sim = Sim::new(
+            std::sync::Arc::new(thedas_vfs::Vfs::new()),
+            std::sync::Arc::new(thedas_script::EngineTable::default()),
+            1,
+        );
+        sim.world.tutorials.push(thedas_sim::journal::Tutorial {
+            resref: "lesson".into(),
+            title: None,
+            text: None,
+            pauses: true,
+        });
+        sim.world.tutorial_paused = true;
+        sim.world.training.step = 7;
+        sim.world.cutscenes.push("intro.cut".into());
+        let shown = Presentation {
+            pad_active: true,
+            ..Default::default()
+        };
+        let v = sim_values_for(&sim, &shown);
+        assert_eq!(v["Tutorials.TutorialList"], UiValue::String(String::new()));
+        assert_eq!(v["Tutorials.TrainingStep"], num(0));
+        assert_eq!(v["Client.Paused"], num(0));
+        assert_eq!(sim.world.tutorials.len(), 1);
+        sim.world.cutscenes.clear();
+        let v = sim_values_for(&sim, &shown);
+        assert_eq!(
+            v["Tutorials.TutorialList"],
+            UiValue::String("lesson,pad".into())
+        );
+        assert_eq!(v["Tutorials.TrainingStep"], num(7));
+        assert_eq!(v["Client.Paused"], num(1));
+    }
+
+    #[test]
+    fn opening_a_container_rebuilds_the_cached_inventory_at_once() {
+        use thedas_sim::world::ObjectKind;
+        let mut sim = Sim::new(
+            std::sync::Arc::new(thedas_vfs::Vfs::new()),
+            std::sync::Arc::new(thedas_script::EngineTable::default()),
+            1,
+        );
+        let hero = sim.world.spawn(ObjectKind::Creature, "player");
+        sim.world.hero = Some(hero);
+        let chest = sim.world.spawn(ObjectKind::Placeable, "footlocker");
+        let shown = Presentation::default();
+        let mut cache = ValueCache::default();
+        let show = |cache: &mut ValueCache| {
+            cache
+                .updates
+                .iter()
+                .rev()
+                .find(|(g, _)| g == "Inventory")
+                .and_then(|(_, rows)| {
+                    rows.iter()
+                        .find(|(k, _)| k == "GUIInventory.ShowContainer")
+                        .map(|(_, v)| v.clone())
+                })
+        };
+        sim_values_cached(&sim, &shown, &mut cache);
+        assert_eq!(show(&mut cache), Some(num(0)));
+        cache.updates.clear();
+        // The same frame time: only the open container changed.
+        sim.open_container(chest);
+        sim_values_cached(&sim, &shown, &mut cache);
+        assert_eq!(show(&mut cache), Some(num(1)), "the footlocker panel shows");
+        cache.updates.clear();
+        sim.close_container();
+        sim_values_cached(&sim, &shown, &mut cache);
+        assert_eq!(show(&mut cache), Some(num(0)));
+    }
 
     #[test]
     fn empty_party_slots_read_as_no_creature() {
