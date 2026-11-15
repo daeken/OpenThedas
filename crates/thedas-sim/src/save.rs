@@ -261,6 +261,7 @@ impl Sim {
         self.world = world;
         self.restore_da2_encounters();
         self.restore_script_heartbeats();
+        self.repair_body_bags();
         // A conversation whose last line was already shown does not come back: the game
         // cannot be saved during a conversation, so a loaded game never resumes one at its
         // end (saves made by test drivers can hold one; reloading it would put the last

@@ -1104,12 +1104,10 @@ impl Sim {
         self.world
             .location_vfx
             .retain(|v| v.duration_ms.is_none_or(|d| v.started_ms + d > end));
-        self.world
-            .instant_vfx
-            .retain(|v| v.started_ms + crate::world::INSTANT_VFX_MS > end);
+        self.world.instant_vfx.retain(|v| v.started_ms + v.ms > end);
         self.world
             .instant_location_vfx
-            .retain(|v| v.started_ms + crate::world::INSTANT_VFX_MS > end);
+            .retain(|v| v.started_ms + v.ms > end);
         self.leave_conversation_mode();
         self.advance_ambient(ms);
         self.update_perception();
@@ -2532,9 +2530,13 @@ impl Sim {
         }
     }
 
-    /// Queues ENTER for triggers a creature is now in and EXIT for ones it left. Provisional:
-    /// trigger outlines are tested in the XY plane, and the creature is the event's creator
-    /// and object 0.
+    /// Queues ENTER for triggers a creature is now in and EXIT for ones it left. Origins'
+    /// outline test is on XY (0x799130), with authored offsets translated without facing
+    /// rotation (0x7997cf). Origins' sender (0x698850) gives the events the creature as
+    /// creator and event target, integer 0 = 0, and the receiving trigger in object slot 0.
+    /// DA2 keeps its provisional payload; membership timing is separate. Origins queues
+    /// every EXIT before any ENTER, matching the two comparison phases in 0x6ae100; DA2
+    /// retains its provisional ENTER-first order.
     pub fn update_triggers(&mut self, id: ObjectId) {
         let Some(o) = self.world.get(id) else { return };
         if o.kind != ObjectKind::Creature {
@@ -2546,15 +2548,26 @@ impl Sim {
             .trigger_ids()
             .iter()
             .filter_map(|&t| self.world.get(t))
-            .filter(|t| t.active && t.area == area && crate::engine::in_trigger(pos, t))
+            .filter(|t| t.active && t.area == area && crate::engine::in_trigger(pos, t, self.game))
             .map(|t| t.id)
             .collect();
         let before = self.world.in_triggers.get(&id).cloned().unwrap_or_default();
-        for (list, name) in [(&now, "ENTER"), (&before, "EXIT")] {
+        let changes = if self.game == thedas_vfs::Game::Origins {
+            [(&before, "EXIT"), (&now, "ENTER")]
+        } else {
+            [(&now, "ENTER"), (&before, "EXIT")]
+        };
+        for (list, name) in changes {
             let other = if name == "ENTER" { &before } else { &now };
             for &t in list.iter().filter(|t| !other.contains(t)) {
                 let mut ev = self.new_event(name, Some(id));
-                ev.objects = vec![id];
+                if self.game == thedas_vfs::Game::Origins {
+                    ev.target = Some(id);
+                    ev.ints = vec![0];
+                    ev.objects = vec![t];
+                } else {
+                    ev.objects = vec![id];
+                }
                 self.world.queue_event(0, t, ev, None);
             }
         }
@@ -4280,6 +4293,36 @@ impl Sim {
                 template: o.template.clone(),
             };
             self.world.trace.push(e);
+        }
+    }
+
+    /// Body bags saved before they were built from their template (no script, appearance or
+    /// fields; see [`Sim::spawn_body_bag`]) take it now, keeping what they hold and where
+    /// they lie, so the player can open the ones already lying in a saved game.
+    pub(crate) fn repair_body_bags(&mut self) {
+        let bags: Vec<ObjectId> = self
+            .world
+            .objects
+            .values()
+            .filter(|o| {
+                o.kind == ObjectKind::Placeable
+                    && o.template
+                        .eq_ignore_ascii_case(crate::inventory::BODY_BAG_TEMPLATE)
+                    && o.script.is_none()
+            })
+            .map(|o| o.id)
+            .collect();
+        if bags.is_empty() {
+            return;
+        }
+        let Ok(t) = self.read_gff3(&format!("{}.utp", crate::inventory::BODY_BAG_TEMPLATE)) else {
+            return;
+        };
+        for id in bags {
+            if let Some(o) = self.world.get_mut(id) {
+                apply_template(o, &t);
+                apply_placeable_useable(o, self.game);
+            }
         }
     }
 
@@ -6607,13 +6650,209 @@ mod tests {
             .values()
             .map(|q| (q.target, q.event.objects.clone()))
             .collect();
-        assert_eq!(q, vec![(tr, vec![c])]);
+        assert_eq!(q, vec![(tr, vec![tr])]);
         s.world.queue.clear();
         s.move_object(c, [10.2, 10.2, 0.0], None);
         assert!(s.world.queue.is_empty(), "still inside: no new event");
         s.move_object(c, [20.0, 10.0, 0.0], None);
         assert_eq!(s.world.queue.len(), 1);
         assert!(!s.world.in_triggers.contains_key(&c));
+    }
+
+    #[test]
+    fn trigger_event_fields_reach_scripts_with_distinct_target_and_receiver() {
+        let table = Arc::new(
+            EngineTable::parse(
+                b"#define ENGINE_STRUCTURE_0 event\n\
+                event GetCurrentEvent() = 0;\n\
+                object GetEventCreator(event e) = 1;\n\
+                object GetEventTarget(event e) = 2;\n\
+                object GetEventObject(event e, int index) = 3;\n\
+                void SetLocalObject(object o, string key, object value) = 4;\n\
+                int GetEventInteger(event e, int index) = 5;\n\
+                int GetEventType(event e) = 6;\n\
+                void SetLocalInt(object o, string key, int value) = 7;\n\
+                int EVENT_TYPE_ENTER = 8;\nint EVENT_TYPE_EXIT = 9;\n",
+            )
+            .unwrap(),
+        );
+        // Store the fields returned by the event getters on OBJECT_SELF. This tests the
+        // event after delivery, where an absent event target defaults to the receiver.
+        let mut body = Vec::new();
+        for (key, getter, indexed, integer) in [
+            ("creator", 1, false, false),
+            ("target", 2, false, false),
+            ("object0", 3, true, false),
+            ("integer0", 5, true, true),
+            ("type", 6, false, true),
+        ] {
+            if indexed {
+                body.extend([0x04, 0x03, 0, 0, 0, 0]);
+            }
+            body.extend([0x05, 0x00, 0, 0, 0]); // GetCurrentEvent()
+            body.extend([0x05, 0x00, 0, getter, if indexed { 2 } else { 1 }]);
+            body.extend([0x04, 0x05]);
+            body.extend((key.len() as u16).to_be_bytes());
+            body.extend(key.as_bytes());
+            body.extend([0x04, 0x06, 0, 0, 0, 0]); // OBJECT_SELF
+            body.extend([0x05, 0x00, 0, if integer { 7 } else { 4 }, 3]);
+        }
+        body.extend([0x20, 0x00]);
+        let mut bytes = b"NCS V1.0B".to_vec();
+        bytes.extend(((13 + body.len()) as u32).to_be_bytes());
+        bytes.extend(body);
+        let script = Ncs::parse(&bytes).unwrap();
+        for game in [thedas_vfs::Game::Origins, thedas_vfs::Game::DragonAge2] {
+            let mut s = Sim::new(Arc::new(Vfs::new()), table.clone(), 7);
+            s.game = game;
+            s.add_script("event_fields", script.clone());
+            let area = s.world.spawn(ObjectKind::Area, "a");
+            let tr = s.world.spawn(ObjectKind::Trigger, "t");
+            let c = s.world.spawn(ObjectKind::Creature, "c");
+            let t = s.world.get_mut(tr).unwrap();
+            t.area = Some(area);
+            t.position = [10.0, 10.0, 0.0];
+            t.script = Some("event_fields".into());
+            t.geometry = vec![
+                [-1.0, -1.0, 0.0],
+                [1.0, -1.0, 0.0],
+                [1.0, 1.0, 0.0],
+                [-1.0, 1.0, 0.0],
+            ];
+            s.world.get_mut(c).unwrap().area = Some(area);
+            for (pos, ty) in [([10.0, 10.0, 0.0], 8), ([20.0, 10.0, 0.0], 9)] {
+                s.move_object(c, pos, None);
+                let mut queued = std::mem::take(&mut s.world.queue).into_values();
+                let q = queued.next().unwrap();
+                assert!(queued.next().is_none());
+                assert_eq!(q.target, tr);
+                s.deliver(q.target, q.event, q.script);
+                let locals = &s.world.get(tr).unwrap().locals;
+                assert_eq!(locals.objects.get("creator"), Some(&c));
+                let (target, object0) = if game == thedas_vfs::Game::Origins {
+                    (c, tr)
+                } else {
+                    (tr, c)
+                };
+                assert_eq!(locals.objects.get("target"), Some(&target));
+                assert_eq!(locals.objects.get("object0"), Some(&object0));
+                assert_eq!(locals.ints.get("integer0"), Some(&0));
+                assert_eq!(locals.ints.get("type"), Some(&ty));
+            }
+        }
+    }
+
+    #[test]
+    fn origins_trigger_membership_uses_authored_axes_and_ignores_height() {
+        let mut s = sim();
+        let area = s.world.spawn(ObjectKind::Area, "a");
+        let tr = s.world.spawn(ObjectKind::Trigger, "t");
+        let c = s.world.spawn(ObjectKind::Creature, "c");
+        let t = s.world.get_mut(tr).unwrap();
+        t.area = Some(area);
+        t.position = [10.0, 20.0, 30.0];
+        t.facing = 90.0;
+        t.geometry = vec![
+            [1.0, -0.5, 0.0],
+            [3.0, -0.5, 0.0],
+            [3.0, 0.5, 0.0],
+            [1.0, 0.5, 0.0],
+        ];
+        s.world.get_mut(c).unwrap().area = Some(area);
+        // Facing must not move this eastward outline north of the trigger.
+        s.move_object(c, [10.0, 22.0, 30.0], None);
+        assert!(s.world.queue.is_empty());
+        s.move_object(c, [12.0, 20.0, 130.0], None);
+        assert_eq!(s.world.in_triggers.get(&c), Some(&vec![tr]));
+        let ev = &s.world.queue.values().next().unwrap().event;
+        assert_eq!(ev.ty, s.event_type("ENTER"));
+        s.world.queue.clear();
+        s.move_object(c, [12.0, 20.0, -130.0], None);
+        assert!(s.world.queue.is_empty(), "height alone does not leave");
+        s.move_object(c, [10.0, 22.0, -130.0], None);
+        assert_eq!(s.world.queue.len(), 1);
+        assert_eq!(
+            s.world.queue.values().next().unwrap().event.ty,
+            s.event_type("EXIT")
+        );
+        assert!(!s.world.in_triggers.contains_key(&c));
+    }
+
+    #[test]
+    fn origins_trigger_changes_queue_all_exits_before_any_enters() {
+        for game in [thedas_vfs::Game::Origins, thedas_vfs::Game::DragonAge2] {
+            let table =
+                EngineTable::parse(b"int EVENT_TYPE_ENTER = 8;\nint EVENT_TYPE_EXIT = 9;\n")
+                    .unwrap();
+            let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(table), 7);
+            s.game = game;
+            let area = s.world.spawn(ObjectKind::Area, "a");
+            let c = s.world.spawn(ObjectKind::Creature, "c");
+            s.world.get_mut(c).unwrap().area = Some(area);
+            let mut triggers = Vec::new();
+            for (tag, x) in [
+                ("leave1", 10.0),
+                ("enter1", 20.0),
+                ("leave2", 10.0),
+                ("enter2", 20.0),
+            ] {
+                let t = s.world.spawn(ObjectKind::Trigger, tag);
+                let o = s.world.get_mut(t).unwrap();
+                o.area = Some(area);
+                o.position = [x, 10.0, 0.0];
+                o.geometry = vec![
+                    [-1.0, -1.0, 0.0],
+                    [1.0, -1.0, 0.0],
+                    [1.0, 1.0, 0.0],
+                    [-1.0, 1.0, 0.0],
+                ];
+                triggers.push(t);
+            }
+            // A trigger shared by both positions must send neither EXIT nor ENTER.
+            let shared = s.world.spawn(ObjectKind::Trigger, "shared");
+            let o = s.world.get_mut(shared).unwrap();
+            o.area = Some(area);
+            o.position = [15.0, 10.0, 0.0];
+            o.geometry = vec![
+                [-6.0, -1.0, 0.0],
+                [6.0, -1.0, 0.0],
+                [6.0, 1.0, 0.0],
+                [-6.0, 1.0, 0.0],
+            ];
+            s.move_object(c, [10.0, 10.0, 0.0], None);
+            s.world.queue.clear();
+            s.move_object(c, [20.0, 10.0, 0.0], None);
+            let queued: Vec<_> = s
+                .world
+                .queue
+                .values()
+                .map(|q| (q.target, q.event.ty))
+                .collect();
+            let exits = [
+                (triggers[0], s.event_type("EXIT")),
+                (triggers[2], s.event_type("EXIT")),
+            ];
+            let enters = [
+                (triggers[1], s.event_type("ENTER")),
+                (triggers[3], s.event_type("ENTER")),
+            ];
+            let expected: Vec<_> = if game == thedas_vfs::Game::Origins {
+                exits.into_iter().chain(enters).collect()
+            } else {
+                enters.into_iter().chain(exits).collect()
+            };
+            assert_eq!(queued, expected, "{game:?}");
+            assert_eq!(
+                s.world.in_triggers.get(&c),
+                Some(&vec![triggers[1], triggers[3], shared])
+            );
+            s.world.queue.clear();
+            s.move_object(c, [20.0, 10.0, 100.0], None);
+            assert!(
+                s.world.queue.is_empty(),
+                "unchanged membership queues no events"
+            );
+        }
     }
 
     #[test]

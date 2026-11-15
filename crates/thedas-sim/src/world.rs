@@ -464,9 +464,9 @@ pub struct LocationVfx {
 }
 
 /// An instant visual effect played on an object (an `EffectVisualEffect` applied with
-/// `EFFECT_DURATION_TYPE_INSTANT`): DAOrigins.exe applies such an effect and keeps nothing,
-/// so this is only a note for presentation that the effect was played, kept for
-/// [`INSTANT_VFX_MS`]. Not saved.
+/// `EFFECT_DURATION_TYPE_INSTANT`): the script's effect ends at once and the visual plays on
+/// by its animations (see [`crate::vfx`]), so this is a note for presentation that the
+/// effect was played, kept while it is shown (`ms`). Not saved.
 #[derive(Clone, Debug, PartialEq)]
 pub struct InstantVfx {
     pub target: ObjectId,
@@ -474,12 +474,16 @@ pub struct InstantVfx {
     pub vfx: i32,
     /// World time it was played.
     pub started_ms: u64,
+    /// How long it is shown, in milliseconds ([`crate::vfx::VfxTiming::ms`]).
+    pub ms: u64,
+    /// It loops a duration animation while shown ([`crate::vfx::VfxTiming::lasting`]).
+    pub lasting: bool,
 }
 
 /// An instant visual effect played at a place (`Engine_ApplyEffectAtLocation` with an
 /// `EffectVisualEffect` of `EFFECT_DURATION_TYPE_INSTANT`: a spell's impact on the ground):
-/// as with [`InstantVfx`], the executable keeps nothing, so `GetEffects` never finds it; this
-/// note is for presentation, kept for [`INSTANT_VFX_MS`]. Not saved.
+/// as with [`InstantVfx`], the script's effect ends at once, so `GetEffects` never finds it;
+/// this note is for presentation, kept while the visual is shown. Not saved.
 #[derive(Clone, Debug, PartialEq)]
 pub struct InstantLocationVfx {
     /// Tells it from the others while it is kept.
@@ -492,11 +496,11 @@ pub struct InstantLocationVfx {
     pub facing: f32,
     /// World time it was played.
     pub started_ms: u64,
+    /// How long it is shown, in milliseconds ([`crate::vfx::VfxTiming::ms`]).
+    pub ms: u64,
+    /// It loops a duration animation while shown ([`crate::vfx::VfxTiming::lasting`]).
+    pub lasting: bool,
 }
-
-/// How long an [`InstantVfx`] note is kept for presentation to pick up. Not the effect's
-/// length (the VFX resource has its own); provisional.
-pub const INSTANT_VFX_MS: u64 = 2_000;
 
 /// The open party picker: the followers picked so far (at most three), in order.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
