@@ -11,14 +11,25 @@
 
 use crate::gpu::DEPTH_FORMAT;
 
-/// The sample counts a pixel the adapter can draw `format` colour and our depth with: 1
-/// (off) and every larger count both support, in order.
-pub fn supported_samples(adapter: &wgpu::Adapter, format: wgpu::TextureFormat) -> Vec<u32> {
+/// The sample counts a pixel `device` (on `adapter`) can draw `format` colour and our depth
+/// with: 1 (off) and every larger count both support, in order. The adapter's own counts
+/// beyond WebGPU's guaranteed 1 and 4 (2x, 8x on Apple GPUs) are usable only on a device
+/// made with `TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES`; without it they would fail to
+/// validate (a 2x terrain pipeline panics the level build).
+pub fn supported_samples(
+    adapter: &wgpu::Adapter,
+    device: &wgpu::Device,
+    format: wgpu::TextureFormat,
+) -> Vec<u32> {
+    let specific = device
+        .features()
+        .contains(wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES);
     let colour = adapter.get_texture_format_features(format).flags;
     let depth = adapter.get_texture_format_features(DEPTH_FORMAT).flags;
     let mut out = vec![1];
     for n in [2, 4, 8, 16] {
-        if colour.sample_count_supported(n) && depth.sample_count_supported(n) {
+        let allowed = specific || n == 4;
+        if allowed && colour.sample_count_supported(n) && depth.sample_count_supported(n) {
             out.push(n);
         }
     }
