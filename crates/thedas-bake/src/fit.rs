@@ -33,6 +33,10 @@ pub struct Row {
     /// The room ambient this texel's piece takes (index into the ambient list), if any.
     pub room: Option<u32>,
     pub atlas_xy: (u32, u32),
+    /// The surface point, its geometric normal and that normal faced toward the camera.
+    pub p: Vec3,
+    pub ng: Vec3,
+    pub nf: Vec3,
 }
 
 /// Computes the features of every covered texel of one region (every `stride`-th texel).
@@ -113,6 +117,9 @@ pub fn rows(
                 ao_uni45,
                 room,
                 atlas_xy: (ax as u32, ay as u32),
+                p: sp,
+                ng,
+                nf,
             });
         }
     }
@@ -245,4 +252,140 @@ mod tests {
         let x = nnls(&[vec![1.0]], &[-1.0], 10);
         assert_eq!(x, vec![0.0]);
     }
+}
+
+/// A light found by [`discover`]: what the residual RGB of a set of texels asks for.
+#[derive(Clone, Debug)]
+pub struct Found {
+    pub position: Vec3,
+    pub radius: f32,
+    /// Linear colour × brightness.
+    pub color: Vec3,
+    /// How much of the residual's squared norm it explains.
+    pub gain: f64,
+}
+
+/// Greedy matching pursuit for missing point lights: candidate positions on a grid over the
+/// texels' bounds (raised up to `lift` above them) and a few radii; the candidate whose
+/// falloff × |cos| × visibility best explains the residual (per channel, non-negative) is
+/// taken out, and the search repeats `count` times. `residual` is per row, linear RGB.
+pub fn discover(
+    bvh: &crate::bvh::Bvh,
+    rows: &[&Row],
+    residual: &mut [Vec3],
+    settings: &Settings,
+    count: usize,
+    spacing: f32,
+    lift: f32,
+) -> Vec<Found> {
+    let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+    for r in rows {
+        lo = lo.min(r.p);
+        hi = hi.max(r.p);
+    }
+    hi.z += lift;
+    let mut candidates = Vec::new();
+    let steps = |a: f32, b: f32| ((b - a) / spacing).ceil().max(0.0) as i32;
+    for ix in 0..=steps(lo.x, hi.x) {
+        for iy in 0..=steps(lo.y, hi.y) {
+            for iz in 0..=steps(lo.z, hi.z) {
+                candidates.push(lo + Vec3::new(ix as f32, iy as f32, iz as f32) * spacing);
+            }
+        }
+    }
+    let radii = [3.0f32, 6.0, 10.0, 16.0];
+    let mut found = Vec::new();
+    for _ in 0..count {
+        // Features per candidate are recomputed each round; the grid is small.
+        let best = std::thread::scope(|s| {
+            let threads = settings.threads.max(1);
+            let chunk = candidates.len().div_ceil(threads).max(1);
+            let handles: Vec<_> = candidates
+                .chunks(chunk)
+                .map(|cands| {
+                    let residual = &*residual;
+                    s.spawn(move || {
+                        let mut best: Option<(f64, Vec3, f32, Vec3)> = None;
+                        for &c in cands {
+                            // Visibility once per candidate and row, reused by every radius.
+                            let mut vis: Vec<(usize, f32, f32)> = Vec::new();
+                            let rmax = radii[radii.len() - 1];
+                            for (i, r) in rows.iter().enumerate() {
+                                let to = c - r.p;
+                                let d = to.length();
+                                if d == 0.0 || d >= rmax {
+                                    continue;
+                                }
+                                let dir = to / d;
+                                if r.nf.dot(dir) <= 0.0 {
+                                    continue;
+                                }
+                                if crate::bake::shadowed(bvh, r.p, dir, d, settings) {
+                                    continue;
+                                }
+                                vis.push((i, d, r.ng.dot(dir).abs()));
+                            }
+                            for &rad in &radii {
+                                let (mut ff, mut fr) = (0.0f64, [0.0f64; 3]);
+                                for &(i, d, cos) in &vis {
+                                    if d >= rad {
+                                        continue;
+                                    }
+                                    let f = ((1.0 - d / rad) * cos) as f64;
+                                    ff += f * f;
+                                    for (c, acc) in fr.iter_mut().enumerate() {
+                                        *acc += f * residual[i][c] as f64;
+                                    }
+                                }
+                                if ff <= 0.0 {
+                                    continue;
+                                }
+                                let gain: f64 =
+                                    fr.iter().map(|&x| x.max(0.0) * x.max(0.0) / ff).sum();
+                                if best.as_ref().is_none_or(|b| gain > b.0) {
+                                    let col = Vec3::new(
+                                        (fr[0].max(0.0) / ff) as f32,
+                                        (fr[1].max(0.0) / ff) as f32,
+                                        (fr[2].max(0.0) / ff) as f32,
+                                    );
+                                    best = Some((gain, c, rad, col));
+                                }
+                            }
+                        }
+                        best
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .filter_map(|h| h.join().ok().flatten())
+                .max_by(|a, b| a.0.total_cmp(&b.0))
+        });
+        let Some((gain, position, radius, color)) = best else {
+            break;
+        };
+        if gain <= 0.0 {
+            break;
+        }
+        // Take it out of the residual.
+        for (i, r) in rows.iter().enumerate() {
+            let to = position - r.p;
+            let d = to.length();
+            if d == 0.0 || d >= radius {
+                continue;
+            }
+            let dir = to / d;
+            if r.nf.dot(dir) <= 0.0 || crate::bake::shadowed(bvh, r.p, dir, d, settings) {
+                continue;
+            }
+            residual[i] -= color * (1.0 - d / radius) * r.ng.dot(dir).abs();
+        }
+        found.push(Found {
+            position,
+            radius,
+            color,
+            gain,
+        });
+    }
+    found
 }

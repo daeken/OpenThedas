@@ -67,6 +67,9 @@ struct Args {
     /// Use a previous --fit's fit.txt for the RGB pass's light brightness and room ambients.
     #[arg(long)]
     use_fit: Option<PathBuf>,
+    /// With --fit: look for this many missing (baked-only) lights in the residual.
+    #[arg(long, default_value_t = 0)]
+    discover: usize,
     /// Fit every n-th texel.
     #[arg(long, default_value_t = 2)]
     stride: u32,
@@ -187,6 +190,19 @@ fn main() -> Result<()> {
                 ["ambient", room, r, g, b, ..] => {
                     let c = Vec3::new(r.parse()?, g.parse()?, b.parse()?);
                     ambient.insert(room.to_string(), c);
+                }
+                ["found", x, y, z, r, cr, cg, cb] => {
+                    points.push(BakeLight {
+                        kind: LightKind::Point {
+                            position: Vec3::new(x.parse()?, y.parse()?, z.parse()?),
+                            radius: r.parse()?,
+                        },
+                        color: Vec3::new(cr.parse()?, cg.parse()?, cb.parse()?),
+                        brightness: 1.0,
+                        in_lightmap: true,
+                        cast_shadows: false,
+                    });
+                    names.push("found".into());
                 }
                 ["light", i, k, ..] => {
                     let (i, k): (usize, f32) = (i.parse()?, k.parse()?);
@@ -781,6 +797,7 @@ fn fit(
         ),
     ];
     let mut out = String::new();
+    let mut last = None;
     for (pname, pick) in pickers.iter() {
         let lf = fit::fit_lights(&rows, lights, rooms.len(), settings.gamma, pick.as_ref());
         println!(
@@ -835,6 +852,59 @@ fn fit(
                 l.color.y,
                 l.color.z
             );
+        }
+        last = Some(lf);
+    }
+    // Missing lights: what the residual RGB of unoccluded texels asks for.
+    if let (Some(lf), true) = (&last, args.discover > 0) {
+        let picked: Vec<&fit::Row> = rows.iter().filter(|r| open_model(r) >= 0.98).collect();
+        let step = (picked.len() / 6000).max(1);
+        let picked: Vec<&fit::Row> = picked.into_iter().step_by(step).collect();
+        let mut residual: Vec<Vec3> = picked
+            .iter()
+            .map(|r| {
+                let mut v = r
+                    .room
+                    .map(|room| lf.ambient[room as usize])
+                    .unwrap_or(Vec3::ZERO);
+                for &(i, t) in &r.terms {
+                    v += lights[i as usize].color * (lf.light_scale[i as usize] as f32 * t);
+                }
+                let y = Vec3::new(
+                    fit::linear(r.shipped[0], settings.gamma) as f32,
+                    fit::linear(r.shipped[1], settings.gamma) as f32,
+                    fit::linear(r.shipped[2], settings.gamma) as f32,
+                );
+                y - v
+            })
+            .collect();
+        let before: f64 = residual.iter().map(|r| r.length_squared() as f64).sum();
+        let found = fit::discover(
+            &bake.bvh,
+            &picked,
+            &mut residual,
+            settings,
+            args.discover,
+            2.0,
+            4.0,
+        );
+        let after: f64 = residual.iter().map(|r| r.length_squared() as f64).sum();
+        println!(
+            "discovered {} lights over {} texels: residual {:.3} -> {:.3}",
+            found.len(),
+            picked.len(),
+            before,
+            after
+        );
+        for f in &found {
+            println!(
+                "  found at {} r {} colour {:.3} {:.3} {:.3} gain {:.3}",
+                f.position, f.radius, f.color.x, f.color.y, f.color.z, f.gain
+            );
+            out.push_str(&format!(
+                "found {} {} {} {} {} {} {}\n",
+                f.position.x, f.position.y, f.position.z, f.radius, f.color.x, f.color.y, f.color.z
+            ));
         }
     }
     std::fs::create_dir_all(&args.out)?;

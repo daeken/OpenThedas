@@ -165,6 +165,11 @@ falloff × |cos| × visibility, and occlusion ray hit distances, then fits.
   clamp(−1 + 2v, 0, 1) for unoccluded share v, stored as is (`--ao-model 1.5,2,-1,1`). So
   crevices go to exactly 0 in RGB and alpha alike. Meshes with MMH 6177 = 0 (carpets) do not
   occlude.
+- **Missing lights.** `--fit --discover N` searches the residual RGB of unoccluded texels for
+  point lights (a 2-unit grid over the texels' bounds up to 4 above, radii 3–16, non-negative
+  colour per channel, greedy). On room1400 its first four finds are blue fills at radius 6 about
+  2 above the floor (colour ≈ (0.05, 0.1, 0.2)), cutting the residual by 20%; `--use-fit` adds
+  them to the RGB pass.
 - **Coverage.** Shipped parts are covered one texel beyond what the toolset's film reaches
   on every side (`--dilate 1`: an uncovered texel next to covered ones takes their mean).
 - **Shadows are hard.** Sampling point lights as spheres (`--light-size`) makes the fit worse
