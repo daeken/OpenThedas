@@ -1601,7 +1601,7 @@ pub fn call(
         "IsInTrigger" => {
             let (o, tr) = (h.object(obj(a, 0)), h.object(obj(a, 1)));
             ok(b(match (o, tr) {
-                (Some(o), Some(tr)) => o.area == tr.area && in_trigger(o.position, tr),
+                (Some(o), Some(tr)) => o.area == tr.area && in_trigger(o.position, tr, h.sim.game),
                 _ => false,
             }))
         }
@@ -4651,6 +4651,20 @@ pub fn call(
                 return ok(Value::Int(action));
             }
             let o = h.object(id);
+            // A body bag opens for looting: `placeable_core` calls `OpenInventory` only for
+            // PLACEABLE_ACTION_OPEN_INVENTORY, and the bag's type (placeable_types row 16,
+            // "Body Bag") has no state controller to give it an action, as a chest's has.
+            // Provisional: DAOrigins.exe's GetPlaceableAction is not traced; the exe reads
+            // the template's IsBodyBag into the placeable (0x750683, setter 0x74bd70).
+            if o.is_some_and(|o| {
+                o.template
+                    .eq_ignore_ascii_case(crate::inventory::BODY_BAG_TEMPLATE)
+            }) {
+                return ok(Value::Int(constant(
+                    &h.sim.table,
+                    "PLACEABLE_ACTION_OPEN_INVENTORY",
+                )));
+            }
             let dest = o.is_some_and(|o| {
                 o.locals
                     .strings
@@ -5848,14 +5862,17 @@ pub fn dist(a: [f32; 3], b: [f32; 3]) -> f32 {
     ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt()
 }
 
-/// Point-in-polygon on the XY plane (even-odd rule).
-/// Whether a point is inside a trigger. The outline is relative to the trigger's position
-/// and rotated by its facing (degrees about Z).
-pub fn in_trigger(p: [f32; 3], trigger: &crate::world::Object) -> bool {
+/// Whether a point is inside a trigger's XY outline. Origins' loader adds the trigger's
+/// position to its authored vertices without rotating them (0x7997cf..0x7997e8), and
+/// its membership test reads only XY (0x799130). DA2 retains the provisional rotation.
+pub fn in_trigger(p: [f32; 3], trigger: &crate::world::Object, game: thedas_vfs::Game) -> bool {
     if trigger.geometry.len() < 3 {
         return false;
     }
     let (dx, dy) = (p[0] - trigger.position[0], p[1] - trigger.position[1]);
+    if game == thedas_vfs::Game::Origins {
+        return inside([dx, dy, p[2]], &trigger.geometry);
+    }
     let (s, c) = (-trigger.facing.to_radians()).dsin_cos();
     let local = [dx * c - dy * s, dx * s + dy * c, p[2]];
     inside(local, &trigger.geometry)
@@ -8011,6 +8028,50 @@ mod tests {
             script: "test".into(),
         };
         call(&mut h, caller, &f, a).unwrap().unwrap()
+    }
+
+    #[test]
+    fn origins_trigger_query_keeps_authored_axes_while_da2_keeps_rotation() {
+        let table = EngineTable::parse(
+            b"int IsInTrigger(object creature, object trigger) = 39;\n\
+            int EVENT_TYPE_ENTER = 8;\nint EVENT_TYPE_EXIT = 9;\n",
+        )
+        .unwrap();
+        let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(table), 1);
+        let area = s.world.spawn(crate::world::ObjectKind::Area, "a");
+        let c = s.world.spawn(crate::world::ObjectKind::Creature, "c");
+        let tr = s.world.spawn(crate::world::ObjectKind::Trigger, "t");
+        s.world.get_mut(c).unwrap().area = Some(area);
+        let t = s.world.get_mut(tr).unwrap();
+        t.area = Some(area);
+        t.position = [10.0, 20.0, 30.0];
+        t.geometry = vec![
+            [1.0, -0.5, 0.0],
+            [3.0, -0.5, 0.0],
+            [3.0, 0.5, 0.0],
+            [1.0, 0.5, 0.0],
+        ];
+        let args = [Value::Object(c), Value::Object(tr)];
+        s.world.get_mut(c).unwrap().position = [12.0, 20.0, 130.0];
+        for facing in [0.0, 90.0, 180.0, 270.0] {
+            s.world.get_mut(tr).unwrap().facing = facing;
+            s.update_triggers(c);
+            assert_eq!(run(&mut s, c, "IsInTrigger", &args), Some(Value::Int(1)));
+        }
+        s.world.get_mut(tr).unwrap().facing = 90.0;
+        s.game = thedas_vfs::Game::DragonAge2;
+        s.update_triggers(c);
+        assert_eq!(run(&mut s, c, "IsInTrigger", &args), Some(Value::Int(0)));
+        s.world.get_mut(c).unwrap().position = [10.0, 22.0, 130.0];
+        s.update_triggers(c);
+        assert_eq!(run(&mut s, c, "IsInTrigger", &args), Some(Value::Int(1)));
+        s.game = thedas_vfs::Game::Origins;
+        s.update_triggers(c);
+        assert_eq!(run(&mut s, c, "IsInTrigger", &args), Some(Value::Int(0)));
+        s.world.get_mut(c).unwrap().position = [12.0, 20.0, 130.0];
+        s.world.get_mut(c).unwrap().area = None;
+        s.update_triggers(c);
+        assert_eq!(run(&mut s, c, "IsInTrigger", &args), Some(Value::Int(0)));
     }
 
     fn effect_accessors_sim() -> Sim {
@@ -12543,6 +12604,32 @@ mod coverage_tests {
     fn sim() -> Sim {
         let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
         Sim::new(Arc::new(Vfs::new()), table, 1)
+    }
+
+    #[test]
+    fn a_body_bag_opens_for_looting_and_other_placeables_are_used() {
+        let table = Arc::new(
+            EngineTable::parse(
+                b"int PLACEABLE_ACTION_USE = 5;\n\
+                  int PLACEABLE_ACTION_OPEN_INVENTORY = 11;\n\
+                  int GetPlaceableAction(object oPlaceable) = 1;\n",
+            )
+            .unwrap(),
+        );
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        let foe = s.world.spawn(ObjectKind::Creature, "foe");
+        s.world.get_mut(foe).unwrap().money = 5;
+        let bag = s.spawn_body_bag(foe, false).unwrap();
+        // placeable_core opens a container only for PLACEABLE_ACTION_OPEN_INVENTORY.
+        assert_eq!(
+            run(&mut s, bag, "GetPlaceableAction", &[Value::Object(bag)]),
+            Some(Value::Int(11))
+        );
+        let lever = s.world.spawn(ObjectKind::Placeable, "lever");
+        assert_eq!(
+            run(&mut s, lever, "GetPlaceableAction", &[Value::Object(lever)]),
+            Some(Value::Int(5))
+        );
     }
 
     /// Calls engine function `name` as `caller`.
