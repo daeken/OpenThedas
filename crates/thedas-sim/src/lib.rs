@@ -34,6 +34,7 @@ pub mod derived;
 pub mod dialog;
 mod encounter;
 pub mod engine;
+mod engine_equality;
 pub mod fmath;
 mod heartbeat;
 pub mod inventory;
