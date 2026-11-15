@@ -107,6 +107,25 @@ linked controller when present. This connects performance ownership to the
 getter's actual state and supplies a precise reset boundary for a future
 locomotion implementation.
 
+DA2 also has a directly traced body-heading step at `0x8a6110`. Its desired
+direction comes from locomotion `+0x90`; the current direction is in the
+update record at `+0x10`. It requires a nonzero mode and desired direction,
+with an additional independent-facing choice controlled by `+0xf8`.
+`0x8c8780` converts horizontal direction to degrees, and `0x8c8ff0` wraps the
+signed heading difference with bounds -180 and 180. For remaining error `e`
+and elapsed seconds `dt`, `0x8a6203..0x8a6240` limits the next turn by
+`180 * dt / (0.4 - 0.28 * abs(e) / 180)`, clamping to the remaining error.
+Differences below the approximately `1e-6` threshold return without rotating.
+The resulting direction is normalized before being written back.
+
+The constants are independently read from their float storage: milliseconds
+to seconds at `0xbe1a40`, inverse 180 at `0xbf3d54`, 0.28 at `0xc237f0`, 0.4
+at `0xc23498`, signed 180 at `0xbe0828/0xbe082c`, and epsilon at `0xc2442c`.
+Callers include ordinary movement `0x8b11e4` and the mode-3/4 update branch at
+`0x8c5be0`; another caller is `0x8a761b`. This confirms the same scalar yaw
+law previously traced for Origins. It does not establish identical route
+filtering, controller completion or all movement modes between the games.
+
 The retained `ability_core` script uses IsMoving in at least two materially
 different branches: bytecode `0x11c5` gates a target-dependent follow-up,
 whereas `0x20c4` selects between a moving additive animation and a queued
