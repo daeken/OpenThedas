@@ -34,6 +34,11 @@ pub struct Clip {
     /// An animation made in memory (a speaker's lip sync, see `thedas_formats::facefx`),
     /// played in place of one looked up by `trees` and `actions`.
     pub inline: Option<Arc<Animation>>,
+    /// The creature's appearance's translation multipliers (`apr_base`, 0x6a13c0): the
+    /// clip's translation keys are scaled by them and added to the skeleton's own
+    /// translations (see [`crate::skeleton::Layer::scale`]). `None` keeps the older
+    /// first-key convention (a cutscene's poses).
+    pub translation_scale: Option<[f32; 3]>,
 }
 
 impl Default for Clip {
@@ -48,6 +53,7 @@ impl Default for Clip {
             weight: 1.0,
             phase: None,
             inline: None,
+            translation_scale: None,
         }
     }
 }
@@ -324,6 +330,7 @@ impl Animator {
             skeleton: s,
             rest,
             layers,
+            scale: clip.translation_scale.map(glam::Vec3::from_array),
         })
     }
 }
@@ -337,6 +344,8 @@ struct Prepared {
     skeleton: Arc<crate::skeleton::Skeleton>,
     rest: Arc<Vec<Mat4>>,
     layers: Vec<PreparedLayer>,
+    /// The clip's [`Clip::translation_scale`].
+    scale: Option<glam::Vec3>,
 }
 
 impl Prepared {
@@ -351,6 +360,7 @@ impl Prepared {
                 against_base: *b,
                 weight: *w,
                 nodes: n,
+                scale: self.scale,
             })
             .collect();
         let pose = self.skeleton.pose_mapped(&mapped);
@@ -569,7 +579,9 @@ mod tests {
             name: "wave".into(),
             length: 1.0,
             additive: false,
+            unscaled: false,
             scalars: Default::default(),
+            colors: Vec::new(),
             tracks: vec![
                 track(hashed("elbow_rotation"), Channel::Rotation),
                 // A bone this skeleton does not have stays hashed.
@@ -610,7 +622,9 @@ mod tests {
             name: "motion".into(),
             length: 1.0,
             additive: false,
+            unscaled: false,
             scalars: Vec::new(),
+            colors: Vec::new(),
             tracks: vec![Track {
                 bone: "elbow".into(),
                 channel: Channel::Translation,
@@ -642,6 +656,7 @@ mod tests {
                             Prepared {
                                 skeleton: skeleton.clone(),
                                 rest: Arc::new(skeleton.rest()),
+                                scale: None,
                                 layers: vec![(
                                     animation.clone(),
                                     time,

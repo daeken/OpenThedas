@@ -29,7 +29,7 @@
 //!   `[0xbf22c8] >= 2`; see `d3d_gpu::ShadowBlur`); at High both partitions and the blur's
 //!   targets are 1024 texels a side ([`partition_size`]).
 //!
-//! Provisional: the boxes' limits towards the sun ([`SUN_REACH`]); the second partition
+//! Provisional: the second partition
 //! starts where the first ends; the engine's elevation clamp of the light (0x452ac2) is
 //! not applied; the bias drops
 //! D3D9's half-texel offset (wgpu samples texel centres at half-texel coordinates); the
@@ -72,8 +72,11 @@ pub fn partition_reach(detail: crate::scene::Detail) -> [f32; 2] {
 pub const SINGLE_PARTITION_REACH: [f32; 2] = [50.0, 100.0];
 
 /// How far towards the sun a partition's box may reach beyond its camera slice, for the
-/// casters standing outside the slice (provisional, see [`partitions`]).
-pub const SUN_REACH: f32 = 60.0;
+/// casters standing outside it: this many times the slice's own depth along the light
+/// (DAOrigins.exe's slot `+0x6ac`, 3.0 from 0x453dca; the reach `+0x6b0` computed at
+/// 0x453689 from the slice's eight corners in light space, and the near plane taken as the
+/// nearer of the casters' and that limit at 0x45273a; notes/shadow-box-depth-trace.md).
+pub const SUNWARD_SPANS: f32 = 3.0;
 
 /// One shadow partition.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -156,7 +159,8 @@ fn bias() -> Mat4 {
 /// As DAOrigins.exe gathers them (0x452570 for each caster, 0x453240 then the box): in the
 /// light's view each partition's box grows to cover the casters, but never past its camera
 /// slice's box across the light (`x`, `y`: casters off the slice cannot shadow it); along
-/// the light (`z`) it reaches the casters nearer the sun, up to [`SUN_REACH`] beyond the
+/// the light (`z`) it reaches the casters nearer the sun, up to [`SUNWARD_SPANS`] times the
+/// slice's own depth beyond the
 /// slice, and no deeper than the slice. A box at least a metre a side (0x452824). Without a
 /// caster over its slice, a partition covers the slice.
 ///
@@ -235,12 +239,15 @@ pub fn partitions_smoothed(
                 Vec3::new(
                     min.x.max(lo.x),
                     min.y.max(lo.y),
-                    min.z.max(lo.z - SUN_REACH),
+                    min.z.max(lo.z - SUNWARD_SPANS * (hi.z - lo.z)),
                 ),
                 Vec3::new(max.x.min(hi.x), max.y.min(hi.y), max.z.min(hi.z)),
             )
         } else {
-            (Vec3::new(lo.x, lo.y, lo.z - SUN_REACH), hi)
+            (
+                Vec3::new(lo.x, lo.y, lo.z - SUNWARD_SPANS * (hi.z - lo.z)),
+                hi,
+            )
         };
         let max = max.max(min + Vec3::ONE);
         let (min, max) = match previous[k] {

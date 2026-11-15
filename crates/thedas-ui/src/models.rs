@@ -774,9 +774,36 @@ pub struct Motion {
 /// out of and in combat.
 pub const COL_AMBIENT_TREE: u32 = 0x5009_76ec;
 pub const COL_COMBAT_TREE: u32 = 0xde80_b418;
+/// `apr_base.gda`'s translation multipliers (x, y, z), read by the appearance setup
+/// (DAOrigins.exe 0x6a13c0) for its clips' translations: 0.73 for dwarves, 0.92 for elves
+/// (notes/nonhuman-clip-retarget-trace.md). Their names are not known.
+pub const COL_TRANSLATION_SCALE: [u32; 3] = [0xa397_7767, 0xba8c_4626, 0x91a1_15e5];
+
+/// A creature's translation multipliers (see [`COL_TRANSLATION_SCALE`]); `None` when its
+/// appearance's row lacks them (the exe then keeps (1, 1, 1)) or it is no creature.
+pub fn translation_scale(sim: &Sim, id: ObjectId) -> Option<[f32; 3]> {
+    let o = sim
+        .world
+        .get(id)
+        .filter(|o| o.kind == ObjectKind::Creature)?;
+    let t = sim.world.tables().get(0, "apr_base")?;
+    let app = o.appearance as i64;
+    let mut out = [1.0f32; 3];
+    for (k, hash) in COL_TRANSLATION_SCALE.iter().enumerate() {
+        out[k] = match t.cell_by_hash(*hash, app)? {
+            Cell::Float(v) => *v as f32,
+            Cell::Int(v) => *v as f32,
+            _ => return None,
+        };
+    }
+    Some(out)
+}
+
 /// Dragon Age II's `apr_base` column naming the damage-reaction tree
 /// (`humanoid_damage_reactions.anb` for humanoids and hurlocks), which holds the deaths
-/// (`die_quick_*`). Its name is not known, only its hash; DA:O's table has no such column.
+/// (`die_quick_*`). In Dragon Age: Origins the same hash is `AmbientOverride` (`dwarf.anb`,
+/// `child.anb`, ...: an appearance's extra ambient action tree, 0x748370;
+/// notes/nonhuman-clip-retarget-trace.md), not read here yet.
 pub const COL_DA2_REACTION_TREE: u32 = 0x3678_42f0;
 
 /// Actions in the trees (from `humanoid.anb`, `combat_humanoid.anb`, `movement.anb` and the
@@ -1275,7 +1302,7 @@ pub fn visual_effects(sim: &Sim, o: &Object) -> Vec<EffectModel> {
             model,
             key: format!("{base}_{n}"),
             started_ms: Some(v.started_ms),
-            lasting: false,
+            lasting: v.lasting,
         });
     }
     out
@@ -1339,7 +1366,7 @@ pub fn location_vfx_models(sim: &Sim, area: ObjectId) -> Vec<ObjectModel> {
                     model: model(v.vfx)?,
                     key: format!("i{}_{}", v.vfx, v.started_ms),
                     started_ms: Some(v.started_ms),
-                    lasting: false,
+                    lasting: v.lasting,
                 }],
                 ..at(id, v.vfx, v.position, v.facing)
             })
@@ -1458,6 +1485,8 @@ mod tests {
                 position: [1.0, 2.0, 3.0],
                 facing: 45.0,
                 started_ms: 0,
+                ms: 2000,
+                lasting: false,
             });
         let drawn = location_vfx_models(&s, area);
         assert_eq!(drawn.len(), 1);
