@@ -72,6 +72,13 @@ pub struct EngineTypes {
 }
 
 pub struct Sim {
+    /// Character creation's face lists (`chargenmorphcfg.xml`) by (list, race and gender),
+    /// parsed once: the interface asks for them every frame.
+    face_lists: std::sync::Mutex<std::collections::HashMap<(String, String), Vec<String>>>,
+    /// Head presets (`.mop`) by name, parsed once (`None`: missing or unreadable).
+    morph_presets: std::sync::Mutex<
+        std::collections::HashMap<String, Option<Arc<thedas_formats::morph::MorphPreset>>>,
+    >,
     pub world: World,
     /// What loading the last save found of older builds' damage (see
     /// [`crate::save::SaveIssue`]).
@@ -589,6 +596,8 @@ impl Sim {
             })
             .collect();
         Sim {
+            face_lists: Default::default(),
+            morph_presets: Default::default(),
             world: World::new(tables, seed),
             vfs,
             table,
@@ -909,11 +918,48 @@ impl Sim {
         let Some(rg) = self.face_race_gender(id) else {
             return Vec::new();
         };
-        self.vfs
+        let key = (list.to_string(), rg);
+        if let Some(v) = self
+            .face_lists
+            .lock()
+            .ok()
+            .and_then(|m| m.get(&key).cloned())
+        {
+            return v;
+        }
+        let v = self
+            .vfs
             .read("chargenmorphcfg.xml")
             .ok()
-            .and_then(|(xml, _)| thedas_formats::morph::face_config_list(&xml, list, &rg).ok())
-            .unwrap_or_default()
+            .and_then(|(xml, _)| thedas_formats::morph::face_config_list(&xml, list, &key.1).ok())
+            .unwrap_or_default();
+        if let Ok(mut m) = self.face_lists.lock() {
+            m.insert(key, v.clone());
+        }
+        v
+    }
+
+    /// A head preset (`NAME.mop`), parsed once.
+    pub fn morph_preset(&self, name: &str) -> Option<Arc<thedas_formats::morph::MorphPreset>> {
+        let key = name.to_ascii_lowercase();
+        if let Some(p) = self
+            .morph_presets
+            .lock()
+            .ok()
+            .and_then(|m| m.get(&key).cloned())
+        {
+            return p;
+        }
+        let p = self
+            .vfs
+            .read(&format!("{name}.mop"))
+            .ok()
+            .and_then(|(d, _)| thedas_formats::morph::MorphPreset::parse(&d).ok())
+            .map(Arc::new);
+        if let Ok(mut m) = self.morph_presets.lock() {
+            m.insert(key, p.clone());
+        }
+        p
     }
 
     /// The face character creation's face screen starts on for a creature: the first head
