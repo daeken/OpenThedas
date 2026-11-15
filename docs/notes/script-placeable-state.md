@@ -2,7 +2,9 @@
 
 `SetPlaceableState` at 0x65ee60 resolves a placeable through 0x5d5b40 and
 calls 0x74f9d0 with force zero. Successful placeable actions at 0x74fc10
-reach the same ordinary state path.
+reach the same ordinary state path. The action path first skips a target
+whose low unsigned short is 0xffff at 0x74fc40. Explicit setter requests
+continue through the ordinary setter's bounds check.
 
 The appearance setup at 0x7508c5 reads table 93, column 0x9a320a51, using
 the unsigned low 16 bits of appearance. A nonempty name opens the controller

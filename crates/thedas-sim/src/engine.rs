@@ -5587,7 +5587,10 @@ fn placeable_transition(sim: &Sim, id: ObjectId, action: i32, variation: bool) -
     }
     let next = int(0xa2b4_782c)?;
     let alt = int(0x5ad0_780d).filter(|&v| v > 0);
-    Some(if variation { alt.unwrap_or(next) } else { next })
+    let next = if variation { alt.unwrap_or(next) } else { next };
+    // 0x74fc40 skips the action's absent unsigned-short target before invoking
+    // the ordinary setter. An explicit SetPlaceableState(-1) still reaches it.
+    (next as u16 != u16::MAX).then_some(next)
 }
 
 /// A placeable's default action in its current state, from its type's state controller:
@@ -7676,6 +7679,36 @@ mod tests {
                 sim.world.get(id).unwrap().fields.get("State").copied(),
                 expected
             );
+        }
+        for sentinel in [-1, 65_535, -65_537, 131_071] {
+            sim.world.tables().insert(
+                "statecnt_fixture",
+                &["ID", "#52be3c5e", "#a2b4782c", "#5ad0780d"],
+                vec![(
+                    0,
+                    vec![
+                        Cell::Int(0),
+                        Cell::Int(3),
+                        Cell::Int(sentinel),
+                        Cell::Int(sentinel),
+                    ],
+                )],
+            );
+            for variation in [0, 1] {
+                sim.world.get_mut(id).unwrap().fields.remove("State");
+                run(
+                    &mut sim,
+                    id,
+                    "SetPlaceableActionResult",
+                    &[
+                        Value::Object(id),
+                        Value::Int(3),
+                        Value::Int(1),
+                        Value::Int(variation),
+                    ],
+                );
+                assert!(!sim.world.get(id).unwrap().fields.contains_key("State"));
+            }
         }
     }
 
