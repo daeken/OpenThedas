@@ -112,7 +112,9 @@ as #739.
 
 From `docs/deferred.md` and `docs/notes/deferred-*.md`:
 - G-buffer surfaces use authored mesh tangent/binormal frames, with derivatives for
-  missing or degenerate frames. Static1's material tint is missing.
+  missing or degenerate frames. Nonzero Static1 tints transform the complete fused baked
+  lighting sum before fog. Tinted draws retain faithful shading in probe/SSAO, diagnostic
+  and separate-reflection modes; see `docs/deferred.md` for the palette limits.
 - Not yet in the G-buffer: hair (lit forward), unsupported alpha/blended families,
   Char2 (low detail), and far tree billboards. Character rim light, skin scattering,
   gore/heraldry and remote materials are not represented.
