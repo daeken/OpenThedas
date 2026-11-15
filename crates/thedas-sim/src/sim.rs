@@ -2534,7 +2534,9 @@ impl Sim {
     /// outline test is on XY (0x799130), with authored offsets translated without facing
     /// rotation (0x7997cf). Origins' sender (0x698850) gives the events the creature as
     /// creator and event target, integer 0 = 0, and the receiving trigger in object slot 0.
-    /// DA2 keeps its provisional payload; membership timing is separate.
+    /// DA2 keeps its provisional payload; membership timing is separate. Origins queues
+    /// every EXIT before any ENTER, matching the two comparison phases in 0x6ae100; DA2
+    /// retains its provisional ENTER-first order.
     pub fn update_triggers(&mut self, id: ObjectId) {
         let Some(o) = self.world.get(id) else { return };
         if o.kind != ObjectKind::Creature {
@@ -2550,7 +2552,12 @@ impl Sim {
             .map(|t| t.id)
             .collect();
         let before = self.world.in_triggers.get(&id).cloned().unwrap_or_default();
-        for (list, name) in [(&now, "ENTER"), (&before, "EXIT")] {
+        let changes = if self.game == thedas_vfs::Game::Origins {
+            [(&before, "EXIT"), (&now, "ENTER")]
+        } else {
+            [(&now, "ENTER"), (&before, "EXIT")]
+        };
+        for (list, name) in changes {
             let other = if name == "ENTER" { &before } else { &now };
             for &t in list.iter().filter(|t| !other.contains(t)) {
                 let mut ev = self.new_event(name, Some(id));
@@ -6768,6 +6775,83 @@ mod tests {
             s.event_type("EXIT")
         );
         assert!(!s.world.in_triggers.contains_key(&c));
+    }
+
+    #[test]
+    fn origins_trigger_changes_queue_all_exits_before_any_enters() {
+        for game in [thedas_vfs::Game::Origins, thedas_vfs::Game::DragonAge2] {
+            let table =
+                EngineTable::parse(b"int EVENT_TYPE_ENTER = 8;\nint EVENT_TYPE_EXIT = 9;\n")
+                    .unwrap();
+            let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(table), 7);
+            s.game = game;
+            let area = s.world.spawn(ObjectKind::Area, "a");
+            let c = s.world.spawn(ObjectKind::Creature, "c");
+            s.world.get_mut(c).unwrap().area = Some(area);
+            let mut triggers = Vec::new();
+            for (tag, x) in [
+                ("leave1", 10.0),
+                ("enter1", 20.0),
+                ("leave2", 10.0),
+                ("enter2", 20.0),
+            ] {
+                let t = s.world.spawn(ObjectKind::Trigger, tag);
+                let o = s.world.get_mut(t).unwrap();
+                o.area = Some(area);
+                o.position = [x, 10.0, 0.0];
+                o.geometry = vec![
+                    [-1.0, -1.0, 0.0],
+                    [1.0, -1.0, 0.0],
+                    [1.0, 1.0, 0.0],
+                    [-1.0, 1.0, 0.0],
+                ];
+                triggers.push(t);
+            }
+            // A trigger shared by both positions must send neither EXIT nor ENTER.
+            let shared = s.world.spawn(ObjectKind::Trigger, "shared");
+            let o = s.world.get_mut(shared).unwrap();
+            o.area = Some(area);
+            o.position = [15.0, 10.0, 0.0];
+            o.geometry = vec![
+                [-6.0, -1.0, 0.0],
+                [6.0, -1.0, 0.0],
+                [6.0, 1.0, 0.0],
+                [-6.0, 1.0, 0.0],
+            ];
+            s.move_object(c, [10.0, 10.0, 0.0], None);
+            s.world.queue.clear();
+            s.move_object(c, [20.0, 10.0, 0.0], None);
+            let queued: Vec<_> = s
+                .world
+                .queue
+                .values()
+                .map(|q| (q.target, q.event.ty))
+                .collect();
+            let exits = [
+                (triggers[0], s.event_type("EXIT")),
+                (triggers[2], s.event_type("EXIT")),
+            ];
+            let enters = [
+                (triggers[1], s.event_type("ENTER")),
+                (triggers[3], s.event_type("ENTER")),
+            ];
+            let expected: Vec<_> = if game == thedas_vfs::Game::Origins {
+                exits.into_iter().chain(enters).collect()
+            } else {
+                enters.into_iter().chain(exits).collect()
+            };
+            assert_eq!(queued, expected, "{game:?}");
+            assert_eq!(
+                s.world.in_triggers.get(&c),
+                Some(&vec![triggers[1], triggers[3], shared])
+            );
+            s.world.queue.clear();
+            s.move_object(c, [20.0, 10.0, 100.0], None);
+            assert!(
+                s.world.queue.is_empty(),
+                "unchanged membership queues no events"
+            );
+        }
     }
 
     #[test]
