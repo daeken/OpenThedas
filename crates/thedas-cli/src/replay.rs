@@ -501,7 +501,10 @@ mod tests {
         assert_eq!(s.world.time_ms, 200);
         assert!(result.stopped);
         assert!(result.drift.is_none());
-        assert!(replay(&mut s, &journal, Some(100)).is_err());
+        let writer = JournalWriter::start(&mut s, TEST_BUILD, Vec::new()).unwrap();
+        let later = Journal::parse(&writer.into_inner(), TEST_BUILD).unwrap();
+        let error = replay(&mut s, &later, Some(100)).err().unwrap().to_string();
+        assert!(error.contains("precedes checkpoint"), "{error}");
     }
 
     #[test]
