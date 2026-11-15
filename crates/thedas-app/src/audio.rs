@@ -2284,8 +2284,13 @@ impl GameAudio {
         }
         self.container = opened;
         self.follow_cutscene(state.cutscene.clone());
-        // Voice-over.
-        if self.voice.as_ref().map(|v| &v.0) != state.line.as_ref() {
+        // Voice-over. Not while the load screen is up: a conversation the new area's load
+        // events start exists in the simulation before the screen comes down (the area's
+        // events run in the step that performs the transition), while DAOrigins.exe starts
+        // it only once loading is over (0x6c73c0 places the party, then unpauses); its first
+        // line spoke over the loading screen and was over by the time the dialog showed.
+        // The line starts when the screen goes.
+        if !state.loading && self.voice.as_ref().map(|v| &v.0) != state.line.as_ref() {
             if let Some((_, Some(h), _)) = self.voice.take() {
                 self.engine.stop(h, true);
             }
