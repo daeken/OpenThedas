@@ -3475,6 +3475,7 @@ impl UiLayer {
 
     pub fn tick(&mut self, dt_ms: f64) -> Vec<GameMessage> {
         self.loading_stains(dt_ms);
+        self.value_cache.advance(dt_ms);
         self.stage.tick(dt_ms)
     }
 
