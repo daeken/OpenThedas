@@ -1854,9 +1854,15 @@ mod tests {
             );
             sim.world.trace.keep = true;
             let area = sim.world.spawn(crate::world::ObjectKind::Area, "street");
+            sim.world.area = Some(area);
             sim.world.get_mut(hero).unwrap().area = Some(area);
             sim.world.get_mut(npc).unwrap().area = Some(area);
             assert!(sim.open_conversation(hero, npc, remarks("beggar", &["one"], true), None));
+            assert_eq!(
+                said(&sim),
+                ["one"],
+                "the speaker starts in the current area"
+            );
             let requested = |sim: &Sim| {
                 sim.world.trace.entries.iter().any(|e| {
                     matches!(e, TraceEntry::EventQueued { target, ty: 18, .. } if *target == npc)
