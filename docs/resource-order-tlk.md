@@ -33,6 +33,13 @@ Static trace of the GOG executable:
   0x4c0de0 -> 0x414170 -> 0x413800; resource filename case folding does not establish
   registry-name equality. No matching entry is still a successful return.
 
+The module registration and teardown paths normalize their module string before
+calling the table manager: 0x5d51b3 -> 0x5d51de and 0x5d53e6 -> 0x5d5417 remove
+every literal U+0020 space through 0x4c3000. The helper repeatedly finds and replaces
+that substring (0x4c2fc0), advancing by the replacement's length. Both paths read
+the same module member and preserve its case. This is caller-specific normalization,
+not a rule for every named table or for other whitespace characters.
+
 ## Gender reprioritization
 
 **0x4e5cf0 is not unload.** It walks the vector from front to back, copies an entry whose
