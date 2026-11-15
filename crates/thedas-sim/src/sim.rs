@@ -2928,11 +2928,16 @@ impl Sim {
                 o.position = p;
                 if let Some((dx, dy)) = dir {
                     let want = crate::world::facing_toward(dx, dy);
-                    let since = o.commands.first().and_then(|c| c.turned_at).unwrap_or(t0);
-                    let dt = now.saturating_sub(since) as f32 / 1000.0;
-                    o.facing = turn_toward(o.facing, want, dt);
-                    if let Some(c) = o.commands.first_mut() {
-                        c.turned_at = Some(now);
+                    if self.game == thedas_vfs::Game::DragonAge2 && o.kind != ObjectKind::Creature {
+                        // DA2's traced locomotion component belongs to creatures.
+                        o.facing = want;
+                    } else {
+                        let since = o.commands.first().and_then(|c| c.turned_at).unwrap_or(t0);
+                        let dt = now.saturating_sub(since) as f32 / 1000.0;
+                        o.facing = turn_toward(o.facing, want, dt);
+                        if let Some(c) = o.commands.first_mut() {
+                            c.turned_at = Some(now);
+                        }
                     }
                 }
             }
@@ -3981,7 +3986,13 @@ impl Sim {
             // stick's aim) does not snap onto the body at the end. DA2 completion likewise
             // stops the follower (0x675fae -> 0x8a60e0) without assigning that bearing.
             // Jumps and placements still take the location's facing.
-            let keeps_facing = walked && cmd.from.is_some();
+            let keeps_facing = walked
+                && cmd.from.is_some()
+                && (self.game != thedas_vfs::Game::DragonAge2
+                    || self
+                        .world
+                        .get(id)
+                        .is_some_and(|o| o.kind == ObjectKind::Creature));
             if let Some(obj) = self.world.get_mut(id) {
                 obj.position = l.position;
                 obj.area = Some(l.area);

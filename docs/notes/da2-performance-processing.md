@@ -142,8 +142,8 @@ sites do not establish which branch caused a particular lost fight.
 
 ## Source comparison and replay limits
 
-At main `9dbc981d`, DA2 line handling activates bound world objects; the
-separate placement/follower changes are under review in #895/#898. Neither
+DA2 line handling activates bound world objects; the separate
+placement/follower changes landed in #895/#898. Neither
 activation nor pose placement implements the processing lifecycle above.
 `AddCommand` appends/prepends directly and does not yet apply all the native
 admission/static rules. `IsMoving` still falls back to the unimplemented
@@ -163,11 +163,11 @@ introduced by this note.
 
 ## Implemented heading slice
 
-DA2 translating movers now use the existing elapsed-time yaw limiter, including
+DA2 translating creatures now use the existing elapsed-time yaw limiter, including
 its saved last-turn timestamp. Ordinary started moves retain their body heading
 at arrival instead of taking the original order's bearing. Native completion
 `0x675fae -> 0x8a60e0` stops the follower without installing that bearing.
-Explicit jumps and placement keep their facing behavior. Origins follows the
+Explicit jumps, placement and non-creature movers keep their facing behavior. Origins follows the
 same code it used before this DA2 extension.
 
 Regressions exercise a native 33 ms quarter-turn example through the actual
