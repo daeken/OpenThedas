@@ -37,5 +37,27 @@ actual binder, prior named claims, arbitrary numbered labels, exhaustion,
 explicit tags, non-party/reserve exclusion, actor indices, empty parties and
 Origins isolation. On merged main 90f64bab, fmt, workspace all-target clippy
 with warnings denied, workspace tests (1,207 passed, 17 ignored, zero failures)
-and release MCP/CLI/app builds pass. Corpus, A/B sweep, repeat/reload and
-installed-resource integration evidence are recorded after their runs finish.
+and release MCP/CLI/app builds pass. The DAO corpus has no archive, read or typed
+failures; the existing 5,219 undeclared-action findings are unchanged. A full
+s01–s13 main/candidate sweep has no story-log or plot-sequence differences and
+all 15 complete checkpoints are identical. Four Origins 600-tick repeat/reload
+checks match. DA2 repeats match; its reload differs only in `next_effect_id`
+(2 versus 3), also reproduced on main. The frozen d87f9ef2 baseline has the same
+sim/script/VFS/MCP source as merged main 90f64bab; the intervening change is in
+the renderer.
+
+The installed Karl performance is unchanged on this branch alone, since main
+does not yet place spoken-line actors. Integrated with the separate named-stage
+repair, identical replies finish at the same t=1323927 and place Bethany and
+Varric on their authored end marks. A repeat produces identical complete JSON.
+Matched captures use one renderer for both endpoints.
+
+This changes combat starting positions. The established conditional combat
+driver wins Karl's fight on main and the placement-only branch, but wipes with
+both repairs integrated at t=1414027. Spending available level-up points and
+waiting before the approach does not change that result. No developer healing,
+direct kills, activation or plot forcing is used. The larger Sundermount ambush
+also still wipes with the established driver on both placement-only and the
+integration. These checkpoint outcomes do not establish fresh-run completion
+or prove the cause of either wipe; processing suspension and actor AI still
+need investigation.

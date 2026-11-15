@@ -480,71 +480,6 @@ mod tests {
     }
 
     #[test]
-    fn da2_follower_aliases_take_unclaimed_active_party_members_in_order() {
-        for game in [thedas_vfs::Game::Origins, thedas_vfs::Game::DragonAge2] {
-            let (mut s, hero, first, _) = sim();
-            s.game = game;
-            let second = s.world.spawn(ObjectKind::Creature, "second");
-            let third = s.world.spawn(ObjectKind::Creature, "third");
-            let reserve = s.world.spawn(ObjectKind::Creature, "reserve");
-            let area = s.world.area;
-            for id in [second, third, reserve] {
-                s.world.get_mut(id).unwrap().area = area;
-            }
-            s.world.get_mut(hero).unwrap().followers = vec![first, second, third];
-            let tracks = Tracks {
-                actors: vec![
-                    actor("second", [0.0; 3], 0.0),
-                    actor("PLAYER", [0.0; 3], 0.0),
-                    actor("FOLLOWER 99", [1.0; 3], 0.0),
-                    actor("FOLLOWER 99", [9.0; 3], 0.0),
-                    actor("FOLLOWER 1", [2.0; 3], 0.0),
-                    actor("FOLLOWER 2", [3.0; 3], 0.0),
-                    actor("FOLLOWER:second", [4.0; 3], 0.0),
-                    actor("FOLLOWER:reserve", [5.0; 3], 0.0),
-                ],
-                ..Tracks::default()
-            };
-            let bound = s.bind_cutscene_actors(
-                &tracks,
-                Some(LineContext {
-                    owner: first,
-                    player: hero,
-                    unstaged: false,
-                    placement: Placement::NONE,
-                }),
-            );
-            let expected = if game == thedas_vfs::Game::DragonAge2 {
-                vec![second, hero, first, third]
-            } else {
-                vec![second, hero]
-            };
-            assert_eq!(bound.iter().map(|b| b.object).collect::<Vec<_>>(), expected);
-            if game == thedas_vfs::Game::DragonAge2 {
-                assert_eq!(bound[2].actor, 2);
-                assert_eq!(bound[3].actor, 4);
-                assert_eq!(bound[2].end.unwrap().0, [1.0; 3]);
-                assert_eq!(bound[3].end.unwrap().0, [2.0; 3]);
-            }
-            let explicit = Tracks {
-                actors: vec![actor("FOLLOWER:third", [0.0; 3], 0.0)],
-                ..Tracks::default()
-            };
-            let explicit_bound = s.bind_cutscene_actors(&explicit, None);
-            assert_eq!(
-                explicit_bound.iter().map(|b| b.object).collect::<Vec<_>>(),
-                if game == thedas_vfs::Game::DragonAge2 {
-                    vec![third]
-                } else {
-                    vec![]
-                }
-            );
-            s.world.get_mut(hero).unwrap().followers.clear();
-            assert!(s.bind_cutscene_actors(&explicit, None).is_empty());
-        }
-    }
-
-    #[test]
     fn a_conversation_leaves_its_creatures_on_their_marks() {
         let (mut s, hero, hunter, _) = sim();
         let placement = s
@@ -629,5 +564,69 @@ mod tests {
             s.conversation_placement(Some("none"), false, hunter, hero)
                 .is_none()
         );
+    }
+    #[test]
+    fn da2_follower_aliases_take_unclaimed_active_party_members_in_order() {
+        for game in [thedas_vfs::Game::Origins, thedas_vfs::Game::DragonAge2] {
+            let (mut s, hero, first, _) = sim();
+            s.game = game;
+            let second = s.world.spawn(ObjectKind::Creature, "second");
+            let third = s.world.spawn(ObjectKind::Creature, "third");
+            let reserve = s.world.spawn(ObjectKind::Creature, "reserve");
+            let area = s.world.area;
+            for id in [second, third, reserve] {
+                s.world.get_mut(id).unwrap().area = area;
+            }
+            s.world.get_mut(hero).unwrap().followers = vec![first, second, third];
+            let tracks = Tracks {
+                actors: vec![
+                    actor("second", [0.0; 3], 0.0),
+                    actor("PLAYER", [0.0; 3], 0.0),
+                    actor("FOLLOWER 99", [1.0; 3], 0.0),
+                    actor("FOLLOWER 99", [9.0; 3], 0.0),
+                    actor("FOLLOWER 1", [2.0; 3], 0.0),
+                    actor("FOLLOWER 2", [3.0; 3], 0.0),
+                    actor("FOLLOWER:second", [4.0; 3], 0.0),
+                    actor("FOLLOWER:reserve", [5.0; 3], 0.0),
+                ],
+                ..Tracks::default()
+            };
+            let bound = s.bind_cutscene_actors(
+                &tracks,
+                Some(LineContext {
+                    owner: first,
+                    player: hero,
+                    unstaged: false,
+                    placement: Placement::NONE,
+                }),
+            );
+            let expected = if game == thedas_vfs::Game::DragonAge2 {
+                vec![second, hero, first, third]
+            } else {
+                vec![second, hero]
+            };
+            assert_eq!(bound.iter().map(|b| b.object).collect::<Vec<_>>(), expected);
+            if game == thedas_vfs::Game::DragonAge2 {
+                assert_eq!(bound[2].actor, 2);
+                assert_eq!(bound[3].actor, 4);
+                assert_eq!(bound[2].end.unwrap().0, [1.0; 3]);
+                assert_eq!(bound[3].end.unwrap().0, [2.0; 3]);
+            }
+            let explicit = Tracks {
+                actors: vec![actor("FOLLOWER:third", [0.0; 3], 0.0)],
+                ..Tracks::default()
+            };
+            let explicit_bound = s.bind_cutscene_actors(&explicit, None);
+            assert_eq!(
+                explicit_bound.iter().map(|b| b.object).collect::<Vec<_>>(),
+                if game == thedas_vfs::Game::DragonAge2 {
+                    vec![third]
+                } else {
+                    vec![]
+                }
+            );
+            s.world.get_mut(hero).unwrap().followers.clear();
+            assert!(s.bind_cutscene_actors(&explicit, None).is_empty());
+        }
     }
 }
