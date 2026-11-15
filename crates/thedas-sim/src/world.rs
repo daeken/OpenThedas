@@ -183,6 +183,9 @@ pub struct Object {
     pub base_appearance: Option<u16>,
     pub rank: i32,
     pub interactive: bool,
+    /// Origins' requested ambient interaction and its active animation phase.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interaction: Option<crate::interaction::Interaction>,
     /// Trigger polygon (XY used for containment).
     pub geometry: Vec<[f32; 3]>,
     /// Pending commands (front first).
@@ -271,6 +274,7 @@ impl Object {
             base_appearance: None,
             rank: 0,
             interactive: true,
+            interaction: None,
             geometry: Vec::new(),
             commands: Vec::new(),
             followers: Vec::new(),

@@ -196,7 +196,7 @@ pub struct Sim {
 pub const MAX_DEPTH: usize = 24;
 
 /// The length of a route from `from` through `points`.
-fn path_length(from: [f32; 3], points: &[[f32; 3]]) -> f32 {
+pub(crate) fn path_length(from: [f32; 3], points: &[[f32; 3]]) -> f32 {
     let mut prev = from;
     let mut len = 0.0;
     for &p in points {
@@ -3504,7 +3504,9 @@ impl Sim {
             .filter_map(|o| {
                 let c = o.commands.first()?;
                 Some(match c.due {
-                    Some(d) if !da2 => (o.id, Some(d), None),
+                    Some(d) if !da2 && c.name != crate::interaction::COMMAND => {
+                        (o.id, Some(d), None)
+                    }
                     _ => (o.id, None, Some(c.clone())),
                 })
             })
@@ -3533,6 +3535,14 @@ impl Sim {
             let Some(mut cmd) = cmd else { continue };
             if origins_prepared && self.world.get(id).and_then(|o| o.commands.first()) != Some(&cmd)
             {
+                continue;
+            }
+            if self.game == thedas_vfs::Game::Origins && cmd.name == crate::interaction::COMMAND {
+                if let Some(due) = self.interaction_deadline(id)
+                    && best.is_none_or(|(b, bid)| (due, id) < (b, bid))
+                {
+                    best = Some((due, id));
+                }
                 continue;
             }
             let due = match cmd.due {
@@ -3950,6 +3960,16 @@ impl Sim {
 
     /// Completes an object's front command: applies its movement and tells the object.
     fn finish_command(&mut self, id: ObjectId) {
+        if self.game == thedas_vfs::Game::Origins
+            && self.world.get(id).is_some_and(|o| {
+                o.commands
+                    .first()
+                    .is_some_and(|c| c.name == crate::interaction::COMMAND)
+            })
+            && self.advance_interaction(id)
+        {
+            return;
+        }
         // DAOrigins.exe 0x7a4100 searches with radius 20, snap and check enabled
         // (the builder 0x670010 sets the check). Only result 1 places the jumper;
         // a standable-but-blocked point or an exhausted search fails with -1.

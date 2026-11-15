@@ -2315,7 +2315,11 @@ impl Sim {
 
     /// An action's animation in the first of `trees` that has it (cached by tree and
     /// action).
-    fn ability_anim(&mut self, trees: &[String], action: &str) -> Option<AbilityAnimLen> {
+    pub(crate) fn ability_anim(
+        &mut self,
+        trees: &[String],
+        action: &str,
+    ) -> Option<AbilityAnimLen> {
         for tree in trees {
             let key = format!("{tree}|{action}");
             let found = match self.ability_anims.get(&key) {
