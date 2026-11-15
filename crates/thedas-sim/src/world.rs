@@ -386,6 +386,10 @@ pub struct Command {
     /// Keep it across save/reload so a later combat exit is not undone on arrival.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub da2_target_prepared: bool,
+    /// Native DA2 command boolean 2, forwarded to CHOOSE_BASIC_ATTACK integer 2.
+    /// Ordinary player attack input enables the script's range fallback (0x47fc51).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub da2_basic_attack_fallback: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]

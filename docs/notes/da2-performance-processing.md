@@ -145,7 +145,7 @@ sites do not establish which branch caused a particular lost fight.
 DA2 line handling activates bound world objects; the separate
 placement/follower changes landed in #895/#898. Neither
 activation nor pose placement implements the processing lifecycle above.
-`AddCommand` appends/prepends directly and does not yet apply all the native
+DA2 `AddCommand` appends/prepends directly and does not yet apply all the native
 admission/static rules. `IsMoving` still falls back to the unimplemented
 return value. A complete fix needs explicit persistent locomotion state and
 tests of take, held admission, release, cancellation and save/reload.
@@ -166,6 +166,13 @@ This does not classify individual ability branches or prove correct cinematic
 ownership; it narrows the processing-freeze hypothesis without changing combat
 inputs. The old trace predates per-blow attack entries, so it cannot supply
 current attack tallies.
+
+These caller counts identify executing script owners. The getter can receive a
+different actor as its argument. The guarded branch at `0x11c5` reaches effect
+type 9 with engine float 1 set to 0.4 and a 1.5-second duration. The installed
+effects schema identifies type 9 as movement speed. Its exact actor arguments
+and native effect executor remain to be audited. The animation-selection branch
+and the effect branch provide separate inputs for a future locomotion replay.
 
 Damage, health, chargen inputs and Karl combat are owned by the separate
 damage investigation. No balance adjustment or processing heuristic is
