@@ -480,7 +480,10 @@ pub enum Routed {
     Path(Vec<[f32; 3]>),
     /// Only through this closed door.
     Door(thedas_script::vm::ObjectId),
-    /// No route known (no grid, an end off it, or no way at all): a straight line.
+    /// A known-grid path failed, with too much height difference for the native
+    /// collision-tested direct fallback (DAOrigins.exe 0x73ee88).
+    InvalidPath,
+    /// No route known: the provisional straight-line fallback.
     Straight,
 }
 
@@ -1207,6 +1210,121 @@ mod tests {
             heights: vec![0.0; (w * h) as usize],
             surfaces: Vec::new(),
         }
+    }
+
+    fn disconnected_levels(height: f32) -> (Sim, thedas_script::vm::ObjectId) {
+        use crate::world::ObjectKind;
+        use thedas_script::EngineTable;
+        use thedas_vfs::Vfs;
+        let table = EngineTable::parse(
+            b"int EVENT_TYPE_COMMAND_COMPLETE = 500;\nint COMMAND_FAILED_INVALID_PATH = -4;\n",
+        )
+        .unwrap();
+        let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(table), 1);
+        let area = s.world.spawn(ObjectKind::Area, "levels");
+        let hero = s.world.spawn(ObjectKind::Creature, "player");
+        s.world.area = Some(area);
+        s.world.hero = Some(hero);
+        let h = s.world.get_mut(hero).unwrap();
+        h.area = Some(area);
+        h.position = [0.5, 1.5, height];
+        let mut g = grid();
+        for y in 0..g.rows {
+            g.data[(y * g.columns + 2) as usize] = 10;
+            for x in 0..2 {
+                g.heights[(y * g.columns + x) as usize] = height * 16.0;
+            }
+        }
+        s.area_layouts.insert(area, "levels".into());
+        s.nav_grids.insert("levels".into(), Some(Arc::new(g)));
+        (s, hero)
+    }
+
+    #[test]
+    fn failed_path_height_guard_is_strict_and_origins_only() {
+        let goal = [4.5, 1.5, 0.0];
+        for (height, expected) in [
+            (0.5, Routed::Straight),
+            (0.5001, Routed::InvalidPath),
+            (-0.5001, Routed::InvalidPath),
+        ] {
+            let (mut s, hero) = disconnected_levels(height);
+            assert_eq!(s.route_to(hero, goal), expected);
+        }
+        let (mut s, hero) = disconnected_levels(1.0);
+        s.game = thedas_vfs::Game::DragonAge2;
+        assert_eq!(s.route_to(hero, goal), Routed::Straight);
+        s.game = thedas_vfs::Game::Origins;
+        s.nav_grids.insert("levels".into(), None);
+        assert_eq!(s.route_to(hero, goal), Routed::Straight);
+    }
+
+    #[test]
+    fn a_failed_tall_walk_stays_put_and_does_not_cross_triggers() {
+        use crate::world::ObjectKind;
+        let (mut s, hero) = disconnected_levels(1.0);
+        let area = s.world.area;
+        let tr = s.world.spawn(ObjectKind::Trigger, "across_the_wall");
+        let o = s.world.get_mut(tr).unwrap();
+        o.area = area;
+        o.position = [2.0, 1.0, 0.0];
+        o.geometry = vec![
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [0.0, 1.0, 0.0],
+        ];
+        assert!(!s.walk(hero, [4.5, 1.5, 0.0], area));
+        assert_eq!(s.world.get(hero).unwrap().position, [0.5, 1.5, 1.0]);
+        assert!(s.world.queue.is_empty());
+        assert!(!s.world.in_triggers.contains_key(&hero));
+        assert_eq!(s.world.time_ms, 0);
+    }
+
+    #[test]
+    fn a_failed_tall_move_reports_invalid_path_without_moving() {
+        use crate::world::{Command, Location};
+        let (mut s, hero) = disconnected_levels(1.0);
+        let goal = [4.5, 1.5, 0.0];
+        let area = s.world.area.unwrap();
+        s.world.get_mut(hero).unwrap().commands.push(Command {
+            ty: 20,
+            name: "CommandMoveToLocation".into(),
+            location: Some(Location {
+                area,
+                position: goal,
+                facing: 0.0,
+            }),
+            ints: vec![1, 0],
+            ..Default::default()
+        });
+        s.tick(0);
+        let h = s.world.get(hero).unwrap();
+        assert!(h.commands.is_empty());
+        assert_eq!(h.position, [0.5, 1.5, 1.0]);
+        assert_eq!(
+            h.combat.previous_command.as_ref().unwrap().name,
+            "CommandMoveToLocation"
+        );
+        let complete = s.world.queue.values().find(|q| q.event.ty == 500).unwrap();
+        assert_eq!(complete.target, hero);
+        assert_eq!(complete.event.ints, [20, -4]);
+    }
+
+    #[test]
+    fn a_valid_sloping_route_can_change_height_by_more_than_half_a_metre() {
+        let (mut s, hero) = disconnected_levels(1.0);
+        let mut g = grid();
+        g.data.fill(1);
+        for y in 0..g.rows {
+            for x in 0..g.columns {
+                g.heights[(y * g.columns + x) as usize] = (4 - x) as f32 * 4.0;
+            }
+        }
+        s.nav_grids.insert("levels".into(), Some(Arc::new(g)));
+        assert!(matches!(s.route_to(hero, [4.5, 1.5, 0.0]), Routed::Path(_)));
+        assert!(s.walk(hero, [4.5, 1.5, 0.0], s.world.area));
+        assert_eq!(s.world.get(hero).unwrap().position, [4.5, 1.5, 0.0]);
     }
 
     #[test]
