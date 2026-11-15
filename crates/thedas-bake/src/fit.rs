@@ -23,6 +23,13 @@ pub struct Row {
     pub reach: Vec<(u32, f32)>,
     /// Converged occlusion: the fraction of 64 cosine rays that escape.
     pub open: f32,
+    /// Occlusion ray hit distances (∞ = escaped) out to 5: 64 cosine-distributed rays, then 64
+    /// uniform ones.
+    pub ao_cos: Vec<f32>,
+    pub ao_uni: Vec<f32>,
+    /// The same within 45° of the normal.
+    pub ao_cos45: Vec<f32>,
+    pub ao_uni45: Vec<f32>,
     /// The room ambient this texel's piece takes (index into the ambient list), if any.
     pub room: Option<u32>,
     pub atlas_xy: (u32, u32),
@@ -88,12 +95,22 @@ pub fn rows(
                 }
             }
             let open = crate::bake::occlusion_converged(&scene.bvh, sp, ng, nf, settings, 64);
+            let hits = |cosine, cone| {
+                crate::bake::occlusion_hits(&scene.bvh, sp, nf, settings, 64, 5.0, cosine, cone)
+            };
+            let (ao_cos, ao_uni) = (hits(true, 0.0), hits(false, 0.0));
+            let c45 = std::f32::consts::FRAC_1_SQRT_2;
+            let (ao_cos45, ao_uni45) = (hits(true, c45), hits(false, c45));
             out.push(Row {
                 shipped: [px[0], px[1], px[2], px[3]],
                 terms,
                 unshadowed,
                 reach,
                 open,
+                ao_cos,
+                ao_uni,
+                ao_cos45,
+                ao_uni45,
                 room,
                 atlas_xy: (ax as u32, ay as u32),
             });
@@ -139,21 +156,21 @@ pub struct LightFit {
     pub rmse_levels: f64,
 }
 
-/// Fits `lm = ambient(room) + Σ k_l · colour_l · term_l` to texels whose shipped alpha says
-/// both the shadow pass and occlusion are 1 (alpha ≥ `min_alpha`), per channel in linear space.
+/// Fits `lm = ambient(room) + Σ k_l · colour_l · term_l`, per channel in linear space, to the
+/// texels `use_row` picks (ones where occlusion is believed to be 1).
 pub fn fit_lights(
     rows: &[Row],
     lights: &[BakeLight],
     rooms: usize,
     gamma: f32,
-    min_alpha: u8,
+    use_row: &dyn Fn(&Row) -> bool,
 ) -> LightFit {
     let nl = lights.len();
     let n = nl + rooms * 3;
     let mut a = vec![vec![0.0f64; n]; n];
     let mut b = vec![0.0f64; n];
     let mut used = 0;
-    for r in rows.iter().filter(|r| r.shipped[3] >= min_alpha) {
+    for r in rows.iter().filter(|r| use_row(r)) {
         used += 1;
         for c in 0..3 {
             let mut feats: Vec<(usize, f64)> = r
@@ -191,7 +208,7 @@ pub fn fit_lights(
     // Residual in 8-bit levels.
     let mut se = 0.0;
     let mut count = 0;
-    for r in rows.iter().filter(|r| r.shipped[3] >= min_alpha) {
+    for r in rows.iter().filter(|r| use_row(r)) {
         for (c, &shipped) in r.shipped[..3].iter().enumerate() {
             let mut v = r
                 .room

@@ -83,6 +83,18 @@ impl Bvh {
         best
     }
 
+    /// The nearest hit with `tmin < t < tmax` among triangles that cast shadows.
+    pub fn closest_casting(&self, from: Vec3, dir: Vec3, tmin: f32, tmax: f32) -> Option<Hit> {
+        let mut best: Option<Hit> = None;
+        let mut limit = tmax;
+        self.walk(from, dir, tmin, &mut limit, true, &mut |hit, limit| {
+            *limit = hit.t;
+            best = Some(hit);
+            false
+        });
+        best
+    }
+
     /// Whether anything is hit with `tmin < t < tmax`.
     pub fn occluded(&self, from: Vec3, dir: Vec3, tmin: f32, tmax: f32) -> bool {
         let mut any = false;

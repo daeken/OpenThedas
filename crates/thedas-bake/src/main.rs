@@ -39,6 +39,15 @@ struct Args {
     /// Experimental shadow pass min(1, k·Σ falloff·cos)^e, as "k,e".
     #[arg(long, value_parser = parse_ke)]
     shadow_intensity: Option<(f32, f32)>,
+    /// Experimental fitted occlusion model "length,exponent,lo,power".
+    #[arg(long)]
+    ao_model: Option<String>,
+    /// Experimental soft shadows for point lights: "radius,samples".
+    #[arg(long, value_parser = parse_ke)]
+    light_size: Option<(f32, f32)>,
+    /// Grow each part's covered area by this many texels.
+    #[arg(long, default_value_t = 0)]
+    dilate: u32,
     /// Occlusion ray length.
     #[arg(long, default_value_t = 5.0)]
     ao_length: f32,
@@ -55,6 +64,9 @@ struct Args {
     /// Explain one atlas texel (x,y) instead of baking.
     #[arg(long, value_parser = parse_xy)]
     probe: Option<(i32, i32)>,
+    /// Use a previous --fit's fit.txt for the RGB pass's light brightness and room ambients.
+    #[arg(long)]
+    use_fit: Option<PathBuf>,
     /// Fit every n-th texel.
     #[arg(long, default_value_t = 2)]
     stride: u32,
@@ -72,6 +84,22 @@ fn main() -> Result<()> {
     let started = Instant::now();
     let scene = AreaScene::load(&vfs, &level)?;
     let bake = BakeScene::new(&scene, &vfs);
+    if let Ok(near) = std::env::var("THEDAS_BAKE_NEAR") {
+        let v: Vec<f32> = near.split(',').filter_map(|x| x.parse().ok()).collect();
+        let p = Vec3::new(v[0], v[1], v[2]);
+        for (i, d) in scene.draws.iter().enumerate() {
+            let dist = (d.sphere.0 - p).length() - d.sphere.1;
+            if dist < 0.5 {
+                eprintln!(
+                    "near: draw {i} {} {} sphere {:?} static {}",
+                    d.model,
+                    scene.meshes[d.mesh].key,
+                    d.sphere,
+                    i < scene.static_draws
+                );
+            }
+        }
+    }
     eprintln!(
         "{level}: {} triangles ({} non-casting draws left out), {} regions in {} atlases, {} lights (loaded in {:.1}s)",
         bake.bvh.tris.len(),
@@ -87,6 +115,17 @@ fn main() -> Result<()> {
         ao_rays: args.ao_rays,
         ao_length: args.ao_length,
         ao_converged: args.ao_converged,
+        dilate: args.dilate,
+        light_size: args.light_size.map(|(r, n)| (r, n as u32)),
+        ao_model: args.ao_model.as_deref().map(|s| {
+            let v: Vec<f32> = s.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+            thedas_bake::bake::AoModel {
+                length: v.first().copied().unwrap_or(1.5),
+                exponent: v.get(1).copied().unwrap_or(2.0),
+                lo: v.get(2).copied().unwrap_or(-1.0),
+                power: v.get(3).copied().unwrap_or(1.0),
+            }
+        }),
         shadow_model: match args.shadow_intensity {
             Some((k, e)) => thedas_bake::bake::ShadowModel::Intensity { k, e },
             None => thedas_bake::bake::ShadowModel::Monochrome,
@@ -139,6 +178,26 @@ fn main() -> Result<()> {
         });
     }
 
+    // A fit's results replace the RGB pass's light brightness and the room ambients.
+    if let Some(path) = &args.use_fit {
+        let text = std::fs::read_to_string(path)?;
+        for line in text.lines() {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            match f.as_slice() {
+                ["ambient", room, r, g, b, ..] => {
+                    let c = Vec3::new(r.parse()?, g.parse()?, b.parse()?);
+                    ambient.insert(room.to_string(), c);
+                }
+                ["light", i, k, ..] => {
+                    let (i, k): (usize, f32) = (i.parse()?, k.parse()?);
+                    if let Some(l) = points.get_mut(i) {
+                        l.brightness = k;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
     if args.fit {
         return fit(
             &args, &vfs, &scene, &bake, &points, &names, &ambient, &settings,
@@ -161,6 +220,7 @@ fn main() -> Result<()> {
         let shipped = dds.decode_rgba8(0, 0)?;
         let mut ours = vec![0u8; (aw * ah * 4) as usize];
         let mut mask = vec![false; (aw * ah) as usize];
+        let mut placed = vec![false; (aw * ah) as usize];
         let t0 = Instant::now();
         let mut unplaced = 0;
         for &ri in regions {
@@ -224,17 +284,26 @@ fn main() -> Result<()> {
                         continue;
                     }
                     let i = (y * pl.w + x) as usize;
+                    let at = (ay as u32 * aw + ax as u32) as usize;
+                    placed[at] = true;
                     if !films.covered[i] {
                         continue;
                     }
-                    let at = (ay as u32 * aw + ax as u32) as usize;
                     ours[at * 4..at * 4 + 4].copy_from_slice(&films.rgba(i));
                     mask[at] = true;
                 }
             }
         }
         let mut stats = Stats::default();
+        let (mut extra, mut missing) = (0u64, 0u64);
         for (i, &m) in mask.iter().enumerate() {
+            let zero = shipped[i * 4..i * 4 + 4] == [0, 0, 0, 0];
+            if m && zero {
+                extra += 1;
+            }
+            if placed[i] && !m && !zero {
+                missing += 1;
+            }
             if m {
                 let o = [
                     ours[i * 4],
@@ -252,7 +321,7 @@ fn main() -> Result<()> {
             }
         }
         let line = format!(
-            "{atlas:28} {aw}x{ah} {} regions ({unplaced} unplaced) {:.1}s\n  {}\n",
+            "{atlas:28} {aw}x{ah} {} regions ({unplaced} unplaced) {:.1}s; {extra} of ours are black in the shipped atlas, {missing} shipped texels we leave uncovered\n  {}\n",
             regions.len(),
             t0.elapsed().as_secs_f32(),
             stats.line()
@@ -261,6 +330,24 @@ fn main() -> Result<()> {
         report.push_str(&line);
         total.merge(&stats);
         let stem = atlas.trim_end_matches(".dds");
+        if std::env::var_os("THEDAS_BAKE_COVERAGE").is_some() {
+            // Red: ours covers; green: shipped is not black; blue: inside a placed region.
+            let mut img = vec![0u8; (aw * ah * 3) as usize];
+            for i in 0..(aw * ah) as usize {
+                img[i * 3] = if mask[i] { 255 } else { 0 };
+                img[i * 3 + 1] = if shipped[i * 4..i * 4 + 4] != [0, 0, 0, 0] {
+                    255
+                } else {
+                    0
+                };
+                img[i * 3 + 2] = if placed[i] { 96 } else { 0 };
+            }
+            let file = std::fs::File::create(args.out.join(format!("{stem}-coverage.png")))?;
+            let mut enc = png::Encoder::new(std::io::BufWriter::new(file), aw, ah);
+            enc.set_color(png::ColorType::Rgb);
+            enc.set_depth(png::BitDepth::Eight);
+            enc.write_header()?.write_image_data(&img)?;
+        }
         write_side_by_side(
             &args.out.join(format!("{stem}.png")),
             aw,
@@ -355,6 +442,17 @@ fn fit(
                 *culprits.entry(i as usize).or_default() += 1;
             }
         }
+    }
+    for r in rows
+        .iter()
+        .filter(|r| r.shipped[3] < 8 && r.terms.iter().map(|t| t.1).sum::<f32>() > 0.3)
+        .step_by(41)
+        .take(12)
+    {
+        println!(
+            "  strongly lit by us, dark in alpha at {:?}: shipped {:?}, terms {:?}",
+            r.atlas_xy, r.shipped, r.terms
+        );
     }
     let mut culprits: Vec<_> = culprits.into_iter().collect();
     culprits.sort_by_key(|c| std::cmp::Reverse(c.1));
@@ -455,6 +553,164 @@ fn fit(
             );
         }
     }
+    // Occlusion models on the saturated texels: visibility v from the hit distances, then
+    // colour = clamp(lo + (1 − lo)·v), then the film's power.
+    {
+        let sat: Vec<&fit::Row> = rows
+            .iter()
+            .filter(|r| r.terms.iter().map(|t| t.1).sum::<f32>() >= 0.45 && r.shipped[3] >= 24)
+            .collect();
+        println!(
+            "  occlusion models over {} saturated, lit texels",
+            sat.len()
+        );
+        {
+            let n = sat.len().max(1) as f64;
+            let mean = sat.iter().map(|r| r.shipped[3] as f64).sum::<f64>() / n;
+            let rmse255 = (sat
+                .iter()
+                .map(|r| (255.0 - r.shipped[3] as f64).powi(2))
+                .sum::<f64>()
+                / n)
+                .sqrt();
+            let mut hist = [0usize; 8];
+            for r in &sat {
+                hist[(r.shipped[3] / 32) as usize] += 1;
+            }
+            println!(
+                "  shipped alpha there: mean {mean:.1}, RMSE vs 255 {rmse255:.1}, histogram by 32s {hist:?}"
+            );
+        }
+        let mut results = Vec::new();
+        for (dist, cosine) in [
+            ("cosine", 0),
+            ("uniform", 1),
+            ("cosine45", 2),
+            ("uniform45", 3),
+        ] {
+            for (wname, wi) in [
+                ("binary L", 0),
+                ("(1-t/L)^1", 1),
+                ("(1-t/L)^2", 2),
+                ("(1-t/L)^0.5", 3),
+            ] {
+                for li in [0.5f32, 1.0, 1.5, 2.0, 3.0, 5.0] {
+                    for lo in [0.0f32, -0.5, -1.0, -1.5, -2.0] {
+                        for pw in [1.0f32, 1.0 / 1.5, 0.5] {
+                            let (mut se, mut n) = (0.0f64, 0);
+                            for r in &sat {
+                                let hits = match cosine {
+                                    0 => &r.ao_cos,
+                                    1 => &r.ao_uni,
+                                    2 => &r.ao_cos45,
+                                    _ => &r.ao_uni45,
+                                };
+                                let occ: f32 = hits
+                                    .iter()
+                                    .map(|&t| {
+                                        if t >= li {
+                                            0.0
+                                        } else {
+                                            let x = 1.0 - t / li;
+                                            match wi {
+                                                0 => 1.0,
+                                                1 => x,
+                                                2 => x * x,
+                                                _ => x.sqrt(),
+                                            }
+                                        }
+                                    })
+                                    .sum::<f32>()
+                                    / hits.len() as f32;
+                                let v = 1.0 - occ;
+                                let c = (lo + (1.0 - lo) * v).clamp(0.0, 1.0).powf(pw);
+                                let d = 255.0 * c as f64 - r.shipped[3] as f64;
+                                se += d * d;
+                                n += 1;
+                            }
+                            results.push(((se / n.max(1) as f64).sqrt(), dist, wname, li, lo, pw));
+                        }
+                    }
+                }
+            }
+        }
+        results.sort_by(|a, b| a.0.total_cmp(&b.0));
+        for r in results.iter().take(12) {
+            println!(
+                "  occlusion model RMSE {:.2}: {} {} L {} lo {} power {:.3}",
+                r.0, r.1, r.2, r.3, r.4, r.5
+            );
+        }
+    }
+    // Shadow pass falloff shapes, with the fitted occlusion model, over every texel.
+    {
+        let ao_of = |r: &fit::Row| -> f32 {
+            let (len, ex, lo) = (1.5f32, 2.0f32, -1.0f32);
+            let occ: f32 = r
+                .ao_cos
+                .iter()
+                .map(|&t| {
+                    if t >= len {
+                        0.0
+                    } else {
+                        (1.0 - t / len).powf(ex)
+                    }
+                })
+                .sum::<f32>()
+                / r.ao_cos.len() as f32;
+            (lo + (1.0 - lo) * (1.0 - occ)).clamp(0.0, 1.0)
+        };
+        let aos: Vec<f32> = rows.iter().map(ao_of).collect();
+        let mut results = Vec::new();
+        for (gname, g) in [
+            ("linear", 0),
+            ("quadratic", 1),
+            ("cos²", 2),
+            ("smoothstep", 3),
+        ] {
+            for rs in [1.0f32, 0.9, 0.8] {
+                for ki in 1..=24 {
+                    let k = ki as f32 * 0.5;
+                    for ei in 3..=10 {
+                        let e = ei as f32 * 0.1;
+                        let mut se = 0.0f64;
+                        for (r, ao) in rows.iter().zip(&aos) {
+                            let mut sum = 0.0f32;
+                            for (&(_, t), &(_, q)) in r.terms.iter().zip(&r.reach) {
+                                let lin = 1.0 - q;
+                                let cosv = if lin > 0.0 { t / lin } else { 0.0 };
+                                let q = q / rs;
+                                if q >= 1.0 {
+                                    continue;
+                                }
+                                let f = match g {
+                                    0 => 1.0 - q,
+                                    1 => (1.0 - q) * (1.0 - q),
+                                    2 => (std::f32::consts::FRAC_PI_2 * q).cos().powi(2),
+                                    _ => {
+                                        let x = 1.0 - q;
+                                        x * x * (3.0 - 2.0 * x)
+                                    }
+                                };
+                                sum += f * cosv;
+                            }
+                            let sm = (k * sum).min(1.0).powf(e);
+                            let d = 255.0 * (ao * sm) as f64 - r.shipped[3] as f64;
+                            se += d * d;
+                        }
+                        results.push(((se / rows.len().max(1) as f64).sqrt(), gname, rs, k, e));
+                    }
+                }
+            }
+        }
+        results.sort_by(|a, b| a.0.total_cmp(&b.0));
+        for r in results.iter().take(10) {
+            println!(
+                "  shadow falloff RMSE {:.2}: {} radius×{} k {} e {:.1}",
+                r.0, r.1, r.2, r.3, r.4
+            );
+        }
+    }
     // Grid search: sm = min(1, k · Σ w_l t_l)^e, alpha = 255 · ao^(1/γ) · sm.
     let weight = |mode: usize, c: Vec3| -> f32 {
         match mode {
@@ -500,12 +756,53 @@ fn fit(
         "occlusion vs alpha where both lit: MAE {:.1} bias {:+.1} RMSE {:.1}",
         f.mae[3], f.bias[3], f.rmse[3]
     );
-    for min_alpha in [250u8, 200] {
-        let lf = fit::fit_lights(&rows, lights, rooms.len(), settings.gamma, min_alpha);
+    let open_model = |r: &fit::Row| -> f32 {
+        let (len, ex, lo) = (1.5f32, 2.0f32, -1.0f32);
+        let occ: f32 = r
+            .ao_cos
+            .iter()
+            .map(|&t| {
+                if t >= len {
+                    0.0
+                } else {
+                    (1.0 - t / len).powf(ex)
+                }
+            })
+            .sum::<f32>()
+            / r.ao_cos.len() as f32;
+        (lo + (1.0 - lo) * (1.0 - occ)).clamp(0.0, 1.0)
+    };
+    type Picker<'a> = (&'a str, Box<dyn Fn(&fit::Row) -> bool + 'a>);
+    let pickers: [Picker; 2] = [
+        ("alpha ≥ 250", Box::new(|r: &fit::Row| r.shipped[3] >= 250)),
+        (
+            "modelled occlusion ≥ 0.98",
+            Box::new(|r: &fit::Row| open_model(r) >= 0.98),
+        ),
+    ];
+    let mut out = String::new();
+    for (pname, pick) in pickers.iter() {
+        let lf = fit::fit_lights(&rows, lights, rooms.len(), settings.gamma, pick.as_ref());
         println!(
-            "lightmap fit on alpha≥{min_alpha}: {} texels, RMSE {:.2} levels",
+            "lightmap fit on {pname}: {} texels, RMSE {:.2} levels",
             lf.texels, lf.rmse_levels
         );
+        out.clear();
+        for (i, room) in rooms.iter().enumerate() {
+            if lf.ambient[i] == Vec3::ZERO {
+                continue;
+            }
+            out.push_str(&format!(
+                "ambient {room} {} {} {}\n",
+                lf.ambient[i].x, lf.ambient[i].y, lf.ambient[i].z
+            ));
+        }
+        for (i, k) in lf.light_scale.iter().enumerate() {
+            out.push_str(&format!(
+                "light {i} {k} {}\n",
+                names.get(i).map(String::as_str).unwrap_or("?")
+            ));
+        }
         for (i, room) in rooms.iter().enumerate() {
             println!(
                 "  ambient {room}: fitted {:.4} {:.4} {:.4}  data {:?}",
@@ -540,6 +837,8 @@ fn fit(
             );
         }
     }
+    std::fs::create_dir_all(&args.out)?;
+    std::fs::write(args.out.join("fit.txt"), out)?;
     Ok(())
 }
 

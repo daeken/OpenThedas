@@ -51,11 +51,28 @@ pub struct Settings {
     pub ao_length: f32,
     /// Primary samples per texel (eclipseRay's scene default, 0x405d60).
     pub samples: u32,
+    /// Experimental: texels to grow each part's covered area by (see [`Films::dilate`]).
+    pub dilate: u32,
     /// Instead of the toolset's few rays per sample, a converged estimate with this many rays
     /// (for comparing shapes without the noise).
     pub ao_converged: Option<u32>,
+    /// Experimental occlusion model from fitting the shipped atlases (overrides the above).
+    pub ao_model: Option<AoModel>,
+    /// Experimental soft shadows for point lights: (sphere radius, visibility samples).
+    pub light_size: Option<(f32, u32)>,
     pub shadow_model: ShadowModel,
     pub threads: usize,
+}
+
+/// An occlusion model fitted to the shipped atlases: 64 cosine rays out to `length`; a hit at
+/// distance t occludes (1 − t/length)^`exponent`; with v the unoccluded share, the pass value
+/// is clamp(lo + (1 − lo)·v, 0, 1)^`power`, before the film's gamma.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AoModel {
+    pub length: f32,
+    pub exponent: f32,
+    pub lo: f32,
+    pub power: f32,
 }
 
 /// What the shadow pass records per sample.
@@ -78,7 +95,10 @@ impl Default for Settings {
             ao_rays: 5,
             ao_length: 5.0,
             samples: 8,
+            dilate: 0,
             ao_converged: None,
+            ao_model: None,
+            light_size: None,
             shadow_model: ShadowModel::Monochrome,
             threads: 4,
         }
@@ -288,7 +308,55 @@ pub fn bake_region(
         films.occlusion[i] = film(a.2 * inv, true);
         films.covered[i] = true;
     }
+    for _ in 0..settings.dilate {
+        films.dilate();
+    }
     films
+}
+
+impl Films {
+    /// Grows the covered area by one texel: each uncovered texel next to covered ones (of its
+    /// eight neighbours) takes their rounded mean. Experimental: the shipped atlases are covered
+    /// one texel beyond what the toolset's film reaches.
+    pub fn dilate(&mut self) {
+        let (w, h) = (self.w as i64, self.h as i64);
+        let old = self.clone();
+        for y in 0..h {
+            for x in 0..w {
+                let i = (y * w + x) as usize;
+                if old.covered[i] {
+                    continue;
+                }
+                let (mut n, mut l, mut sm, mut ao) = (0u32, [0u32; 3], 0u32, 0u32);
+                for dy in -1..=1 {
+                    for dx in -1..=1 {
+                        let (nx, ny) = (x + dx, y + dy);
+                        if nx < 0 || ny < 0 || nx >= w || ny >= h {
+                            continue;
+                        }
+                        let j = (ny * w + nx) as usize;
+                        if !old.covered[j] {
+                            continue;
+                        }
+                        n += 1;
+                        for (acc, &v) in l.iter_mut().zip(&old.light[j]) {
+                            *acc += v as u32;
+                        }
+                        sm += old.shadow[j] as u32;
+                        ao += old.occlusion[j] as u32;
+                    }
+                }
+                if n == 0 {
+                    continue;
+                }
+                let avg = |v: u32| ((v + n / 2) / n) as u8;
+                self.light[i] = [avg(l[0]), avg(l[1]), avg(l[2])];
+                self.shadow[i] = avg(sm);
+                self.occlusion[i] = avg(ao);
+                self.covered[i] = true;
+            }
+        }
+    }
 }
 
 fn sample(
@@ -329,20 +397,53 @@ fn sample(
         if c.max_element() <= 0.0 || nf.dot(dir) <= 0.0 {
             continue;
         }
-        if !(l.in_lightmap || l.cast_shadows) || shadowed(&scene.bvh, sp, dir, tmax, settings) {
+        if !(l.in_lightmap || l.cast_shadows) {
+            continue;
+        }
+        let vis = match (l.kind, settings.light_size) {
+            (LightKind::Point { position, .. }, Some((size, n))) if size > 0.0 => {
+                soft_visibility(&scene.bvh, sp, position, size, n, settings)
+            }
+            _ => {
+                if shadowed(&scene.bvh, sp, dir, tmax, settings) {
+                    0.0
+                } else {
+                    1.0
+                }
+            }
+        };
+        if vis <= 0.0 {
             continue;
         }
         if l.in_lightmap {
-            light += c * ng.dot(dir).abs();
+            light += c * ng.dot(dir).abs() * vis;
         }
         lit |= l.cast_shadows;
         if l.cast_shadows {
-            reach += f * ng.dot(dir).abs();
+            reach += f * ng.dot(dir).abs() * vis;
         }
     }
-    let open = match settings.ao_converged {
-        Some(n) => occlusion_converged(&scene.bvh, sp, ng, nf, settings, n),
-        None => occlusion(&scene.bvh, sp, ng, nf, settings, q),
+    let open = match (settings.ao_model, settings.ao_converged) {
+        (Some(m), _) => {
+            let hits = occlusion_hits(&scene.bvh, sp, nf, settings, 64, m.length, true, 0.0);
+            let occ: f32 = hits
+                .iter()
+                .map(|&t| {
+                    if t >= m.length {
+                        0.0
+                    } else {
+                        (1.0 - t / m.length).powf(m.exponent)
+                    }
+                })
+                .sum::<f32>()
+                / hits.len() as f32;
+            // The film raises the pass to 1/gamma; undo that so `power` is the final one.
+            (m.lo + (1.0 - m.lo) * (1.0 - occ))
+                .clamp(0.0, 1.0)
+                .powf(m.power * settings.gamma)
+        }
+        (None, Some(n)) => occlusion_converged(&scene.bvh, sp, ng, nf, settings, n),
+        (None, None) => occlusion(&scene.bvh, sp, ng, nf, settings, q),
     };
     Some(Sample {
         light,
@@ -407,6 +508,70 @@ pub fn occlusion_converged(
         }
     }
     open as f32 / count as f32
+}
+
+#[allow(clippy::too_many_arguments)]
+/// Occlusion ray hit distances (∞ for an escape) for `count` rays out to `length`, cosine
+/// distributed (or uniform over the hemisphere), for fitting occlusion models.
+pub fn occlusion_hits(
+    bvh: &Bvh,
+    p: Vec3,
+    nf: Vec3,
+    settings: &Settings,
+    count: u32,
+    length: f32,
+    cosine: bool,
+    cone_cos: f32,
+) -> Vec<f32> {
+    let a = if nf.x.abs() > 0.9 { Vec3::Y } else { Vec3::X };
+    let t = nf.cross(a).normalize();
+    let b = nf.cross(t);
+    let bias = settings.shadow_bias;
+    (0..count)
+        .map(|i| {
+            let u1 = (i as f32 + 0.5) / count as f32;
+            let phi = std::f32::consts::TAU * vdc(i);
+            // Within the cone z ≥ cone_cos: cosine-weighted (z² uniform) or uniform in solid
+            // angle (z uniform).
+            let z = if cosine {
+                (cone_cos * cone_cos + (1.0 - cone_cos * cone_cos) * u1).sqrt()
+            } else {
+                cone_cos + (1.0 - cone_cos) * u1
+            };
+            let r = (1.0 - z * z).max(0.0).sqrt();
+            let dir = nf * z + (t * phi.cos() + b * phi.sin()) * r;
+            bvh.closest_casting(p + dir * bias, dir, 0.0, length - 2.0 * bias)
+                .map(|h| h.t + bias)
+                .unwrap_or(f32::INFINITY)
+        })
+        .collect()
+}
+
+/// Experimental soft shadows: the share of `n` points spread over a sphere of radius `size`
+/// around the light (a Fibonacci set) that the surface point sees.
+pub fn soft_visibility(
+    bvh: &Bvh,
+    p: Vec3,
+    light: Vec3,
+    size: f32,
+    n: u32,
+    settings: &Settings,
+) -> f32 {
+    let n = n.max(1);
+    let golden = std::f32::consts::PI * (3.0 - 5.0f32.sqrt());
+    let mut seen = 0;
+    for i in 0..n {
+        let z = 1.0 - 2.0 * (i as f32 + 0.5) / n as f32;
+        let r = (1.0 - z * z).max(0.0).sqrt();
+        let a = golden * i as f32;
+        let q = light + Vec3::new(r * a.cos(), r * a.sin(), z) * size;
+        let to = q - p;
+        let d = to.length();
+        if d > 0.0 && !shadowed(bvh, p, to / d, d, settings) {
+            seen += 1;
+        }
+    }
+    seen as f32 / n as f32
 }
 
 /// `scene_t::isShadowed` (yafraycore 0x10022e90): the origin moves `b` along the ray and hits
