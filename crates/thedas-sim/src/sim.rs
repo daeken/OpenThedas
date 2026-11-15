@@ -159,6 +159,10 @@ pub struct Sim {
     /// Walkers held up by another creature's body: since when, and whether that was
     /// reported (see `Sim::advance_movers`). Not saved.
     pub(crate) blocked_since: HashMap<ObjectId, (u64, bool)>,
+    /// Perception's sight-line answers between two creatures, kept while neither moves
+    /// and the area's collision is the same (see `Sim::update_perception`). Not saved: a
+    /// pure function of positions and geometry, worked out again when missing.
+    pub(crate) sight_memo: crate::combat::SightMemo,
     /// The add-ins' area-list scripts, read once (see [`crate::prcscr`]).
     pub(crate) prcscr: Option<Arc<Vec<(String, String)>>>,
     /// The area list whose add-in scripts have run since it was loaded. Not saved: a load
@@ -674,6 +678,7 @@ impl Sim {
             placeable_collisions: HashMap::new(),
             door_collisions: HashMap::new(),
             blocked_since: HashMap::new(),
+            sight_memo: Default::default(),
             prcscr: None,
             prcscr_ran: None,
             fire_lengths: HashMap::new(),
