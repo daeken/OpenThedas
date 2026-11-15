@@ -49,6 +49,7 @@ pub const SAVE_FORMAT: u32 = 1;
 /// - 10: Origins placed objects initialize their current State from InitialState.
 ///   Earlier saves without State receive that initial value and its PWK footprint;
 ///   explicit saved states and their existing pathing writes are preserved.
+///   An older no-op setter that left no State field cannot be distinguished.
 pub const SAVE_REVISION: u32 = 10;
 
 /// The trace channel loading reports save damage on.

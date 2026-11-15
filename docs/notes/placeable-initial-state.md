@@ -83,3 +83,6 @@ Explicit saved State and existing pathing patches survive; revisiting a known
 area does not initialize again. DA2 retains its existing behavior.
 Migration uses an unloaded object's remembered active flag, so parking an area
 does not turn its initially closed doors into group-1 objects on return.
+An older no-op script setter could leave no State field at all; such an
+unrecorded choice cannot be distinguished from the old initialization bug and
+receives InitialState during migration.
