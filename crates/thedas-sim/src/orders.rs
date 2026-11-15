@@ -33,6 +33,7 @@ fn command(sim: &Sim, ty: &str, name: &str) -> Command {
         impacted: false,
         arrived: false,
         da2_target_prepared: false,
+        interaction: None,
         path: Vec::new(),
         turned_at: None,
         is_static: false,

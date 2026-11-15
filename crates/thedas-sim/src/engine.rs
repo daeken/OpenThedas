@@ -3024,6 +3024,7 @@ pub fn call(
                 impacted: false,
                 arrived: false,
                 da2_target_prepared: false,
+                interaction: None,
                 path: Vec::new(),
                 turned_at: None,
                 is_static: false,
@@ -3196,6 +3197,9 @@ pub fn call(
                 c.cancellable_at = None;
                 c.cancellable = false;
                 c.da2_target_prepared = false;
+                if let Some(interaction) = c.interaction.as_mut() {
+                    interaction.stage = 0;
+                }
                 if c.name != "CommandMoveToMultiLocations" {
                     c.path.clear();
                 }
@@ -11686,6 +11690,7 @@ mod tests {
                 impacted: false,
                 arrived: false,
                 da2_target_prepared: false,
+                interaction: None,
                 path: vec![],
                 turned_at: None,
                 is_static: false,

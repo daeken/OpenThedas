@@ -2507,6 +2507,7 @@ impl Sim {
                 impacted: false,
                 arrived: false,
                 da2_target_prepared: false,
+                interaction: None,
                 path: Vec::new(),
                 turned_at: None,
                 is_static: false,
@@ -2969,6 +2970,9 @@ impl Sim {
                         c.due = Some(now);
                         c.from = Some((here, now));
                         c.path = vec![here];
+                        if c.name == crate::interaction::COMMAND {
+                            c.approach = Some(here);
+                        }
                     }
                 }
             }
@@ -3057,6 +3061,9 @@ impl Sim {
         let Some(c) = o.commands.first() else {
             return false;
         };
+        if self.game == thedas_vfs::Game::Origins && c.name == crate::interaction::COMMAND {
+            return self.interaction_object_arrived(id);
+        }
         if !c.name.starts_with("CommandMoveToObject") {
             return false;
         }
@@ -6067,6 +6074,7 @@ mod tests {
             impacted: false,
             arrived: false,
             da2_target_prepared: false,
+            interaction: None,
             path: Vec::new(),
             turned_at: None,
             is_static: false,
@@ -6703,6 +6711,7 @@ mod tests {
             impacted: false,
             arrived: false,
             da2_target_prepared: false,
+            interaction: None,
             path: Vec::new(),
             turned_at: None,
             is_static: false,
@@ -6799,6 +6808,7 @@ mod tests {
             impacted: false,
             arrived: false,
             da2_target_prepared: false,
+            interaction: None,
             path: Vec::new(),
             turned_at: None,
             is_static: false,
@@ -6845,6 +6855,7 @@ mod tests {
             impacted: false,
             arrived: false,
             da2_target_prepared: false,
+            interaction: None,
             path: Vec::new(),
             turned_at: None,
             is_static: false,
@@ -6965,6 +6976,7 @@ mod tests {
             impacted: false,
             arrived: false,
             da2_target_prepared: false,
+            interaction: None,
             path: Vec::new(),
             turned_at: None,
             is_static: false,
@@ -7171,6 +7183,7 @@ mod tests {
                 impacted: false,
                 arrived: false,
                 da2_target_prepared: false,
+                interaction: None,
                 path: Vec::new(),
                 turned_at: None,
                 is_static: false,
@@ -7225,6 +7238,7 @@ mod tests {
             impacted: false,
             arrived: false,
             da2_target_prepared: false,
+            interaction: None,
             path: Vec::new(),
             turned_at: None,
             is_static: false,
@@ -7373,6 +7387,7 @@ mod tests {
             impacted: false,
             arrived: false,
             da2_target_prepared: false,
+            interaction: None,
             path: Vec::new(),
             turned_at: None,
             is_static: false,
@@ -7443,6 +7458,7 @@ mod tests {
             impacted: false,
             arrived: false,
             da2_target_prepared: false,
+            interaction: None,
             path: Vec::new(),
             turned_at: None,
             is_static: false,
@@ -7497,6 +7513,7 @@ mod tests {
             impacted: false,
             arrived: false,
             da2_target_prepared: false,
+            interaction: None,
             path: Vec::new(),
             turned_at: None,
             is_static: false,
@@ -7727,6 +7744,7 @@ mod tests {
                 impacted: false,
                 arrived: false,
                 da2_target_prepared: false,
+                interaction: None,
                 path: Vec::new(),
                 turned_at: None,
                 is_static: false,
@@ -7757,6 +7775,7 @@ mod tests {
             impacted: false,
             arrived: false,
             da2_target_prepared: false,
+            interaction: None,
             path: Vec::new(),
             turned_at: None,
             is_static: false,
@@ -7841,6 +7860,7 @@ mod tests {
             impacted: false,
             arrived: false,
             da2_target_prepared: false,
+            interaction: None,
             path: Vec::new(),
             turned_at: None,
             is_static: false,
@@ -7909,6 +7929,7 @@ mod tests {
             impacted: false,
             arrived: false,
             da2_target_prepared: false,
+            interaction: None,
             path: Vec::new(),
             turned_at: None,
             is_static: false,
@@ -8138,6 +8159,7 @@ mod tests {
             impacted: false,
             arrived: false,
             da2_target_prepared: false,
+            interaction: None,
             path: Vec::new(),
             turned_at: None,
             is_static: false,

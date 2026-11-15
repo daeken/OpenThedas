@@ -15,6 +15,17 @@ use crate::world::{Command, ObjectKind};
 pub const COMMAND: &str = "CommandInteract";
 pub const COMMAND_TYPE: i32 = 37;
 
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct CommandState {
+    pub primary: bool,
+    pub skip_reposition: bool,
+    pub play_exit: bool,
+    pub object_approach: bool,
+    pub facing: Option<f32>,
+    /// 0 admission, 1 approaching, 2 animation.
+    pub stage: u8,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Settings {
     pub id: i32,
@@ -87,7 +98,13 @@ impl Sim {
             target: Some(target),
             // Native command flags 2 and 1, respectively. These belong to the
             // command: changing a request does not retarget or reposition it anew.
-            ints: vec![i32::from(primary), i32::from(skip_reposition)],
+            ints: vec![settings.id, settings.pose, settings.loops],
+            interaction: Some(CommandState {
+                primary,
+                skip_reposition,
+                play_exit: settings.play_exit,
+                ..Default::default()
+            }),
             ..Default::default()
         })
     }
@@ -95,10 +112,25 @@ impl Sim {
     /// Start a phase or resume the saved deadline. Missing animation IDs fail like
     /// 0x7a70ca. An unavailable animation component has zero duration (0x694e50).
     pub(crate) fn interaction_deadline(&mut self, who: ObjectId) -> Option<u64> {
-        let (cmd, state) = self
+        let cmd = self.world.get(who)?.commands.first()?.clone();
+        let metadata = cmd.interaction.as_ref()?;
+        // 0x7a6f5c initializes a creature that has no earlier requested interaction
+        // from the command payload. This also permits AddCommand on another actor.
+        let initial = Interaction {
+            requested: Settings {
+                id: cmd.ints.first().copied().unwrap_or(0),
+                pose: cmd.ints.get(1).copied().unwrap_or(1),
+                loops: cmd.ints.get(2).copied().unwrap_or(0),
+                play_exit: metadata.play_exit,
+            },
+            playback: None,
+        };
+        let mut state = self
             .world
-            .get(who)
-            .and_then(|o| Some((o.commands.first()?.clone(), o.interaction.clone()?)))?;
+            .get_mut(who)?
+            .interaction
+            .get_or_insert(initial)
+            .clone();
         let target = cmd.target.and_then(|id| self.world.get(id)).map(|o| o.kind);
         let Some(target) = target else {
             self.fail_front_command(who, "COMMAND_FAILED_TARGET_DESTROYED");
@@ -107,22 +139,33 @@ impl Sim {
         if let Some(due) = cmd.due {
             return Some(due);
         }
-        let stage = cmd.ints.get(2).copied().unwrap_or(0);
-        if stage == 0 && cmd.ints.get(1) != Some(&1) {
+        let stage = metadata.stage;
+        if stage == 0 {
+            state.playback = None;
+            self.world.get_mut(who)?.interaction.as_mut()?.playback = None;
+        }
+        if stage == 0 && !metadata.skip_reposition {
             return self.approach_interaction(who, &cmd, state.requested);
         }
         if stage == 1 {
-            self.world.get_mut(who)?.facing = cmd.seconds;
+            let facing = metadata.facing.or_else(|| {
+                let target = self.world.get(cmd.target?)?;
+                let actor = self.world.get(who)?;
+                Some(crate::world::facing_toward(
+                    target.position[0] - actor.position[0],
+                    target.position[1] - actor.position[1],
+                ))
+            })?;
+            self.world.get_mut(who)?.facing = facing;
         }
         let c = self.world.get_mut(who)?.commands.first_mut()?;
-        c.ints.resize(3, 2);
-        c.ints[2] = 2;
+        c.interaction.as_mut()?.stage = 2;
         let table = if target == ObjectKind::Creature {
             124
         } else {
             123
         };
-        let primary = target != ObjectKind::Creature || cmd.ints.first() == Some(&1);
+        let primary = target != ObjectKind::Creature || metadata.primary;
         let phase = state.playback.as_ref().map_or(0, |p| p.phase);
         let animation = self.interaction_animation(table, state.requested, primary, phase);
         if animation == 0 {
@@ -151,7 +194,13 @@ impl Sim {
             started: now,
             looping,
         });
-        o.commands.first_mut()?.due = Some(due);
+        let c = o.commands.first_mut()?;
+        c.ints = vec![
+            state.requested.id,
+            state.requested.pose,
+            state.requested.loops,
+        ];
+        c.due = Some(due);
         Some(due)
     }
 
@@ -206,23 +255,11 @@ impl Sim {
         let (to, facing, tolerance) = if target.kind == ObjectKind::Placeable
             && let Some((point, facing)) = self.interaction_point(target.id, settings.id)
         {
-            (point, facing, self.body_radius(who))
+            (point, Some(facing), self.body_radius(who))
         } else {
-            let p = target.position;
-            let (dx, dy) = (from[0] - p[0], from[1] - p[1]);
-            let distance = (dx * dx + dy * dy).sqrt();
-            let reach =
-                self.body_radius(who) + self.body_radius(target.id) + crate::orders::INTERACT_GAP;
-            let to = if distance > reach {
-                [
-                    p[0] + dx / distance * reach,
-                    p[1] + dy / distance * reach,
-                    p[2],
-                ]
-            } else {
-                from
-            };
-            (to, crate::world::facing_toward(-dx, -dy), 0.0)
+            // 0x743872 supplies max range 0.1 and minimum 0 to the ordinary
+            // move-to-object subcommand; capsule contact can end that walk.
+            (target.position, None, 0.15)
         };
         let path = if crate::engine::dist(from, to) > tolerance {
             match self.route_to(who, to) {
@@ -244,11 +281,11 @@ impl Sim {
         let ms = (crate::sim::path_length(from, &path) / self.move_speed(who) * 1000.0) as u64;
         let o = self.world.get_mut(who)?;
         let c = o.commands.first_mut()?;
-        c.ints.resize(3, 1);
-        c.ints[2] = 1;
-        c.seconds = facing;
+        let metadata = c.interaction.as_mut()?;
+        metadata.stage = 1;
+        metadata.object_approach = facing.is_none();
+        metadata.facing = facing;
         if path.is_empty() {
-            o.facing = facing;
             return self.interaction_deadline(who);
         }
         let due = now.saturating_add(ms.max(1));
@@ -257,6 +294,36 @@ impl Sim {
         c.path = path;
         c.due = Some(due);
         Some(due)
+    }
+
+    pub(crate) fn interaction_object_arrived(&self, who: ObjectId) -> bool {
+        let Some(actor) = self.world.get(who) else {
+            return false;
+        };
+        let Some(cmd) = actor.commands.first() else {
+            return false;
+        };
+        if !cmd
+            .interaction
+            .as_ref()
+            .is_some_and(|m| m.stage == 1 && m.object_approach)
+        {
+            return false;
+        }
+        let Some(target) = cmd.target.and_then(|id| self.world.get(id)) else {
+            return false;
+        };
+        let Some(goal) = cmd.approach else {
+            return false;
+        };
+        let distance = |point: [f32; 3]| {
+            ((actor.position[0] - point[0]).powi(2) + (actor.position[1] - point[1]).powi(2)).sqrt()
+        };
+        distance(goal) <= 0.15
+            || (target.kind == ObjectKind::Creature
+                && self.alive(target.id)
+                && distance(target.position)
+                    <= self.capsule_radius(who) + self.capsule_radius(target.id) + 0.05)
     }
 
     /// 0x5ca860: the placeable-relative use point and facing, with angles in degrees.
@@ -314,7 +381,7 @@ impl Sim {
             return (0, false);
         };
         let tables = self.world.tables();
-        let Some(anims) = tables.get(0, "anim_base") else {
+        let Some(anims) = tables.get(0, "") else {
             return (0, false);
         };
         let Some(Cell::String(action)) = anims.cell_by_hash(0x7a39_8af9, i64::from(animation))
@@ -508,7 +575,9 @@ mod tests {
         s.tick(0);
         let c = &s.world.get(a).unwrap().commands[0];
         assert_eq!(c.target, Some(b));
-        assert_eq!(&c.ints[..2], &[1, 1]);
+        assert_eq!(c.ints, vec![1, 2, -1]);
+        assert!(c.interaction.as_ref().unwrap().primary);
+        assert!(c.interaction.as_ref().unwrap().skip_reposition);
         assert_eq!(animation(&s, a), 31);
         assert_eq!(s.world.get(a).unwrap().commands.len(), 1);
         request(&mut s, a, other, 2, 1, -1, true);
@@ -531,7 +600,10 @@ mod tests {
         assert!(s.world.get(b).unwrap().commands.is_empty());
         request(&mut s, a, b, 1, 1, -1, true);
         assert_eq!(s.world.get(b).unwrap().commands[0].target, Some(a));
-        assert_eq!(s.world.get(b).unwrap().commands[0].ints, vec![0, 1]);
+        let partner = &s.world.get(b).unwrap().commands[0];
+        assert_eq!(partner.ints, vec![1, 1, -1]);
+        assert!(!partner.interaction.as_ref().unwrap().primary);
+        assert!(partner.interaction.as_ref().unwrap().skip_reposition);
         s.tick(1);
         assert_eq!(animation(&s, a), 21);
         assert_eq!(animation(&s, b), 22);
@@ -587,7 +659,7 @@ mod tests {
         for looping in [false, true] {
             let (mut s, a, b) = sim();
             s.world.tables().insert(
-                "anim_base",
+                "#0",
                 &["#7a398af9", "#12a02374"],
                 vec![
                     (11, vec![Cell::String("enter".into()), Cell::Int(0)]),
@@ -724,5 +796,121 @@ mod tests {
                 .values()
                 .any(|q| q.target == a && q.event.ints == vec![37, -7])
         );
+    }
+
+    #[test]
+    fn a_finite_pose_can_become_infinite_and_a_nonpositive_pose_holds_the_entry() {
+        for pose in [0, 1] {
+            let (mut s, a, b) = sim();
+            request(&mut s, a, b, 1, pose, 1, true);
+            s.tick(0);
+            request(&mut s, a, b, 1, pose, -1, true);
+            s.tick(100);
+            assert_eq!(animation(&s, a), if pose == 0 { 11 } else { 21 });
+            assert_eq!(s.world.get(a).unwrap().commands[0].due, Some(u64::MAX));
+            request(&mut s, a, b, 1, pose, 0, true);
+            s.tick(0);
+            assert_eq!(animation(&s, a), 41);
+            s.tick(1);
+            assert!(s.world.get(a).unwrap().commands.is_empty());
+        }
+    }
+
+    #[test]
+    fn an_interaction_command_can_initialize_another_creature_from_its_payload() {
+        let (mut s, a, b) = sim();
+        request(&mut s, a, b, 1, 2, -1, false);
+        let other = s.world.spawn(ObjectKind::Creature, "other");
+        let c = s.world.get(a).unwrap().commands[0].clone();
+        let handle = s.world.store(crate::world::EngineData::Command(c));
+        let f = s.table.function_by_name("AddCommand").unwrap().clone();
+        let mut h = ScriptHost {
+            sim: &mut s,
+            event: None,
+            script: "test".into(),
+        };
+        let ty = h.sim.types.command;
+        engine::call(
+            &mut h,
+            a,
+            &f,
+            &[
+                Value::Object(other),
+                Value::Engine {
+                    ty,
+                    handle: Some(handle),
+                },
+                Value::Int(1),
+                Value::Int(0),
+                Value::Int(-1),
+            ],
+        )
+        .unwrap()
+        .unwrap();
+        s.tick(1);
+        assert_eq!(animation(&s, other), 31);
+        assert_eq!(
+            s.world
+                .get(other)
+                .unwrap()
+                .interaction
+                .as_ref()
+                .unwrap()
+                .requested,
+            Settings {
+                id: 1,
+                pose: 2,
+                loops: -1,
+                play_exit: false
+            }
+        );
+    }
+
+    #[test]
+    fn reciprocal_object_approaches_end_at_capsule_contact() {
+        let (mut s, a, b) = sim();
+        let area = s.world.spawn(ObjectKind::Area, "area");
+        s.world.get_mut(b).unwrap().kind = ObjectKind::Creature;
+        for (who, x) in [(a, 0.0), (b, 4.0)] {
+            let o = s.world.get_mut(who).unwrap();
+            o.area = Some(area);
+            o.position = [x, 0.0, 0.0];
+        }
+        let f = s
+            .table
+            .function_by_name("InteractWithObject")
+            .unwrap()
+            .clone();
+        let mut h = ScriptHost {
+            sim: &mut s,
+            event: None,
+            script: "test".into(),
+        };
+        engine::call(
+            &mut h,
+            a,
+            &f,
+            &[
+                Value::Object(a),
+                Value::Object(b),
+                Value::Int(1),
+                Value::Int(1),
+                Value::Int(-1),
+                Value::Int(1),
+                Value::Int(0),
+            ],
+        )
+        .unwrap()
+        .unwrap();
+        for _ in 0..200 {
+            s.tick(50);
+        }
+        for who in [a, b] {
+            assert_eq!(s.world.get(who).unwrap().commands[0].due, Some(u64::MAX));
+            assert!(s.world.get(who).unwrap().commands[0].from.is_none());
+        }
+        let p = s.world.get(a).unwrap().position;
+        let q = s.world.get(b).unwrap().position;
+        assert!(crate::engine::dist(p, q) >= s.capsule_radius(a) + s.capsule_radius(b) - 0.05);
     }
 }

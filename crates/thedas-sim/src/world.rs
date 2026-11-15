@@ -334,6 +334,9 @@ pub struct Command {
     /// `COMMAND_TYPE_*`.
     pub ty: i32,
     pub name: String,
+    /// Execution metadata of an Origins ambient interaction; separate from script integers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interaction: Option<crate::interaction::CommandState>,
     /// Origins' AddCommand bStatic: ordinary add behavior cannot clear this command.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub is_static: bool,
