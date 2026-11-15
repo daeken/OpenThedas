@@ -849,7 +849,7 @@ impl Live {
             return;
         }
         // A tutorial that pauses the game holds it until its popup is dismissed.
-        if self.sim().world.tutorial_paused {
+        if self.sim().tutorial_paused() {
             return;
         }
         self.owed_ms += dt_ms.clamp(0.0, MAX_STEP_MS);
