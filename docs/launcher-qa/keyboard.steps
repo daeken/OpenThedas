@@ -13,6 +13,15 @@ key Tab
 expect focus Pick the game's folder
 key Tab
 expect focus Don't have the game
+expect expanded Don't have the game?
+key Enter
+run 300
+expect collapsed Don't have the game?
+expect no text Download Dragon Age: Origins from GOG
+key Enter
+run 300
+expect expanded Don't have the game?
+expect text Download Dragon Age: Origins from GOG
 key Shift+Tab
 expect focus Pick the game's folder
 key Shift+Tab

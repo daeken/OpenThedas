@@ -235,7 +235,7 @@ struct LoadArgs {
     chargen: Option<String>,
     /// Cutscenes: "skip" (default: each ends at once, as if it had played) or "play" (it
     /// runs its length on the simulation's ticks, holding the world still, as in the game).
-    cutscenes: Option<String>,
+    cutscenes: Option<CutscenePolicyArg>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -462,15 +462,44 @@ struct SlotArgs {
     seed: Option<u64>,
     /// load_state: from now on, "skip" cutscenes (end each at once) or "play" them (run
     /// their length on the simulation's ticks). Unchanged when not given.
-    cutscenes: Option<String>,
+    cutscenes: Option<CutscenePolicyArg>,
 }
 
-/// A `cutscenes` argument: "play" or "skip"; `None` when absent or unknown.
-fn cutscene_policy(arg: Option<&str>) -> Option<thedas_sim::sim::CutscenePolicy> {
-    match arg.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
-        Some("play") => Some(thedas_sim::sim::CutscenePolicy::Play),
-        Some("skip") => Some(thedas_sim::sim::CutscenePolicy::Skip),
-        _ => None,
+/// The schema advertises both policies, and malformed values cannot silently skip a
+/// scene. Keep accepting the casing/whitespace the original string option accepted.
+#[derive(Clone, Copy, Debug, JsonSchema)]
+#[schemars(rename_all = "lowercase")]
+enum CutscenePolicyArg {
+    Play,
+    Skip,
+}
+
+impl<'de> Deserialize<'de> for CutscenePolicyArg {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        match value.trim().to_ascii_lowercase().as_str() {
+            "play" => Ok(Self::Play),
+            "skip" => Ok(Self::Skip),
+            _ => Err(serde::de::Error::custom(
+                "cutscenes must be 'play' or 'skip'",
+            )),
+        }
+    }
+}
+
+impl From<CutscenePolicyArg> for thedas_sim::sim::CutscenePolicy {
+    fn from(value: CutscenePolicyArg) -> Self {
+        match value {
+            CutscenePolicyArg::Play => Self::Play,
+            CutscenePolicyArg::Skip => Self::Skip,
+        }
+    }
+}
+
+fn cutscene_policy_name(policy: thedas_sim::sim::CutscenePolicy) -> &'static str {
+    match policy {
+        thedas_sim::sim::CutscenePolicy::Play => "play",
+        thedas_sim::sim::CutscenePolicy::Skip => "skip",
     }
 }
 
@@ -1010,7 +1039,7 @@ impl Server {
             waypoint: a.waypoint,
             seed: a.seed.unwrap_or(1),
             keep_trace: true,
-            cutscenes: cutscene_policy(a.cutscenes.as_deref()).unwrap_or_default(),
+            cutscenes: a.cutscenes.map(Into::into).unwrap_or_default(),
             // Before the module loads: a new game starts character creation then.
             chargen: if a.chargen.as_deref() == Some("manual") {
                 thedas_sim::sim::ChargenPolicy::Manual
@@ -1045,7 +1074,9 @@ impl Server {
         }
     }
 
-    #[tool(description = "Current time, area, hero position, conversation and counters.")]
+    #[tool(
+        description = "Current time, area, hero position, conversation, cutscene policy and active cutscene clock, and counters."
+    )]
     async fn status(&self) -> String {
         self.with_sim(|st| {
             let sim = st.sim.as_ref().ok_or("no sim")?;
@@ -1057,6 +1088,13 @@ impl Server {
                 "area": sim.world.area.map(|a| summary(sim, a)),
                 "hero": sim.world.hero.map(|h| summary(sim, h)),
                 "game_mode": sim.world.game_mode,
+                "cutscenes": cutscene_policy_name(sim.cutscene_policy),
+                "cutscene": sim.world.cutscene.as_ref().map(|c| json!({
+                    "name": c.name,
+                    "elapsed_ms": c.elapsed_ms,
+                    "seconds": c.seconds,
+                    "from_dialog": c.from_dialog,
+                })),
                 "objects": sim.world.objects.len(),
                 "queued_events": sim.world.queue.len(),
                 "scripts_run": tr.scripts_run,
@@ -2319,7 +2357,7 @@ impl Server {
     }
 
     #[tool(
-        description = "Restore the simulation state from an in-memory slot, or from a JSON file written by save_state if path is given."
+        description = "Restore the simulation state from an in-memory slot, or from a JSON file written by save_state if path is given. Set cutscenes to 'play' to keep subsequent cutscenes playing on ticks, or 'skip' to end each at once; omission keeps the session policy."
     )]
     async fn load_state(&self, Parameters(a): Parameters<SlotArgs>) -> String {
         self.with_sim(|st| {
@@ -2330,8 +2368,8 @@ impl Server {
                 if let Some(seed) = a.seed {
                     sim.world.rng = thedas_sim::world::Rng::new(seed);
                 }
-                if let Some(p) = cutscene_policy(a.cutscenes.as_deref()) {
-                    sim.cutscene_policy = p;
+                if let Some(p) = a.cutscenes {
+                    sim.cutscene_policy = p.into();
                 }
                 st.trace_cursor = 0;
                 // Damage an older build left in the save (see thedas_sim::save::SaveIssue).
@@ -2340,6 +2378,7 @@ impl Server {
                     "restored": path,
                     "time_ms": sim.world.time_ms,
                     "save_issues": issues,
+                    "cutscenes": cutscene_policy_name(sim.cutscene_policy),
                 }));
             }
             let slot = a.slot.unwrap_or_else(|| "quick".into());
@@ -2349,10 +2388,14 @@ impl Server {
             if let Some(seed) = a.seed {
                 sim.world.rng = thedas_sim::world::Rng::new(seed);
             }
-            if let Some(p) = cutscene_policy(a.cutscenes.as_deref()) {
-                sim.cutscene_policy = p;
+            if let Some(p) = a.cutscenes {
+                sim.cutscene_policy = p.into();
             }
-            Ok(json!({ "restored": slot, "time_ms": sim.world.time_ms }))
+            Ok(json!({
+                "restored": slot,
+                "time_ms": sim.world.time_ms,
+                "cutscenes": cutscene_policy_name(sim.cutscene_policy),
+            }))
         })
     }
 }
@@ -2379,4 +2422,83 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod cutscene_policy_tests {
+    use super::*;
+    use thedas_sim::sim::CutscenePolicy;
+
+    #[test]
+    fn policy_arguments_advertise_choices_and_reject_unknown_values() {
+        for (value, expected) in [
+            ("play", CutscenePolicy::Play),
+            (" SKIP ", CutscenePolicy::Skip),
+        ] {
+            let args: LoadArgs = serde_json::from_value(json!({"cutscenes": value})).unwrap();
+            assert_eq!(CutscenePolicy::from(args.cutscenes.unwrap()), expected);
+        }
+        let omitted: LoadArgs = serde_json::from_value(json!({})).unwrap();
+        assert!(omitted.cutscenes.is_none());
+        assert!(serde_json::from_value::<LoadArgs>(json!({"cutscenes":"plaay"})).is_err());
+        assert!(serde_json::from_value::<SlotArgs>(json!({"cutscenes":"plaay"})).is_err());
+        let schema = serde_json::to_value(schemars::schema_for!(CutscenePolicyArg)).unwrap();
+        assert_eq!(schema["enum"], json!(["play", "skip"]));
+    }
+
+    #[tokio::test]
+    async fn slot_and_file_restores_keep_the_cutscene_and_apply_the_policy() {
+        let server = Server::new();
+        let mut sim = Sim::new(
+            Arc::new(Vfs::new()),
+            Arc::new(thedas_script::EngineTable::default()),
+            7,
+        );
+        sim.world.cutscene = Some(thedas_sim::cutscene::Cutscene {
+            name: "synthetic.cut".into(),
+            seconds: 5.0,
+            lines: Vec::new(),
+            elapsed_ms: 300,
+            from_dialog: false,
+            bound: Vec::new(),
+            placement: None,
+        });
+        server.state.lock().unwrap().sim = Some(sim);
+        let path =
+            std::env::temp_dir().join(format!("thedas-mcp-policy-{}.json", std::process::id()));
+        let args = |value| Parameters(serde_json::from_value::<SlotArgs>(value).unwrap());
+        let saved = server
+            .save_state(args(json!({"slot":"walk-in", "path":path})))
+            .await;
+        assert!(serde_json::from_str::<J>(&saved).is_ok(), "{saved}");
+
+        let restored = server
+            .load_state(args(json!({"slot":"walk-in", "cutscenes":"play"})))
+            .await;
+        assert_eq!(
+            serde_json::from_str::<J>(&restored).unwrap()["cutscenes"],
+            "play"
+        );
+        let status: J = serde_json::from_str(&server.status().await).unwrap();
+        assert_eq!(status["cutscenes"], "play");
+        assert_eq!(status["cutscene"]["name"], "synthetic.cut");
+        assert_eq!(status["cutscene"]["elapsed_ms"], 300);
+        server.state.lock().unwrap().sim.as_mut().unwrap().tick(100);
+        let status: J = serde_json::from_str(&server.status().await).unwrap();
+        assert_eq!(status["cutscene"]["elapsed_ms"], 400);
+
+        // Omission keeps the session policy; it is not part of the saved world.
+        server.load_state(args(json!({"path":path}))).await;
+        let status: J = serde_json::from_str(&server.status().await).unwrap();
+        assert_eq!(status["cutscenes"], "play");
+        assert_eq!(status["cutscene"]["elapsed_ms"], 300);
+        let restored = server
+            .load_state(args(json!({"path":path, "cutscenes":"skip"})))
+            .await;
+        assert_eq!(
+            serde_json::from_str::<J>(&restored).unwrap()["cutscenes"],
+            "skip"
+        );
+        std::fs::remove_file(path).unwrap();
+    }
 }

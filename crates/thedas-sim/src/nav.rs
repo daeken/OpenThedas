@@ -449,7 +449,10 @@ impl Sim {
                         .or_else(|| o.fields.get("AnimContState"))
                         .copied()
                         .unwrap_or(0);
-                    o.active && (state == 0 || state == 1)
+                    o.active
+                        && (state == 0 || state == 1)
+                        && o.placeable_group
+                            .is_none_or(|g| g & thedas_formats::phy::mask::CREATURES != 0)
                 })
             })
             .cloned()
@@ -585,6 +588,11 @@ impl Sim {
             let Some(o) = self.world.get(d) else {
                 continue;
             };
+            if o.placeable_group
+                .is_some_and(|g| g & thedas_formats::phy::mask::SIGHT == 0)
+            {
+                continue;
+            }
             let (position, facing) = (o.position, o.facing);
             let model = types
                 .as_ref()
@@ -764,20 +772,46 @@ impl Sim {
 
     /// The pathing grid of an area (by its object id), loaded once per layout.
     pub fn nav_grid(&mut self, area: thedas_script::vm::ObjectId) -> Option<Arc<NavGrid>> {
-        let name = self.area_layout(area)?;
-        if let Some(g) = self.nav_grids.get(&name) {
-            return g.clone();
+        if let Some(g) = self.changed_nav_grids.get(&area) {
+            return Some(g.clone());
         }
-        let grid = self.load_nav_grid(&name).map(Arc::new);
-        self.nav_grids.insert(name, grid.clone());
-        grid
+        let name = self.area_layout(area)?;
+        let grid = match self.nav_grids.get(&name) {
+            Some(g) => g.clone(),
+            None => {
+                let g = self.load_nav_grid(&name).map(Arc::new);
+                self.nav_grids.insert(name, g.clone());
+                g
+            }
+        }?;
+        let grid = self.with_nav_patches(area, grid);
+        if self.world.nav_patches.contains_key(&area) {
+            self.changed_nav_grids.insert(area, grid.clone());
+        }
+        Some(grid)
     }
 
     /// The pathing grid of an area if the simulation has already loaded it (read-only:
     /// for presentation, which must not load it through [`Sim::nav_grid`]).
     pub fn loaded_nav_grid(&self, area: thedas_script::vm::ObjectId) -> Option<Arc<NavGrid>> {
+        if let Some(g) = self.changed_nav_grids.get(&area) {
+            return Some(g.clone());
+        }
         let name = self.area_layouts.get(&area)?;
-        self.nav_grids.get(name)?.clone()
+        Some(self.with_nav_patches(area, self.nav_grids.get(name)?.clone()?))
+    }
+
+    fn with_nav_patches(&self, area: ObjectId, grid: Arc<NavGrid>) -> Arc<NavGrid> {
+        let Some(patches) = self.world.nav_patches.get(&area) else {
+            return grid;
+        };
+        let mut changed = (*grid).clone();
+        for (&index, &value) in patches {
+            if let Some(cell) = changed.data.get_mut(index as usize) {
+                *cell = value;
+            }
+        }
+        Arc::new(changed)
     }
 
     /// An area's layout collision if the simulation has already loaded it (read-only: for
@@ -896,6 +930,11 @@ impl Sim {
         let mut placed: Vec<(thedas_script::vm::ObjectId, String, [f32; 3], f32)> = Vec::new();
         for o in self.world.objects.values() {
             if o.kind != crate::world::ObjectKind::Placeable || o.area != Some(area) || !o.active {
+                continue;
+            }
+            if o.placeable_group
+                .is_some_and(|g| g & thedas_formats::phy::mask::SIGHT == 0)
+            {
                 continue;
             }
             let door = matches!(

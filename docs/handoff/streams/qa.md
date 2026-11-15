@@ -38,7 +38,7 @@ Organisation: QA is one thread in the project. The coordinator relays requests f
 3. Hidden window with control: `THEDAS_HIDDEN_WINDOW=1 thedas-app --save S --control 127.0.0.1:PORT --no-audio`, then JSON lines (`status`, `input`, `screenshot`, `state`, `report`). QA's ports are 7940 to 7949; check with `lsof` before binding and kill by pid only. Ready drivers: `triage/firsthour3/g.py`, `qa/run*/banner.py`, `live.py`, `ws.py`.
 4. Audio is graded with `--audio-wav FILE.wav` (headless, never the speakers). Our engine must never play to the speakers, and nobody touches the Mac's volume.
 5. Every candidate gets one new game through the chargen screens in all six origins (`qa/run81/origins.sh`, with the binary name swapped), plus a sweep of saves (`qa/run81/loads.sh`), plus the specific items in the candidate's change list.
-6. Sim-side checks drive `sim-bin/thedas-mcp-<commit>` through `OpenThedas-testdata/drive.py` (`load`, `walk`, `fight`, `talk`, `save`, `clear_area`). `qa/sim-recipes/fight_measure.py` measures fights. Note: the MCP always skips cutscenes; it has no Play option.
+6. Sim-side checks drive `sim-bin/thedas-mcp-<commit>` through `OpenThedas-testdata/drive.py` (`load`, `walk`, `fight`, `talk`, `save`, `clear_area`). `qa/sim-recipes/fight_measure.py` measures fights. MCP `load` and `load_state` accept `cutscenes: "play"` to preserve scenes; `status` reports the policy and active scene's clock. See the [Beraht save recipe](../../notes/mcp-cutscene-policy.md).
 
 ## Running the original (CrossOver, bottle `DAO_QA`)
 
@@ -62,7 +62,7 @@ Organisation: QA is one thread in the project. The coordinator relays requests f
 - Published testers' build: testers-1 8137c5d (QA PASS). The first update candidate cb8205a passed on the Mac and on Windows x64; the items above are open.
 - Recent PASSes on main: #712 unusable items greyed (078b146), weapon sets (#666, #670), #620 ambient lines, cutscene lights, death screen, Ostagar Alistair and Flemeth, chests and stores, door occlusion (footstep flicker reduced but not gone, reported to audio).
 - Open references in the original: the inventory with an unusable item; a City Elf or Dwarf Noble opening without the hero; Alistair at King's Camp and the Rica corridor (parked: console unreliable); reverb takes in the Proving (route rehearsed, two sound-on attempts failed).
-- Open for sim: a cutscene-policy option in the MCP, so saves can keep cutscenes (needed for a Beraht walk-in save).
+- Available for QA: MCP's cutscene-policy option (initially #737), with validated choices, status reporting and a tested [Beraht walk-in save recipe](../../notes/mcp-cutscene-policy.md). Enable playing before the scene starts; changing policy cannot recover a scene a save already skipped.
 
 ## What a newcomer must not break
 

@@ -138,6 +138,7 @@ pub struct Sim {
     /// The closed door that stopped the last `walk`, if one did.
     pub walk_blocked_by: Option<ObjectId>,
     pub(crate) nav_grids: HashMap<String, Option<Arc<thedas_formats::level::NavGrid>>>,
+    pub(crate) changed_nav_grids: HashMap<ObjectId, Arc<thedas_formats::level::NavGrid>>,
     /// Conversations' line staging, read once (see [`crate::cutactors::LineCut`]).
     pub(crate) line_cuts: HashMap<String, Arc<Vec<crate::cutactors::LineCut>>>,
     /// Each layout's collision for sight lines (see `crate::collision`), loaded when first
@@ -620,6 +621,7 @@ impl Sim {
             install_root: None,
             area_layouts: HashMap::new(),
             nav_grids: HashMap::new(),
+            changed_nav_grids: HashMap::new(),
             line_cuts: HashMap::new(),
             collisions: HashMap::new(),
             placeable_collisions: HashMap::new(),
@@ -687,6 +689,7 @@ impl Sim {
     /// or a restore): object ids are reused across worlds.
     pub(crate) fn forget_world_caches(&mut self) {
         self.area_layouts.clear();
+        self.changed_nav_grids.clear();
         self.door_cells.clear();
         self.placeable_collisions.clear();
         self.door_collisions.clear();
@@ -1222,6 +1225,7 @@ impl Sim {
         self.advance_da2_projectiles();
         self.regenerate(elapsed);
         self.decay_corpses(elapsed);
+        self.advance_script_heartbeats(elapsed);
         self.update_threat(elapsed);
         self.expire_effects();
         self.update_aoes();
@@ -2471,7 +2475,8 @@ impl Sim {
 
     /// Re-arms a heartbeat after it fires, while the object still has one.
     fn next_heartbeat(&mut self, target: ObjectId, ty: i32) {
-        if ty != self.event_type("HEARTBEAT2") || ty == 0 {
+        if self.game == thedas_vfs::Game::Origins || ty != self.event_type("HEARTBEAT2") || ty == 0
+        {
             return;
         }
         let Some(ms) = self
