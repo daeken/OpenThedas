@@ -611,9 +611,41 @@ pub struct EffectTimeline {
     pub lasting: bool,
     pub impact: Option<EffectRate>,
     pub duration: Option<EffectRate>,
+    /// The emitter's nodes from the model's root (or its crust node) down to it, as
+    /// placed, which the animations' node tracks ([`EffectRate::nodes`]) turn and move.
+    pub chain: Vec<thedas_formats::level::Transform>,
+    /// What stands above the chain in the model (the body node the crust hangs from).
+    pub above: Mat4,
 }
 
 impl EffectTimeline {
+    /// The emitter's placement in the model `since_built` seconds after the scene was
+    /// built, its chain's nodes turned and moved by the playing animation's tracks (a
+    /// spinning dummy that whirls Blizzard's snow); `None` while no animation moves them,
+    /// when the emitter stays as placed. An instant effect holds its impact's end.
+    pub fn in_model_at(&self, since_built: f32) -> Option<Mat4> {
+        self.param(since_built, |r, t| {
+            if r.nodes.is_empty() {
+                return None;
+            }
+            let mut m = self.above;
+            for (k, node) in self.chain.iter().enumerate() {
+                let (rot, tr) = r
+                    .nodes
+                    .get(k)
+                    .map_or((None, None), |(a, b)| (a.as_ref(), b.as_ref()));
+                let rotation = rot
+                    .and_then(|r| crate::skeleton::sample_rotation(&r.keys, t))
+                    .unwrap_or_else(|| Quat::from_array(node.rotation).normalize());
+                let position = tr
+                    .and_then(|r| crate::skeleton::sample_translation(&r.keys, t))
+                    .unwrap_or(Vec3::from_array(node.position));
+                m *= Mat4::from_rotation_translation(rotation, position);
+            }
+            Some(m)
+        })
+    }
+
     /// How long an instant effect whose model has no impact animation plays, in seconds.
     pub const UNTIMED_FLASH: f32 = 2.0;
 
@@ -690,6 +722,44 @@ pub struct EffectRate {
     /// The `<emitter>_agemapscalexmultiplier` and `..y..` tracks.
     pub scale_x: Option<thedas_formats::anim::ScalarTrack>,
     pub scale_y: Option<thedas_formats::anim::ScalarTrack>,
+    /// Per node of the emitter's chain ([`EffectTimeline::chain`]), its rotation and
+    /// translation tracks (`<node>_rotation`, `<node>_translation`); empty when the
+    /// animation moves none of them.
+    pub nodes: Vec<NodeTracks>,
+}
+
+/// A node's rotation and translation tracks in an effect animation.
+pub type NodeTracks = (
+    Option<thedas_formats::anim::Track>,
+    Option<thedas_formats::anim::Track>,
+);
+
+/// The tracks of `a` that move the nodes of `chain` (see [`EffectRate::nodes`]).
+fn node_tracks(
+    a: &thedas_formats::anim::Animation,
+    chain: &[(&str, &thedas_formats::level::Transform)],
+) -> Vec<NodeTracks> {
+    use thedas_formats::anim::Channel;
+    let find = |name: &str, channel: Channel| {
+        a.tracks
+            .iter()
+            .find(|t| t.channel == channel && t.bone.eq_ignore_ascii_case(name))
+            .cloned()
+    };
+    let nodes: Vec<NodeTracks> = chain
+        .iter()
+        .map(|(name, _)| {
+            (
+                find(name, Channel::Rotation),
+                find(name, Channel::Translation),
+            )
+        })
+        .collect();
+    if nodes.iter().all(|(r, t)| r.is_none() && t.is_none()) {
+        Vec::new()
+    } else {
+        nodes
+    }
 }
 
 impl EffectRate {
@@ -2791,23 +2861,40 @@ impl<'a> Loader<'a> {
         };
         // Emitters with the crust node above them, and their transform below it (or from
         // the model root when there is none).
-        type Found<'a> = Vec<(&'a Emitter, Option<&'a str>, Option<&'a str>, Mat4)>;
-        fn walk<'a>(n: &'a Node, below: Mat4, hook: Option<&'a str>, out: &mut Found<'a>) {
-            let (below, hook) = if n.kind == KIND_CRUST {
-                (Mat4::IDENTITY, n.name.as_deref().or(hook))
+        // Each emitter also keeps the nodes from there down to it, which the effect's
+        // animations may turn and move.
+        type Chain<'a> = Vec<(&'a str, &'a thedas_formats::level::Transform)>;
+        type Found<'a> = Vec<(
+            &'a Emitter,
+            Option<&'a str>,
+            Option<&'a str>,
+            Mat4,
+            Chain<'a>,
+        )>;
+        fn walk<'a>(
+            n: &'a Node,
+            below: Mat4,
+            chain: &Chain<'a>,
+            hook: Option<&'a str>,
+            out: &mut Found<'a>,
+        ) {
+            let (below, hook, chain) = if n.kind == KIND_CRUST {
+                (Mat4::IDENTITY, n.name.as_deref().or(hook), Vec::new())
             } else {
-                (below * transform_matrix(&n.transform), hook)
+                let mut c = chain.clone();
+                c.push((n.name.as_deref().unwrap_or(""), &n.transform));
+                (below * transform_matrix(&n.transform), hook, c)
             };
             if let Some(e) = &n.emitter {
-                out.push((e, n.name.as_deref(), hook, below));
+                out.push((e, n.name.as_deref(), hook, below, chain.clone()));
             }
             for c in &n.children {
-                walk(c, below, hook, out);
+                walk(c, below, &chain, hook, out);
             }
         }
         let mut found = Vec::new();
         for n in &model.nodes {
-            walk(n, Mat4::IDENTITY, None, &mut found);
+            walk(n, Mat4::IDENTITY, &Vec::new(), None, &mut found);
         }
         let mut animation = |suffix: &str| {
             self.read(&format!("{effect}.{suffix}.ani"))
@@ -2816,7 +2903,7 @@ impl<'a> Loader<'a> {
         };
         let (impact, looping) = (animation("impa"), animation("dura"));
         let mut out = Vec::new();
-        for (k, (e, name, hook, below)) in found.into_iter().enumerate() {
+        for (k, (e, name, hook, below, chain)) in found.into_iter().enumerate() {
             let (in_model, follows) = match hook {
                 // An effect played at a place has no body to hang from: its emitters stand
                 // where it was played, from the model's root.
@@ -2860,6 +2947,7 @@ impl<'a> Loader<'a> {
                         .cloned(),
                     scale_x: track("agemapscalexmultiplier"),
                     scale_y: track("agemapscaleymultiplier"),
+                    nodes: node_tracks(a, &chain),
                 })
             };
             let rate = Some(EffectTimeline {
@@ -2867,6 +2955,8 @@ impl<'a> Loader<'a> {
                 lasting: instance.lasting,
                 impact: rate_in(&impact),
                 duration: rate_in(&looping),
+                chain: chain.iter().map(|(_, t)| **t).collect(),
+                above: in_model * below.inverse(),
             });
             if let Some(emitter) =
                 self.push_emitter(effect, e, name, prop.transform * in_model, &[], false)
@@ -3824,6 +3914,69 @@ mod tests {
     }
 
     #[test]
+    fn an_effects_node_tracks_turn_its_emitters() {
+        use thedas_formats::anim::{Channel, Key, Track};
+        use thedas_formats::level::Transform;
+        let quarter = glam::Quat::from_rotation_z(std::f32::consts::FRAC_PI_2);
+        let spin = EffectRate {
+            length: 1.0,
+            birthrate: None,
+            range: None,
+            color: None,
+            scale_x: None,
+            scale_y: None,
+            // The dummy turns a quarter round over the second; the emitter below it stays.
+            nodes: vec![
+                (
+                    Some(Track {
+                        bone: "newdummy".into(),
+                        channel: Channel::Rotation,
+                        keys: vec![
+                            Key {
+                                time: 0.0,
+                                value: [0.0, 0.0, 0.0, 1.0],
+                            },
+                            Key {
+                                time: 1.0,
+                                value: quarter.to_array(),
+                            },
+                        ],
+                    }),
+                    None,
+                ),
+                (None, None),
+            ],
+        };
+        let t = EffectTimeline {
+            age: 0.0,
+            lasting: true,
+            impact: None,
+            duration: Some(spin),
+            chain: vec![
+                Transform {
+                    position: [0.0, 0.0, 1.0],
+                    rotation: [0.0, 0.0, 0.0, 1.0],
+                },
+                Transform {
+                    position: [2.0, 0.0, 0.0],
+                    rotation: [0.0, 0.0, 0.0, 1.0],
+                },
+            ],
+            above: Mat4::IDENTITY,
+        };
+        let at = |s: f32| t.in_model_at(s).unwrap().transform_point3(Vec3::ZERO);
+        assert!(at(0.0).distance(Vec3::new(2.0, 0.0, 1.0)) < 1e-5);
+        // A quarter turn about Z carries the emitter from +X to +Y.
+        assert!(at(0.999).distance(Vec3::new(0.0, 2.0, 1.0)) < 1e-2);
+        // An animation moving none of its nodes leaves it as placed.
+        let still = EffectTimeline {
+            duration: None,
+            ..t.clone()
+        };
+        assert_eq!(still.in_model_at(0.5), None);
+    }
+
+    #[test]
     fn an_effects_colour_multiplier_follows_its_animations() {
         use thedas_formats::anim::ColorTrack;
         let fade_in = EffectRate {
@@ -3832,6 +3985,7 @@ mod tests {
             range: None,
             scale_x: None,
             scale_y: None,
+            nodes: Vec::new(),
             color: Some(ColorTrack {
                 target: "glow_agemapcolormultiplier".into(),
                 keys: vec![(0.0, [1.0, 1.0, 1.0, 0.0]), (1.0, [1.0, 1.0, 1.0, 1.0])],
@@ -3840,6 +3994,8 @@ mod tests {
         let instant = EffectTimeline {
             age: 0.0,
             lasting: false,
+            chain: Vec::new(),
+            above: Mat4::IDENTITY,
             impact: Some(fade_in.clone()),
             duration: None,
         };
@@ -3871,6 +4027,7 @@ mod tests {
             range: None,
             scale_x: None,
             scale_y: None,
+            nodes: Vec::new(),
             color: None,
         };
         assert_eq!(r.at(1.0), Some((7.5, 0.0)));
@@ -3883,6 +4040,7 @@ mod tests {
             range: None,
             scale_x: None,
             scale_y: None,
+            nodes: Vec::new(),
             color: None,
         };
         assert_eq!(own.at(1.0), None);
@@ -3891,6 +4049,8 @@ mod tests {
         let lasting = EffectTimeline {
             age: 0.5,
             lasting: true,
+            chain: Vec::new(),
+            above: Mat4::IDENTITY,
             impact: Some(r.clone()),
             duration: Some(EffectRate {
                 length: 1.0,
@@ -3901,6 +4061,7 @@ mod tests {
                 range: None,
                 scale_x: None,
                 scale_y: None,
+                nodes: Vec::new(),
                 color: None,
             }),
         };
@@ -3911,6 +4072,8 @@ mod tests {
         let flash = EffectTimeline {
             age: 0.0,
             lasting: false,
+            chain: Vec::new(),
+            above: Mat4::IDENTITY,
             impact: Some(own),
             duration: None,
         };
