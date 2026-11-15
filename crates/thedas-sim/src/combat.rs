@@ -2396,9 +2396,10 @@ pub fn attack_tree(combat_tree: &str, main: &str, main_slots: i64, off: &str) ->
 impl Sim {
     /// `GetWeaponStyle`: `WEAPONSTYLE_NONE` without a main-hand weapon; with a melee one,
     /// `DUAL` beside an off-hand melee weapon, `TWOHANDED` for one that fits only the main
-    /// hand, else `SINGLE`; ranged weapons and wands `SINGLE`. Provisional: the executable
-    /// keeps the style in the creature's combat state (0x6a3c30); how it sets it is not
-    /// traced, so it is read from the weapons as [`attack_tree`] reads them.
+    /// hand, else `SINGLE`; ranged weapons and wands `SINGLE`. Origins' getter (0x6a3c30)
+    /// reads combat-state +0x5c. Its traced melee gear selector (0x7c3500) chooses OW/WS,
+    /// DW or TW, which 0x7c3600 maps to SINGLE, DUAL or TWOHANDED. We derive that choice
+    /// on query, as [`attack_tree`] does. Other weapon/appearance cases remain provisional.
     pub fn weapon_style(&self, id: ObjectId) -> i32 {
         if self.game == thedas_vfs::Game::DragonAge2 {
             return self.da2_combat_style(id);
