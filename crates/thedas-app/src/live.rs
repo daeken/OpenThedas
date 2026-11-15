@@ -311,6 +311,9 @@ pub struct Live {
     /// stage clock when it last stepped.
     stage_blend: Option<(thedas_render::Camera, f64, f64)>,
     stage_clock_ms: f64,
+    stage_pose: (f32, f32, u64),
+    stage_drag_seen: u64,
+    stage_pivot: glam::Vec3,
     /// The playing cutscene's movies (see [`crate::intro::CutsceneMovies`]).
     cutscene_movies: crate::intro::CutsceneMovies,
     /// Whether a cutscene's movie waits for its decoder (a capture, whose frames must show
@@ -771,6 +774,9 @@ impl Live {
             stage_shown: None,
             stage_blend: None,
             stage_clock_ms: 0.0,
+            stage_pose: (0.0, 0.0, 0),
+            stage_drag_seen: 0,
+            stage_pivot: glam::Vec3::ZERO,
             cutscene_movies: Default::default(),
             movies_wait: false,
             format: None,
@@ -1478,6 +1484,11 @@ impl Live {
         view
     }
 
+    /// Presentation-only paperdoll input; the simulation's creature is unchanged.
+    pub fn set_chargen_pose(&mut self, pose: (f32, f32, u64)) {
+        self.stage_pose = pose;
+    }
+
     /// The camera character creation's stage is seen through, while it is up (see
     /// [`crate::chargen_stage::camera`]): camera preset `preset` framing the creature at
     /// its mark. `base` gives the clip planes. `None` leaves the game camera as it is.
@@ -1491,6 +1502,8 @@ impl Live {
             Some((p, c)) if p == preset => c,
             _ => {
                 let head = self.head_now(id);
+                self.stage_pivot =
+                    head.unwrap_or(glam::Vec3::from_array(mark) + glam::Vec3::Z * 1.6);
                 let c =
                     crate::chargen_stage::camera(preset, glam::Vec3::from_array(mark), head, base);
                 // Kept only once the creature is drawn (its head found).
@@ -1500,6 +1513,12 @@ impl Live {
                 c
             }
         };
+        // A drag completes an active preset move before applying its input (0x7b2442).
+        if self.stage_drag_seen != self.stage_pose.2 {
+            self.stage_drag_seen = self.stage_pose.2;
+            self.stage_blend = None;
+            self.stage_shown = Some((preset, target));
+        }
         // A new preset is moved to from where the camera was, as the exe blends (see
         // `crate::chargen_stage::BLEND_MS`).
         if let Some((p, shown)) = self.stage_shown
@@ -1519,7 +1538,11 @@ impl Live {
             None => target,
         };
         self.stage_shown = Some((preset, c));
-        Some(c)
+        Some(if preset == 1 {
+            crate::chargen_stage::tilt(&c, self.stage_pivot, self.stage_pose.1)
+        } else {
+            c
+        })
     }
 
     /// How far drawn creature `id`'s head bone stands above its feet, at rest: what
@@ -1823,7 +1846,9 @@ impl Live {
             level.area_id = area_id;
         }
         let mut models = match &staged {
-            Some((id, stage)) => stage_models(&sim, *id, stage, &mut self.models),
+            Some((id, stage)) => {
+                stage_models(&sim, *id, stage, self.stage_pose.0, &mut self.models)
+            }
             None => {
                 let mut m = thedas_ui::models::area_models_cached(&sim, area, &mut self.models);
                 m.extend(thedas_ui::models::location_vfx_models(&sim, area));
@@ -3564,6 +3589,7 @@ fn stage_models(
     sim: &Sim,
     id: ObjectId,
     stage: &crate::chargen_stage::Stage,
+    yaw: f32,
     cache: &mut ModelCache,
 ) -> Vec<ObjectModel> {
     let Some(o) = sim.world.get(id) else {
@@ -3578,7 +3604,8 @@ fn stage_models(
         return Vec::new();
     };
     m.position = stage.mark;
-    m.facing = stage.facing;
+    // The exe composes a rotation by the negative drag argument onto the creature.
+    m.facing = stage.facing - yaw.to_degrees();
     vec![m]
 }
 

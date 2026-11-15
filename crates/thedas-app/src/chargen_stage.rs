@@ -131,6 +131,18 @@ fn orientation() -> Quat {
         * Quat::from_rotation_x(PITCH_DEGREES.to_radians())
 }
 
+/// The face camera orbits the cached head position about its right axis (0x7b2595).
+/// The input layer has already clamped the absolute pitch to -60..10 degrees.
+pub fn tilt(at: &Camera, pivot: Vec3, degrees: f32) -> Camera {
+    let right = at.forward().cross(Vec3::Z).normalize();
+    let q = Quat::from_axis_angle(right, degrees.to_radians());
+    Camera {
+        position: pivot + q * (at.position - pivot),
+        pitch: at.pitch + degrees.to_radians(),
+        ..*at
+    }
+}
+
 /// The stage camera for camera preset `preset` (0x7b38a0 in stage mode, under
 /// `GameModeCharGen`), for a creature standing at `feet` whose head bone is at `head`;
 /// `base` gives the clip planes. The camera looks along its +Y, turned by [`orientation`];
@@ -204,6 +216,22 @@ pub fn camera(preset: i32, feet: Vec3, head: Option<Vec3>, base: &Camera) -> Cam
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn face_tilt_keeps_the_head_pivot_and_orbit_radius() {
+        let head = Vec3::new(1.0, 2.0, 1.7);
+        let c = camera(
+            1,
+            Vec3::new(1.0, 2.0, 0.0),
+            Some(head),
+            &Camera::new(Vec3::ZERO, 0.0, 0.0),
+        );
+        let tilted = tilt(&c, head, 20.0);
+        assert!((tilted.position.distance(head) - c.position.distance(head)).abs() < 1e-6);
+        assert!((tilted.pitch.to_degrees() - 10.0).abs() < 1e-4);
+        assert!(tilted.position.z < c.position.z);
+        assert_eq!(tilt(&c, head, 0.0), c);
+    }
 
     #[test]
     fn a_preset_change_blends_the_short_way_round() {
