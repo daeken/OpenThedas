@@ -1,0 +1,19 @@
+[package]
+name = "thedas-bake"
+description = "Our own lightmap baker, built to match the lightmaps Dragon Age: Origins ships"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+thedas-vfs.workspace = true
+thedas-formats.workspace = true
+thedas-render.workspace = true
+glam.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+png.workspace = true
+log.workspace = true
+env_logger.workspace = true
