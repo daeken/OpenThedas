@@ -3005,6 +3005,7 @@ pub fn call(
                 target: None,
                 location: None,
                 seconds: 0.0,
+                max_range: None,
                 ints: Vec::new(),
                 strings: Vec::new(),
                 due: None,
@@ -3019,9 +3020,8 @@ pub fn call(
                 da2_target_prepared: false,
                 path: Vec::new(),
             };
-            // Only the first float is kept (a wait's seconds, a move's minimum range): a
-            // later one (CommandMoveToObject's fMaxRange) used to land there when the first
-            // was 0.
+            // The first float is a wait's seconds or a move's minimum range. Keep
+            // MoveToObject's second float as its maximum (0x66f260, clamp at 0x66f312).
             let mut first_float = true;
             for (p, v) in f.params.iter().zip(a) {
                 match (&p.ty, v) {
@@ -3029,6 +3029,9 @@ pub fn call(
                     (Type::Float, Value::Float(x)) if first_float => {
                         first_float = false;
                         c.seconds = *x;
+                    }
+                    (Type::Float, Value::Float(x)) if n == "CommandMoveToObject" => {
+                        c.max_range = Some(x.max(c.seconds));
                     }
                     (Type::Int, Value::Int(x)) => c.ints.push(*x),
                     (Type::String | Type::Resource, Value::String(s) | Value::Resource(s)) => {
@@ -3080,7 +3083,9 @@ pub fn call(
             })
         }
         "SetCommandFloat" => {
-            // Provisional: float 0 is the command's time (`seconds`); others are dropped.
+            // 0x66ee60 writes the indexed native float directly. MoveToObject's
+            // builder stores maximum in slot 0 and minimum in slot 1 (0x66f39a).
+            // Other command layouts remain provisional.
             let mut c = match h.sim.world.handle(handle(a, 0)) {
                 Some(EngineData::Command(c)) => c.clone(),
                 _ => {
@@ -3090,7 +3095,14 @@ pub fn call(
                     });
                 }
             };
-            if int(a, 2) == 0 {
+            let index = int(a, 2);
+            if c.name == "CommandMoveToObject" {
+                match index {
+                    0 => c.max_range = Some(float(a, 1)),
+                    1 => c.seconds = float(a, 1),
+                    _ => {}
+                }
+            } else if index == 0 {
                 c.seconds = float(a, 1);
             }
             let hd = h.sim.world.store(EngineData::Command(c));
@@ -3121,9 +3133,19 @@ pub fn call(
                         .and_then(|c| c.ints.get(usize::try_from(i).ok()?).copied())
                         .unwrap_or(0),
                 ),
-                "GetCommandFloat" => {
-                    Value::Float(c.as_ref().filter(|_| i == 0).map_or(0.0, |c| c.seconds))
-                }
+                "GetCommandFloat" => Value::Float(c.as_ref().map_or(0.0, |c| {
+                    if c.name == "CommandMoveToObject" {
+                        match i {
+                            0 => c.max_range.unwrap_or(c.seconds),
+                            1 => c.seconds,
+                            _ => 0.0,
+                        }
+                    } else if i == 0 {
+                        c.seconds
+                    } else {
+                        0.0
+                    }
+                })),
                 _ => Value::Object(
                     c.as_ref()
                         .filter(|_| i == 0)
@@ -8312,6 +8334,110 @@ mod tests {
     }
 
     #[test]
+    fn move_to_object_builder_keeps_both_ranges_and_old_saves_keep_the_minimum() {
+        let table = Arc::new(EngineTable::parse(b"#define ENGINE_STRUCTURE_2 command\n\
+            command CommandMoveToObject(object o, int r, float min, int original, float max) = 560;\n\
+            float GetCommandFloat(command c, int i = 0) = 546;\n\
+            command SetCommandFloat(command c, float v, int i = 0) = 547;\n").unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        for (min, max, want) in [(0.0, 4.0, 4.0), (3.0, 1.0, 3.0), (2.0, 5.0, 5.0)] {
+            let value = run(
+                &mut s,
+                OBJECT_INVALID,
+                "CommandMoveToObject",
+                &[
+                    Value::Object(9),
+                    Value::Int(1),
+                    Value::Float(min),
+                    Value::Int(0),
+                    Value::Float(max),
+                ],
+            )
+            .unwrap();
+            let Value::Engine { handle, .. } = value else {
+                panic!("command")
+            };
+            let Some(EngineData::Command(c)) = s.world.handle(handle) else {
+                panic!("command data")
+            };
+            assert_eq!((c.seconds, c.max_range), (min, Some(want)));
+            let mut json = serde_json::to_value(c).unwrap();
+            let restored: Command = serde_json::from_value(json.clone()).unwrap();
+            assert_eq!(&restored, c);
+            json.as_object_mut().unwrap().remove("max_range");
+            let old: Command = serde_json::from_value(json).unwrap();
+            assert_eq!((old.seconds, old.max_range), (min, None));
+            let value = Value::Engine {
+                ty: s.types.command,
+                handle,
+            };
+            assert_eq!(
+                run(
+                    &mut s,
+                    0,
+                    "GetCommandFloat",
+                    &[value.clone(), Value::Int(0)]
+                ),
+                Some(Value::Float(want))
+            );
+            assert_eq!(
+                run(
+                    &mut s,
+                    0,
+                    "GetCommandFloat",
+                    &[value.clone(), Value::Int(1)]
+                ),
+                Some(Value::Float(min))
+            );
+            let changed = run(
+                &mut s,
+                0,
+                "SetCommandFloat",
+                &[value, Value::Float(7.0), Value::Int(0)],
+            )
+            .unwrap();
+            assert_eq!(
+                run(
+                    &mut s,
+                    0,
+                    "GetCommandFloat",
+                    &[changed.clone(), Value::Int(0)]
+                ),
+                Some(Value::Float(7.0))
+            );
+            assert_eq!(
+                run(
+                    &mut s,
+                    0,
+                    "GetCommandFloat",
+                    &[changed.clone(), Value::Int(1)]
+                ),
+                Some(Value::Float(min))
+            );
+            let changed = run(
+                &mut s,
+                0,
+                "SetCommandFloat",
+                &[changed, Value::Float(6.0), Value::Int(1)],
+            )
+            .unwrap();
+            assert_eq!(
+                run(
+                    &mut s,
+                    0,
+                    "GetCommandFloat",
+                    &[changed.clone(), Value::Int(0)]
+                ),
+                Some(Value::Float(7.0))
+            );
+            assert_eq!(
+                run(&mut s, 0, "GetCommandFloat", &[changed, Value::Int(1)]),
+                Some(Value::Float(6.0))
+            );
+        }
+    }
+
+    #[test]
     fn origins_scripted_heartbeat_setters_require_a_creature() {
         let table = Arc::new(
             EngineTable::parse(
@@ -11229,6 +11355,7 @@ mod tests {
                 target: None,
                 location: None,
                 seconds: 0.0,
+                max_range: None,
                 ints: vec![],
                 strings: vec![],
                 due: Some(5000),

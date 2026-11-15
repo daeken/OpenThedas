@@ -672,7 +672,7 @@ struct Light {
     colour: vec4<f32>,
     // Bit per room index (256 rooms) the light reaches.
     rooms: array<vec4<u32>, 2>,
-    // x: its shadow map's slot (`deferred_shadow.rs`), −1 for none
+    // x: shadow slot (`deferred_shadow.rs`), −1 for none; y: domain; zw: atlas texel origin
     shadow: vec4<f32>,
 };
 
@@ -681,7 +681,7 @@ struct Light {
 // (16 KiB at most).
 @group(0) @binding(1) var<uniform> lights: array<Light, 192>;
 // Per shadow slot, its six faces' view-projections (`deferred_shadow::faces`).
-@group(0) @binding(2) var<uniform> shadow_faces: array<mat4x4<f32>, 24>;
+@group(0) @binding(2) var<uniform> shadow_faces: array<mat4x4<f32>, 96>;
 // 16 x 9 screen tiles, two vec4s each: six ascending 32-bit light masks plus padding.
 struct TileLights {
     screen: array<vec4<u32>, 288>,
@@ -779,7 +779,7 @@ fn sun_visibility(p: vec3<f32>, n: vec3<f32>, grazing_floor: bool) -> f32 {
 
 // How much of a point light at `lp` (shadow slot `slot`) reaches `p` (normal `n`): its
 // cube face by the major axis of the direction, a bilinear 2×2 comparison of distances.
-fn shadowed(slot: i32, lp: vec3<f32>, p: vec3<f32>, n: vec3<f32>) -> f32 {
+fn shadowed(slot: i32, origin: vec2<i32>, lp: vec3<f32>, p: vec3<f32>, n: vec3<f32>) -> f32 {
     let v = p + n * 0.04 - lp;
     let a = abs(v);
     // Inside the cube's near planes there is no caster. In particular, do not divide
@@ -798,7 +798,9 @@ fn shadowed(slot: i32, lp: vec3<f32>, p: vec3<f32>, n: vec3<f32>) -> f32 {
     let layer = slot * 6 + face;
     let c = shadow_faces[layer] * vec4<f32>(lp + v, 1.0);
     let ndc = c.xy / c.w;
-    let size = vec2<f32>(textureDimensions(shadow_maps));
+    // Each of the six array layers is a sheet of 512-square light tiles. Clamp PCF
+    // coordinates inside this tile before adding its origin, including at cube seams.
+    let size = vec2<f32>(512.0);
     let at = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5) * size - 0.5;
     let base = vec2<i32>(floor(at));
     let f = at - floor(at);
@@ -807,7 +809,7 @@ fn shadowed(slot: i32, lp: vec3<f32>, p: vec3<f32>, n: vec3<f32>) -> f32 {
     var s: array<f32, 4>;
     for (var k = 0; k < 4; k = k + 1) {
         let t = clamp(base + vec2<i32>(k % 2, k / 2), vec2<i32>(0), hi);
-        s[k] = select(0.0, 1.0, dist <= textureLoad(shadow_maps, t, layer, 0).x);
+        s[k] = select(0.0, 1.0, dist <= textureLoad(shadow_maps, origin + t, face, 0).x);
     }
     return mix(mix(s[0], s[1], f.x), mix(s[2], s[3], f.x), f.y);
 }
@@ -1065,7 +1067,7 @@ fn light_surface(frag: vec4<f32>, p: vec3<f32>, ga: vec4<f32>, spec: vec4<f32>,
         let att = c * c;
         var shade = 1.0;
         if (light_shadow.x >= 0.0) {
-            shade = shadowed(i32(light_shadow.x + 0.5), position.xyz, p, n);
+            shade = shadowed(i32(light_shadow.x + 0.5), vec2<i32>(light_shadow.zw), position.xyz, p, n);
             if (view == 10u) {
                 return vec4<f32>(shade, att, 0.0, 1.0);
             }
