@@ -179,8 +179,13 @@ falloff × |cos| × visibility, and occlusion ray hit distances, then fits.
 - **Shadows are hard.** Sampling point lights as spheres (`--light-size`) makes the fit worse
   at every size tried (0.25–1).
 - Whole level, each atlas fitted then baked (Cousland, 88 atlases, 19.2M texels): mean error
-  RGB 9.4 / 8.2 / 8.8, alpha 15.2 levels (RMSE 17 / 15 / 16 and 42); 35% of texels within 4
+  RGB 9.4 / 8.2 / 8.8, alpha 15.0 levels (RMSE 17 / 15 / 16 and 42); 35% of texels within 4
   levels on every channel. Alpha is the weakest part (window and fake-sun fills).
+- **Exteriors** (Lake Calenhad `lak100d`, 71 terrain/LOD atlases, 26.3M texels): mean error RGB
+  4.0 / 4.1 / 3.8, alpha 8.3 levels; 70% of texels within 4 levels on every channel. The sun
+  is in the shadow pass only (its fitted RGB brightness is ≈ 0, as the editor routing says);
+  the baked ambient is a dim green, about (0.06, 0.09, 0.06); water surfaces are not part of
+  the bake scene (terrain under the lake is sunlit in the shipped alpha).
 - With all of the above and the fitted lights, room1400's 876k texels differ by a mean of
   7.4–9.5 levels in RGB and 6.9 in alpha (RMSE 14–17 and 26.5); 47% are within 4 levels on
   every channel. First light was ~14 and ~13.
