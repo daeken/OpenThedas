@@ -1248,6 +1248,13 @@ impl AreaRenderer {
         }
     }
 
+    /// Diagnostic override for sun-shadow samples whose result is already known.
+    pub fn set_deferred_sun_early_exit(&mut self, enabled: Option<bool>) {
+        if let Some(d) = &mut self.deferred {
+            d.set_sun_early_exit(enabled);
+        }
+    }
+
     /// Diagnostic override for room/domain light-mask intersection.
     pub fn set_deferred_light_masks(&mut self, enabled: Option<bool>) {
         if let Some(d) = &mut self.deferred {

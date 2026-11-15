@@ -709,6 +709,11 @@ fn sun_visibility(p: vec3<f32>, n: vec3<f32>, grazing_floor: bool) -> f32 {
     if (sun.enabled.x == 0u || sun.direction.w < 0.5) {
         return 1.0;
     }
+    // The final grazing floor clamps to one on back faces, regardless of either
+    // shadow map. Preserve the original path as a diagnostic comparison.
+    if (sun.enabled.y != 0u && grazing_floor && dot(n, -sun.direction.xyz) <= 0.0) {
+        return 1.0;
+    }
     let q = vec4<f32>(p, 1.0);
     let sd = sun.data;
     let plane = dot(sd[8], q);
@@ -722,6 +727,10 @@ fn sun_visibility(p: vec3<f32>, n: vec3<f32>, grazing_floor: bool) -> f32 {
         let t = vec3<f32>(dot(sd[0], q), dot(sd[1], q), dot(sd[2], q)) / dot(sd[3], q);
         if (all(t.xy >= vec2<f32>(0.0)) && all(t.xy <= vec2<f32>(1.0))) {
             let centre = sun_sample(t.xy, true);
+            // A lit centre selects one independently of the four green taps.
+            if (sun.enabled.y != 0u && t.z <= centre.x) {
+                return 1.0;
+            }
             var green = centre.y;
             for (var k = 0u; k < 4u; k = k + 1u) {
                 green += sun_sample(t.xy + offsets[k], true).y;
