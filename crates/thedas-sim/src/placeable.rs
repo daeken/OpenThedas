@@ -228,16 +228,9 @@ impl Sim {
             .unwrap()
             .placeable_fade_at
             .get_or_insert(now);
-        // 0x696a60 makes the first request authoritative, including a request
-        // already made by another subsystem. The existing deadline is saved.
-        if !self
-            .world
-            .destroy_at
-            .iter()
-            .any(|&(_, object)| object == id)
-        {
-            self.world.queue_destroy(3000, id);
-        }
+        // 0x696a60 latches the first native request. Delivery rechecks the
+        // independent IsDestroyable flag; a blocked delivery never retries.
+        self.world.request_origins_destroy(3000, id);
     }
 
     pub(crate) fn set_placeable_health(&mut self, id: ObjectId, current: i32) {
@@ -442,14 +435,14 @@ mod tests {
         let (mut s, id) = playback_fixture();
         s.set_placeable_health(id, 0);
         s.tick(100);
-        assert!(s.world.destroy_at.is_empty());
+        assert!(s.world.origins_destroy_at.is_empty());
         start(&mut s, id, "dying", 0.2);
         s.world.get_mut(id).unwrap().active = false; // Opacity and playback are independent.
         s.tick(100);
         s.tick(100);
-        assert!(s.world.destroy_at.is_empty()); // Two truncated half-steps reach 65534.
+        assert!(s.world.origins_destroy_at.is_empty()); // Two truncated half-steps reach 65534.
         s.tick(1);
-        assert_eq!(s.world.destroy_at, vec![(3301, id)]);
+        assert_eq!(s.world.origins_destroy_at, vec![(3301, id)]);
         assert_eq!(s.world.get(id).unwrap().placeable_fade_at, Some(301));
         assert!(
             !s.world
@@ -463,13 +456,68 @@ mod tests {
         // A second callback neither restarts fading nor replaces the deletion time.
         s.tick(50);
         s.placeable_animation_complete(id);
-        assert_eq!(s.world.destroy_at, vec![(3301, id)]);
+        assert_eq!(s.world.origins_destroy_at, vec![(3301, id)]);
         assert_eq!(s.world.get(id).unwrap().placeable_fade_at, Some(301));
         let json = s.save_json().unwrap();
         s.load_json(&json).unwrap();
         s.tick(2949);
         assert!(s.world.get(id).is_some());
         s.tick(1);
+        assert!(s.world.get(id).is_none());
+    }
+
+    #[test]
+    fn placeable_removal_checks_the_delivery_flag_and_keeps_a_blocked_latch() {
+        for (requested_flag, delivered_flag) in [(0, 1), (1, 0)] {
+            let (mut s, id) = playback_fixture();
+            s.set_placeable_health(id, 0);
+            s.world
+                .get_mut(id)
+                .unwrap()
+                .fields
+                .insert("IsDestroyable".into(), requested_flag);
+            s.placeable_animation_complete(id);
+            assert_eq!(s.world.origins_destroy_at, vec![(3000, id)]);
+            assert!(s.world.get(id).unwrap().origins_destroy_requested);
+            s.world
+                .get_mut(id)
+                .unwrap()
+                .fields
+                .insert("IsDestroyable".into(), delivered_flag);
+            let save = s.save_json().unwrap();
+            s.load_json(&save).unwrap();
+            s.tick(3000);
+            assert_eq!(s.world.get(id).is_some(), delivered_flag == 0);
+            assert!(s.world.origins_destroy_at.is_empty());
+            if delivered_flag == 0 {
+                s.world
+                    .get_mut(id)
+                    .unwrap()
+                    .fields
+                    .insert("IsDestroyable".into(), 1);
+                let save = s.save_json().unwrap();
+                s.load_json(&save).unwrap();
+                assert!(s.world.get(id).unwrap().origins_destroy_requested);
+                s.placeable_animation_complete(id);
+                assert!(s.world.origins_destroy_at.is_empty());
+                s.tick(3000);
+                assert!(s.world.get(id).is_some(), "a consumed request cannot retry");
+            }
+        }
+    }
+
+    #[test]
+    fn forced_lifetimes_remain_independent_of_native_removal_requests() {
+        let (mut s, id) = playback_fixture();
+        s.set_placeable_health(id, 0);
+        s.world
+            .get_mut(id)
+            .unwrap()
+            .fields
+            .insert("IsDestroyable".into(), 0);
+        s.placeable_animation_complete(id);
+        s.world.queue_destroy(0, id);
+        s.world.destroy_due();
         assert!(s.world.get(id).is_none());
     }
 
@@ -481,13 +529,13 @@ mod tests {
             start(&mut s, id, "dying", 1.0);
             s.world.get_mut(id).unwrap().appearance = appearance;
             s.set_placeable_health(id, health);
-            s.world.queue_destroy(7000, id);
+            s.world.request_origins_destroy(7000, id);
             s.tick(1000);
             assert_eq!(
                 s.world.get(id).unwrap().placeable_fade_at.is_some(),
                 destroy
             );
-            assert_eq!(s.world.destroy_at, vec![(7000, id)]);
+            assert_eq!(s.world.origins_destroy_at, vec![(7000, id)]);
         }
     }
 
@@ -522,7 +570,7 @@ mod tests {
             .pending = false;
         s.tick(100);
         s.tick(1);
-        assert_eq!(s.world.destroy_at, vec![(3201, id)]);
+        assert_eq!(s.world.origins_destroy_at, vec![(3201, id)]);
         start(&mut s, id, "new", 0.5); // Same node resets rather than duplicates.
         assert_eq!(
             s.world
@@ -536,7 +584,7 @@ mod tests {
             1
         );
         s.tick(500);
-        assert_eq!(s.world.destroy_at, vec![(3201, id)]);
+        assert_eq!(s.world.origins_destroy_at, vec![(3201, id)]);
     }
 
     #[test]
@@ -633,7 +681,7 @@ mod tests {
                 .pending
         );
         s.tick(1000);
-        assert_eq!(s.world.destroy_at, vec![(4000, id)]);
+        assert_eq!(s.world.origins_destroy_at, vec![(4000, id)]);
     }
 
     #[test]
@@ -642,7 +690,7 @@ mod tests {
         s.set_placeable_health(id, 0);
         start(&mut s, id, "dying", 1.0);
         s.tick(2000); // Increment 131070 contributes its low unsigned short 65534.
-        assert!(s.world.destroy_at.is_empty());
+        assert!(s.world.origins_destroy_at.is_empty());
         assert_eq!(
             s.world
                 .get(id)
@@ -655,20 +703,20 @@ mod tests {
             65534
         );
         s.tick(1);
-        assert_eq!(s.world.destroy_at, vec![(5001, id)]);
+        assert_eq!(s.world.origins_destroy_at, vec![(5001, id)]);
         let (mut s, id) = playback_fixture();
         s.set_placeable_health(id, 0);
         start(&mut s, id, "dying", 1.0);
         s.game = thedas_vfs::Game::DragonAge2;
         s.tick(1000);
-        assert!(s.world.destroy_at.is_empty());
+        assert!(s.world.origins_destroy_at.is_empty());
         s.game = thedas_vfs::Game::Origins;
         // Refresh clocks on parked ticks so their suspended time is not caught up.
         s.world.get_mut(id).unwrap().parked = Some(false);
         s.tick(1000);
         s.world.get_mut(id).unwrap().parked = None;
         s.tick(1000);
-        assert_eq!(s.world.destroy_at, vec![(6000, id)]);
+        assert_eq!(s.world.origins_destroy_at, vec![(6000, id)]);
     }
 
     #[test]
@@ -690,7 +738,7 @@ mod tests {
         o.appearance = 227;
         o.fields.insert("Health".into(), 1);
         s.set_placeable_health(id, 0);
-        assert!(s.world.destroy_at.is_empty());
+        assert!(s.world.origins_destroy_at.is_empty());
         s.set_placeable_state(id, 1);
         let playback = s
             .world
@@ -707,12 +755,15 @@ mod tests {
         let json = s.save_json().unwrap();
         s.load_json(&json).unwrap();
         for _ in 0..300 {
-            if !s.world.destroy_at.is_empty() {
+            if !s.world.origins_destroy_at.is_empty() {
                 break;
             }
             s.tick(10);
         }
-        assert_eq!(s.world.destroy_at, vec![(s.world.time_ms + 3000, id)]);
+        assert_eq!(
+            s.world.origins_destroy_at,
+            vec![(s.world.time_ms + 3000, id)]
+        );
         assert!((5860..5900).contains(&s.world.time_ms));
         // Ordinary doors/chests do not opt into removal, retaining their contents.
         for appearance in [1, 5] {
@@ -829,7 +880,7 @@ mod tests {
             assert_eq!(s.nav_grid(area).unwrap().data[index], 8);
             assert_eq!(s.nav_grid(untouched).unwrap().data, base.data);
             assert_eq!(s.world.get(id).unwrap().placeable_group, Some(1));
-            assert!(s.world.destroy_at.is_empty()); // Health alone never starts removal.
+            assert!(s.world.origins_destroy_at.is_empty()); // Health alone never starts removal.
             s.world.nav_patches.clear();
             s.changed_nav_grids.clear();
             // Table lookup truncates appearance, but the PWK loader formats the

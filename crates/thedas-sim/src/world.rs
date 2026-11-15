@@ -145,6 +145,9 @@ pub struct Object {
     /// Time the completion callback targeted opacity zero. Active is independent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub placeable_fade_at: Option<u64>,
+    /// Native +0x2bd remains set even when message 11 cannot delete the object.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub origins_destroy_requested: bool,
     pub locals: Locals,
     /// The script that receives this object's events.
     pub script: Option<String>,
@@ -274,6 +277,7 @@ impl Object {
             placeable_group: None,
             placeable_playback: None,
             placeable_fade_at: None,
+            origins_destroy_requested: false,
             active: true,
             locals: Locals::default(),
             script: None,
@@ -845,6 +849,9 @@ pub struct World {
     /// Objects to remove at a time (projectiles when they land).
     #[serde(default)]
     pub destroy_at: Vec<(u64, ObjectId)>,
+    /// Native guarded deletion messages; forced lifetimes retain their own queue.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub origins_destroy_at: Vec<(u64, ObjectId)>,
     /// `SetLoadHint`: the hint (row, M2DA table) the next area transition's loading screen
     /// shows; taken by that transition into [`World::transition_hint`].
     #[serde(default)]
@@ -1073,6 +1080,7 @@ impl World {
             autopilot: false,
             pool_xp: false,
             destroy_at: Vec::new(),
+            origins_destroy_at: Vec::new(),
             corpse_decay_max_ms: crate::decay::DEFAULT_MAX_MS,
             load_hint: None,
             death_hint: None,
@@ -1260,9 +1268,36 @@ impl World {
         self.destroy_at.push((self.time_ms + delay_ms, id));
     }
 
+    /// The first native request is authoritative, including after blocked delivery.
+    pub(crate) fn request_origins_destroy(&mut self, delay_ms: u64, id: ObjectId) {
+        let Some(object) = self.get_mut(id) else {
+            return;
+        };
+        if object.origins_destroy_requested {
+            return;
+        }
+        object.origins_destroy_requested = true;
+        self.origins_destroy_at.push((self.time_ms + delay_ms, id));
+    }
+
     /// Removes the objects whose time is up.
     pub fn destroy_due(&mut self) {
         let now = self.time_ms;
+        let (due, keep): (Vec<_>, Vec<_>) = self
+            .origins_destroy_at
+            .drain(..)
+            .partition(|(t, _)| *t <= now);
+        self.origins_destroy_at = keep;
+        for (_, id) in due {
+            // Message 11 checks the current byte, then consumes the message
+            // without clearing the request latch (0x698b41..0x698b65).
+            if self
+                .get(id)
+                .is_some_and(|o| o.fields.get("IsDestroyable").copied().unwrap_or(1) != 0)
+            {
+                self.queue_destroy(0, id);
+            }
+        }
         let (due, keep): (Vec<_>, Vec<_>) = self.destroy_at.drain(..).partition(|(t, _)| *t <= now);
         self.destroy_at = keep;
         for (_, id) in due {

@@ -60,7 +60,7 @@ The listener at 0x694ee0 sends event 13 to CCPlaceable's completion handler
 at 0x74d200. That handler clears the outstanding byte and checks current
 health and the current appearance's destruction predicate. On the enabled
 nonpositive-health path it targets opacity zero and requests destruction
-after 3000 ms. The request at 0x696a60 preserves the first pending request.
+after 3000 ms. The request at 0x696a60 preserves the first request.
 Opacity advances using client delta divided by 500 through 0x695a90.
 
 The ordinary state-controller path now retains one-shot nodes in the
@@ -101,8 +101,8 @@ weight change instead. This is not a reason to cancel all outgoing nodes.
 
 Completion clears the saved outstanding byte, rechecks current signed-short
 health and the low-short appearance predicate, records the opacity-zero
-target time and queues removal after 3000 ms. Existing removal requests
-win. Both in-flight nodes and the first removal deadline survive JSON
+target time and queues removal after 3000 ms. Existing native removal requests
+win. In-flight nodes, the request latch and the first removal deadline survive JSON
 reload; older snapshots do not invent an animation from their stored state.
 Parked playback pauses and refreshes its clock, and Active is independent.
 DA2 keeps its previous path.
@@ -114,3 +114,15 @@ installation and full physics remain open as recorded in the walkmesh
 note. These static traces used the existing Origins analysis files. The
 original executable was never run, and this note contains only our own
 description.
+
+### Guarded removal delivery
+
+The base-object message handler checks the current `IsDestroyable` byte before
+cleanup and deletion (`0x698b41..0x698b65`). This is separate from the request
+latch set by `0x696a60`. A blocked message is consumed without clearing that
+latch, so later completion notifications cannot retry the request. The saved
+Origins request latch and deadline queue now preserve that distinction. The
+existing forced lifetime queue keeps its own behavior. Tests change the flag
+between completion and delivery and reload both pending and blocked requests.
+The general script delay, item-specific path and exact frame delivery order
+remain outside this state-controller slice.
