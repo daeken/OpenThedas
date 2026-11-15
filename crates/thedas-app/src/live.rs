@@ -272,6 +272,8 @@ pub struct Live {
     swings: thedas_ui::models::PlaceableSwings,
     /// Creatures' starts and stops (see [`thedas_ui::locomotion`]).
     locomotion: thedas_ui::locomotion::Locomotion,
+    /// Crossfades between creatures' animations outside movement.
+    crossfade: thedas_ui::crossfade::Crossfade,
     /// Objects drawn faded, by id: their opacity (0..1; missing is 1). The camera fades a
     /// creature it is inside (DAOrigins.exe 0x6c4130 eases it to 0.05).
     pub opacity: std::collections::HashMap<ObjectId, f32>,
@@ -751,6 +753,7 @@ impl Live {
             models: ModelCache::default(),
             swings: Default::default(),
             locomotion: Default::default(),
+            crossfade: Default::default(),
             opacity: Default::default(),
             cache: RenderCache::default(),
             async_loads: false,
@@ -1867,6 +1870,7 @@ impl Live {
         };
         self.swings.apply(&sim, &mut models);
         self.locomotion.apply(&sim, &mut models);
+        self.crossfade.apply(&sim, &mut models);
         let was = self.staged;
         self.staged = staged.map(|(id, s)| (id, s.mark, s.facing));
         if self.staged.map(|s| s.0) != was.map(|s| s.0) {
@@ -2052,12 +2056,24 @@ impl Live {
                 self.travel = false;
             }
         }
+        // Each creature's appearance scales its clips' translations (a dwarf sits lower than
+        // the human clip's drop; see `thedas_render::skeleton::Layer::scale`).
+        let scales: std::collections::HashMap<ObjectId, [f32; 3]> = {
+            let sim = self.sim();
+            models
+                .iter()
+                .filter_map(|m| thedas_ui::models::translation_scale(&sim, m.id).map(|s| (m.id, s)))
+                .collect()
+        };
         let (Some(level), Some(objects)) = (self.level.as_ref(), self.objects.as_mut()) else {
             return Ok(());
         };
         let mut posed: Vec<(Mat4, Option<Clip>)> = Vec::with_capacity(models.len());
         for m in &models {
             let mut c = m.motion.as_ref().map(clip);
+            if let Some(c) = c.as_mut() {
+                c.translation_scale = Some(scales.get(&m.id).copied().unwrap_or([1.0; 3]));
+            }
             let none = Vec::new();
             let held = kept.get(&m.id).unwrap_or(&none);
             let (at, facing) = match posing.get(&m.id) {

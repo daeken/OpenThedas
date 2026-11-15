@@ -13,6 +13,7 @@ pub mod atlas;
 pub mod avm1;
 pub mod binding;
 pub mod chains;
+pub mod crossfade;
 pub mod input;
 pub mod keys;
 pub mod locomotion;
