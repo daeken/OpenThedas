@@ -92,10 +92,14 @@ impl Live {
             "active_vfx": self.effects.as_ref().map(|e| &e.key),
             "location_vfx_near_camera": sim.world.location_vfx.iter()
                 .filter(|v| Some(v.area) == sim.world.area && glam::Vec3::from_array(v.position).distance_squared(eye) <= 50.0 * 50.0)
-                .take(512).collect::<Vec<_>>(),
+                .take(512).map(|v| json!({ "handle": v.handle, "vfx": v.vfx,
+                    "position": v.position, "facing_degrees": v.facing, "started_ms": v.started_ms,
+                    "duration_ms": v.duration_ms })).collect::<Vec<_>>(),
             "instant_location_vfx_near_camera": sim.world.instant_location_vfx.iter()
                 .filter(|v| Some(v.area) == sim.world.area && glam::Vec3::from_array(v.position).distance_squared(eye) <= 50.0 * 50.0)
-                .take(512).collect::<Vec<_>>(),
+                .take(512).map(|v| json!({ "handle": v.handle, "vfx": v.vfx,
+                    "position": v.position, "facing_degrees": v.facing, "started_ms": v.started_ms,
+                    "duration_ms": v.ms, "lasting": v.lasting })).collect::<Vec<_>>(),
             "cutaway_opacity": self.cutaway.0.shown(),
         })
     }
