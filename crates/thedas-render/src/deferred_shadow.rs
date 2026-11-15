@@ -733,10 +733,12 @@ mod tests {
         let device = &ctx.device;
         let mut pool = ShadowPool::new(device);
         let vertex = |y, z, u, v| {
-            [
+            let mut vertex = [0.0; std::mem::size_of::<DeferredVertex>() / 4];
+            vertex[..18].copy_from_slice(&[
                 2.0f32, y, z, -1.0, 0.0, 0.0, u, v, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
                 0.0,
-            ]
+            ]);
+            vertex
         };
         let stream = [
             vertex(0.75, 0.75, 0.0, 0.0),

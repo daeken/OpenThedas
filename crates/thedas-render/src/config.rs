@@ -5,6 +5,7 @@ use std::sync::LazyLock;
 pub(crate) struct Config {
     pub punch: bool,
     pub objects: bool,
+    pub mesh_tangents: bool,
     pub terrain: bool,
     pub faces: bool,
     pub fronds: bool,
@@ -48,6 +49,7 @@ pub(crate) static CONFIG: LazyLock<Config> = LazyLock::new(|| {
     Config {
         punch: enabled("THEDAS_DEFERRED_PUNCH"),
         objects: enabled("THEDAS_DEFERRED_OBJECTS"),
+        mesh_tangents: enabled("THEDAS_DEFERRED_MESH_TANGENTS"),
         terrain: enabled("THEDAS_DEFERRED_TERRAIN"),
         faces: enabled("THEDAS_DEFERRED_FACES"),
         fronds: enabled("THEDAS_DEFERRED_FRONDS"),

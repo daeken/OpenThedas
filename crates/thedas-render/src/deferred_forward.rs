@@ -282,7 +282,7 @@ impl Gpu {
                 buffers: &[
                     Some(wgpu::VertexBufferLayout { array_stride: std::mem::size_of::<DeferredVertex>() as u64, step_mode: wgpu::VertexStepMode::Vertex,
                         attributes: &wgpu::vertex_attr_array![0=>Float32x3,1=>Float32x3,2=>Float32x2,3=>Float32x2,4=>Float32x4,5=>Float32x4]}),
-                    Some(wgpu::VertexBufferLayout { array_stride: 16, step_mode: wgpu::VertexStepMode::Vertex, attributes: &wgpu::vertex_attr_array![6=>Float32x4] }),
+                    Some(wgpu::VertexBufferLayout { array_stride: 16, step_mode: wgpu::VertexStepMode::Vertex, attributes: &wgpu::vertex_attr_array![8=>Float32x4] }),
                 ]},
             primitive: wgpu::PrimitiveState {cull_mode: cull_of(p.cull), ..Default::default()},
             depth_stencil: Some(wgpu::DepthStencilState { format: DEPTH_FORMAT, depth_write_enabled: Some(p.z_write), depth_compare: Some(compare(p.z_func)), stencil: Default::default(), bias: Default::default() }),
