@@ -542,6 +542,10 @@ impl Sim {
                     o.active = true;
                 }
             }
+            if let Some(stage) = &cut.da2_stage {
+                c.staged = self.bind_da2_stage(stage, c.owner, c.player);
+                return;
+            }
         }
         let Some(tracks) = cut.tracks.clone() else {
             return;
