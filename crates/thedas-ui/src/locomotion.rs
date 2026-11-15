@@ -111,16 +111,14 @@ impl ClipInfo {
     fn next_at(&self, t: f32) -> Option<&str> {
         self.next
             .iter()
-            .filter(|(at, _)| *at <= t)
-            .last()
+            .rfind(|(at, _)| *at <= t)
             .map(|(_, n)| n.as_str())
     }
 
     fn protected_at(&self, t: f32) -> bool {
         self.protect
             .iter()
-            .filter(|(at, _)| *at <= t)
-            .last()
+            .rfind(|(at, _)| *at <= t)
             .is_some_and(|(_, p)| *p)
     }
 }
