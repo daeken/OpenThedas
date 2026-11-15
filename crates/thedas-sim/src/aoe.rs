@@ -223,9 +223,10 @@ impl Sim {
     /// The living, active creatures, in the world's order, with where they stand.
     fn aoe_inhabitants(&self) -> Vec<Inhabitant> {
         self.world
-            .objects
-            .values()
-            .filter(|c| c.kind == ObjectKind::Creature && c.active && !c.dead)
+            .creature_ids()
+            .iter()
+            .filter_map(|&id| self.world.get(id))
+            .filter(|c| c.active && !c.dead)
             .map(|c| (c.id, c.position, c.area))
             .collect()
     }
