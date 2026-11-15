@@ -582,6 +582,20 @@ pub struct PropDraws {
     pub attachments: Vec<PropAttachment>,
     /// The emitters of its visual effects ([`Prop::effects`]), which follow it.
     pub emitters: Vec<PropEmitter>,
+    /// The point lights of its visual effects, which follow it.
+    pub lights: Vec<PropLight>,
+}
+
+/// A point light of a prop's visual effect (`fxa_fire_conj_c`'s `flame_c`): the light as
+/// its node gives it, its placement in the prop's model space at rest, the body node it
+/// follows, and its effect's animations (its `<light>_color` and `<light>_radius` tracks,
+/// in [`EffectRate::color`] and [`EffectRate::radius`]; and the nodes above it).
+#[derive(Clone, Debug, PartialEq)]
+pub struct PropLight {
+    pub light: SceneLight,
+    pub in_model: Mat4,
+    pub follows: Option<(usize, usize)>,
+    pub rate: Option<EffectTimeline>,
 }
 
 /// An emitter that follows a prop: its index in [`AreaScene::emitters`], its placement in
@@ -671,6 +685,12 @@ impl EffectTimeline {
         self.param(since_built, |r, t| r.color.as_ref().map(|c| c.at(t)))
     }
 
+    /// For an effect's light, its radius `since_built` seconds after the scene was built,
+    /// as its `<light>_radius` track sets it; `None` for the light's own.
+    pub fn radius_at(&self, since_built: f32) -> Option<f32> {
+        self.param(since_built, |r, t| r.radius.as_ref().map(|k| k.at(t)))
+    }
+
     /// The emitter's age map size multipliers (x, y) `since_built` seconds after the scene
     /// was built, as the effect's animations set them (`<emitter>_agemapscalexmultiplier`
     /// and `..y..`: a flare grown from nothing); `None` for the emitter's own. Either track
@@ -726,6 +746,8 @@ pub struct EffectRate {
     /// translation tracks (`<node>_rotation`, `<node>_translation`); empty when the
     /// animation moves none of them.
     pub nodes: Vec<NodeTracks>,
+    /// For an effect's light, its `<light>_radius` track.
+    pub radius: Option<thedas_formats::anim::ScalarTrack>,
 }
 
 /// A node's rotation and translation tracks in an effect animation.
@@ -2851,26 +2873,30 @@ impl<'a> Loader<'a> {
     /// game plays around it are not played, the crust node's own transform is not used,
     /// effect models' meshes and other animated parameters (`gob_remotematerialalpha`)
     /// are not drawn, and an effect on a body without the named node is left out.
-    fn place_effect(&mut self, instance: &PropEffect, prop: &Prop) -> Vec<PropEmitter> {
+    fn place_effect(
+        &mut self,
+        instance: &PropEffect,
+        prop: &Prop,
+    ) -> (Vec<PropEmitter>, Vec<PropLight>) {
         use thedas_formats::emitter::Emitter;
-        use thedas_formats::model::{KIND_CRUST, Node};
+        use thedas_formats::model::{KIND_CRUST, Light, Node};
         let effect = instance.model.as_str();
         let Some(model) = self.model(effect) else {
             self.warn(format!("{}: no effect model {effect}", prop.label));
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         };
+        // The parts placed: emitters, and point lights.
+        #[derive(Clone, Copy)]
+        enum Part<'a> {
+            Emitter(&'a Emitter),
+            Light(&'a Light),
+        }
         // Emitters with the crust node above them, and their transform below it (or from
         // the model root when there is none).
         // Each emitter also keeps the nodes from there down to it, which the effect's
         // animations may turn and move.
         type Chain<'a> = Vec<(&'a str, &'a thedas_formats::level::Transform)>;
-        type Found<'a> = Vec<(
-            &'a Emitter,
-            Option<&'a str>,
-            Option<&'a str>,
-            Mat4,
-            Chain<'a>,
-        )>;
+        type Found<'a> = Vec<(Part<'a>, Option<&'a str>, Option<&'a str>, Mat4, Chain<'a>)>;
         fn walk<'a>(
             n: &'a Node,
             below: Mat4,
@@ -2886,7 +2912,22 @@ impl<'a> Loader<'a> {
                 (below * transform_matrix(&n.transform), hook, c)
             };
             if let Some(e) = &n.emitter {
-                out.push((e, n.name.as_deref(), hook, below, chain.clone()));
+                out.push((
+                    Part::Emitter(e),
+                    n.name.as_deref(),
+                    hook,
+                    below,
+                    chain.clone(),
+                ));
+            }
+            if let Some(l @ Light::Point { .. }) = &n.light {
+                out.push((
+                    Part::Light(l),
+                    n.name.as_deref(),
+                    hook,
+                    below,
+                    chain.clone(),
+                ));
             }
             for c in &n.children {
                 walk(c, below, &chain, hook, out);
@@ -2902,8 +2943,8 @@ impl<'a> Loader<'a> {
                 .and_then(|d| thedas_formats::anim::Animation::parse(&d).ok())
         };
         let (impact, looping) = (animation("impa"), animation("dura"));
-        let mut out = Vec::new();
-        for (k, (e, name, hook, below, chain)) in found.into_iter().enumerate() {
+        let (mut out, mut lights) = (Vec::new(), Vec::new());
+        for (k, (part, name, hook, below, chain)) in found.into_iter().enumerate() {
             let (in_model, follows) = match hook {
                 // An effect played at a place has no body to hang from: its emitters stand
                 // where it was played, from the model's root.
@@ -2943,11 +2984,15 @@ impl<'a> Loader<'a> {
                     color: a
                         .colors
                         .iter()
-                        .find(|c| c.target == format!("{name}_agemapcolormultiplier"))
+                        .find(|c| {
+                            c.target == format!("{name}_agemapcolormultiplier")
+                                || c.target == format!("{name}_color")
+                        })
                         .cloned(),
                     scale_x: track("agemapscalexmultiplier"),
                     scale_y: track("agemapscaleymultiplier"),
                     nodes: node_tracks(a, &chain),
+                    radius: track("radius"),
                 })
             };
             let rate = Some(EffectTimeline {
@@ -2958,6 +3003,37 @@ impl<'a> Loader<'a> {
                 chain: chain.iter().map(|(_, t)| **t).collect(),
                 above: in_model * below.inverse(),
             });
+            let e = match part {
+                Part::Emitter(e) => e,
+                Part::Light(Light::Point {
+                    color,
+                    radius,
+                    affect_domain,
+                    is_static,
+                    version,
+                    flicker,
+                }) => {
+                    lights.push(PropLight {
+                        light: SceneLight::Point {
+                            position: Vec3::ZERO,
+                            color: Vec3::new(color[0], color[1], color[2]),
+                            radius: *radius,
+                            name: name.unwrap_or("").to_string(),
+                            domain: *affect_domain,
+                            is_static: is_static.unwrap_or(false),
+                            version: version.unwrap_or(0),
+                            intensity: 1.0,
+                            flicker: *flicker,
+                            room: None,
+                        },
+                        in_model,
+                        follows,
+                        rate,
+                    });
+                    continue;
+                }
+                Part::Light(_) => continue,
+            };
             if let Some(emitter) =
                 self.push_emitter(effect, e, name, prop.transform * in_model, &[], false)
             {
@@ -2971,7 +3047,7 @@ impl<'a> Loader<'a> {
                 });
             }
         }
-        out
+        (out, lights)
     }
 
     /// The particle emitters of a placed model. Mesh-particle and physics emitters are left
@@ -3276,17 +3352,19 @@ impl AreaScene {
         };
         for prop in props {
             let first = l.scene.draws.len();
-            let emitters = prop
-                .effects
-                .iter()
-                .flat_map(|effect| l.place_effect(effect, prop))
-                .collect();
+            let (mut emitters, mut lights) = (Vec::new(), Vec::new());
+            for effect in &prop.effects {
+                let (e, li) = l.place_effect(effect, prop);
+                emitters.extend(e);
+                lights.extend(li);
+            }
             l.scene.props.push(PropDraws {
                 label: prop.label.clone(),
                 transform: prop.transform,
                 draws: first..first,
                 attachments: Vec::new(),
                 emitters,
+                lights,
             });
         }
         l.scene
@@ -3680,17 +3758,19 @@ impl AreaScene {
                 }
             }
             let draws = first..l.scene.draws.len();
-            let emitters = prop
-                .effects
-                .iter()
-                .flat_map(|effect| l.place_effect(effect, prop))
-                .collect();
+            let (mut emitters, mut lights) = (Vec::new(), Vec::new());
+            for effect in &prop.effects {
+                let (e, li) = l.place_effect(effect, prop);
+                emitters.extend(e);
+                lights.extend(li);
+            }
             l.scene.props.push(PropDraws {
                 label: prop.label.clone(),
                 transform: prop.transform,
                 draws,
                 attachments,
                 emitters,
+                lights,
             });
         }
         l.assign_probes();
@@ -3925,6 +4005,7 @@ mod tests {
             color: None,
             scale_x: None,
             scale_y: None,
+            radius: None,
             // The dummy turns a quarter round over the second; the emitter below it stays.
             nodes: vec![
                 (
@@ -3985,6 +4066,7 @@ mod tests {
             range: None,
             scale_x: None,
             scale_y: None,
+            radius: None,
             nodes: Vec::new(),
             color: Some(ColorTrack {
                 target: "glow_agemapcolormultiplier".into(),
@@ -4027,6 +4109,7 @@ mod tests {
             range: None,
             scale_x: None,
             scale_y: None,
+            radius: None,
             nodes: Vec::new(),
             color: None,
         };
@@ -4040,6 +4123,7 @@ mod tests {
             range: None,
             scale_x: None,
             scale_y: None,
+            radius: None,
             nodes: Vec::new(),
             color: None,
         };
@@ -4061,6 +4145,7 @@ mod tests {
                 range: None,
                 scale_x: None,
                 scale_y: None,
+                radius: None,
                 nodes: Vec::new(),
                 color: None,
             }),
