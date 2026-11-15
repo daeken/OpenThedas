@@ -300,23 +300,31 @@ pub struct ValueCache {
     pub updates: Vec<(String, Vec<(String, UiValue)>)>,
     /// Groups no longer shown.
     pub drops: Vec<String>,
+    /// The interface's own time (the frames' durations added up), which the groups age by:
+    /// real time in play, the steps' time when driven by a script.
+    now_ms: f64,
 }
 
 /// A group of values as set into the bridge: what it was built for (a creature, say), and when.
 struct Built {
     token: u64,
-    at: std::time::Instant,
-    ttl: std::time::Duration,
+    at_ms: f64,
+    ttl_ms: f64,
 }
 
 impl ValueCache {
+    /// Moves the interface's time on by a frame.
+    pub fn advance(&mut self, dt_ms: f64) {
+        self.now_ms += dt_ms;
+    }
+
     /// Whether `group` must be built again (not built yet, built for another `token`, or
     /// older than its lifetime); notes it as shown.
     fn stale(&mut self, group: &str, token: u64) -> bool {
         self.seen.insert(group.to_string());
         self.groups
             .get(group)
-            .is_none_or(|b| b.token != token || b.at.elapsed() >= b.ttl)
+            .is_none_or(|b| b.token != token || self.now_ms - b.at_ms >= b.ttl_ms)
     }
 
     /// Hands over a built group, to stay until `ttl` has passed.
@@ -325,8 +333,8 @@ impl ValueCache {
             group.to_string(),
             Built {
                 token,
-                at: std::time::Instant::now(),
-                ttl: std::time::Duration::from_millis(ttl_ms),
+                at_ms: self.now_ms,
+                ttl_ms: ttl_ms as f64,
             },
         );
         self.updates.push((group.to_string(), rows));
@@ -346,13 +354,14 @@ impl ValueCache {
     }
 }
 
-/// How long a creature's derived properties are left as they are (milliseconds of real time,
-/// so a paused game's inventory screen still shows an equipped item's effect): they come
+/// How long a creature's derived properties are left as they are (milliseconds of the interface's time,
+/// which runs while the game is paused, so the inventory screen still shows an equipped
+/// item's effect): they come
 /// from its base properties, equipment and effects, which change a few times a minute, while
 /// building them for every property of every party member each frame was most of the cost of
 /// building the values. They are handed over once (in `updates`) and stay bound; the current
 /// values (health and mana bars) are built fresh each frame.
-const DERIVED_MS: u64 = 200;
+const DERIVED_MS: u64 = 500;
 
 /// How long the inventory, quickbar and key bindings are left as they are (see
 /// [`DERIVED_MS`]).
@@ -425,7 +434,11 @@ fn sim_values_with(
         );
     }
     let tables = sim.world.tables();
-    let mut creature = |prefix: &str, id: u32, sticky: bool| {
+    let creature = |v: &mut BTreeMap<String, UiValue>,
+                    cache: &mut Option<&mut ValueCache>,
+                    prefix: &str,
+                    id: u32,
+                    sticky: bool| {
         let Some(o) = sim.world.get(id) else { return };
         v.insert(prefix.to_string(), num(id));
         v.insert(format!("{prefix}.ID"), num(id));
@@ -546,44 +559,48 @@ fn sim_values_with(
         v.insert(format!("{prefix}.InCombat"), num(o.combat.in_combat as u8));
     };
     for (i, id) in members.iter().enumerate() {
-        creature(&format!("Party.Members.{i}"), *id, true);
+        creature(&mut v, &mut cache, &format!("Party.Members.{i}"), *id, true);
     }
     if let Some(c) = controlled.or(hero) {
-        creature("GUI.SelectedChar", c, true);
+        creature(&mut v, &mut cache, "GUI.SelectedChar", c, true);
     }
     // The creature in character generation or level-up, as levelup.gfx reads it: its
     // attributes and points (34 attribute, 35 skill, 36 talent, 38 specialization), with
     // what equipment adds as each attribute's Modifier. The screen spends the points itself
     // unless the auto-level option (`Stats.AutoLevelUp`) is on; it is off. Provisional.
     if let Some(c) = sim.world.chargen {
-        creature("CharGenCreature", c, false);
-        if let Some(o) = sim.world.get(c) {
-            for (p, (base, _)) in &o.properties {
-                v.insert(
-                    format!("CharGenCreature.Attributes.{p}.Modifier"),
-                    num(sim.equipment_bonus(c, *p)),
-                );
-                // The points being spent go on the base, which the screen shows as Total
-                // (depletables keep their maximum).
-                let depletable = [
-                    "PROPERTY_DEPLETABLE_HEALTH",
-                    "PROPERTY_DEPLETABLE_MANA_STAMINA",
-                ]
-                .iter()
-                .any(|k| thedas_sim::sim::constant(&sim.table, k) == *p);
-                if !depletable {
-                    v.insert(format!("CharGenCreature.Attributes.{p}.Total"), num(*base));
+        section(&mut cache, "ChargenCreature", u64::from(c), &mut v, |v| {
+            creature(v, &mut None, "CharGenCreature", c, false);
+            if let Some(o) = sim.world.get(c) {
+                for (p, (base, _)) in &o.properties {
+                    v.insert(
+                        format!("CharGenCreature.Attributes.{p}.Modifier"),
+                        num(sim.equipment_bonus(c, *p)),
+                    );
+                    // The points being spent go on the base, which the screen shows as Total
+                    // (depletables keep their maximum).
+                    let depletable = [
+                        "PROPERTY_DEPLETABLE_HEALTH",
+                        "PROPERTY_DEPLETABLE_MANA_STAMINA",
+                    ]
+                    .iter()
+                    .any(|k| thedas_sim::sim::constant(&sim.table, k) == *p);
+                    if !depletable {
+                        v.insert(format!("CharGenCreature.Attributes.{p}.Total"), num(*base));
+                    }
                 }
             }
-        }
-        v.insert("CharGenCreature.Stats.AutoLevelUp".into(), num(0));
-        crate::chains::bind(
-            sim,
-            c,
-            "CharGenCreature.Stats",
-            crate::chains::DISPLAYMODE_LEVELUP,
-            &mut v,
-        );
+            v.insert("CharGenCreature.Stats.AutoLevelUp".into(), num(0));
+        });
+        section(&mut cache, "ChargenChains", u64::from(c), &mut v, |v| {
+            crate::chains::bind(
+                sim,
+                c,
+                "CharGenCreature.Stats",
+                crate::chains::DISPLAYMODE_LEVELUP,
+                v,
+            )
+        });
     }
     // The skills or spells/talents screen (abilities.gfx): which it shows, and the member's
     // abilities listed as the spellbook lists them.
@@ -592,13 +609,15 @@ fn sim_values_with(
             "GUI.AbilityScene".into(),
             num(f64::from(shown.ability_scene)),
         );
-        crate::chains::bind(
-            sim,
-            c,
-            "GUI.SelectedChar.Stats",
-            crate::chains::DISPLAYMODE_SPELLBOOK,
-            &mut v,
-        );
+        section(&mut cache, "SpellbookChains", u64::from(c), &mut v, |v| {
+            crate::chains::bind(
+                sim,
+                c,
+                "GUI.SelectedChar.Stats",
+                crate::chains::DISPLAYMODE_SPELLBOOK,
+                v,
+            )
+        });
     }
     // The portrait the engine drew of each member's head (portraits.gfx loads it).
     for (i, id) in members.iter().enumerate() {
@@ -833,17 +852,21 @@ fn sim_values_with(
         &mut v,
         |v| inventory(sim, who, shown.item_filter, v),
     );
-    store(sim, shown, &mut v);
-    party_picker(sim, shown, &mut v);
-    saves(sim, shown, &mut v);
-    journal(sim, shown, &mut v);
+    section(&mut cache, "Store", 0, &mut v, |v| store(sim, shown, v));
+    section(&mut cache, "PartyPicker", 0, &mut v, |v| {
+        party_picker(sim, shown, v)
+    });
+    section(&mut cache, "Saves", 0, &mut v, |v| saves(sim, shown, v));
+    section(&mut cache, "Journal", 0, &mut v, |v| journal(sim, shown, v));
     alerts(sim, shown, &mut v);
-    crate::options::values(
-        &shown.options,
-        shown.resolution,
-        (&shown.antialias_samples, shown.antialias_default_on),
-        &mut v,
-    );
+    section(&mut cache, "Options", 0, &mut v, |v| {
+        crate::options::values(
+            &shown.options,
+            shown.resolution,
+            (&shown.antialias_samples, shown.antialias_default_on),
+            v,
+        )
+    });
     if let Some(e) = &shown.examine {
         v.insert(
             "GUIItemExamine.ItemToken".into(),
@@ -919,7 +942,13 @@ fn sim_values_with(
         "ClientOptions.GameOptions.DifficultyLevel".into(),
         num(sim.world.difficulty),
     );
-    chargen_screen(sim, &mut v);
+    section(
+        &mut cache,
+        "ChargenScreen",
+        u64::from(sim.world.chargen.unwrap_or(0)),
+        &mut v,
+        |v| chargen_screen(sim, v),
+    );
     // The tutorial popups waiting (popuplayer.gfx shows the first: its `Title`, `Text` and
     // the `CodexResRef` its Codex button opens; Next when more wait, else Close), with
     // tutorials on (`Tutorials.Enabled`). An empty list hides the panel.
@@ -986,9 +1015,11 @@ fn sim_values_with(
         v.insert(format!("GUI.GuiHighlights.{i}.Highlight"), num(0));
     }
     if let Some(who) = controlled.or(hero) {
-        tactics(sim, who, &mut v);
+        section(&mut cache, "Tactics", u64::from(who), &mut v, |v| {
+            tactics(sim, who, v)
+        });
     }
-    map_notes(sim, &mut v);
+    section(&mut cache, "MapNotes", 0, &mut v, |v| map_notes(sim, v));
     // The minimap, as minimap.gfx reads it: the picture, the world corners it spans
     // (`Left`/`Bottom` the lower, `Right`/`Top` the upper) and the share of the picture
     // they cover. Provisional: north is taken to be up (0).
