@@ -500,10 +500,10 @@ impl Animator {
         // (and its attachments and effects with it) and is seen when it comes into view.
         for (i, ((transform, _), poses)) in props.iter().zip(by_prop).enumerate() {
             if posing[i] {
-                renderer.pose_prop(ctx, scene, i, *transform, &poses);
+                renderer.pose_prop(ctx, scene, i, *transform, &poses, true);
                 self.last_poses[i] = Some((shapes[i], poses));
             } else if let Some((_, kept)) = &self.last_poses[i] {
-                renderer.pose_prop(ctx, scene, i, *transform, kept);
+                renderer.pose_prop(ctx, scene, i, *transform, kept, false);
             }
         }
     }

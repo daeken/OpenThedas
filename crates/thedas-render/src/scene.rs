@@ -315,6 +315,7 @@ impl LightRig {
                     affect_domain,
                     is_static,
                     version,
+                    flicker,
                 } = lp.light
                 {
                     out.lights.push(SceneLight::Point {
@@ -326,6 +327,7 @@ impl LightRig {
                         is_static: is_static.unwrap_or(false),
                         version: version.unwrap_or(0),
                         intensity: 1.0,
+                        flicker: *flicker,
                         room: None,
                     });
                 }
@@ -393,6 +395,10 @@ pub enum SceneLight {
         /// it. It multiplies the colour the shaders are given (0x46b47e) and weighs the
         /// light when a draw's lights are picked (0x53d35f).
         intensity: f32,
+        /// How its intensity flickers, for a light whose node gives a variation (see
+        /// [`crate::flicker`]): a factor on the colour the shaders are given, apart from
+        /// `intensity`, that never weighs its pick.
+        flicker: Option<crate::flicker::Flicker>,
         /// The room (id) whose layout placed it: it reaches that room and the rooms the
         /// room's [`AreaScene::light_rooms`] lists. `None` for a light a placed object
         /// carries (provisional: it reaches every room).
@@ -2546,6 +2552,7 @@ impl<'a> Loader<'a> {
                     affect_domain,
                     is_static,
                     version,
+                    flicker,
                 } => SceneLight::Point {
                     position: m.transform_point3(Vec3::ZERO),
                     color: Vec3::new(color[0], color[1], color[2]),
@@ -2555,6 +2562,7 @@ impl<'a> Loader<'a> {
                     is_static: is_static.unwrap_or(false),
                     version: version.unwrap_or(0),
                     intensity: 1.0,
+                    flicker: *flicker,
                     room: layout_room,
                 },
                 thedas_formats::model::Light::Ambient { color } => SceneLight::Ambient {
@@ -2759,7 +2767,9 @@ impl<'a> Loader<'a> {
         let mut out = Vec::new();
         for (k, (e, name, hook, below)) in found.into_iter().enumerate() {
             let (in_model, follows) = match hook {
-                Some(hook) => {
+                // An effect played at a place has no body to hang from: its emitters stand
+                // where it was played, from the model's root.
+                Some(hook) if !prop.models.is_empty() => {
                     let body = prop.models.iter().find_map(|m| {
                         let mmh = self.model(m)?;
                         let chain = mmh.node_chain(hook)?;
@@ -2775,7 +2785,7 @@ impl<'a> Loader<'a> {
                     let node = self.scene.skeletons[skeleton].node(hook);
                     (at * below, node.map(|n| (skeleton, n)))
                 }
-                None => (below, None),
+                _ => (below, None),
             };
             // The emitter's tracks in an animation; an animation that plays without them
             // gives it nothing.

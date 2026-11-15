@@ -476,6 +476,24 @@ pub struct InstantVfx {
     pub started_ms: u64,
 }
 
+/// An instant visual effect played at a place (`Engine_ApplyEffectAtLocation` with an
+/// `EffectVisualEffect` of `EFFECT_DURATION_TYPE_INSTANT`: a spell's impact on the ground):
+/// as with [`InstantVfx`], the executable keeps nothing, so `GetEffects` never finds it; this
+/// note is for presentation, kept for [`INSTANT_VFX_MS`]. Not saved.
+#[derive(Clone, Debug, PartialEq)]
+pub struct InstantLocationVfx {
+    /// Tells it from the others while it is kept.
+    pub handle: u64,
+    /// The effect's `VFX_base` row (its integer 0).
+    pub vfx: i32,
+    pub area: ObjectId,
+    pub position: [f32; 3],
+    /// Degrees, as objects use.
+    pub facing: f32,
+    /// World time it was played.
+    pub started_ms: u64,
+}
+
 /// How long an [`InstantVfx`] note is kept for presentation to pick up. Not the effect's
 /// length (the VFX resource has its own); provisional.
 pub const INSTANT_VFX_MS: u64 = 2_000;
@@ -849,6 +867,12 @@ pub struct World {
     /// Instant visual effects played on objects lately (see [`InstantVfx`]).
     #[serde(skip)]
     pub instant_vfx: Vec<InstantVfx>,
+    /// Instant visual effects played at places lately (see [`InstantLocationVfx`]).
+    #[serde(skip)]
+    pub instant_location_vfx: Vec<InstantLocationVfx>,
+    /// The next [`InstantLocationVfx::handle`].
+    #[serde(skip)]
+    pub next_instant_vfx: u64,
     /// The next [`LocationVfx::handle`].
     #[serde(default)]
     pub next_vfx: u64,
@@ -1030,6 +1054,8 @@ impl World {
             store: None,
             location_vfx: Vec::new(),
             instant_vfx: Vec::new(),
+            instant_location_vfx: Vec::new(),
+            next_instant_vfx: 0,
             next_vfx: 0,
             chanter_board: None,
             plot_actions: PlotActions::default(),

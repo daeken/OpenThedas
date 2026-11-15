@@ -232,6 +232,13 @@ struct Args {
     /// `THEDAS_DEFERRED_BAKED_LIGHTING`, else `baked`.
     #[arg(long, value_parser = ["baked", "hybrid", "realtime"])]
     lighting: Option<String>,
+    /// Viewer (`--area`): place visual effects in the level, `MODEL@X,Y,Z` separated by `;`
+    /// (`fxa_fireball_impact_p@10,4,0;fxa_storm_area_p@14,2,0`), each a model of the
+    /// game's VFX (`.mmh` without the extension) standing there, its emitters running from
+    /// the start (`--time` seconds into them at a capture). For looking at effects and their
+    /// light; ours, nothing the original offers.
+    #[arg(long, default_value = "")]
+    vfx: String,
     /// The original's "Graphics Detail" video option, which picks the materials' techniques
     /// and the bloom's blur: `low`, `medium` or `high` (High's materials draw as Medium's; its
     /// sun shadows are 1024 texels a side and reach further).
@@ -327,6 +334,41 @@ fn hero_camera(pos: [f32; 3], facing: f32) -> Camera {
         yaw,
         -0.3,
     )
+}
+
+/// `--vfx`: `MODEL@X,Y,Z` separated by `;`, each as a prop showing that model.
+fn parse_vfx(spec: &str) -> Result<Vec<thedas_render::Prop>> {
+    spec.split(';')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .enumerate()
+        .map(|(i, item)| {
+            let (model, at) = item.split_once('@').context("--vfx takes MODEL@X,Y,Z")?;
+            let xyz: Vec<f32> = at
+                .split(',')
+                .map(|v| v.trim().parse::<f32>())
+                .collect::<std::result::Result<_, _>>()
+                .context("--vfx position must be X,Y,Z")?;
+            let [x, y, z] = xyz[..] else {
+                bail!("--vfx position must be X,Y,Z");
+            };
+            Ok(thedas_render::Prop {
+                label: format!("vfx{i}"),
+                models: Vec::new(),
+                attached: Vec::new(),
+                morph: None,
+                hide_hair: false,
+                tints: Vec::new(),
+                effects: vec![thedas_render::PropEffect {
+                    model: model.trim().trim_end_matches(".mmh").to_ascii_lowercase(),
+                    key: format!("vfx{i}"),
+                    age: 0.0,
+                    lasting: true,
+                }],
+                transform: thedas_render::Prop::placement([x, y, z], 0.0),
+            })
+        })
+        .collect()
 }
 
 fn parse_size(s: &str) -> Result<(u32, u32)> {
@@ -742,6 +784,9 @@ fn capture(
                     loaded.render_path,
                 );
                 renderer.frame_effects = loaded.frame_effects;
+                // `--vfx` effects play through their timelines up to the capture's time (no
+                // animator poses viewer props).
+                renderer.play_prop_effects(scene, shader_time);
                 renderer.set_time(shader_time);
                 log_stats(&renderer);
                 renderer.capture(ctx, &camera, w, h)?
@@ -974,7 +1019,7 @@ fn ask_report_note(ui: &mut ui::UiLayer, pad: bool) {
     // The box's OK wants some text, and the pad cannot type yet: a pad's report starts
     // with a line that can go as it is.
     let text = if pad { "(sent from a controller)" } else { "" };
-    ui.ask_text(report::NOTE_ID, prompt, text, ok, other);
+    ui.ask_free_text(report::NOTE_ID, prompt, text, ok, other);
 }
 
 /// What a report under way waits for.
@@ -1004,6 +1049,8 @@ enum Marking {
     Off,
     /// The choice is asked: frames since asked (or seen up), and times it did not show.
     Offered(u32, u32),
+    /// A spot's note was answered: mark another, or go straight to the overall note.
+    More(u32, u32),
     /// Boxes are being drawn: the one being dragged (from, to), and the one whose note
     /// is being asked, with frames and tries as for the choice.
     On {
@@ -1076,7 +1123,7 @@ fn ask_mark_choice(ui: &mut ui::UiLayer, pad: bool) {
 }
 
 fn ask_region_note(ui: &mut ui::UiLayer) {
-    ui.ask_text(
+    ui.ask_free_text(
         report::REGION_ID,
         report::REGION_PROMPT,
         "",
@@ -1085,13 +1132,18 @@ fn ask_region_note(ui: &mut ui::UiLayer) {
     );
 }
 
+fn ask_more_marks(ui: &mut ui::UiLayer) {
+    ui.ask_choice(
+        report::MORE_MARKS_ID,
+        report::MORE_MARKS_PROMPT,
+        "Mark another spot",
+        "Done marking",
+    );
+}
+
 /// Whether the game's message box shows `prompt` now.
-fn box_shows(ui: &ui::UiLayer, prompt: &str) -> bool {
-    ui.stage.dialog_up()
-        && matches!(
-            ui.stage.bridge.value("GUIPopupLayer.DialogBoxText"),
-            Some(thedas_ui::UiValue::String(t)) if t == prompt
-        )
+fn box_shows(ui: &mut ui::UiLayer, prompt: &str) -> bool {
+    ui.stage.dialog_prompt().as_deref() == Some(prompt)
 }
 
 /// What the window's surface gave a redraw.
@@ -1441,6 +1493,7 @@ impl App {
                     self.loaded.render_path,
                 );
                 r.frame_effects = self.loaded.frame_effects;
+                r.start_prop_effects(scene, 0.25);
                 log_stats(&r);
                 println!("camera {}", self.camera.spec());
                 Some(r)
@@ -1847,7 +1900,11 @@ impl App {
                 self.update_answers.push(a);
                 continue;
             }
-            if (a.id == report::MARK_ID || a.id == report::REGION_ID) && self.recorder.busy() {
+            if matches!(
+                a.id,
+                report::MARK_ID | report::REGION_ID | report::MORE_MARKS_ID
+            ) && self.recorder.busy()
+            {
                 self.mark_answers.push(a);
                 continue;
             }
@@ -2036,7 +2093,11 @@ impl App {
                 self.update_answers.push(a);
                 continue;
             }
-            if (a.id == report::MARK_ID || a.id == report::REGION_ID) && self.recorder.busy() {
+            if matches!(
+                a.id,
+                report::MARK_ID | report::REGION_ID | report::MORE_MARKS_ID
+            ) && self.recorder.busy()
+            {
                 self.mark_answers.push(a);
                 continue;
             }
@@ -2926,13 +2987,17 @@ impl App {
             return;
         };
         match (a.id, &mut w.marking) {
-            (report::MARK_ID, Marking::Offered(..)) if a.accepted => {
+            (report::MARK_ID, Marking::Offered(..))
+            | (report::MORE_MARKS_ID, Marking::More(..))
+                if a.accepted =>
+            {
                 w.marking = Marking::On {
                     drag: None,
                     asking: None,
                 };
             }
-            (report::MARK_ID, Marking::Offered(..)) => self.end_marking(),
+            (report::MARK_ID, Marking::Offered(..))
+            | (report::MORE_MARKS_ID, Marking::More(..)) => self.end_marking(),
             (report::REGION_ID, Marking::On { asking, .. }) => {
                 if let Some((rect, ..)) = asking.take() {
                     if a.accepted {
@@ -2940,6 +3005,10 @@ impl App {
                             rect,
                             note: a.text.trim().to_string(),
                         });
+                    }
+                    w.marking = Marking::More(0, 0);
+                    if let Some(g) = self.gfx.as_mut() {
+                        ask_more_marks(&mut g.ui);
                     }
                 }
             }
@@ -2955,11 +3024,18 @@ impl App {
             return;
         };
         let up = g.ui.stage.dialog_up();
+        let more = matches!(w.marking, Marking::More(..));
         match &mut w.marking {
             Marking::Off => {}
-            Marking::Offered(frames, tries) => {
+            Marking::Offered(frames, tries) | Marking::More(frames, tries) => {
                 *frames += 1;
-                if box_shows(&g.ui, report::MARK_PROMPT) || box_shows(&g.ui, MARK_PROMPT_PAD) {
+                let shown = if more {
+                    box_shows(&mut g.ui, report::MORE_MARKS_PROMPT)
+                } else {
+                    box_shows(&mut g.ui, report::MARK_PROMPT)
+                        || box_shows(&mut g.ui, MARK_PROMPT_PAD)
+                };
+                if shown {
                     *frames = 0;
                 } else if *frames > NOTE_REASK_FRAMES {
                     *frames = 0;
@@ -2967,20 +3043,25 @@ impl App {
                     if *tries > NOTE_TRIES {
                         self.end_marking();
                     } else if !up {
-                        ask_mark_choice(&mut g.ui, pad);
+                        if more {
+                            ask_more_marks(&mut g.ui);
+                        } else {
+                            ask_mark_choice(&mut g.ui, pad);
+                        }
                     }
                 }
             }
             Marking::On { asking, .. } => {
                 if let Some((_, frames, tries)) = asking.as_mut() {
                     *frames += 1;
-                    if box_shows(&g.ui, report::REGION_PROMPT) {
+                    if box_shows(&mut g.ui, report::REGION_PROMPT) {
                         *frames = 0;
                     } else if *frames > NOTE_REASK_FRAMES {
                         *frames = 0;
                         *tries += 1;
                         if *tries > NOTE_TRIES {
                             *asking = None;
+                            g.ui.cancel_text_popup(report::REGION_ID);
                         } else if !up {
                             ask_region_note(&mut g.ui);
                         }
@@ -3079,12 +3160,8 @@ impl App {
         // so the game never waits on it.
         if let (Some((frames, tries)), Some(g)) = (w.note_asked.as_mut(), self.gfx.as_mut()) {
             let up = g.ui.stage.dialog_up();
-            let ours = up
-                && matches!(
-                    g.ui.stage.bridge.value("GUIPopupLayer.DialogBoxText"),
-                    Some(thedas_ui::UiValue::String(t))
-                        if t == report::NOTE_PROMPT || t == report::NOTE_PROMPT_SEND
-                );
+            let ours = box_shows(&mut g.ui, report::NOTE_PROMPT)
+                || box_shows(&mut g.ui, report::NOTE_PROMPT_SEND);
             *frames += 1;
             if ours {
                 *frames = 0;
@@ -3094,6 +3171,7 @@ impl App {
                 if *tries > NOTE_TRIES {
                     log::warn!("report: the note could not be asked; kept without one");
                     w.note_asked = None;
+                    g.ui.cancel_text_popup(report::NOTE_ID);
                     self.recorder.note(Some(String::new()));
                 } else if !up {
                     ask_report_note(&mut g.ui, self.pad.used);
@@ -3106,6 +3184,16 @@ impl App {
         let Some(w) = self.report_wait.take() else {
             return;
         };
+        if let Some(g) = self.gfx.as_mut() {
+            for id in [
+                report::NOTE_ID,
+                report::MARK_ID,
+                report::REGION_ID,
+                report::MORE_MARKS_ID,
+            ] {
+                g.ui.cancel_text_popup(id);
+            }
+        }
         let reply = w.reply;
         if w.paused_it {
             if let Some(live) = self.live.as_mut() {
@@ -6664,7 +6752,8 @@ fn main() -> Result<()> {
         args.area.as_deref().unwrap_or(DEFAULT_AREA)
     };
     let detail = thedas_render::scene::Detail::parse(&args.detail).unwrap_or_default();
-    let mut loaded = load(&install, area, &args.shaders, &[], detail)?;
+    let vfx = parse_vfx(&args.vfx)?;
+    let mut loaded = load(&install, area, &args.shaders, &vfx, detail)?;
     loaded.frame_effects = args.frame_effects == "on";
     loaded.render_path = thedas_render::RenderPath::parse(&args.renderer).unwrap_or_default();
     if let Some(l) = live.as_mut() {
@@ -7606,6 +7695,22 @@ fn pack_note(name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn vfx_specs_parse_into_effect_props() {
+        let props = super::parse_vfx("fxa_fire_aoe_p@1,2,3; FXA_Ice_Cld_P.mmh @ -4.5,0,7").unwrap();
+        assert_eq!(props.len(), 2);
+        assert_eq!(props[0].effects[0].model, "fxa_fire_aoe_p");
+        assert_eq!(props[1].effects[0].model, "fxa_ice_cld_p");
+        assert!(props[0].effects[0].lasting && props[0].models.is_empty());
+        assert_eq!(
+            props[1].transform.w_axis.truncate(),
+            glam::Vec3::new(-4.5, 0.0, 7.0)
+        );
+        assert!(super::parse_vfx("").unwrap().is_empty());
+        assert!(super::parse_vfx("fxa_fire_aoe_p").is_err());
+        assert!(super::parse_vfx("fxa_fire_aoe_p@1,2").is_err());
+    }
+
     /// Against a real install (`THEDAS_INSTALL`), offscreen: the EA logo's frame
     /// two seconds in is drawn letterboxed in a taller window (written to `$INTRO_PNG` when
     /// set, to look at).

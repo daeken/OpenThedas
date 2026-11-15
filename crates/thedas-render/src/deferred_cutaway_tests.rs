@@ -275,6 +275,7 @@ fn baked_lighting_specialization_keeps_light_word_boundaries_and_fallbacks() {
                     is_static: false,
                     version: 0,
                     intensity: 1.0,
+                    flicker: None,
                     room: None,
                 })
                 .collect(),
@@ -340,6 +341,7 @@ fn static_tint_clamps_complete_lighting_and_tracks_fused_handoffs() {
         is_static: false,
         version: 0,
         intensity: 1.0,
+        flicker: None,
         room: None,
     }];
     scene.materials[0]

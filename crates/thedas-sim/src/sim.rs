@@ -1107,6 +1107,9 @@ impl Sim {
         self.world
             .instant_vfx
             .retain(|v| v.started_ms + crate::world::INSTANT_VFX_MS > end);
+        self.world
+            .instant_location_vfx
+            .retain(|v| v.started_ms + crate::world::INSTANT_VFX_MS > end);
         self.leave_conversation_mode();
         self.advance_ambient(ms);
         self.update_perception();
