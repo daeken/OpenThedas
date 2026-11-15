@@ -232,6 +232,13 @@ struct Args {
     /// `THEDAS_DEFERRED_BAKED_LIGHTING`, else `baked`.
     #[arg(long, value_parser = ["baked", "hybrid", "realtime"])]
     lighting: Option<String>,
+    /// Viewer (`--area`): place visual effects in the level, `MODEL@X,Y,Z` separated by `;`
+    /// (`fxa_fireball_impact_p@10,4,0;fxa_storm_area_p@14,2,0`), each a model of the
+    /// game's VFX (`.mmh` without the extension) standing there, its emitters running from
+    /// the start (`--time` seconds into them at a capture). For looking at effects and their
+    /// light; ours, nothing the original offers.
+    #[arg(long, default_value = "")]
+    vfx: String,
     /// The original's "Graphics Detail" video option, which picks the materials' techniques
     /// and the bloom's blur: `low`, `medium` or `high` (High's materials draw as Medium's; its
     /// sun shadows are 1024 texels a side and reach further).
@@ -327,6 +334,43 @@ fn hero_camera(pos: [f32; 3], facing: f32) -> Camera {
         yaw,
         -0.3,
     )
+}
+
+/// `--vfx`: `MODEL@X,Y,Z` separated by `;`, each as a prop showing that model.
+fn parse_vfx(spec: &str) -> Result<Vec<thedas_render::Prop>> {
+    spec.split(';')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .enumerate()
+        .map(|(i, item)| {
+            let (model, at) = item
+                .split_once('@')
+                .context("--vfx takes MODEL@X,Y,Z")?;
+            let xyz: Vec<f32> = at
+                .split(',')
+                .map(|v| v.trim().parse::<f32>())
+                .collect::<std::result::Result<_, _>>()
+                .context("--vfx position must be X,Y,Z")?;
+            let [x, y, z] = xyz[..] else {
+                bail!("--vfx position must be X,Y,Z");
+            };
+            Ok(thedas_render::Prop {
+                label: format!("vfx{i}"),
+                models: Vec::new(),
+                attached: Vec::new(),
+                morph: None,
+                hide_hair: false,
+                tints: Vec::new(),
+                effects: vec![thedas_render::PropEffect {
+                    model: model.trim().trim_end_matches(".mmh").to_ascii_lowercase(),
+                    key: format!("vfx{i}"),
+                    age: 0.0,
+                    lasting: true,
+                }],
+                transform: thedas_render::Prop::placement([x, y, z], 0.0),
+            })
+        })
+        .collect()
 }
 
 fn parse_size(s: &str) -> Result<(u32, u32)> {
@@ -742,6 +786,9 @@ fn capture(
                     loaded.render_path,
                 );
                 renderer.frame_effects = loaded.frame_effects;
+                // `--vfx` effects play through their timelines up to the capture's time (no
+                // animator poses viewer props).
+                renderer.play_prop_effects(scene, shader_time);
                 renderer.set_time(shader_time);
                 log_stats(&renderer);
                 renderer.capture(ctx, &camera, w, h)?
@@ -1448,6 +1495,7 @@ impl App {
                     self.loaded.render_path,
                 );
                 r.frame_effects = self.loaded.frame_effects;
+                r.start_prop_effects(scene, 0.25);
                 log_stats(&r);
                 println!("camera {}", self.camera.spec());
                 Some(r)
@@ -6706,7 +6754,8 @@ fn main() -> Result<()> {
         args.area.as_deref().unwrap_or(DEFAULT_AREA)
     };
     let detail = thedas_render::scene::Detail::parse(&args.detail).unwrap_or_default();
-    let mut loaded = load(&install, area, &args.shaders, &[], detail)?;
+    let vfx = parse_vfx(&args.vfx)?;
+    let mut loaded = load(&install, area, &args.shaders, &vfx, detail)?;
     loaded.frame_effects = args.frame_effects == "on";
     loaded.render_path = thedas_render::RenderPath::parse(&args.renderer).unwrap_or_default();
     if let Some(l) = live.as_mut() {
@@ -7648,6 +7697,19 @@ fn pack_note(name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn vfx_specs_parse_into_effect_props() {
+        let props = super::parse_vfx("fxa_fire_aoe_p@1,2,3; FXA_Ice_Cld_P.mmh @ -4.5,0,7").unwrap();
+        assert_eq!(props.len(), 2);
+        assert_eq!(props[0].effects[0].model, "fxa_fire_aoe_p");
+        assert_eq!(props[1].effects[0].model, "fxa_ice_cld_p");
+        assert!(props[0].effects[0].lasting && props[0].models.is_empty());
+        assert_eq!(props[1].transform.w_axis.truncate(), glam::Vec3::new(-4.5, 0.0, 7.0));
+        assert!(super::parse_vfx("").unwrap().is_empty());
+        assert!(super::parse_vfx("fxa_fire_aoe_p").is_err());
+        assert!(super::parse_vfx("fxa_fire_aoe_p@1,2").is_err());
+    }
+
     /// Against a real install (`THEDAS_INSTALL`), offscreen: the EA logo's frame
     /// two seconds in is drawn letterboxed in a taller window (written to `$INTRO_PNG` when
     /// set, to look at).
