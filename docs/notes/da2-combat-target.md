@@ -73,3 +73,27 @@ Origins isolation. Installed-resource A/B replay must report the first changed
 authored decision and the outcome, without treating this missing AI input as a
 proven sole cause of any wipe. No damage, health, cooldown, difficulty or stat
 adjustment belongs in this repair.
+
+## Installed-resource replay
+
+In the post-Ogre checkpoint, the first matched changed getter is Bethany's
+`rules_core` call at t=861964: invalid on baseline, living hostile 540 with this
+repair. The script now validates that target and follows its hostile-target
+branch instead of attempting a cluster target and falling through to another
+tactic. Preparation also emits basic-attack selection before approach, so the
+first event-order difference occurs earlier, at t=860350.
+
+Replaying all 662 baseline requests literally leaves the candidate alive in
+combat at t=885350; baseline had wiped at t=900750. These are input-count
+endpoints, not matched elapsed times: game-over handling and commands affect
+time advancement. Extending the candidate with authored party AI clears the
+fight at t=958350. Independently rerunning the original conditional driver
+clears it at t=956950. Both candidate runs have zero script errors, without
+developer healing, direct kills, activation or plot forcing.
+
+The earlier pre-Ogre checkpoint remains a separate limitation. The conditional
+driver still wipes (t=915150 versus baseline t=903150). Its literal-input replay
+reaches an ended Innocent Blood conversation that the old input list never
+closes, then stalls in combat. This is evidence of changed AI input and a
+successful post-Ogre cleanup, not a claim that the entire prologue or its wipe
+causes are resolved.
