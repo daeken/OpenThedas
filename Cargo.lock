@@ -5341,6 +5341,7 @@ dependencies = [
  "log",
  "naga",
  "pollster 0.4.0",
+ "serde_json",
  "thedas-formats",
  "thedas-shader",
  "thedas-vfs",
