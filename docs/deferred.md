@@ -414,6 +414,31 @@ ambient discontinuities. The original baked image remains the default while thos
 addressed. Moving the remaining material families into the G-buffer is still
 the next coverage step.
 
+## Real-time bounce
+
+`fs_bounce` gathers one bounce of light at half resolution before the lighting pass, which
+adds it to the ambient term (times the albedo in fused frames). `THEDAS_DEFERRED_BOUNCE=0`
+turns it off; `THEDAS_DEFERRED_VIEW=bounce` shows it alone.
+
+- **Shadowed point lights:** each cube texel is the first surface the light reaches, so it
+  is lit; 24 texels per light (four per face, a 2 × 2 grid jittered per pixel) become small
+  emitters at that point, with a normal from neighbouring texels and the light's colour and
+  falloff. Each stands for its solid angle times its distance squared, and relights a
+  receiver by both cosines over `π r²` (`r²` clamped near the patch). Bounce surfaces reflect
+  a fixed grey (0.4): the cubes hold no albedo. Lights reach receivers within twice their
+  radius and only in rooms they reach.
+- **Sun (screen-space):** sixteen points of a 3 m hemisphere around the receiver, each the
+  surface the screen shows there, lit by the sun through its cascades and reflecting its own
+  G-buffer albedo (so a green carpet tints nearby stone). The sun's maps can't be used the
+  way the cubes are: they see a roof, not the sunlit floor under a window. Off-screen
+  surfaces are missed, so the bounce fades at the frame's edges.
+
+Which lights bounce depends on the lightmap mode: with lightmaps (`baked`, `hybrid`) only
+the dynamic lights (emitters, spells), whose bounce the lightmaps never held; with none
+(`realtime`) the static lights and the sun too. No receiver-to-sender visibility test yet,
+no temporal accumulation (the per-pixel jitter is averaged by the depth-aware 2 × 2
+upsample only), and one bounce.
+
 ## Measuring frame cost
 
 For fixed-scene save captures (`--save ...`), `THEDAS_BENCH_FRAMES=120 THEDAS_BENCH_DUMP=1`

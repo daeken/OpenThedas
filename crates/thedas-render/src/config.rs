@@ -18,6 +18,7 @@ pub(crate) struct Config {
     /// is real-time (see `docs/deferred.md`).
     pub realtime_direct: bool,
     pub ssao: bool,
+    pub bounce: bool,
     pub point_shadows: bool,
     pub shadow_slots: usize,
     pub tree_shadows: bool,
@@ -106,6 +107,7 @@ pub(crate) static CONFIG: LazyLock<Config> = LazyLock::new(|| {
         baked_lighting: baked_lighting() != BakedLighting::Realtime,
         realtime_direct: baked_lighting() == BakedLighting::Hybrid,
         ssao: enabled("THEDAS_DEFERRED_SSAO"),
+        bounce: enabled("THEDAS_DEFERRED_BOUNCE"),
         point_shadows: enabled("THEDAS_DEFERRED_POINT_SHADOWS"),
         shadow_slots: std::env::var("THEDAS_DEFERRED_SHADOW_SLOTS")
             .ok()
