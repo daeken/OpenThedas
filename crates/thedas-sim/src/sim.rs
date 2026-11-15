@@ -2970,6 +2970,38 @@ impl Sim {
                 }
             }
         }
+        // DA2's task-37 motion is sampled on its own animation clock. Changing
+        // an impact deadline to the tail must not rewind its position.
+        for (id, wanted) in self.da2_animation_positions() {
+            let Some((was, area)) = self.world.get(id).map(|o| (o.position, o.area)) else {
+                continue;
+            };
+            if was == wanted {
+                continue;
+            }
+            let mut at = self.slide_past_bodies(id, was, wanted).unwrap_or(wanted);
+            if was == at {
+                continue;
+            }
+            if let Some(area) = area {
+                if self.door_sight(area).blocks(was, at) {
+                    continue;
+                }
+                if let Some(g) = self.nav_grid(area) {
+                    at = crate::nav::walkable_reach(&g, was, at).unwrap_or(was);
+                }
+            }
+            // Use the same trigger-crossing samples as ordinary locomotion.
+            let steps = (crate::engine::dist(was, at) / TRIGGER_STEP).ceil().max(1.) as usize;
+            for i in 1..=steps {
+                let f = i as f32 / steps as f32;
+                self.move_object(
+                    id,
+                    std::array::from_fn(|j| was[j] + (at[j] - was[j]) * f),
+                    None,
+                );
+            }
+        }
     }
 
     /// Puts a `CommandMoveToObject` walker that stepped inside its minimum range back out
