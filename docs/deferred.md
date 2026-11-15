@@ -62,7 +62,7 @@ worker threads exist. Discard warm-up frames and pair adjacent opposite modes.
 
    | target | format | contents |
    |---|---|---|
-   | 0 | `Rgba8Unorm` | albedo rgb; alpha material code: Static1 (0), prop (64/255), Low terrain (128/255), character (192/255), other terrain (1) |
+   | 0 | `Rgba8Unorm` | albedo rgb; alpha material code: Static1 (0 or a spare code for tint), Black (32/255), prop (64/255), Low terrain (128/255), character (192/255), other terrain (1) |
    | 1 | `Rgba8Unorm` | specular mask rgb (`mml_tSpecularMask`), specular power code (its alpha) |
    | 2 | `Rgba16Float` | normal (octahedral xy, world space, from `mml_tNormalMap` through the mesh's tangent frame, with derivative fallback), room index, specular falloff (`mml_vFalloffParams`, as Static1's vertex shader works it out) |
    | 3 | `Rgba16Float` | fused baked ambient/reflection/emission RGB and baked visibility; separate-pass modes retain lightmap or probe irradiance RGB; floats preserve HDR probes |
@@ -142,8 +142,22 @@ must affect bounce independently of reflection. Fusion is selected for the whole
 G-buffer, including object contributors, on each frame; renderer switches, target resizes
 and shadow updates do not reuse stale reflection pixels.
 
-Static1's material tint remains to come. The G-buffer uses authored mesh tangent frames
-where complete, with screen derivatives as a fallback (see the controls below).
+Nonzero Static1 material tints apply to the complete fused lighting sum before fog:
+`clamp(colour / (1 - tint.rgb), 0, 1) * (1 - tint.a)`. This includes bounce,
+direct diffuse/specular and cubemap reflection. Spare albedo material codes select a
+4 KiB uniform table shared by level and object contributors; albedo and specular masks
+retain their existing precision and the G-buffer formats and geometry passes stay the
+same. Untinted materials retain the existing deferred HDR equation. The palette
+supports 250 distinct transforms; an overflowing shared frame renders faithfully.
+Singular or nonfinite tints retain their faithful draw. Probe/SSAO, diagnostic and
+separate-reflection modes also retain tinted draws on their faithful shaders: applying
+the nonlinear clamp to bounce and reflection separately would be incorrect. Switching
+back to fused baked lighting restores their G-buffer coverage. Runtime fades keep the
+existing faithful handoff. `THEDAS_DEFERRED_STATIC_TINT=0` restores the previous omission;
+this comparison switch is read once.
+
+The G-buffer uses authored mesh tangent frames where complete, with screen derivatives
+as a fallback (see the controls below).
 
 **Deferred draws**: the level's own opaque draws with Static1's shaders
 (`Static1.psh`, or `Static1_Fast.psh` at Low; no alpha test, no blending), not

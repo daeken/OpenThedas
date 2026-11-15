@@ -27,6 +27,9 @@ use crate::scene::{AreaScene, DOMAIN_CHARACTERS, DOMAIN_LEVEL, SceneLight};
 #[path = "deferred_light_masks.rs"]
 mod light_masks;
 
+#[path = "deferred_static_tint.rs"]
+mod static_tint;
+
 #[path = "deferred_forward.rs"]
 mod forward;
 
@@ -147,7 +150,8 @@ struct DrawData {
     /// The assigned irradiance probe's twelve rows (RGB).
     probe: [[f32; 4]; 12],
     tint: [[f32; 4]; 10],
-    /// x: 0 level, 1 prop, 2 character; y: emissive; z: tint;
+    /// x: 0 level, 1 prop, 2 character; y: emissive;
+    /// z: object tint mode, or Static1 tint index (local until frame preparation);
     /// w: 1 face, 2 eye, 3 forward hair, 4 forward eyelash.
     material: [f32; 4],
     tint_color: [f32; 4],
@@ -168,6 +172,7 @@ struct LightingUniforms {
     counts: [u32; 4],
     depth_plane: [f32; 4],
     size: [f32; 4],
+    static_tints: [[f32; 4]; 256],
 }
 
 #[repr(C)]
@@ -204,6 +209,7 @@ struct PlanDraw {
     alpha_test: bool,
     /// 0: general material, 1: Static1, 2: terrain, 3: unlit Black.
     kind: usize,
+    static_tint: bool,
     /// Its index in [`D3dPass::draws`].
     k: usize,
     /// Its scene draw.
@@ -233,6 +239,9 @@ pub(crate) struct DeferredPass {
     cutouts: Vec<crate::deferred_cutout::Draw>,
     cutout_materials: Vec<crate::deferred_cutout::Material>,
     data: Vec<DrawData>,
+    static_tints: Vec<[f32; 4]>,
+    /// Nonlinear tints need a complete fused colour sum. Other modes stay faithful.
+    static_tints_active: bool,
     /// Diffuse, normal, specular, lightmap, cube, terrain masks, tint and emissive.
     groups: Vec<[wgpu::TextureView; 12]>,
     group_samplers: Vec<Option<wgpu::Sampler>>,
@@ -482,6 +491,7 @@ impl DeferredPass {
         let mut forward_tangents = HashMap::new();
         let mut draws = Vec::new();
         let mut data = Vec::new();
+        let mut static_tints = Vec::new();
         let mut takes = vec![false; d3d.draws.len()];
         let mut vertices = HashMap::new();
         let mut skin_count = 1; // Slot zero is identity for rigid meshes.
@@ -561,6 +571,27 @@ impl DeferredPass {
             let is_object = forward.is_some()
                 || object_material(program)
                 || crate::deferred_alpha::character(&program.name);
+            let tint_color = crate::d3d::material_vector(m, "mml_vTintColor").unwrap_or([0.0; 4]);
+            let static_tint = if !is_object
+                && !is_terrain
+                && !is_black
+                && crate::config::CONFIG.static_tint
+                && tint_color != [0.0; 4]
+            {
+                let Some(transform) = static_tint::transform(tint_color) else {
+                    continue; // Undefined authored tint stays on its original shader.
+                };
+                let i = static_tints
+                    .iter()
+                    .position(|t| *t == transform)
+                    .unwrap_or_else(|| {
+                        static_tints.push(transform);
+                        static_tints.len() - 1
+                    });
+                i + 1
+            } else {
+                0
+            };
             let alpha = forward.map(|f| &f.alpha).or(alpha);
             // The probe's cubemap as the faithful pass binds it (see `d3d::sampler_texture`).
             let cube = item.probe.and_then(|p| scene.probes.get(p)).map(|p| {
@@ -719,6 +750,7 @@ impl DeferredPass {
             draws.push(PlanDraw {
                 forward: forward_pipeline,
                 alpha_test: alpha.is_some(),
+                static_tint: static_tint != 0,
                 kind: if is_black {
                     3
                 } else if is_terrain {
@@ -822,7 +854,9 @@ impl DeferredPass {
                     } else {
                         0.0
                     },
-                    if program.name.contains("notnt") {
+                    if !is_object && !is_terrain && !is_black {
+                        static_tint as f32
+                    } else if program.name.contains("notnt") {
                         0.0
                     } else if program.name.contains("multnt") {
                         2.0
@@ -843,7 +877,7 @@ impl DeferredPass {
                         0.0
                     },
                 ],
-                tint_color: crate::d3d::material_vector(m, "mml_vTintColor").unwrap_or([0.0; 4]),
+                tint_color,
                 character: {
                     let mut c = crate::deferred_character::CharacterData::new(m);
                     if is_hair {
@@ -969,6 +1003,8 @@ impl DeferredPass {
             cutouts,
             cutout_materials,
             data,
+            static_tints,
+            static_tints_active: true,
             groups,
             group_samplers,
             group_noise_samplers,
@@ -1810,13 +1846,24 @@ impl DeferredPass {
         rooms: &HashMap<i64, u32>,
         fused_reflections: bool,
         direct_terrain_layers: bool,
+        tint_codes: &[u8],
     ) -> bool {
         if self.refused {
             return false;
         }
         self.trees.prepare(d3d, &mut self.takes);
+        if self.static_tints_active != fused_reflections {
+            self.static_tints_active = fused_reflections;
+            for d in self.draws.iter().filter(|d| d.static_tint) {
+                self.takes[d.k] = fused_reflections;
+            }
+        }
         if crate::config::CONFIG.log_materials && !self.logged_materials {
             self.logged_materials = true;
+            log::info!(
+                "deferred Static1 tint: {} distinct transforms, fused={fused_reflections}",
+                self.static_tints.len()
+            );
             forward::log_materials(d3d, &self.forward_draws, true);
             let mut counts: HashMap<&str, [usize; 2]> = HashMap::new();
             for (k, d) in d3d
@@ -1865,6 +1912,9 @@ impl DeferredPass {
             let world = d3d.world(d.draw).unwrap_or(Mat4::IDENTITY);
             let world_view = view * world;
             let mut data = *data;
+            if d.static_tint {
+                data.material[2] = tint_codes[data.material[2] as usize] as f32;
+            }
             data.room[0] = d.room.and_then(|r| rooms.get(&r)).copied().unwrap_or(0) as f32;
             if data.material[0] == 1.0 {
                 for c in 0..3 {
@@ -1962,6 +2012,22 @@ impl DeferredPass {
         let direct_terrain_layers = self
             .direct_terrain_layers
             .unwrap_or(crate::config::CONFIG.direct_terrain_layers);
+        let mut tints = static_tint::Table::new();
+        let Some(tint_codes) = std::iter::once(self.static_tints.as_slice())
+            .chain(contributors.iter().map(|c| c.pass.static_tints.as_slice()))
+            .map(|palette| tints.include(palette))
+            .collect::<Option<Vec<_>>>()
+        else {
+            // More than 250 distinct transforms cannot fit the material byte.
+            // The caller renders the complete frame faithfully on this path.
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                log::warn!(
+                    "deferred Static1 tint palette exceeds 250 transforms; rendering faithfully"
+                )
+            });
+            return false;
+        };
         for c in contributors.iter() {
             for &room in c.pass.rooms.keys() {
                 let next = self.rooms.len() as u32 + 1;
@@ -1979,10 +2045,11 @@ impl DeferredPass {
             &self.rooms.clone(),
             fused_reflections,
             direct_terrain_layers,
+            &tint_codes[0],
         ) {
             return false;
         }
-        for c in contributors.iter_mut() {
+        for (c, codes) in contributors.iter_mut().zip(&tint_codes[1..]) {
             c.pass.prepare(
                 ctx,
                 color_format,
@@ -1992,6 +2059,7 @@ impl DeferredPass {
                 &self.rooms,
                 fused_reflections,
                 direct_terrain_layers,
+                codes,
             );
         }
         let characters = self.data.iter().any(|d| d.material[0] > 1.5)
@@ -2218,6 +2286,7 @@ impl DeferredPass {
                         .unwrap_or(crate::config::CONFIG.depth_lights),
                 ) << 1)) as f32,
             ],
+            static_tints: tints.factors,
         };
         let sun = SunUniforms {
             data: d3d
@@ -2381,6 +2450,7 @@ impl DeferredPass {
                 && fused_reflections;
             draw_all(
                 &self.draws,
+                self.static_tints_active,
                 &mut pass,
                 gpu,
                 &gpu.gbuffer,
@@ -2394,6 +2464,7 @@ impl DeferredPass {
                 if let Some(g) = c.pass.gpu.as_ref() {
                     draw_all(
                         &c.pass.draws,
+                        c.pass.static_tints_active,
                         &mut pass,
                         g,
                         &g.gbuffer,
@@ -2482,6 +2553,7 @@ impl DeferredPass {
         pass.set_bind_group(2, gpu.sun_group.as_ref().expect("sun targets"), &[]);
         draw_all(
             &self.draws,
+            self.static_tints_active,
             &mut pass,
             gpu,
             &gpu.env,
@@ -2495,6 +2567,7 @@ impl DeferredPass {
             if let Some(g) = c.pass.gpu.as_ref() {
                 draw_all(
                     &c.pass.draws,
+                    c.pass.static_tints_active,
                     &mut pass,
                     g,
                     &g.env,
@@ -2692,6 +2765,7 @@ fn casters<'a>(
 #[allow(clippy::too_many_arguments)]
 fn draw_all(
     draws: &[PlanDraw],
+    static_tints_active: bool,
     pass: &mut wgpu::RenderPass<'_>,
     gpu: &Gpu,
     pipelines: &[wgpu::RenderPipeline; 3],
@@ -2705,6 +2779,7 @@ fn draw_all(
     for &i in &gpu.order {
         let d = &draws[i];
         if d.forward.is_some()
+            || (d.static_tint && !static_tints_active)
             || !d3d.in_view(d.k)
             || d3d.is_faded(&d3d.draws[d.k])
             || (!gbuffer && d.kind == 3)
@@ -2880,6 +2955,7 @@ mod tests {
     fn material_and_skin_uniforms_fit_portable_limits() {
         assert_eq!(MAX_LIGHTS, 192);
         assert_eq!(std::mem::size_of::<TileUniforms>(), 5120);
+        assert!(std::mem::size_of::<LightingUniforms>() <= 16 * 1024);
         assert!(std::mem::size_of::<TileUniforms>() <= 16 * 1024);
         assert!(std::mem::size_of::<DrawUniforms>() <= DRAW_STRIDE);
         assert_eq!(DRAW_STRIDE % 256, 0);

@@ -30,6 +30,15 @@ fn skin_transforms_positions_and_normals_and_materials_keep_hdr_and_tint() {
                     select(0.0, 1.0, point_uses_baked_mask(true, 0u)),
                     select(0.0, 1.0, point_uses_baked_mask(true, 128u))); }}
                 if (p.x >= 16.0) {{
+                    if (p.x >= 26.0) {{
+                        let colours = array<vec3<f32>, 6>(vec3<f32>(0.2, 0.4, 0.8), vec3<f32>(2.0, -0.5, 0.3),
+                            vec3<f32>(0.3, 0.3, 0.3), vec3<f32>(0.3), vec3<f32>(0.3), vec3<f32>(0.3));
+                        let factors = array<vec4<f32>, 6>(vec4<f32>(2.0, 4.0, 0.5, 0.5), vec4<f32>(2.0, 4.0, 0.5, 0.5),
+                            vec4<f32>(2.0, 4.0, 0.5, 0.0), vec4<f32>(2.0, 4.0, 0.5, 1.0),
+                            vec4<f32>(2.0, 4.0, 0.5, -1.0), vec4<f32>(-2.0, 4.0, 0.5, 2.0));
+                        let i = u32(p.x) - 26u;
+                        return vec4<f32>(static_tint_colour(colours[i], factors[i]), 1.0);
+                    }}
                     let input = VsIn(vec3<f32>(p.xy, 0.0), vec3<f32>(0.0, 0.0, 1.0),
                         p.xy, p.xy, weights, indices, vec4<f32>(0.0, 2.0, 0.0, 1.0), vec3<f32>(3.0, 0.0, 0.0));
                     var vertex = gbuffer_skinned(input);
@@ -271,12 +280,12 @@ fn skin_transforms_positions_and_normals_and_materials_keep_hdr_and_tint() {
         [1.0, 0.0, 0.0, 1.0],
         [1.0, 0.0, 0.0, 1.0],
         [0.0; 4],
-        [0.0; 4],
-        [0.0; 4],
-        [0.0; 4],
-        [0.0; 4],
-        [0.0; 4],
-        [0.0; 4],
+        [0.2, 0.5, 0.2, 1.0],   // Static tint saturates before alpha scaling.
+        [0.5, 0.0, 0.075, 1.0], // HDR and negative inputs reach the authored clamp.
+        [0.0, 0.0, 0.0, 1.0],
+        [0.6, 1.0, 0.15, 1.0],
+        [-0.6, -1.0, -0.15, 1.0],
+        [0.0, 2.0, 0.3, 1.0], // Scaling after saturation can leave [0, 1].
     ];
     for (actual, expected) in actual.iter().zip(expected.iter().flatten()) {
         assert!((actual - expected).abs() < 0.0001, "{actual} != {expected}");
