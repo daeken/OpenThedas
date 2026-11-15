@@ -20,6 +20,9 @@ they agree. Otherwise it queries the transition and destination-pose
 animations, then stores the requested unsigned-short state if it fits the
 controller count, or zero if it exceeds the count. The comparison precedes
 the bounds check, including for an already out-of-range current state.
+The transition query treats destination 0xffff as the current state's
+diagonal animation; an explicit setter request of -1 therefore queries
+that animation before storing normalized state zero.
 
 The simulation now applies these acceptance rules through both the script
 setter and successful action results. Synthetic engine-call regressions

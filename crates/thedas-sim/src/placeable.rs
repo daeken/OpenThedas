@@ -332,6 +332,9 @@ impl Sim {
 }
 
 fn controller_animation(controller: &crate::m2da::Table, from: u16, to: u16) -> Option<i64> {
+    // 0xa3ba80 uses 0xffff as a diagonal-query sentinel before bounding
+    // either index. The ordinary setter passes its unnormalized request.
+    let to = if to == u16::MAX { from } else { to };
     let (&from, &to) = (
         controller.order.get(usize::from(from))?,
         controller.order.get(usize::from(to))?,
@@ -568,7 +571,7 @@ mod tests {
                     vec![
                         Cell::String("B".into()),
                         Cell::Int(0),
-                        Cell::Int(0),
+                        Cell::Int(17),
                         Cell::Int(0),
                     ],
                 ),
@@ -600,6 +603,17 @@ mod tests {
                 .unwrap()
                 .pending
         );
+        s.world
+            .get_mut(id)
+            .unwrap()
+            .placeable_playback
+            .as_mut()
+            .unwrap()
+            .pending = true;
+        s.set_placeable_state(id, -1); // Animation query selects B's diagonal, then state becomes 0.
+        let o = s.world.get(id).unwrap();
+        assert_eq!(o.fields.get("State"), Some(&0));
+        assert!(!o.placeable_playback.as_ref().unwrap().pending);
         s.world
             .get_mut(id)
             .unwrap()
