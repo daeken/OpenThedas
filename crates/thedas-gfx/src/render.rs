@@ -33,6 +33,8 @@ struct Draw {
     // x: paint (0 solid, 1 bitmap, 2-4 gradients); y: destination blend; z: texture slot;
     // w: sampler.
     mode: vec4<f32>,
+    // A rectangular mask in target pixels (x0, y0, x1, y1); all zeros for none.
+    clip: vec4<f32>,
 };
 struct Vert {
     pos: vec2<f32>,
@@ -74,6 +76,10 @@ fn vs(@builtin(vertex_index) vi: u32) -> V {
 
 fn shade(i: V) -> vec4<f32> {
     let d = draws[i.rec];
+    if (any(d.clip != vec4<f32>(0.0))
+        && (i.pos.x < d.clip.x || i.pos.y < d.clip.y || i.pos.x >= d.clip.z || i.pos.y >= d.clip.w)) {
+        discard;
+    }
     var c = i.color;
     let mode = i32(d.mode.x + 0.5);
     let slot = u32(d.mode.z + 0.5);
@@ -177,6 +183,9 @@ struct DrawU {
     mul: [f32; 4],
     add: [f32; 4],
     mode: [f32; 4],
+    /// A rectangle (x0, y0, x1, y1, target pixels) outside which nothing draws: a mask that
+    /// is an axis-aligned rectangle, without the stencil. All zeros: none.
+    clip: [f32; 4],
 }
 
 const SAMPLES: u32 = 4;
@@ -191,6 +200,45 @@ struct GpuMesh {
     binding: Option<crate::gpu::Tex>,
     /// Scaleform text shadows keep shadowColor when the text's parent is tinted.
     fixed_rgb: bool,
+    /// The mesh is exactly this axis-aligned rectangle (local twips: x0, y0, x1, y1), so as
+    /// a mask it can clip by rectangle instead of the stencil.
+    rect: Option<[f32; 4]>,
+}
+
+/// Whether `m` covers exactly its bounding rectangle (every vertex on a corner, the
+/// triangles' area that of the rectangle).
+fn mesh_rect(m: &Mesh) -> Option<[f32; 4]> {
+    let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+    for v in &m.vertices {
+        x0 = x0.min(v.pos[0]);
+        y0 = y0.min(v.pos[1]);
+        x1 = x1.max(v.pos[0]);
+        y1 = y1.max(v.pos[1]);
+    }
+    let eps = 0.5;
+    let on = |a: f32, lo: f32, hi: f32| (a - lo).abs() < eps || (a - hi).abs() < eps;
+    if x1 - x0 < eps
+        || y1 - y0 < eps
+        || !m
+            .vertices
+            .iter()
+            .all(|v| on(v.pos[0], x0, x1) && on(v.pos[1], y0, y1))
+    {
+        return None;
+    }
+    let mut area = 0.0f32;
+    for t in m.indices.chunks_exact(3) {
+        let p = |i: u32| {
+            m.vertices
+                .get(i as usize)
+                .map(|v| v.pos)
+                .unwrap_or_default()
+        };
+        let (a, b, c) = (p(t[0]), p(t[1]), p(t[2]));
+        area += ((b[0] - a[0]) * (c[1] - a[1]) - (c[0] - a[0]) * (b[1] - a[1])).abs() / 2.0;
+    }
+    let want = (x1 - x0) * (y1 - y0);
+    ((area - want).abs() <= want * 1e-3).then_some([x0, y0, x1, y1])
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -714,6 +762,7 @@ impl Renderer {
         let mut b = Build {
             ops: Vec::new(),
             uniforms: Vec::new(),
+            clip: [0.0; 4],
         };
         let root = player.vm.root;
         self.walk(
@@ -850,6 +899,17 @@ impl Renderer {
             "gfx stream",
         );
         let table = self.table_group();
+        if std::env::var_os("GFX_BATCH_DEBUG").is_some() {
+            let mut runs: Vec<(String, usize)> = Vec::new();
+            for op in &b.ops {
+                let k = format!("{:?}/{:?}/{}", op.blend, op.stencil, op.reference);
+                match runs.last_mut() {
+                    Some((last, n)) if *last == k => *n += 1,
+                    _ => runs.push((k, 1)),
+                }
+            }
+            eprintln!("gfx batches: {runs:?}");
+        }
         let (Some((record_buf, _)), Some((stream_buf, _))) = (&self.records, &self.stream) else {
             return;
         };
@@ -1034,7 +1094,9 @@ impl Renderer {
             return None;
         }
         let verts = self.arena.alloc(&self.device, &self.queue, &m.vertices);
+        let rect = mesh_rect(m);
         Some(Arc::new(GpuMesh {
+            rect,
             verts,
             indices: Arc::from(m.indices.as_slice()),
             mode,
@@ -1498,7 +1560,7 @@ impl Renderer {
                 .and_then(|o| o.parent)
                 .map(|p| player.vm.display.world_matrix(p))
                 .unwrap_or(Matrix::IDENTITY);
-            self.mask_ops(
+            let rect = self.mask_ops(
                 player,
                 images,
                 mask,
@@ -1508,6 +1570,23 @@ impl Renderer {
                 Stencil::Push,
                 b,
             );
+            if let Some(rect) = rect {
+                let saved = b.clip;
+                b.clip = clip_intersect(saved, rect);
+                self.walk_content(
+                    player,
+                    images,
+                    d,
+                    parent,
+                    parent_cx,
+                    parent_blend,
+                    view,
+                    stencil,
+                    b,
+                );
+                b.clip = saved;
+                return;
+            }
             self.walk_content(
                 player,
                 images,
@@ -1603,6 +1682,7 @@ impl Renderer {
             let mut source = Build {
                 ops: Vec::new(),
                 uniforms: Vec::new(),
+                clip: [0.0; 4],
             };
             self.walk(
                 player,
@@ -1648,6 +1728,7 @@ impl Renderer {
                     m0: [1.0, 0.0, 0.0, 0.0],
                     m1: [0.0, 1.0, 0.0, 0.0],
                     mul: [1.0; 4],
+                    clip: b.clip,
                     ..Default::default()
                 });
                 b.push(&mesh, u, blend, stencil);
@@ -1735,24 +1816,36 @@ impl Renderer {
             .iter()
             .map(|(k, c)| (*k, *c, player.vm.display.get(*c).and_then(|x| x.clip_depth)))
             .collect();
-        // Open masks: (until depth, mask object, its matrix, stencil level inside).
-        let mut masks: Vec<(i32, DisplayId)> = Vec::new();
+        // Open masks: (until depth, mask object, the clip before a rectangular mask).
+        let mut masks: Vec<(i32, DisplayId, Option<[f32; 4]>)> = Vec::new();
         let mut level = stencil;
         let grid = self.grid_for(player, d, parent);
         for (depth, c, clip) in kids {
-            while let Some((until, m)) = masks.last().copied() {
+            while let Some((until, m, saved)) = masks.last().copied() {
                 if depth > until {
-                    self.mask_ops(player, images, m, world, view, level, Stencil::Pop, b);
-                    level -= 1;
+                    match saved {
+                        Some(saved) => b.clip = saved,
+                        None => {
+                            self.mask_ops(player, images, m, world, view, level, Stencil::Pop, b);
+                            level -= 1;
+                        }
+                    }
                     masks.pop();
                 } else {
                     break;
                 }
             }
             if let Some(until) = clip {
-                self.mask_ops(player, images, c, world, view, level, Stencil::Push, b);
-                level += 1;
-                masks.push((until, c));
+                match self.mask_ops(player, images, c, world, view, level, Stencil::Push, b) {
+                    Some(rect) => {
+                        masks.push((until, c, Some(b.clip)));
+                        b.clip = clip_intersect(b.clip, rect);
+                    }
+                    None => {
+                        level += 1;
+                        masks.push((until, c, None));
+                    }
+                }
                 continue;
             }
             if let Some((noscale, remap)) = &grid {
@@ -1802,9 +1895,14 @@ impl Renderer {
             }
             self.walk(player, images, c, world, cx, blend, view, level, b);
         }
-        while let Some((_, m)) = masks.pop() {
-            self.mask_ops(player, images, m, world, view, level, Stencil::Pop, b);
-            level -= 1;
+        while let Some((_, m, saved)) = masks.pop() {
+            match saved {
+                Some(saved) => b.clip = saved,
+                None => {
+                    self.mask_ops(player, images, m, world, view, level, Stencil::Pop, b);
+                    level -= 1;
+                }
+            }
         }
     }
 
@@ -1820,10 +1918,11 @@ impl Renderer {
         level: u32,
         mode: Stencil,
         b: &mut Build,
-    ) {
+    ) -> Option<[f32; 4]> {
         let mut tmp = Build {
             ops: Vec::new(),
             uniforms: std::mem::take(&mut b.uniforms),
+            clip: b.clip,
         };
         // A mask counts however its clip is set to show.
         let vis = player.vm.display.get(m).map(|o| o.visible);
@@ -1848,6 +1947,23 @@ impl Renderer {
             o.visible = v;
         }
         b.uniforms = tmp.uniforms;
+        // A mask that is one axis-aligned rectangle clips by rectangle: no stencil writes,
+        // and the masked content keeps batching with its neighbours.
+        if mode == Stencil::Push && tmp.ops.len() == 1 {
+            let op = &tmp.ops[0];
+            if let (Some(r), Some(u)) = (op.mesh.rect, b.uniforms.get(op.uniform as usize)) {
+                if u.m0[1].abs() < 1e-7 && u.m1[0].abs() < 1e-7 {
+                    let to_px = |x: f32, y: f32| {
+                        let nx = u.m0[0] * x + u.m0[2];
+                        let ny = u.m1[1] * y + u.m1[2];
+                        ((nx + 1.0) * 0.5 * view.w, (1.0 - ny) * 0.5 * view.h)
+                    };
+                    let (ax, ay) = to_px(r[0], r[1]);
+                    let (bx, by) = to_px(r[2], r[3]);
+                    return Some([ax.min(bx), ay.min(by), ax.max(bx), ay.max(by)]);
+                }
+            }
+        }
         let reference = level;
         for mut op in tmp.ops {
             op.stencil = mode;
@@ -1855,6 +1971,7 @@ impl Renderer {
             op.blend = Blend::Normal;
             b.ops.push(op);
         }
+        None
     }
 
     /// For a clip with a scaling grid that is scaled: its matrix with the scale taken out
@@ -2015,6 +2132,30 @@ struct Viewport {
 struct Build {
     ops: Vec<Op>,
     uniforms: Vec<DrawU>,
+    /// The rectangular mask records made now get (see `DrawU::clip`).
+    clip: [f32; 4],
+}
+
+/// The intersection of two clip rectangles (zeros meaning none); an empty result clips
+/// everything.
+fn clip_intersect(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
+    if a == [0.0; 4] {
+        return b;
+    }
+    if b == [0.0; 4] {
+        return a;
+    }
+    let r = [
+        a[0].max(b[0]),
+        a[1].max(b[1]),
+        a[2].min(b[2]),
+        a[3].min(b[3]),
+    ];
+    if r[2] <= r[0] || r[3] <= r[1] {
+        [1.0, 1.0, 0.0, 0.0]
+    } else {
+        r
+    }
 }
 
 /// Cuts `mesh` (moved by `place`) along the grid's lines so each piece lies in one cell, then
@@ -2218,6 +2359,7 @@ impl Build {
                 cx.add[3] / 255.0,
             ],
             mode: [0.0; 4],
+            clip: self.clip,
         };
         self.uniforms.push(u);
         self.uniforms.len() as u32 - 1
