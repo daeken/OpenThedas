@@ -37,3 +37,24 @@ three followers on the pressure plates nor interacts with this placeable. The
 story also requires actually taking the shield, completing Gorim's conversation,
 and bringing a party member back through the betrayal trigger. See the external
 `origdn.report.md` for the save-specific route and observed validation results.
+
+## Pressure-plate area-of-effect creators
+
+The same origin exposes another creature-only filter in `create_aoe`. Each plate
+applies its persistent AoE with itself as creator. On ENTER, the pad script reads
+`GetEventCreator`, sets that placeable's `TRIG_TALK_REPEAT` to the AoE member count,
+then reads it back. Only count one advances a plate flag. Filtering the creator
+to creatures makes both local calls use OBJECT_INVALID, so no plate flag is set.
+
+In the same pinned exe, `0x7a03bf` reads the effect's creator at `+0x40` and
+passes it to `0x7e4720`, which stores the id unchanged at AoE `+0x4ac`.
+`0x7e5c02..0x7e5c0e` forwards that field as ENTER's creator to `0x698850`;
+`0x7e5c7c..0x7e5c88` does the same for EXIT. The first heartbeat copies it to
+event `+0x24` at `0x7e4ba3..0x7e4bad`. None of these paths filters the creator's
+object type. Origins now preserves the id; DA2 retains its existing policy.
+
+Previously saved chamber AoEs already contain OBJECT_INVALID instead of the
+plate's creator. That information is lost: the fix does not guess a creator on
+load. Resume the supplied earlier `dwarf_noble_03_bdn200ar_ruined_taig.json`
+and enter the chamber freshly. Saves made after the fix preserve creators through
+save/reload, covered by a synthetic ENTER/EXIT/heartbeat test.
