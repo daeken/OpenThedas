@@ -76,7 +76,10 @@ Final workspace checks pass 1,164 tests, zero failures and 16 ignored.
 
 The final save immediately precedes `stop()` in each scenario; comparing its
 complete `world.plots` map includes inherited flags, rather than just that
-scenario's writes. Missing flags read false. Against exact main `0b42da74`:
+scenario's writes. Missing flags normally use the plot resource's initial
+value. Read-only `plot_flag` probes confirm that the three flags with
+absent-versus-stored differences below all default to false. Against exact
+main `0b42da74`:
 
 | Step | Stored entries main/candidate | Final flag values |
 | --- | ---: | --- |
