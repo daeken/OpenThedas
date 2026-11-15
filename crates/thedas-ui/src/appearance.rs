@@ -222,11 +222,7 @@ fn value(sim: &Sim, id: ObjectId, s: &Slider, min: f32, max: f32) -> f32 {
             .position(|n| *n == name)
             .map(|i| i as f32)
     };
-    let preset = || {
-        let h = head.as_ref()?;
-        let (d, _) = sim.vfs.read(&format!("{h}.mop")).ok()?;
-        thedas_formats::morph::MorphPreset::parse(&d).ok()
-    };
+    let preset = || sim.morph_preset(head.as_ref()?);
     let preset_model = |slot: usize| {
         let p = preset()?;
         Some(p.models.get(slot).cloned().flatten().unwrap_or_default())

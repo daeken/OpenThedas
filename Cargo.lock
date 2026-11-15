@@ -5227,6 +5227,7 @@ dependencies = [
  "ureq",
  "wgpu",
  "winit",
+ "zip 2.6.1",
 ]
 
 [[package]]
