@@ -839,6 +839,23 @@ fn reaches(l: Light, room: u32) -> bool {
     return (bits & (1u << (room % 32u))) != 0u;
 }
 
+// Whether either sun cascade holds `p` (its map coordinates fall inside), so its runtime
+// visibility is known there.
+fn sun_covered(p: vec3<f32>) -> bool {
+    if (sun.enabled.x == 0u || sun.direction.w < 0.5) {
+        return false;
+    }
+    let q = vec4<f32>(p, 1.0);
+    let sd = sun.data;
+    if (dot(sd[8], q) > 0.0) {
+        let t = vec3<f32>(dot(sd[0], q), dot(sd[1], q), dot(sd[2], q)) / dot(sd[3], q);
+        return all(t.xy >= vec2<f32>(0.0)) && all(t.xy <= vec2<f32>(1.0));
+    }
+    let t = vec3<f32>(dot(sd[4], q), dot(sd[5], q), dot(sd[6], q))
+        / dot(vec4<f32>(sd[7].xyz, 1.0), q);
+    return all(t.xy >= vec2<f32>(0.0)) && all(t.xy <= vec2<f32>(1.0));
+}
+
 fn point_uses_baked_mask(is_static: bool, material: u32) -> bool {
     // Props and characters have probes, not baked direct-light visibility.
     return is_static && material != 64u && material != 192u;
@@ -1090,19 +1107,30 @@ fn light_surface(frag: vec4<f32>, p: vec3<f32>, ga: vec4<f32>, spec: vec4<f32>,
         }
       }
     }
+    var diff_sun = vec3<f32>(0.0);
+    var spec_sun = vec3<f32>(0.0);
     if (lighting.sun_dir.w > 0.5) {
         let ls = -lighting.sun_dir.xyz;
         let ndl = dot(n, ls);
         if (strands || ndl >= 0.0) {
             let diffuse_response = select(ndl, max(ndl * 0.75 + 0.25, 0.0), strands);
-            diff_s = diff_s + diffuse_response * lighting.sun_colour.rgb;
+            diff_sun = diffuse_response * lighting.sun_colour.rgb;
             if (compute_specular) {
                 let h = normalize(v + ls);
-                spec_s = spec_s + highlight(n, h, power, hair) * lighting.sun_colour.rgb;
+                spec_sun = highlight(n, h, power, hair) * lighting.sun_colour.rgb;
             }
         }
     }
     let sun_shade = sun_visibility(p, n, !terrain_low && !object);
+    // The hybrid mode: where a runtime cascade covers the point, the sun takes that
+    // visibility alone, not the lightmap's baked mask; elsewhere it keeps the mask.
+    if (sun.enabled.z != 0u && !object && sun_covered(p)) {
+        diff_d = diff_d + diff_sun * sun_shade;
+        spec_d = spec_d + spec_sun * sun_shade;
+    } else {
+        diff_s = diff_s + diff_sun;
+        spec_s = spec_s + spec_sun;
+    }
     // Static1: alpha masks baked direct visibility once; RGB is baked bounce,
     // dimmed by only 15% in a runtime shadow (exploration camera w = 0).
     // Dynamic lights have their own visibility and never take this sun mask.
