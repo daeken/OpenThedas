@@ -416,6 +416,8 @@ fn floaty_scale(d: f32) -> f64 {
 }
 
 pub struct UiLayer {
+    /// What building the interface's values reuses between frames.
+    value_cache: thedas_ui::binding::ValueCache,
     pub stage: Stage,
     composite: Option<Composite>,
     device: wgpu::Device,
@@ -897,6 +899,7 @@ impl UiLayer {
         );
         stage.open_all(names);
         Self {
+            value_cache: Default::default(),
             stage,
             composite: None,
             device: ctx.device.clone(),
@@ -2246,9 +2249,14 @@ impl UiLayer {
         let (want, line) = {
             let sim = sim.lock().unwrap_or_else(|p| p.into_inner());
             let shown = self.shown.lock().map(|s| s.clone()).unwrap_or_default();
-            self.stage
-                .bridge
-                .bind(thedas_ui::binding::sim_values_for(&sim, &shown));
+            let values = thedas_ui::binding::sim_values_cached(&sim, &shown, &mut self.value_cache);
+            for (group, rows) in std::mem::take(&mut self.value_cache.updates) {
+                self.stage.bridge.bind_sticky(&group, rows);
+            }
+            for group in std::mem::take(&mut self.value_cache.drops) {
+                self.stage.bridge.drop_sticky(&group);
+            }
+            self.stage.bridge.bind(values);
             let waits = thedas_ui::binding::awaits_continue(&sim);
             let cutscene = sim.world.cutscene.is_some();
             let line = thedas_ui::binding::conversation(&sim).map(|d| {
@@ -3467,6 +3475,7 @@ impl UiLayer {
 
     pub fn tick(&mut self, dt_ms: f64) -> Vec<GameMessage> {
         self.loading_stains(dt_ms);
+        self.value_cache.advance(dt_ms);
         self.stage.tick(dt_ms)
     }
 
