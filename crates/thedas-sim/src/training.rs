@@ -108,7 +108,20 @@ impl Sim {
 
     /// Whether training holds the game paused (see the module's doc).
     pub fn training_paused(&self) -> bool {
-        self.world.training.mode != 0 && self.world.training.paused
+        self.world.training.mode != 0 && self.world.training.paused && !self.tutorials_held()
+    }
+
+    /// Tutorials wait for cinematic playback, including the handoff to a queued cut.
+    /// The native tutorial pause path only pauses explore/combat (0x6940cd), not
+    /// GameModeCutscene. Our cutscene clock is separate from `game_mode`.
+    pub fn tutorials_held(&self) -> bool {
+        self.game == thedas_vfs::Game::Origins
+            && (self.world.cutscene.is_some() || !self.world.cutscenes.is_empty())
+    }
+
+    /// A queued tutorial's pause becomes effective when its panel can be shown.
+    pub fn tutorial_paused(&self) -> bool {
+        self.world.tutorial_paused && !self.tutorials_held()
     }
 
     /// Why the game cannot be saved now, if it cannot: training mode disables saving
@@ -190,6 +203,42 @@ mod tests {
         assert_eq!(s.world.training.mode, 1);
         assert!(!s.training_paused(), "the conversation runs on");
         assert!(s.saving_blocked().is_some(), "saving is still refused");
+    }
+
+    #[test]
+    fn cinematic_playback_holds_tutorials_without_losing_the_pending_pause() {
+        let mut s = sim();
+        s.set_training_mode(1);
+        s.begin_training_step(1, 1065, 0);
+        s.world.tutorial_paused = true;
+        assert!(s.training_paused());
+        assert!(s.tutorial_paused());
+        let cut = crate::cutscene::Cutscene {
+            name: "intro.cut".into(),
+            seconds: 5.0,
+            lines: vec![],
+            elapsed_ms: 0,
+            from_dialog: false,
+            bound: vec![],
+            placement: None,
+        };
+        s.world.cutscenes.push(cut.name.clone());
+        assert!(s.tutorials_held(), "hold the queued handoff too");
+        assert!(!s.training_paused());
+        assert!(!s.tutorial_paused());
+        s.world.cutscenes.clear();
+        s.world.cutscene = Some(cut);
+        assert!(s.tutorials_held());
+        assert!(!s.training_paused());
+        assert!(!s.tutorial_paused());
+        assert!(s.saving_blocked().is_some());
+        s.game = thedas_vfs::Game::DragonAge2;
+        assert!(!s.tutorials_held(), "DA2 keeps its existing behavior");
+        s.game = thedas_vfs::Game::Origins;
+        s.world.cutscene = None;
+        assert_eq!(s.world.training.step, 1);
+        assert!(s.training_paused(), "the lesson resumes after the cut");
+        assert!(s.tutorial_paused());
     }
 
     #[test]

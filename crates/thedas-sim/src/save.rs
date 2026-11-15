@@ -43,7 +43,10 @@ pub const SAVE_FORMAT: u32 = 1;
 ///   `SkillList`: a monster's own abilities). Loading an earlier save adds each creature's
 ///   template abilities to what it has (one a script took away since is given back: earlier
 ///   saves cannot tell).
-pub const SAVE_REVISION: u32 = 8;
+/// - 9: Origins placeables load their `Useable` interaction flag. Earlier saves left
+///   non-useable scenery interactive; loading disables those objects. An earlier script
+///   explicitly enabling such scenery cannot be distinguished from the old default.
+pub const SAVE_REVISION: u32 = 9;
 
 /// The trace channel loading reports save damage on.
 pub const SAVE_CHANNEL: i32 = -7;
@@ -380,6 +383,13 @@ impl Sim {
         if save_revision < 8 {
             self.restore_template_abilities();
         }
+        if save_revision < 9 && self.game == thedas_vfs::Game::Origins {
+            for object in self.world.objects.values_mut().filter(|o| {
+                o.kind == crate::world::ObjectKind::Placeable && o.fields.get("Useable") == Some(&0)
+            }) {
+                object.interactive = false;
+            }
+        }
         // DA2 snapshots can contain PC followers initialized through the monster path
         // and already-perceived NPCs with no level. Rebuild only absent stats; the
         // predicates make this idempotent without changing Origins' save revision.
@@ -452,6 +462,46 @@ mod tests {
         let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(EngineTable::default()), 7);
         s.module_info.name = "test".into();
         s
+    }
+
+    #[test]
+    fn old_origins_scenery_loses_the_incorrect_interaction_default() {
+        for game in [thedas_vfs::Game::Origins, thedas_vfs::Game::DragonAge2] {
+            let mut s = sim();
+            s.game = game;
+            let door = s.world.spawn(ObjectKind::Placeable, "scenery_door");
+            s.world
+                .get_mut(door)
+                .unwrap()
+                .fields
+                .insert("Useable".into(), 0);
+            let usable = s.world.spawn(ObjectKind::Placeable, "usable_door");
+            s.world
+                .get_mut(usable)
+                .unwrap()
+                .fields
+                .insert("Useable".into(), 1);
+            let creature = s.world.spawn(ObjectKind::Creature, "creature");
+            s.world
+                .get_mut(creature)
+                .unwrap()
+                .fields
+                .insert("Useable".into(), 0);
+            let mut old = s.save_game();
+            old.revision = 8;
+            s.load_game(old).unwrap();
+            assert_eq!(
+                s.world.get(door).unwrap().interactive,
+                game != thedas_vfs::Game::Origins
+            );
+            assert!(s.world.get(usable).unwrap().interactive);
+            assert!(s.world.get(creature).unwrap().interactive);
+            // A script's explicit choice in a new save remains authoritative.
+            s.world.get_mut(door).unwrap().interactive = true;
+            let bytes = s.save_json().unwrap();
+            s.load_json(&bytes).unwrap();
+            assert!(s.world.get(door).unwrap().interactive);
+        }
     }
 
     #[test]
