@@ -6506,7 +6506,11 @@ fn main() -> Result<()> {
         env_logger::Env::default().default_filter_or("info,wgpu=warn,naga=warn"),
     ));
     let mut args = Args::parse();
-    if let Some(mode) = args.lighting.as_deref().and_then(thedas_render::BakedLighting::parse) {
+    if let Some(mode) = args
+        .lighting
+        .as_deref()
+        .and_then(thedas_render::BakedLighting::parse)
+    {
         thedas_render::set_baked_lighting(mode);
     }
     faces::set_language(&args.language);

@@ -81,11 +81,13 @@ pub fn set_baked_lighting(mode: BakedLighting) {
 }
 
 fn baked_lighting() -> BakedLighting {
-    *LIGHTING.get_or_init(|| match std::env::var("THEDAS_DEFERRED_BAKED_LIGHTING").as_deref() {
-        Ok("0") => BakedLighting::Realtime,
-        Ok("bounce") | Ok("hybrid") => BakedLighting::Hybrid,
-        _ => BakedLighting::Baked,
-    })
+    *LIGHTING.get_or_init(
+        || match std::env::var("THEDAS_DEFERRED_BAKED_LIGHTING").as_deref() {
+            Ok("0") => BakedLighting::Realtime,
+            Ok("bounce") | Ok("hybrid") => BakedLighting::Hybrid,
+            _ => BakedLighting::Baked,
+        },
+    )
 }
 
 pub(crate) static CONFIG: LazyLock<Config> = LazyLock::new(|| {
@@ -149,7 +151,10 @@ mod lighting_tests {
         assert_eq!(BakedLighting::parse("baked"), Some(BakedLighting::Baked));
         assert_eq!(BakedLighting::parse("Hybrid"), Some(BakedLighting::Hybrid));
         assert_eq!(BakedLighting::parse("bounce"), Some(BakedLighting::Hybrid));
-        assert_eq!(BakedLighting::parse("realtime"), Some(BakedLighting::Realtime));
+        assert_eq!(
+            BakedLighting::parse("realtime"),
+            Some(BakedLighting::Realtime)
+        );
         assert_eq!(BakedLighting::parse("off"), None);
     }
 }
