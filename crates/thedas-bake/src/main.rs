@@ -392,7 +392,18 @@ fn fit(
     settings: &Settings,
 ) -> Result<()> {
     use thedas_bake::fit;
-    let rooms: Vec<&String> = ambient.keys().collect();
+    // Every room with lightmapped pieces gets a fitted ambient, whether or not its light model
+    // has a runtime one.
+    let room_names: std::collections::BTreeSet<String> = ambient
+        .keys()
+        .cloned()
+        .chain(
+            bake.regions
+                .iter()
+                .map(|r| scene.draws[r.draw].room.to_ascii_lowercase()),
+        )
+        .collect();
+    let rooms: Vec<&String> = room_names.iter().collect();
     let mut rows = Vec::new();
     for (atlas, regions) in &bake.atlases {
         if let Some(f) = &args.atlas
@@ -823,7 +834,10 @@ fn fit(
         for (i, room) in rooms.iter().enumerate() {
             println!(
                 "  ambient {room}: fitted {:.4} {:.4} {:.4}  data {:?}",
-                lf.ambient[i].x, lf.ambient[i].y, lf.ambient[i].z, ambient[*room]
+                lf.ambient[i].x,
+                lf.ambient[i].y,
+                lf.ambient[i].z,
+                ambient.get(*room)
             );
         }
         let mut seen: Vec<(usize, usize)> = (0..lights.len())
