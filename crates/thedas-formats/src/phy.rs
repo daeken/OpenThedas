@@ -103,6 +103,9 @@ pub struct Phy {
     /// root's (0x543e70 walks the parents up and copies the root's byte), and sound
     /// occlusion reads it for the shapes a ray crosses (0x81c4f0 -> 0x5429c0).
     pub sound_material: u8,
+    /// Each collision object's shape-mask union, in file order. The runtime group's
+    /// getter returns the first nonzero actor mask (0x839080 -> 0x81e6c0).
+    pub actor_masks: Vec<u32>,
 }
 
 const MAX_DEPTH: usize = 64;
@@ -120,7 +123,8 @@ impl Phy {
         d.expect_type("PHY ")?;
         let root = gff.root;
         let mut shapes = Vec::new();
-        walk(&d, root, None, &mut shapes, 0)?;
+        let mut actor_masks = Vec::new();
+        walk(&d, root, None, &mut shapes, &mut actor_masks, 0)?;
         // The root node: the first node under the model header.
         let mut sound_material = 0;
         for c in d.structs(root, field::CHILDREN)? {
@@ -137,6 +141,7 @@ impl Phy {
             name: d.opt_str(root, field::NAME)?,
             shapes,
             sound_material,
+            actor_masks,
         })
     }
 }
@@ -146,6 +151,7 @@ fn walk(
     id: StructId,
     parent: Option<&str>,
     out: &mut Vec<Shape>,
+    actor_masks: &mut Vec<u32>,
     depth: usize,
 ) -> TypedResult<()> {
     if depth > MAX_DEPTH {
@@ -153,6 +159,7 @@ fn walk(
     }
     let label = d.label(id).0;
     if &label == b"cobj" {
+        let start = out.len();
         for s in d.structs(id, field::CHILDREN)? {
             if &d.label(s).0 == b"shap" {
                 if let Some(shape) = read_shape(d, s, parent)? {
@@ -160,6 +167,7 @@ fn walk(
                 }
             }
         }
+        actor_masks.push(out[start..].iter().fold(0, |mask, s| mask | s.mask));
         return Ok(());
     }
     let name = if &label == b"node" || &label == b"mshh" {
@@ -168,7 +176,7 @@ fn walk(
         parent.map(str::to_string)
     };
     for c in d.structs(id, field::CHILDREN)? {
-        walk(d, c, name.as_deref(), out, depth + 1)?;
+        walk(d, c, name.as_deref(), out, actor_masks, depth + 1)?;
     }
     Ok(())
 }
@@ -423,6 +431,10 @@ mod tests {
         assert_eq!(phy.name.as_deref(), Some("plc_test_0"));
         assert_eq!(phy.shapes.len(), 3);
         assert_eq!(phy.sound_material, 5);
+        assert_eq!(
+            phy.actor_masks,
+            [mask::STATIC | mask::STATIC_SOLID | mask::CREATURES]
+        );
         assert_eq!(phy.shapes[0].parent.as_deref(), Some("Root"));
         assert_eq!(
             phy.shapes[0].geometry,
