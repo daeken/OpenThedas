@@ -24,7 +24,8 @@
 //! the share by which the camera's position (+0x170) and orientation (+0x1a0) move toward
 //! the preset's (+0x180, +0x1b0): a plain lerp (0x5b0db0) from where the camera is now, so
 //! it covers most of the way in well under a second, slowing as it closes. Once the time
-//! is up, or the position is within 1e-6 (0xb217f0), the camera takes the preset's.
+//! is up the camera takes the preset's. At squared distance <= 1e-6 (0x45b080,
+//! 0xb217f0), the update instead leaves the camera and timer where they are.
 //! Provisional: the frame time is taken to be in seconds; the orientation is lerped as yaw
 //! and pitch here (the exe's 0x4cbc10 is not traced); the head height of the face preset is
 //! sampled when the preset is first framed for the creature's current look.
@@ -148,14 +149,20 @@ fn orientation() -> Quat {
 /// The time over which the camera's per-frame share toward a new preset grows to the whole
 /// way (milliseconds).
 pub const BLEND_MS: f64 = 4000.0;
+/// Squared positional tolerance (0x45b080 / 0xb217f0): one millimetre of distance.
+const BLEND_DISTANCE_SQUARED: f32 = 1e-6;
 
 /// One frame of a move toward `target` (see the module's notes): from `at`, with `gone`
 /// milliseconds moved before and `dt` this frame. Returns the camera and the time gone, or
-/// `None` for the time once the move is over (the camera is then the target).
+/// `None` when the timer reaches its limit. Inside the positional tolerance the exe
+/// skips the update, retaining both the current camera and the active timer.
 pub fn step(at: &Camera, target: &Camera, gone: f64, dt: f64) -> (Camera, Option<f64>) {
+    if at.position.distance_squared(target.position) <= BLEND_DISTANCE_SQUARED {
+        return (*at, Some(gone));
+    }
     let gone = gone + dt.max(0.0);
     let t = gone / BLEND_MS;
-    if t >= 1.0 || at.position.distance(target.position) < 1e-6 {
+    if t >= 1.0 {
         return (*target, None);
     }
     (blend(at, target, t as f32), Some(gone))
@@ -224,18 +231,35 @@ mod tests {
         let b = Camera::new(Vec3::new(10.0, 0.0, 0.0), 0.0, 0.0);
         // At 60 frames a second, as the exe steps it.
         let (mut at, mut gone, mut ms): (Camera, Option<f64>, f64) = (a, Some(0.0), 0.0);
-        while let Some(g) = gone {
+        let mut stopped = None;
+        for _ in 0..240 {
             ms += 1000.0 / 60.0;
-            (at, gone) = step(&at, &b, g, 1000.0 / 60.0);
+            let before = at;
+            (at, gone) = step(&at, &b, gone.unwrap(), 1000.0 / 60.0);
             if (ms - 500.0).abs() < 8.0 {
                 // Half a second in: well past halfway (a straight 4 s blend: an eighth).
                 assert!(at.position.x > 7.5, "{}", at.position.x);
             }
-            assert!(ms <= BLEND_MS + 20.0);
+            if at.position == before.position {
+                stopped.get_or_insert(ms);
+            }
         }
-        assert_eq!(at.position, b.position);
-        // Over within a second and a half (the position comes within 1e-6).
-        assert!(ms < 1500.0, "{ms}");
+        assert!(at.position.distance(b.position) <= 0.001);
+        assert!(stopped.unwrap() < 1500.0, "{stopped:?}");
+    }
+
+    #[test]
+    fn the_cutoff_is_squared_distance_and_keeps_the_last_camera() {
+        let at = Camera::new(Vec3::new(0.0005, 0.0, 0.0), 0.2, 0.1);
+        let target = Camera::new(Vec3::ZERO, 0.5, 0.3);
+        let (held, gone) = step(&at, &target, 500.0, 16.0);
+        assert_eq!(held.position, at.position);
+        assert_eq!((held.yaw, held.pitch), (at.yaw, at.pitch));
+        assert_eq!(gone, Some(500.0));
+        let outside = Camera::new(Vec3::new(0.002, 0.0, 0.0), 0.2, 0.1);
+        let (moved, gone) = step(&outside, &target, 500.0, 16.0);
+        assert!(moved.position.x < outside.position.x);
+        assert_eq!(gone, Some(516.0));
     }
 
     #[test]
