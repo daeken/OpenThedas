@@ -47,8 +47,15 @@ walks to Karl and follows the same replies. The baseline reaches t=1326515 with
 the five templars inactive and no fight. With activation, all five become active,
 the authored hostility handoff starts combat, and the driver wipes at t=1364215.
 Both have zero script errors. Tranquility completion is not claimed. No plot
-forcing, direct activation, developer healing, kill aids or forced transitions
-are used in the route replay.
+forcing, direct activation, developer healing or kill aids are used.
+
+The inherited checkpoint has an inconsistent arrival: the current area is the
+Chantry, but the hero still belongs to Hightown Night. The driver's ordinary
+`move_hero` request consequently takes the existing cross-area walk fallback,
+which moves the hero into Karl's area without elapsed time. This is a matched
+activation test, not proof of a faithful Chantry arrival. The later wipe also
+predates the separate stored-combat-target repair. Neither cinematic placement
+nor this activation omission alone is established as the cause of that wipe.
 
 Synthetic regressions cover the spoken-line/performance mapping, no-performance
 flag, bindings without world objects, current-area resolution, persistence on
