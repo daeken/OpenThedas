@@ -1609,7 +1609,8 @@ pub fn call(
             let kind = if h.sim.game == thedas_vfs::Game::Origins {
                 // 0x669550 converts the type bit to log2(type) + 1; the non-pooled
                 // factory at 0x6861f0 accepts only kinds 6 and 10. Preserve the
-                // positive conversion ranges, including noncanonical type bits.
+                // ordinary SSE2 path's positive conversion ranges, including
+                // noncanonical type bits (see script-created-object-types.md).
                 match int(a, 0) {
                     32..=63 => ObjectKind::Creature,
                     512..=1023 => ObjectKind::Placeable,

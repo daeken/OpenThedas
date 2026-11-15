@@ -8,6 +8,10 @@ truncation and addition of one (0x6696a3..0x6696c7). Ordinary positive inputs
 script constants are 32 and 512. Treating every noncanonical value as an unknown
 enum would discard part of this conversion.
 
+These ranges describe the ordinary SSE2 conversion path through
+0x8e34f9..0x8e350b. Boundary rounding in the historical x87 fallback has not
+been verified.
+
 The creation request reaches 0x687830 at 0x669705. It first checks a creature
 pool indexed by template. Without a matching pool, 0x68793b calls factory
 0x6861f0. That factory has two branches: kind 6 constructs a creature through
