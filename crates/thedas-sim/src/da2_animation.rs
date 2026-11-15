@@ -317,6 +317,10 @@ impl Sim {
         let motion = (|| {
             let o = o?;
             let cmd = o.commands.first()?;
+            // Modern preparation 0x641473 clears both flags for self casts.
+            if cmd.target == Some(id) {
+                return None;
+            }
             let abilities = self.world.tables().get(1, "")?;
             let flags = number(abilities.cell_by_hash(0x650e_5503, i64::from(ability)))? as i32;
             // 0x640e43 copies bit 0 into task bool 7 (translation). Bit 1 /
@@ -505,6 +509,17 @@ mod tests {
             cancel: None,
             motion: motion_keys(&motion_fixture()).unwrap(),
         };
+        sim.world.get_mut(who).unwrap().commands[0].target = Some(who);
+        sim.start_da2_animation_motion(who, 71, &sample, 1.);
+        assert!(
+            sim.world
+                .get(who)
+                .unwrap()
+                .combat
+                .animation_motion
+                .is_none()
+        );
+        sim.world.get_mut(who).unwrap().commands[0].target = Some(target);
         let moving_tables = sim.world.tables.clone();
         let turning_only = crate::m2da::Tables::empty();
         turning_only.insert(

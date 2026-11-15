@@ -16,6 +16,7 @@ Read-only inspection of the player's DA2 analysis image establishes:
   modern executor copies them to animation task 37 at 0x6d85b7..0x6d85e2.
   Boolean 7 permits translation (0x6d9215); boolean 8 permits turning. Ranged
   basic attacks with only bit 1 set must not acquire lunge translation.
+  Self-target preparation clears both flags at 0x641473.
 - Task 37's processor at 0x6d8860 supplies an animation-controller movement
   request, through 0x52ec70. Animation locomotion is separate from the cast's
   impact event and its remaining tail.
@@ -53,6 +54,8 @@ This is not a complete native PhysX controller or animation blend graph.
 Root rotation, native controller blending, arbitrary target-node bounds,
 vertical steps and exact collision response remain separate work. The
 existing turn-to-target approximation supplies the initial orientation.
+Target-distance warping here covers object-targeted attacks; ground-targeted
+motion retains the unwarped curve.
 Origins neither creates nor advances this DA2 motion state; its absent
 optional save field remains omitted.
 
