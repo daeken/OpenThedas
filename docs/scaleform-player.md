@@ -151,6 +151,10 @@ The player lives in `crates/thedas-gfx`:
 - Display `_x`/`_y` writes truncate to whole twips (1/20 pixel) toward zero.
   Rounding each fractional credits-scroll update instead compounds a position
   difference over time, despite matching the movie's timer rate.
+- Script-visible bounds compose each leaf's transform before measuring and round
+  transformed points to the nearest twip with ties to even. Rounding the far edge
+  outwards inflated the area map's 604-pixel viewport to 604.1 pixels,
+  changing the map scale, centring and marker placement.
 - Compare hidden-window captures of the menu, chargen, HUD, inventory and conversation
   against the previous own-player build. Exercise the dwarf commoner and human noble
   chargen click-through as well as the simulation gates.
