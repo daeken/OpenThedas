@@ -1023,6 +1023,11 @@ impl UiMovie {
         )
     }
 
+    /// Reads a movie variable directly, including primitive values such as zero.
+    pub fn get(&mut self, path: &str) -> UiValue {
+        own::from_host(&self.player.player.get_variable(path))
+    }
+
     /// Sets a movie variable by path (`_global.GUISystem.OriginalStageWidth`), as Scaleform's
     /// `SetVariable` does.
     pub fn set(&mut self, path: &str, value: UiValue) {

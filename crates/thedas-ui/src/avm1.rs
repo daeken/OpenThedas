@@ -1029,6 +1029,12 @@ fn wrap_returning(out: &mut Vec<u8>, f: &str) {
 /// wrapping [`RETURNING_FSCOMMANDS`].
 pub fn register_invoke(movie_name: &str) -> Vec<u8> {
     let mut out = Vec::new();
+    if movie_name.eq_ignore_ascii_case("popuplayer.gfx") {
+        get_path(&mut out, &["_global"]);
+        push(&mut out, &[Push::Str("thedas_dialog_input_ready")]);
+        out.extend(dialog_input_ready_function());
+        out.push(SET_MEMBER);
+    }
     // _global.thedas_wrap = wrap_maker
     get_path(&mut out, &["_global"]);
     push(&mut out, &[Push::Str("thedas_wrap")]);
@@ -1272,6 +1278,27 @@ fn set_function() -> Vec<u8> {
     function(&["p", "m", "v"], &body)
 }
 
+/// The popup initializer installs onKeyDown last, after assigning the default text,
+/// name limits and focus. A field can exist for many host ticks before this happens.
+fn dialog_input_ready_function() -> Vec<u8> {
+    let mut body = Vec::new();
+    get_path(
+        &mut body,
+        &[
+            "_global",
+            "PopupLayer",
+            "ms_mcPopup",
+            "TextInput_mc",
+            "TextField",
+            "onKeyDown",
+        ],
+    );
+    body.push(TYPEOF);
+    push(&mut body, &[Push::Str("function")]);
+    body.extend_from_slice(&[STRICT_EQUALS, RETURN]);
+    function(&[], &body)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1287,6 +1314,43 @@ mod tests {
         fn font(&self, _: &str, _: bool, _: bool) -> Option<std::sync::Arc<thedas_gfx::swf::Font>> {
             None
         }
+    }
+
+    #[test]
+    fn popup_input_readiness_requires_the_initializers_final_handler() {
+        use thedas_gfx::HostValue;
+        use thedas_gfx::avm1::value::Value;
+
+        let movie = b"FWS\x08\x12\0\0\0\x08\0\0\x1e\x01\0\x40\0\0\0";
+        let mut player = thedas_gfx::Player::new(
+            movie,
+            "popup-ready-test",
+            Box::new(Empty),
+            std::sync::Arc::new(Empty),
+            Some(register_invoke("popuplayer.gfx")),
+        )
+        .unwrap();
+        player.run_frame();
+        let ready = "_global.thedas_dialog_input_ready";
+        assert_eq!(player.invoke(ready, &[]), HostValue::Bool(false));
+        let mut parent = Value::Object(player.vm.global);
+        for name in ["PopupLayer", "ms_mcPopup", "TextInput_mc", "TextField"] {
+            let child = Value::Object(player.vm.new_object());
+            player.vm.set(&parent, name, child.clone());
+            parent = child;
+        }
+        // Existence, type and name limits are not evidence that init finished.
+        player.vm.set(&parent, "type", Value::from("input"));
+        player.vm.set(&parent, "maxChars", Value::Number(20.0));
+        assert_eq!(player.invoke(ready, &[]), HostValue::Bool(false));
+        let handler = player.vm.new_native(|_, _, _| Value::Undefined);
+        player.vm.set(&parent, "onKeyDown", Value::Object(handler));
+        assert_eq!(player.invoke(ready, &[]), HostValue::Bool(true));
+        // A replacement dialog does not inherit readiness from the old field.
+        let popup_layer = player.get_value("_global.PopupLayer");
+        let replacement = Value::Object(player.vm.new_object());
+        player.vm.set(&popup_layer, "ms_mcPopup", replacement);
+        assert_eq!(player.invoke(ready, &[]), HostValue::Bool(false));
     }
 
     #[test]

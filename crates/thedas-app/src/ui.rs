@@ -1,6 +1,7 @@
 //! The Scaleform interface layer: movies played by `thedas-ui` into offscreen textures,
 //! composited over the scene with premultiplied alpha.
 
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
@@ -363,6 +364,8 @@ struct TextPopup {
     labels: [String; 2],
     frames: u8,
     free_text: bool,
+    input_ready: bool,
+    pending_keys: VecDeque<thedas_ui::UiKey>,
 }
 
 impl TextPopup {
@@ -1735,6 +1738,8 @@ impl UiLayer {
             labels: [ok.into(), cancel.into()],
             frames: 0,
             free_text: false,
+            input_ready: false,
+            pending_keys: VecDeque::new(),
         });
     }
 
@@ -1749,7 +1754,7 @@ impl UiLayer {
         let Some(popup) = self.text_popup.take_if(|p| p.id == id) else {
             return;
         };
-        if self.stage.dialog_prompt().as_deref() == Some(&popup.prompt) {
+        if self.stage.owns_dialog(popup.id) {
             self.stage.call_in(
                 thedas_ui::stage::POPUP_LAYER,
                 "_global.PopupLayer.HideAllPopups",
@@ -1913,13 +1918,13 @@ impl UiLayer {
             return;
         };
         if popup.frames >= 2 {
-            // Up: its field takes the typing (see `Stage::focus_dialog_field`), for its first
-            // frames (later, a press on its buttons lets go of the focus on purpose).
-            if popup.frames < FOCUS_FRAMES
-                && self.stage.dialog_prompt().as_deref() == Some(&popup.prompt)
-            {
+            // Ordinary prompts retain their initial focus retries. Free text
+            // establishes focus at initialization, in allow_free_text_popup.
+            if popup.frames < FOCUS_FRAMES {
                 popup.frames += 1;
-                self.stage.focus_dialog_field();
+                if !popup.free_text && self.stage.owns_dialog(popup.id) {
+                    self.stage.focus_dialog_field();
+                }
             }
             return;
         }
@@ -1941,22 +1946,43 @@ impl UiLayer {
             if up.is_none() {
                 log::warn!("ui: a text box with no popup layer up");
                 self.text_popup = None;
+            } else if self.stage.dialog_prompt().as_deref() == Some(&popup.prompt) {
+                self.stage.claim_dialog(popup.id);
             }
         }
     }
 
-    /// The movie initializes its field during the tick. Apply the report policy
-    /// afterward, before rendering or accepting input on the first visible frame.
+    /// Host ticks and movie frames are independent. Keep the report policy for
+    /// the live clip's whole lifetime and deliver early keys only after its
+    /// initializer has finished writing the default text and Enter handler.
     fn allow_free_text_popup(&mut self) {
-        let Some(popup) = self.text_popup.as_ref() else {
+        let Some(popup) = self.text_popup.as_mut() else {
             return;
         };
-        if popup.free_text
-            && (2..FOCUS_FRAMES).contains(&popup.frames)
-            && self.stage.dialog_prompt().as_deref() == Some(&popup.prompt)
-        {
-            self.stage.allow_dialog_free_text();
+        if popup.free_text && popup.frames >= 2 && self.stage.owns_dialog(popup.id) {
+            // Init can finish after the host's focus retries have ended. Focus
+            // once its handler exists, including before replaying queued Enter.
+            popup.input_ready = self.stage.allow_dialog_free_text()
+                && (popup.input_ready || self.stage.focus_initialized_dialog_field());
+            if popup.input_ready {
+                while let Some(key) = popup.pending_keys.front().copied() {
+                    if !self.stage.owns_dialog(popup.id) {
+                        popup.pending_keys.clear();
+                        break;
+                    }
+                    if !self.stage.key(key) {
+                        break;
+                    }
+                    popup.pending_keys.pop_front();
+                }
+            }
         }
+    }
+
+    fn free_text_input_pending(&mut self) -> bool {
+        self.text_popup.as_ref().is_some_and(|p| {
+            p.free_text && p.frames >= 2 && !p.input_ready && self.stage.owns_dialog(p.id)
+        })
     }
 
     /// Shows a script's message box (`ShowPopup`, `World::popup`) on the popup layer, as the
@@ -3616,19 +3642,28 @@ impl UiLayer {
         self.stage.click_as(button, x, y);
     }
 
-    /// Whether a movie's text field has focus (keys type into it, not the game's).
+    /// Whether text input belongs to a focused field or an initializing report box.
     pub fn typing(&mut self) -> bool {
-        self.stage.text_focus().is_some()
+        self.free_text_input_pending() || self.stage.text_focus().is_some()
     }
 
-    /// A key for the focused text field; false when there is none.
+    /// A key for the focused field, queued while our report field initializes.
     pub fn key(&mut self, key: thedas_ui::UiKey) -> bool {
+        self.allow_free_text_popup();
+        if self.free_text_input_pending() {
+            self.text_popup
+                .as_mut()
+                .unwrap()
+                .pending_keys
+                .push_back(key);
+            return true;
+        }
         self.stage.key(key)
     }
 
-    /// Types text into the focused text field; false when there is none.
+    /// Types text through the same initialization gate as individual key events.
     pub fn type_text(&mut self, text: &str) -> bool {
-        self.stage.type_text(text)
+        text.chars().all(|c| self.key(thedas_ui::UiKey::Char(c)))
     }
 
     /// Draws every movie over `frame`, in order: straight into it (see `thedas_ui::direct`),
@@ -3844,11 +3879,16 @@ fn gui_id(s: Screen, container: bool) -> Option<i32> {
 mod tests {
     use super::*;
 
-    /// Uses the installed movie, without a window or simulation. No game data is
-    /// embedded in this test. Run explicitly with THEDAS_INSTALL set.
-    #[test]
-    #[ignore]
-    fn report_popups_wait_cancel_and_keep_typing_across_name_and_choice_boxes() {
+    fn popup_property(ui: &mut UiLayer, path: &str) -> thedas_ui::UiValue {
+        ui.stage
+            .movies
+            .iter_mut()
+            .find(|m| m.name == thedas_ui::stage::POPUP_LAYER)
+            .unwrap()
+            .get(path)
+    }
+
+    fn installed_popup_ui() -> UiLayer {
         let install = thedas_vfs::DaoInstall::open(
             std::env::var_os("THEDAS_INSTALL").expect("THEDAS_INSTALL"),
         )
@@ -3865,6 +3905,145 @@ mod tests {
             &[thedas_ui::stage::POPUP_LAYER.into()],
             (1280, 720),
         );
+        for _ in 0..20 {
+            ui.stage.tick(1000.0 / 30.0);
+        }
+        ui
+    }
+
+    fn delay_report_input_init(ui: &mut UiLayer) {
+        // Reports reopen the same movie after their marking choice closes.
+        ui.ask_choice(41, "Before report", "Continue", "Cancel");
+        for _ in 0..20 {
+            ui.show_text_popup();
+            ui.stage.tick(1000.0 / 30.0);
+        }
+        ui.stage.call_in(
+            thedas_ui::stage::POPUP_LAYER,
+            "_global.PopupLayer.ms_mcPopup.Buttons_mc.Button2_mc.SimulateButtonPush",
+            &[],
+        );
+        ui.cancel_text_popup(41);
+        ui.stage.tick(1000.0 / 30.0);
+        assert!(ui.stage.dialog_prompt().is_none());
+        ui.ask_free_text(42, "Late report", "", "Save", "Cancel");
+        // Many host ticks, zero movie frames: deterministically put the movie's
+        // initializer beyond the former FOCUS_FRAMES policy/focus window.
+        for _ in 0..FOCUS_FRAMES + 20 {
+            ui.show_text_popup();
+            ui.stage.tick(0.0);
+            ui.allow_free_text_popup();
+        }
+        let popup = ui.text_popup.as_ref().unwrap();
+        assert_eq!(popup.frames, FOCUS_FRAMES);
+        assert!(!popup.input_ready);
+        assert!(ui.stage.owns_dialog(42));
+        assert!(
+            ui.typing(),
+            "early input must be captured even before focus"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires THEDAS_INSTALL and an offscreen GPU"]
+    fn report_late_input_init_does_not_restore_name_limits() {
+        let mut ui = installed_popup_ui();
+        delay_report_input_init(&mut ui);
+        for _ in 0..20 {
+            ui.stage.tick(1000.0 / 30.0);
+            ui.allow_free_text_popup();
+        }
+        assert!(ui.text_popup.as_ref().unwrap().input_ready);
+        let note = "Sera's long report, 000123. #$% \"quoted\"! ".repeat(10);
+        assert!(ui.type_text(&note));
+        let field = "_global.PopupLayer.ms_mcPopup.TextInput_mc.TextField";
+        // The player exposes maxChars = 0 (unlimited) as null.
+        assert_eq!(
+            popup_property(&mut ui, &format!("{field}.maxChars")),
+            thedas_ui::UiValue::Null,
+        );
+        assert_eq!(
+            popup_property(&mut ui, &format!("{field}.restrict")),
+            thedas_ui::UiValue::Null,
+        );
+        assert_eq!(
+            popup_property(&mut ui, &format!("{field}.text")),
+            thedas_ui::UiValue::String(note.clone()),
+        );
+        assert!(ui.key(thedas_ui::UiKey::Enter));
+        assert_eq!(
+            ui.stage.bridge.value("GUIPopupLayer.InputText"),
+            Some(thedas_ui::UiValue::String(note))
+        );
+        assert!(ui.stage.dialog_prompt().is_none());
+        ui.cancel_text_popup(42);
+        // A new name prompt with identical wording is a different clip. It must
+        // retain the movie's limits after the free-text question has ended.
+        ui.ask_text(43, "Late report", "", "OK", "Cancel");
+        for _ in 0..20 {
+            ui.show_text_popup();
+            ui.stage.tick(1000.0 / 30.0);
+            ui.allow_free_text_popup();
+        }
+        assert_eq!(
+            popup_property(&mut ui, &format!("{field}.maxChars")),
+            thedas_ui::UiValue::Number(20.0),
+        );
+    }
+
+    #[test]
+    #[ignore = "requires THEDAS_INSTALL and an offscreen GPU"]
+    fn report_late_input_init_preserves_early_typing_edits_and_enter() {
+        let mut ui = installed_popup_ui();
+        delay_report_input_init(&mut ui);
+        // A user can click an authored field before its init handlers exist.
+        // That must not leave Enter without its key listener when init finishes.
+        ui.stage.focus_dialog_field();
+        assert!(ui.type_text("replace this"));
+        assert!(ui.key(thedas_ui::UiKey::SelectAll));
+        let note = "Sera's early report, 000123. #$% \"quoted\"! ".repeat(10);
+        assert!(ui.type_text(&note));
+        assert!(ui.type_text("x"));
+        assert!(ui.key(thedas_ui::UiKey::Backspace));
+        assert!(ui.key(thedas_ui::UiKey::Enter));
+        assert!(!ui.text_popup.as_ref().unwrap().pending_keys.is_empty());
+        for _ in 0..20 {
+            ui.stage.tick(1000.0 / 30.0);
+            ui.allow_free_text_popup();
+        }
+        assert!(ui.text_popup.as_ref().unwrap().pending_keys.is_empty());
+        assert_eq!(
+            ui.stage.bridge.value("GUIPopupLayer.InputText"),
+            Some(thedas_ui::UiValue::String(note))
+        );
+        assert!(ui.stage.dialog_prompt().is_none());
+        ui.cancel_text_popup(42);
+        delay_report_input_init(&mut ui);
+        assert!(ui.type_text("discard this queued input"));
+        ui.cancel_text_popup(42);
+        assert!(ui.text_popup.is_none());
+        ui.ask_text(43, "Late report", "Rowan", "OK", "Cancel");
+        for _ in 0..20 {
+            ui.show_text_popup();
+            ui.stage.tick(1000.0 / 30.0);
+            ui.allow_free_text_popup();
+        }
+        assert_eq!(
+            ui.stage.call_in(
+                thedas_ui::stage::POPUP_LAYER,
+                "_global.PopupLayer.ms_mcPopup.TextInput_mc.TextField.text.toString",
+                &[],
+            ),
+            Some(thedas_ui::UiValue::String("Rowan".into())),
+        );
+    }
+
+    /// Uses the installed movie, without a window or simulation. No game data is
+    /// embedded in this test. Run explicitly with THEDAS_INSTALL set.
+    #[test]
+    #[ignore]
+    fn report_popups_wait_cancel_and_keep_typing_across_name_and_choice_boxes() {
+        let mut ui = installed_popup_ui();
         let pump = |ui: &mut UiLayer| {
             for _ in 0..20 {
                 ui.show_text_popup();
@@ -3927,7 +4106,7 @@ mod tests {
                 // That must not erase the queued report's input flag or callbacks.
                 ui.stage.bridge.bind([]);
             }
-            // Type on the first tick with an input field, without extra settling frames.
+            // Type as soon as the report accepts input, without settling first.
             for _ in 0..20 {
                 ui.show_text_popup();
                 ui.stage.tick(1000.0 / 30.0);
@@ -3939,6 +4118,7 @@ mod tests {
             assert!(crate::box_shows(&mut ui, "Report"));
             let note = format!("Sera's report {n}: \"wrong\", 123. #$% ").repeat(30);
             assert!(ui.type_text(&note));
+            pump(&mut ui); // Early typing waits for TextInput_mc_init.
             assert_eq!(
                 ui.stage.call_in(
                     thedas_ui::stage::POPUP_LAYER,
