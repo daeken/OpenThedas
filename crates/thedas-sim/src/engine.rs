@@ -817,10 +817,14 @@ fn applied_effect(
 fn apply_visual_or_effect(h: &mut ScriptHost, target: ObjectId, e: Effect) {
     let instant = constant(&h.sim.table, "EFFECT_DURATION_TYPE_INSTANT");
     if e.ty == 4 && e.duration_type == instant && h.object(target).is_some() {
+        let vfx = e.ints.first().copied().unwrap_or(0);
+        let timing = h.sim.instant_vfx_timing(vfx);
         let note = crate::world::InstantVfx {
             target,
-            vfx: e.ints.first().copied().unwrap_or(0),
+            vfx,
             started_ms: h.sim.world.time_ms,
+            ms: timing.ms,
+            lasting: timing.lasting,
         };
         h.sim.world.instant_vfx.push(note);
     }
@@ -3547,6 +3551,23 @@ pub fn call(
                             effect: e,
                         };
                         h.sim.world.location_vfx.push(entry);
+                    } else {
+                        // Played and gone: a note for presentation (see
+                        // `InstantLocationVfx`).
+                        h.sim.world.next_instant_vfx += 1;
+                        let vfx = e.ints.first().copied().unwrap_or(0);
+                        let timing = h.sim.instant_vfx_timing(vfx);
+                        let note = crate::world::InstantLocationVfx {
+                            handle: h.sim.world.next_instant_vfx,
+                            vfx,
+                            ms: timing.ms,
+                            lasting: timing.lasting,
+                            area: l.area,
+                            position: l.position,
+                            facing: l.facing,
+                            started_ms: h.sim.world.time_ms,
+                        };
+                        h.sim.world.instant_location_vfx.push(note);
                     }
                 }
             }
@@ -12701,6 +12722,25 @@ mod coverage_tests {
             &[Value::Object(area), found[0].clone()],
         );
         assert!(s.world.location_vfx.is_empty());
+        // An instant one (a spell's impact) is played and kept nowhere the scripts see; a
+        // note of it stays for presentation, for a while.
+        let impact = vfx(&mut s, 88);
+        let ground = place(&mut s, 2.0);
+        run(
+            &mut s,
+            hero,
+            "Engine_ApplyEffectAtLocation",
+            &[Value::Int(1), impact, ground, Value::Float(0.0)],
+        );
+        assert!(s.world.location_vfx.is_empty());
+        let notes = &s.world.instant_location_vfx;
+        assert_eq!(notes.len(), 1);
+        assert_eq!(
+            (notes[0].vfx, notes[0].area, notes[0].position),
+            (88, area, [2.0, 0.0, 0.0])
+        );
+        s.tick(crate::vfx::UNREAD_MS + 1);
+        assert!(s.world.instant_location_vfx.is_empty());
     }
 
     #[test]

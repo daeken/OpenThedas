@@ -22,6 +22,9 @@ pub struct BakeLight {
     pub in_lightmap: bool,
     /// In the shadow (alpha) pass: the toolset's `CastShadows`.
     pub cast_shadows: bool,
+    /// The share of a point light's radius the shadow pass reaches (1 unless fitted: some
+    /// shipped lights were baked with a smaller radius than the one they ship with).
+    pub shadow_reach: f32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -66,13 +69,15 @@ pub struct Settings {
 
 /// An occlusion model fitted to the shipped atlases: 64 cosine rays out to `length`; a hit at
 /// distance t occludes (1 − t/length)^`exponent`; with v the unoccluded share, the pass value
-/// is clamp(lo + (1 − lo)·v, 0, 1)^`power`, before the film's gamma.
+/// is `hi`·clamp(lo + (1 − lo)·v, 0, 1)^`power` after the film's gamma.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct AoModel {
     pub length: f32,
     pub exponent: f32,
     pub lo: f32,
     pub power: f32,
+    /// The value of a fully open texel.
+    pub hi: f32,
 }
 
 /// What the shadow pass records per sample.
@@ -418,7 +423,7 @@ fn sample(
         if rgb {
             light += c * ng.dot(dir).abs() * vis;
         }
-        lit |= l.cast_shadows;
+        lit |= l.cast_shadows && f > 1.0 - l.shadow_reach;
         if l.cast_shadows {
             reach += f * ng.dot(dir).abs() * vis;
         }
@@ -438,9 +443,11 @@ fn sample(
                 .sum::<f32>()
                 / hits.len() as f32;
             // The film raises the pass to 1/gamma; undo that so `power` is the final one.
-            (m.lo + (1.0 - m.lo) * (1.0 - occ))
-                .clamp(0.0, 1.0)
-                .powf(m.power * settings.gamma)
+            (m.hi
+                * (m.lo + (1.0 - m.lo) * (1.0 - occ))
+                    .clamp(0.0, 1.0)
+                    .powf(m.power))
+            .powf(settings.gamma)
         }
         (None, Some(n)) => occlusion_converged(&scene.bvh, sp, ng, nf, settings, n),
         (None, None) => occlusion(&scene.bvh, sp, ng, nf, settings, q),

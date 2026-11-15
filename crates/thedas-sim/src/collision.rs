@@ -665,8 +665,20 @@ impl Collision {
             return false;
         }
         let d = sub(b, a);
-        let mut stack = vec![0usize];
-        while let Some(n) = stack.pop() {
+        // The traversal stack lives on the stack (this runs for every hostile pair every
+        // tick); a tree deeper than it holds spills into a vector. Same order either way.
+        let mut fixed = [0usize; 64];
+        let mut top = 1usize;
+        let mut spill: Vec<usize> = Vec::new();
+        loop {
+            let n = if let Some(n) = spill.pop() {
+                n
+            } else if top > 0 {
+                top -= 1;
+                fixed[top]
+            } else {
+                break;
+            };
             let node = &self.nodes[n];
             if !segment_aabb(a, d, node.lo, node.hi) {
                 continue;
@@ -680,8 +692,14 @@ impl Collision {
                     return true;
                 }
             } else {
-                stack.push(node.first as usize);
-                stack.push(node.first as usize + 1);
+                for c in [node.first as usize, node.first as usize + 1] {
+                    if spill.is_empty() && top < fixed.len() {
+                        fixed[top] = c;
+                        top += 1;
+                    } else {
+                        spill.push(c);
+                    }
+                }
             }
         }
         false
