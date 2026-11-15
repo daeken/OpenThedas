@@ -1225,6 +1225,7 @@ impl Sim {
         self.advance_da2_projectiles();
         self.regenerate(elapsed);
         self.decay_corpses(elapsed);
+        self.advance_script_heartbeats(elapsed);
         self.update_threat(elapsed);
         self.expire_effects();
         self.update_aoes();
@@ -2473,7 +2474,8 @@ impl Sim {
 
     /// Re-arms a heartbeat after it fires, while the object still has one.
     fn next_heartbeat(&mut self, target: ObjectId, ty: i32) {
-        if ty != self.event_type("HEARTBEAT2") || ty == 0 {
+        if self.game == thedas_vfs::Game::Origins || ty != self.event_type("HEARTBEAT2") || ty == 0
+        {
             return;
         }
         let Some(ms) = self
