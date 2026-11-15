@@ -226,6 +226,12 @@ struct Args {
     /// per pixel by every light in reach; see docs/deferred.md). F11 flips between them.
     #[arg(long, default_value = "faithful", value_parser = ["faithful", "deferred"])]
     renderer: String,
+    /// What the deferred renderer does with the baked lightmaps: `baked` (as the original),
+    /// `hybrid` (their bounce light kept, every light's shadows real-time) or `realtime`
+    /// (none: probe ambient, SSAO, real-time shadows; experimental). Defaults to
+    /// `THEDAS_DEFERRED_BAKED_LIGHTING`, else `baked`.
+    #[arg(long, value_parser = ["baked", "hybrid", "realtime"])]
+    lighting: Option<String>,
     /// The original's "Graphics Detail" video option, which picks the materials' techniques
     /// and the bloom's blur: `low`, `medium` or `high` (High's materials draw as Medium's; its
     /// sun shadows are 1024 texels a side and reach further).
@@ -6500,6 +6506,13 @@ fn main() -> Result<()> {
         env_logger::Env::default().default_filter_or("info,wgpu=warn,naga=warn"),
     ));
     let mut args = Args::parse();
+    if let Some(mode) = args
+        .lighting
+        .as_deref()
+        .and_then(thedas_render::BakedLighting::parse)
+    {
+        thedas_render::set_baked_lighting(mode);
+    }
     faces::set_language(&args.language);
     live::ANTIALIASING.store(
         args.antialiasing.unwrap_or(1).max(1),
@@ -7529,6 +7542,7 @@ fn main() -> Result<()> {
             "detail": args.detail,
             "frame_effects": args.frame_effects,
             "renderer": args.renderer,
+            "lighting": args.lighting,
             "language": args.language,
             "module": args.module,
             "install": report::install_info(&install, &args.language),
