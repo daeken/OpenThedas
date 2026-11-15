@@ -226,6 +226,12 @@ struct Args {
     /// per pixel by every light in reach; see docs/deferred.md). F11 flips between them.
     #[arg(long, default_value = "faithful", value_parser = ["faithful", "deferred"])]
     renderer: String,
+    /// What the deferred renderer does with the baked lightmaps: `baked` (as the original),
+    /// `hybrid` (their bounce light kept, every light's shadows real-time) or `realtime`
+    /// (none: probe ambient, SSAO, real-time shadows; experimental). Defaults to
+    /// `THEDAS_DEFERRED_BAKED_LIGHTING`, else `baked`.
+    #[arg(long, value_parser = ["baked", "hybrid", "realtime"])]
+    lighting: Option<String>,
     /// The original's "Graphics Detail" video option, which picks the materials' techniques
     /// and the bloom's blur: `low`, `medium` or `high` (High's materials draw as Medium's; its
     /// sun shadows are 1024 texels a side and reach further).
@@ -1887,7 +1893,7 @@ impl App {
             g.reticle
                 .draw(&g.ctx.device, &mut encoder, &view, size, &lines);
         }
-        g.ui.composite(&mut encoder, &view, g.config.format);
+        g.ui.composite(&mut encoder, &frame.texture, g.config.format);
         // The pad's pointer goes over the interface.
         let ctx = self
             .pad
@@ -2303,6 +2309,12 @@ impl App {
                 modmode::Action::FlyTo(id) => self.fly_to(id),
                 modmode::Action::LiveEdits(on) => {
                     let note = workspace::mount(on).unwrap_or_else(|e| e);
+                    if let Some(m) = self.mod_mode.as_mut() {
+                        m.live_note = Some(note);
+                    }
+                }
+                modmode::Action::PackMod(name) => {
+                    let note = pack_note(&name);
                     if let Some(m) = self.mod_mode.as_mut() {
                         m.live_note = Some(note);
                     }
@@ -4213,6 +4225,7 @@ impl App {
             Step::ModWorld => log.push(self.mod_mode_world_step(None)),
             Step::ModPlot(name) => log.push(self.mod_mode_world_step(Some(name))),
             &Step::ModLive(on) => log.push(workspace::mount(on).unwrap_or_else(|e| e)),
+            Step::ModPack(name) => log.push(pack_note(name)),
             &Step::ModMove(position, facing) => {
                 log.push(match self.mod_mode.as_ref().and_then(|m| m.selected) {
                     Some(id) => self.mod_mode_place(
@@ -5917,6 +5930,7 @@ enum Step {
     ModExport,
     /// Live edits on or off (`modlive on`, `modlive off`).
     ModLive(bool),
+    ModPack(String),
     /// Live edits look for saved textures now (`modsync`).
     ModSync,
     /// The inspected object is put at a place, turned to a facing (`modmove X,Y,Z F`).
@@ -6365,6 +6379,7 @@ fn parse_step(s: &str) -> Result<Step> {
             "off" => false,
             _ => bail!("modlive takes on or off"),
         }),
+        "modpack" => Step::ModPack(arg.to_string()),
         "modsync" => Step::ModSync,
         "modmove" => {
             let (at, f) = arg.split_once(' ').context("modmove takes X,Y,Z FACING")?;
@@ -6491,6 +6506,13 @@ fn main() -> Result<()> {
         env_logger::Env::default().default_filter_or("info,wgpu=warn,naga=warn"),
     ));
     let mut args = Args::parse();
+    if let Some(mode) = args
+        .lighting
+        .as_deref()
+        .and_then(thedas_render::BakedLighting::parse)
+    {
+        thedas_render::set_baked_lighting(mode);
+    }
     faces::set_language(&args.language);
     live::ANTIALIASING.store(
         args.antialiasing.unwrap_or(1).max(1),
@@ -6803,6 +6825,7 @@ fn main() -> Result<()> {
                     | Step::ModPlot(_)
                     | Step::ModExport
                     | Step::ModLive(_)
+                    | Step::ModPack(_)
                     | Step::ModSync
                     | Step::ModMove(..)
                     | Step::ModMoveView
@@ -7519,6 +7542,7 @@ fn main() -> Result<()> {
             "detail": args.detail,
             "frame_effects": args.frame_effects,
             "renderer": args.renderer,
+            "lighting": args.lighting,
             "language": args.language,
             "module": args.module,
             "install": report::install_info(&install, &args.language),
@@ -7550,6 +7574,20 @@ fn main() -> Result<()> {
     match app.error {
         Some(e) => Err(e),
         None => Ok(()),
+    }
+}
+
+/// What packing the live edits into a mod called `name` did, for mod mode's note and the
+/// `modpack` step.
+fn pack_note(name: &str) -> String {
+    match workspace::pack(name) {
+        Ok(p) => format!(
+            "Packed {} file(s) ({} bytes): {} (add it to mods.txt to use it)",
+            p.files,
+            p.bytes,
+            p.path.display()
+        ),
+        Err(e) => e,
     }
 }
 

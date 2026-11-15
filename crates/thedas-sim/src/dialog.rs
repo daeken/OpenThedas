@@ -223,6 +223,8 @@ pub struct Conversation {
 #[derive(Clone, Debug, PartialEq)]
 pub struct AmbientTalk {
     pub(crate) c: Conversation,
+    /// The area where it began; a travelling party member does not carry it along.
+    pub(crate) area: Option<ObjectId>,
     /// The lines and replies it has used: it stops when it comes back to one (chants loop).
     pub(crate) used: Vec<usize>,
     /// How long its line still has, in milliseconds.
@@ -860,6 +862,7 @@ impl Sim {
             ambient_run: ambient(self),
             ..c
         };
+        let area = self.world.area;
         let advancing = self.dialog_advancing;
         self.dialog_advancing |= self.game == thedas_vfs::Game::DragonAge2 && !c.ambient_run;
         let c = match start {
@@ -873,9 +876,13 @@ impl Sim {
             // conversation of the same owner is not traced.
             let owner = c.owner;
             self.ambient.retain(|a| a.c.owner != owner);
-            if let Some(line) = c.line.filter(|_| start.is_some()) {
+            if let Some(line) = c
+                .line
+                .filter(|_| start.is_some() && self.ambient_owner_present(owner, area))
+            {
                 let (_, ms) = self.ambient_line_time(&c, line);
                 self.ambient.push(AmbientTalk {
+                    area,
                     used: vec![line],
                     left_ms: i64::from(ms),
                     flagged: ambient_start,
@@ -1001,14 +1008,20 @@ impl Sim {
         }
         let mut going = Vec::new();
         for mut a in std::mem::take(&mut self.ambient) {
-            // Its owner gone or dead, the rest is not said (provisional: not traced).
-            if !self.world.get(a.c.owner).is_some_and(|o| !o.dead) {
+            if !self.world.get(a.c.owner).is_some_and(|o| !o.dead)
+                || !self.ambient_owner_present(a.c.owner, a.area)
+            {
                 continue;
             }
             a.left_ms -= ms as i64;
             // A long step says the lines that fall within it, each for its own time.
             let mut a = Some(a);
             while let Some(t) = a.take() {
+                // A preceding line's script can deactivate/move an owner or unload its
+                // area during this same long tick.
+                if !self.ambient_owner_present(t.c.owner, t.area) {
+                    break;
+                }
                 if t.left_ms > 0 {
                     going.push(t);
                     break;
@@ -1027,9 +1040,22 @@ impl Sim {
         self.ambient = going;
     }
 
+    fn ambient_owner_present(&self, owner: ObjectId, area: Option<ObjectId>) -> bool {
+        self.game != thedas_vfs::Game::Origins
+            || self.world.get(owner).is_some_and(|o| {
+                !o.dead && o.active && o.area == self.world.area && area == self.world.area
+            })
+    }
+
     /// The line of an ambient conversation is over: its next line is said, or `None` when
     /// it has ended (no reply left, or one it has used already).
     fn ambient_next(&mut self, a: AmbientTalk) -> Option<AmbientTalk> {
+        // The exe ends ambient dialogs on area unload (0x6c5e94 -> 0x6ff8e0).
+        // Our parked objects remain addressable: reject them before actions or promotion.
+        if !self.ambient_owner_present(a.c.owner, a.area) {
+            return None;
+        }
+        let area = a.area;
         let AmbientTalk {
             mut c,
             mut used,
@@ -1062,6 +1088,9 @@ impl Sim {
             let node = c.dlg.nodes[r].clone();
             self.mark_shown(&mut c, r);
             self.node_action(&node, &c);
+            if !self.ambient_owner_present(c.owner, area) {
+                return None;
+            }
             let n = node
                 .children
                 .iter()
@@ -1079,13 +1108,14 @@ impl Sim {
         // Alistair's exchange with the mage at Ostagar runs on into his own conversation
         // with the player ("You know, one good thing about the Blight..."), which waits
         // for the player to speak to him. Provisional: 0x7f1910 is not traced.
-        if flagged && !c.dlg.nodes[next].ambient {
+        if (flagged && !c.dlg.nodes[next].ambient) || !self.ambient_owner_present(c.owner, area) {
             return None;
         }
         let c = self.speak(c, next);
         let (_, ms) = self.ambient_line_time(&c, next);
         Some(AmbientTalk {
             c,
+            area,
             used,
             left_ms: i64::from(ms),
             flagged,
@@ -1837,6 +1867,112 @@ mod tests {
         sim.tick(8000);
         assert_eq!(said(&sim).len(), 4);
         assert!(sim.ambient.is_empty());
+    }
+
+    #[test]
+    fn an_ambient_owner_must_remain_active_in_the_current_area() {
+        use crate::world::ObjectKind;
+        for choice in [false, true] {
+            for remote in [false, true] {
+                let (mut sim, hero, npc) = passers_by();
+                let here = sim.world.spawn(ObjectKind::Area, "here");
+                let away = sim.world.spawn(ObjectKind::Area, "away");
+                sim.world.area = Some(here);
+                for id in [hero, npc] {
+                    sim.world.get_mut(id).unwrap().area = Some(here);
+                }
+                let mut d = remarks("flemeth", &["welcome", "later"], false);
+                d.nodes[1].action = PlotRef {
+                    plot: Some("must_not_run".into()),
+                    flag: 1,
+                    value: true,
+                    script: None,
+                };
+                if choice {
+                    d.nodes[1].text = Some("A player choice".into());
+                }
+                assert!(sim.open_conversation(hero, npc, d, None));
+                if remote {
+                    // Still active, but in another area.
+                    sim.world.get_mut(npc).unwrap().area = Some(away);
+                } else {
+                    sim.world.get_mut(npc).unwrap().active = false;
+                }
+                sim.tick(20000);
+                assert_eq!(said(&sim), ["welcome"]);
+                assert!(sim.talk.is_none(), "no remote player choices");
+                assert!(sim.ambient.is_empty());
+                assert!(!sim.get_plot_flag("must_not_run", 1, false, npc));
+                // Reactivation/return does not resume a cancelled conversation.
+                let o = sim.world.get_mut(npc).unwrap();
+                o.active = true;
+                o.area = Some(here);
+                sim.tick(20000);
+                assert_eq!(said(&sim), ["welcome"]);
+            }
+        }
+    }
+
+    #[test]
+    fn area_unload_ends_ambient_dialogs_even_for_travelling_owners() {
+        use crate::world::ObjectKind;
+        let (mut sim, hero, npc) = passers_by();
+        let here = sim.world.spawn(ObjectKind::Area, "here");
+        let away = sim.world.spawn(ObjectKind::Area, "away");
+        sim.world.get_mut(away).unwrap().template = "away".into();
+        sim.world.get_mut(here).unwrap().template = "here".into();
+        sim.world.area = Some(here);
+        sim.world.get_mut(hero).unwrap().followers.push(npc);
+        for id in [hero, npc] {
+            sim.world.get_mut(id).unwrap().area = Some(here);
+        }
+        assert!(sim.open_conversation(hero, npc, remarks("guard", &["one", "two"], false), None));
+        sim.area_transition("away", "");
+        assert_eq!(sim.world.get(npc).unwrap().area, Some(away));
+        assert!(sim.world.get(npc).unwrap().active);
+        assert!(sim.ambient.is_empty());
+        assert!(sim.world.ambient_lines.is_empty());
+        sim.area_transition("here", "");
+        sim.tick(20000);
+        assert!(sim.ambient.is_empty());
+        assert!(said(&sim).is_empty());
+    }
+
+    #[test]
+    fn ambient_scripts_can_deactivate_the_owner_during_a_long_tick() {
+        for action_at in [1, 2] {
+            let (mut sim, hero, npc) = passers_by();
+            sim.table = std::sync::Arc::new(
+                thedas_script::EngineTable::parse(
+                    b"void SetObjectActive(object owner, int active) = 1;\n",
+                )
+                .unwrap(),
+            );
+            // Own script: SetObjectActive(OBJECT_SELF, 0).
+            let code = [
+                0x04, 0x03, 0, 0, 0, 0, 0x04, 0x06, 0, 0, 0, 0, 0x05, 0, 0, 1, 2, 0x20, 0,
+            ];
+            let mut bytes = b"NCS V1.0B".to_vec();
+            bytes.extend(((13 + code.len()) as u32).to_be_bytes());
+            bytes.extend(code);
+            sim.add_script("leave", thedas_script::Ncs::parse(&bytes).unwrap());
+            let mut d = remarks("guard", &["one", "two", "three"], false);
+            d.nodes[action_at].action.script = Some("leave".into());
+            d.nodes[3].text = Some("A player choice".into());
+            assert!(sim.open_conversation(hero, npc, d, None));
+            sim.tick(30000);
+            assert!(!sim.world.get(npc).unwrap().active);
+            assert_eq!(
+                said(&sim),
+                if action_at == 1 {
+                    vec!["one"]
+                } else {
+                    vec!["one", "two"]
+                }
+            );
+            assert!(sim.ambient.is_empty());
+            assert!(sim.talk.is_none());
+        }
     }
     #[test]
     fn a_conversation_starts_at_a_chosen_line() {
