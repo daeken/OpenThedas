@@ -3015,14 +3015,15 @@ fn debug_view() -> u32 {
     })
 }
 
-/// Which shadowed lights bounce (`fs_bounce`): bit 0 the dynamic ones (emitters, moving
-/// lights), which the lightmaps' baked bounce never held; bit 1 the static ones too, when
-/// no lightmap bounce stands in for theirs. `THEDAS_DEFERRED_BOUNCE=0` turns it off.
+/// What bounces (`fs_bounce`): bit 0 the shadowed dynamic lights (emitters, moving
+/// lights), which the lightmaps' baked bounce never held; with no lightmap bounce standing
+/// in, bit 1 the shadowed static lights too and bit 2 the sun (screen-space).
+/// `THEDAS_DEFERRED_BOUNCE=0` turns it off.
 fn bounce_flags(baked_lighting: bool) -> u32 {
     if !crate::config::CONFIG.bounce {
         return 0;
     }
-    1 | if baked_lighting { 0 } else { 2 }
+    1 | if baked_lighting { 0 } else { 2 | 4 }
 }
 
 /// The real-time bounce target's format.

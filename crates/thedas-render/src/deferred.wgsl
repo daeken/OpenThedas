@@ -973,7 +973,67 @@ fn fs_bounce(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
             }
         }
     }
+    if ((flags & 4u) != 0u && lighting.sun_dir.w > 0.5) {
+        sum = sum + sun_bounce(x, nx, frag.xy);
+    }
     return vec4<f32>(sum, 1.0);
+}
+
+// Sunlight bounced off what the screen shows near `x` (normal `nx`): sixteen points of a
+// 3 m hemisphere, each the visible surface there, lit by the sun through its cascades and
+// reflecting its own G-buffer albedo. A cube-map gather can't do this for the sun: its
+// shadow maps see a roof, not the sunlit floor under a window. Off-screen surfaces are
+// missed, so the bounce fades at the frame's edges.
+fn sun_bounce(x: vec3<f32>, nx: vec3<f32>, frag: vec2<f32>) -> vec3<f32> {
+    let radius = 3.0;
+    let count = 16u;
+    let axis = select(vec3<f32>(0.0, 0.0, 1.0), vec3<f32>(0.0, 1.0, 0.0), abs(nx.z) > 0.95);
+    let t = normalize(cross(axis, nx));
+    let b = cross(nx, t);
+    let ls = -lighting.sun_dir.xyz;
+    let spin = bounce_noise(frag) * 6.2831853;
+    // Each sample stands for its share of the hemisphere's surface.
+    let area = 2.0 * PI * radius * radius / f32(count);
+    var sum = vec3<f32>(0.0);
+    for (var i = 0u; i < count; i = i + 1u) {
+        let f = (f32(i) + 0.5) / f32(count);
+        let angle = f32(i) * 2.39996323 + spin;
+        let z = 0.1 + 0.9 * f;
+        let xy = sqrt(1.0 - z * z);
+        let direction = t * (cos(angle) * xy) + b * (sin(angle) * xy) + nx * z;
+        let sample = x + direction * radius * (0.25 + 0.75 * fract(f * 7.0 + spin));
+        let clip = lighting.view_proj * vec4<f32>(sample, 1.0);
+        if (clip.w <= 0.0 || clip.z < 0.0 || clip.z >= clip.w) {
+            continue;
+        }
+        let ndc = clip.xy / clip.w;
+        let pixel = vec2<i32>(floor(vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5) * lighting.size.xy + 0.5));
+        if (any(pixel < vec2<i32>(0)) || any(pixel >= vec2<i32>(lighting.size.xy))) {
+            continue;
+        }
+        let depth = textureLoad(g_depth, pixel, 0).x;
+        if (depth >= 1.0) {
+            continue;
+        }
+        let y = world_at(pixel, depth);
+        let ny = oct_decode(textureLoad(g_normal, pixel, 0).xy);
+        let lit = max(dot(ny, ls), 0.0);
+        if (lit <= 0.0) {
+            continue;
+        }
+        let w = x - y;
+        let r2 = max(dot(w, w), 0.25 * area + 0.05);
+        let r = sqrt(r2);
+        let cos_y = max(dot(ny, w) / r, 0.0);
+        let cos_x = max(dot(nx, -w) / r, 0.0);
+        if (cos_y * cos_x <= 0.0) {
+            continue;
+        }
+        let albedo = textureLoad(g_albedo, pixel, 0).rgb;
+        let e = lighting.sun_colour.rgb * lit * sun_visibility(y, ny, false);
+        sum = sum + albedo * e * area * cos_y * cos_x / (PI * r2);
+    }
+    return sum;
 }
 
 // The bounce at full-resolution pixel `px` (depth `depth`): the four nearest half-
