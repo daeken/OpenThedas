@@ -2825,6 +2825,7 @@ pub fn call(
                 cancellable: false,
                 impacted: false,
                 arrived: false,
+                da2_target_prepared: false,
                 path: Vec::new(),
             };
             // Only the first float is kept (a wait's seconds, a move's minimum range): a
@@ -3327,14 +3328,20 @@ pub fn call(
             let who = obj(a, 0);
             let running = h.sim.world.get_mut(who).and_then(|o| {
                 if o.commands.first().is_some_and(|c| c.due.is_some()) {
-                    Some(o.commands.remove(0).ty)
+                    Some(o.commands.remove(0))
                 } else {
                     None
                 }
             });
-            if let Some(ty) = running {
+            if let Some(cmd) = running {
+                if cmd.name == "CommandUseAbility" {
+                    h.sim.complete_da2_combat_target(who);
+                }
                 let mut ev = h.sim.new_event("COMMAND_COMPLETE", Some(who));
-                ev.ints = vec![ty, constant(&h.sim.table, "COMMAND_FAILED_COMMAND_CLEARED")];
+                ev.ints = vec![
+                    cmd.ty,
+                    constant(&h.sim.table, "COMMAND_FAILED_COMMAND_CLEARED"),
+                ];
                 h.sim.world.queue_event(0, who, ev, None);
             }
             void()
@@ -3342,11 +3349,17 @@ pub fn call(
         "ClearAllCommands" => {
             let who = obj(a, 0);
             let running = h.sim.world.get_mut(who).and_then(|o| {
-                let first = o.commands.first().map(|c| c.ty);
+                let first = o
+                    .commands
+                    .first()
+                    .map(|c| (c.ty, c.name == "CommandUseAbility"));
                 o.commands.clear();
                 first
             });
-            if let Some(ty) = running {
+            if let Some((ty, ability)) = running {
+                if ability {
+                    h.sim.complete_da2_combat_target(who);
+                }
                 let mut ev = h.sim.new_event("COMMAND_COMPLETE", Some(who));
                 ev.ints = vec![ty, constant(&h.sim.table, "COMMAND_RESULT_INVALID")];
                 h.sim.world.queue_event(0, who, ev, None);
@@ -4294,9 +4307,7 @@ pub fn call(
                 (obj(a, 0), int(a, 1), int(a, 2) != 0, int(a, 3) != 0);
             if success {
                 if let Some(next) = placeable_transition(h.sim, id, action, variation) {
-                    if let Some(o) = h.sim.world.get_mut(id) {
-                        o.fields.insert("State".into(), next);
-                    }
+                    h.sim.set_placeable_state(id, next);
                 }
             }
             void()
@@ -4456,9 +4467,12 @@ pub fn call(
                 0
             }))
         }
-        "SetPlaceableState" | "SetPlotGiver" | "SetAutoLevelUp" | "SetFollowerApprovalEnabled" => {
+        "SetPlaceableState" => {
+            h.sim.set_placeable_state(obj(a, 0), int(a, 1));
+            void()
+        }
+        "SetPlotGiver" | "SetAutoLevelUp" | "SetFollowerApprovalEnabled" => {
             let field = match name {
-                "SetPlaceableState" => "State",
                 "SetPlotGiver" => "PlotGiver",
                 "SetAutoLevelUp" => "AutoLevelUp",
                 _ => "ApprovalEnabled",
@@ -4501,16 +4515,12 @@ pub fn call(
         // --- Combat and perception (see `combat`) ------------------------------------------
         "GetCombatState" => ok(b(h.object(obj(a, 0)).is_some_and(|o| o.combat.in_combat))),
         "SetCombatState" => {
-            if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
-                o.combat.in_combat = int(a, 1) != 0;
-            }
+            h.sim.set_combat_state(obj(a, 0), int(a, 1) != 0);
             void()
         }
         "GetAttackTarget" => ok(Value::Object(
-            h.object(obj(a, 0))
-                .and_then(|o| o.commands.first())
-                .filter(|c| c.name == "CommandAttack")
-                .and_then(|c| c.target)
+            h.sim
+                .script_attack_target(obj(a, 0))
                 .unwrap_or(OBJECT_INVALID),
         )),
         "IsObjectHostile" => ok(b(h.sim.hostile(obj(a, 0), obj(a, 1)))),
@@ -5584,9 +5594,10 @@ fn placeable_transition(sim: &Sim, id: ObjectId, action: i32, variation: bool) -
     if int(0x52be_3c5e)? != action {
         return None;
     }
-    let next = int(0xa2b4_782c)?;
-    let alt = int(0x5ad0_780d).filter(|&v| v > 0);
-    Some(if variation { alt.unwrap_or(next) } else { next })
+    let next = int(if variation { 0x5ad0_780d } else { 0xa2b4_782c })? as u16;
+    // 0x74fc40 skips the action's absent unsigned-short target before invoking
+    // the ordinary setter. An explicit SetPlaceableState(-1) still reaches it.
+    (next != u16::MAX).then_some(i32::from(next))
 }
 
 /// A placeable's default action in its current state, from its type's state controller:
@@ -7508,6 +7519,247 @@ mod tests {
             script: "test".into(),
         };
         call(&mut h, caller, &f, a).unwrap().unwrap()
+    }
+
+    fn state_controlled_placeable() -> (Sim, ObjectId) {
+        let table = Arc::new(
+            EngineTable::parse(
+                b"void SetPlaceableState(object o, int state) = 1;\n\
+                  void SetPlaceableActionResult(object o, int a, int s, int v = 0) = 2;\n",
+            )
+            .unwrap(),
+        );
+        let mut sim = Sim::new(Arc::new(Vfs::new()), table, 1);
+        let tables = crate::m2da::Tables::empty();
+        let mut appearance = vec![Cell::Empty; 8];
+        appearance.push(Cell::String("statecnt_fixture\0".into()));
+        tables.insert(
+            "#93",
+            &["a", "b", "c", "d", "e", "f", "g", "h", "#9a320a51"],
+            vec![(5, appearance)],
+        );
+        // Sparse IDs distinguish the controller's row count from its row IDs.
+        tables.insert(
+            "statecnt_fixture",
+            &["ID", "#52be3c5e", "#a2b4782c", "#5ad0780d"],
+            [0, 10, 99]
+                .into_iter()
+                .map(|id| {
+                    (
+                        id,
+                        vec![Cell::Int(id), Cell::Int(3), Cell::Int(9), Cell::Int(2)],
+                    )
+                })
+                .collect(),
+        );
+        sim.world.tables = Arc::new(tables);
+        let id = sim.world.spawn(ObjectKind::Placeable, "controlled");
+        let o = sim.world.get_mut(id).unwrap();
+        o.appearance = 5;
+        o.fields.insert("Appearance".into(), 5);
+        o.fields.insert("AnimContState".into(), 0);
+        (sim, id)
+    }
+
+    #[test]
+    fn origins_placeable_state_setter_uses_unsigned_controller_bounds() {
+        let (mut sim, id) = state_controlled_placeable();
+        sim.world.get_mut(id).unwrap().appearance = 65_541;
+        for (request, expected) in [(65_538, 2), (3, 0), (-65_535, 1), (-1, 0)] {
+            run(
+                &mut sim,
+                id,
+                "SetPlaceableState",
+                &[Value::Object(id), Value::Int(request)],
+            );
+            assert_eq!(
+                sim.world.get(id).unwrap().fields.get("State"),
+                Some(&expected)
+            );
+        }
+        sim.world.get_mut(id).unwrap().fields.remove("State");
+        run(
+            &mut sim,
+            id,
+            "SetPlaceableState",
+            &[Value::Object(id), Value::Int(65_536)],
+        );
+        assert!(!sim.world.get(id).unwrap().fields.contains_key("State"));
+        // The same-state return precedes the bounds check, even for a legacy state.
+        sim.world
+            .get_mut(id)
+            .unwrap()
+            .fields
+            .insert("State".into(), 3);
+        run(
+            &mut sim,
+            id,
+            "SetPlaceableState",
+            &[Value::Object(id), Value::Int(65_539)],
+        );
+        assert_eq!(sim.world.get(id).unwrap().fields.get("State"), Some(&3));
+        assert!(sim.world.destroy_at.is_empty());
+        assert!(sim.world.nav_patches.is_empty());
+    }
+
+    #[test]
+    fn origins_placeable_state_requires_a_loaded_nonempty_controller() {
+        let (mut sim, id) = state_controlled_placeable();
+        sim.world.tables().insert(
+            "#93",
+            &["#9a320a51"],
+            vec![
+                (5, vec![Cell::String("missing".into())]),
+                (6, vec![Cell::String("empty".into())]),
+                (7, vec![Cell::String(String::new())]),
+            ],
+        );
+        sim.world.tables().insert("empty", &["ID"], vec![]);
+        // An empty controller name must not select the nonempty animation table 0.
+        sim.world
+            .tables()
+            .insert("#0", &["ID"], vec![(0, vec![Cell::Int(0)])]);
+        for appearance in [5, 6, 7, 8] {
+            sim.world.get_mut(id).unwrap().appearance = appearance;
+            run(
+                &mut sim,
+                id,
+                "SetPlaceableState",
+                &[Value::Object(id), Value::Int(2)],
+            );
+            assert!(!sim.world.get(id).unwrap().fields.contains_key("State"));
+        }
+        sim.world.tables().insert(
+            "#93",
+            &["#9a320a51"],
+            vec![(5, vec![Cell::String("statecnt_fixture".into())])],
+        );
+        for kind in [ObjectKind::Creature, ObjectKind::Item, ObjectKind::Area] {
+            let other = sim.world.spawn(kind, "other");
+            sim.world.get_mut(other).unwrap().appearance = 5;
+            run(
+                &mut sim,
+                id,
+                "SetPlaceableState",
+                &[Value::Object(other), Value::Int(2)],
+            );
+            assert!(!sim.world.get(other).unwrap().fields.contains_key("State"));
+        }
+        let count = sim.world.objects.len();
+        run(
+            &mut sim,
+            id,
+            "SetPlaceableState",
+            &[Value::Object(OBJECT_INVALID), Value::Int(2)],
+        );
+        assert_eq!(sim.world.objects.len(), count);
+        sim.game = thedas_vfs::Game::DragonAge2;
+        run(
+            &mut sim,
+            id,
+            "SetPlaceableState",
+            &[Value::Object(id), Value::Int(-65_535)],
+        );
+        assert_eq!(
+            sim.world.get(id).unwrap().fields.get("State"),
+            Some(&-65_535)
+        );
+    }
+
+    #[test]
+    fn origins_placeable_action_results_use_the_state_setter() {
+        let (mut sim, id) = state_controlled_placeable();
+        for (success, variation, expected) in [(0, 0, None), (1, 1, Some(2)), (1, 0, Some(0))] {
+            sim.world.get_mut(id).unwrap().fields.remove("State");
+            run(
+                &mut sim,
+                id,
+                "SetPlaceableActionResult",
+                &[
+                    Value::Object(id),
+                    Value::Int(3),
+                    Value::Int(success),
+                    Value::Int(variation),
+                ],
+            );
+            assert_eq!(
+                sim.world.get(id).unwrap().fields.get("State").copied(),
+                expected
+            );
+        }
+        for sentinel in [-1, 65_535, -65_537, 131_071] {
+            sim.world.tables().insert(
+                "statecnt_fixture",
+                &["ID", "#52be3c5e", "#a2b4782c", "#5ad0780d"],
+                vec![(
+                    0,
+                    vec![
+                        Cell::Int(0),
+                        Cell::Int(3),
+                        Cell::Int(sentinel),
+                        Cell::Int(sentinel),
+                    ],
+                )],
+            );
+            for variation in [0, 1] {
+                sim.world.get_mut(id).unwrap().fields.remove("State");
+                run(
+                    &mut sim,
+                    id,
+                    "SetPlaceableActionResult",
+                    &[
+                        Value::Object(id),
+                        Value::Int(3),
+                        Value::Int(1),
+                        Value::Int(variation),
+                    ],
+                );
+                assert!(!sim.world.get(id).unwrap().fields.contains_key("State"));
+            }
+        }
+        for (next, alternate, variation, expected) in [
+            (2, -1, 0, Some(2)),
+            (2, -1, 1, None),
+            (-1, 2, 1, Some(2)),
+            (2, 0, 1, None),
+            (2, 65_535, 1, None),
+            (65_538, -1, 0, Some(2)),
+        ] {
+            sim.world.tables().insert(
+                "statecnt_fixture",
+                &["ID", "#52be3c5e", "#a2b4782c", "#5ad0780d"],
+                [0, 1, 2]
+                    .into_iter()
+                    .map(|state| {
+                        (
+                            state,
+                            vec![
+                                Cell::Int(state),
+                                Cell::Int(3),
+                                Cell::Int(next),
+                                Cell::Int(alternate),
+                            ],
+                        )
+                    })
+                    .collect(),
+            );
+            sim.world.get_mut(id).unwrap().fields.remove("State");
+            run(
+                &mut sim,
+                id,
+                "SetPlaceableActionResult",
+                &[
+                    Value::Object(id),
+                    Value::Int(3),
+                    Value::Int(1),
+                    Value::Int(variation),
+                ],
+            );
+            assert_eq!(
+                sim.world.get(id).unwrap().fields.get("State").copied(),
+                expected
+            );
+        }
     }
 
     #[test]
@@ -9518,7 +9770,7 @@ mod tests {
             "c5",
             "c6",
             "c7",
-            "Controller",
+            "#9a320a51",
         ];
         let row = |id: i64, ctl: &str| {
             let mut v: Vec<Cell> = (0..8).map(Cell::Int).collect();
@@ -9543,10 +9795,17 @@ mod tests {
         t.insert(
             "statecnt_door",
             &["ID", "#52be3c5e", "#a2b4782c", "#5ad0780d"],
-            vec![st(0, 1, 2, 4), st(1, 3, 0, 0), st(2, 2, 0, 0)],
+            vec![
+                st(0, 1, 2, 4),
+                st(1, 3, 0, 0),
+                st(2, 2, 0, 0),
+                st(3, 0, 0, 0),
+                st(4, 2, 0, 0),
+            ],
         );
         s.world.tables = Arc::new(t);
         let door = s.world.spawn(ObjectKind::Placeable, "door");
+        s.world.get_mut(door).unwrap().appearance = 93;
         s.world.get_mut(door).unwrap().fields.extend([
             ("Appearance".to_string(), 93),
             ("AnimContState".to_string(), 1),
@@ -10432,6 +10691,7 @@ mod tests {
                 cancellable: false,
                 impacted: false,
                 arrived: false,
+                da2_target_prepared: false,
                 path: vec![],
             });
         assert_eq!(

@@ -366,6 +366,10 @@ pub struct Command {
     /// so the attack's start step tests the range with its slack (see `Sim::approach_point`).
     #[serde(default)]
     pub arrived: bool,
+    /// DA2's combat-target preparation has run for this command, before approach.
+    /// Keep it across save/reload so a later combat exit is not undone on arrival.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub da2_target_prepared: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
