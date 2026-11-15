@@ -488,6 +488,16 @@ discard for draws without an alpha test. Material sampling and G-buffer outputs 
 shared with the cutout pipeline. Cutouts retain authored comparisons, opacity and clip;
 faded draws retain forward rendering. Draw order and depth tests are unchanged.
 
+`THEDAS_DEFERRED_SUN_EARLY_EXIT=0` retains every original sun-filter tap for
+comparisons. The default omits map reads when the final grazing-angle floor clamps
+visibility to one, and omits the four near-map green taps when the centre depth
+already selects full visibility. Shadowed near receivers and the far PCF retain
+their complete filters, white-border rule, distance fade and grazing floor.
+The shared G-buffer, separate reflection and forward lighting use this same
+function. The control is read once; the per-renderer
+`THEDAS_BENCH_DEFERRED_COMPARE=sun-early-exit` override alternates it in one capture
+and restores the configured policy afterwards.
+
 ## Order of work
 
 1. Switch plus G-buffer and lighting for static level geometry (this document's first PR).
