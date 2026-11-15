@@ -97,3 +97,14 @@ reaches an ended Innocent Blood conversation that the old input list never
 closes, then stalls in combat. This is evidence of changed AI input and a
 successful post-Ogre cleanup, not a claim that the entire prologue or its wipe
 causes are resolved.
+
+The corrected Chantry driver stops walking to the old Hightown door when
+Anders's dialogue transitions inside. Starting from this consistent arrival,
+the activation-only branch still wipes at t=1414127. A local integration of
+activation and this target repair wins Karl's fight, follows the final Karl
+dialogue, returns to Darktown and finishes Anders's explanation at t=1504060.
+The hero, Bethany and Varric survive; Anders joins the active followers. A
+second run from the preceding Hightown checkpoint reproduces this endpoint
+with zero script errors. No developer healing, kill aids, activation, plot
+forcing or forced travel is used. DA2 cinematic placement and processing
+suspension remain outside both repairs.
