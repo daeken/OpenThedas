@@ -3912,7 +3912,16 @@ impl Sim {
             // is dead; rules_core answers it with UT_Talk, which begins the conversation.
             let target = cmd
                 .target
-                .filter(|&t| self.world.get(t).is_some_and(|o| !o.dead));
+                .filter(|&t| self.world.get(t).is_some_and(|o| !o.dead))
+                // A click must respect the ambient speaker's current line before
+                // dispatching DIALOGUE: UT_Talk clears ambient dialogs before calling
+                // BeginConversation, which otherwise bypasses its restart guard.
+                // The native ambient manager arbitrates a speaker's active line at
+                // 0x6ff190, before starting its voice (0x6ffaa0 -> 0x6fe4a0).
+                .filter(|&t| {
+                    self.game != thedas_vfs::Game::Origins
+                        || !self.ambient.iter().any(|a| a.c.owner == t)
+                });
             if let Some(t) = target {
                 let mut ev = self.new_event("DIALOGUE", Some(id));
                 ev.resources = vec![cmd.strings.first().cloned().unwrap_or_default()];
