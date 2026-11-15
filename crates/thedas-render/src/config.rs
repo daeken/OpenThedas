@@ -16,6 +16,7 @@ pub(crate) struct Config {
     pub baked_lighting: bool,
     pub ssao: bool,
     pub point_shadows: bool,
+    pub shadow_slots: usize,
     pub tree_shadows: bool,
     pub tiled_lights: bool,
     pub tight_tiles: bool,
@@ -61,6 +62,11 @@ pub(crate) static CONFIG: LazyLock<Config> = LazyLock::new(|| {
         baked_lighting: enabled("THEDAS_DEFERRED_BAKED_LIGHTING"),
         ssao: enabled("THEDAS_DEFERRED_SSAO"),
         point_shadows: enabled("THEDAS_DEFERRED_POINT_SHADOWS"),
+        shadow_slots: std::env::var("THEDAS_DEFERRED_SHADOW_SLOTS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(crate::deferred_shadow::SLOTS)
+            .clamp(1, crate::deferred_shadow::SLOTS),
         tree_shadows: enabled("THEDAS_DEFERRED_TREE_SHADOWS"),
         tiled_lights: enabled("THEDAS_DEFERRED_TILED_LIGHTS"),
         tight_tiles: enabled("THEDAS_DEFERRED_TIGHT_TILES"),

@@ -1,6 +1,6 @@
 //! Shadows for the deferred path's point lights (ours: the original shadows only its sun).
 //!
-//! A pool of [`SLOTS`] cube shadow maps, given each frame to the dynamic lights that matter
+//! An atlas of up to [`SLOTS`] cube shadow maps, given each frame to the lights that matter
 //! most (the glowing emitters', which have no baked visibility in the lightmaps; see
 //! [`crate::deferred`]). Each face is a 90° view from the light, its texels the distance to
 //! the nearest caster (`R32Float`); the lighting pass picks a point's face by the major axis
@@ -20,7 +20,7 @@ pub const SHADOW_WGSL: &str = concat!(
 );
 
 /// Shadowed lights per frame.
-pub(crate) const SLOTS: usize = 4;
+pub(crate) const SLOTS: usize = 16;
 /// Texels on a side of a cube face.
 pub(crate) const SIZE: u32 = 512;
 /// The faces' near plane, metres. Geometry nearer the light than this casts nothing: a
@@ -30,6 +30,12 @@ const NEAR: f32 = 0.35;
 const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R32Float;
 /// Dynamic uniform offsets must be multiples of this on every backend.
 const STRIDE: usize = 256;
+
+pub(crate) fn atlas_columns(slots: usize) -> u32 {
+    let slots = slots.clamp(1, SLOTS) as u32;
+    let columns = slots.isqrt();
+    columns + u32::from(columns * columns < slots)
+}
 
 /// The cube's faces, in the order the lighting shader picks them: +X, −X, +Y, −Y, +Z, −Z
 /// (each with an up that is not along it).
@@ -134,6 +140,9 @@ impl CasterInputs {
 
 pub(crate) struct ShadowPool {
     pipeline: wgpu::RenderPipeline,
+    clear_pipeline: wgpu::RenderPipeline,
+    slots: usize,
+    columns: u32,
     layout: wgpu::BindGroupLayout,
     buffer: wgpu::Buffer,
     tree_faces: wgpu::Buffer,
@@ -147,8 +156,9 @@ pub(crate) struct ShadowPool {
     pub(crate) reuse_override: Option<bool>,
     #[cfg(test)]
     pub(crate) rendered_cubes: usize,
-    /// Per layer (slot · 6 + face), the colour and depth views drawn into.
-    layers: Vec<(wgpu::TextureView, wgpu::TextureView)>,
+    /// Six face sheets, with one tile per light; depth is scratch shared by all sheets.
+    layers: Vec<wgpu::TextureView>,
+    depth: wgpu::TextureView,
     /// Every layer, for the lighting pass.
     pub(crate) view: wgpu::TextureView,
     #[cfg(test)]
@@ -157,6 +167,17 @@ pub(crate) struct ShadowPool {
 
 impl ShadowPool {
     pub(crate) fn new(device: &wgpu::Device) -> ShadowPool {
+        Self::with_slots(device, crate::config::CONFIG.shadow_slots)
+    }
+
+    fn with_slots(device: &wgpu::Device, slots: usize) -> ShadowPool {
+        let slots = slots.clamp(1, SLOTS);
+        let columns = atlas_columns(slots);
+        log::info!(
+            "deferred shadows: {slots} atlas slots, six {}x{} distance sheets, shared scratch depth",
+            SIZE * columns,
+            SIZE * (slots as u32).div_ceil(columns),
+        );
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("deferred shadows"),
             source: wgpu::ShaderSource::Wgsl(SHADOW_WGSL.into()),
@@ -287,13 +308,50 @@ impl ShadowPool {
             multiview_mask: None,
             cache: None,
         });
-        let texture = |label, format, usage| {
+        let clear_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("deferred shadow tile clear"),
+            layout: Some(
+                &device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("deferred shadow tile clear"),
+                    bind_group_layouts: &[],
+                    immediate_size: 0,
+                }),
+            ),
+            vertex: wgpu::VertexState {
+                module: &module,
+                entry_point: Some("vs_clear"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            primitive: Default::default(),
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::Always),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: Default::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &module,
+                entry_point: Some("fs_clear"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: FORMAT,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+        let texture = |label, format, layers, usage| {
             device.create_texture(&wgpu::TextureDescriptor {
                 label: Some(label),
                 size: wgpu::Extent3d {
-                    width: SIZE,
-                    height: SIZE,
-                    depth_or_array_layers: (SLOTS * 6) as u32,
+                    width: SIZE * columns,
+                    height: SIZE * (slots as u32).div_ceil(columns),
+                    depth_or_array_layers: layers,
                 },
                 mip_level_count: 1,
                 sample_count: 1,
@@ -306,6 +364,7 @@ impl ShadowPool {
         let colour = texture(
             "deferred shadow distances",
             FORMAT,
+            6,
             wgpu::TextureUsages::RENDER_ATTACHMENT
                 | wgpu::TextureUsages::TEXTURE_BINDING
                 | wgpu::TextureUsages::COPY_SRC,
@@ -313,6 +372,7 @@ impl ShadowPool {
         let depth = texture(
             "deferred shadow depth",
             DEPTH_FORMAT,
+            1,
             wgpu::TextureUsages::RENDER_ATTACHMENT,
         );
         let layer = |t: &wgpu::Texture, i: u32| {
@@ -323,9 +383,8 @@ impl ShadowPool {
                 ..Default::default()
             })
         };
-        let layers = (0..(SLOTS * 6) as u32)
-            .map(|i| (layer(&colour, i), layer(&depth, i)))
-            .collect();
+        let layers = (0..6).map(|i| layer(&colour, i)).collect();
+        let depth = layer(&depth, 0);
         let view = colour.create_view(&wgpu::TextureViewDescriptor {
             dimension: Some(wgpu::TextureViewDimension::D2Array),
             ..Default::default()
@@ -350,6 +409,9 @@ impl ShadowPool {
         });
         ShadowPool {
             pipeline,
+            clear_pipeline,
+            slots,
+            columns,
             layout,
             buffer,
             tree_faces,
@@ -363,6 +425,7 @@ impl ShadowPool {
             #[cfg(test)]
             rendered_cubes: 0,
             layers,
+            depth,
             view,
             #[cfg(test)]
             texture: colour,
@@ -426,7 +489,7 @@ impl ShadowPool {
         let inputs: Vec<_> = if reuse || self.reuse_override.is_some() {
             lights
                 .iter()
-                .take(SLOTS)
+                .take(self.slots)
                 .map(|&(position, radius)| CubeInputs {
                     light: (position, radius),
                     casters: casters
@@ -450,7 +513,7 @@ impl ShadowPool {
         } else {
             Vec::new()
         };
-        let dirty: Vec<_> = (0..lights.len().min(SLOTS))
+        let dirty: Vec<_> = (0..lights.len().min(self.slots))
             .map(|i| !reuse || self.previous.get(i) != inputs.get(i))
             .collect();
         self.previous = inputs;
@@ -468,7 +531,7 @@ impl ShadowPool {
         let mut tree_faces = Vec::new();
         let cull = self.culling.unwrap_or(crate::config::CONFIG.shadow_cull);
         let mut before = 0;
-        for (slot, &(position, radius)) in lights.iter().take(SLOTS).enumerate() {
+        for (slot, &(position, radius)) in lights.iter().take(self.slots).enumerate() {
             if !dirty[slot] {
                 layers.extend((0..6).map(|_| Vec::new()));
                 tree_layers.extend((0..6).map(|_| Vec::new()));
@@ -585,32 +648,21 @@ impl ShadowPool {
                 materials.len() - 1
             })
             .collect();
-        for (layer, draws) in layers.iter().enumerate() {
-            if !dirty[layer / 6] {
-                continue;
-            }
-            let Some((colour, depth)) = self.layers.get(layer) else {
-                continue;
-            };
+        for (face, colour) in self.layers.iter().enumerate() {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("deferred shadow face"),
+                label: Some("deferred shadow atlas face"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: colour,
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        // Nothing in the way: as far as can be.
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 1.0e9,
-                            g: 0.0,
-                            b: 0.0,
-                            a: 1.0,
-                        }),
+                        // Preserve clean slots; clear only dirty tiles below.
+                        load: wgpu::LoadOp::Load,
                         store: wgpu::StoreOp::Store,
                     },
                 })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: depth,
+                    view: &self.depth,
                     depth_ops: Some(wgpu::Operations {
                         load: wgpu::LoadOp::Clear(1.0),
                         store: wgpu::StoreOp::Discard,
@@ -621,22 +673,34 @@ impl ShadowPool {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            pass.set_pipeline(&self.pipeline);
-            for &(i, slot) in draws {
-                let c = &casters[i];
-                let mesh = c.mesh;
-                pass.set_bind_group(
-                    0,
-                    &groups[caster_groups[i]].1,
-                    &[slot * STRIDE as u32, c.bone_offset],
-                );
-                pass.set_bind_group(1, &materials[caster_materials[i]].1, &[]);
-                pass.set_vertex_buffer(0, c.vertices.slice(..));
-                pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(0..mesh.count, 0, 0..1);
-            }
-            for &i in &tree_layers[layer] {
-                trees[i].draw(&mut pass, &self.tree_group, (layer * STRIDE) as u32);
+            for (cube, &dirty) in dirty.iter().enumerate() {
+                if !dirty {
+                    continue;
+                }
+                let x = cube as u32 % self.columns * SIZE;
+                let y = cube as u32 / self.columns * SIZE;
+                pass.set_viewport(x as f32, y as f32, SIZE as f32, SIZE as f32, 0.0, 1.0);
+                pass.set_scissor_rect(x, y, SIZE, SIZE);
+                pass.set_pipeline(&self.clear_pipeline);
+                pass.draw(0..3, 0..1);
+                pass.set_pipeline(&self.pipeline);
+                let layer = cube * 6 + face;
+                for &(i, slot) in &layers[layer] {
+                    let c = &casters[i];
+                    let mesh = c.mesh;
+                    pass.set_bind_group(
+                        0,
+                        &groups[caster_groups[i]].1,
+                        &[slot * STRIDE as u32, c.bone_offset],
+                    );
+                    pass.set_bind_group(1, &materials[caster_materials[i]].1, &[]);
+                    pass.set_vertex_buffer(0, c.vertices.slice(..));
+                    pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
+                    pass.draw_indexed(0..mesh.count, 0, 0..1);
+                }
+                for &i in &tree_layers[layer] {
+                    trees[i].draw(&mut pass, &self.tree_group, (layer * STRIDE) as u32);
+                }
             }
         }
     }
@@ -651,11 +715,11 @@ mod tests {
     fn reused_cubes_follow_slot_changes_and_reappearing_lights() {
         let ctx = crate::gpu::GpuContext::headless().unwrap();
         let device = &ctx.device;
-        let mut pool = ShadowPool::new(device);
+        let mut pool = ShadowPool::with_slots(device, SLOTS);
         let check = |pool: &mut ShadowPool, lights: &[(Vec3, f32)]| {
             let readback = device.create_buffer(&wgpu::BufferDescriptor {
                 label: None,
-                size: 512,
+                size: lights.len().max(1) as u64 * 256,
                 usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
                 mapped_at_creation: false,
             });
@@ -667,9 +731,9 @@ mod tests {
                         texture: &pool.texture,
                         mip_level: 0,
                         origin: wgpu::Origin3d {
-                            x: 0,
-                            y: 0,
-                            z: slot as u32 * 6,
+                            x: slot as u32 % pool.columns * SIZE,
+                            y: slot as u32 / pool.columns * SIZE,
+                            z: 0,
                         },
                         aspect: wgpu::TextureAspect::All,
                     },
@@ -724,6 +788,14 @@ mod tests {
         assert_eq!(pool.rendered_cubes, 6);
         check(&mut pool, &[b, moved]);
         assert_eq!(pool.rendered_cubes, 8);
+        let mut full = vec![a; SLOTS];
+        check(&mut pool, &full);
+        assert_eq!(pool.rendered_cubes, 8 + SLOTS);
+        full[SLOTS - 1] = b;
+        check(&mut pool, &full);
+        assert_eq!(pool.rendered_cubes, 9 + SLOTS);
+        check(&mut pool, &full);
+        assert_eq!(pool.rendered_cubes, 9 + SLOTS);
     }
 
     #[test]
@@ -731,7 +803,7 @@ mod tests {
         assert!(std::mem::size_of::<DrawUniforms>() <= STRIDE);
         let ctx = crate::gpu::GpuContext::headless().unwrap();
         let device = &ctx.device;
-        let mut pool = ShadowPool::new(device);
+        let mut pool = ShadowPool::with_slots(device, SLOTS);
         let vertex = |y, z, u, v| {
             let mut vertex = [0.0; std::mem::size_of::<DeferredVertex>() / 4];
             vertex[..18].copy_from_slice(&[
@@ -806,6 +878,7 @@ mod tests {
         let pose = std::cell::RefCell::<Vec<[f32; 4]>>::default();
         let world = std::cell::Cell::new(Mat4::IDENTITY);
         let light = std::cell::Cell::new((Vec3::ZERO, 10.0));
+        let last_moved = std::cell::Cell::new(false);
         let present = std::cell::Cell::new(true);
         let read = |pool: &mut ShadowPool, alpha: [f32; 4], clip: f32| {
             let pose = pose.borrow();
@@ -823,46 +896,52 @@ mod tests {
             };
             let readback = device.create_buffer(&wgpu::BufferDescriptor {
                 label: None,
-                size: 512,
+                size: (SLOTS * 512) as u64,
                 usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
                 mapped_at_creation: false,
             });
             let mut encoder = device.create_command_encoder(&Default::default());
             let casters = [caster];
+            let mut lights = vec![light.get(); SLOTS];
+            if last_moved.get() {
+                lights[SLOTS - 1] = (Vec3::Y * 100.0, 10.0);
+            }
             pool.encode(
                 device,
                 &ctx.queue,
                 &mut encoder,
-                &[light.get()],
+                &lights,
                 if present.get() { &casters } else { &[] },
                 &[],
             );
-            for (i, x) in [210, 300].into_iter().enumerate() {
-                encoder.copy_texture_to_buffer(
-                    wgpu::TexelCopyTextureInfo {
-                        texture: &pool.texture,
-                        mip_level: 0,
-                        origin: wgpu::Origin3d {
-                            x,
-                            y: SIZE / 2,
-                            z: 0,
+            for cube in 0..SLOTS {
+                for (i, x) in [210, 300].into_iter().enumerate() {
+                    encoder.copy_texture_to_buffer(
+                        wgpu::TexelCopyTextureInfo {
+                            texture: &pool.texture,
+                            mip_level: 0,
+                            origin: wgpu::Origin3d {
+                                x: cube as u32 % pool.columns * SIZE + x,
+                                y: cube as u32 / pool.columns * SIZE + SIZE / 2,
+                                z: 0,
+                            },
+                            aspect: wgpu::TextureAspect::All,
                         },
-                        aspect: wgpu::TextureAspect::All,
-                    },
-                    wgpu::TexelCopyBufferInfo {
-                        buffer: &readback,
-                        layout: wgpu::TexelCopyBufferLayout {
-                            offset: i as u64 * 256,
-                            bytes_per_row: Some(256),
-                            rows_per_image: Some(1),
+                        wgpu::TexelCopyBufferInfo {
+                            buffer: &readback,
+                            layout: wgpu::TexelCopyBufferLayout {
+                                offset: (cube * 2 + i) as u64 * 256,
+                                bytes_per_row: Some(256),
+                                rows_per_image: Some(1),
+                            },
                         },
-                    },
-                    wgpu::Extent3d {
-                        width: 1,
-                        height: 1,
-                        depth_or_array_layers: 1,
-                    },
-                );
+                        wgpu::Extent3d {
+                            width: 1,
+                            height: 1,
+                            depth_or_array_layers: 1,
+                        },
+                    );
+                }
             }
             ctx.queue.submit([encoder.finish()]);
             let (tx, rx) = std::sync::mpsc::channel();
@@ -872,7 +951,25 @@ mod tests {
             device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
             rx.recv().unwrap().unwrap();
             let bytes = readback.slice(..).get_mapped_range().unwrap();
-            [0, 256].map(|i| *bytemuck::from_bytes::<f32>(&bytes[i..i + 4]) < light.get().1)
+            let pixels = |cube| {
+                [0, 256].map(|i| {
+                    let i = cube * 512 + i;
+                    *bytemuck::from_bytes::<f32>(&bytes[i..i + 4]) < light.get().1
+                })
+            };
+            let first = pixels(0);
+            for cube in 1..SLOTS {
+                assert_eq!(
+                    pixels(cube),
+                    if last_moved.get() && cube == SLOTS - 1 {
+                        [false, false]
+                    } else {
+                        first
+                    },
+                    "atlas tile {cube}"
+                );
+            }
+            first
         };
         assert_eq!(read(&mut pool, [7.0, 255.0, 3.0, 1.0], 0.0), [false, true]);
         let rendered = pool.rendered_cubes;
@@ -883,15 +980,23 @@ mod tests {
         );
         pool.reuse_override = Some(false);
         assert_eq!(read(&mut pool, [7.0, 255.0, 3.0, 1.0], 0.0), [false, true]);
-        assert_eq!(pool.rendered_cubes, rendered + 1);
+        assert_eq!(pool.rendered_cubes, rendered + SLOTS);
         pool.reuse_override = Some(true);
         assert_eq!(read(&mut pool, [7.0, 255.0, 3.0, 1.0], 0.0), [false, true]);
         assert_eq!(
             pool.rendered_cubes,
-            rendered + 1,
+            rendered + SLOTS,
             "benchmark reuse must retain the control's maps"
         );
         pool.reuse_override = None;
+        // Redraw one distant tile without erasing any of its reused neighbours.
+        last_moved.set(true);
+        let rendered = pool.rendered_cubes;
+        assert_eq!(read(&mut pool, [7.0, 255.0, 3.0, 1.0], 0.0), [false, true]);
+        assert_eq!(pool.rendered_cubes, rendered + 1);
+        last_moved.set(false);
+        assert_eq!(read(&mut pool, [7.0, 255.0, 3.0, 1.0], 0.0), [false, true]);
+        assert_eq!(pool.rendered_cubes, rendered + 2);
         assert_eq!(read(&mut pool, [7.0, 255.0, 2.0, 1.0], 0.0), [true, false]);
         // Match D3D9's 8-bit rounding: a fraction below one still passes >= 255.
         assert_eq!(
@@ -941,7 +1046,7 @@ mod tests {
         assert_eq!(read(&mut pool, [7.0, 255.0, 3.0, 1.0], 0.0), [true, false]);
         assert_eq!(
             pool.rendered_cubes,
-            rendered + 1,
+            rendered + SLOTS,
             "in-place palette update must redraw"
         );
         world.set(Mat4::from_translation(Vec3::Y * 10.0));
@@ -958,7 +1063,7 @@ mod tests {
             let output = read(&mut pool, [7.0, 255.0, 3.0, 1.0], 0.0);
             assert_eq!(
                 pool.rendered_cubes,
-                rendered + 1,
+                rendered + SLOTS,
                 "changed light must redraw"
             );
             pool.previous.clear();
@@ -1009,6 +1114,213 @@ mod tests {
     #[test]
     fn shadow_shader_translates_everywhere() {
         crate::backend_check::translates("deferred shadows", SHADOW_WGSL);
+    }
+
+    #[test]
+    fn atlas_pcf_stays_inside_each_light_at_face_edges_and_corners() {
+        let ctx = crate::gpu::GpuContext::headless().unwrap();
+        let device = &ctx.device;
+        let source = format!(
+            "{}\n{}",
+            crate::deferred::DEFERRED_WGSL,
+            r#"
+            @fragment fn fs_atlas_test(@builtin(position) pixel: vec4<f32>) -> @location(0) f32 {
+                let index = u32(pixel.x);
+                let slot = index / 54u;
+                let face = (index / 9u) % 6u;
+                let sample = index % 9u;
+                let forward = array<vec3<f32>, 6>(
+                    vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(-1.0, 0.0, 0.0),
+                    vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(0.0, -1.0, 0.0),
+                    vec3<f32>(0.0, 0.0, 1.0), vec3<f32>(0.0, 0.0, -1.0));
+                let up = select(vec3<f32>(0.0, 0.0, 1.0), vec3<f32>(0.0, 1.0, 0.0), face >= 4u);
+                // Just inside each face: exercise all four edges and corners without
+                // changing the major-axis face under floating-point reconstruction.
+                let xy = vec2<f32>(f32(sample % 3u) - 1.0, f32(sample / 3u) - 1.0) * 0.9999;
+                let direction = forward[face] + cross(forward[face], up) * xy.x + up * xy.y;
+                let origin = vec2<i32>(i32(slot % 4u), i32(slot / 4u)) * 512;
+                return shadowed(i32(slot), origin, vec3<f32>(0.0), normalize(direction) * 3.0, vec3<f32>(0.0));
+            }"#,
+        );
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("atlas PCF fixture"),
+            source: wgpu::ShaderSource::Wgsl(source.into()),
+        });
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("atlas PCF fixture"),
+            layout: None,
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_fullscreen"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_atlas_test"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: FORMAT,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: Default::default(),
+            depth_stencil: None,
+            multisample: Default::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+        let matrices: Vec<_> = (0..SLOTS)
+            .flat_map(|_| faces(Vec3::ZERO, 10.0).map(|m| m.to_cols_array_2d()))
+            .collect();
+        let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents: bytemuck::cast_slice(&matrices),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let uniforms = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[wgpu::BindGroupEntry {
+                binding: 2,
+                resource: buffer.as_entire_binding(),
+            }],
+        });
+        // Alternate open and occluded neighbours in both atlas directions.
+        let atlas = device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d {
+                width: SIZE * 4,
+                height: SIZE * 4,
+                depth_or_array_layers: 6,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: FORMAT,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        for slot in 0..SLOTS {
+            let open = (slot % 4 + slot / 4) % 2 == 0;
+            let values = vec![if open { 20.0f32 } else { 0.0 }; (SIZE * SIZE) as usize];
+            for face in 0..6 {
+                ctx.queue.write_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &atlas,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d {
+                            x: slot as u32 % 4 * SIZE,
+                            y: slot as u32 / 4 * SIZE,
+                            z: face,
+                        },
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    bytemuck::cast_slice(&values),
+                    wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(SIZE * 4),
+                        rows_per_image: Some(SIZE),
+                    },
+                    wgpu::Extent3d {
+                        width: SIZE,
+                        height: SIZE,
+                        depth_or_array_layers: 1,
+                    },
+                );
+            }
+        }
+        let view = atlas.create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(wgpu::TextureViewDimension::D2Array),
+            ..Default::default()
+        });
+        let textures = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &pipeline.get_bind_group_layout(1),
+            entries: &[wgpu::BindGroupEntry {
+                binding: 5,
+                resource: wgpu::BindingResource::TextureView(&view),
+            }],
+        });
+        let width = SLOTS as u32 * 54;
+        let out = device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d {
+                width,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let bytes_per_row = (width * 4).next_multiple_of(256);
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: bytes_per_row as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = device.create_command_encoder(&Default::default());
+        {
+            let out_view = out.create_view(&Default::default());
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &out_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                ..Default::default()
+            });
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &uniforms, &[]);
+            pass.set_bind_group(1, &textures, &[]);
+            pass.draw(0..3, 0..1);
+        }
+        encoder.copy_texture_to_buffer(
+            out.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(bytes_per_row),
+                    rows_per_image: Some(1),
+                },
+            },
+            out.size(),
+        );
+        ctx.queue.submit([encoder.finish()]);
+        let (tx, rx) = std::sync::mpsc::channel();
+        readback
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |r| tx.send(r).unwrap());
+        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        rx.recv().unwrap().unwrap();
+        let bytes = readback.slice(..).get_mapped_range().unwrap();
+        let values: &[f32] = bytemuck::cast_slice(&bytes);
+        for (index, &value) in values[..width as usize].iter().enumerate() {
+            let slot = index / 54;
+            let expected = if (slot % 4 + slot / 4) % 2 == 0 {
+                1.0
+            } else {
+                0.0
+            };
+            assert_eq!(
+                value,
+                expected,
+                "slot {slot}, face {}, sample {}",
+                index / 9 % 6,
+                index % 9
+            );
+        }
     }
 
     /// The lighting shader picks a face by the major axis of the direction from the light;
