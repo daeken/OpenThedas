@@ -119,6 +119,8 @@ pub struct LiveObjects {
     /// Creatures' faces (their eyes', else their head's mesh centre), offset from the
     /// creature, from their draws when the scene was built: where portraits look.
     faces: std::collections::HashMap<ObjectId, glam::Vec3>,
+    /// Interaction volumes of invisible placeables, which have no draws to pick.
+    unseen_shapes: std::collections::HashMap<ObjectId, Vec<crate::camfade::Shape>>,
     /// The placeables' opaque surfaces as drawn (doors, furniture), which the game camera
     /// keeps on the near side of, as it does the level's.
     solid: thedas_render::collide::Collider,
@@ -847,7 +849,7 @@ impl Live {
             return;
         }
         // A tutorial that pauses the game holds it until its popup is dismissed.
-        if self.sim().world.tutorial_paused {
+        if self.sim().tutorial_paused() {
             return;
         }
         self.owed_ms += dt_ms.clamp(0.0, MAX_STEP_MS);
@@ -1883,6 +1885,23 @@ impl Live {
             models.push(m);
         }
         let kept = shown.kept;
+        // The next frame's locomotion leaves these creatures' standing pose to the cutscene:
+        // a playing cutscene's actors, and creatures a conversation line animates or that
+        // keep a cutscene's animations (a seated creature). A conversation line that only
+        // places and faces its speakers leaves them to locomotion, so they turn in place
+        // toward each other as #914 has them.
+        let cut_playing = sim.world.cutscene.is_some();
+        self.locomotion.hold(
+            posing
+                .iter()
+                .filter(|(_, show)| cut_playing || !show.animations.is_empty())
+                .map(|(id, _)| *id)
+                .chain(
+                    kept.iter()
+                        .filter(|(_, a)| !a.is_empty())
+                        .map(|(id, _)| *id),
+                ),
+        );
         // A cutscene's weapon draws and hidden actors.
         let mut hidden = std::collections::HashSet::new();
         // Party members the playing cutscene does not cast are not drawn while it plays
@@ -2769,6 +2788,7 @@ impl Live {
         let mut bounds = std::collections::HashMap::new();
         let mut faces = std::collections::HashMap::new();
         let mut shapes = std::collections::HashMap::new();
+        let mut unseen_shapes = std::collections::HashMap::new();
         let mut placeable_draws = Vec::new();
         let mut moving = std::collections::HashMap::new();
         for (i, (m, p)) in models.iter().zip(&scene.props).enumerate() {
@@ -2799,6 +2819,14 @@ impl Live {
                     thedas_render::collide::Collider::from_draws(&scene, p.draws.clone(), false);
                 if !shape.is_empty() {
                     shapes.insert(m.id, shape);
+                }
+                if p.draws.is_empty()
+                    && let Some(level) = self.level.as_ref()
+                {
+                    let shapes = invisible_placeable_shapes(&level.vfs, &m.models);
+                    if !shapes.is_empty() {
+                        unseen_shapes.insert(m.id, shapes);
+                    }
                 }
             }
             // A creature's eyes (`_uem_` meshes) or head (`_uhm_`; Dragon Age II's heads are
@@ -2840,6 +2868,7 @@ impl Live {
             bounds,
             shapes,
             faces,
+            unseen_shapes,
             solid,
             moving,
             bodies: models
@@ -2867,6 +2896,61 @@ const PORTRAIT_GAIN: f32 = 1.8;
 pub enum Pick {
     Object(ObjectId),
     Ground([f32; 3]),
+}
+
+/// Invisible transition markers carry a PHY interaction volume even though their MMH
+/// has no mesh. Render bounds cannot represent these objects.
+fn invisible_placeable_shapes(
+    vfs: &thedas_vfs::Vfs,
+    models: &[String],
+) -> Vec<crate::camfade::Shape> {
+    models
+        .iter()
+        .flat_map(|model| {
+            let phy = vfs
+                .read(&format!("{model}.phy"))
+                .ok()
+                .and_then(|(data, _)| thedas_formats::phy::Phy::parse(&data).ok());
+            let mmh = vfs
+                .read(&format!("{model}.mmh"))
+                .ok()
+                .and_then(|(data, _)| thedas_formats::model::Mmh::parse(&data).ok());
+            phy.map(|phy| {
+                crate::camfade::model_shapes_in_mask(
+                    &phy,
+                    mmh.as_ref(),
+                    thedas_formats::phy::mask::PLACEABLES,
+                )
+            })
+            .unwrap_or_default()
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod invisible_pick_tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires THEDAS_INSTALL pointing at a DAO install"]
+    fn dust_towns_invisible_exit_has_a_pick_volume_without_rendered_meshes() {
+        let install =
+            DaoInstall::open(PathBuf::from(std::env::var_os("THEDAS_INSTALL").unwrap())).unwrap();
+        let vfs = install.play_vfs(TextureQuality::High).unwrap();
+        let model = "plc_invisowide_01_0";
+        let (data, _) = vfs.read(&format!("{model}.mmh")).unwrap();
+        let mmh = thedas_formats::model::Mmh::parse(&data).unwrap();
+        assert!(mmh.mesh_pieces().is_empty());
+        let shapes = invisible_placeable_shapes(&vfs, &[model.into()]);
+        assert!(!shapes.is_empty());
+        let placement = Prop::placement([342.92227, 280.8993, 9.373493], 245.0);
+        let point = placement.transform_point3(glam::Vec3::new(0.0, 0.0, 1.5));
+        let origin = placement.transform_point3(glam::Vec3::new(0.0, 3.0, 1.5));
+        assert!(shapes.iter().any(|s| {
+            s.ray(&placement, origin, (point - origin).normalize())
+                .is_some()
+        }));
+    }
 }
 
 /// A model's creature shapes (its `.phy`'s creatures group, see [`crate::camfade`]), read
@@ -2954,7 +3038,7 @@ impl Live {
                 }
                 // A placeable is picked where the click meets its surfaces (a door's
                 // bounding sphere reaches far past the door, over whoever stands by it);
-                // one with nothing drawn, by its bounds.
+                // one with nothing drawn, by its PHY interaction volume, then its bounds.
                 thedas_sim::world::ObjectKind::Placeable if o.interactive => {
                     let objects = self.objects.as_ref();
                     match objects.and_then(|s| s.shapes.get(&o.id)) {
@@ -2964,9 +3048,19 @@ impl Live {
                                 .first_hit(origin, origin + dir * (PICK_REACH / len))
                                 .map(|f| f * PICK_REACH / len)
                         }
-                        None => objects
-                            .and_then(|s| s.bounds.get(&o.id))
-                            .and_then(|&(off, r)| ray_sphere(origin, dir, p + off, r)),
+                        None => objects.and_then(|s| {
+                            if let Some(shapes) = s.unseen_shapes.get(&o.id) {
+                                let placement = Prop::placement(o.position, o.facing);
+                                shapes
+                                    .iter()
+                                    .filter_map(|s| s.ray(&placement, origin, dir))
+                                    .min_by(f32::total_cmp)
+                            } else {
+                                s.bounds
+                                    .get(&o.id)
+                                    .and_then(|&(off, r)| ray_sphere(origin, dir, p + off, r))
+                            }
+                        }),
                     }
                 }
                 _ => None,

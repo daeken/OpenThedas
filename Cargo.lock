@@ -5244,6 +5244,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "thedas-bake"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "env_logger",
+ "glam",
+ "log",
+ "png",
+ "serde_json",
+ "thedas-formats",
+ "thedas-render",
+ "thedas-vfs",
+]
+
+[[package]]
 name = "thedas-cli"
 version = "0.1.0"
 dependencies = [
@@ -5325,6 +5341,7 @@ dependencies = [
  "log",
  "naga",
  "pollster 0.4.0",
+ "serde_json",
  "thedas-formats",
  "thedas-shader",
  "thedas-vfs",

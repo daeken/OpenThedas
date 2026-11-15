@@ -261,6 +261,9 @@ pub(crate) struct DeferredPass {
     effect_lights: Vec<SceneLight>,
     /// The lights its own renderer's glowing emitters give, set each frame.
     own_lights: Vec<SceneLight>,
+    /// Experimental: a fitted light set's baked-only fill lights (lightmaps-off mode only;
+    /// see `crate::lightset`), lit with the bake's linear falloff and no specular.
+    fill_lights: Vec<SceneLight>,
     /// The GPU refused the pass: the level stays faithful.
     refused: bool,
     /// Experimental probe + runtime visibility mode. Fixed when this renderer is built.
@@ -464,6 +467,12 @@ impl DeferredPass {
         cache: &mut TextureCache,
     ) -> Option<DeferredPass> {
         let started = std::time::Instant::now();
+        // Experimental: a fitted light set for the lightmaps-off mode (see `crate::lightset`).
+        let light_set = if crate::config::CONFIG.baked_lighting {
+            None
+        } else {
+            crate::lightset::LightSet::for_level(&scene.level)
+        };
         let punch_enabled = crate::config::CONFIG.punch;
         let punch: HashMap<usize, _> = if punch_enabled {
             d3d.draws
@@ -804,16 +813,28 @@ impl DeferredPass {
                     },
                 ],
                 terrain: crate::deferred_terrain::TerrainData::new(m),
-                probe: item
-                    .probe
-                    .and_then(|i| scene.probes.get(i))
-                    .map(|p| p.probe.rows())
-                    .unwrap_or_else(|| {
-                        thedas_formats::probe::IrradianceProbe::uniform(
-                            crate::d3d::NO_PROBE_IRRADIANCE,
-                        )
-                        .rows()
-                    }),
+                probe: match light_set
+                    .as_ref()
+                    .filter(|_| !is_object)
+                    .and_then(|set| set.ambient.get(&item.room.to_ascii_lowercase()))
+                {
+                    // The room's baked ambient in place of the probe, encoded as the
+                    // lightmaps store light (gamma 1.5), which the shaders use raw.
+                    Some(a) => thedas_formats::probe::IrradianceProbe::uniform(
+                        a.max(Vec3::ZERO).powf(1.0 / 1.5).to_array(),
+                    )
+                    .rows(),
+                    None => item
+                        .probe
+                        .and_then(|i| scene.probes.get(i))
+                        .map(|p| p.probe.rows())
+                        .unwrap_or_else(|| {
+                            thedas_formats::probe::IrradianceProbe::uniform(
+                                crate::d3d::NO_PROBE_IRRADIANCE,
+                            )
+                            .rows()
+                        }),
+                },
                 tint: {
                     let values = m
                         .object
@@ -1025,6 +1046,36 @@ impl DeferredPass {
             gpu: None,
             effect_lights: Vec::new(),
             own_lights: Vec::new(),
+            fill_lights: light_set
+                .map(|set| {
+                    // A fill belongs to the room of the pieces its atlas lights, so it reaches
+                    // what that room's lights reach (it casts no shadow of its own).
+                    let atlas_room = |atlas: &str| {
+                        let suffix = format!("{atlas}.dds");
+                        scene.draws.iter().find_map(|d| {
+                            let lm = d.lightmap.as_ref()?;
+                            lm.texture
+                                .to_ascii_lowercase()
+                                .ends_with(&suffix)
+                                .then_some(d.room_id)?
+                        })
+                    };
+                    set.fills
+                        .iter()
+                        .map(|f| SceneLight::Point {
+                            position: f.position,
+                            color: f.color,
+                            radius: f.radius,
+                            name: "baked fill".into(),
+                            domain: None,
+                            is_static: true,
+                            version: 0,
+                            intensity: 1.0,
+                            room: f.atlas.as_deref().and_then(atlas_room),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
             refused: false,
             baked_lighting: crate::config::CONFIG.baked_lighting,
             ssao: crate::config::CONFIG.ssao,
@@ -2163,6 +2214,24 @@ impl DeferredPass {
             }
             slots
         };
+        if !self.fill_lights.is_empty() {
+            // A light set's fill lights: after the shadow slots are chosen (they never take
+            // one), nearest first into what room the light list has left. Colour w = 2 marks
+            // them for the lighting pass (linear falloff, no specular, level surfaces only).
+            let planes = frustum(camera.view_proj(width as f32 / height.max(1) as f32));
+            let mut fills: Vec<(f32, GpuLight)> = self
+                .fill_lights
+                .iter()
+                .filter_map(|l| self.light(l, &planes, camera.position, characters))
+                .collect();
+            fills.sort_by(|a, b| a.0.total_cmp(&b.0));
+            fills.truncate(MAX_LIGHTS.saturating_sub(lights.len()));
+            for (_, mut l) in fills {
+                l.colour[3] = 2.0;
+                l.shadow[0] = -1.0;
+                lights.push(l);
+            }
+        }
         if crate::config::CONFIG.log_lights {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| {
@@ -2255,8 +2324,8 @@ impl DeferredPass {
                 .create_texture(&wgpu::TextureDescriptor {
                     label: Some("deferred bounce"),
                     size: wgpu::Extent3d {
-                        width: width.div_ceil(2).max(1),
-                        height: height.div_ceil(2).max(1),
+                        width: width.div_ceil(4).max(1),
+                        height: height.div_ceil(4).max(1),
                         depth_or_array_layers: 1,
                     },
                     mip_level_count: 1,
@@ -2601,7 +2670,11 @@ impl DeferredPass {
                     },
                 })],
                 depth_stencil_attachment: None,
-                timestamp_writes: None,
+                timestamp_writes: if bounce_flags != 0 {
+                    profile.as_deref_mut().and_then(|p| p.pass("bounce"))
+                } else {
+                    None
+                },
                 occlusion_query_set: None,
                 multiview_mask: None,
             });

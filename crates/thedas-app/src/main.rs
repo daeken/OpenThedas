@@ -276,7 +276,8 @@ struct Args {
     #[arg(long)]
     audio: bool,
     /// Headless (`--steps`): record the game's sound to this WAV file (stereo, 48 kHz),
-    /// never to the speakers.
+    /// never to the speakers. In a windowed run (including `--control`) the sound runs
+    /// silently, for its log lines, and no WAV is written.
     #[arg(long)]
     audio_wav: Option<PathBuf>,
     /// Ask whether the problem reported in this report folder is fixed, once the game is up
@@ -1904,7 +1905,7 @@ impl App {
             g.reticle
                 .draw(&g.ctx.device, &mut encoder, &view, size, &lines);
         }
-        g.ui.composite(&mut encoder, &view, g.config.format);
+        g.ui.composite(&mut encoder, &frame.texture, g.config.format);
         // The pad's pointer goes over the interface.
         let ctx = self
             .pad
@@ -7601,7 +7602,19 @@ fn main() -> Result<()> {
             let off = args.no_audio
                 || std::env::var_os("THEDAS_NO_AUDIO").is_some()
                 || (args.control.is_some() && !args.audio);
-            if off {
+            if args.audio_wav.is_some() {
+                // A windowed run with --audio-wav: the game's sound runs (its log lines
+                // say what it plays, e.g. "audio: voice starts") but never reaches the
+                // speakers. The WAV itself is written only by headless --steps runs.
+                log::info!("audio: silent (no speakers; --audio-wav in a windowed run)");
+                Some(audio::GameAudio::recording(
+                    &install,
+                    &args.module,
+                    &loaded_vfs,
+                    &args.language,
+                    48000,
+                ))
+            } else if off {
                 log::info!("audio: off");
                 None
             } else {

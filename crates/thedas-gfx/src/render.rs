@@ -410,7 +410,7 @@ pub struct Renderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
     format: wgpu::TextureFormat,
-    pipelines: HashMap<(Blend, Stencil), wgpu::RenderPipeline>,
+    pipelines: HashMap<PipelineKey, wgpu::RenderPipeline>,
     /// Group 0: draw records, the vertex arena and the per-render vertex stream.
     draw_layout: wgpu::BindGroupLayout,
     /// One texture and its sampler (each draw's own without texture arrays; the backdrop).
@@ -454,11 +454,51 @@ pub struct Renderer {
     bitmaps: HashMap<(String, bool, bool), Option<Bitmap>>,
     engine_images: HashMap<String, Option<EngineImage>>,
     targets: Option<Targets>,
+    /// Drawing straight into a host's picture (see [`Renderer::draw_into`]): the last
+    /// build, uploaded, and the stencil buffer it draws with.
+    direct: Option<Direct>,
+    /// The copy of the picture that destination-dependent blends sample, by size and format.
+    backdrop: Option<(
+        (u32, u32),
+        wgpu::TextureFormat,
+        wgpu::Texture,
+        wgpu::BindGroup,
+    )>,
     /// Draws in the last frame.
     pub draws: usize,
     filters: crate::filters::Filters,
     filter_stack: Vec<DisplayId>,
     masking: bool,
+}
+
+/// A pipeline: blend, stencil use, target format, samples.
+type PipelineKey = (Blend, Stencil, wgpu::TextureFormat, u32);
+
+/// A build uploaded for drawing: its records and stream are in the renderer's buffers.
+struct Prepared {
+    ops: Vec<Op>,
+    /// Each op's place in the stream.
+    ranges: Vec<(u32, u32)>,
+    draw_group: wgpu::BindGroup,
+    table: Option<wgpu::BindGroup>,
+}
+
+/// Where an encode draws: the picture (texture for backdrop copies, view to draw into),
+/// its multisampled stand-in, the stencil, and whether to clear the picture first.
+struct Target<'a> {
+    texture: &'a wgpu::Texture,
+    view: &'a wgpu::TextureView,
+    msaa: Option<&'a wgpu::TextureView>,
+    stencil: &'a wgpu::TextureView,
+    samples: u32,
+    clear: bool,
+}
+
+/// The state of drawing straight into a host's picture.
+struct Direct {
+    size: (u32, u32),
+    stencil: wgpu::TextureView,
+    prepared: Option<Prepared>,
 }
 
 struct Targets {
@@ -610,6 +650,8 @@ impl Renderer {
             bitmaps: HashMap::new(),
             engine_images: HashMap::new(),
             targets: None,
+            direct: None,
+            backdrop: None,
             draws: 0,
             filters: crate::filters::Filters::new(device, format),
             filter_stack: Vec::new(),
@@ -617,8 +659,14 @@ impl Renderer {
         }
     }
 
-    fn pipeline(&mut self, blend: Blend, stencil: Stencil) -> &wgpu::RenderPipeline {
-        let key = (blend, stencil);
+    fn pipeline(
+        &mut self,
+        blend: Blend,
+        stencil: Stencil,
+        format: wgpu::TextureFormat,
+        samples: u32,
+    ) -> &wgpu::RenderPipeline {
+        let key = (blend, stencil, format, samples);
         if !self.pipelines.contains_key(&key) {
             let pass_op = match stencil {
                 Stencil::Content => wgpu::StencilOperation::Keep,
@@ -656,7 +704,7 @@ impl Renderer {
                         bias: Default::default(),
                     }),
                     multisample: wgpu::MultisampleState {
-                        count: self.samples,
+                        count: samples,
                         ..Default::default()
                     },
                     fragment: Some(wgpu::FragmentState {
@@ -668,7 +716,7 @@ impl Renderer {
                         }),
                         compilation_options: Default::default(),
                         targets: &[Some(wgpu::ColorTargetState {
-                            format: self.format,
+                            format,
                             blend: (blend.shader_mode() == 0).then(|| blend.state()),
                             write_mask: if stencil == Stencil::Content {
                                 wgpu::ColorWrites::ALL
@@ -808,6 +856,17 @@ impl Renderer {
     /// Draws the movie into [`Renderer::output`] (transparent background).
     pub fn render(&mut self, player: &mut Player, images: &mut dyn Images, size: (u32, u32)) {
         self.ensure_targets(size);
+        let b = self.build(player, images, size);
+        let started = std::time::Instant::now();
+        if let Some(targets) = self.targets.take() {
+            self.draw_build(b, &targets);
+            self.targets = Some(targets);
+        }
+        self.stats.submit_us = started.elapsed().as_micros() as u64;
+    }
+
+    /// Walks the movie into a draw list for a picture of `size` (stats reset).
+    fn build(&mut self, player: &mut Player, images: &mut dyn Images, size: (u32, u32)) -> Build {
         let (authored_w, authored_h) = player.vm.movie.stage_size();
         let s = (size.0 as f32 / authored_w).min(size.1 as f32 / authored_h);
         let ox = (size.0 as f32 - authored_w * s) / 2.0;
@@ -841,17 +900,12 @@ impl Renderer {
         self.draws = b.ops.len();
         self.stats.draws = b.ops.len();
         self.stats.build_us = started.elapsed().as_micros() as u64;
-        let started = std::time::Instant::now();
-        if let Some(targets) = self.targets.take() {
-            self.draw_build(&b, &targets);
-            self.targets = Some(targets);
-        }
-        self.stats.submit_us = started.elapsed().as_micros() as u64;
         // Drop text meshes of fields that are gone.
         self.texts
             .retain(|d, _| player.vm.display.get(*d).is_some());
         self.drawings
             .retain(|d, _| player.vm.display.get(*d).is_some());
+        b
     }
 
     /// Makes sure `slot` is a storage buffer of at least `need` bytes.
@@ -926,9 +980,36 @@ impl Renderer {
         self.table_group.as_ref().map(|(_, g)| g.clone())
     }
 
-    fn draw_build(&mut self, b: &Build, t: &Targets) {
+    /// Draws `b` into the renderer's own targets `t` (cleared first) and submits.
+    fn draw_build(&mut self, b: Build, t: &Targets) {
+        let Some(prepared) = self.prepare_build(b) else {
+            return;
+        };
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("gfx") });
+        let view = t.output.create_view(&Default::default());
+        let format = self.format;
+        self.calls = self.encode(
+            &prepared,
+            &mut encoder,
+            Target {
+                texture: &t.output,
+                view: &view,
+                msaa: t.msaa.as_ref(),
+                stencil: &t.stencil,
+                samples: self.samples,
+                clear: true,
+            },
+            format,
+        );
+        self.queue.submit(Some(encoder.finish()));
+    }
+
+    /// Uploads `b`'s records and vertex stream and makes the bind groups that draw them.
+    fn prepare_build(&mut self, b: Build) -> Option<Prepared> {
         // Records: one per op (`Build::push` gives each its own), read by index.
-        let mut records = b.uniforms.clone();
+        let mut records = b.uniforms;
         for op in &b.ops {
             if let (Some(tex), Some(r)) = (&op.mesh.binding, records.get_mut(op.uniform as usize)) {
                 r.mode[2] = tex.slot() as f32;
@@ -977,7 +1058,7 @@ impl Renderer {
             eprintln!("gfx batches: {runs:?}");
         }
         let (Some((record_buf, _)), Some((stream_buf, _))) = (&self.records, &self.stream) else {
-            return;
+            return None;
         };
         self.queue.write_buffer(record_buf, 0, record_bytes);
         self.queue.write_buffer(stream_buf, 0, stream_bytes);
@@ -999,54 +1080,96 @@ impl Renderer {
                 },
             ],
         });
-        for op in &b.ops {
-            self.pipeline(op.blend, op.stencil);
-        }
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("gfx") });
-        // Resolve before a destination-dependent blend, then sample a snapshot rather
-        // than the active attachment. Keep the multisample colour/stencil between passes
-        // so later siblings and open clip-depth masks retain their state.
-        let snapshot = b.ops.iter().any(|op| op.blend.shader_mode() != 0).then(|| {
+        Some(Prepared {
+            ops: b.ops,
+            ranges,
+            draw_group,
+            table,
+        })
+    }
+
+    /// The backdrop texture for destination-dependent blends over a picture of `size` and
+    /// `format`, made again when either changes.
+    fn backdrop(
+        &mut self,
+        size: (u32, u32),
+        format: wgpu::TextureFormat,
+    ) -> (wgpu::Texture, wgpu::BindGroup) {
+        if !self
+            .backdrop
+            .as_ref()
+            .is_some_and(|(s, f, _, _)| *s == size && *f == format)
+        {
             let tex = self.device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("gfx blend backdrop"),
-                size: t.output.size(),
+                size: wgpu::Extent3d {
+                    width: size.0.max(1),
+                    height: size.1.max(1),
+                    depth_or_array_layers: 1,
+                },
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
-                format: self.format,
+                format,
                 usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
                 view_formats: &[],
             });
             let binding = texture_binding(&self.device, &self.texture_layout, &tex, &self.clamp);
-            (tex, binding)
-        });
-        // Even a first draw that needs a backdrop must see a cleared target.
+            self.backdrop = Some((size, format, tex, binding));
+        }
+        let (_, _, t, b) = self.backdrop.as_ref().expect("made above");
+        (t.clone(), b.clone())
+    }
+
+    /// Records `p`'s draws into `encoder`, onto `t`; returns the draw calls made.
+    fn encode(
+        &mut self,
+        p: &Prepared,
+        encoder: &mut wgpu::CommandEncoder,
+        t: Target<'_>,
+        format: wgpu::TextureFormat,
+    ) -> usize {
+        for op in &p.ops {
+            self.pipeline(op.blend, op.stencil, format, t.samples);
+        }
+        // Resolve before a destination-dependent blend, then sample a snapshot rather
+        // than the active attachment. Keep the multisample colour/stencil between passes
+        // so later siblings and open clip-depth masks retain their state. A picture that
+        // cannot be copied gives those blends a white backdrop.
+        let copyable = t.texture.usage().contains(wgpu::TextureUsages::COPY_SRC);
+        let size = (t.texture.width(), t.texture.height());
+        let snapshot = p
+            .ops
+            .iter()
+            .any(|op| op.blend.shader_mode() != 0)
+            .then(|| self.backdrop(size, t.texture.format()));
+        let table = p.table.as_ref();
         let mut calls = 0usize;
         let mut start = 0;
         let mut first = true;
         loop {
-            let end = (start + usize::from(!first)..b.ops.len())
-                .find(|&i| b.ops[i].blend.shader_mode() != 0)
-                .unwrap_or(b.ops.len());
-            if !first && start < b.ops.len() && b.ops[start].blend.shader_mode() != 0 {
-                let (texture, _) = snapshot.as_ref().unwrap();
-                encoder.copy_texture_to_texture(
-                    t.output.as_image_copy(),
-                    texture.as_image_copy(),
-                    t.output.size(),
-                );
+            let end = (start + usize::from(!first)..p.ops.len())
+                .find(|&i| p.ops[i].blend.shader_mode() != 0)
+                .unwrap_or(p.ops.len());
+            // A first pass runs before any destination blend (it may draw nothing), so the
+            // picture copied here holds what was drawn (or cleared) before.
+            if !first && start < p.ops.len() && p.ops[start].blend.shader_mode() != 0 && copyable {
+                if let Some((texture, _)) = snapshot.as_ref() {
+                    encoder.copy_texture_to_texture(
+                        t.texture.as_image_copy(),
+                        texture.as_image_copy(),
+                        t.texture.size(),
+                    );
+                }
             }
-            let out_view = t.output.create_view(&Default::default());
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("gfx"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: t.msaa.as_ref().unwrap_or(&out_view),
-                    resolve_target: t.msaa.as_ref().map(|_| &out_view),
+                    view: t.msaa.unwrap_or(t.view),
+                    resolve_target: t.msaa.map(|_| t.view),
                     depth_slice: None,
                     ops: wgpu::Operations {
-                        load: if first {
+                        load: if first && t.clear {
                             wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT)
                         } else {
                             wgpu::LoadOp::Load
@@ -1060,7 +1183,7 @@ impl Renderer {
                     },
                 })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &t.stencil,
+                    view: t.stencil,
                     depth_ops: Some(wgpu::Operations {
                         load: wgpu::LoadOp::Clear(1.0),
                         store: wgpu::StoreOp::Discard,
@@ -1086,8 +1209,8 @@ impl Renderer {
                 snapshot.as_ref().map(|(_, bg)| bg).unwrap_or(&self.white),
                 &[],
             );
-            pass.set_bind_group(0, &draw_group, &[]);
-            if let Some(table) = &table {
+            pass.set_bind_group(0, &p.draw_group, &[]);
+            if let Some(table) = table {
                 pass.set_bind_group(1, table, &[]);
             }
             // Consecutive ops that share a pipeline, a stencil reference and (without
@@ -1106,37 +1229,114 @@ impl Renderer {
             };
             let mut i = start;
             while i < end {
-                let op = &b.ops[i];
+                let op = &p.ops[i];
                 let k = key(op);
                 let mut j = i + 1;
-                while j < end && key(&b.ops[j]) == k {
+                while j < end && key(&p.ops[j]) == k {
                     j += 1;
                 }
-                let Some(p) = self.pipelines.get(&(op.blend, op.stencil)) else {
+                let Some(pl) = self
+                    .pipelines
+                    .get(&(op.blend, op.stencil, format, t.samples))
+                else {
                     i = j;
                     continue;
                 };
-                pass.set_pipeline(p);
+                pass.set_pipeline(pl);
                 pass.set_stencil_reference(op.reference);
                 if table.is_none() {
                     let single = op.mesh.binding.as_ref().map(|t| t.single());
                     pass.set_bind_group(1, single.unwrap_or(&self.white), &[]);
                 }
-                let first = ranges[i].0;
-                let last = ranges[j - 1].0 + ranges[j - 1].1;
+                let first = p.ranges[i].0;
+                let last = p.ranges[j - 1].0 + p.ranges[j - 1].1;
                 pass.draw(first..last, 0..1);
                 calls += 1;
                 i = j;
             }
             drop(pass);
-            if end == b.ops.len() {
+            if end == p.ops.len() {
                 break;
             }
             start = end;
             first = false;
         }
-        self.queue.submit(Some(encoder.finish()));
-        self.calls = calls;
+        calls
+    }
+
+    /// Brings the movie's draw list up to date for drawing straight into a host's picture
+    /// of `size` (see [`Renderer::draw_into`]): walks and uploads only when the movie or
+    /// the size changed. Returns whether it rebuilt.
+    pub fn prepare_into(
+        &mut self,
+        player: &mut Player,
+        images: &mut dyn Images,
+        size: (u32, u32),
+    ) -> bool {
+        let resized = self.direct.as_ref().is_none_or(|d| d.size != size);
+        let dirty = player.take_dirty();
+        if !dirty && !resized && self.direct.as_ref().is_some_and(|d| d.prepared.is_some()) {
+            return false;
+        }
+        if resized {
+            let stencil = self
+                .device
+                .create_texture(&wgpu::TextureDescriptor {
+                    label: Some("gfx stencil"),
+                    size: wgpu::Extent3d {
+                        width: size.0.max(1),
+                        height: size.1.max(1),
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::Depth24PlusStencil8,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                    view_formats: &[],
+                })
+                .create_view(&Default::default());
+            self.direct = Some(Direct {
+                size,
+                stencil,
+                prepared: None,
+            });
+        }
+        let b = self.build(player, images, size);
+        let prepared = self.prepare_build(b);
+        if let Some(d) = self.direct.as_mut() {
+            d.prepared = prepared;
+        }
+        true
+    }
+
+    /// Draws the movie's prepared draw list (see [`Renderer::prepare_into`]) over `target`,
+    /// a picture of the prepared size, into `encoder`. Nothing is re-walked or uploaded:
+    /// an unchanged movie costs its few draw calls. Blends act on what is already in the
+    /// picture, as the original's did on the game's frame.
+    pub fn draw_into(&mut self, encoder: &mut wgpu::CommandEncoder, target: &wgpu::Texture) {
+        let Some(direct) = self.direct.take() else {
+            return;
+        };
+        if direct.size == (target.width(), target.height()) {
+            if let Some(prepared) = direct.prepared.as_ref() {
+                let view = target.create_view(&Default::default());
+                self.calls = self.encode(
+                    prepared,
+                    encoder,
+                    Target {
+                        texture: target,
+                        view: &view,
+                        msaa: None,
+                        stencil: &direct.stencil,
+                        samples: 1,
+                        clear: false,
+                    },
+                    target.format(),
+                );
+            }
+        }
+        self.direct = Some(direct);
     }
 
     fn upload(
@@ -1909,7 +2109,7 @@ impl Renderer {
             );
             self.filter_stack.pop();
             let targets = self.create_targets((view.w as u32, view.h as u32));
-            self.draw_build(&source, &targets);
+            self.draw_build(source, &targets);
             let output = self.filters.apply(
                 &self.device,
                 &self.queue,
@@ -2244,7 +2444,41 @@ impl Renderer {
     /// Reads the output back (straight RGBA), for tests and captures.
     pub fn capture(&self) -> Option<(u32, u32, Vec<u8>)> {
         let t = self.targets.as_ref()?;
-        let (w, h) = t.size;
+        self.read_back(&t.output)
+    }
+
+    /// The prepared draw list (see [`Renderer::prepare_into`]) drawn over a transparent
+    /// picture and read back (straight RGBA), for captures of a movie drawn that way.
+    pub fn capture_prepared(&mut self) -> Option<(u32, u32, Vec<u8>)> {
+        let (w, h) = self.direct.as_ref()?.size;
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("gfx capture"),
+            size: wgpu::Extent3d {
+                width: w.max(1),
+                height: h.max(1),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        // New textures start cleared (transparent).
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        self.draw_into(&mut encoder, &texture);
+        self.queue.submit(Some(encoder.finish()));
+        self.read_back(&texture)
+    }
+
+    /// Reads an RGBA8 picture back, un-premultiplied.
+    fn read_back(&self, texture: &wgpu::Texture) -> Option<(u32, u32, Vec<u8>)> {
+        let (w, h) = (texture.width(), texture.height());
         let row = (w * 4).div_ceil(256) * 256;
         let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("gfx capture"),
@@ -2257,7 +2491,7 @@ impl Renderer {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
         enc.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
-                texture: &t.output,
+                texture,
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
@@ -3195,6 +3429,107 @@ mod shadow_tests {
                 }
             }
         }
+    }
+
+    /// A picture to draw into, filled with `rgba`, and a way to read it back.
+    fn picture(device: &wgpu::Device, queue: &wgpu::Queue, rgba: [u8; 4]) -> wgpu::Texture {
+        let size = wgpu::Extent3d {
+            width: 32,
+            height: 32,
+            depth_or_array_layers: 1,
+        };
+        let t = device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Bgra8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let bgra = [rgba[2], rgba[1], rgba[0], rgba[3]];
+        queue.write_texture(
+            t.as_image_copy(),
+            &bgra.repeat(32 * 32),
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(32 * 4),
+                rows_per_image: Some(32),
+            },
+            size,
+        );
+        t
+    }
+
+    fn read_picture(device: &wgpu::Device, queue: &wgpu::Queue, t: &wgpu::Texture) -> Vec<[u8; 4]> {
+        let buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: 256 * 32,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut enc = device.create_command_encoder(&Default::default());
+        enc.copy_texture_to_buffer(
+            t.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buf,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(256),
+                    rows_per_image: Some(32),
+                },
+            },
+            t.size(),
+        );
+        queue.submit(Some(enc.finish()));
+        buf.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        let data = buf.slice(..).get_mapped_range().unwrap();
+        data.chunks_exact(4)
+            .map(|p| [p[2], p[1], p[0], p[3]])
+            .collect()
+    }
+
+    #[test]
+    fn drawing_into_a_picture_blends_with_it_and_reuses_the_draw_list() {
+        let (device, queue) = crate::gpu::test_device();
+        let mut p = blend_player();
+        let root = p.vm.root;
+        // Left half: grey multiplied onto the picture. Right quarter: inverted.
+        let grey = quad(&mut p, root, 0, [128, 128, 128, 255], 320.0);
+        p.vm.display.get_mut(grey).unwrap().blend = BlendMode::Multiply;
+        let inv = quad(&mut p, root, 1, [255; 4], 160.0);
+        p.vm.display.get_mut(inv).unwrap().blend = BlendMode::Invert;
+        p.vm.display.get_mut(inv).unwrap().matrix.tx = 480.0;
+        let mut renderer = Renderer::new(&device, &queue, wgpu::TextureFormat::Rgba8Unorm);
+        assert!(renderer.prepare_into(&mut p, &mut Empty, (32, 32)));
+        let target = picture(&device, &queue, [200, 100, 50, 255]);
+        let draw = |r: &mut Renderer| {
+            let mut enc = device.create_command_encoder(&Default::default());
+            r.draw_into(&mut enc, &target);
+            queue.submit(Some(enc.finish()));
+        };
+        draw(&mut renderer);
+        let px = read_picture(&device, &queue, &target);
+        let at = |x: usize| px[16 * 32 + x];
+        let near = |a: [u8; 4], b: [u8; 4]| {
+            a.iter()
+                .zip(b)
+                .all(|(x, y)| (*x as i32 - y as i32).abs() <= 1)
+        };
+        assert!(near(at(8), [100, 50, 25, 255]), "{:?}", at(8));
+        assert!(near(at(20), [200, 100, 50, 255]), "{:?}", at(20));
+        assert!(near(at(28), [55, 155, 205, 255]), "{:?}", at(28));
+        // Unchanged: nothing to rebuild, and the same list draws again on a fresh picture.
+        assert!(!renderer.prepare_into(&mut p, &mut Empty, (32, 32)));
+        let target2 = picture(&device, &queue, [200, 100, 50, 255]);
+        let mut enc = device.create_command_encoder(&Default::default());
+        renderer.draw_into(&mut enc, &target2);
+        queue.submit(Some(enc.finish()));
+        assert_eq!(read_picture(&device, &queue, &target2), px);
     }
 
     #[test]

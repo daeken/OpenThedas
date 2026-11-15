@@ -124,6 +124,9 @@ pub const FINISH_SCENE: &str = "_global.GUISystem.FinishSceneFromGame";
 /// after starting a movie and when the resolution changes.
 pub const LAYOUT: &str = "_global.MovieUtils.UpdateAllLayouts";
 
+/// What `bound` holds for a name in a sticky group: kept by every bind.
+const STICKY: u64 = u64::MAX;
+
 #[derive(Default)]
 struct State {
     values: BTreeMap<String, UiValue>,
@@ -132,8 +135,25 @@ struct State {
     sounds: Vec<String>,
     /// Messages the handler already acted on, oldest first (their text).
     handled: std::collections::VecDeque<String>,
-    /// The names the last [`GameBridge::bind`] set.
-    bound: std::collections::BTreeSet<String>,
+    /// The names [`GameBridge::bind`] sets, with the bind that last set each.
+    bound: std::collections::HashMap<String, u64>,
+    /// Counts binds (see `bound`).
+    binds: u64,
+    /// The names each sticky group (see [`GameBridge::bind_sticky`]) sets.
+    sticky: std::collections::HashMap<String, Vec<String>>,
+    /// Bumped whenever a value changes, appears or goes (see [`GameBridge::generation`]).
+    generation: u64,
+    /// The generation each value last changed, appeared or went at.
+    changed: std::collections::HashMap<String, u64>,
+}
+
+impl State {
+    /// Sets a value outside a bind, noting the change.
+    fn put(&mut self, name: &str, value: UiValue) {
+        self.generation += 1;
+        self.changed.insert(name.to_string(), self.generation);
+        self.values.insert(name.to_string(), value);
+    }
 }
 
 /// Engine values and strings the movies ask for, shared by every movie.
@@ -239,7 +259,7 @@ impl GameBridge {
 
     pub fn set_value(&self, name: &str, value: UiValue) {
         if let Ok(mut s) = self.state.lock() {
-            s.values.insert(name.to_string(), value);
+            s.put(name, value);
         }
     }
 
@@ -248,28 +268,159 @@ impl GameBridge {
         if let Ok(mut s) = self.state.lock() {
             for (k, v) in values {
                 s.unanswered.remove(&k);
-                s.values.insert(k, v);
+                s.put(&k, v);
             }
+        }
+    }
+
+    /// Sets a group of values that every [`GameBridge::bind`] keeps until the group is set
+    /// again or dropped: for values that change rarely, so that building them every frame is
+    /// not needed. Names the group had before and no longer has are gone.
+    pub fn bind_sticky(&self, group: &str, values: Vec<(String, UiValue)>) {
+        let Ok(mut guard) = self.state.lock() else {
+            return;
+        };
+        let s = &mut *guard;
+        let next = s.generation + 1;
+        let mut changed = false;
+        let old = s.sticky.remove(group).unwrap_or_default();
+        let mut names = Vec::with_capacity(values.len());
+        for (k, v) in values {
+            if !s.unanswered.is_empty() {
+                s.unanswered.remove(&k);
+            }
+            match s.values.get_mut(&k) {
+                Some(cur) => {
+                    if *cur != v {
+                        *cur = v;
+                        changed = true;
+                        s.changed.insert(k.clone(), next);
+                    }
+                }
+                None => {
+                    s.values.insert(k.clone(), v);
+                    changed = true;
+                    s.changed.insert(k.clone(), next);
+                }
+            }
+            s.bound.insert(k.clone(), STICKY);
+            names.push(k);
+        }
+        let keep: std::collections::HashSet<&String> = names.iter().collect();
+        for k in old {
+            if !keep.contains(&k) {
+                s.bound.remove(&k);
+                s.values.remove(&k);
+                s.changed.insert(k, next);
+                changed = true;
+            }
+        }
+        s.sticky.insert(group.to_string(), names);
+        if changed {
+            s.generation = next;
+        }
+    }
+
+    /// Removes a sticky group's values.
+    pub fn drop_sticky(&self, group: &str) {
+        let Ok(mut guard) = self.state.lock() else {
+            return;
+        };
+        let s = &mut *guard;
+        let next = s.generation + 1;
+        let mut changed = false;
+        for k in s.sticky.remove(group).unwrap_or_default() {
+            s.bound.remove(&k);
+            s.values.remove(&k);
+            s.changed.insert(k, next);
+            changed = true;
+        }
+        if changed {
+            s.generation = next;
         }
     }
 
     /// Binds the engine's whole state (e.g. [`crate::binding::sim_values`] every frame):
     /// values the last bind set that are not in `values` are gone (a conversation's earlier
     /// replies, a party member who left); values the movies set themselves are kept.
+    /// Every frame binds thousands of values that mostly did not change: each is compared
+    /// in place, and only a change (or a value appearing or going) moves the generation.
     pub fn bind(&self, values: impl IntoIterator<Item = (String, UiValue)>) {
-        if let Ok(mut s) = self.state.lock() {
-            let mut bound = std::collections::BTreeSet::new();
-            for (k, v) in values {
+        let Ok(mut guard) = self.state.lock() else {
+            return;
+        };
+        let s = &mut *guard;
+        s.binds += 1;
+        let bind = s.binds;
+        // What this bind changes is at the next generation.
+        let next = s.generation + 1;
+        let mut changed = false;
+        for (k, v) in values {
+            if !s.unanswered.is_empty() {
                 s.unanswered.remove(&k);
-                s.values.insert(k.clone(), v);
-                bound.insert(k);
             }
-            let stale: Vec<String> = s.bound.difference(&bound).cloned().collect();
-            for k in stale {
-                s.values.remove(&k);
+            match s.values.get_mut(&k) {
+                Some(old) => {
+                    if *old != v {
+                        *old = v;
+                        changed = true;
+                        s.changed.insert(k.clone(), next);
+                    }
+                }
+                None => {
+                    s.values.insert(k.clone(), v);
+                    changed = true;
+                    s.changed.insert(k.clone(), next);
+                }
             }
-            s.bound = bound;
+            match s.bound.get_mut(&k) {
+                Some(b) => *b = bind,
+                None => {
+                    s.bound.insert(k, bind);
+                }
+            }
         }
+        let (values, last) = (&mut s.values, &mut s.changed);
+        s.bound.retain(|k, b| {
+            let keep = *b == bind || *b == STICKY;
+            if !keep {
+                values.remove(k);
+                last.insert(k.clone(), next);
+                changed = true;
+            }
+            keep
+        });
+        if changed {
+            s.generation = next;
+        }
+    }
+
+    /// For each (name, must) the value (or its absence) when `must` or when it changed after
+    /// generation `since`, `None` otherwise; and the generation now. One lock for a movie's
+    /// whole set of observers.
+    #[allow(clippy::type_complexity)]
+    pub fn observe(
+        &self,
+        names: &[(&str, bool)],
+        since: u64,
+    ) -> (u64, Vec<Option<Option<UiValue>>>) {
+        let Ok(s) = self.state.lock() else {
+            return (0, names.iter().map(|_| None).collect());
+        };
+        let found = names
+            .iter()
+            .map(|&(name, must)| {
+                (must || s.changed.get(name).is_some_and(|&g| g > since))
+                    .then(|| s.values.get(name).cloned())
+            })
+            .collect();
+        (s.generation, found)
+    }
+
+    /// A number that changes whenever any value does: a movie whose observers heard the
+    /// values at one generation has nothing new to hear until it moves.
+    pub fn generation(&self) -> u64 {
+        self.state.lock().map(|s| s.generation).unwrap_or(0)
     }
 
     /// Records names a movie wanted that nothing answers.
@@ -348,7 +499,7 @@ impl GameBridge {
                 let text = call.args.first().map(as_string).unwrap_or_default();
                 let (k, v) = text.split_once(' ').unwrap_or((&text, ""));
                 if let Ok(mut s) = self.state.lock() {
-                    s.values.insert(k.to_string(), written_value(k, v));
+                    s.put(k, written_value(k, v));
                 }
                 UiValue::Undefined
             }
@@ -599,7 +750,7 @@ impl GameBridge {
         match call.name.as_str() {
             "SetValue" | "SetValueUnicode" => {
                 let (k, v) = text.split_once(' ').unwrap_or((&text, ""));
-                s.values.insert(k.to_string(), written_value(k, v));
+                s.put(k, written_value(k, v));
                 // The journal's own attributes are game state: a movie writing one (journal.gfx
                 // clearing a quest's `Updated` as it is read) is passed on to the game, as are
                 // the tactics screen's (tactics.gfx writing a slot's target, condition, command
@@ -724,6 +875,53 @@ mod tests {
         assert_eq!(b.value("Movie.Own"), Some(n(3.0)));
         // The defaults every movie reads stay.
         assert!(b.value("Scaleform.Platform").is_some());
+    }
+
+    #[test]
+    fn the_generation_moves_only_when_a_value_does() {
+        let b = bridge();
+        let n = |x: f64| UiValue::Number(x);
+        b.bind([("A".into(), n(1.0)), ("B".into(), n(2.0))]);
+        let g = b.generation();
+        b.bind([("A".into(), n(1.0)), ("B".into(), n(2.0))]);
+        assert_eq!(b.generation(), g);
+        b.bind([("A".into(), n(1.0)), ("B".into(), n(5.0))]);
+        let g2 = b.generation();
+        assert_ne!(g2, g);
+        // A value going moves it too, and then stays gone.
+        b.bind([("A".into(), n(1.0))]);
+        assert_ne!(b.generation(), g2);
+        assert_eq!(b.value("B"), None);
+        let g3 = b.generation();
+        b.bind([("A".into(), n(1.0))]);
+        assert_eq!(b.generation(), g3);
+        b.set_value("Movie.Own", n(3.0));
+        assert_ne!(b.generation(), g3);
+    }
+
+    #[test]
+    fn observers_see_only_what_changed_since_their_last_look() {
+        let b = bridge();
+        let n = |x: f64| UiValue::Number(x);
+        b.bind([("A".into(), n(1.0)), ("B".into(), n(2.0))]);
+        let (g, first) = b.observe(&[("A", true), ("B", true), ("Gone", true)], 0);
+        assert_eq!(
+            first,
+            vec![Some(Some(n(1.0))), Some(Some(n(2.0))), Some(None)]
+        );
+        // Nothing changed: nothing to look at, unless asked to.
+        b.bind([("A".into(), n(1.0)), ("B".into(), n(2.0))]);
+        let (g2, same) = b.observe(&[("A", false), ("B", true)], g);
+        assert_eq!(same, vec![None, Some(Some(n(2.0)))]);
+        b.bind([("A".into(), n(7.0))]);
+        let (_, after) = b.observe(&[("A", false), ("B", false), ("Gone", false)], g2);
+        // A changed, B went; Gone never was.
+        assert_eq!(after, vec![Some(Some(n(7.0))), Some(None), None]);
+        b.set_value("Gone", n(3.0));
+        assert_eq!(
+            b.observe(&[("Gone", false)], g2).1,
+            vec![Some(Some(n(3.0)))]
+        );
     }
 
     #[test]

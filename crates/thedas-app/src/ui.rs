@@ -465,6 +465,8 @@ fn floaty_scale(d: f32) -> f64 {
 }
 
 pub struct UiLayer {
+    /// What building the interface's values reuses between frames.
+    value_cache: thedas_ui::binding::ValueCache,
     pub stage: Stage,
     composite: Option<Composite>,
     device: wgpu::Device,
@@ -945,6 +947,7 @@ impl UiLayer {
         );
         stage.open_all(names);
         Self {
+            value_cache: Default::default(),
             stage,
             composite: None,
             device: ctx.device.clone(),
@@ -1486,7 +1489,9 @@ impl UiLayer {
             self.uber_settle = UBER_SETTLE_MS;
             self.uber_splash = Some(head);
         }
-        if self.uber_settle <= 0.0 {
+        // Drawn straight into the frame, the splash multiplies onto the game's picture as
+        // authored: no pass of its own.
+        if thedas_ui::direct() || self.uber_settle <= 0.0 {
             return;
         }
         self.uber_settle -= dt_ms;
@@ -1549,6 +1554,11 @@ impl UiLayer {
     /// picture under the whole movie, not onto the movie's own background art as well.
     fn death_blood(&mut self, dt_ms: f64) {
         const MOVIE: &str = "deathscreen.gfx";
+        // Drawn straight into the frame (`thedas_ui::direct`), the layers multiply onto
+        // what is under them as authored.
+        if thedas_ui::direct() {
+            return;
+        }
         if !self.stage.movies.iter().any(|m| m.name == MOVIE) {
             self.death_settle = None;
             self.death_multiply.clear();
@@ -1616,6 +1626,11 @@ impl UiLayer {
     /// is drawn by the player over nothing in its pass.
     fn loading_stains(&mut self, dt_ms: f64) {
         const MOVIE: &str = "load_town.gfx";
+        // Drawn straight into the frame (`thedas_ui::direct`), the stains multiply onto the
+        // parchment and the frame as the original's did.
+        if thedas_ui::direct() {
+            return;
+        }
         if !self.stage.movies.iter().any(|m| m.name == MOVIE) {
             self.load_multiply.clear();
             self.load_above.clear();
@@ -2303,9 +2318,14 @@ impl UiLayer {
         let (want, line) = {
             let sim = sim.lock().unwrap_or_else(|p| p.into_inner());
             let shown = self.shown.lock().map(|s| s.clone()).unwrap_or_default();
-            self.stage
-                .bridge
-                .bind(thedas_ui::binding::sim_values_for(&sim, &shown));
+            let values = thedas_ui::binding::sim_values_cached(&sim, &shown, &mut self.value_cache);
+            for (group, rows) in std::mem::take(&mut self.value_cache.updates) {
+                self.stage.bridge.bind_sticky(&group, rows);
+            }
+            for group in std::mem::take(&mut self.value_cache.drops) {
+                self.stage.bridge.drop_sticky(&group);
+            }
+            self.stage.bridge.bind(values);
             let waits = thedas_ui::binding::awaits_continue(&sim);
             let cutscene = sim.world.cutscene.is_some();
             let line = thedas_ui::binding::conversation(&sim).map(|d| {
@@ -3529,6 +3549,7 @@ impl UiLayer {
 
     pub fn tick(&mut self, dt_ms: f64) -> Vec<GameMessage> {
         self.loading_stains(dt_ms);
+        self.value_cache.advance(dt_ms);
         let messages = self.stage.tick(dt_ms);
         self.allow_free_text_popup();
         messages
@@ -3610,16 +3631,23 @@ impl UiLayer {
         self.stage.type_text(text)
     }
 
-    /// Renders every movie into its texture and draws them over `target`, in order.
+    /// Draws every movie over `frame`, in order: straight into it (see `thedas_ui::direct`),
+    /// or rendered each into its texture and composited.
     pub fn composite(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
-        target: &wgpu::TextureView,
+        frame: &wgpu::Texture,
         format: wgpu::TextureFormat,
     ) {
         if self.stage.movies.is_empty() {
             return;
         }
+        // Each movie draws its cached draw list straight over the frame, in order.
+        if thedas_ui::direct() {
+            self.stage.draw_into(encoder, frame);
+            return;
+        }
+        let target = &frame.create_view(&Default::default());
         let comp = self
             .composite
             .get_or_insert_with(|| Composite::new(&self.device, format));
