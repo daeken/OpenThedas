@@ -982,7 +982,8 @@ impl Sim {
             return Vec::new();
         };
         let mut out = Vec::new();
-        for o in self.world.objects.values() {
+        let actors = self.world.actor_ids();
+        for o in actors.iter().filter_map(|&id| self.world.get(id)) {
             if o.kind != crate::world::ObjectKind::Placeable || o.area != Some(area) || !o.active {
                 continue;
             }
@@ -1067,7 +1068,8 @@ impl Sim {
         let tables = self.world.tables();
         let types = tables.get(0, "placeable_types")?;
         let mut placed: Vec<(thedas_script::vm::ObjectId, String, [f32; 3], f32)> = Vec::new();
-        for o in self.world.objects.values() {
+        let actors = self.world.actor_ids();
+        for o in actors.iter().filter_map(|&id| self.world.get(id)) {
             if o.kind != crate::world::ObjectKind::Placeable || o.area != Some(area) || !o.active {
                 continue;
             }
@@ -1637,6 +1639,7 @@ mod tests {
             da2_target_prepared: false,
             path: Vec::new(),
             turned_at: None,
+            is_static: false,
         });
         let r = 2.0 * s.capsule_radius(leader);
         for _ in 0..400 {
@@ -1727,6 +1730,7 @@ mod tests {
             da2_target_prepared: false,
             path: Vec::new(),
             turned_at: None,
+            is_static: false,
         });
         let r = 2.0 * s.capsule_radius(hero);
         for _ in 0..150 {
@@ -1844,6 +1848,7 @@ mod tests {
             da2_target_prepared: false,
             path: Vec::new(),
             turned_at: None,
+            is_static: false,
         });
         // Four metres in a straight line, but the wall sends it up through the gap: the
         // route is longer, and halfway along it the walker is in the top row, not inside

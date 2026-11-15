@@ -175,6 +175,7 @@ mod ani {
     pub const NAME: u32 = 4006;
     pub const LENGTH: u32 = 4009;
     pub const ADDITIVE: u32 = 4011;
+    pub const UNSCALED: u32 = 4040;
     pub const TARGET: u32 = 4000;
     pub const KIND: u32 = 4001;
     pub const KEYS: u32 = 4004;
@@ -182,6 +183,7 @@ mod ani {
     pub const VALUE: u32 = 4036;
     pub const Y: u32 = 4037;
     pub const Z: u32 = 4038;
+    pub const W: u32 = 4039;
 }
 
 /// Track kinds (4001).
@@ -197,6 +199,9 @@ pub mod track_kind {
     /// A single float (an exported parameter of a model: an emitter's birthrate, a remote
     /// material's alpha).
     pub const FLOAT: i64 = 8;
+    /// A colour as four floats (an exported parameter of a model: an emitter's
+    /// `agemapcolormultiplier`, a light's `color`).
+    pub const COLOR4: i64 = 10;
 }
 
 /// The key time that means the end of the animation.
@@ -282,6 +287,36 @@ pub struct ScalarTrack {
     pub keys: Vec<(f32, f32)>,
 }
 
+/// A colour track: an exported colour parameter of a model, keyed over the animation.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ColorTrack {
+    /// The parameter's name, lowercase.
+    pub target: String,
+    /// (time in seconds, rgba), in time order.
+    pub keys: Vec<(f32, [f32; 4])>,
+}
+
+impl ColorTrack {
+    /// The value at `t` seconds: linear between keys, held before the first and after the
+    /// last (as [`ScalarTrack::at`]). Provisional: the exe's interpolation is not traced.
+    pub fn at(&self, t: f32) -> [f32; 4] {
+        let Some(&(t0, v0)) = self.keys.first() else {
+            return [0.0; 4];
+        };
+        if t <= t0 {
+            return v0;
+        }
+        for w in self.keys.windows(2) {
+            let ((ta, a), (tb, b)) = (w[0], w[1]);
+            if t <= tb {
+                let f = if tb > ta { (t - ta) / (tb - ta) } else { 1.0 };
+                return std::array::from_fn(|i| a[i] + (b[i] - a[i]) * f);
+            }
+        }
+        self.keys.last().map_or(v0, |k| k.1)
+    }
+}
+
 impl ScalarTrack {
     /// The value at `t` seconds: linear between keys, held before the first and after the
     /// last. Provisional: the exe's interpolation of float tracks is not traced.
@@ -332,9 +367,15 @@ pub struct Animation {
     /// (0x544090 → 0x8110f0). Their first keys are the identity (`mh.po_2arm_06.ani`,
     /// `mh_o.eyejitter.ani`).
     pub additive: bool,
+    /// Field 4040: its translations are not scaled by the creature's appearance (the loader
+    /// 0x815fb0 keeps it at +0x2f; the blend setup 0x814ab1 then takes (1, 1, 1) for the
+    /// appearance's translation multipliers; notes/nonhuman-clip-retarget-trace.md).
+    pub unscaled: bool,
     pub tracks: Vec<Track>,
     /// Its float tracks ([`track_kind::FLOAT`]).
     pub scalars: Vec<ScalarTrack>,
+    /// Its colour tracks ([`track_kind::COLOR4`]).
+    pub colors: Vec<ColorTrack>,
 }
 
 /// Keys are kept to this many per track, far above any shipped animation.
@@ -390,6 +431,7 @@ impl Animation {
         }
         let mut tracks = Vec::new();
         let mut scalars = Vec::new();
+        let mut colors = Vec::new();
         for t in d.structs(root, ani::TRACKS)? {
             let target = d
                 .opt_name_or_hash(t, ani::TARGET)?
@@ -432,6 +474,28 @@ impl Animation {
                     }
                     keys.sort_by(|a, b| a.0.total_cmp(&b.0));
                     scalars.push(ScalarTrack { target, keys });
+                } else if kind == track_kind::COLOR4
+                    && let Some(list) = d.opt_struct(t, ani::KEYS)?
+                {
+                    let raw = d.structs(list, ani::KEYS)?;
+                    if raw.len() > MAX_KEYS {
+                        return Err(TypedError::Invalid(format!(
+                            "animation: {} keys in {target}",
+                            raw.len()
+                        )));
+                    }
+                    let mut keys = Vec::with_capacity(raw.len());
+                    for k in raw {
+                        let time =
+                            d.opt_i64(k, ani::TIME)?.unwrap_or(0) as f32 / TIME_SCALE * length;
+                        let mut v = [0.0f32; 4];
+                        for (c, l) in [ani::VALUE, ani::Y, ani::Z, ani::W].into_iter().enumerate() {
+                            v[c] = d.opt_f32(k, l)?.unwrap_or(0.0);
+                        }
+                        keys.push((time, v));
+                    }
+                    keys.sort_by(|a, b| a.0.total_cmp(&b.0));
+                    colors.push(ColorTrack { target, keys });
                 }
                 continue;
             };
@@ -497,8 +561,10 @@ impl Animation {
             name: d.opt_str(root, ani::NAME)?.unwrap_or_default(),
             length,
             additive: d.opt_i64(root, ani::ADDITIVE)?.is_some_and(|v| v != 0),
+            unscaled: d.opt_i64(root, ani::UNSCALED)?.is_some_and(|v| v != 0),
             tracks,
             scalars,
+            colors,
         })
     }
 }
@@ -825,6 +891,43 @@ mod tests {
         assert_eq!(track.at(-1.0), 5.0);
         assert_eq!(track.at(1.0), 7.5);
         assert_eq!(track.at(3.0), 10.0);
+    }
+
+    #[test]
+    fn colour_tracks_are_kept_by_their_parameter_name() {
+        let mut b = Builder::new(b"ANI ");
+        let key = |b: &mut Builder, time: u16, a: f32| {
+            b.add(
+                b"col4",
+                vec![
+                    (4035, Value::U16(time)),
+                    (4036, Value::F32(1.0)),
+                    (4037, Value::F32(0.5)),
+                    (4038, Value::F32(0.25)),
+                    (4039, Value::F32(a)),
+                ],
+            )
+        };
+        let (k1, k2) = (key(&mut b, 0, 0.0), key(&mut b, 65535, 1.0));
+        let l = b.add(b"list", vec![(4004, structs(&[k1, k2]))]);
+        let t = b.add(
+            b"node",
+            vec![
+                (4000, s("Glow_AgeMapColorMultiplier")),
+                (4001, Value::U32(10)),
+                (4004, Value::Struct(Some(l))),
+            ],
+        );
+        let root = b.add(
+            b"anim",
+            vec![(4005, structs(&[t])), (4009, Value::F32(2.0))],
+        );
+        let a = Animation::from_gff(&b.finish(root)).unwrap();
+        assert!(a.tracks.is_empty() && a.scalars.is_empty());
+        let c = &a.colors[0];
+        assert_eq!(c.target, "glow_agemapcolormultiplier");
+        assert_eq!(c.at(1.0), [1.0, 0.5, 0.25, 0.5]);
+        assert_eq!(c.at(5.0), [1.0, 0.5, 0.25, 1.0]);
     }
 
     #[test]

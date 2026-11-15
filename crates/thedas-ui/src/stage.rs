@@ -210,11 +210,21 @@ fn add_book_backdrop(m: &mut UiMovie) {
     );
     let black = format!("{ROOT}.black");
     m.call(&format!("{black}.beginFill"), &[n(0.0), n(100.0)]);
-    m.call(&format!("{black}.moveTo"), &[n(-4096.0), n(-4096.0)]);
-    for (x, y) in [(5120.0, -4096.0), (5120.0, 5120.0), (-4096.0, 5120.0)] {
+    // A square scaled up, not a polygon with far corners: the renderer left a triangle of the
+    // game showing at the screen's corner with those.
+    m.call(&format!("{black}.moveTo"), &[n(0.0), n(0.0)]);
+    for (x, y) in [(100.0, 0.0), (100.0, 100.0), (0.0, 100.0), (0.0, 0.0)] {
         m.call(&format!("{black}.lineTo"), &[n(x), n(y)]);
     }
     m.call(&format!("{black}.endFill"), &[]);
+    for (prop, v) in [
+        ("_x", -4096.0),
+        ("_y", -4096.0),
+        ("_width", 9216.0),
+        ("_height", 9216.0),
+    ] {
+        m.set(&format!("{black}.{prop}"), n(v));
+    }
     m.call(
         &format!("{ROOT}.createEmptyMovieClip"),
         &[s("page"), n(1.0)],
@@ -644,6 +654,23 @@ impl Stage {
             && self.movies.iter().any(|m| m.name == POPUP_LAYER)
     }
 
+    /// The prompt of the dialog the movie actually created. The bridge's
+    /// `GUIPopupLayer.DialogBoxText` can already hold the next question while
+    /// `ShowDialogBox` refuses it because another dialog is still open.
+    pub fn dialog_prompt(&mut self) -> Option<String> {
+        let m = self.movies.iter_mut().find(|m| m.name == POPUP_LAYER)?;
+        if !matches!(
+            m.call("_global.PopupLayer.ms_mcPopup.getDepth", &[]),
+            UiValue::Number(_)
+        ) {
+            return None;
+        }
+        match m.call("_global.PopupLayer.ms_sInitString.toString", &[]) {
+            UiValue::String(prompt) => Some(prompt),
+            _ => None,
+        }
+    }
+
     /// The movies that take the mouse: all of them, or only the popup layer while one of its
     /// dialogs is up (it pushes the `GUIPopup` context then and pops it when the dialog
     /// closes). Provisional: the game's context system decides which input reaches which
@@ -696,6 +723,27 @@ impl Stage {
         }
     }
 
+    /// The button was released while an item or ability was being dragged from one movie to
+    /// another (`GUI.Dragging`): the movie with a drop target under the mouse (the front
+    /// one) ends the drag, and takes the drop; with none under it, the front movie ends it,
+    /// and the drag is refused. The movies call the drag's callbacks themselves
+    /// (`GUI.InvokeCallback`). Provisional: the exe's handling is not traced; the movies'
+    /// own `StopExternalDrag` is what it is taken to call.
+    pub fn drop_external(&mut self) {
+        let mut target = None;
+        for (i, m) in self.movies.iter_mut().enumerate().rev() {
+            let probe = m.call(crate::avm1::DROP_PROBE, &[]);
+            if matches!(&probe, UiValue::String(t) if t != "undefined") {
+                target = Some(i);
+                break;
+            }
+        }
+        let i = target.unwrap_or(self.movies.len().saturating_sub(1));
+        if let Some(m) = self.movies.get_mut(i) {
+            m.call(crate::avm1::DROP_EXTERNAL, &[]);
+        }
+    }
+
     pub fn mouse_button(&mut self, x: f64, y: f64, down: bool) {
         let mut released = None;
         for m in self.input_movies() {
@@ -738,6 +786,23 @@ impl Stage {
                 focused_input_field(m).is_some()
             }
             None => false,
+        }
+    }
+
+    /// Report notes opt out of popuplayer.gfx's `TextInput_mc_init` name defaults
+    /// (`maxChars = 20`, `restrict` set even with `GUIPopupLayer.Filter = 0`). Apply
+    /// after that initializer runs, to this dialog instance only.
+    pub fn allow_dialog_free_text(&mut self) {
+        if !self.dialog_up() {
+            return;
+        }
+        let Some(m) = self.movies.iter_mut().find(|m| m.name == POPUP_LAYER) else {
+            return;
+        };
+        let field = "_global.PopupLayer.ms_mcPopup.TextInput_mc.TextField";
+        if m.call(&format!("{field}.type.toString"), &[]) == UiValue::String("input".into()) {
+            m.set(&format!("{field}.maxChars"), UiValue::Number(0.0));
+            m.set(&format!("{field}.restrict"), UiValue::Null);
         }
     }
 

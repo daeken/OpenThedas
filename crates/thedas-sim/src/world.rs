@@ -323,13 +323,16 @@ pub struct Event {
     pub vectors: Vec<[f32; 3]>,
 }
 
-/// A queued command (`AddCommand`). Provisional: commands complete as soon as the executor
-/// reaches them, except `Wait`, which lasts its duration.
+/// A command payload and its simulation execution state. An active command stays at the
+/// front of its object's vector; the remaining entries are the waiting queue.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Command {
     /// `COMMAND_TYPE_*`.
     pub ty: i32,
     pub name: String,
+    /// Origins' AddCommand bStatic: ordinary add behavior cannot clear this command.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_static: bool,
     pub target: Option<ObjectId>,
     pub location: Option<Location>,
     pub seconds: f32,
@@ -461,9 +464,9 @@ pub struct LocationVfx {
 }
 
 /// An instant visual effect played on an object (an `EffectVisualEffect` applied with
-/// `EFFECT_DURATION_TYPE_INSTANT`): DAOrigins.exe applies such an effect and keeps nothing,
-/// so this is only a note for presentation that the effect was played, kept for
-/// [`INSTANT_VFX_MS`]. Not saved.
+/// `EFFECT_DURATION_TYPE_INSTANT`): the script's effect ends at once and the visual plays on
+/// by its animations (see [`crate::vfx`]), so this is a note for presentation that the
+/// effect was played, kept while it is shown (`ms`). Not saved.
 #[derive(Clone, Debug, PartialEq)]
 pub struct InstantVfx {
     pub target: ObjectId,
@@ -471,11 +474,33 @@ pub struct InstantVfx {
     pub vfx: i32,
     /// World time it was played.
     pub started_ms: u64,
+    /// How long it is shown, in milliseconds ([`crate::vfx::VfxTiming::ms`]).
+    pub ms: u64,
+    /// It loops a duration animation while shown ([`crate::vfx::VfxTiming::lasting`]).
+    pub lasting: bool,
 }
 
-/// How long an [`InstantVfx`] note is kept for presentation to pick up. Not the effect's
-/// length (the VFX resource has its own); provisional.
-pub const INSTANT_VFX_MS: u64 = 2_000;
+/// An instant visual effect played at a place (`Engine_ApplyEffectAtLocation` with an
+/// `EffectVisualEffect` of `EFFECT_DURATION_TYPE_INSTANT`: a spell's impact on the ground):
+/// as with [`InstantVfx`], the script's effect ends at once, so `GetEffects` never finds it;
+/// this note is for presentation, kept while the visual is shown. Not saved.
+#[derive(Clone, Debug, PartialEq)]
+pub struct InstantLocationVfx {
+    /// Tells it from the others while it is kept.
+    pub handle: u64,
+    /// The effect's `VFX_base` row (its integer 0).
+    pub vfx: i32,
+    pub area: ObjectId,
+    pub position: [f32; 3],
+    /// Degrees, as objects use.
+    pub facing: f32,
+    /// World time it was played.
+    pub started_ms: u64,
+    /// How long it is shown, in milliseconds ([`crate::vfx::VfxTiming::ms`]).
+    pub ms: u64,
+    /// It loops a duration animation while shown ([`crate::vfx::VfxTiming::lasting`]).
+    pub lasting: bool,
+}
 
 /// The open party picker: the followers picked so far (at most three), in order.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -846,6 +871,12 @@ pub struct World {
     /// Instant visual effects played on objects lately (see [`InstantVfx`]).
     #[serde(skip)]
     pub instant_vfx: Vec<InstantVfx>,
+    /// Instant visual effects played at places lately (see [`InstantLocationVfx`]).
+    #[serde(skip)]
+    pub instant_location_vfx: Vec<InstantLocationVfx>,
+    /// The next [`InstantLocationVfx::handle`].
+    #[serde(skip)]
+    pub next_instant_vfx: u64,
     /// The next [`LocationVfx::handle`].
     #[serde(default)]
     pub next_vfx: u64,
@@ -1027,6 +1058,8 @@ impl World {
             store: None,
             location_vfx: Vec::new(),
             instant_vfx: Vec::new(),
+            instant_location_vfx: Vec::new(),
+            next_instant_vfx: 0,
             next_vfx: 0,
             chanter_board: None,
             plot_actions: PlotActions::default(),
