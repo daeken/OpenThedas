@@ -3031,6 +3031,18 @@ impl Live {
         let mut sim = shared.lock().unwrap_or_else(|p| p.into_inner());
         let area = sim.world.area?;
         let leader = sim.world.controlled();
+        // Where the ray first meets the level's own surfaces (walls, floors, terrain).
+        let level_hit = self.level.as_ref().and_then(|l| {
+            let len = dir.length().max(1e-6);
+            l.collider
+                .first_hit(origin, origin + dir * (PICK_REACH / len))
+                .map(|f| f * PICK_REACH / len)
+        });
+        // The leader's middle: an invisible volume between the camera and the leader is one
+        // the camera has been pulled back through, standing beside it.
+        let leader_at = leader
+            .and_then(|l| sim.world.get(l))
+            .map(|o| glam::Vec3::from_array(o.position) + glam::Vec3::Z);
         let mut best: Option<(f32, ObjectId)> = None;
         for o in sim.world.objects.values() {
             if o.area != Some(area) || !o.active || Some(o.id) == leader {
@@ -3056,10 +3068,25 @@ impl Live {
                         }
                         None => objects.and_then(|s| {
                             if let Some(shapes) = s.unseen_shapes.get(&o.id) {
+                                // An invisible volume (an area transition's marker) is
+                                // picked only where it can be seen: not through a wall or
+                                // the floor in front of it (it was picked through the whole
+                                // level, so ground clicks near it, and its cursor from far
+                                // away, chose it), not from inside it, and not when it
+                                // stands between the camera and the leader (after arriving
+                                // through it, every click went back out).
                                 let placement = Prop::placement(o.position, o.facing);
+                                let behind = leader_at.is_some_and(|l| {
+                                    shapes.iter().any(|s| {
+                                        s.ray(&placement, origin, l - origin)
+                                            .is_some_and(|t| t <= 1.0)
+                                    })
+                                });
                                 shapes
                                     .iter()
+                                    .filter(|_| !behind)
                                     .filter_map(|s| s.ray(&placement, origin, dir))
+                                    .filter(|&t| t > 0.0 && level_hit.is_none_or(|w| t <= w))
                                     .min_by(f32::total_cmp)
                             } else {
                                 s.bounds
