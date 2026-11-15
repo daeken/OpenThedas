@@ -3142,7 +3142,12 @@ const EMITTER_REACH_PER: f32 = 4.0;
 
 /// The light an emitter's living particles give, as a point light at their glow-weighted
 /// centre (ours: the original's particles light nothing). `None` when they show none.
-pub fn emitter_light(e: &crate::particles::EmitterState, tint: Vec3) -> Option<SceneLight> {
+pub fn emitter_light(e: &crate::particles::EmitterState) -> Option<SceneLight> {
+    emitter_light_tinted(e, Vec3::ONE)
+}
+
+/// [`emitter_light`] for particles whose texture tints them `tint` ([`texture_tint`]).
+pub fn emitter_light_tinted(e: &crate::particles::EmitterState, tint: Vec3) -> Option<SceneLight> {
     if e.opacity <= 0.0 || e.particles.is_empty() || light_shaft(&e.blueprint.material) {
         return None;
     }
@@ -3417,7 +3422,7 @@ mod tests {
             Mat4::from_translation(at),
             1,
         );
-        assert_eq!(emitter_light(&e, Vec3::ONE), None, "no particles, no light");
+        assert_eq!(emitter_light(&e), None, "no particles, no light");
         e.advance(0.5);
         let Some(SceneLight::Point {
             position,
@@ -3426,7 +3431,7 @@ mod tests {
             is_static,
             room,
             ..
-        }) = emitter_light(&e, Vec3::ONE)
+        }) = emitter_light(&e)
         else {
             panic!("a burning emitter gives a point light");
         };
@@ -3438,7 +3443,7 @@ mod tests {
         assert!(!is_static && room.is_none());
         // Hidden (a cut-away model's), it gives none.
         e.opacity = 0.0;
-        assert_eq!(emitter_light(&e, Vec3::ONE), None);
+        assert_eq!(emitter_light(&e), None);
     }
 
     #[test]

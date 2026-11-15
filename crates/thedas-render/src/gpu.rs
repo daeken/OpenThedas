@@ -1257,7 +1257,7 @@ impl AreaRenderer {
                     .get(i)
                     .copied()
                     .unwrap_or(glam::Vec3::ONE);
-                crate::deferred::emitter_light(self.emitters.get(i)?, tint)
+                crate::deferred::emitter_light_tinted(self.emitters.get(i)?, tint)
             })
             .collect()
     }
