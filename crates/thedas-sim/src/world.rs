@@ -346,6 +346,10 @@ pub struct Command {
     /// between is interpolated (see `Sim::advance_movers`).
     #[serde(default)]
     pub from: Option<([f32; 3], u64)>,
+    /// For a move: when its mover's body last turned toward the way it goes (see
+    /// `Sim::advance_movers` and `turn_toward`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turned_at: Option<u64>,
     /// For an attack whose target is out of reach: where the attacker is walking to first
     /// (see `Sim::attack_reach`).
     #[serde(default)]
