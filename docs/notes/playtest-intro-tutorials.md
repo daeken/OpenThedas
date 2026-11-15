@@ -27,9 +27,16 @@ quaternion, adds its base position, then writes the resulting pose through
 `0x7d0660`. The existing track evaluator and cut-camera override follow this
 path; this patch does not replace it with the gameplay camera.
 
-A hidden-window capture of the opening on the baseline reproduced a red
-geometry obstruction around 12.3 seconds while Camera 11 was moving on its
-track. The later cuts also followed their authored camera actors. The source
-of that obstruction is still unresolved; tutorial deferral does not claim to
-repair that separate rendering symptom. No executable bytes or game assets
-are included here.
+A hidden-window capture of the opening reproduced a red geometry obstruction
+around 12.3 seconds while Camera 11 was moving on its track. The existing
+native recording `reference/original/triage/dc_intro_beraht` also shows that
+surface in frame 460, then clears it by frame 470. The later cuts likewise
+follow their authored camera actors. A matched-camera diagnostic disproved
+an initial suspicion that removing a placeable fixed it: the earlier clear
+capture had simply reached a later point on the track.
+
+The transient red view is therefore present in the native opening too. The
+reproduced training pause can hold it indefinitely; allowing the clock to run
+lets the camera continue through it. No geometry or camera-track workaround
+is applied. No executable bytes, original frames or game assets are included
+here.
