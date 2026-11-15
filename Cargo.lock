@@ -5244,6 +5244,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "thedas-bake"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "env_logger",
+ "glam",
+ "log",
+ "png",
+ "thedas-formats",
+ "thedas-render",
+ "thedas-vfs",
+]
+
+[[package]]
 name = "thedas-cli"
 version = "0.1.0"
 dependencies = [
