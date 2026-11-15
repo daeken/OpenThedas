@@ -48,9 +48,14 @@ cache includes only objects whose runtime group intersects the sight mask.
 
 Animation completion 0x74d200 remains separate: after checking current and
 the appearance predicate, it changes byte +0x18d and requests destruction
-after 3000 ms. No timer, animation completion or object removal is inferred
-from this health write. The state-controller animation path, byte +0x18d,
-state-change operation 0, full physics and DA2 remain open under SCR-009.
+after 3000 ms. That byte targets opacity: 0x695a60 reads the target, while
+0x695a90 approaches it from the current opacity using the client update
+delta divided by 500 and clamps the result to [0, 1]. The immediate-opacity
+path is 0x695c20; completion uses 0x695c00 instead. This is separate from
+Active and must not be replaced by immediate hiding. No timer, animation
+completion or object removal is inferred from this health write. The
+state-controller animation/completion path, fading, state-change operation
+0, full physics and DA2 remain open under SCR-009.
 
 Validation includes synthetic transformed grids, null state entries and
 malformed-grid rejection, plus all four real destructive appearances on
