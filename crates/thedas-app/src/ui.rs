@@ -2305,6 +2305,7 @@ impl UiLayer {
         let resolution = self.stage.size();
         if let Ok(mut shown) = self.shown.lock() {
             shown.resolution = resolution;
+            shown.screens = screens.shown().iter().map(|s| *s as u32).collect();
             // A notification's entry is the journal's to open on while it is up.
             if journal.is_none() {
                 shown.journal_focus = None;
@@ -3483,6 +3484,12 @@ impl UiLayer {
     /// there is the interface's, not the world's. Provisional: the game hit-tests the movies'
     /// shapes; an opaque pixel stands in for that.
     pub fn covers(&self, x: f64, y: f64) -> bool {
+        // A button's hit area can be drawn clear (the tutorial panel's "View in codex"): the
+        // click is the interface's wherever a clip is, not only where a pixel shows.
+        self.stage.movies.iter().any(|m| m.has_clip_at(x, y)) || self.covers_pixel(x, y)
+    }
+
+    fn covers_pixel(&self, x: f64, y: f64) -> bool {
         let textures: Vec<wgpu::Texture> = self
             .stage
             .movies

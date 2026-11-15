@@ -83,6 +83,9 @@ pub fn sim_values(sim: &Sim) -> BTreeMap<String, UiValue> {
 /// keeps for it.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Presentation {
+    /// Which screens are up (the app's screen numbers): a screen opening or closing makes the
+    /// values it reads be built again at once (see [`ValueCache`]).
+    pub screens: Vec<u32>,
     /// An item or ability is being dragged between movies (`GUI.StartDragging` until the
     /// button is released): `GUI.Dragging` reads 1, which the movies' drop targets look for.
     pub dragging: bool,
@@ -305,6 +308,9 @@ pub struct ValueCache {
     pub updates: Vec<(String, Vec<(String, UiValue)>)>,
     /// Groups no longer shown.
     pub drops: Vec<String>,
+    /// What the interface showed when the groups were built: a screen opening or a tab
+    /// picked changes what its values are, so every group is built again at once.
+    shown: Option<Presentation>,
     /// The interface's own time (the frames' durations added up), which the groups age by:
     /// real time in play, the steps' time when driven by a script.
     now_ms: f64,
@@ -321,6 +327,16 @@ impl ValueCache {
     /// Moves the interface's time on by a frame.
     pub fn advance(&mut self, dt_ms: f64) {
         self.now_ms += dt_ms;
+    }
+
+    /// Notes what the interface shows now; a change makes every group stale.
+    fn see(&mut self, shown: &Presentation) {
+        if self.shown.as_ref() != Some(shown) {
+            self.shown = Some(shown.clone());
+            for b in self.groups.values_mut() {
+                b.at_ms = f64::NEG_INFINITY;
+            }
+        }
     }
 
     /// Whether `group` must be built again (not built yet, built for another `token`, or
@@ -406,6 +422,7 @@ pub fn sim_values_cached(
     shown: &Presentation,
     cache: &mut ValueCache,
 ) -> BTreeMap<String, UiValue> {
+    cache.see(shown);
     sim_values_with(sim, shown, Some(cache))
 }
 
