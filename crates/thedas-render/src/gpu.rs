@@ -1252,7 +1252,11 @@ impl AreaRenderer {
             .glowing_emitters()
             .into_iter()
             .filter_map(|i| {
-                let tint = self.emitter_tints.get(i).copied().unwrap_or(glam::Vec3::ONE);
+                let tint = self
+                    .emitter_tints
+                    .get(i)
+                    .copied()
+                    .unwrap_or(glam::Vec3::ONE);
                 crate::deferred::emitter_light(self.emitters.get(i)?, tint)
             })
             .collect()
