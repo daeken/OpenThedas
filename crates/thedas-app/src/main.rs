@@ -226,6 +226,12 @@ struct Args {
     /// per pixel by every light in reach; see docs/deferred.md). F11 flips between them.
     #[arg(long, default_value = "faithful", value_parser = ["faithful", "deferred"])]
     renderer: String,
+    /// What the deferred renderer does with the baked lightmaps: `baked` (as the original),
+    /// `hybrid` (their bounce light kept, every light's shadows real-time) or `realtime`
+    /// (none: probe ambient, SSAO, real-time shadows; experimental). Defaults to
+    /// `THEDAS_DEFERRED_BAKED_LIGHTING`, else `baked`.
+    #[arg(long, value_parser = ["baked", "hybrid", "realtime"])]
+    lighting: Option<String>,
     /// The original's "Graphics Detail" video option, which picks the materials' techniques
     /// and the bloom's blur: `low`, `medium` or `high` (High's materials draw as Medium's; its
     /// sun shadows are 1024 texels a side and reach further).
@@ -270,7 +276,8 @@ struct Args {
     #[arg(long)]
     audio: bool,
     /// Headless (`--steps`): record the game's sound to this WAV file (stereo, 48 kHz),
-    /// never to the speakers.
+    /// never to the speakers. In a windowed run (including `--control`) the sound runs
+    /// silently, for its log lines, and no WAV is written.
     #[arg(long)]
     audio_wav: Option<PathBuf>,
     /// Ask whether the problem reported in this report folder is fixed, once the game is up
@@ -1887,7 +1894,7 @@ impl App {
             g.reticle
                 .draw(&g.ctx.device, &mut encoder, &view, size, &lines);
         }
-        g.ui.composite(&mut encoder, &view, g.config.format);
+        g.ui.composite(&mut encoder, &frame.texture, g.config.format);
         // The pad's pointer goes over the interface.
         let ctx = self
             .pad
@@ -6500,6 +6507,13 @@ fn main() -> Result<()> {
         env_logger::Env::default().default_filter_or("info,wgpu=warn,naga=warn"),
     ));
     let mut args = Args::parse();
+    if let Some(mode) = args
+        .lighting
+        .as_deref()
+        .and_then(thedas_render::BakedLighting::parse)
+    {
+        thedas_render::set_baked_lighting(mode);
+    }
     faces::set_language(&args.language);
     live::ANTIALIASING.store(
         args.antialiasing.unwrap_or(1).max(1),
@@ -7529,6 +7543,7 @@ fn main() -> Result<()> {
             "detail": args.detail,
             "frame_effects": args.frame_effects,
             "renderer": args.renderer,
+            "lighting": args.lighting,
             "language": args.language,
             "module": args.module,
             "install": report::install_info(&install, &args.language),
@@ -7545,7 +7560,19 @@ fn main() -> Result<()> {
             let off = args.no_audio
                 || std::env::var_os("THEDAS_NO_AUDIO").is_some()
                 || (args.control.is_some() && !args.audio);
-            if off {
+            if args.audio_wav.is_some() {
+                // A windowed run with --audio-wav: the game's sound runs (its log lines
+                // say what it plays, e.g. "audio: voice starts") but never reaches the
+                // speakers. The WAV itself is written only by headless --steps runs.
+                log::info!("audio: silent (no speakers; --audio-wav in a windowed run)");
+                Some(audio::GameAudio::recording(
+                    &install,
+                    &args.module,
+                    &loaded_vfs,
+                    &args.language,
+                    48000,
+                ))
+            } else if off {
                 log::info!("audio: off");
                 None
             } else {

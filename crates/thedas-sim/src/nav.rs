@@ -5,7 +5,8 @@
 //! of 287 stand on 1s; 9s form the walls between rooms, with gaps where doors stand), its
 //! height is the stored value in sixteenths of a metre, and a creature can step between
 //! neighbouring cells whose heights differ by at most [`MAX_STEP`]. Routes are 8-connected
-//! A* without cutting blocked corners.
+//! A* without cutting blocked corners, straightened as DAOrigins.exe's planner straightens
+//! them (see [`straighten`]).
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
@@ -18,6 +19,14 @@ use crate::sim::Sim;
 
 /// The largest height change between neighbouring cells a walker can take, in metres.
 pub const MAX_STEP: f32 = 0.6;
+
+/// The largest height change between cells a straight leg crosses (DAOrigins.exe's
+/// traversability query, 0xa4bde3-0xa4be01: float 0.5 at 0xb59324).
+const STRAIGHT_STEP: f32 = 0.5;
+
+/// The spacing of the points the planner keeps along a long straight leg, in metres
+/// (DAOrigins.exe 0xa4e3dc-0xa4e3e2: 2.0 at 0xb59318).
+const LEG_SPACING: f32 = 2.0;
 
 /// The radius of the body the safe-location search places (DAOrigins.exe 0xae7104).
 const SAFE_BODY_RADIUS: f32 = 0.5;
@@ -181,6 +190,14 @@ pub fn route_avoiding(
     let start = nearest_walkable(g, from)?;
     let goal = nearest_walkable(g, to)?;
     let idx = |c: (u32, u32)| (c.1 * g.columns + c.0) as usize;
+    // The cells a route may use: the search and the straightening of its route
+    // ([`straighten`]) both go by this, and step between cells by [`passable`].
+    let free = |c: (u32, u32)| walkable(g, c) && !blocked.contains(&idx(c));
+    // A straight line that is clear needs no search (DAOrigins.exe 0xa4e1b0 tries
+    // 0xa4bb80 from start to goal first, 0xa4e20a-0xa4e26a).
+    if straight_clear(g, from, to, &free) {
+        return Some(resample(g, from, &[to]));
+    }
     let h = |c: (u32, u32)| {
         let (dx, dy) = (
             (c.0 as f32 - goal.0 as f32).abs(),
@@ -213,14 +230,13 @@ pub fn route_avoiding(
                 .collect();
             pts.pop();
             pts.push(to);
-            return Some(pts);
+            return Some(straighten(g, from, &pts, &free));
         }
         expanded += 1;
         if expanded > SEARCH_LIMIT {
             return None;
         }
         let base = cost.get(&idx(c)).copied().unwrap_or(f32::MAX);
-        let hc = height(g, c);
         for (dx, dy) in [
             (-1, 0),
             (1, 0),
@@ -236,17 +252,8 @@ pub fn route_avoiding(
                 continue;
             }
             let n = (x as u32, y as u32);
-            let free = |c: (u32, u32)| walkable(g, c) && !blocked.contains(&idx(c));
-            if !free(n) || (height(g, n) - hc).abs() > MAX_STEP {
+            if !passable(g, c, n, MAX_STEP, &free) {
                 continue;
-            }
-            // No cutting corners past blocked cells.
-            if dx != 0 && dy != 0 {
-                let a = ((c.0 as i32 + dx) as u32, c.1);
-                let b = (c.0, (c.1 as i32 + dy) as u32);
-                if !free(a) || !free(b) {
-                    continue;
-                }
             }
             let step = if dx != 0 && dy != 0 {
                 std::f32::consts::SQRT_2
@@ -262,6 +269,135 @@ pub fn route_avoiding(
         }
     }
     None
+}
+
+/// The search's route (`pts`, cell centres walked from `from`, ending at the goal) as
+/// DAOrigins.exe's planner leaves it: the shortcut helper (0xa4c2a0) tests a stretch's two
+/// ends with the traversability query ([`straight_clear`]) and, when the line between them
+/// is clear, drops the points in between; when it is not, it splits the stretch at its
+/// middle point and does the same with each half (0xa4c45f-0xa4c485). Long legs then get
+/// points back at about [`LEG_SPACING`] ([`resample`]).
+///
+/// The 8-connected search's own route turns in 45° steps from cell centre to cell centre,
+/// and its first leg runs from wherever the walker stands to the next cell's centre, which
+/// can be beside or behind it; walked as it is, with a route made again every frame (the
+/// pad's stick and the movement keys order a walk a little ahead each frame), the hero's
+/// heading swung from frame to frame. Not ported: the planner's partition of a fresh
+/// stretch by path length against octile distance before shortcutting (0xa4c790, tolerance
+/// 0.25), its relaxation of corners over point triples (0xa4d110 -> 0xa4c930), and the
+/// query's 3x3 clearance test round each cell for the walker's radius (0xa4bd28-0xa4bdd5):
+/// a line here needs only the cells it crosses to be free.
+fn straighten(
+    g: &NavGrid,
+    from: [f32; 3],
+    pts: &[[f32; 3]],
+    free: &impl Fn((u32, u32)) -> bool,
+) -> Vec<[f32; 3]> {
+    let all: Vec<[f32; 3]> = std::iter::once(from).chain(pts.iter().copied()).collect();
+    let mut keep = vec![true; all.len()];
+    let mut stretches = vec![(0, all.len() - 1)];
+    while let Some((lo, hi)) = stretches.pop() {
+        if hi - lo < 2 {
+            continue;
+        }
+        if straight_clear(g, all[lo], all[hi], free) {
+            keep[lo + 1..hi].iter_mut().for_each(|k| *k = false);
+        } else {
+            let mid = (lo + hi) / 2;
+            stretches.push((mid, hi));
+            stretches.push((lo, mid));
+        }
+    }
+    let kept: Vec<[f32; 3]> = all
+        .iter()
+        .zip(&keep)
+        .skip(1)
+        .filter(|(_, k)| **k)
+        .map(|(p, _)| *p)
+        .collect();
+    resample(g, from, &kept)
+}
+
+/// Points put back along each leg longer than twice [`LEG_SPACING`]: `floor(length /
+/// spacing)` of them, evenly along it (DAOrigins.exe 0xa4c335-0xa4c448), each at the
+/// floor's height there. The exe does this to the legs its shortcuts make; here every leg
+/// gets it, the direct line too, because a mover's height is interpolated between points
+/// where the exe's physics controller keeps it on the floor.
+fn resample(g: &NavGrid, from: [f32; 3], pts: &[[f32; 3]]) -> Vec<[f32; 3]> {
+    let mut out = Vec::with_capacity(pts.len());
+    let mut at = from;
+    for &to in pts {
+        let (dx, dy) = (to[0] - at[0], to[1] - at[1]);
+        let length = (dx * dx + dy * dy).sqrt();
+        if length > 2.0 * LEG_SPACING {
+            let n = (length / LEG_SPACING).floor() as usize;
+            for k in 1..=n {
+                let f = k as f32 / (n + 1) as f32;
+                let p = [at[0] + dx * f, at[1] + dy * f, 0.0];
+                let z = g
+                    .cell(p)
+                    .map_or(at[2] + (to[2] - at[2]) * f, |c| height(g, c));
+                out.push([p[0], p[1], z]);
+            }
+        }
+        out.push(to);
+        at = to;
+    }
+    out
+}
+
+/// Whether a walker can step from cell `c` to the neighbouring cell `n` (8-connected): `n`
+/// is `free`, their heights differ by at most `step`, and a diagonal step cuts no corner of
+/// a cell that is not free. The route search (with [`MAX_STEP`]) and [`straight_clear`]
+/// (with the stricter [`STRAIGHT_STEP`]) both step by this, over the same free cells, so a
+/// straightened route goes only where the search could have.
+fn passable(
+    g: &NavGrid,
+    c: (u32, u32),
+    n: (u32, u32),
+    step: f32,
+    free: &impl Fn((u32, u32)) -> bool,
+) -> bool {
+    if !free(n) || (height(g, n) - height(g, c)).abs() > step {
+        return false;
+    }
+    c.0 == n.0 || c.1 == n.1 || (free((n.0, c.1)) && free((c.0, n.1)))
+}
+
+/// Whether a walker can go in a straight line from `a` to `b`, as DAOrigins.exe's
+/// traversability query (0xa4bb80) walks a line over the grid in half-cell steps
+/// (0xa4bc49-0xa4bc76): it starts on a `free` cell, and each cell the line passes into is
+/// one the route search could step to from the last ([`passable`]), with no height change
+/// over [`STRAIGHT_STEP`]. A line starting off the grid or on a cell that is not free is
+/// not straight-clear.
+fn straight_clear(
+    g: &NavGrid,
+    a: [f32; 3],
+    b: [f32; 3],
+    free: &impl Fn((u32, u32)) -> bool,
+) -> bool {
+    let Some(mut prev) = g.cell(a) else {
+        return false;
+    };
+    if !free(prev) {
+        return false;
+    }
+    let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+    let n = (((dx * dx + dy * dy).sqrt() / (g.cell_size * 0.5)).ceil() as usize).max(1);
+    for k in 1..=n {
+        let f = k as f32 / n as f32;
+        let Some(c) = g.cell([a[0] + dx * f, a[1] + dy * f, 0.0]) else {
+            return false;
+        };
+        if c == prev {
+            continue;
+        }
+        if !passable(g, prev, c, STRAIGHT_STEP, free) {
+            return false;
+        }
+        prev = c;
+    }
+    true
 }
 
 /// `placeable_types.gda`: a placeable appearance's state controller (`StateCnt_Door`,
@@ -390,7 +526,10 @@ pub enum Routed {
     Path(Vec<[f32; 3]>),
     /// Only through this closed door.
     Door(thedas_script::vm::ObjectId),
-    /// No route known (no grid, an end off it, or no way at all): a straight line.
+    /// A known-grid path failed, with too much height difference for the native
+    /// collision-tested direct fallback (DAOrigins.exe 0x73ee88).
+    InvalidPath,
+    /// No route known: the provisional straight-line fallback.
     Straight,
 }
 
@@ -1011,6 +1150,103 @@ impl Sim {
 mod tests {
     use super::*;
 
+    /// An open floor of `w` by `h` one-metre cells.
+    fn floor(w: u32, h: u32) -> NavGrid {
+        NavGrid {
+            columns: w,
+            rows: h,
+            cell_size: 1.0,
+            clearance: 2.0,
+            base: [0.0, 0.0, 0.0],
+            normal: [0.0, 0.0, 1.0],
+            data: vec![1u8; (w * h) as usize],
+            heights: vec![0.0; (w * h) as usize],
+            surfaces: Vec::new(),
+        }
+    }
+
+    fn heading(a: [f32; 3], b: [f32; 3]) -> f32 {
+        (b[1] - a[1]).atan2(b[0] - a[0]).to_degrees()
+    }
+
+    #[test]
+    fn an_open_floor_is_crossed_in_one_heading_from_where_the_walker_stands() {
+        let g = floor(12, 12);
+        // Standing near a cell's corner, going a little off the grid's eight directions:
+        // the search's own route turns 45° on the way and starts toward the next cell's
+        // centre, beside the walker.
+        let from = [0.9, 0.1, 0.0];
+        let to = [9.5, 4.5, 0.0];
+        let p = route(&g, from, to).unwrap();
+        assert_eq!(*p.last().unwrap(), to);
+        let want = heading(from, to);
+        let mut at = from;
+        for q in &p {
+            assert!(
+                (heading(at, *q) - want).abs() < 0.5,
+                "{at:?} -> {q:?} turns off the line to {to:?} ({p:?})"
+            );
+            at = *q;
+        }
+        // A clear line is taken at once (no search), with points kept along it about
+        // LEG_SPACING apart (none further apart than twice that).
+        let mut at = from;
+        for q in &p {
+            let d = ((q[0] - at[0]).powi(2) + (q[1] - at[1]).powi(2)).sqrt();
+            assert!(
+                (LEG_SPACING * 0.5..=2.0 * LEG_SPACING).contains(&d),
+                "{p:?}"
+            );
+            at = *q;
+        }
+    }
+
+    #[test]
+    fn a_straightened_route_does_not_cut_through_a_closed_doorway_beside_a_corner() {
+        // A wall down column 3 (rows 0 to 2) ends at a closed doorway (3,3), with open floor
+        // past it at (3,4): the route goes round by row 4, and no straight leg crosses the
+        // doorway's cell or clips its corner.
+        let mut g = floor(7, 5);
+        for y in 0..3 {
+            g.data[(y * 7 + 3) as usize] = 10;
+        }
+        let door = 3 * 7 + 3;
+        let blocked: std::collections::HashSet<usize> = [door as usize].into_iter().collect();
+        let from = [1.5, 1.5, 0.0];
+        let to = [5.5, 1.5, 0.0];
+        let p = route_avoiding(&g, from, to, &blocked).unwrap();
+        let mut at = from;
+        for q in &p {
+            for k in 0..=200 {
+                let f = k as f32 / 200.0;
+                let x = [at[0] + (q[0] - at[0]) * f, at[1] + (q[1] - at[1]) * f, 0.0];
+                let c = g.cell(x).unwrap();
+                assert!(
+                    walkable(&g, c) && (c.1 * 7 + c.0) != door,
+                    "{at:?} -> {q:?} crosses {c:?} in {p:?}"
+                );
+            }
+            at = *q;
+        }
+        assert!(p.iter().any(|q| q[1] > 4.0), "round by row 4: {p:?}");
+    }
+
+    #[test]
+    fn a_straightened_route_still_goes_round_a_wall() {
+        let g = grid();
+        let p = route(&g, [0.5, 0.5, 0.0], [4.5, 0.5, 0.0]).unwrap();
+        let free = |c: (u32, u32)| walkable(&g, c);
+        let mut at = [0.5, 0.5, 0.0];
+        for q in &p {
+            assert!(
+                straight_clear(&g, at, *q, &free),
+                "{at:?} -> {q:?} in {p:?}"
+            );
+            at = *q;
+        }
+        assert!(p.iter().any(|q| q[1] > 2.0), "over the top row: {p:?}");
+    }
+
     /// A 5x3 grid with a wall down column 2 except at the top row.
     fn grid() -> NavGrid {
         let (w, h) = (5u32, 3u32);
@@ -1029,6 +1265,121 @@ mod tests {
             heights: vec![0.0; (w * h) as usize],
             surfaces: Vec::new(),
         }
+    }
+
+    fn disconnected_levels(height: f32) -> (Sim, thedas_script::vm::ObjectId) {
+        use crate::world::ObjectKind;
+        use thedas_script::EngineTable;
+        use thedas_vfs::Vfs;
+        let table = EngineTable::parse(
+            b"int EVENT_TYPE_COMMAND_COMPLETE = 500;\nint COMMAND_FAILED_INVALID_PATH = -4;\n",
+        )
+        .unwrap();
+        let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(table), 1);
+        let area = s.world.spawn(ObjectKind::Area, "levels");
+        let hero = s.world.spawn(ObjectKind::Creature, "player");
+        s.world.area = Some(area);
+        s.world.hero = Some(hero);
+        let h = s.world.get_mut(hero).unwrap();
+        h.area = Some(area);
+        h.position = [0.5, 1.5, height];
+        let mut g = grid();
+        for y in 0..g.rows {
+            g.data[(y * g.columns + 2) as usize] = 10;
+            for x in 0..2 {
+                g.heights[(y * g.columns + x) as usize] = height * 16.0;
+            }
+        }
+        s.area_layouts.insert(area, "levels".into());
+        s.nav_grids.insert("levels".into(), Some(Arc::new(g)));
+        (s, hero)
+    }
+
+    #[test]
+    fn failed_path_height_guard_is_strict_and_origins_only() {
+        let goal = [4.5, 1.5, 0.0];
+        for (height, expected) in [
+            (0.5, Routed::Straight),
+            (0.5001, Routed::InvalidPath),
+            (-0.5001, Routed::InvalidPath),
+        ] {
+            let (mut s, hero) = disconnected_levels(height);
+            assert_eq!(s.route_to(hero, goal), expected);
+        }
+        let (mut s, hero) = disconnected_levels(1.0);
+        s.game = thedas_vfs::Game::DragonAge2;
+        assert_eq!(s.route_to(hero, goal), Routed::Straight);
+        s.game = thedas_vfs::Game::Origins;
+        s.nav_grids.insert("levels".into(), None);
+        assert_eq!(s.route_to(hero, goal), Routed::Straight);
+    }
+
+    #[test]
+    fn a_failed_tall_walk_stays_put_and_does_not_cross_triggers() {
+        use crate::world::ObjectKind;
+        let (mut s, hero) = disconnected_levels(1.0);
+        let area = s.world.area;
+        let tr = s.world.spawn(ObjectKind::Trigger, "across_the_wall");
+        let o = s.world.get_mut(tr).unwrap();
+        o.area = area;
+        o.position = [2.0, 1.0, 0.0];
+        o.geometry = vec![
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [0.0, 1.0, 0.0],
+        ];
+        assert!(!s.walk(hero, [4.5, 1.5, 0.0], area));
+        assert_eq!(s.world.get(hero).unwrap().position, [0.5, 1.5, 1.0]);
+        assert!(s.world.queue.is_empty());
+        assert!(!s.world.in_triggers.contains_key(&hero));
+        assert_eq!(s.world.time_ms, 0);
+    }
+
+    #[test]
+    fn a_failed_tall_move_reports_invalid_path_without_moving() {
+        use crate::world::{Command, Location};
+        let (mut s, hero) = disconnected_levels(1.0);
+        let goal = [4.5, 1.5, 0.0];
+        let area = s.world.area.unwrap();
+        s.world.get_mut(hero).unwrap().commands.push(Command {
+            ty: 20,
+            name: "CommandMoveToLocation".into(),
+            location: Some(Location {
+                area,
+                position: goal,
+                facing: 0.0,
+            }),
+            ints: vec![1, 0],
+            ..Default::default()
+        });
+        s.tick(0);
+        let h = s.world.get(hero).unwrap();
+        assert!(h.commands.is_empty());
+        assert_eq!(h.position, [0.5, 1.5, 1.0]);
+        assert_eq!(
+            h.combat.previous_command.as_ref().unwrap().name,
+            "CommandMoveToLocation"
+        );
+        let complete = s.world.queue.values().find(|q| q.event.ty == 500).unwrap();
+        assert_eq!(complete.target, hero);
+        assert_eq!(complete.event.ints, [20, -4]);
+    }
+
+    #[test]
+    fn a_valid_sloping_route_can_change_height_by_more_than_half_a_metre() {
+        let (mut s, hero) = disconnected_levels(1.0);
+        let mut g = grid();
+        g.data.fill(1);
+        for y in 0..g.rows {
+            for x in 0..g.columns {
+                g.heights[(y * g.columns + x) as usize] = (4 - x) as f32 * 4.0;
+            }
+        }
+        s.nav_grids.insert("levels".into(), Some(Arc::new(g)));
+        assert!(matches!(s.route_to(hero, [4.5, 1.5, 0.0]), Routed::Path(_)));
+        assert!(s.walk(hero, [4.5, 1.5, 0.0], s.world.area));
+        assert_eq!(s.world.get(hero).unwrap().position, [4.5, 1.5, 0.0]);
     }
 
     #[test]
@@ -1285,6 +1636,7 @@ mod tests {
             arrived: false,
             da2_target_prepared: false,
             path: Vec::new(),
+            turned_at: None,
         });
         let r = 2.0 * s.capsule_radius(leader);
         for _ in 0..400 {
@@ -1374,6 +1726,7 @@ mod tests {
             arrived: false,
             da2_target_prepared: false,
             path: Vec::new(),
+            turned_at: None,
         });
         let r = 2.0 * s.capsule_radius(hero);
         for _ in 0..150 {
@@ -1490,6 +1843,7 @@ mod tests {
             arrived: false,
             da2_target_prepared: false,
             path: Vec::new(),
+            turned_at: None,
         });
         // Four metres in a straight line, but the wall sends it up through the gap: the
         // route is longer, and halfway along it the walker is in the top row, not inside

@@ -89,11 +89,24 @@ impl GpuContext {
         if crate::profile::enabled() {
             wanted |= wgpu::Features::TIMESTAMP_QUERY;
         }
+        // Texture arrays let the interface (thedas-gfx) sample every image through one
+        // binding and merge its draws; without them it draws once per texture.
+        wanted |= wgpu::Features::TEXTURE_BINDING_ARRAY
+            | wgpu::Features::SAMPLED_TEXTURE_AND_STORAGE_BUFFER_ARRAY_NON_UNIFORM_INDEXING
+            | wgpu::Features::PARTIALLY_BOUND_BINDING_ARRAY;
+        let mut limits = wgpu::Limits::default();
+        let offered = adapter.limits();
+        limits.max_binding_array_elements_per_shader_stage = offered
+            .max_binding_array_elements_per_shader_stage
+            .min(1 << 16);
+        limits.max_binding_array_sampler_elements_per_shader_stage = offered
+            .max_binding_array_sampler_elements_per_shader_stage
+            .min(1 << 16);
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("thedas"),
                 required_features: adapter.features() & wanted,
-                required_limits: wgpu::Limits::default(),
+                required_limits: limits,
                 ..Default::default()
             })
             .await
@@ -563,6 +576,8 @@ pub struct AreaRenderer {
     lightmap_groups: Vec<wgpu::BindGroup>,
     stand_in: Vec<Draw>,
     d3d: crate::d3d_gpu::D3dPass,
+    /// Which props have been posed at least once (see [`Self::prop_seen`]).
+    posed_props: Vec<bool>,
     /// (scene draw index, draw) in drawing order.
     opaque: Vec<(usize, DrawRef)>,
     blended: Vec<(usize, DrawRef)>,
@@ -1091,6 +1106,7 @@ impl AreaRenderer {
             lightmap_groups,
             stand_in,
             d3d,
+            posed_props: Vec::new(),
             opaque,
             blended,
             only_draws: None,
@@ -1424,6 +1440,25 @@ impl AreaRenderer {
         }
     }
 
+    /// Whether the last frame showed prop `prop` or cast a shadow from it (any of its
+    /// draws in the view or a sun partition), or it was never posed: posing a prop no
+    /// one sees can wait. `seen` is [`D3dPass::seen_draws`]'s, taken once a frame.
+    pub fn prop_seen(&self, scene: &AreaScene, prop: usize, seen: &[bool]) -> bool {
+        if seen.is_empty() || !self.posed_props.get(prop).copied().unwrap_or(false) {
+            return true;
+        }
+        scene.props.get(prop).is_none_or(|p| {
+            p.draws
+                .clone()
+                .any(|d| seen.get(d).copied().unwrap_or(true))
+        })
+    }
+
+    /// The draws the last frame showed or cast a shadow from (see [`Self::prop_seen`]).
+    pub fn seen_draws(&self) -> Vec<bool> {
+        self.d3d.seen_draws()
+    }
+
     pub fn pose_prop(
         &mut self,
         ctx: &GpuContext,
@@ -1435,6 +1470,10 @@ impl AreaRenderer {
         let Some(p) = scene.props.get(prop) else {
             return;
         };
+        if self.posed_props.len() <= prop {
+            self.posed_props.resize(prop + 1, false);
+        }
+        self.posed_props[prop] = true;
         let to_model = p.transform.inverse();
         let attached: std::collections::HashSet<usize> =
             p.attachments.iter().flat_map(|a| a.draws.clone()).collect();
@@ -1760,6 +1799,13 @@ impl AreaRenderer {
         self.d3d
             .update(ctx, camera, width, height, self.time as f32);
         self.updated = true;
+    }
+
+    /// This frame's sun texture matrices/partition plane and map size, for capture
+    /// diagnostics. Reading these does not advance the fit or its smoothing history.
+    pub fn sun_shadow_data(&self) -> Option<([[f32; 4]; 9], u32)> {
+        let (data, _) = self.d3d.sun_shadows()?;
+        Some((data, self.d3d.shadows.as_ref()?.size()))
     }
 
     /// Records this renderer's shadow casters into the partitions: `clear` for the first
