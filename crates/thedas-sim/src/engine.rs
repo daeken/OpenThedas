@@ -3039,6 +3039,7 @@ pub fn call(
                 da2_target_prepared: false,
                 path: Vec::new(),
                 turned_at: None,
+                is_static: false,
             };
             // The first float is a wait's seconds or a move's minimum range. Keep
             // MoveToObject's second float as its maximum (0x66f260, clamp at 0x66f312).
@@ -3175,11 +3176,87 @@ pub fn call(
             })
         }
         "AddCommand" => {
-            let Some(EngineData::Command(c)) = h.sim.world.handle(handle(a, 1)).cloned() else {
+            let Some(EngineData::Command(mut c)) = h.sim.world.handle(handle(a, 1)).cloned() else {
                 return ok(Value::Int(0));
             };
             let target = obj(a, 0);
-            let front = int(a, 2) != 0;
+            let origins = h.sim.game == thedas_vfs::Game::Origins;
+            let front = if origins {
+                int(a, 2) == 1
+            } else {
+                int(a, 2) != 0
+            };
+            if origins {
+                let Some(o) = h.sim.world.get(target) else {
+                    return ok(Value::Int(0));
+                };
+                // DAOrigins.exe 0x66e0e0 -> 0x73cd10: front/back chooses a place in
+                // the waiting queue, independently of the active executor. Add behavior
+                // clears the active command; it is never pushed back to resume later.
+                // The defaults come from table 94, with a different column when the
+                // incoming type matches the active one (0x73cddd..0x73ce24).
+                c.is_static = int(a, 3) != 0;
+                // GetCurrentCommand can supply this payload again. Native execution
+                // state belongs to the executor, so the newly admitted copy is fresh.
+                c.due = None;
+                c.from = None;
+                c.turned_at = None;
+                c.approach = None;
+                c.ring_wait = false;
+                c.arrived = false;
+                c.impacted = false;
+                c.after_impact_ms = None;
+                c.cancellable_at = None;
+                c.cancellable = false;
+                c.da2_target_prepared = false;
+                if c.name != "CommandMoveToMultiLocations" {
+                    c.path.clear();
+                }
+                let running = o.commands.first().filter(|c| c.due.is_some());
+                let same = running.map_or(0, |c| c.ty) == c.ty;
+                let changed_target = o.kind == ObjectKind::Creature
+                    && c.target.unwrap_or(OBJECT_INVALID)
+                        != h.sim.script_attack_target(target).unwrap_or(OBJECT_INVALID);
+                let behavior = a.get(4).map_or(-1, |_| int(a, 4));
+                let behavior = if behavior == -1 {
+                    h.sim.world.tables().get(94, "").map_or(0, |table| {
+                        cell_int(table.cell_by_hash(
+                            if same { 0x7569_547a } else { 0xed36_668a },
+                            c.ty as i64,
+                        ))
+                    })
+                } else {
+                    behavior
+                };
+                // 1 clears only the active command; 2 also clears ordinary waiting
+                // commands. Native behavior 3 clears the waiting queue on a target
+                // change. Static commands survive all three (0x73c930, 0x73c730).
+                if matches!(behavior, 1..=3) {
+                    let o = h.sim.world.get_mut(target).unwrap();
+                    if behavior == 2 || (behavior == 3 && changed_target) {
+                        o.commands.retain(|c| c.due.is_some() || c.is_static);
+                    }
+                    let cleared = o
+                        .commands
+                        .first()
+                        .is_some_and(|c| c.due.is_some() && !c.is_static)
+                        .then(|| o.commands.remove(0));
+                    if let Some(cleared) = cleared {
+                        let result = constant(&h.sim.table, "COMMAND_FAILED_COMMAND_CLEARED");
+                        let mut ev = h.sim.new_event("COMMAND_COMPLETE", Some(target));
+                        ev.ints = vec![cleared.ty, result];
+                        h.sim.world.trace.push(TraceEntry::Command {
+                            t,
+                            object: target,
+                            command: cleared.name.clone(),
+                            status: format!("failed {result}"),
+                        });
+                        h.sim.world.get_mut(target).unwrap().combat.previous_command =
+                            Some(cleared);
+                        h.sim.world.queue_event(0, target, ev, None);
+                    }
+                }
+            }
             if front
                 && h.sim.game == thedas_vfs::Game::DragonAge2
                 && h.sim.world.get(target).is_some_and(|o| {
@@ -3199,7 +3276,12 @@ pub fn call(
             match h.sim.world.get_mut(target) {
                 Some(o) => {
                     if front {
-                        o.commands.insert(0, c);
+                        // The native active executor is separate from the waiting queue.
+                        // Keep its simulation front in place if add behavior left it alive.
+                        let at = usize::from(
+                            origins && o.commands.first().is_some_and(|c| c.due.is_some()),
+                        );
+                        o.commands.insert(at, c);
                     } else {
                         o.commands.push(c);
                     }
@@ -11636,6 +11718,7 @@ mod tests {
                 da2_target_prepared: false,
                 path: vec![],
                 turned_at: None,
+                is_static: false,
             });
         assert_eq!(
             conjuring(&mut s),

@@ -1637,6 +1637,7 @@ mod tests {
             da2_target_prepared: false,
             path: Vec::new(),
             turned_at: None,
+            is_static: false,
         });
         let r = 2.0 * s.capsule_radius(leader);
         for _ in 0..400 {
@@ -1727,6 +1728,7 @@ mod tests {
             da2_target_prepared: false,
             path: Vec::new(),
             turned_at: None,
+            is_static: false,
         });
         let r = 2.0 * s.capsule_radius(hero);
         for _ in 0..150 {
@@ -1844,6 +1846,7 @@ mod tests {
             da2_target_prepared: false,
             path: Vec::new(),
             turned_at: None,
+            is_static: false,
         });
         // Four metres in a straight line, but the wall sends it up through the gap: the
         // route is longer, and halfway along it the walker is in the top row, not inside

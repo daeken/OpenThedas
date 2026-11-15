@@ -9,17 +9,19 @@
 //!
 //! | index | function | used by | amount |
 //! |---|---|---|---|
-//! | 1 | 0x79cb30 | Attack | 0.5 (Strength − 10) + 0.5 (Dexterity − 10) |
-//! | 2 | 0x79cc90 | Defense | Dexterity − 10 |
+//! | 1 | 0x79cb30 | Attack | 0.5 max(Strength − 10, 0) + 0.5 max(Dexterity − 10, 0) |
+//! | 2 | 0x79cc90 | Defense | max(Dexterity − 10, 0) |
 //! | 3 | 0x83a430 | Armor | 0 |
-//! | 4 | 0x79cd40 | AP_BONUS | (Cunning − 10) / 7 |
-//! | 5 | 0x79cdf0 | SpellPower | Magic − 10 |
-//! | 6 | 0x79cea0 | Health | 5 (Constitution − 10) |
-//! | 7 | 0x79cf50 | Mana_Stamina | 5 (Willpower − 10) |
+//! | 4 | 0x79cd40 | AP_BONUS | max(Cunning − 10, 0) / 7 |
+//! | 5 | 0x79cdf0 | SpellPower | max(Magic − 10, 0) |
+//! | 6 | 0x79cea0 | Health | 5 max(Constitution − 10, 0) |
+//! | 7 | 0x79cf50 | Mana_Stamina | 5 max(Willpower − 10, 0) |
 //! | 8 | 0x79d000 | Resistance_Mind | 0.5 ((Willpower − 10) + (Magic − 10) + (Cunning − 10)) |
 //! | 9 | 0x79d0f0 | Resistance_Physical | 0.5 ((Strength − 10) + (Constitution − 10) + (Dexterity − 10)) |
 //!
-//! Scores under 10 subtract. An original save agrees: a hero with Constitution 14 and
+//! Attack, Defense, AP_BONUS, SpellPower, Health and Mana_Stamina floor each attribute
+//! contribution at zero (0x79cb30..0x79cffe). The two resistance derivations retain signed
+//! contributions (0x79d000, 0x79d0f0). An original save agrees: a hero with Constitution 14 and
 //! Willpower 11 stores Health base 100, current 120 and Mana base 100, current 105.
 
 use thedas_script::vm::ObjectId;
@@ -188,12 +190,12 @@ impl Sim {
         let (str_, dex, wil, mag, cun, con) =
             (attr(1), attr(2), attr(3), attr(4), attr(5), attr(6));
         match index {
-            1 => 0.5 * str_ + 0.5 * dex,
-            2 => dex,
-            4 => cun / 7.0,
-            5 => mag,
-            6 => 5.0 * con,
-            7 => 5.0 * wil,
+            1 => 0.5 * str_.max(0.0) + 0.5 * dex.max(0.0),
+            2 => dex.max(0.0),
+            4 => cun.max(0.0) / 7.0,
+            5 => mag.max(0.0),
+            6 => 5.0 * con.max(0.0),
+            7 => 5.0 * wil.max(0.0),
             8 => 0.5 * (wil + mag + cun),
             9 => 0.5 * (str_ + con + dex),
             _ => 0.0,
@@ -266,12 +268,45 @@ mod tests {
         assert_eq!(bonus(9), 10.5, "attack: half of strength's and dexterity's");
         assert_eq!(bonus(10), 9.0);
         assert_eq!(bonus(11), 0.0, "armour comes from gear only");
-        assert_eq!(bonus(13), -2.0, "magic 8 takes away");
+        assert_eq!(bonus(13), 0.0, "magic below 10 contributes nothing");
         assert_eq!(bonus(32), 0.5 * (1.0 - 2.0 + 14.0));
         assert_eq!(bonus(33), 0.5 * (12.0 + 6.0 + 9.0));
         assert_eq!(bonus(53), 2.0, "cunning 24: a seventh of a point");
         assert_eq!(bonus(12), 0.0, "no derivation");
         // A ranged attacker's attack is derived the same way.
         assert_eq!(bonus(9), 10.5);
+
+        // Native 0x79cb30..0x79cffe floor the attribute contributions, not the
+        // final property total. A weak attribute cannot cancel a stronger one;
+        // property bases and explicit modifiers still apply normally.
+        let o = s.world.get_mut(c).unwrap();
+        for p in 1..=6 {
+            o.properties.insert(p, (8.0, 0.0));
+        }
+        o.properties.insert(2, (14.0, 0.0));
+        o.properties.insert(9, (60.0, 0.0));
+        o.modifiers.insert(9, -10.0);
+        assert_eq!(s.attribute_bonus(c, 9), 2.0);
+        assert_eq!(s.property_total(c, 9), 52.0);
+        for p in [7, 8, 13, 53] {
+            assert_eq!(s.attribute_bonus(c, p), 0.0, "property {p}");
+        }
+        s.world.get_mut(c).unwrap().modifiers.insert(2, -6.0);
+        assert_eq!(s.attribute_bonus(c, 9), 0.0);
+        assert_eq!(s.attribute_bonus(c, 10), 0.0);
+        assert_eq!(s.attribute_bonus(c, 32), -3.0, "mind resistance is signed");
+        assert_eq!(
+            s.attribute_bonus(c, 33),
+            -3.0,
+            "physical resistance is signed"
+        );
+
+        // Origins' stun effect subtracts 1000 Dexterity. It removes the
+        // attribute contribution, leaving the property's base and modifiers.
+        let o = s.world.get_mut(c).unwrap();
+        o.properties.insert(10, (50.0, 0.0));
+        o.modifiers.insert(2, -1000.0);
+        assert_eq!(s.property_total(c, 10), 50.0, "stun keeps base defense");
+        assert_eq!(s.property_total(c, 9), 50.0, "stun keeps base attack");
     }
 }
