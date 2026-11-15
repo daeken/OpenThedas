@@ -60,8 +60,9 @@ const STACK_FIELDS: [&str; 6] = [
     "StoreFlag",
 ];
 impl Sim {
-    /// The effects an item's properties put on whoever wears it: for each of its template's
-    /// properties of the worn kind, `itemprps.gda`'s effect with its `Int0`/`Int1`,
+    /// The effects an item's properties put on whoever wears it. DA2 uses its native
+    /// item_properties schema and parameter builder in da2_items. For Origins, each template
+    /// property of the worn kind gives `itemprps.gda`'s effect with its `Int0`/`Int1`,
     /// `Float0`/`Float1`, the parameter the row names scaled by the property's power, the
     /// item as creator. Provisional: the kinds, the power rule and the all-attributes row
     /// are read from the table's contents, not traced in the executable; on-hit
@@ -225,6 +226,9 @@ impl Sim {
         props: &[(i32, i32)],
     ) -> Vec<crate::world::Effect> {
         use thedas_formats::gda::Cell;
+        if self.game == thedas_vfs::Game::DragonAge2 {
+            return self.da2_item_property_effects(item, props);
+        }
         let props = props.to_vec();
         if props.is_empty() {
             return Vec::new();
@@ -282,6 +286,52 @@ impl Sim {
             });
         }
         out
+    }
+
+    /// DA2 LoadItemsFromTemplate (0x598a10) destroys equipped items first,
+    /// even when the backpack is retained. Destruction goes through the normal
+    /// unequip path so item effects end before their source objects disappear.
+    pub(crate) fn discard_da2_template_inventory(&mut self, owner: ObjectId, replace: bool) {
+        let old = self
+            .world
+            .get(owner)
+            .map(|o| {
+                let equipped: std::collections::BTreeSet<_> = o
+                    .equipment
+                    .values()
+                    .chain(o.other_set.values())
+                    .copied()
+                    .collect();
+                let mut old: Vec<_> = o
+                    .inventory
+                    .iter()
+                    .copied()
+                    .filter(|i| equipped.contains(i))
+                    .collect();
+                // Keep malformed older snapshots from retaining an equipped item
+                // merely because it is absent from the owner's inventory list.
+                for &item in &equipped {
+                    if !old.contains(&item) {
+                        old.push(item);
+                    }
+                }
+                if replace {
+                    old.extend(
+                        o.inventory
+                            .iter()
+                            .copied()
+                            .filter(|i| !equipped.contains(i)),
+                    );
+                }
+                old
+            })
+            .unwrap_or_default();
+        for item in old {
+            // Also unwind old snapshots whose equipment is absent from inventory;
+            // destroy_object discovers holders through their inventory lists.
+            self.unequip(owner, item);
+            self.destroy_object(item);
+        }
     }
 
     /// The engine's side of `who` putting on `item` (already in `slot`): the item's
