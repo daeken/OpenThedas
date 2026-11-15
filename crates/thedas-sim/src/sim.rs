@@ -1313,6 +1313,7 @@ impl Sim {
         self.world.time_ms = until;
         self.advance_movers();
         self.advance_da2_projectiles();
+        self.advance_plot_action_cooldowns();
         self.regenerate(elapsed);
         self.decay_corpses(elapsed);
         self.kick_ambient_creatures(elapsed);

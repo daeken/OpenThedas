@@ -4350,6 +4350,7 @@ pub fn call(
         }
         // The plot actions control (world state the interface shows).
         "SetPlotActionSet" => {
+            h.sim.advance_plot_action_cooldowns();
             h.sim.world.plot_actions.set = int(a, 0);
             void()
         }
@@ -4358,7 +4359,26 @@ pub fn call(
             void()
         }
         "SetPlotActionState" => {
+            h.sim.advance_plot_action_cooldowns();
             h.sim.world.plot_actions.states.insert(int(a, 0), int(a, 1));
+            void()
+        }
+        "SetPlotActionCooldown" if f.id == 861 && h.sim.game == thedas_vfs::Game::Origins => {
+            let script = string(a, 4);
+            h.sim.set_plot_action_cooldown(
+                int(a, 0),
+                float(a, 1),
+                crate::plot_cooldown::PlotCooldown {
+                    total_bits: 0,
+                    remaining_bits: 0,
+                    percent_bits: 0,
+                    last_ms: 0,
+                    event_type: int(a, 2),
+                    caller,
+                    recipient: obj(a, 3),
+                    script: (!script.is_empty()).then_some(script),
+                },
+            );
             void()
         }
         "GetPlotActionState" => ok(Value::Int(
