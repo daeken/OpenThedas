@@ -394,6 +394,10 @@ pub const BINDINGS: &[Binding] = &[
     // Every D-pad direction and both stick clicks are taken in the field; A is free with RT.
     // Provisional: the 360 version's button for it is not traced.
     chord(Field, RT, A, Do::SwapWeapons, "SwapWeaponSets"),
+    // Pause and unpause (Space on the keyboard): the field had no pad button for it, so a
+    // pad player could not unpause after a tactical pause. Provisional: the 360 version's
+    // button is not traced.
+    chord(Field, RT, Start, Do::Pause, "TogglePause"),
     tap(Field, LB, Do::PrevMember, "SelectPreviousCharacterMessage"),
     tap(Field, RB, Do::NextMember, "SelectNextCharacterMessage"),
     chord(Field, RB, LB, Do::WholeParty, "ToggleFullPartySelect"),
@@ -892,6 +896,13 @@ mod tests {
             s.set(b, false);
             c.update(&s, Field, 16.0);
         }
+        // With RT, Start pauses and unpauses instead of opening the game menu.
+        assert_eq!(
+            acts(&c.update(&press(&mut s, Start), Field, 16.0)),
+            vec![Action::Pause]
+        );
+        s.set(Start, false);
+        c.update(&s, Field, 16.0);
         // With RT, A switches weapon sets instead of acting on what is in front.
         assert_eq!(
             acts(&c.update(&press(&mut s, A), Field, 16.0)),

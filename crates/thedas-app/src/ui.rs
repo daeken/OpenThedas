@@ -1142,21 +1142,32 @@ impl UiLayer {
             "GUI.GoToCodex" => true,
             _ => return false,
         };
-        let Some(resref) = args
+        // The plot's resource, with or without its `plt_` (a notification's carries it; a
+        // tutorial popup's Codex button sends the plot's name without it: `tut_plot_map`),
+        // among numbers such as whether the quest is done.
+        let Some(arg) = args
             .iter()
             .map(|a| a.trim())
-            .find(|a| a.starts_with("plt_"))
+            .find(|a| !a.is_empty() && a.parse::<f64>().is_err())
         else {
             return true;
         };
+        let bare = arg.trim_start_matches("plt_");
+        let resref = format!("plt_{bare}");
+        let resref = resref.as_str();
         let view = sim.lock().unwrap_or_else(|p| p.into_inner()).journal();
         let focus = if codex {
             view.codex
                 .iter()
-                .find(|g| g.entries.iter().any(|e| e.resref == resref))
-                .map(|g| thedas_ui::binding::JournalFocus {
+                .find_map(|g| {
+                    g.entries
+                        .iter()
+                        .find(|e| e.resref == resref)
+                        .map(|e| (g, e))
+                })
+                .map(|(g, e)| thedas_ui::binding::JournalFocus {
                     codex: true,
-                    resref: resref.to_string(),
+                    resref: e.resref.clone(),
                     group: g.kind.to_string(),
                     completed: false,
                 })
