@@ -157,6 +157,16 @@ missing input, not native outcomes or a proven cause of the wipes. The
 retained checkpoint epoch and driver differ from the newly supplied fresh
 chain; their combat timing must be reported separately.
 
+The retained pre-Ogre trace spans `839750..915150` ms. Its IsMoving callers
+are Hawke (35), Bethany (28) and Aveline (11). Bethany and Aveline each receive
+75 heartbeats at 1000 ms intervals, extending to `914566` and `914372` ms.
+Completed Use Ability commands number 35, 27 and 12 respectively. Thus these
+actors are not globally starved of script/command processing in that replay.
+This does not classify individual ability branches or prove correct cinematic
+ownership; it narrows the processing-freeze hypothesis without changing combat
+inputs. The old trace predates per-blow attack entries, so it cannot supply
+current attack tallies.
+
 Damage, health, chargen inputs and Karl combat are owned by the separate
 damage investigation. No balance adjustment or processing heuristic is
 introduced by this note.
