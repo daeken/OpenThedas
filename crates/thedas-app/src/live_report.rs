@@ -42,7 +42,7 @@ impl Live {
                     "facing_radians": (-forward.x).atan2(forward.y), "forward": forward.to_array(),
                     "roots": roots,
                     "first_draw_world": objects.renderer.draw_world(prop.draws.start).map(|m| m.to_cols_array()),
-                    "animations": clip.map(|c| crate::report::clip_snapshot(&self.animator, c)),
+                    "animations": clip.as_ref().map(|c| crate::report::clip_snapshot(&self.animator, c)),
                     "look_at": self.looks.report(*id), "opacity": opacity,
                     "camera_fade": self.opacity.get(id),
                     "attached_vfx": self.effects.as_ref().map(|effects| effects.key.iter()
