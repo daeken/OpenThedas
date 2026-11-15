@@ -570,6 +570,7 @@ mod tests {
             length: 1.0,
             additive: false,
             scalars: Default::default(),
+            colors: Vec::new(),
             tracks: vec![
                 track(hashed("elbow_rotation"), Channel::Rotation),
                 // A bone this skeleton does not have stays hashed.
@@ -611,6 +612,7 @@ mod tests {
             length: 1.0,
             additive: false,
             scalars: Vec::new(),
+            colors: Vec::new(),
             tracks: vec![Track {
                 bone: "elbow".into(),
                 channel: Channel::Translation,

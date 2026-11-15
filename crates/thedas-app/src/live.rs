@@ -2156,8 +2156,12 @@ impl Live {
             };
             objects.renderer.set_prop_opacity(ctx, &objects.scene, i, o);
         }
-        // A cutscene's lights join the level's, for the level and for the objects.
-        let lights = cut_scene_lights(&mut self.cut_light_model, &level.vfs, &cut_lights);
+        // A cutscene's lights join the level's, for the level and for the objects, and so
+        // do the lights of the visual effects (as they stood last frame).
+        let mut lights = cut_scene_lights(&mut self.cut_light_model, &level.vfs, &cut_lights);
+        if let Some(e) = &self.effects {
+            lights.extend(e.renderer.effect_lights());
+        }
         objects.renderer.set_extra_lights(&lights);
         if let Some(level) = self.level.as_mut() {
             level.renderer.set_extra_lights(&lights);
