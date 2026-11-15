@@ -12,6 +12,7 @@
 //! Nothing here reads the wall clock, the frame rate or a GPU: time advances only through
 //! [`Sim::tick`], and randomness comes from a seeded generator.
 
+pub mod ambient;
 pub mod aoe;
 pub mod appearance;
 pub mod chanters;

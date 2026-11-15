@@ -54,8 +54,11 @@ fn gpu() -> Gpu {
         ..Default::default()
     }))
     .expect("adapter");
+    let (required_features, required_limits) = thedas_gfx::gpu::wanted(&adapter);
     let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("capture"),
+        required_features,
+        required_limits,
         ..Default::default()
     }))
     .expect("device");

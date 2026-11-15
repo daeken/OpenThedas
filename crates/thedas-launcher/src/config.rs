@@ -65,6 +65,8 @@ pub struct PlayOptions {
     /// `faithful` (the original's shaders) or `deferred` (ours) (`--renderer`); F11 flips
     /// between them in game.
     pub renderer: String,
+    /// The deferred renderer's lightmaps: `baked`, `hybrid` or `realtime` (`--lighting`).
+    pub lighting: String,
     /// The logo and intro movies before the start menu (off: `--no-intro`).
     pub intro: bool,
     /// Voice-over language folder (`--language`).
@@ -80,6 +82,7 @@ impl Default for PlayOptions {
             detail: "medium".into(),
             frame_effects: true,
             renderer: "faithful".into(),
+            lighting: "baked".into(),
             intro: true,
             language: "en-us".into(),
             audio: true,
@@ -99,6 +102,8 @@ impl PlayOptions {
             if self.frame_effects { "on" } else { "off" }.into(),
             "--renderer".into(),
             self.renderer.clone(),
+            "--lighting".into(),
+            self.lighting.clone(),
             "--language".into(),
             self.language.clone(),
         ];
@@ -285,5 +290,6 @@ mod tests {
         assert!(a.contains("--no-audio"));
         assert!(a.contains("--frame-effects off"));
         assert!(a.contains("--renderer faithful"));
+        assert!(a.contains("--lighting baked"));
     }
 }
