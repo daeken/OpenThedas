@@ -1778,6 +1778,7 @@ impl Live {
     /// changes, the objects when the set of objects (or what they wear) changes; then places
     /// and poses every object.
     pub fn sync(&mut self, ctx: &GpuContext, format: wgpu::TextureFormat) -> Result<()> {
+        let mut profile = crate::frame_profile::FrameProfile::new("sync");
         self.format = Some(format);
         let shared = self.sim.clone();
         let mut sim = shared.lock().unwrap_or_else(|p| p.into_inner());
@@ -1855,6 +1856,7 @@ impl Live {
                 m
             }
         };
+        crate::frame_profile::FrameProfile::mark(&mut profile, "models");
         self.swings.apply(&sim, &mut models);
         let was = self.staged;
         self.staged = staged.map(|(id, s)| (id, s.mark, s.facing));
@@ -1997,6 +1999,7 @@ impl Live {
                 Some((from, sight))
             })
             .collect();
+        crate::frame_profile::FrameProfile::mark(&mut profile, "look_targets");
         let key = objects_key(&models);
         if self.async_loads && self.objects.is_none() {
             // A new level's objects are built on the worker too, before the world shows.
@@ -2027,6 +2030,7 @@ impl Live {
         let (Some(level), Some(objects)) = (self.level.as_ref(), self.objects.as_mut()) else {
             return Ok(());
         };
+        crate::frame_profile::FrameProfile::mark(&mut profile, "objects");
         let mut posed: Vec<(Mat4, Option<Clip>)> = Vec::with_capacity(models.len());
         for m in &models {
             let mut c = m.motion.as_ref().map(clip);
@@ -2114,6 +2118,7 @@ impl Live {
             }
             posed.push((Prop::placement(at, facing), c));
         }
+        crate::frame_profile::FrameProfile::mark(&mut profile, "clips");
         self.animator.pose_props(
             &level.vfs,
             &objects.scene,
@@ -2122,6 +2127,7 @@ impl Live {
             &posed,
             0.0,
         );
+        crate::frame_profile::FrameProfile::mark(&mut profile, "pose");
         objects.follow_poses();
         for (i, m) in models.iter().enumerate() {
             let o = if hidden.contains(&m.id) {
@@ -2142,8 +2148,12 @@ impl Live {
             .zip(posed)
             .map(|(m, (t, c))| (m.id, t, c))
             .collect();
+        crate::frame_profile::FrameProfile::mark(&mut profile, "placements");
         self.show_effects(ctx, format, &layout, &models)?;
-        self.show_rings(ctx, format, &layout, &models)
+        crate::frame_profile::FrameProfile::mark(&mut profile, "effects");
+        self.show_rings(ctx, format, &layout, &models)?;
+        crate::frame_profile::FrameProfile::mark(&mut profile, "rings");
+        Ok(())
     }
 
     /// Shows the selection rings of the creatures drawn (see [`crate::rings`]): a scene of

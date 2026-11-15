@@ -58,6 +58,7 @@ mod cutcam;
 mod faces;
 mod focusnav;
 mod follow;
+mod frame_profile;
 mod framestats;
 mod glb;
 mod glb_in;
@@ -1657,6 +1658,7 @@ impl App {
     }
 
     fn redraw(&mut self) -> Result<()> {
+        let mut profile = frame_profile::FrameProfile::new("redraw");
         if let Some(g) = self.gfx.as_mut() {
             if let Some(stats) = g.frames.frame(Instant::now()) {
                 g.window.set_title(&format!("{} | {stats}", g.title));
@@ -1677,6 +1679,7 @@ impl App {
         self.mod_mode_frame(dt);
         self.returning_frame();
         self.update();
+        frame_profile::FrameProfile::mark(&mut profile, "input_camera");
         let Some(g) = self.gfx.as_mut() else {
             return Ok(());
         };
@@ -1689,6 +1692,7 @@ impl App {
             _ => (None, SurfaceState::Unavailable),
         };
         let plan = frame_plan(surface, !self.frame_requests.is_empty());
+        frame_profile::FrameProfile::mark(&mut profile, "surface");
         if plan.reconfigure {
             g.surface.configure(&g.ctx.device, &g.config);
         }
@@ -1698,8 +1702,10 @@ impl App {
         // for a presented frame get one drawn offscreen instead.
         let Some(frame) = frame else {
             self.tick_unpresented(dt)?;
+            frame_profile::FrameProfile::mark(&mut profile, "unpresented");
             if plan.offscreen_frames {
                 self.answer_frames_offscreen();
+                frame_profile::FrameProfile::mark(&mut profile, "offscreen_capture");
             }
             return Ok(());
         };
@@ -1749,6 +1755,7 @@ impl App {
             }
             (None, None) => false,
         };
+        frame_profile::FrameProfile::mark(&mut profile, "sync_world");
         // The level's frame buffer effects go over the world, under the interface; they copy
         // the frame, which needs a surface that allows it.
         if drawn && g.config.usage.contains(wgpu::TextureUsages::COPY_SRC) {
@@ -1888,6 +1895,7 @@ impl App {
                 .draw(&g.ctx.device, &mut encoder, &view, size, &lines);
         }
         g.ui.composite(&mut encoder, &view, g.config.format);
+        frame_profile::FrameProfile::mark(&mut profile, "interface_draw");
         // The pad's pointer goes over the interface.
         let ctx = self
             .pad
@@ -1920,6 +1928,7 @@ impl App {
         }
         g.window.pre_present_notify();
         g.ctx.queue.present(frame);
+        frame_profile::FrameProfile::mark(&mut profile, "submit_present");
         Ok(())
     }
 
@@ -1948,6 +1957,7 @@ impl App {
     /// A frame with nothing to draw into: the simulation, its presentation and the interface
     /// run as on a drawn frame (see [`App::redraw`]); the drawing alone is skipped.
     fn tick_unpresented(&mut self, dt: f64) -> Result<()> {
+        let mut profile = frame_profile::FrameProfile::new("unpresented");
         let Some(g) = self.gfx.as_mut() else {
             return Ok(());
         };
@@ -1964,9 +1974,11 @@ impl App {
             if !live.loading() {
                 live.advance_presentation(dt);
             }
+            frame_profile::FrameProfile::mark(&mut profile, "simulation");
             live.frame_size = (g.config.width, g.config.height);
             live.set_chargen_pose(g.ui.paperdoll_pose());
             live.sync(&g.ctx, g.config.format)?;
+            frame_profile::FrameProfile::mark(&mut profile, "sync");
             if self.screens.is_some() {
                 loading_screen(live, &mut g.ui, &mut self.load_screen_up);
             }
@@ -1974,6 +1986,7 @@ impl App {
             // they are kept up with no frame to present too (a hidden window's portraits
             // stayed empty, and a client's offscreen frame showed them so).
             draw_likenesses(live, &mut g.ui, self.screens.as_ref(), &g.ctx, dt);
+            frame_profile::FrameProfile::mark(&mut profile, "portraits");
         }
         if self.live.is_none() {
             if let Some(r) = g.renderer.as_mut() {
@@ -2005,6 +2018,7 @@ impl App {
             &self.camera,
             dt,
         );
+        frame_profile::FrameProfile::mark(&mut profile, "interface");
         self.requests.append(&mut g.ui.requests);
         // A save just written gets the picture of the game as it stands (the world alone,
         // as the save and load screens show it).
