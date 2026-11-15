@@ -36,15 +36,15 @@ pub fn inferred() -> Vec<Function> {
         },
         Function {
             id: 860,
-            name: "Inferred860".into(),
+            name: "RequestTarget".into(),
             ret: Type::Void,
             params: vec![
-                p(Type::Int, "n1", None),
-                p(Type::Float, "f1", None),
-                p(Type::Float, "f2", None),
-                p(Type::Int, "n2", None),
-                p(Type::Object, "oObject", None),
-                p(Type::String, "s1", None),
+                p(Type::Int, "nTargetMask", None),
+                p(Type::Float, "fRadius", None),
+                p(Type::Float, "fUnused", None),
+                p(Type::Int, "nEventType", None),
+                p(Type::Object, "oRecipient", None),
+                p(Type::String, "sScript", None),
             ],
         },
         Function {

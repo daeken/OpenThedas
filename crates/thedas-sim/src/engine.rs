@@ -1161,6 +1161,18 @@ pub fn call(
 
         // --- Objects ----------------------------------------------------------------------
         "GetModule" => ok(Value::Object(h.sim.world.module.unwrap_or(OBJECT_INVALID))),
+        "RequestTarget" if f.id == 860 && h.sim.game == thedas_vfs::Game::Origins => {
+            let script = string(a, 5);
+            h.sim.request_target(crate::target_request::TargetRequest {
+                mask: int(a, 0),
+                radius: float(a, 1),
+                event_type: int(a, 3),
+                caller,
+                recipient: obj(a, 4),
+                script: (!script.is_empty()).then_some(script),
+            });
+            void()
+        }
         "GetHero" => ok(Value::Object(h.sim.world.hero.unwrap_or(OBJECT_INVALID))),
         // Origins command 438 (0x661870 -> 0x5d5ca0) reads the player's controlled
         // object id at +0x5c, also used by GetMainControlled (0x660ae0). It does

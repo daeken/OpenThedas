@@ -318,7 +318,7 @@ pub struct Event {
     pub objects: Vec<ObjectId>,
     pub resources: Vec<String>,
     pub locations: Vec<Location>,
-    /// Dragon Age II's vector parameters (`SetEventVector`, `GetEventVector`).
+    /// Vector parameters, including Origins' requested target position.
     #[serde(default)]
     pub vectors: Vec<[f32; 3]>,
 }
@@ -715,6 +715,8 @@ pub struct World {
     /// [`World::controlled`]). Saved.
     #[serde(default)]
     pub controlled: Option<ObjectId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_request: Option<crate::target_request::TargetRequest>,
     pub party: Option<ObjectId>,
     /// Plot flags by (plot resource, flag).
     #[serde(with = "pairs")]
@@ -1013,6 +1015,7 @@ impl World {
             da2_encounter_order: Vec::new(),
             hero: None,
             controlled: None,
+            target_request: None,
             party: None,
             plots: BTreeMap::new(),
             nav_patches: BTreeMap::new(),
