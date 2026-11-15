@@ -784,6 +784,10 @@ pub const COL_DA2_REACTION_TREE: u32 = 0x3678_42f0;
 pub mod action {
     pub const PAUSE: &str = "pause";
     pub const RUN: &str = "runf";
+    /// The walking cycle and the run's leans into turns (`movement.anb`).
+    pub const WALK: &str = "walkf";
+    pub const LEAN_LEFT: &str = "runleanl";
+    pub const LEAN_RIGHT: &str = "runleanr";
     pub const DIE: &str = "die";
     /// Dragon Age II's fall straight back (its damage-reaction tree's deaths).
     pub const DA2_DIE: &str = "die_quick_straight_back";
