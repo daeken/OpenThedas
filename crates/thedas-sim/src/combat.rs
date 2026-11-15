@@ -245,6 +245,49 @@ impl Sim {
         }
     }
 
+    /// Prepare the persistent target once, before approach and COMMAND_PENDING.
+    /// The marker belongs to the command: arriving/reloading must not restore a
+    /// target that a combat-exit transition cleared while the caster walked.
+    pub(crate) fn prepare_da2_combat_target(&mut self, id: ObjectId, cmd: &crate::world::Command) {
+        if self.game != thedas_vfs::Game::DragonAge2
+            || cmd.name != "CommandUseAbility"
+            || cmd.da2_target_prepared
+            || self
+                .world
+                .get(id)
+                .and_then(|o| o.commands.first())
+                .is_some_and(|c| {
+                    c.da2_target_prepared
+                        && c.name == cmd.name
+                        && c.ints == cmd.ints
+                        && c.target == cmd.target
+                })
+        {
+            return;
+        }
+        let ability = cmd.ints.first().copied().unwrap_or(0);
+        let target = cmd.target.unwrap_or(OBJECT_INVALID);
+        if ability <= 1
+            || !self
+                .world
+                .tables()
+                .get(1, "")
+                .is_some_and(|t| t.has_row(i64::from(ability)))
+            || (target != OBJECT_INVALID && self.world.get(target).is_none())
+        {
+            return;
+        }
+        if let Some(c) = self
+            .world
+            .get_mut(id)
+            .and_then(|o| o.commands.first_mut())
+            .filter(|c| c.name == cmd.name && c.ints == cmd.ints && c.target == cmd.target)
+        {
+            c.da2_target_prepared = true;
+        }
+        self.remember_da2_combat_target(id, target);
+    }
+
     /// Modern completion 0x676288..0x6762a2 clears outside combat for active
     /// party members and non-party followers. The cached native membership flag
     /// (0x5a00b8 / 0x5a05bc) uses the active list, unlike preparation's pool test.
@@ -1338,6 +1381,7 @@ impl Sim {
             cancellable: false,
             impacted: false,
             arrived: false,
+            da2_target_prepared: false,
             path: Vec::new(),
         };
         self.da2_default_attack_command(&mut cmd);
@@ -1451,6 +1495,7 @@ impl Sim {
             cancellable: false,
             impacted: false,
             arrived: false,
+            da2_target_prepared: false,
             path: Vec::new(),
         };
         if let Some(o) = self.world.get_mut(who).filter(|o| o.commands.is_empty()) {
@@ -1506,20 +1551,7 @@ impl Sim {
         }
         let target = cmd.target.unwrap_or(OBJECT_INVALID);
         let ability = cmd.ints.first().copied().unwrap_or(0);
-        // The placeholder must first select an actual basic attack. Native preparation
-        // also rejects absent ability/target records before its target write. Our
-        // preparation/approach remains simplified (see da2-combat-target.md).
-        if self.game == thedas_vfs::Game::DragonAge2
-            && ability > 1
-            && self
-                .world
-                .tables()
-                .get(1, "")
-                .is_some_and(|t| t.has_row(i64::from(ability)))
-            && (target == OBJECT_INVALID || self.world.get(target).is_some())
-        {
-            self.remember_da2_combat_target(id, target);
-        }
+        self.prepare_da2_combat_target(id, cmd);
         let item = self.ability_item(id, cmd);
         let mut ev = self.new_event("COMMAND_PENDING", Some(id));
         ev.objects = vec![id, target, item];
@@ -2695,6 +2727,32 @@ mod tests {
     }
 
     #[test]
+    fn da2_target_is_prepared_before_approach_and_not_reasserted_after_reload() {
+        let mut s = target_sim(thedas_vfs::Game::DragonAge2);
+        let area = s.world.spawn(ObjectKind::Area, "arena");
+        let who = s.world.spawn(ObjectKind::Creature, "caster");
+        let enemy = s.world.spawn(ObjectKind::Creature, "enemy");
+        for id in [who, enemy] {
+            s.world.get_mut(id).unwrap().area = Some(area);
+        }
+        s.world.get_mut(enemy).unwrap().position = [30., 0., 0.];
+        s.order_ability(who, 3110, enemy, "");
+        s.set_combat_state(who, true);
+        s.step(1);
+        let cmd = &s.world.get(who).unwrap().commands[0];
+        assert!(cmd.approach.is_some());
+        assert!(cmd.da2_target_prepared);
+        assert_eq!(stored_target(&mut s, who), enemy);
+        s.set_combat_state(who, false);
+        let json = serde_json::to_string(&s.world).unwrap();
+        s.world = serde_json::from_str(&json).unwrap();
+        let cmd = s.world.get(who).unwrap().commands[0].clone();
+        assert!(cmd.da2_target_prepared);
+        s.start_ability(who, &cmd);
+        assert_eq!(stored_target(&mut s, who), OBJECT_INVALID);
+    }
+
+    #[test]
     fn da2_target_preparation_does_not_accept_placeholder_or_missing_records() {
         let mut s = target_sim(thedas_vfs::Game::DragonAge2);
         let who = s.world.spawn(ObjectKind::Creature, "caster");
@@ -3662,6 +3720,7 @@ mod tests {
                 cancellable: false,
                 impacted: false,
                 arrived: false,
+                da2_target_prepared: false,
                 path: Vec::new(),
             });
         s.world.get_mut(rogue).unwrap().combat.attack = Some(AttackResult {

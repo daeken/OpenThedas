@@ -56,9 +56,12 @@ decision. Old snapshots default to no stored target; nothing invents historical
 preparation when loading an old save. An absent target is omitted from JSON.
 Origins keeps its existing queue-based getter and does not populate the field.
 
-Preparation uses the simulator's existing command-start/approach path. That path
-still has simplified capability/admission checks and turns/walks at its existing
-points; this change does not claim a complete native command-executor port.
+Preparation records the target before approach and before `COMMAND_PENDING`;
+basic attack selection now also precedes approach. A per-command marker survives
+save/reload, so reaching the target does not undo a combat-exit clear that
+happened during the walk. The command path still has simplified native
+capability/admission checks; this change does not claim a complete native
+command-executor port.
 The presentation's `attack_target` accessor remains the view of the currently
 drawn legacy swing, distinct from the script API's persistent target.
 

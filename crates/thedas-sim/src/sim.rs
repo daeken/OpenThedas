@@ -2417,6 +2417,7 @@ impl Sim {
                 cancellable: false,
                 impacted: false,
                 arrived: false,
+                da2_target_prepared: false,
                 path: Vec::new(),
             };
             // A follow move already under way goes on from where it has got to.
@@ -3359,7 +3360,6 @@ impl Sim {
                     if self.game == thedas_vfs::Game::DragonAge2
                         && cmd.name == "CommandUseAbility"
                         && cmd.ints.first() == Some(&1)
-                        && matches!(self.approach_point(id, &cmd), Approach::InReach)
                     {
                         let original = cmd.clone();
                         let chosen = self.choose_da2_basic_attack(id, &mut cmd);
@@ -3382,6 +3382,7 @@ impl Sim {
                             if let Some(o) = self.world.get_mut(id) {
                                 o.combat.previous_command = Some(o.commands.remove(slot));
                             }
+                            self.complete_da2_combat_target(id);
                             let mut ev = self.new_event("COMMAND_COMPLETE", Some(id));
                             ev.ints = vec![cmd.ty, if result == 1 { 1 } else { -3 }];
                             self.world.queue_event(APPROACH_CHECK_MS, id, ev, None);
@@ -3398,6 +3399,7 @@ impl Sim {
                             continue;
                         }
                     }
+                    self.prepare_da2_combat_target(id, &cmd);
                     // An attack asks its owner's script for the result first, which may
                     // also set how long it takes.
                     // An attacker out of reach walks up first (the attack starts when it
@@ -5325,6 +5327,7 @@ mod tests {
             cancellable: false,
             impacted: false,
             arrived: false,
+            da2_target_prepared: false,
             path: Vec::new(),
         });
         let t0 = s.world.time_ms;
@@ -5846,6 +5849,7 @@ mod tests {
             cancellable: false,
             impacted: false,
             arrived: false,
+            da2_target_prepared: false,
             path: Vec::new(),
         });
         assert!(s.walk(hero, [10.0, 0.0, 0.0], None));
@@ -5938,6 +5942,7 @@ mod tests {
             cancellable: false,
             impacted: false,
             arrived: false,
+            da2_target_prepared: false,
             path: Vec::new(),
         };
         let o = s.world.get_mut(id).unwrap();
@@ -5980,6 +5985,7 @@ mod tests {
             cancellable: false,
             impacted: false,
             arrived: false,
+            da2_target_prepared: false,
             path: Vec::new(),
         });
         s.tick(1);
@@ -6017,6 +6023,7 @@ mod tests {
             cancellable: false,
             impacted: false,
             arrived: false,
+            da2_target_prepared: false,
             path: Vec::new(),
         });
         s.tick(1);
@@ -6130,6 +6137,7 @@ mod tests {
                 cancellable: false,
                 impacted: false,
                 arrived: false,
+                da2_target_prepared: false,
                 path: Vec::new(),
             });
         }
@@ -6180,6 +6188,7 @@ mod tests {
             cancellable: false,
             impacted: false,
             arrived: false,
+            da2_target_prepared: false,
             path: Vec::new(),
         };
         s.world.get_mut(id).unwrap().commands.push(walk());
@@ -6324,6 +6333,7 @@ mod tests {
             cancellable: false,
             impacted: false,
             arrived: false,
+            da2_target_prepared: false,
             path: Vec::new(),
         };
         let blow = crate::world::Effect {
@@ -6390,6 +6400,7 @@ mod tests {
             cancellable: false,
             impacted: false,
             arrived: false,
+            da2_target_prepared: false,
             path: Vec::new(),
         });
         // At 5 m/s: five metres after a second.
@@ -6440,6 +6451,7 @@ mod tests {
             cancellable: false,
             impacted: false,
             arrived: false,
+            da2_target_prepared: false,
             path: Vec::new(),
         };
         let walk = cmd(
@@ -6666,6 +6678,7 @@ mod tests {
                 cancellable: false,
                 impacted: false,
                 arrived: false,
+                da2_target_prepared: false,
                 path: Vec::new(),
             });
             crowd.push(c);
@@ -6692,6 +6705,7 @@ mod tests {
             cancellable: false,
             impacted: false,
             arrived: false,
+            da2_target_prepared: false,
             path: Vec::new(),
         });
         // It walks to just outside the crowd and waits; the ring is still full, so the
@@ -6772,6 +6786,7 @@ mod tests {
             cancellable: false,
             impacted: false,
             arrived: false,
+            da2_target_prepared: false,
             path: Vec::new(),
         };
         // Away to 5 m from the target, on the line through the mover.
@@ -6836,6 +6851,7 @@ mod tests {
             cancellable: false,
             impacted: false,
             arrived: false,
+            da2_target_prepared: false,
             path: Vec::new(),
         });
         let mut arrived = None;
@@ -7061,6 +7077,7 @@ mod tests {
             cancellable: false,
             impacted: false,
             arrived: false,
+            da2_target_prepared: false,
             path: Vec::new(),
         };
         assert_eq!(

@@ -2825,6 +2825,7 @@ pub fn call(
                 cancellable: false,
                 impacted: false,
                 arrived: false,
+                da2_target_prepared: false,
                 path: Vec::new(),
             };
             // Only the first float is kept (a wait's seconds, a move's minimum range): a
@@ -10440,6 +10441,7 @@ mod tests {
                 cancellable: false,
                 impacted: false,
                 arrived: false,
+                da2_target_prepared: false,
                 path: vec![],
             });
         assert_eq!(
