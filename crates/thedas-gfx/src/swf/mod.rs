@@ -261,6 +261,23 @@ pub struct Movie {
 }
 
 impl Movie {
+    /// An exported bitmap, including GFx images with their own linkage name.
+    pub fn image(&self, name: &str) -> Option<&ExternalImage> {
+        let character = self
+            .exports
+            .get(&name.to_ascii_lowercase())
+            .and_then(|id| self.characters.get(id))
+            .or_else(|| {
+                self.characters.values().find(|c| {
+                    matches!(c, Character::Image(i) if i.export_name.eq_ignore_ascii_case(name))
+                })
+            });
+        match character {
+            Some(Character::Image(image)) => Some(image),
+            _ => None,
+        }
+    }
+
     /// Stage size in pixels.
     pub fn stage_size(&self) -> (f32, f32) {
         (
