@@ -13,6 +13,62 @@ use crate::sim::Sim;
 use crate::world::ObjectKind;
 
 impl Sim {
+    /// The ordinary state path (0x74f9d0, force=0), shared by the script setter
+    /// and successful actions. Animation playback and PWK installation remain separate.
+    pub(crate) fn set_placeable_state(&mut self, id: ObjectId, state: i32) {
+        if self.game == thedas_vfs::Game::DragonAge2 {
+            if let Some(o) = self.world.get_mut(id) {
+                o.fields.insert("State".into(), state);
+            }
+            return;
+        }
+        let Some(o) = self
+            .world
+            .get(id)
+            .filter(|o| o.kind == ObjectKind::Placeable)
+        else {
+            return;
+        };
+        let tables = self.world.tables();
+        let Some(types) = tables.get(93, "") else {
+            return;
+        };
+        let Some(Cell::String(controller)) =
+            types.cell_by_hash(0x9a32_0a51, i64::from(o.appearance as u16))
+        else {
+            return;
+        };
+        let controller = crate::engine::clean(controller);
+        if controller.is_empty() {
+            return;
+        }
+        let Some(controller) = tables.get(0, controller).filter(|t| !t.is_empty()) else {
+            return;
+        };
+        let current = o
+            .fields
+            .get("State")
+            .or_else(|| o.fields.get("AnimContState"))
+            .copied()
+            .unwrap_or(0) as u16;
+        let state = state as u16;
+        if current == state {
+            return;
+        }
+        // The controller loader stores one record per row position (0xa3bc73).
+        // The setter bounds the unsigned-short request by that record count.
+        let state = if usize::from(state) < controller.order.len() {
+            i32::from(state)
+        } else {
+            0
+        };
+        self.world
+            .get_mut(id)
+            .unwrap()
+            .fields
+            .insert("State".into(), state);
+    }
+
     pub(crate) fn set_placeable_health(&mut self, id: ObjectId, current: i32) {
         if self.game != thedas_vfs::Game::Origins
             || !self
