@@ -130,12 +130,16 @@ pub fn line_cuts(g: &Gff4) -> Vec<LineCut> {
 
 impl Sim {
     /// The party members a playing cutscene does not cast, which presentation should not
-    /// draw while it plays (empty when no cutscene plays). Provisional: in DAOrigins.exe the
-    /// Dwarf Commoner's hero starts on the slums waypoint `start` (background_defaults,
-    /// M2DA 1001), inside the hanging brazier, and does not show during `bdccs_intro.cut`,
-    /// which does not cast him (QA capture,
-    /// OpenThedas-testdata/reference/original/triage/dc_intro_beraht); the code that hides
-    /// him is not traced, and the rule is read from that one cutscene.
+    /// draw while it plays (empty when no full cutscene plays). Traced in Origins:
+    /// GameModeCutscene enter 0x692980 -> 0x7cd0d0 enables playback; after actor binding
+    /// (0x7e36b0 -> 0x7e30b0), update 0x7e3f76 -> 0x67c980 hides the moving party
+    /// (party list +0x234, queried by 0x631830). Then 0x7e4020..0x7e40a7 makes every
+    /// bound object visible again. Exit 0x7e1784 -> 0x67cad0 restores the party's normal
+    /// visibility. Thus the unbound hero stays hidden at the Dwarf Commoner's brazier
+    /// waypoint during bdccs_intro, without changing his position. See
+    /// `docs/notes/cutscene-party-visibility.md` for the render-model visibility chain.
+    /// Provisional: DA2, the native tool/editor override and the separate inline-dialogue
+    /// presentation path have not been covered by this rule's Origins trace.
     pub fn cutscene_hidden_party(&self) -> Vec<ObjectId> {
         let Some(c) = &self.world.cutscene else {
             return Vec::new();
