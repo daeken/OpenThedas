@@ -621,6 +621,7 @@ fn check_data(
         (b"G2DA", _) => Some(Gda::from_gff4(&doc).map(|_| ()).map_err(|e| e.to_string())),
         (b"TLK ", _) => Some(Tlk::from_gff4(&doc).map(|_| ()).map_err(|e| e.to_string())),
         (_, "arl") => Some(s(Arl::from_gff4(&doc).map(|_| ()))),
+        (_, "pwk") => Some(s(thedas_formats::pwk::Pwk::from_gff4(&doc).map(|_| ()))),
         (_, "rml") => Some(s(Rml::from_gff4(&doc).map(|_| ()))),
         (_, "mmh") => Some(s(Mmh::from_gff4(&doc).map(|_| ()))),
         (_, "tnt") => Some(s(thedas_formats::tint::Tint::from_gff4(&doc).map(|_| ()))),

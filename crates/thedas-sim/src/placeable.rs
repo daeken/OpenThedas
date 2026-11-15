@@ -212,11 +212,20 @@ mod tests {
             o.position = [20.0, 20.0, 0.0];
             o.fields.insert("Health".into(), 5);
             o.fields.insert("State".into(), 65_536); // Native state indexes use u16.
+            let door = s.is_door(id);
+            // Populate the sight cache before destruction, so a stale cache cannot
+            // keep the old physics group blocking after the health write.
+            if !door {
+                assert!(!s.placeable_collision(area).unwrap().is_empty());
+            }
             s.set_placeable_health(id, 1);
             assert!(s.world.nav_patches.is_empty());
             assert_eq!(s.world.get(id).unwrap().placeable_group, None);
             s.set_placeable_health(id, 0);
             assert_eq!(s.world.get(id).unwrap().placeable_group, Some(1));
+            assert!(s.placeable_collision(area).unwrap().is_empty());
+            assert!(s.closed_doors(area).is_empty());
+            assert!(s.door_sight(area).solid.is_empty());
             let patches = s
                 .world
                 .nav_patches
