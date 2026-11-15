@@ -716,9 +716,14 @@ impl Sim {
 
     /// Runs a target's `APPLY_EFFECT` handler for an effect, keeps it if it lasts, and
     /// checks for death afterwards.
-    pub fn apply_effect(&mut self, target: ObjectId, effect: Effect) {
+    pub fn apply_effect(&mut self, target: ObjectId, mut effect: Effect) {
         if self.world.get(target).is_none() {
             return;
+        }
+        self.world.identify_effect(&mut effect);
+        if effect.ty == 4 {
+            effect.visual_target = Some(target);
+            effect.visual_location = None;
         }
         let creator = effect.creator;
         let t = self.world.time_ms;
@@ -849,7 +854,13 @@ impl Sim {
     /// modifier's change, for instance). Returns whether the creature had it.
     pub fn remove_effect(&mut self, target: ObjectId, effect: &Effect) -> bool {
         let removed = match self.world.get_mut(target) {
-            Some(o) => match o.effects.iter().position(|x| x == effect) {
+            Some(o) => match o.effects.iter().position(|x| {
+                if effect.id != 0 {
+                    x.id == effect.id
+                } else {
+                    x == effect
+                }
+            }) {
                 Some(i) => Some(o.effects.remove(i)),
                 None => None,
             },
