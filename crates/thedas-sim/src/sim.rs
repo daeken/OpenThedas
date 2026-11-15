@@ -2530,9 +2530,9 @@ impl Sim {
         }
     }
 
-    /// Queues ENTER for triggers a creature is now in and EXIT for ones it left. Provisional:
-    /// trigger outlines are tested in the XY plane, and the creature is the event's creator
-    /// and object 0.
+    /// Queues ENTER for triggers a creature is now in and EXIT for ones it left. Origins'
+    /// outline test is on XY (0x799130), with authored offsets translated without facing
+    /// rotation (0x7997cf). Provisional: the creature is the event's creator and object 0.
     pub fn update_triggers(&mut self, id: ObjectId) {
         let Some(o) = self.world.get(id) else { return };
         if o.kind != ObjectKind::Creature {
@@ -2544,7 +2544,7 @@ impl Sim {
             .trigger_ids()
             .iter()
             .filter_map(|&t| self.world.get(t))
-            .filter(|t| t.active && t.area == area && crate::engine::in_trigger(pos, t))
+            .filter(|t| t.active && t.area == area && crate::engine::in_trigger(pos, t, self.game))
             .map(|t| t.id)
             .collect();
         let before = self.world.in_triggers.get(&id).cloned().unwrap_or_default();
@@ -6610,6 +6610,42 @@ mod tests {
         assert!(s.world.queue.is_empty(), "still inside: no new event");
         s.move_object(c, [20.0, 10.0, 0.0], None);
         assert_eq!(s.world.queue.len(), 1);
+        assert!(!s.world.in_triggers.contains_key(&c));
+    }
+
+    #[test]
+    fn origins_trigger_membership_uses_authored_axes_and_ignores_height() {
+        let mut s = sim();
+        let area = s.world.spawn(ObjectKind::Area, "a");
+        let tr = s.world.spawn(ObjectKind::Trigger, "t");
+        let c = s.world.spawn(ObjectKind::Creature, "c");
+        let t = s.world.get_mut(tr).unwrap();
+        t.area = Some(area);
+        t.position = [10.0, 20.0, 30.0];
+        t.facing = 90.0;
+        t.geometry = vec![
+            [1.0, -0.5, 0.0],
+            [3.0, -0.5, 0.0],
+            [3.0, 0.5, 0.0],
+            [1.0, 0.5, 0.0],
+        ];
+        s.world.get_mut(c).unwrap().area = Some(area);
+        // Facing must not move this eastward outline north of the trigger.
+        s.move_object(c, [10.0, 22.0, 30.0], None);
+        assert!(s.world.queue.is_empty());
+        s.move_object(c, [12.0, 20.0, 130.0], None);
+        assert_eq!(s.world.in_triggers.get(&c), Some(&vec![tr]));
+        let ev = &s.world.queue.values().next().unwrap().event;
+        assert_eq!(ev.ty, s.event_type("ENTER"));
+        s.world.queue.clear();
+        s.move_object(c, [12.0, 20.0, -130.0], None);
+        assert!(s.world.queue.is_empty(), "height alone does not leave");
+        s.move_object(c, [10.0, 22.0, -130.0], None);
+        assert_eq!(s.world.queue.len(), 1);
+        assert_eq!(
+            s.world.queue.values().next().unwrap().event.ty,
+            s.event_type("EXIT")
+        );
         assert!(!s.world.in_triggers.contains_key(&c));
     }
 
