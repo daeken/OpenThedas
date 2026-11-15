@@ -901,6 +901,79 @@ impl Sim {
         true
     }
 
+    /// Origins native 350: snapshot the source's default inventory, then perform
+    /// ordinary per-item transfers. Both weapon sets remain in equipment.
+    pub(crate) fn move_all_items(&mut self, from: ObjectId, to: ObjectId) {
+        let inventory_kind = |k| {
+            matches!(
+                k,
+                ObjectKind::Creature | ObjectKind::Placeable | ObjectKind::Store
+            )
+        };
+        if from == to || !self.world.get(to).is_some_and(|o| inventory_kind(o.kind)) {
+            return;
+        }
+        let Some(src) = self.world.get(from).filter(|o| inventory_kind(o.kind)) else {
+            return;
+        };
+        let worn: Vec<_> = src
+            .equipment
+            .values()
+            .chain(src.other_set.values())
+            .copied()
+            .collect();
+        let items: Vec<_> = src
+            .inventory
+            .iter()
+            .copied()
+            .filter(|id| !worn.contains(id))
+            .collect();
+        for item in items {
+            let Some(it) = self.world.get(item).filter(|o| o.kind == ObjectKind::Item) else {
+                continue;
+            };
+            let target = self.world.get(to).unwrap();
+            // Creature default inventories route plot items and coin outside the
+            // ordinary backpack capacity (0x73f600). Backpack removal itself is
+            // unconditional (0x722ae0); Irremovable restricts equipment removal.
+            let special = target.kind == ObjectKind::Creature
+                && (it.plot || it.fields.get("BaseItem") == Some(&BASE_ITEM_COPPER));
+            let max = target
+                .fields
+                .get("MaxInventorySize")
+                .copied()
+                .unwrap_or_else(|| {
+                    if target.kind == ObjectKind::Creature {
+                        crate::engine::DEFAULT_INVENTORY_SIZE
+                    } else {
+                        -1
+                    }
+                });
+            let ordinary: Vec<_> = target
+                .inventory
+                .iter()
+                .copied()
+                .filter(|id| {
+                    !target
+                        .equipment
+                        .values()
+                        .chain(target.other_set.values())
+                        .any(|i| i == id)
+                        && self
+                            .world
+                            .get(*id)
+                            .is_some_and(|o| target.kind != ObjectKind::Creature || !o.plot)
+                })
+                .collect();
+            let merges = ordinary
+                .iter()
+                .any(|&id| self.stacks_with(item, id) && self.stack_count(id) < self.max_stack(id));
+            if special || max == -1 || ordinary.len() < max.max(0) as usize || merges {
+                self.give_item(item, to);
+            }
+        }
+    }
+
     /// Whether `id` is the hero or one of the hero's followers.
     pub(crate) fn in_party(&self, id: ObjectId) -> bool {
         let Some(hero) = self.world.hero else {
@@ -1673,6 +1746,171 @@ mod tests {
 
     const LDF: &str = "int EVENT_TYPE_INVENTORY_ADDED = 6;\n\
         int EVENT_TYPE_INVENTORY_REMOVED = 7;\n";
+
+    fn bulk_sim() -> (Sim, ObjectId, ObjectId) {
+        let table = EngineTable::parse(
+            format!("{LDF}void MoveAllItems(object a, object b) = 350;\n").as_bytes(),
+        )
+        .unwrap();
+        let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(table), 1);
+        let from = s.world.spawn(ObjectKind::Creature, "from");
+        let to = s.world.spawn(ObjectKind::Placeable, "to");
+        (s, from, to)
+    }
+
+    fn bulk_call(s: &mut Sim, from: ObjectId, to: ObjectId) {
+        let f = s.table.function_by_name("MoveAllItems").unwrap().clone();
+        let mut h = crate::sim::ScriptHost {
+            sim: s,
+            event: None,
+            script: "test".into(),
+        };
+        assert!(
+            crate::engine::call(
+                &mut h,
+                from,
+                &f,
+                &[
+                    thedas_script::vm::Value::Object(from),
+                    thedas_script::vm::Value::Object(to)
+                ]
+            )
+            .unwrap()
+            .unwrap()
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn bulk_transfer_moves_backpack_items_in_order_and_keeps_both_equipment_sets_and_money() {
+        let (mut s, from, to) = bulk_sim();
+        let items: [_; 4] = std::array::from_fn(|_| s.world.spawn(ObjectKind::Item, "item"));
+        let source = s.world.get_mut(from).unwrap();
+        source.inventory = items.to_vec();
+        source.equipment.insert(0, items[0]);
+        source.other_set.insert(0, items[2]);
+        source.money = 27;
+        let f = &mut s.world.get_mut(items[1]).unwrap().fields;
+        f.insert("Irremovable".into(), 1);
+        f.insert("Droppable".into(), 0);
+        s.world.get_mut(items[3]).unwrap().plot = true;
+        bulk_call(&mut s, from, to);
+        assert_eq!(
+            s.world.get(from).unwrap().inventory,
+            vec![items[0], items[2]]
+        );
+        assert_eq!(s.world.get(to).unwrap().inventory, vec![items[1], items[3]]);
+        let source = s.world.get(from).unwrap();
+        assert_eq!(source.equipment.get(&0), Some(&items[0]));
+        assert_eq!(source.other_set.get(&0), Some(&items[2]));
+        assert_eq!(source.money, 27);
+        assert_eq!(s.world.get(to).unwrap().money, 0);
+        assert_eq!(
+            s.world.queue.len(),
+            4,
+            "each transfer tells both inventories"
+        );
+    }
+
+    #[test]
+    fn bulk_transfer_merges_stacks_and_leaves_items_that_exceed_capacity() {
+        use thedas_formats::gda::Cell;
+        let (mut s, from, _) = bulk_sim();
+        let to = s.world.spawn(ObjectKind::Creature, "to");
+        s.world
+            .get_mut(to)
+            .unwrap()
+            .fields
+            .insert("MaxInventorySize".into(), 1);
+        s.world
+            .tables()
+            .insert("bitm_base", &["#39974122"], vec![(25, vec![Cell::Int(3)])]);
+        let existing = s.world.spawn(ObjectKind::Item, "stack");
+        let incoming = s.world.spawn(ObjectKind::Item, "stack");
+        let blocked = s.world.spawn(ObjectKind::Item, "blocked");
+        for id in [existing, incoming] {
+            let f = &mut s.world.get_mut(id).unwrap().fields;
+            f.insert("BaseItem".into(), 25);
+            f.insert("StackSize".into(), 1);
+        }
+        s.world.get_mut(from).unwrap().inventory = vec![blocked, incoming];
+        s.world.get_mut(to).unwrap().inventory = vec![existing];
+        bulk_call(&mut s, from, to);
+        assert_eq!(s.world.get(from).unwrap().inventory, vec![blocked]);
+        assert_eq!(s.world.get(to).unwrap().inventory, vec![existing]);
+        assert!(s.world.get(incoming).is_none());
+        assert_eq!(s.stack_count(existing), 2);
+        assert_eq!(s.world.queue.len(), 2);
+    }
+
+    #[test]
+    fn bulk_transfer_routes_plot_items_and_coin_past_creature_backpack_capacity() {
+        let (mut s, from, _) = bulk_sim();
+        let hero = s.world.spawn(ObjectKind::Creature, "hero");
+        s.world.hero = Some(hero);
+        s.world
+            .get_mut(hero)
+            .unwrap()
+            .fields
+            .insert("MaxInventorySize".into(), 0);
+        let plot = s.world.spawn(ObjectKind::Item, "plot");
+        s.world.get_mut(plot).unwrap().plot = true;
+        let coin = s.world.spawn(ObjectKind::Item, "coin");
+        let f = &mut s.world.get_mut(coin).unwrap().fields;
+        f.insert("BaseItem".into(), BASE_ITEM_COPPER);
+        f.insert("StackSize".into(), 19);
+        let blocked = s.world.spawn(ObjectKind::Item, "ordinary");
+        s.world.get_mut(from).unwrap().inventory = vec![plot, coin, blocked];
+        bulk_call(&mut s, from, hero);
+        assert_eq!(s.world.get(from).unwrap().inventory, vec![blocked]);
+        assert_eq!(s.world.get(hero).unwrap().inventory, vec![plot]);
+        assert_eq!(s.world.get(hero).unwrap().money, 19);
+        assert!(s.world.get(coin).is_none());
+    }
+
+    #[test]
+    fn bulk_transfer_rejects_invalid_possessors_and_self_transfer_without_events() {
+        let (mut s, from, to) = bulk_sim();
+        let item = s.world.spawn(ObjectKind::Item, "item");
+        s.world.get_mut(from).unwrap().inventory = vec![item];
+        let invalid = s.world.spawn(ObjectKind::Trigger, "not_an_inventory");
+        for (source, target) in [
+            (from, from),
+            (from, invalid),
+            (invalid, to),
+            (from, OBJECT_INVALID),
+            (OBJECT_INVALID, to),
+        ] {
+            bulk_call(&mut s, source, target);
+        }
+        assert_eq!(s.world.get(from).unwrap().inventory, vec![item]);
+        assert!(s.world.get(to).unwrap().inventory.is_empty());
+        assert!(s.world.queue.is_empty());
+    }
+
+    #[test]
+    fn bulk_transfer_da2_dispatch_remains_unchanged() {
+        let (mut s, from, to) = bulk_sim();
+        s.game = thedas_vfs::Game::DragonAge2;
+        let f = s.table.function_by_name("MoveAllItems").unwrap().clone();
+        let mut h = crate::sim::ScriptHost {
+            sim: &mut s,
+            event: None,
+            script: "test".into(),
+        };
+        assert!(
+            crate::engine::call(
+                &mut h,
+                from,
+                &f,
+                &[
+                    thedas_script::vm::Value::Object(from),
+                    thedas_script::vm::Value::Object(to)
+                ]
+            )
+            .is_none()
+        );
+    }
 
     #[test]
     fn looting_moves_droppable_items_and_tells_both_sides() {
