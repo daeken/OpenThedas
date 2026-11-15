@@ -5,8 +5,7 @@
 
 use thedas_formats::anim::{AnimInfo, AnimTree, parse_events};
 use thedas_formats::gda::Cell;
-use thedas_formats::gff4::{Gff4, List};
-use thedas_formats::typed::Doc;
+use thedas_formats::gff4::{Gff4, List, StructId, Value};
 use thedas_script::vm::ObjectId;
 
 use crate::combat::AbilityTiming;
@@ -37,27 +36,36 @@ pub(crate) struct AnimationMotion {
 }
 
 fn motion_keys(doc: &Gff4) -> Option<Vec<[f32; 4]>> {
-    let d = Doc::new(doc, "DA2 animation motion");
-    d.expect_type("GAD ").ok()?;
-    // 0x90f5c0: GAD 4008 admits the animation to the motion controller.
-    if d.opt_i64(doc.root, 4008).ok()?? == 0 {
+    fn field(doc: &Gff4, id: StructId, label: u32) -> Option<&Value> {
+        match doc.field(id, label)? {
+            Value::Generic(slot) => slot.value.as_ref(),
+            value => Some(value),
+        }
+    }
+    if doc.file_type.0 != *b"GAD " {
         return None;
     }
-    let track = d.structs(doc.root, 4005).ok()?.into_iter().find(|&t| {
-        d.opt_name_or_hash(t, 4000)
-            .ok()
-            .flatten()
-            .is_some_and(|name| {
-                name == "gob_translation"
-                    || thedas_formats::hash_of_hashed_name(&name)
-                        == Some(thedas_formats::name_hash32("gob_translation"))
-            })
+    // 0x90f5c0: GAD 4008 admits the animation to the motion controller.
+    if field(doc, doc.root, 4008)?.as_i64()? == 0 {
+        return None;
+    }
+    let List::Struct(tracks) = field(doc, doc.root, 4005)?.as_list()? else {
+        return None;
+    };
+    let track = tracks.iter().flatten().copied().find(|&t| {
+        field(doc, t, 4000).is_some_and(|value| {
+            value.as_str().is_some_and(|name| {
+                name.trim_end_matches('\0')
+                    .eq_ignore_ascii_case("gob_translation")
+            }) || value.as_i64().map(|hash| hash as u32)
+                == Some(thedas_formats::name_hash32("gob_translation"))
+        })
     })?;
     // 0x911b50 -> 0x90c900: each flat key is seconds, x, y, z.
-    if d.opt_i64(track, 4001).ok()?? != 6 || d.opt_i64(track, 4003).ok()?? != 4 {
+    if field(doc, track, 4001)?.as_i64()? != 6 || field(doc, track, 4003)?.as_i64()? != 4 {
         return None;
     }
-    let List::F32(values) = d.get(track, 4004)?.as_list()? else {
+    let List::F32(values) = field(doc, track, 4004)?.as_list()? else {
         return None;
     };
     if values.is_empty() || values.len() % 4 != 0 || values.len() > 4 * (1 << 16) {
