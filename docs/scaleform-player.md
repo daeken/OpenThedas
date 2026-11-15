@@ -85,6 +85,10 @@ The player lives in `crates/thedas-gfx`:
 4. **`text`**: HTML-subset parser (p, br, font face/size/color, b, i, u, img), layout with
    word wrap, autosize, `textAutoSize` shrink, shadows; glyphs from the font library's
    DefineFont3 outlines, rasterised into a glyph atlas at the drawn size.
+   `shadowStyle` keeps all `s{x,y}{x,y}...` shadow offsets, including repeats, and
+   supports explicit `t{x,y}{x,y}...` text passes. An s-only style keeps text at the
+   origin. Invalid/non-finite offsets are ignored. The 53 movies setting this property
+   use three s-only values, all covered by the parser regression.
    Focused fields track a selection anchor and caret. Ctrl+A and `Selection.setSelection`
    replace/delete the selected range; Shift navigation extends it. Selection getters and
    setters translate script UTF-16 indices to the text storage's character boundaries.
@@ -184,7 +188,7 @@ The player lives in `crates/thedas-gfx`:
   Dragging extends the selection, including outside the field until release; Shift-click
   retains its anchor. Picking uses the field's inverse world transform and the layout's
   aligned, wrapped and scrolled character advances, including spaces and missing glyphs.
-- Remaining work includes complete text `shadowStyle`, native inline `<img>` layout,
+- Remaining work includes native inline `<img>` layout,
   cached bitmap alpha masks, and broader interaction parity.
 - Tools: `cargo run -p thedas-ui --example capture -- INSTALL OUT.png MOVIES [FRAMES]
   [WxH]` captures the player once and reports timings. `SF_CAPTURE_SETUP` supplies optional
