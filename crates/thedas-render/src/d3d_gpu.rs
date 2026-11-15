@@ -3219,6 +3219,28 @@ impl D3dPass {
         }
     }
 
+    /// Which draws the last frame showed or cast a shadow from (in the view, or a sun
+    /// partition's caster): by index into `draws`. Empty before any update.
+    pub fn seen_draws(&self) -> Vec<bool> {
+        let mut seen = self
+            .in_view
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let casting = self
+            .caster_visible
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for (c, v) in self.casters.iter().zip(casting.iter()) {
+            if (v[0] || v[1])
+                && let Some(s) = seen.get_mut(c.draw)
+            {
+                *s = true;
+            }
+        }
+        seen
+    }
+
     /// Whether draw `i` (an index into `draws`) is in this frame's view (see
     /// [`D3dPass::update`]); before any update, every draw is.
     pub fn in_view(&self, i: usize) -> bool {
