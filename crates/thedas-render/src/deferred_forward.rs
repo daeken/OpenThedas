@@ -233,6 +233,12 @@ pub(super) fn shader() -> String {
         .split_once("struct Lighting {")
         .expect("lighting section");
     let lighting = lighting
+        // The bounce result (group 3 in the deferred lighting pass) is unreachable from
+        // fs_forward; keep it clear of the sun group's new place.
+        .replace(
+            "@group(3) @binding(0) var bounce_tex",
+            "@group(3) @binding(4) var bounce_tex",
+        )
         .replace("@group(2)", "@group(3)")
         .replace("@group(0)", "@group(2)")
         .replace(
