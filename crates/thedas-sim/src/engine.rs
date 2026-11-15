@@ -5585,12 +5585,10 @@ fn placeable_transition(sim: &Sim, id: ObjectId, action: i32, variation: bool) -
     if int(0x52be_3c5e)? != action {
         return None;
     }
-    let next = int(0xa2b4_782c)?;
-    let alt = int(0x5ad0_780d).filter(|&v| v > 0);
-    let next = if variation { alt.unwrap_or(next) } else { next };
+    let next = int(if variation { 0x5ad0_780d } else { 0xa2b4_782c })? as u16;
     // 0x74fc40 skips the action's absent unsigned-short target before invoking
     // the ordinary setter. An explicit SetPlaceableState(-1) still reaches it.
-    (next as u16 != u16::MAX).then_some(next)
+    (next != u16::MAX).then_some(i32::from(next))
 }
 
 /// A placeable's default action in its current state, from its type's state controller:
@@ -7709,6 +7707,49 @@ mod tests {
                 );
                 assert!(!sim.world.get(id).unwrap().fields.contains_key("State"));
             }
+        }
+        for (next, alternate, variation, expected) in [
+            (2, -1, 0, Some(2)),
+            (2, -1, 1, None),
+            (-1, 2, 1, Some(2)),
+            (2, 0, 1, None),
+            (2, 65_535, 1, None),
+            (65_538, -1, 0, Some(2)),
+        ] {
+            sim.world.tables().insert(
+                "statecnt_fixture",
+                &["ID", "#52be3c5e", "#a2b4782c", "#5ad0780d"],
+                [0, 1, 2]
+                    .into_iter()
+                    .map(|state| {
+                        (
+                            state,
+                            vec![
+                                Cell::Int(state),
+                                Cell::Int(3),
+                                Cell::Int(next),
+                                Cell::Int(alternate),
+                            ],
+                        )
+                    })
+                    .collect(),
+            );
+            sim.world.get_mut(id).unwrap().fields.remove("State");
+            run(
+                &mut sim,
+                id,
+                "SetPlaceableActionResult",
+                &[
+                    Value::Object(id),
+                    Value::Int(3),
+                    Value::Int(1),
+                    Value::Int(variation),
+                ],
+            );
+            assert_eq!(
+                sim.world.get(id).unwrap().fields.get("State").copied(),
+                expected
+            );
         }
     }
 

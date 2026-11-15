@@ -4,7 +4,9 @@
 calls 0x74f9d0 with force zero. Successful placeable actions at 0x74fc10
 reach the same ordinary state path. The action path first skips a target
 whose low unsigned short is 0xffff at 0x74fc40. Explicit setter requests
-continue through the ordinary setter's bounds check.
+continue through the ordinary setter's bounds check. The action controller
+at 0xa3bb58 selects its primary or variation target directly, including
+zero and the absent sentinel, according to the variation argument.
 
 The appearance setup at 0x7508c5 reads table 93, column 0x9a320a51, using
 the unsigned low 16 bits of appearance. A nonempty name opens the controller
