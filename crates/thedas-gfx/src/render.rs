@@ -1971,10 +1971,8 @@ impl Renderer {
             }
             Kind::Text(_) => {
                 // Upright fields (stretched or not) take their glyphs from the atlas.
-                let upright = world.b.abs() < 1e-5
-                    && world.c.abs() < 1e-5
-                    && world.a > 0.0
-                    && world.d > 0.0;
+                let upright =
+                    world.b.abs() < 1e-5 && world.c.abs() < 1e-5 && world.a > 0.0 && world.d > 0.0;
                 let pxs = upright.then_some((world.a * view.k * 20.0, world.d * view.k * 20.0));
                 self.text_meshes(player, images, d, pxs)
             }
