@@ -170,10 +170,17 @@ falloff × |cos| × visibility, and occlusion ray hit distances, then fits.
   colour per channel, greedy). On room1400 its first four finds are blue fills at radius 6 about
   2 above the floor (colour ≈ (0.05, 0.1, 0.2)), cutting the residual by 20%; `--use-fit` adds
   them to the RGB pass.
+- **Shadow-pass membership.** Not every `_ll` light is in the alpha: `--fit` tests each light
+  on the texels it alone reaches and leaves it out when they are dark in the shipped alpha
+  more than ten to one (`noshadow` in fit.txt). In Cousland that removes `sun_fake_static`
+  (5 lit / 3554 dark) and some `window_bounce_*_RT` fills.
 - **Coverage.** Shipped parts are covered one texel beyond what the toolset's film reaches
   on every side (`--dilate 1`: an uncovered texel next to covered ones takes their mean).
 - **Shadows are hard.** Sampling point lights as spheres (`--light-size`) makes the fit worse
   at every size tried (0.25–1).
+- Whole level, each atlas fitted then baked (Cousland, 88 atlases, 19.2M texels): mean error
+  RGB 9.4 / 8.2 / 8.8, alpha 15.2 levels (RMSE 17 / 15 / 16 and 42); 35% of texels within 4
+  levels on every channel. Alpha is the weakest part (window and fake-sun fills).
 - With all of the above and the fitted lights, room1400's 876k texels differ by a mean of
   7.4–9.5 levels in RGB and 6.9 in alpha (RMSE 14–17 and 26.5); 47% are within 4 levels on
   every channel. First light was ~14 and ~13.
