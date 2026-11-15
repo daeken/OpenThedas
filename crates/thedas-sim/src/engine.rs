@@ -1347,9 +1347,7 @@ pub fn call(
         }
         "GetObjectActive" => ok(b(h.object(obj(a, 0)).is_some_and(|o| o.active))),
         "SetObjectActive" => {
-            if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
-                o.active = int(a, 1) != 0;
-            }
+            h.sim.set_object_active(obj(a, 0), int(a, 1) != 0);
             void()
         }
         "IsDead" => ok(b(h.object(obj(a, 0)).is_some_and(|o| {
@@ -4801,7 +4799,7 @@ pub fn call(
             void()
         }
         "HasConversation" => ok(b(h.object(obj(a, 0)).is_some_and(|o| o.dialog.is_some()))),
-        // The state set by SetPlaceableState or an action's result, else the template's
+        // The current instance/script state, else the template's
         // starting state (`AnimContState`).
         "GetPlaceableState" => ok(Value::Int(
             h.object(obj(a, 0))
