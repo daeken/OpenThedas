@@ -356,6 +356,55 @@ pub struct TextAnswer {
     pub text: String,
 }
 
+struct TextPopup {
+    id: u32,
+    prompt: String,
+    text: Option<String>,
+    labels: [String; 2],
+    frames: u8,
+    free_text: bool,
+}
+
+impl TextPopup {
+    /// Write immediately before showing: the previous dialog's answer and a script's
+    /// bindings can change these shared values while this question waits.
+    fn write_values(&self, b: &thedas_ui::protocol::GameBridge) {
+        use thedas_ui::UiValue;
+        let k = "GUIPopupLayer";
+        b.set_value(
+            &format!("{k}.DialogBoxText"),
+            UiValue::String(self.prompt.clone()),
+        );
+        b.set_value(&format!("{k}.NumButtons"), UiValue::Number(2.0));
+        b.set_value(
+            &format!("{k}.InputBox"),
+            UiValue::Number(f64::from(u8::from(self.text.is_some()))),
+        );
+        b.set_value(
+            &format!("{k}.InputText"),
+            UiValue::String(self.text.clone().unwrap_or_default()),
+        );
+        b.set_value(&format!("{k}.Checkbox"), UiValue::Number(0.0));
+        for e in [
+            "CheckboxText",
+            "CheckboxControlledAttribute",
+            "PickerList",
+            "PickerDescriptions",
+        ] {
+            b.set_value(&format!("{k}.{e}"), UiValue::String(String::new()));
+        }
+        b.set_value(&format!("{k}.PickerDefault"), UiValue::Number(0.0));
+        b.set_value(&format!("{k}.Filter"), UiValue::Number(0.0));
+        for (i, label) in self.labels.iter().enumerate() {
+            b.set_value(&format!("{k}.Label{i}"), UiValue::String(label.clone()));
+            b.set_value(
+                &format!("{k}.Callback{i}"),
+                UiValue::String(format!("{TEXT_POPUP_RESULT} {} {}", self.id, i + 1)),
+            );
+        }
+    }
+}
+
 /// A message floaty up over a creature.
 struct Floaty {
     id: u32,
@@ -455,7 +504,7 @@ pub struct UiLayer {
     script_popup: Option<((i32, i32, u32), u8)>,
     /// The engine's own text box up (see [`UiLayer::ask_text`]): its id and the frames
     /// since its values were set, and the answers not yet taken.
-    text_popup: Option<(u32, u8)>,
+    text_popup: Option<TextPopup>,
     /// The game menu's online-features button has been relabelled "Report Issue" since
     /// mainmenu.gfx was loaded (see `UiLayer::report_button`).
     report_labelled: bool,
@@ -1632,9 +1681,19 @@ impl UiLayer {
     /// holding `text`, and OK / Cancel buttons (`ok`, `cancel`; the pad's A and B press
     /// them). Nothing goes through the simulation; the answer comes back from
     /// [`UiLayer::take_text_answers`] with `id`. It shows once its values have reached the
-    /// movie, two frames on, and replaces one still up. Needs the popup layer (the HUD).
+    /// movie, two frames on, and waits for an existing dialog to close. Needs the popup
+    /// layer (the HUD).
     pub fn ask_text(&mut self, id: u32, prompt: &str, text: &str, ok: &str, cancel: &str) {
         self.ask(id, prompt, Some(text), ok, cancel);
+    }
+
+    /// A report note uses the same box, without the movie's name-field character limit
+    /// or restriction. Ordinary name prompts retain the movie's settings.
+    pub fn ask_free_text(&mut self, id: u32, prompt: &str, text: &str, ok: &str, cancel: &str) {
+        self.ask_text(id, prompt, text, ok, cancel);
+        if let Some(popup) = &mut self.text_popup {
+            popup.free_text = true;
+        }
     }
 
     /// Asks the player to choose between two buttons (`a`, `b`) with the game's own message
@@ -1645,46 +1704,35 @@ impl UiLayer {
     }
 
     fn ask(&mut self, id: u32, prompt: &str, text: Option<&str>, ok: &str, cancel: &str) {
-        use thedas_ui::UiValue;
-        let k = "GUIPopupLayer";
-        let b = &self.stage.bridge;
-        b.set_value(
-            &format!("{k}.DialogBoxText"),
-            UiValue::String(prompt.into()),
-        );
-        b.set_value(&format!("{k}.NumButtons"), UiValue::Number(2.0));
-        b.set_value(
-            &format!("{k}.InputBox"),
-            UiValue::Number(f64::from(u8::from(text.is_some()))),
-        );
-        b.set_value(
-            &format!("{k}.InputText"),
-            UiValue::String(text.unwrap_or_default().into()),
-        );
-        b.set_value(&format!("{k}.Checkbox"), UiValue::Number(0.0));
-        for e in [
-            "CheckboxText",
-            "CheckboxControlledAttribute",
-            "PickerList",
-            "PickerDescriptions",
-        ] {
-            b.set_value(&format!("{k}.{e}"), UiValue::String(String::new()));
-        }
-        b.set_value(&format!("{k}.PickerDefault"), UiValue::Number(0.0));
-        b.set_value(&format!("{k}.Filter"), UiValue::Number(0.0));
-        for (i, label) in [ok, cancel].into_iter().enumerate() {
-            b.set_value(&format!("{k}.Label{i}"), UiValue::String(label.into()));
-            b.set_value(
-                &format!("{k}.Callback{i}"),
-                UiValue::String(format!("{TEXT_POPUP_RESULT} {id} {}", i + 1)),
-            );
-        }
-        self.text_popup = Some((id, 0));
+        self.text_popup = Some(TextPopup {
+            id,
+            prompt: prompt.into(),
+            text: text.map(str::to_owned),
+            labels: [ok.into(), cancel.into()],
+            frames: 0,
+            free_text: false,
+        });
     }
 
     /// The answers to [`UiLayer::ask_text`] since last asked.
     pub fn take_text_answers(&mut self) -> Vec<TextAnswer> {
         std::mem::take(&mut self.text_answers)
+    }
+
+    /// Cancels an unanswered engine question, including one waiting behind a script's
+    /// dialog. It must not appear later after its caller has given up or finished.
+    pub fn cancel_text_popup(&mut self, id: u32) {
+        if !self.text_popup.as_ref().is_some_and(|p| p.id == id) {
+            return;
+        }
+        let popup = self.text_popup.take().unwrap();
+        if self.stage.dialog_prompt().as_deref() == Some(&popup.prompt) {
+            self.stage.call_in(
+                thedas_ui::stage::POPUP_LAYER,
+                "_global.PopupLayer.HideAllPopups",
+                &[],
+            );
+        }
     }
 
     /// The game menu's online-features button ("Player Profile": the original's online
@@ -1838,20 +1886,33 @@ impl UiLayer {
 
     /// Shows the engine's own text box once its values have reached the movie.
     fn show_text_popup(&mut self) {
-        let Some((_, frames)) = self.text_popup.as_mut() else {
+        let Some(popup) = self.text_popup.as_mut() else {
             return;
         };
-        if *frames >= 2 {
+        if popup.frames >= 2 {
             // Up: its field takes the typing (see `Stage::focus_dialog_field`), for its first
             // frames (later, a press on its buttons lets go of the focus on purpose).
-            if *frames < FOCUS_FRAMES {
-                *frames += 1;
+            if popup.frames < FOCUS_FRAMES
+                && self.stage.dialog_prompt().as_deref() == Some(&popup.prompt)
+            {
+                popup.frames += 1;
+                if popup.free_text {
+                    self.stage.allow_dialog_free_text();
+                }
                 self.stage.focus_dialog_field();
             }
             return;
         }
-        *frames += 1;
-        if *frames == 2 {
+        popup.frames += 1;
+        if popup.frames == 2 {
+            // ShowDialogBox silently refuses a second live box. Wait for the actual
+            // dialog to close; do not focus it or apply our report's free-text policy
+            // to a script's name prompt in the meantime.
+            if self.stage.dialog_prompt().is_some() {
+                popup.frames = 1;
+                return;
+            }
+            popup.write_values(&self.stage.bridge);
             let up = self.stage.call_in(
                 thedas_ui::stage::POPUP_LAYER,
                 "_global.PopupLayer.ShowDialogBoxFromGame",
@@ -2391,7 +2452,11 @@ impl UiLayer {
                         text: typed,
                     });
                 }
-                if self.text_popup.is_some_and(|(up, _)| Some(up) == num(0)) {
+                if self
+                    .text_popup
+                    .as_ref()
+                    .is_some_and(|p| Some(p.id) == num(0))
+                {
                     self.text_popup = None;
                 }
                 false
@@ -3728,6 +3793,90 @@ fn gui_id(s: Screen, container: bool) -> Option<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Uses the installed movie, without a window or simulation. No game data is
+    /// embedded in this test. Run explicitly with THEDAS_INSTALL set.
+    #[test]
+    #[ignore]
+    fn report_popups_wait_cancel_and_keep_typing_across_name_and_choice_boxes() {
+        let install = thedas_vfs::DaoInstall::open(
+            std::env::var_os("THEDAS_INSTALL").expect("THEDAS_INSTALL"),
+        )
+        .unwrap();
+        let vfs = Arc::new(
+            install
+                .play_vfs(thedas_vfs::install::TextureQuality::High)
+                .unwrap(),
+        );
+        let ctx = GpuContext::headless().unwrap();
+        let mut ui = UiLayer::new(
+            &ctx,
+            &vfs,
+            &[thedas_ui::stage::POPUP_LAYER.into()],
+            (1280, 720),
+        );
+        let pump = |ui: &mut UiLayer| {
+            for _ in 0..20 {
+                ui.show_text_popup();
+                ui.stage.tick(1000.0 / 30.0);
+            }
+        };
+        let close = |ui: &mut UiLayer| {
+            ui.stage.call_in(
+                thedas_ui::stage::POPUP_LAYER,
+                "_global.PopupLayer.ms_mcPopup.Buttons_mc.Button2_mc.SimulateButtonPush",
+                &[],
+            );
+            ui.stage.tick(1000.0 / 30.0);
+        };
+        let field = "_global.PopupLayer.ms_mcPopup.TextInput_mc.TextField";
+        for n in 0..3 {
+            ui.ask_text(1, "Name", "Rowan", "OK", "Cancel");
+            pump(&mut ui);
+            ui.ask_free_text(2, "Report", "", "Save", "Keep here");
+            pump(&mut ui);
+            assert!(crate::box_shows(&mut ui, "Name"));
+            assert!(!crate::box_shows(&mut ui, "Report"));
+            assert_eq!(
+                ui.stage.call_in(
+                    thedas_ui::stage::POPUP_LAYER,
+                    &format!("{field}.maxChars.toString"),
+                    &[],
+                ),
+                Some(thedas_ui::UiValue::String("20".into()))
+            );
+            if n == 0 {
+                // A timed-out report must not appear after the name box closes.
+                ui.cancel_text_popup(2);
+                close(&mut ui);
+                pump(&mut ui);
+                assert!(ui.stage.dialog_prompt().is_none());
+                ui.ask_free_text(2, "Report", "", "Save", "Keep here");
+            } else {
+                close(&mut ui);
+            }
+            pump(&mut ui);
+            assert!(crate::box_shows(&mut ui, "Report"));
+            let note = format!("Sera's report {n}: \"wrong\", 123. #$% ").repeat(30);
+            assert!(ui.type_text(&note));
+            assert_eq!(
+                ui.stage.call_in(
+                    thedas_ui::stage::POPUP_LAYER,
+                    &format!("{field}.text.toString"),
+                    &[],
+                ),
+                Some(thedas_ui::UiValue::String(note))
+            );
+            close(&mut ui);
+            ui.cancel_text_popup(2);
+            assert!(!ui.typing());
+            ui.ask_choice(3, "Mark another spot?", "Mark another spot", "Done marking");
+            pump(&mut ui);
+            assert!(!ui.typing());
+            close(&mut ui);
+            ui.cancel_text_popup(3);
+        }
+    }
 
     #[test]
     fn text_resources_decode_by_their_byte_order_mark() {

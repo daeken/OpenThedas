@@ -967,7 +967,7 @@ fn ask_report_note(ui: &mut ui::UiLayer, pad: bool) {
     // The box's OK wants some text, and the pad cannot type yet: a pad's report starts
     // with a line that can go as it is.
     let text = if pad { "(sent from a controller)" } else { "" };
-    ui.ask_text(report::NOTE_ID, prompt, text, ok, other);
+    ui.ask_free_text(report::NOTE_ID, prompt, text, ok, other);
 }
 
 /// What a report under way waits for.
@@ -997,6 +997,8 @@ enum Marking {
     Off,
     /// The choice is asked: frames since asked (or seen up), and times it did not show.
     Offered(u32, u32),
+    /// A spot's note was answered: mark another, or go straight to the overall note.
+    More(u32, u32),
     /// Boxes are being drawn: the one being dragged (from, to), and the one whose note
     /// is being asked, with frames and tries as for the choice.
     On {
@@ -1069,7 +1071,7 @@ fn ask_mark_choice(ui: &mut ui::UiLayer, pad: bool) {
 }
 
 fn ask_region_note(ui: &mut ui::UiLayer) {
-    ui.ask_text(
+    ui.ask_free_text(
         report::REGION_ID,
         report::REGION_PROMPT,
         "",
@@ -1078,13 +1080,18 @@ fn ask_region_note(ui: &mut ui::UiLayer) {
     );
 }
 
+fn ask_more_marks(ui: &mut ui::UiLayer) {
+    ui.ask_choice(
+        report::MORE_MARKS_ID,
+        report::MORE_MARKS_PROMPT,
+        "Mark another spot",
+        "Done marking",
+    );
+}
+
 /// Whether the game's message box shows `prompt` now.
-fn box_shows(ui: &ui::UiLayer, prompt: &str) -> bool {
-    ui.stage.dialog_up()
-        && matches!(
-            ui.stage.bridge.value("GUIPopupLayer.DialogBoxText"),
-            Some(thedas_ui::UiValue::String(t)) if t == prompt
-        )
+fn box_shows(ui: &mut ui::UiLayer, prompt: &str) -> bool {
+    ui.stage.dialog_prompt().as_deref() == Some(prompt)
 }
 
 /// What the window's surface gave a redraw.
@@ -1840,7 +1847,11 @@ impl App {
                 self.update_answers.push(a);
                 continue;
             }
-            if (a.id == report::MARK_ID || a.id == report::REGION_ID) && self.recorder.busy() {
+            if matches!(
+                a.id,
+                report::MARK_ID | report::REGION_ID | report::MORE_MARKS_ID
+            ) && self.recorder.busy()
+            {
                 self.mark_answers.push(a);
                 continue;
             }
@@ -2029,7 +2040,11 @@ impl App {
                 self.update_answers.push(a);
                 continue;
             }
-            if (a.id == report::MARK_ID || a.id == report::REGION_ID) && self.recorder.busy() {
+            if matches!(
+                a.id,
+                report::MARK_ID | report::REGION_ID | report::MORE_MARKS_ID
+            ) && self.recorder.busy()
+            {
                 self.mark_answers.push(a);
                 continue;
             }
@@ -2913,13 +2928,17 @@ impl App {
             return;
         };
         match (a.id, &mut w.marking) {
-            (report::MARK_ID, Marking::Offered(..)) if a.accepted => {
+            (report::MARK_ID, Marking::Offered(..))
+            | (report::MORE_MARKS_ID, Marking::More(..))
+                if a.accepted =>
+            {
                 w.marking = Marking::On {
                     drag: None,
                     asking: None,
                 };
             }
-            (report::MARK_ID, Marking::Offered(..)) => self.end_marking(),
+            (report::MARK_ID, Marking::Offered(..))
+            | (report::MORE_MARKS_ID, Marking::More(..)) => self.end_marking(),
             (report::REGION_ID, Marking::On { asking, .. }) => {
                 if let Some((rect, ..)) = asking.take() {
                     if a.accepted {
@@ -2927,6 +2946,10 @@ impl App {
                             rect,
                             note: a.text.trim().to_string(),
                         });
+                    }
+                    w.marking = Marking::More(0, 0);
+                    if let Some(g) = self.gfx.as_mut() {
+                        ask_more_marks(&mut g.ui);
                     }
                 }
             }
@@ -2942,11 +2965,18 @@ impl App {
             return;
         };
         let up = g.ui.stage.dialog_up();
+        let more = matches!(w.marking, Marking::More(..));
         match &mut w.marking {
             Marking::Off => {}
-            Marking::Offered(frames, tries) => {
+            Marking::Offered(frames, tries) | Marking::More(frames, tries) => {
                 *frames += 1;
-                if box_shows(&g.ui, report::MARK_PROMPT) || box_shows(&g.ui, MARK_PROMPT_PAD) {
+                let shown = if more {
+                    box_shows(&mut g.ui, report::MORE_MARKS_PROMPT)
+                } else {
+                    box_shows(&mut g.ui, report::MARK_PROMPT)
+                        || box_shows(&mut g.ui, MARK_PROMPT_PAD)
+                };
+                if shown {
                     *frames = 0;
                 } else if *frames > NOTE_REASK_FRAMES {
                     *frames = 0;
@@ -2954,20 +2984,25 @@ impl App {
                     if *tries > NOTE_TRIES {
                         self.end_marking();
                     } else if !up {
-                        ask_mark_choice(&mut g.ui, pad);
+                        if more {
+                            ask_more_marks(&mut g.ui);
+                        } else {
+                            ask_mark_choice(&mut g.ui, pad);
+                        }
                     }
                 }
             }
             Marking::On { asking, .. } => {
                 if let Some((_, frames, tries)) = asking.as_mut() {
                     *frames += 1;
-                    if box_shows(&g.ui, report::REGION_PROMPT) {
+                    if box_shows(&mut g.ui, report::REGION_PROMPT) {
                         *frames = 0;
                     } else if *frames > NOTE_REASK_FRAMES {
                         *frames = 0;
                         *tries += 1;
                         if *tries > NOTE_TRIES {
                             *asking = None;
+                            g.ui.cancel_text_popup(report::REGION_ID);
                         } else if !up {
                             ask_region_note(&mut g.ui);
                         }
@@ -3066,12 +3101,8 @@ impl App {
         // so the game never waits on it.
         if let (Some((frames, tries)), Some(g)) = (w.note_asked.as_mut(), self.gfx.as_mut()) {
             let up = g.ui.stage.dialog_up();
-            let ours = up
-                && matches!(
-                    g.ui.stage.bridge.value("GUIPopupLayer.DialogBoxText"),
-                    Some(thedas_ui::UiValue::String(t))
-                        if t == report::NOTE_PROMPT || t == report::NOTE_PROMPT_SEND
-                );
+            let ours = box_shows(&mut g.ui, report::NOTE_PROMPT)
+                || box_shows(&mut g.ui, report::NOTE_PROMPT_SEND);
             *frames += 1;
             if ours {
                 *frames = 0;
@@ -3081,6 +3112,7 @@ impl App {
                 if *tries > NOTE_TRIES {
                     log::warn!("report: the note could not be asked; kept without one");
                     w.note_asked = None;
+                    g.ui.cancel_text_popup(report::NOTE_ID);
                     self.recorder.note(Some(String::new()));
                 } else if !up {
                     ask_report_note(&mut g.ui, self.pad.used);
@@ -3093,6 +3125,16 @@ impl App {
         let Some(w) = self.report_wait.take() else {
             return;
         };
+        if let Some(g) = self.gfx.as_mut() {
+            for id in [
+                report::NOTE_ID,
+                report::MARK_ID,
+                report::REGION_ID,
+                report::MORE_MARKS_ID,
+            ] {
+                g.ui.cancel_text_popup(id);
+            }
+        }
         let reply = w.reply;
         if w.paused_it {
             if let Some(live) = self.live.as_mut() {

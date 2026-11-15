@@ -374,7 +374,9 @@ fn press_key(player: &mut Player, key: UiKey) {
     );
     let shift_was_down = player.vm.keys_down.contains(&16);
     let (code, ch) = match key {
-        UiKey::Char(c) => (c.to_ascii_uppercase() as u32, Some(c)),
+        // Text input is not a virtual key code: ASCII punctuation overlaps editing
+        // keys ('\'' = Right, '.' = Delete, '#' = End, '$' = Home, '%' = Left).
+        UiKey::Char(c) => (0, Some(c)),
         UiKey::Backspace => (8, None),
         UiKey::Delete => (46, None),
         UiKey::Enter => (13, None),
@@ -415,8 +417,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn host_shift_edits_extend_replace_and_release_the_modifier() {
+    fn input_player() -> (Player, Value) {
         let movie = b"FWS\x08\x12\0\0\0\x08\0\0\x1e\x01\0\x40\0\0\0";
         let mut player =
             Player::new(movie, "input", Box::new(Empty), Arc::new(Empty), None).unwrap();
@@ -437,6 +438,33 @@ mod tests {
         player
             .vm
             .call_method(&selection, "setFocus", std::slice::from_ref(&value));
+        (player, value)
+    }
+
+    #[test]
+    fn typed_punctuation_is_text_and_name_limits_still_apply() {
+        let (mut player, value) = input_player();
+        let note = "Sera's report: \"it's wrong\", 123. #$% & () [] / \\ !? +-= :; @".repeat(12);
+        press_key(&mut player, UiKey::SelectAll);
+        for c in note.chars() {
+            press_key(&mut player, UiKey::Char(c));
+        }
+        assert_eq!(player.vm.get(&value, "text"), Value::from(note));
+        assert!(player.vm.keys_down.is_empty());
+
+        player.vm.set(&value, "maxChars", Value::Number(5.0));
+        player.vm.set(&value, "restrict", Value::from("A-Za-z"));
+        press_key(&mut player, UiKey::SelectAll);
+        for c in "Sera123's!".chars() {
+            press_key(&mut player, UiKey::Char(c));
+        }
+        assert_eq!(player.vm.get(&value, "text"), Value::from("Seras"));
+    }
+
+    #[test]
+    fn host_shift_edits_extend_replace_and_release_the_modifier() {
+        let (mut player, value) = input_player();
+        let field = player.vm.display_of(&value).unwrap();
 
         let range = |p: &Player| p.vm.display.get(field).unwrap().text().unwrap().selection();
         press_key(&mut player, UiKey::End);
