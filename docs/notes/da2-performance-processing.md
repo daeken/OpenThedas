@@ -160,3 +160,19 @@ chain; their combat timing must be reported separately.
 Damage, health, chargen inputs and Karl combat are owned by the separate
 damage investigation. No balance adjustment or processing heuristic is
 introduced by this note.
+
+## Implemented heading slice
+
+DA2 translating movers now use the existing elapsed-time yaw limiter, including
+its saved last-turn timestamp. Ordinary started moves retain their body heading
+at arrival instead of taking the original order's bearing. Native completion
+`0x675fae -> 0x8a60e0` stops the follower without installing that bearing.
+Explicit jumps and placement keep their facing behavior. Origins follows the
+same code it used before this DA2 extension.
+
+Regressions exercise a native 33 ms quarter-turn example through the actual
+movement scheduler, a zero-time update, continued turning across a world
+round-trip, and a bent route whose arrival bearing differs from the original
+order. This implements the scalar body-yaw step during translation. Persistent
+locomotion modes, stationary turn completion, performance processing ownership,
+the direction filter and complete command admission remain separate work.
