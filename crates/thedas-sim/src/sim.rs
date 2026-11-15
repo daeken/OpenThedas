@@ -2161,10 +2161,13 @@ impl Sim {
     /// How fast a command moves its owner: a move ordered not to run
     /// (`CommandMoveToLocation`'s or `CommandMoveToObject`'s `bRunToLocation` FALSE) walks,
     /// at the appearance's walk speed (column 0x958f23c8, 1.54 for humans; the locomotion's
-    /// mode 1 in 0xa63120); anything else runs ([`Sim::move_speed`]).
+    /// mode 1 in 0xa63120). Origins' combat stance overrides both walk and run with
+    /// column 0x0dc3ebb2 (0xa6312e..0xa63151); anything else runs (`Sim::move_speed`).
     pub fn command_speed(&self, id: ObjectId, cmd: &Command) -> f32 {
         let walks = cmd.name.starts_with("CommandMoveTo") && cmd.ints.first() == Some(&0);
-        if walks {
+        let combat_stance = self.game == thedas_vfs::Game::Origins
+            && self.world.get(id).is_some_and(|o| o.combat.in_combat);
+        if walks && !combat_stance {
             if let Some(v) = self.appearance_speed(id, COL_WALK) {
                 return v * self.speed_multiplier(id);
             }
@@ -2406,6 +2409,7 @@ impl Sim {
                     facing: crate::world::facing_toward(place[0] - from[0], place[1] - from[1]),
                 }),
                 seconds: 0.0,
+                max_range: None,
                 ints: Vec::new(),
                 strings: Vec::new(),
                 due: None,
@@ -2865,18 +2869,20 @@ impl Sim {
         }
     }
 
-    /// Whether a `CommandMoveToObject` walker has arrived. DAOrigins.exe's executor
-    /// (0x7aa200) ends the move once the walker is within its range of the target, by its
-    /// range test (0x7a3090): the distance on the ground at most the larger of the two ranges
-    /// (the command keeps fMinRange and fMaxRange, raised to fMinRange, 0x66f312) plus
-    /// 0.05 m (0xaf70b0), and at least fMinRange less 0.05. A creature target's capsule
-    /// keeps the walker out (the controller stops against it), so a walker touching it has
-    /// arrived too. Provisional: fMaxRange is not kept (so the larger range is fMinRange),
-    /// and how the exe ends a walk stopped against its target is not traced (the
-    /// locomotion's status, 0x7a9130, decides).
     /// Puts a `CommandMoveToObject` walker that stepped inside its minimum range back out
     /// to it, on the line from the target.
     fn stop_at_range(&mut self, id: ObjectId) {
+        if self.game == thedas_vfs::Game::Origins
+            && self
+                .world
+                .get(id)
+                .and_then(|o| o.commands.first())
+                .is_some_and(|c| {
+                    c.name == "CommandMoveToObject" && c.max_range.is_some() && c.location.is_some()
+                })
+        {
+            return;
+        }
         let Some((pos, min, tpos)) = self.world.get(id).and_then(|o| {
             let c = o.commands.first()?;
             let t = self.world.get(c.target?)?;
@@ -2895,6 +2901,48 @@ impl Sim {
         }
     }
 
+    /// Origins' initial range check (0x7aa440) can complete without walking. Otherwise
+    /// 0x7a6ca0 -> 0x7a31c0 chooses a goal fMinRange from the target toward the mover,
+    /// searching within max(0.5, fMaxRange-fMinRange), check off. The locomotion check
+    /// (0x7a9622) uses fMaxRange-fMinRange around that goal, not fMaxRange around the
+    /// target. Keep the goal in the command's saved location. Provisional: the alternate
+    /// LOS-goal search (nonzero native float 4), failed-search fallback 0x73e7f0 and
+    /// replanning a moving target (0x7a50f0) are not modelled.
+    fn move_to_object_goal(&mut self, id: ObjectId, cmd: &Command) -> Option<Location> {
+        let mover = self.world.get(id)?;
+        let target = self.world.get(cmd.target?)?;
+        let area = mover.area?;
+        if target.area != Some(area) || target.id == id {
+            return None;
+        }
+        let (here, there, facing) = (mover.position, target.position, mover.facing);
+        let min = cmd.seconds.max(0.0);
+        let max = cmd.max_range?.max(min);
+        let (dx, dy) = (here[0] - there[0], here[1] - there[1]);
+        let distance = (dx * dx + dy * dy).sqrt();
+        let position = if distance >= (min - 0.05).max(0.0) && distance <= max + 0.05 {
+            here
+        } else {
+            let k = if distance > 1e-4 { min / distance } else { 0.0 };
+            let point = [there[0] + dx * k, there[1] + dy * k, there[2]];
+            let how = crate::nav::SafeSearch {
+                radius: (max - min).max(0.5),
+                body_radius: self.capsule_radius(id),
+                mover: Some(id),
+                standable_keeps: false,
+            };
+            self.safe_search(area, point, how).unwrap_or(point)
+        };
+        Some(Location {
+            area,
+            position,
+            facing,
+        })
+    }
+
+    /// Active Origins walks test the stored locomotion goal with the range width
+    /// (0x7a9622..0x7a9776). Legacy saves and DA2 keep their previous target-centred
+    /// approximation. Capsule-contact completion remains provisional.
     fn move_to_object_arrived(&self, id: ObjectId) -> bool {
         const RANGE_SLACK: f32 = 0.05;
         let Some(o) = self.world.get(id) else {
@@ -2915,10 +2963,19 @@ impl Sim {
         let d = ((t.position[0] - o.position[0]).powi(2) + (t.position[1] - o.position[1]).powi(2))
             .sqrt();
         let min = c.seconds.max(0.0);
-        // A step that went past the lower bound is put back at the range by
-        // [`Sim::stop_at_range`]; a walker that starts inside it is not sent away
-        // (provisional).
-        let in_range = d <= min + RANGE_SLACK;
+        // Legacy/DA2 moves retain their target-centred range approximation and the
+        // lower-bound correction in `stop_at_range`.
+        let max = c.max_range.unwrap_or(min).max(min);
+        let in_range = if self.game == thedas_vfs::Game::Origins && c.max_range.is_some() {
+            c.location.map_or(d <= max + RANGE_SLACK, |l| {
+                let goal_distance = ((l.position[0] - o.position[0]).powi(2)
+                    + (l.position[1] - o.position[1]).powi(2))
+                .sqrt();
+                goal_distance <= max - min + RANGE_SLACK
+            })
+        } else {
+            d <= max + RANGE_SLACK
+        };
         let touching = t.kind == ObjectKind::Creature
             && self.alive(t.id)
             && d <= self.capsule_radius(id) + self.capsule_radius(t.id) + RANGE_SLACK;
@@ -3540,6 +3597,16 @@ impl Sim {
                     let pos = self.world.get(id).map(|o| o.position);
                     let mut path = Vec::new();
                     let mut cmd = cmd;
+                    if self.game == thedas_vfs::Game::Origins
+                        && cmd.name == "CommandMoveToObject"
+                        && cmd.max_range.is_some()
+                    {
+                        cmd.location = self.move_to_object_goal(id, &cmd);
+                        if let Some(c) = self.world.get_mut(id).and_then(|o| o.commands.first_mut())
+                        {
+                            c.location = cmd.location;
+                        }
+                    }
                     // Moving away from an object: to the point at the asked distance from it,
                     // on the line from it through the mover (closer in when the mover is
                     // farther off), as script.ldf describes the command. Provisional: the
@@ -3591,7 +3658,11 @@ impl Sim {
                                 .map(|o| o.position)
                         });
                         if let (Some(to), Some(p)) = (to, pos) {
-                            path = match self.route_to(id, to) {
+                            path = match if to == p {
+                                crate::nav::Routed::Path(vec![p])
+                            } else {
+                                self.route_to(id, to)
+                            } {
                                 crate::nav::Routed::Path(p) => p,
                                 crate::nav::Routed::Straight => Vec::new(),
                                 crate::nav::Routed::Door(door) => {
@@ -3756,16 +3827,10 @@ impl Sim {
                 }
             }
         }
-        // A move to an object ends where the object stands, except a walk to a creature,
-        // which ends where the walk stopped, against its body or in range
+        // A walk to an object ends where the walk stopped, against its body or in range
         // ([`Sim::move_to_object_arrived`]): the walker was set down on the creature (DA2's
         // Hawke on Flemeth). Provisional: the mover keeps its facing.
-        let walked_to_creature = cmd.from.is_some()
-            && cmd
-                .target
-                .and_then(|t| self.world.get(t))
-                .is_some_and(|t| t.kind == ObjectKind::Creature);
-        let to_object = cmd.name.starts_with("CommandMoveToObject") && !walked_to_creature;
+        let to_object = cmd.name.starts_with("CommandMoveToObject") && cmd.from.is_none();
         // A walk whose end lies in a closed door's doorway stopped at the door (its route is
         // cut short there, see `Sim::route_to`): the walker stays where the route left it
         // and is not set down at the end asked for, inside the doorway or past the leaf. (A
@@ -3789,6 +3854,11 @@ impl Sim {
         let location = cmd
             .location
             .filter(|_| cmd.name != "CommandUseAbility")
+            .filter(|_| {
+                !(self.game == thedas_vfs::Game::Origins
+                    && cmd.name == "CommandMoveToObject"
+                    && cmd.max_range.is_some())
+            })
             .filter(|l| !at_door(self, l.position, Some(l.area)));
         if let Some(l) = location {
             // Cross the triggers between where the move began and its end on the way (along
@@ -5346,6 +5416,7 @@ mod tests {
             target: None,
             location: None,
             seconds: 0.0,
+            max_range: None,
             ints: Vec::new(),
             strings: Vec::new(),
             due: None,
@@ -5868,6 +5939,7 @@ mod tests {
                 facing: 0.0,
             }),
             seconds: 0.0,
+            max_range: None,
             ints: Vec::new(),
             strings: Vec::new(),
             due: None,
@@ -5961,6 +6033,7 @@ mod tests {
             target: None,
             location: None,
             seconds,
+            max_range: None,
             ints: Vec::new(),
             strings: Vec::new(),
             due: None,
@@ -6004,6 +6077,7 @@ mod tests {
             target: None,
             location: None,
             seconds: 0.0,
+            max_range: None,
             ints: vec![1],
             strings: Vec::new(),
             due: None,
@@ -6121,6 +6195,7 @@ mod tests {
             target: Some(wp),
             location: None,
             seconds: 0.0,
+            max_range: None,
             ints: Vec::new(),
             strings: Vec::new(),
             due: None,
@@ -6140,6 +6215,94 @@ mod tests {
         assert!(o.commands.is_empty());
         assert_eq!(o.position, [80.0, 120.0, 29.5]);
         assert_eq!(o.area, Some(area));
+    }
+
+    #[test]
+    fn an_origins_move_already_in_range_keeps_its_exact_pose() {
+        let mut s = sim();
+        let area = s.world.spawn(ObjectKind::Area, "a");
+        let walker = s.world.spawn(ObjectKind::Creature, "walker");
+        let target = s.world.spawn(ObjectKind::Waypoint, "target");
+        let here = [7.0, 0.0, 4.0];
+        let o = s.world.get_mut(walker).unwrap();
+        o.area = Some(area);
+        o.position = here;
+        o.commands.push(Command {
+            name: "CommandMoveToObject".into(),
+            target: Some(target),
+            seconds: 1.0,
+            max_range: Some(4.0),
+            ..Default::default()
+        });
+        let t = s.world.get_mut(target).unwrap();
+        t.area = Some(area);
+        t.position = [10.0, 0.0, 9.0];
+        s.tick(100);
+        let o = s.world.get(walker).unwrap();
+        assert!(o.commands.is_empty());
+        assert_eq!(o.position, here);
+    }
+
+    #[test]
+    fn origins_move_completion_uses_the_offset_goal_and_survives_reload() {
+        let mut s = sim();
+        let area = s.world.spawn(ObjectKind::Area, "a");
+        let walker = s.world.spawn(ObjectKind::Creature, "walker");
+        let target = s.world.spawn(ObjectKind::Waypoint, "target");
+        s.world.get_mut(walker).unwrap().area = Some(area);
+        let t = s.world.get_mut(target).unwrap();
+        t.area = Some(area);
+        t.position = [10.0, 0.0, 0.0];
+        let mut cmd = Command {
+            name: "CommandMoveToObject".into(),
+            target: Some(target),
+            seconds: 1.0,
+            max_range: Some(4.0),
+            ..Default::default()
+        };
+        cmd.location = s.move_to_object_goal(walker, &cmd);
+        assert_eq!(cmd.location.unwrap().position, [9.0, 0.0, 0.0]);
+        let restored = serde_json::from_str(&serde_json::to_string(&cmd).unwrap()).unwrap();
+        s.world.get_mut(walker).unwrap().commands.push(restored);
+        // A detour enters the target's 4 m disc before it enters the native goal's
+        // 3 m disc. Testing only the target would complete too soon here.
+        s.world.get_mut(walker).unwrap().position = [8.0, 3.0, 0.0];
+        assert!(!s.move_to_object_arrived(walker));
+        s.world.get_mut(walker).unwrap().position = [9.0, 3.0, 0.0];
+        assert!(s.move_to_object_arrived(walker));
+    }
+
+    #[test]
+    fn a_walk_to_an_object_stops_at_its_maximum_without_teleporting_to_the_target() {
+        for kind in [
+            ObjectKind::Creature,
+            ObjectKind::Waypoint,
+            ObjectKind::Placeable,
+        ] {
+            let mut s = sim();
+            let area = s.world.spawn(ObjectKind::Area, "a");
+            let walker = s.world.spawn(ObjectKind::Creature, "walker");
+            let target = s.world.spawn(kind, "target");
+            s.world.get_mut(walker).unwrap().area = Some(area);
+            let t = s.world.get_mut(target).unwrap();
+            t.area = Some(area);
+            t.position = [10.0, 0.0, 9.0];
+            s.world.get_mut(walker).unwrap().commands.push(Command {
+                name: "CommandMoveToObject".into(),
+                target: Some(target),
+                seconds: 1.0,
+                max_range: Some(4.0),
+                ints: vec![1],
+                ..Default::default()
+            });
+            for _ in 0..100 {
+                s.tick(50);
+            }
+            let o = s.world.get(walker).unwrap();
+            assert!(o.commands.is_empty());
+            let distance = (10.0 - o.position[0]).abs();
+            assert!((3.5..=4.05).contains(&distance), "{kind:?}: {distance}");
+        }
     }
 
     #[test]
@@ -6176,6 +6339,7 @@ mod tests {
                 name: "CommandMoveToObject".into(),
                 target: Some(target),
                 seconds: min,
+                max_range: None,
                 ints: vec![1],
                 ..Default::default()
             });
@@ -6235,6 +6399,7 @@ mod tests {
                 target: Some(hero),
                 location: None,
                 seconds: 0.0,
+                max_range: None,
                 ints: Vec::new(),
                 strings: Vec::new(),
                 due: None,
@@ -6286,6 +6451,7 @@ mod tests {
             target: None,
             location: Some(to),
             seconds: 0.0,
+            max_range: None,
             ints: Vec::new(),
             strings: Vec::new(),
             due: None,
@@ -6431,6 +6597,7 @@ mod tests {
             target: Some(t),
             location: None,
             seconds: 0.0,
+            max_range: None,
             ints: vec![0],
             strings: Vec::new(),
             due: None,
@@ -6498,6 +6665,7 @@ mod tests {
             target: Some(t),
             location: None,
             seconds: 0.0,
+            max_range: None,
             ints: Vec::new(),
             strings: Vec::new(),
             due: None,
@@ -6549,6 +6717,7 @@ mod tests {
             target,
             location,
             seconds: 0.0,
+            max_range: None,
             ints: Vec::new(),
             strings: Vec::new(),
             due: None,
@@ -6776,6 +6945,7 @@ mod tests {
                 target: Some(t),
                 location: None,
                 seconds: 0.0,
+                max_range: None,
                 ints: Vec::new(),
                 strings: Vec::new(),
                 due: Some(u64::MAX / 2),
@@ -6803,6 +6973,7 @@ mod tests {
             target: Some(t),
             location: None,
             seconds: 0.0,
+            max_range: None,
             ints: Vec::new(),
             strings: Vec::new(),
             due: None,
@@ -6884,6 +7055,7 @@ mod tests {
             target: None,
             location: None,
             seconds: 0.0,
+            max_range: None,
             ints: Vec::new(),
             strings: Vec::new(),
             due: None,
@@ -6949,6 +7121,7 @@ mod tests {
                 facing: 0.0,
             }),
             seconds: 0.0,
+            max_range: None,
             ints: Vec::new(),
             strings: Vec::new(),
             due: Some(t0 + 10_000),
@@ -7175,6 +7348,7 @@ mod tests {
             target: None,
             location: None,
             seconds: 0.0,
+            max_range: None,
             ints: vec![run, 0],
             strings: Vec::new(),
             due: None,
@@ -7191,10 +7365,16 @@ mod tests {
         };
         assert_eq!(
             s.command_speed(human, &walk(0)),
-            1.54,
-            "told not to run: a walk"
+            4.66,
+            "Origins combat stance overrides the walk command's gait"
         );
         assert_eq!(s.command_speed(human, &walk(1)), 4.66);
+        s.game = thedas_vfs::Game::DragonAge2;
+        assert_eq!(s.command_speed(human, &walk(0)), 1.54, "DA2 unchanged");
+        s.game = thedas_vfs::Game::Origins;
+        s.world.get_mut(human).unwrap().combat.in_combat = false;
+        assert_eq!(s.command_speed(human, &walk(0)), 1.54, "ordinary walk");
+        assert_eq!(s.command_speed(human, &walk(1)), 6.0, "ordinary run");
         assert_eq!(
             s.move_speed(other),
             DEFAULT_SPEED,

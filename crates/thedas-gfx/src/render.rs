@@ -1022,7 +1022,12 @@ impl Renderer {
             .clone()
     }
 
-    fn text_meshes(&mut self, player: &mut Player, d: DisplayId) -> Vec<Arc<GpuMesh>> {
+    fn text_meshes(
+        &mut self,
+        player: &mut Player,
+        images: &mut dyn Images,
+        d: DisplayId,
+    ) -> Vec<Arc<GpuMesh>> {
         let fonts = player.vm.fonts.clone();
         let Some(t) = player.vm.display.get_mut(d).and_then(|o| o.text_mut()) else {
             return Vec::new();
@@ -1065,10 +1070,11 @@ impl Renderer {
         }
         let layout = t.layout(&*fonts).clone();
         let scroll = t.scroll.max(1) as usize - 1;
-        let shadow = shadow_offsets(&t.shadow_style);
+        let style = text_shadow_style(&t.shadow_style);
         let shadow_color = t.shadow_color;
         let top_skip = layout.lines.get(scroll).map(|l| l.top).unwrap_or(0.0) - crate::text::GUTTER;
         let mut glyphs = Vec::new();
+        let mut inline_images = Vec::new();
         let selection = t.caret.map(|_| t.selection());
         let caret_position = t.caret.and_then(|c| layout.caret_position(c));
         let mut selection_mesh = m.clone();
@@ -1131,6 +1137,9 @@ impl Renderer {
             for g in &line.glyphs {
                 glyphs.push((g.clone(), y - line.top));
             }
+            for (image, x, y) in &line.images {
+                inline_images.push((image.clone(), *x, *y - top_skip));
+            }
             for (x0, x1, uy, c) in &line.underlines {
                 let yy = uy - top_skip;
                 quad(
@@ -1150,19 +1159,56 @@ impl Renderer {
             .into_iter()
             .collect();
         out.extend(self.upload_colored(&selection_mesh, None, 0.0, Matrix::IDENTITY, true));
+        for (image, x, y) in inline_images {
+            let (width, height) = image.size();
+            if width <= 0.0 || height <= 0.0 {
+                continue;
+            }
+            let left = x.max(0.0);
+            let top = y.max(0.0);
+            let right = (x + width).min(bw);
+            let bottom = (y + height).min(bh);
+            if right <= left || bottom <= top {
+                continue;
+            }
+            let url = image
+                .resource
+                .as_ref()
+                .map_or(image.src.as_str(), |r| &r.url);
+            let Some((binding, _, _)) = self.bitmap(images, url, false, true) else {
+                continue;
+            };
+            let mesh = Mesh {
+                paint: Paint::Solid,
+                vertices: [(left, top), (right, top), (right, bottom), (left, bottom)]
+                    .map(|(px, py)| Vertex {
+                        pos: [(bx + px) * 20.0, (by + py) * 20.0],
+                        uv: [(px - x) / width, (py - y) / height],
+                        color: [255; 4],
+                    })
+                    .to_vec(),
+                indices: vec![0, 1, 2, 0, 2, 3],
+            };
+            out.extend(self.upload(&mesh, Some(binding), 1.0, Matrix::IDENTITY));
+        }
         m.vertices.clear();
         m.indices.clear();
         let mut shadow_mesh = m.clone();
-        for pass in 0..=shadow.len() {
+        for (offset, is_shadow) in style
+            .shadows
+            .iter()
+            .map(|offset| (offset, true))
+            .chain(style.text.iter().map(|offset| (offset, false)))
+        {
             for (g, dy) in &glyphs {
                 let mesh = self.glyph(&g.font, g.glyph);
                 let scale = g.size * 20.0 / g.font.em;
-                let (ox, oy, c) = if pass < shadow.len() {
-                    (shadow[pass].0, shadow[pass].1, shadow_color)
+                let (ox, oy, c) = if is_shadow {
+                    (offset.0, offset.1, shadow_color)
                 } else {
                     (
-                        0.0,
-                        0.0,
+                        offset.0,
+                        offset.1,
                         if selection.is_some_and(|(b, e)| g.index >= b && g.index < e) {
                             [255; 3]
                         } else {
@@ -1170,11 +1216,7 @@ impl Renderer {
                         },
                     )
                 };
-                let target = if pass < shadow.len() {
-                    &mut shadow_mesh
-                } else {
-                    &mut m
-                };
+                let target = if is_shadow { &mut shadow_mesh } else { &mut m };
                 let base = target.vertices.len() as u32;
                 for p in &mesh.0 {
                     target.vertices.push(Vertex {
@@ -1406,7 +1448,7 @@ impl Renderer {
                 let (id, r) = (*id, o.ratio);
                 self.shape_meshes(player, images, id, r)
             }
-            Kind::Text(_) => self.text_meshes(player, d),
+            Kind::Text(_) => self.text_meshes(player, images, d),
             Kind::Bitmap { url, width, height } => {
                 let (url, w, h) = (url.clone(), *width, *height);
                 match self.bitmap(images, &url, false, true) {
@@ -1688,17 +1730,47 @@ impl Renderer {
     }
 }
 
-/// Scaleform's text shadow style (`shadowStyle`): offsets in pixels, e.g. `s{1,1}`.
-/// Provisional: the syntax is inferred from the movies' values.
-fn shadow_offsets(style: &str) -> Vec<(f32, f32)> {
-    let mut out = Vec::new();
+struct TextShadowStyle {
+    shadows: Vec<(f32, f32)>,
+    text: Vec<(f32, f32)>,
+}
+
+/// Scaleform's `s{...}t{...}` shadow and text passes, in pixels. The movie's
+/// s-only styles retain the ordinary text pass at the origin. Repeated points
+/// are retained, including the duplicate in the authored eight-offset outline.
+fn text_shadow_style(style: &str) -> TextShadowStyle {
+    let mut out = TextShadowStyle {
+        shadows: Vec::new(),
+        text: vec![(0.0, 0.0)],
+    };
+    let mut section = "";
+    let mut explicit_text = false;
     let mut rest = style;
     while let Some(i) = rest.find('{') {
         let Some(j) = rest[i..].find('}') else { break };
+        let prefix = rest[..i].trim();
+        if !prefix.is_empty() {
+            section = prefix;
+        }
         let inner = &rest[i + 1..i + j];
-        let mut it = inner.split(',').map(|v| v.trim().parse::<f32>().ok());
-        if let (Some(Some(x)), Some(Some(y))) = (it.next(), it.next()) {
-            out.push((x, y));
+        let point = inner.split_once(',').and_then(|(x, y)| {
+            let (x, y) = (x.trim().parse::<f32>().ok()?, y.trim().parse::<f32>().ok()?);
+            let limit = i32::MAX as f32 / 20.0;
+            (x.is_finite() && y.is_finite() && x.abs() <= limit && y.abs() <= limit)
+                .then_some((x, y))
+        });
+        if let Some(point) = point {
+            match section {
+                "s" => out.shadows.push(point),
+                "t" => {
+                    if !explicit_text {
+                        out.text.clear();
+                        explicit_text = true;
+                    }
+                    out.text.push(point);
+                }
+                _ => {}
+            }
         }
         rest = &rest[i + j + 1..];
     }
@@ -2137,6 +2209,47 @@ mod shadow_tests {
     use crate::swf::{EditText, Font, Movie, Record, Rect};
     use crate::text::{Fonts, Layout, Line, PlacedGlyph, TextField};
 
+    #[test]
+    fn shadow_styles_keep_every_movie_offset_and_separate_text_passes() {
+        for (style, expected) in [
+            ("s{1,1}", vec![(1.0, 1.0)]),
+            ("s{0,1}{1,1}{1,0}", vec![(0.0, 1.0), (1.0, 1.0), (1.0, 0.0)]),
+            (
+                "s{0,-1}{1,0}{0,1}{0,-1}{-1,-1}{1,-1}{1,1}{-1,1}",
+                vec![
+                    (0.0, -1.0),
+                    (1.0, 0.0),
+                    (0.0, 1.0),
+                    (0.0, -1.0),
+                    (-1.0, -1.0),
+                    (1.0, -1.0),
+                    (1.0, 1.0),
+                    (-1.0, 1.0),
+                ],
+            ),
+        ] {
+            let parsed = text_shadow_style(style);
+            assert_eq!(parsed.shadows, expected);
+            assert_eq!(parsed.text, [(0.0, 0.0)]);
+        }
+        let parsed = text_shadow_style("s{1.5, -2}{3,4} t{0,0}{8,0}");
+        assert_eq!(parsed.shadows, [(1.5, -2.0), (3.0, 4.0)]);
+        assert_eq!(parsed.text, [(0.0, 0.0), (8.0, 0.0)]);
+        for style in [
+            "",
+            "s",
+            "s{NaN,1}{0,inf}{1e38,0}{1,2,3}",
+            "unknown{1,2}",
+            "é{1,2}",
+            "s{1,2",
+            "t{NaN,0}",
+        ] {
+            let parsed = text_shadow_style(style);
+            assert!(parsed.shadows.is_empty(), "{style}");
+            assert_eq!(parsed.text, [(0.0, 0.0)], "{style}");
+        }
+    }
+
     struct Empty;
     impl Host for Empty {
         fn fscommand(&mut self, _: &str, _: &str) {}
@@ -2191,6 +2304,81 @@ mod shadow_tests {
             ..Default::default()
         });
         id
+    }
+
+    #[test]
+    fn native_inline_images_render_clip_scroll_and_reuse_cached_text_meshes() {
+        use crate::avm1::value::Value;
+
+        struct Pixels(usize);
+        impl Images for Pixels {
+            fn image(&mut self, name: &str) -> Option<(u32, u32, Vec<u8>)> {
+                self.0 += 1;
+                let color = match name {
+                    "coin" => [120, 200, 60, 255],
+                    "other" => [5, 30, 240, 255],
+                    _ => return None,
+                };
+                Some((2, 2, color.repeat(4)))
+            }
+        }
+        let instance =
+            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+        let adapter = pollster::block_on(instance.request_adapter(&Default::default())).unwrap();
+        let (device, queue) =
+            pollster::block_on(adapter.request_device(&Default::default())).unwrap();
+        let mut player = blend_player();
+        let root = player.vm.root;
+        let field =
+            crate::player::create_text(&mut player.vm, root, "images", 1, [0.0, 0.0, 10.0, 8.0])
+                .unwrap();
+        let value = player.vm.display_object(field);
+        player.vm.set(&value, "html", Value::Bool(true));
+        player
+            .vm
+            .set(&value, "textColor", Value::Number(0xff0000 as f64));
+        player.vm.set(
+            &value,
+            "htmlText",
+            Value::from("<img src='coin' width='16' height='12' hspace='2' vspace='-2'>"),
+        );
+        player.vm.display.get_mut(field).unwrap().color.mul[3] = 0.5;
+        let mut images = Pixels(0);
+        let mut renderer = Renderer::new(&device, &queue, wgpu::TextureFormat::Rgba8Unorm);
+        assert!(renderer.render_if_dirty(&mut player, &mut images, (32, 32)));
+        let pixel = |renderer: &Renderer, x: usize, y: usize| {
+            let (_, _, pixels) = renderer.capture().unwrap();
+            <[u8; 4]>::try_from(&pixels[(y * 32 + x) * 4..(y * 32 + x + 1) * 4]).unwrap()
+        };
+        let sample = pixel(&renderer, 5, 3);
+        for (actual, expected) in sample.into_iter().zip([120, 200, 60, 128]) {
+            assert!((actual as i32 - expected).abs() <= 2, "{sample:?}");
+        }
+        assert_eq!(pixel(&renderer, 11, 3)[3], 0);
+        assert_eq!(pixel(&renderer, 5, 9)[3], 0);
+        assert!(!renderer.render_if_dirty(&mut player, &mut images, (32, 32)));
+        assert_eq!(images.0, 1);
+
+        player.vm.set(&value, "_width", Value::Number(24.0));
+        player.vm.set(&value, "_height", Value::Number(24.0));
+        renderer.render_if_dirty(&mut player, &mut images, (32, 32));
+        assert_eq!(pixel(&renderer, 17, 10)[3], 128);
+        assert_eq!(images.0, 1);
+        player.vm.set(&value, "multiline", Value::Bool(true));
+        player.vm.set(
+            &value,
+            "htmlText",
+            Value::from(
+                "<img src='coin' width='6' height='4'><br><img src='other' width='6' height='4'>",
+            ),
+        );
+        player.vm.set(&value, "scroll", Value::Number(2.0));
+        renderer.render_if_dirty(&mut player, &mut images, (32, 32));
+        let sample = pixel(&renderer, 3, 10);
+        for (actual, expected) in sample.into_iter().zip([5, 30, 240, 128]) {
+            assert!((actual as i32 - expected).abs() <= 2, "{sample:?}");
+        }
+        assert_eq!(images.0, 2);
     }
 
     #[test]
@@ -2805,6 +2993,22 @@ mod shadow_tests {
         let shadow = pixel(12, 14);
         assert_eq!(&shadow[..3], &[0, 0, 0]);
         assert!((shadow[3] as i32 - 128).abs() < 2);
+
+        let text = player.vm.display.get_mut(id).unwrap().text_mut().unwrap();
+        text.shadow_style = "s{8,0}{8,8}t{0,0}{0,8}".into();
+        text.revision += 1;
+        player.vm.dirty = true;
+        renderer.render_if_dirty(&mut player, &mut Empty, (32, 32));
+        let (_, _, pixels) = renderer.capture().unwrap();
+        for y in [14, 22] {
+            let glyph = &pixels[(y * 32 + 4) * 4..(y * 32 + 5) * 4];
+            assert!(glyph[0] > 250 && (glyph[1] as i32 - 200).abs() < 3 && glyph[2] == 0);
+            assert!((glyph[3] as i32 - 128).abs() < 2);
+            let shadow = &pixels[(y * 32 + 12) * 4..(y * 32 + 13) * 4];
+            assert_eq!(&shadow[..3], &[0, 0, 0]);
+            assert!((shadow[3] as i32 - 128).abs() < 2);
+        }
+        assert!(!renderer.render_if_dirty(&mut player, &mut Empty, (32, 32)));
     }
 }
 
