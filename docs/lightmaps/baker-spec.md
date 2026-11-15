@@ -153,7 +153,20 @@ falloff × |cos| × visibility, and occlusion ray hit distances, then fits.
   fireplace fits k ≈ 0.6. The room's baked ambient fits ≈ (0.149, 0.146, 0.199), not the
   runtime ambient (0.225, 0.225, 0.2475). What is left is mostly a blue fill: Baked-only
   lights the game files no longer contain.
-- **Alpha is not binary.** Over the static lights, with S = Σ max(0, 1 − d/R)·|cos|·
+- **Alpha *is* binary after all; the curve below is occlusion in disguise.** RGB and alpha
+  carry the same occlusion factor, so alpha / green = sm / lm_g, and lm_g follows from the
+  fitted RGB model: an occlusion-free estimate of the shadow pass. Over texels one static
+  light alone reaches (Cousland room1100/1400/400), that estimate is ≈ 1 (0.9–1.1) at every
+  light strength for most lights (lamp_007, lamp_011, fireplaces, bounce_005): the shipped
+  shadow pass is the toolset's monochrome one. Some lights (lamp_009, lamp_010, bounce_008)
+  step from 0 to 1 well inside their runtime radius: their bake radius was smaller (about
+  two thirds) than the exported one. So the √min(1, 3S) curve below only stands in for an
+  occlusion model we have not matched yet (the shipped occlusion is darker under ceilings,
+  plateauing near 220/255 on open floors); with the current occlusion model it still scores
+  better (alpha MAE 19.5 / 6.5 on room1100 / room1400 against 19.8 / 9.0 monochrome).
+  Next: fit occlusion on the occlusion-free texels' alpha, then return to `Monochrome`
+  with per-light bake radii.
+- **Former reading (kept for the record): alpha rises with light strength.** Over the static lights, with S = Σ max(0, 1 − d/R)·|cos|·
   visibility (no colour), shipped alpha ÷ occlusion ≈ √min(1, 3S): 0.47 at S = 0.075, 0.73
   at 0.175, 0.96 at 0.325, saturated beyond 0.35 (`--shadow-intensity 3,0.5`). Other falloff
   shapes (quadratic, cos², smoothstep) fit no better. [I] A shadow job without `monochrome`
