@@ -9,6 +9,7 @@ run 300
 # Welcome
 expect page Welcome
 expect heading Welcome
+expect expanded Don't have the game?
 expect text Search this computer
 expect text Download Dragon Age: Origins from GOG
 expect no text Download Dragon Age II from GOG
