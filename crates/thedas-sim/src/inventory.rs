@@ -43,6 +43,9 @@ const ALL_ATTRIBUTES: i32 = -1000;
 /// +0x790 in DAOrigins.exe).
 pub const BODY_BAG_FIELD: &str = "BodyBag";
 
+/// The template body bags are made from (see [`Sim::spawn_body_bag`]).
+pub const BODY_BAG_TEMPLATE: &str = "gen_ip_bodybag";
+
 /// `BITM_base.gda`'s `Money - Copper`.
 const BASE_ITEM_COPPER: i32 = 17;
 /// `Crafting Recipe` in `bitm_base`.
@@ -1231,14 +1234,21 @@ impl Sim {
         if items.is_empty() && money == 0 && old_bag.is_none() {
             return None;
         }
+        // Built from its template (`gen_ip_bodybag.utp`: `placeable_core`, appearance 16 "Body
+        // Bag", useable), as `CreateObject` builds a placeable: the player's use of it goes to
+        // `placeable_core`, which opens it for looting (`OpenInventory`). A bare object had
+        // no script, so using it did nothing and what it held could not be taken (Oskias's
+        // lyrium nuggets, the Dwarf Commoner's opening quest).
         let bag = match old_bag {
             Some(b) => b,
-            None => self.world.spawn(ObjectKind::Placeable, "gen_ip_bodybag"),
+            None => {
+                self.create_from_template(ObjectKind::Placeable, BODY_BAG_TEMPLATE, area, pos, 0.0)
+            }
         };
         if let Some(b) = self.world.get_mut(bag) {
             b.position = pos;
             b.area = area;
-            b.template = "gen_ip_bodybag".into();
+            b.template = BODY_BAG_TEMPLATE.into();
             b.inventory.extend(items.iter().copied());
             b.money = b.money.saturating_add(money);
         }
@@ -1250,6 +1260,78 @@ impl Sim {
             c.other_set.retain(|_, i| !items.contains(i));
         }
         Some(bag)
+    }
+}
+
+#[cfg(test)]
+mod body_bag_tests {
+    use std::sync::Arc;
+
+    use thedas_formats::gff3::{Field, Gff3, Struct, Value as G3};
+    use thedas_script::EngineTable;
+    use thedas_vfs::Vfs;
+
+    use super::*;
+
+    /// A `gen_ip_bodybag.utp` with the fields that matter here, in a resource stack.
+    fn sim_with_bag_template() -> Sim {
+        let dir = std::env::temp_dir().join(format!("thedas-bodybag-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("gen_ip_bodybag.utp");
+        let field = |label: &str, value: G3| Field {
+            label: label.into(),
+            value,
+        };
+        let g = Gff3 {
+            file_type: *b"UTP ",
+            file_version: *b"V3.2",
+            structs: vec![Struct {
+                id: 0xffff_ffff,
+                fields: vec![
+                    field("Tag", G3::ExoString(b"gen_ip_bodybag".to_vec())),
+                    field("EventScript", G3::ResRef(b"placeable_core".to_vec())),
+                    field("Appearance", G3::Dword(16)),
+                    field("Useable", G3::Byte(1)),
+                ],
+            }],
+        };
+        std::fs::write(&file, g.write().unwrap()).unwrap();
+        let mut vfs = Vfs::new();
+        vfs.push_files(std::slice::from_ref(&file), "test");
+        Sim::new(Arc::new(vfs), Arc::new(EngineTable::parse(b"").unwrap()), 1)
+    }
+
+    #[test]
+    fn a_body_bag_is_built_from_its_template_so_its_use_reaches_placeable_core() {
+        let mut s = sim_with_bag_template();
+        let foe = s.world.spawn(ObjectKind::Creature, "foe");
+        s.world.get_mut(foe).unwrap().money = 5;
+        let bag = s.spawn_body_bag(foe, false).unwrap();
+        let b = s.world.get(bag).unwrap();
+        assert_eq!(b.script.as_deref(), Some("placeable_core"));
+        assert_eq!(b.appearance, 16);
+        assert!(b.interactive);
+        assert_eq!(b.money, 5);
+    }
+
+    #[test]
+    fn a_saved_bag_without_its_template_takes_it_on_load_and_keeps_its_items() {
+        let mut s = sim_with_bag_template();
+        // As bags were made before: a bare object holding the items.
+        let bag = s.world.spawn(ObjectKind::Placeable, BODY_BAG_TEMPLATE);
+        let nugget = s.world.spawn(ObjectKind::Item, "bdc130im_lyrium_ore");
+        {
+            let b = s.world.get_mut(bag).unwrap();
+            b.template = BODY_BAG_TEMPLATE.into();
+            b.position = [1.0, 2.0, 0.0];
+            b.inventory.push(nugget);
+        }
+        s.repair_body_bags();
+        let b = s.world.get(bag).unwrap();
+        assert_eq!(b.script.as_deref(), Some("placeable_core"));
+        assert_eq!(b.appearance, 16);
+        assert_eq!(b.inventory, vec![nugget]);
+        assert_eq!(b.position, [1.0, 2.0, 0.0]);
     }
 }
 
