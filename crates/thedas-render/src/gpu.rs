@@ -1600,10 +1600,11 @@ impl AreaRenderer {
                 state.world = transform * follow * e.in_model;
                 // Timed from the first posing, when the scene was built.
                 let epoch = *self.effects_epoch.get_or_insert(self.time);
-                state.rate = e
-                    .rate
-                    .as_ref()
-                    .and_then(|r| r.at((self.time - epoch) as f32));
+                let since = (self.time - epoch) as f32;
+                state.rate = e.rate.as_ref().and_then(|r| r.at(since));
+                state.color = e.rate.as_ref().and_then(|r| r.color_at(since));
+                let own = state.blueprint.age_scale_multiplier;
+                state.scale = e.rate.as_ref().and_then(|r| r.scale_at(since, own));
             }
         }
     }
@@ -1616,6 +1617,9 @@ impl AreaRenderer {
             for e in &p.emitters {
                 if let Some(state) = self.emitters.get_mut(e.emitter) {
                     state.rate = e.rate.as_ref().and_then(|r| r.at(at));
+                    state.color = e.rate.as_ref().and_then(|r| r.color_at(at));
+                    let own = state.blueprint.age_scale_multiplier;
+                    state.scale = e.rate.as_ref().and_then(|r| r.scale_at(at, own));
                 }
             }
         }
@@ -1634,6 +1638,9 @@ impl AreaRenderer {
                 for e in &p.emitters {
                     if let Some(state) = self.emitters.get_mut(e.emitter) {
                         state.rate = e.rate.as_ref().and_then(|r| r.at(t as f32));
+                        state.color = e.rate.as_ref().and_then(|r| r.color_at(t as f32));
+                        let own = state.blueprint.age_scale_multiplier;
+                        state.scale = e.rate.as_ref().and_then(|r| r.scale_at(t as f32, own));
                     }
                 }
             }

@@ -630,6 +630,52 @@ impl EffectTimeline {
             _ => Some((0.0, 0.0)),
         }
     }
+
+    /// The emitter's age map colour multiplier `since_built` seconds after the scene was
+    /// built, as the effect's animations set it (`<emitter>_agemapcolormultiplier`: a
+    /// glyph's glow fades in by it); `None` for the emitter's own. An instant effect holds
+    /// its impact's last value once the impact is over.
+    pub fn color_at(&self, since_built: f32) -> Option<[f32; 4]> {
+        self.param(since_built, |r, t| r.color.as_ref().map(|c| c.at(t)))
+    }
+
+    /// The emitter's age map size multipliers (x, y) `since_built` seconds after the scene
+    /// was built, as the effect's animations set them (`<emitter>_agemapscalexmultiplier`
+    /// and `..y..`: a flare grown from nothing); `None` for the emitter's own. Either track
+    /// alone leaves the other axis at the emitter's own (`own`).
+    pub fn scale_at(&self, since_built: f32, own: [f32; 2]) -> Option<[f32; 2]> {
+        self.param(since_built, |r, t| {
+            if r.scale_x.is_none() && r.scale_y.is_none() {
+                return None;
+            }
+            Some([
+                r.scale_x.as_ref().map_or(own[0], |k| k.at(t)),
+                r.scale_y.as_ref().map_or(own[1], |k| k.at(t)),
+            ])
+        })
+    }
+
+    /// An animated parameter `since_built` seconds after the scene was built: `get` of the
+    /// animation playing and the time into it (the impact once, then a lasting effect's
+    /// duration looped); an instant effect holds its impact's end once the impact is over.
+    fn param<T>(&self, since_built: f32, get: impl Fn(&EffectRate, f32) -> Option<T>) -> Option<T> {
+        let t = self.age + since_built.max(0.0);
+        let impact = self.impact.as_ref().map_or(0.0, |i| i.length);
+        let looped = |r: &EffectRate, t: f32| {
+            if r.length > 0.0 {
+                t.rem_euclid(r.length)
+            } else {
+                0.0
+            }
+        };
+        match (&self.impact, &self.duration) {
+            (Some(i), _) if t < impact => get(i, t),
+            (_, Some(d)) if self.lasting => get(d, looped(d, t - impact)),
+            _ if self.lasting => None,
+            (Some(i), _) => get(i, i.length),
+            (None, _) => None,
+        }
+    }
 }
 
 /// An effect emitter's birthrate over one of its effect's animations: the
@@ -639,6 +685,11 @@ pub struct EffectRate {
     pub length: f32,
     pub birthrate: Option<thedas_formats::anim::ScalarTrack>,
     pub range: Option<thedas_formats::anim::ScalarTrack>,
+    /// The `<emitter>_agemapcolormultiplier` colour track.
+    pub color: Option<thedas_formats::anim::ColorTrack>,
+    /// The `<emitter>_agemapscalexmultiplier` and `..y..` tracks.
+    pub scale_x: Option<thedas_formats::anim::ScalarTrack>,
+    pub scale_y: Option<thedas_formats::anim::ScalarTrack>,
 }
 
 impl EffectRate {
@@ -2802,6 +2853,13 @@ impl<'a> Loader<'a> {
                     length: a.length,
                     birthrate: track("birthrate"),
                     range: track("birthraterange"),
+                    color: a
+                        .colors
+                        .iter()
+                        .find(|c| c.target == format!("{name}_agemapcolormultiplier"))
+                        .cloned(),
+                    scale_x: track("agemapscalexmultiplier"),
+                    scale_y: track("agemapscaleymultiplier"),
                 })
             };
             let rate = Some(EffectTimeline {
@@ -3766,6 +3824,42 @@ mod tests {
     }
 
     #[test]
+    fn an_effects_colour_multiplier_follows_its_animations() {
+        use thedas_formats::anim::ColorTrack;
+        let fade_in = EffectRate {
+            length: 1.0,
+            birthrate: None,
+            range: None,
+            scale_x: None,
+            scale_y: None,
+            color: Some(ColorTrack {
+                target: "glow_agemapcolormultiplier".into(),
+                keys: vec![(0.0, [1.0, 1.0, 1.0, 0.0]), (1.0, [1.0, 1.0, 1.0, 1.0])],
+            }),
+        };
+        let instant = EffectTimeline {
+            age: 0.0,
+            lasting: false,
+            impact: Some(fade_in.clone()),
+            duration: None,
+        };
+        assert_eq!(instant.color_at(0.5), Some([1.0, 1.0, 1.0, 0.5]));
+        // Past the impact an instant effect holds its last value.
+        assert_eq!(instant.color_at(3.0), Some([1.0, 1.0, 1.0, 1.0]));
+        // A duration without the track leaves the emitter's own.
+        let lasting = EffectTimeline {
+            lasting: true,
+            duration: Some(EffectRate {
+                color: None,
+                ..fade_in.clone()
+            }),
+            ..instant.clone()
+        };
+        assert_eq!(lasting.color_at(0.5), Some([1.0, 1.0, 1.0, 0.5]));
+        assert_eq!(lasting.color_at(1.5), None);
+    }
+
+    #[test]
     fn an_effect_birthrate_loops_with_its_animation() {
         use thedas_formats::anim::ScalarTrack;
         let r = EffectRate {
@@ -3775,6 +3869,9 @@ mod tests {
                 keys: vec![(0.0, 5.0), (2.0, 10.0)],
             }),
             range: None,
+            scale_x: None,
+            scale_y: None,
+            color: None,
         };
         assert_eq!(r.at(1.0), Some((7.5, 0.0)));
         // Looped: 3 s is 1 s into the second pass.
@@ -3784,6 +3881,9 @@ mod tests {
             length: 2.0,
             birthrate: None,
             range: None,
+            scale_x: None,
+            scale_y: None,
+            color: None,
         };
         assert_eq!(own.at(1.0), None);
 
@@ -3799,6 +3899,9 @@ mod tests {
                     keys: vec![(0.0, 20.0), (1.0, 20.0)],
                 }),
                 range: None,
+                scale_x: None,
+                scale_y: None,
+                color: None,
             }),
         };
         assert_eq!(lasting.at(0.5), Some((7.5, 0.0)));
