@@ -117,6 +117,9 @@ pub struct Object {
     /// see [`heading_of`] and [`facing_toward`].
     pub facing: f32,
     pub active: bool,
+    /// A placeable's runtime physics group override (Origins destruction writes 1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placeable_group: Option<u32>,
     pub locals: Locals,
     /// The script that receives this object's events.
     pub script: Option<String>,
@@ -192,6 +195,10 @@ pub struct Object {
     /// loaded meanwhile); restored when the party comes back.
     #[serde(default)]
     pub parked: Option<bool>,
+    /// Origins' scripted heartbeat interval and elapsed seconds. Our deterministic
+    /// snapshots retain elapsed too; the original save format only retains interval.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heartbeat: Option<Heartbeat>,
     pub effects: Vec<Effect>,
     /// Combat bookkeeping (perception, threat, the pending attack); see `combat`.
     #[serde(default)]
@@ -235,6 +242,7 @@ impl Object {
             area: None,
             position: [0.0; 3],
             facing: 0.0,
+            placeable_group: None,
             active: true,
             locals: Locals::default(),
             script: None,
@@ -264,6 +272,7 @@ impl Object {
             escorts: Vec::new(),
             stored: BTreeMap::new(),
             parked: None,
+            heartbeat: None,
             effects: Vec::new(),
             combat: Default::default(),
             abilities: std::collections::BTreeSet::new(),
@@ -276,6 +285,19 @@ impl Object {
             aoe: None,
             item_properties: None,
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Heartbeat {
+    /// Raw float bits let JSON snapshots retain disabled NaN/infinite intervals.
+    pub interval_bits: u32,
+    pub elapsed: f32,
+}
+
+impl Heartbeat {
+    pub fn interval(&self) -> f32 {
+        f32::from_bits(self.interval_bits)
     }
 }
 
@@ -605,6 +627,9 @@ pub struct World {
     /// Plot flags by (plot resource, flag).
     #[serde(with = "pairs")]
     pub plots: BTreeMap<(String, i32), bool>,
+    /// Runtime pathing-cell writes by area, independent of the shared layout resource.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) nav_patches: BTreeMap<ObjectId, BTreeMap<u32, u8>>,
     /// Each quest's latest journal entry, by plot GUID (see [`crate::journal`]).
     #[serde(default)]
     pub journal: BTreeMap<String, crate::journal::JournalMark>,
@@ -890,6 +915,7 @@ impl World {
             controlled: None,
             party: None,
             plots: BTreeMap::new(),
+            nav_patches: BTreeMap::new(),
             journal: BTreeMap::new(),
             journal_seq: 0,
             recipes: BTreeSet::new(),

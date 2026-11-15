@@ -147,6 +147,11 @@ or install ("Remove", "Download from Steam") carry a fuller accessible name ("Re
 Age: Origins (Steam, This computer)", "Download Dragon Age II from Steam"); text fields are
 labelled by the text beside them.
 
+The macOS adapter is patched locally in `vendor/accesskit_macos` to expose native
+`AXHeading` roles and disclosure triangles with expanded/collapsed state. See its
+`PATCHES.md` for the upstream version and the small adapter diff. egui already supplies
+the disclosure's expanded state; the adapter maps it to `AXExpanded` and `AXValue`.
+
 Scripts drive the launcher through the same tree, clicking controls by name
 (`launcher_control.rs` has the full list):
 
@@ -162,7 +167,8 @@ Scripts drive the launcher through the same tree, clicking controls by name
   `#` comment lines ignored, `${NAME}` replaced by an environment variable.
 - `expect <what>` fails the step unless the page is as said (it retries for four seconds):
   `page`, `heading`, `text`, `no text`, `focus`, `enabled`/`disabled`, `installs`, `message`,
-  `launch`. `mkinstall <folder> [da2]` makes a stand-in install (folders only) to find or
+  `launch`, `expanded`/`collapsed`. `tree` includes an `expanded` boolean for disclosures.
+  `mkinstall <folder> [da2]` makes a stand-in install (folders only) to find or
   pick. `key Shift+Tab` and other modifier combinations work.
 - `THEDAS_LAUNCHER_CONFIG=<file>` points the launcher at a scratch settings file, and
   `THEDAS_LAUNCHER_DRY_RUN=1` makes Play report the command it would run (`launch` in `status`)
@@ -189,6 +195,14 @@ box with no display, wrap it in `xvfb-run -a`. On Windows, set `HOME`/`USERPROFI
 Screenshots of each stage go to `$OUT`. The scripts read the page through the same
 accessibility tree a screen reader does, so a control that loses its name or order fails them.
 They do not stand in for hearing it in VoiceOver or Narrator: that needs a person.
+
+On macOS, `osascript -l JavaScript docs/launcher-qa/macos-ax.js <pid>` dumps the native
+AX roles of the scratch launcher process you started, including the disclosure's
+`AXExpanded` and `AXValue`. It requires exactly one window in that process and never
+reads other processes' windows. A first query can activate the adapter; query again
+after a frame if it returns only the window decorations. Appending `press` presses
+"Don't have the game?" through `AXPress`, so a subsequent dump can verify the state
+changed. Use the scratch environment from `run.sh`, and only a launcher PID you own.
 
 Keyboard behaviour they pin down: Tab goes header, page, footer (Back before the primary
 button, the tabs in reading order); a page change that is not a click on a tab moves focus to

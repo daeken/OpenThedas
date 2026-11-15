@@ -60,6 +60,7 @@ pub mod model;
 pub mod morph;
 pub mod phy;
 pub mod probe;
+pub mod pwk;
 pub mod speedtree;
 pub mod speedtree_gen;
 pub mod stage;
