@@ -2746,7 +2746,14 @@ pub fn call(
                     o.area
                 }
             });
-            let filter = EffectFilter::new(int(a, 2), int(a, 1), creator, 0);
+            // Unlike 0x673d70, this handler does not normalize ability -1.
+            let ability = int(a, 1);
+            let filter = EffectFilter {
+                ty: int(a, 2),
+                ability: (ability != 0).then_some(ability),
+                creator: Some(creator),
+                duration_type: 0,
+            };
             let mut list = Vec::new();
             if let Some(area) = area {
                 for o in h
@@ -7748,6 +7755,14 @@ mod tests {
         assert_eq!(id(&mut s, &first), Some(Value::Int(1)));
         let third = run(&mut s, 1, "Effect", &[Value::Int(4)]).unwrap();
         assert_eq!(id(&mut s, &third), Some(Value::Int(3)));
+        let mut old: serde_json::Value = serde_json::from_slice(&s.save_json().unwrap()).unwrap();
+        old["world"]
+            .as_object_mut()
+            .unwrap()
+            .remove("next_effect_id");
+        s.load_json(&serde_json::to_vec(&old).unwrap()).unwrap();
+        let fourth = run(&mut s, 1, "Effect", &[Value::Int(4)]).unwrap();
+        assert_eq!(id(&mut s, &fourth), Some(Value::Int(4)));
     }
 
     #[test]
@@ -7801,6 +7816,7 @@ mod tests {
         assert_eq!(count(&mut s, 0, 0), 5);
         assert_eq!(count(&mut s, 10, 1012), 4);
         assert_eq!(count(&mut s, 10, 4), 0);
+        assert_eq!(count(&mut s, -1, 0), 0);
         let e = s.world.get(target).unwrap().effects[0].clone();
         let Some(Value::Array { items, .. }) = run(
             &mut s,
@@ -7833,6 +7849,14 @@ mod tests {
         let mut e = s.world.get(target).unwrap().effects[0].clone();
         e.flags = 123;
         assert!(s.remove_effect(target, &e));
+        let raw = Effect {
+            ty: 1012,
+            creator: Some(creator),
+            duration_type: 3,
+            ..Default::default()
+        };
+        s.apply_effect(target, raw.clone());
+        assert!(s.remove_effect(target, &raw));
     }
 
     #[test]
