@@ -105,6 +105,9 @@ The player lives in `crates/thedas-gfx`:
    Leading is included once for a single line, and between subsequent lines.
    A newline within an HTML span carries the first span's line metrics forward until
    another span begins at a line boundary, matching the credits' mixed-size headings.
+   TextField `_x` and `_y` include the scaled authored bounds origin. Reads and writes
+   retain that origin, so helpers place inline tooltip dividers at the field's actual
+   position, including fields whose edit-text bounds start at negative coordinates.
 5. **`render`**: wgpu. Shapes are tessellated once per character (lyon) into cached vertex
    buffers; bitmaps (atlas DDS pages) uploaded once; scale9 drawn natively. Colour transform
    and blend mode per draw; multiply and the few other modes against the scene picture,
