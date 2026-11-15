@@ -1930,6 +1930,12 @@ impl Sim {
         // The old area unloads: its objects go inactive, remembering whether they were
         // active for when the party comes back.
         if let Some(old) = old {
+            // DAOrigins.exe 0x6c5e94 ends every ambient dialog at area unload, including
+            // those owned by party members who are about to travel with the player.
+            if self.game == thedas_vfs::Game::Origins {
+                self.clear_ambient(OBJECT_INVALID);
+                self.world.ambient_lines.clear();
+            }
             for o in self.world.objects.values_mut() {
                 if o.area == Some(old) && !party.contains(&o.id) || o.id == old {
                     o.parked = Some(o.active);

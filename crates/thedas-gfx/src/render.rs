@@ -35,10 +35,13 @@ struct Draw {
     mode: vec4<f32>,
     // A rectangular mask in target pixels (x0, y0, x1, y1); all zeros for none.
     clip: vec4<f32>,
+    // The target's size in pixels (for edge anti-aliasing); zero to skip it.
+    view: vec4<f32>,
 };
 struct Vert {
     pos: vec2<f32>,
     uv: vec2<f32>,
+    extrude: vec2<f32>,
     color: u32,
     pad: u32,
 };
@@ -62,8 +65,26 @@ fn vs(@builtin(vertex_index) vi: u32) -> V {
     let v = verts[e.x];
     let d = draws[e.y];
     var o: V;
-    let x = d.m0.x * v.pos.x + d.m0.y * v.pos.y + d.m0.z;
-    let y = d.m1.x * v.pos.x + d.m1.y * v.pos.y + d.m1.z;
+    var x = d.m0.x * v.pos.x + d.m0.y * v.pos.y + d.m0.z;
+    var y = d.m1.x * v.pos.x + d.m1.y * v.pos.y + d.m1.z;
+    // Edge anti-aliasing: an outer fringe vertex moves one pixel out along its normal.
+    if (any(v.extrude != vec2<f32>(0.0)) && d.view.x > 0.0) {
+        let half = d.view.xy * 0.5;
+        let dir = vec2<f32>(
+            d.m0.x * v.extrude.x + d.m0.y * v.extrude.y,
+            d.m1.x * v.extrude.x + d.m1.y * v.extrude.y) * half;
+        let len = length(dir);
+        if (len > 0.0) {
+            let step = dir / len / half;
+            x = x + step.x;
+            y = y + step.y;
+        }
+    }
+    // Atlas glyphs land on whole pixels, as they were rasterised (no bilinear smear).
+    if (i32(d.mode.x + 0.5) == 5 && d.view.x > 0.0) {
+        x = (round((x * 0.5 + 0.5) * d.view.x) / d.view.x) * 2.0 - 1.0;
+        y = (round((y * 0.5 + 0.5) * d.view.y) / d.view.y) * 2.0 - 1.0;
+    }
     o.pos = vec4<f32>(x, y, 0.0, 1.0);
     o.uv = v.uv;
     o.color = unpack4x8unorm(v.color);
@@ -76,6 +97,10 @@ fn vs(@builtin(vertex_index) vi: u32) -> V {
 
 fn shade(i: V) -> vec4<f32> {
     let d = draws[i.rec];
+    // A mask's stencil takes only the shape itself, not its anti-aliasing fringe.
+    if (d.mode.y < -0.5 && i.color.a < 0.5) {
+        discard;
+    }
     if (any(d.clip != vec4<f32>(0.0))
         && (i.pos.x < d.clip.x || i.pos.y < d.clip.y || i.pos.x >= d.clip.z || i.pos.y >= d.clip.w)) {
         discard;
@@ -89,7 +114,10 @@ fn shade(i: V) -> vec4<f32> {
     let gy = dpdy(i.uv);
     if (mode == 1) {
         let t = sample_tex(slot, smp_index, i.uv, gx, gy);
-        c = vec4<f32>(t.rgb / max(t.a, 0.00001), t.a);
+        c = vec4<f32>(t.rgb / max(t.a, 0.00001), t.a * i.color.a);
+    } else if (mode == 5) {
+        let t = sample_tex(slot, smp_index, i.uv, gx, gy);
+        c = vec4<f32>(i.color.rgb, i.color.a * t.a);
     } else if (mode >= 2) {
         let g = vec2<f32>(
             d.g0.x * i.local.x + d.g0.y * i.local.y + d.g0.z,
@@ -101,7 +129,7 @@ fn shade(i: V) -> vec4<f32> {
             t = length(g) / 16384.0;
         }
         let r = sample_tex(slot, 0u, vec2<f32>(clamp(t, 0.0, 1.0) * (255.0 / 256.0) + 0.5 / 256.0, 0.5), vec2<f32>(0.0), vec2<f32>(0.0));
-        c = vec4<f32>(r.rgb / max(r.a, 0.00001), r.a);
+        c = vec4<f32>(r.rgb / max(r.a, 0.00001), r.a * i.color.a);
     }
     c = clamp(c * d.mul + d.add, vec4<f32>(0.0), vec4<f32>(1.0));
     return vec4<f32>(c.rgb * c.a, c.a);
@@ -170,6 +198,11 @@ fn shader_source(bindless: bool) -> String {
     }
 }
 
+/// Glyph atlas pages are this many pixels square.
+const GLYPH_PAGE: u32 = 1024;
+/// The paint of atlas glyphs: the texture's coverage times the vertex colour.
+const GLYPH_PAINT: f32 = 5.0;
+
 /// The most texture slots a bindless table holds.
 const MAX_SLOTS: u32 = 4096;
 
@@ -186,9 +219,9 @@ struct DrawU {
     /// A rectangle (x0, y0, x1, y1, target pixels) outside which nothing draws: a mask that
     /// is an axis-aligned rectangle, without the stencil. All zeros: none.
     clip: [f32; 4],
+    /// The target's size in pixels, for edge anti-aliasing (zeros: none).
+    view: [f32; 4],
 }
-
-const SAMPLES: u32 = 4;
 
 struct GpuMesh {
     /// Where the vertices are in the arena, and the triangles (relative to that start).
@@ -394,6 +427,9 @@ pub struct Renderer {
     white_view: wgpu::TextureView,
     /// Draw calls in the last render, after merging.
     pub calls: usize,
+    /// Samples per pixel (1: edge anti-aliasing and the glyph atlas do the smoothing;
+    /// `THEDAS_UI_MSAA=4` brings multisampling back for comparison).
+    samples: u32,
     shader: wgpu::ShaderModule,
     pipeline_layout: wgpu::PipelineLayout,
     white: wgpu::BindGroup,
@@ -405,7 +441,10 @@ pub struct Renderer {
     cpu_shapes: HashMap<(u16, u16), Vec<CpuShape>>,
     scale9: HashMap<(DisplayId, [u32; 8]), Vec<Arc<GpuMesh>>>,
     glyphs: HashMap<(usize, usize), Arc<GlyphMesh>>,
-    texts: HashMap<DisplayId, (u64, Vec<Arc<GpuMesh>>)>,
+    texts: HashMap<DisplayId, (u64, u64, Vec<Arc<GpuMesh>>)>,
+    /// The glyph atlas: packing, and each page's texture.
+    glyph_packer: crate::glyphs::Packer,
+    glyph_pages: Vec<(wgpu::Texture, crate::gpu::Tex)>,
     /// Drawing-API meshes by clip, with a hash of the drawing they were made from.
     drawings: HashMap<DisplayId, (u64, Vec<Arc<GpuMesh>>)>,
     /// Quads of images loaded into clips, by URL and size.
@@ -425,7 +464,8 @@ pub struct Renderer {
 struct Targets {
     size: (u32, u32),
     output: wgpu::Texture,
-    msaa: wgpu::TextureView,
+    /// The multisampled picture resolved into `output` (none at one sample).
+    msaa: Option<wgpu::TextureView>,
     stencil: wgpu::TextureView,
 }
 
@@ -545,6 +585,11 @@ impl Renderer {
             stream: None,
             white_view,
             calls: 0,
+            samples: std::env::var("THEDAS_UI_MSAA")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .filter(|n| [1, 2, 4].contains(n))
+                .unwrap_or(1),
             shader,
             pipeline_layout,
             white,
@@ -557,6 +602,8 @@ impl Renderer {
             scale9: HashMap::new(),
             glyphs: HashMap::new(),
             texts: HashMap::new(),
+            glyph_packer: crate::glyphs::Packer::new(GLYPH_PAGE),
+            glyph_pages: Vec::new(),
             drawings: HashMap::new(),
             bitmap_quads: HashMap::new(),
             stats: RenderStats::default(),
@@ -609,7 +656,7 @@ impl Renderer {
                         bias: Default::default(),
                     }),
                     multisample: wgpu::MultisampleState {
-                        count: SAMPLES,
+                        count: self.samples,
                         ..Default::default()
                     },
                     fragment: Some(wgpu::FragmentState {
@@ -669,11 +716,17 @@ impl Renderer {
                 | wgpu::TextureUsages::TEXTURE_BINDING
                 | wgpu::TextureUsages::COPY_SRC,
         );
-        let msaa = tex(self.format, SAMPLES, wgpu::TextureUsages::RENDER_ATTACHMENT)
-            .create_view(&Default::default());
+        let msaa = (self.samples > 1).then(|| {
+            tex(
+                self.format,
+                self.samples,
+                wgpu::TextureUsages::RENDER_ATTACHMENT,
+            )
+            .create_view(&Default::default())
+        });
         let stencil = tex(
             wgpu::TextureFormat::Depth24PlusStencil8,
-            SAMPLES,
+            self.samples,
             wgpu::TextureUsages::RENDER_ATTACHMENT,
         )
         .create_view(&Default::default());
@@ -989,8 +1042,8 @@ impl Renderer {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("gfx"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &t.msaa,
-                    resolve_target: Some(&out_view),
+                    view: t.msaa.as_ref().unwrap_or(&out_view),
+                    resolve_target: t.msaa.as_ref().map(|_| &out_view),
                     depth_slice: None,
                     ops: wgpu::Operations {
                         load: if first {
@@ -998,7 +1051,8 @@ impl Renderer {
                         } else {
                             wgpu::LoadOp::Load
                         },
-                        store: if snapshot.is_some() {
+                        // Without multisampling the attachment is the picture itself.
+                        store: if snapshot.is_some() || t.msaa.is_none() {
                             wgpu::StoreOp::Store
                         } else {
                             wgpu::StoreOp::Discard
@@ -1315,6 +1369,88 @@ impl Renderer {
         out
     }
 
+    /// Glyph `index` of `font` rasterised at `px` pixels per em into the atlas; `None` when
+    /// it has no pixels or is too large for it (the outline is drawn instead).
+    fn atlas_glyph(
+        &mut self,
+        font: &Arc<crate::swf::Font>,
+        index: usize,
+        px: (f32, f32),
+    ) -> Option<crate::glyphs::Placed> {
+        if !(1.0..=160.0).contains(&px.0) || !(1.0..=160.0).contains(&px.1) {
+            return None;
+        }
+        let key = (
+            Arc::as_ptr(font) as usize,
+            index,
+            (px.0 * 4.0).round() as u32,
+            (px.1 * 4.0).round() as u32,
+        );
+        if let Some(p) = self.glyph_packer.get(key) {
+            return p;
+        }
+        let records = font.glyphs.get(index).map(|g| g.outline.as_slice())?;
+        let bitmap = crate::glyphs::rasterize_xy(records, px.0 / font.em, px.1 / font.em);
+        let placed = bitmap.and_then(|b| {
+            let (page, x, y) = self.glyph_packer.place(b.w, b.h)?;
+            while self.glyph_pages.len() <= page {
+                let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("gfx glyph atlas"),
+                    size: wgpu::Extent3d {
+                        width: GLYPH_PAGE,
+                        height: GLYPH_PAGE,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                    view_formats: &[],
+                });
+                let tex = self.make_tex(&texture, crate::gpu::SAMPLER_CLAMP);
+                self.glyph_pages.push((texture, tex));
+            }
+            // White, premultiplied by coverage.
+            let px: Vec<u8> = b.alpha.iter().flat_map(|&a| [a, a, a, a]).collect();
+            self.queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &self.glyph_pages[page].0,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d { x, y, z: 0 },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &px,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(b.w * 4),
+                    rows_per_image: Some(b.h),
+                },
+                wgpu::Extent3d {
+                    width: b.w,
+                    height: b.h,
+                    depth_or_array_layers: 1,
+                },
+            );
+            let s = GLYPH_PAGE as f32;
+            Some(crate::glyphs::Placed {
+                page,
+                uv: [
+                    x as f32 / s,
+                    y as f32 / s,
+                    (x + b.w) as f32 / s,
+                    (y + b.h) as f32 / s,
+                ],
+                left: b.left as f32,
+                top: b.top as f32,
+                w: b.w as f32,
+                h: b.h as f32,
+            })
+        });
+        self.glyph_packer.insert(key, placed);
+        placed
+    }
+
     fn glyph(&mut self, font: &Arc<crate::swf::Font>, index: usize) -> Arc<GlyphMesh> {
         let key = (Arc::as_ptr(font) as usize, index);
         self.glyphs
@@ -1330,19 +1466,27 @@ impl Renderer {
             .clone()
     }
 
+    /// `pxs`: target pixels per local pixel, horizontally and vertically, when the field is
+    /// drawn upright (glyphs come from the atlas, rasterised at that size); `None` draws the
+    /// glyphs' outlines.
     fn text_meshes(
         &mut self,
         player: &mut Player,
         images: &mut dyn Images,
         d: DisplayId,
+        pxs: Option<(f32, f32)>,
     ) -> Vec<Arc<GpuMesh>> {
         let fonts = player.vm.fonts.clone();
         let Some(t) = player.vm.display.get_mut(d).and_then(|o| o.text_mut()) else {
             return Vec::new();
         };
+        // Quarter-pixel steps: a field that only moves keeps its glyphs.
+        let px_key = pxs
+            .map(|(x, y)| ((x * 64.0).round() as u64) << 32 | (y * 64.0).round() as u64)
+            .unwrap_or(u64::MAX);
         let rev = t.revision;
-        if let Some((r, m)) = self.texts.get(&d) {
-            if *r == rev {
+        if let Some((r, k, m)) = self.texts.get(&d) {
+            if *r == rev && *k == px_key {
                 return m.clone();
             }
         }
@@ -1360,6 +1504,7 @@ impl Renderer {
                     pos: [x * 20.0, y * 20.0],
                     uv: [0.0; 2],
                     color: c,
+                    extrude: [0.0; 2],
                 });
             }
             m.indices
@@ -1463,6 +1608,8 @@ impl Renderer {
         }
         // Background/border/underlines are drawn first. Keep shadow geometry separate
         // from the glyphs: a button's RGB replacement must not recolour black shadows.
+        tess::fringe_mesh(&mut m);
+        tess::fringe_mesh(&mut selection_mesh);
         let mut out: Vec<_> = self
             .upload(&m, None, 0.0, Matrix::IDENTITY)
             .into_iter()
@@ -1494,6 +1641,7 @@ impl Renderer {
                         pos: [(bx + px) * 20.0, (by + py) * 20.0],
                         uv: [(px - x) / width, (py - y) / height],
                         color: [255; 4],
+                        extrude: [0.0; 2],
                     })
                     .to_vec(),
                 indices: vec![0, 1, 2, 0, 2, 3],
@@ -1503,6 +1651,8 @@ impl Renderer {
         m.vertices.clear();
         m.indices.clear();
         let mut shadow_mesh = m.clone();
+        let mut text_pages: std::collections::BTreeMap<usize, Mesh> = Default::default();
+        let mut shadow_pages: std::collections::BTreeMap<usize, Mesh> = Default::default();
         for (offset, is_shadow) in style
             .shadows
             .iter()
@@ -1510,8 +1660,9 @@ impl Renderer {
             .chain(style.text.iter().map(|offset| (offset, false)))
         {
             for (g, dy) in &glyphs {
-                let mesh = self.glyph(&g.font, g.glyph);
-                let scale = g.size * 20.0 / g.font.em;
+                let placed = pxs.and_then(|(px, py)| {
+                    self.atlas_glyph(&g.font, g.glyph, (g.size * px, g.size * py))
+                });
                 let (ox, oy, c) = if is_shadow {
                     (offset.0, offset.1, shadow_color)
                 } else {
@@ -1525,6 +1676,41 @@ impl Renderer {
                         },
                     )
                 };
+                if let (Some(pl), Some((px, py))) = (placed, pxs) {
+                    let pages = if is_shadow {
+                        &mut shadow_pages
+                    } else {
+                        &mut text_pages
+                    };
+                    let target = pages.entry(pl.page).or_insert_with(|| Mesh {
+                        paint: Paint::Solid,
+                        vertices: Vec::new(),
+                        indices: Vec::new(),
+                    });
+                    let x0 = (bx + g.x + ox) * 20.0 + pl.left / px * 20.0;
+                    let y0 = (by + g.y + dy + oy) * 20.0 + pl.top / py * 20.0;
+                    let (x1, y1) = (x0 + pl.w / px * 20.0, y0 + pl.h / py * 20.0);
+                    let base = target.vertices.len() as u32;
+                    for (x, y, u, v) in [
+                        (x0, y0, pl.uv[0], pl.uv[1]),
+                        (x1, y0, pl.uv[2], pl.uv[1]),
+                        (x1, y1, pl.uv[2], pl.uv[3]),
+                        (x0, y1, pl.uv[0], pl.uv[3]),
+                    ] {
+                        target.vertices.push(Vertex {
+                            pos: [x, y],
+                            uv: [u, v],
+                            color: [c[0], c[1], c[2], 255],
+                            extrude: [0.0; 2],
+                        });
+                    }
+                    target
+                        .indices
+                        .extend([base, base + 1, base + 2, base, base + 2, base + 3]);
+                    continue;
+                }
+                let mesh = self.glyph(&g.font, g.glyph);
+                let scale = g.size * 20.0 / g.font.em;
                 let target = if is_shadow { &mut shadow_mesh } else { &mut m };
                 let base = target.vertices.len() as u32;
                 for p in &mesh.0 {
@@ -1535,15 +1721,26 @@ impl Renderer {
                         ],
                         uv: [0.0; 2],
                         color: [c[0], c[1], c[2], 255],
+                        extrude: [0.0; 2],
                     });
                 }
                 target.indices.extend(mesh.1.iter().map(|i| i + base));
             }
         }
+        tess::fringe_mesh(&mut shadow_mesh);
+        tess::fringe_mesh(&mut caret_mesh);
         out.extend(self.upload_colored(&shadow_mesh, None, 0.0, Matrix::IDENTITY, true));
+        for (page, mesh) in &shadow_pages {
+            let tex = self.glyph_pages.get(*page).map(|p| p.1.clone());
+            out.extend(self.upload_colored(mesh, tex, GLYPH_PAINT, Matrix::IDENTITY, true));
+        }
         out.extend(self.upload(&m, None, 0.0, Matrix::IDENTITY));
+        for (page, mesh) in &text_pages {
+            let tex = self.glyph_pages.get(*page).map(|p| p.1.clone());
+            out.extend(self.upload(mesh, tex, GLYPH_PAINT, Matrix::IDENTITY));
+        }
         out.extend(self.upload(&caret_mesh, None, 0.0, Matrix::IDENTITY));
-        self.texts.insert(d, (rev, out.clone()));
+        self.texts.insert(d, (rev, px_key, out.clone()));
         out
     }
 
@@ -1733,6 +1930,7 @@ impl Renderer {
                     pos: [x, y],
                     uv: [u, v],
                     color: [255; 4],
+                    extrude: [0.0; 2],
                 })
                 .to_vec(),
                 indices: vec![0, 1, 2, 0, 2, 3],
@@ -1771,7 +1969,13 @@ impl Renderer {
                 let (id, r) = (*id, o.ratio);
                 self.shape_meshes(player, images, id, r)
             }
-            Kind::Text(_) => self.text_meshes(player, images, d),
+            Kind::Text(_) => {
+                // Upright fields (stretched or not) take their glyphs from the atlas.
+                let upright =
+                    world.b.abs() < 1e-5 && world.c.abs() < 1e-5 && world.a > 0.0 && world.d > 0.0;
+                let pxs = upright.then_some((world.a * view.k * 20.0, world.d * view.k * 20.0));
+                self.text_meshes(player, images, d, pxs)
+            }
             Kind::Bitmap { url, width, height } => {
                 let (url, w, h) = (url.clone(), *width, *height);
                 let key = (url.clone(), w.to_bits(), h.to_bits());
@@ -1790,6 +1994,7 @@ impl Renderer {
                                     pos: [x * w * 20.0, y * h * 20.0],
                                     uv: [x, y],
                                     color: [255; 4],
+                                    extrude: [0.0; 2],
                                 });
                             }
                             self.stats.uploads += 1;
@@ -1991,6 +2196,11 @@ impl Renderer {
             }
         }
         let reference = level;
+        for op in &tmp.ops {
+            if let Some(r) = b.uniforms.get_mut(op.uniform as usize) {
+                r.mode[1] = -1.0;
+            }
+        }
         for mut op in tmp.ops {
             op.stencil = mode;
             op.reference = reference;
@@ -2240,6 +2450,7 @@ fn slice_mesh(
             a.uv[1] + (b.uv[1] - a.uv[1]) * t,
         ],
         color: a.color,
+        extrude: [0.0; 2],
     };
     // Clips a polygon to `coord(v) >= edge` (keep_above) or `<= edge`.
     let clip = |poly: Vec<Vertex>, axis: usize, edge: f32, above: bool| -> Vec<Vertex> {
@@ -2417,6 +2628,7 @@ impl Build {
             ],
             mode: [0.0; 4],
             clip: self.clip,
+            view: [v.w, v.h, 0.0, 0.0],
         };
         self.uniforms.push(u);
         self.uniforms.len() as u32 - 1
@@ -2475,6 +2687,7 @@ fn image_quad(bounds: crate::swf::Rect) -> Mesh {
                 pos: [x[u], y[v]],
                 uv: [u as f32, v as f32],
                 color: [255; 4],
+                extrude: [0.0; 2],
             })
             .to_vec(),
         indices: vec![0, 1, 2, 0, 2, 3],

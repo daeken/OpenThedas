@@ -152,6 +152,7 @@ fn main() {
         r.render(&mut p, &mut NoImages, size);
         let _ = device.poll(wgpu::PollType::wait_indefinitely());
         let n = 60;
+        let (mut build_us, mut submit_us) = (0u64, 0u64);
         let (mut script, mut render, mut drawn) =
             (std::time::Duration::ZERO, std::time::Duration::ZERO, 0);
         for _ in 0..n {
@@ -160,18 +161,22 @@ fn main() {
             let b = std::time::Instant::now();
             if r.render_if_dirty(&mut p, &mut NoImages, size) {
                 drawn += 1;
+                build_us += r.stats.build_us;
+                submit_us += r.stats.submit_us;
             }
             let _ = device.poll(wgpu::PollType::wait_indefinitely());
             script += b - a;
             render += b.elapsed();
         }
         println!(
-            "per tick: script {:?}, render {:?} ({drawn}/{n} ticks drew, {} meshes in {} draw calls, bindless {})",
+            "per tick: script {:?}, render {:?} ({drawn}/{n} ticks drew, {} meshes in {} draw calls, bindless {}); per render build {} us, submit {} us",
             script / n,
             render / n,
             r.draws,
             r.calls,
-            r.bindless()
+            r.bindless(),
+            build_us / drawn.max(1) as u64,
+            submit_us / drawn.max(1) as u64
         );
     }
     for l in log
