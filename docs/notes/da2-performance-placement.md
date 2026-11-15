@@ -41,9 +41,9 @@ records default to the earlier release rules, and the marker is omitted when
 false so Origins snapshots do not gain a field.
 
 Activation remains the separately landed behavior. Unresolved bindings create
-no objects. Relative stages, native owner-context fallback, numbered follower
-bindings, processing suspension and full performance camera playback remain
-unfinished. Walkmesh handling uses the existing simulator floor lookup at the
+no objects. Relative stages, native owner-context fallback, processing suspension
+and full performance camera playback remain unfinished. Active-party follower
+aliases are a separate repair in PR #898. Walkmesh handling uses the existing simulator floor lookup at the
 prepared point; native 0x57d200's wider projection search is not reproduced.
 No combat balance, stats, damage or cooldown changes are included.
 
@@ -69,8 +69,15 @@ earlier pre-Ogre checkpoint still wipes at t=915150 on both, with identical
 complete saved JSON; this placement repair does not resolve that wipe.
 
 The same-renderer, same-camera matched capture has Before / After / Delta x4
-panels: 3.636% of pixels change at >2/255 in any RGB channel. Media remains staged
+panels: 4.350% of pixels change at >2/255 in any RGB channel. Media remains staged
 for coordinator review, never published by this job.
+
+Integration with the separate follower-binding repair places Bethany and Varric
+on their authored marks too. The same established Karl combat driver then wipes
+at t=1414027, including a run spending available level-up points and resting before
+the approach. Placement alone still wins as recorded above. The integration
+result is retained explicitly; processing suspension and actor AI remain open,
+and these checkpoint outcomes do not establish fresh-run completion.
 
 Synthetic regressions cover
 runtime-tag parsing, the explicit release switch, duplicate/missing bindings,
