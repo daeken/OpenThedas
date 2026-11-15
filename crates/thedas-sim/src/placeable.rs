@@ -477,6 +477,7 @@ mod tests {
     fn placeable_completion_rechecks_appearance_and_healing_and_keeps_prior_requests() {
         for (health, appearance, destroy) in [(1, 5, false), (0, 6, false), (0, 65_541, true)] {
             let (mut s, id) = playback_fixture();
+            s.set_placeable_health(id, 0);
             start(&mut s, id, "dying", 1.0);
             s.world.get_mut(id).unwrap().appearance = appearance;
             s.set_placeable_health(id, health);
