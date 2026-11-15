@@ -343,9 +343,7 @@ fn parse_vfx(spec: &str) -> Result<Vec<thedas_render::Prop>> {
         .filter(|s| !s.is_empty())
         .enumerate()
         .map(|(i, item)| {
-            let (model, at) = item
-                .split_once('@')
-                .context("--vfx takes MODEL@X,Y,Z")?;
+            let (model, at) = item.split_once('@').context("--vfx takes MODEL@X,Y,Z")?;
             let xyz: Vec<f32> = at
                 .split(',')
                 .map(|v| v.trim().parse::<f32>())
@@ -7704,7 +7702,10 @@ mod tests {
         assert_eq!(props[0].effects[0].model, "fxa_fire_aoe_p");
         assert_eq!(props[1].effects[0].model, "fxa_ice_cld_p");
         assert!(props[0].effects[0].lasting && props[0].models.is_empty());
-        assert_eq!(props[1].transform.w_axis.truncate(), glam::Vec3::new(-4.5, 0.0, 7.0));
+        assert_eq!(
+            props[1].transform.w_axis.truncate(),
+            glam::Vec3::new(-4.5, 0.0, 7.0)
+        );
         assert!(super::parse_vfx("").unwrap().is_empty());
         assert!(super::parse_vfx("fxa_fire_aoe_p").is_err());
         assert!(super::parse_vfx("fxa_fire_aoe_p@1,2").is_err());
