@@ -2402,6 +2402,7 @@ impl Sim {
                     facing: crate::world::facing_toward(place[0] - from[0], place[1] - from[1]),
                 }),
                 seconds: 0.0,
+                max_range: None,
                 ints: Vec::new(),
                 strings: Vec::new(),
                 due: None,
@@ -2859,15 +2860,6 @@ impl Sim {
         }
     }
 
-    /// Whether a `CommandMoveToObject` walker has arrived. DAOrigins.exe's executor
-    /// (0x7aa200) ends the move once the walker is within its range of the target, by its
-    /// range test (0x7a3090): the distance on the ground at most the larger of the two ranges
-    /// (the command keeps fMinRange and fMaxRange, raised to fMinRange, 0x66f312) plus
-    /// 0.05 m (0xaf70b0), and at least fMinRange less 0.05. A creature target's capsule
-    /// keeps the walker out (the controller stops against it), so a walker touching it has
-    /// arrived too. Provisional: fMaxRange is not kept (so the larger range is fMinRange),
-    /// and how the exe ends a walk stopped against its target is not traced (the
-    /// locomotion's status, 0x7a9130, decides).
     /// Puts a `CommandMoveToObject` walker that stepped inside its minimum range back out
     /// to it, on the line from the target.
     fn stop_at_range(&mut self, id: ObjectId) {
@@ -2889,6 +2881,11 @@ impl Sim {
         }
     }
 
+    /// DAOrigins.exe 0x7aa200 uses the horizontal range test at 0x7a3090:
+    /// fMaxRange (raised to fMinRange at 0x66f312) plus 0.05 m slack. Older saves
+    /// without a maximum keep their former minimum-only behavior. Provisional: a
+    /// walker already inside its minimum is not sent away, and capsule contact also
+    /// ends the walk (the native locomotion status at 0x7a9130 is not fully traced).
     fn move_to_object_arrived(&self, id: ObjectId) -> bool {
         const RANGE_SLACK: f32 = 0.05;
         let Some(o) = self.world.get(id) else {
@@ -2912,7 +2909,8 @@ impl Sim {
         // A step that went past the lower bound is put back at the range by
         // [`Sim::stop_at_range`]; a walker that starts inside it is not sent away
         // (provisional).
-        let in_range = d <= min + RANGE_SLACK;
+        let max = c.max_range.unwrap_or(min).max(min);
+        let in_range = d <= max + RANGE_SLACK;
         let touching = t.kind == ObjectKind::Creature
             && self.alive(t.id)
             && d <= self.capsule_radius(id) + self.capsule_radius(t.id) + RANGE_SLACK;
@@ -3715,16 +3713,10 @@ impl Sim {
                 }
             }
         }
-        // A move to an object ends where the object stands, except a walk to a creature,
-        // which ends where the walk stopped, against its body or in range
+        // A walk to an object ends where the walk stopped, against its body or in range
         // ([`Sim::move_to_object_arrived`]): the walker was set down on the creature (DA2's
         // Hawke on Flemeth). Provisional: the mover keeps its facing.
-        let walked_to_creature = cmd.from.is_some()
-            && cmd
-                .target
-                .and_then(|t| self.world.get(t))
-                .is_some_and(|t| t.kind == ObjectKind::Creature);
-        let to_object = cmd.name.starts_with("CommandMoveToObject") && !walked_to_creature;
+        let to_object = cmd.name.starts_with("CommandMoveToObject") && cmd.from.is_none();
         // A walk whose end lies in a closed door's doorway stopped at the door (its route is
         // cut short there, see `Sim::route_to`): the walker stays where the route left it
         // and is not set down at the end asked for, inside the doorway or past the leaf. (A
@@ -5303,6 +5295,7 @@ mod tests {
             target: None,
             location: None,
             seconds: 0.0,
+            max_range: None,
             ints: Vec::new(),
             strings: Vec::new(),
             due: None,
@@ -5824,6 +5817,7 @@ mod tests {
                 facing: 0.0,
             }),
             seconds: 0.0,
+            max_range: None,
             ints: Vec::new(),
             strings: Vec::new(),
             due: None,
@@ -5916,6 +5910,7 @@ mod tests {
             target: None,
             location: None,
             seconds,
+            max_range: None,
             ints: Vec::new(),
             strings: Vec::new(),
             due: None,
@@ -5958,6 +5953,7 @@ mod tests {
             target: None,
             location: None,
             seconds: 0.0,
+            max_range: None,
             ints: vec![1],
             strings: Vec::new(),
             due: None,
@@ -5995,6 +5991,7 @@ mod tests {
             target: Some(wp),
             location: None,
             seconds: 0.0,
+            max_range: None,
             ints: Vec::new(),
             strings: Vec::new(),
             due: None,
@@ -6013,6 +6010,39 @@ mod tests {
         assert!(o.commands.is_empty());
         assert_eq!(o.position, [80.0, 120.0, 29.5]);
         assert_eq!(o.area, Some(area));
+    }
+
+    #[test]
+    fn a_walk_to_an_object_stops_at_its_maximum_without_teleporting_to_the_target() {
+        for kind in [
+            ObjectKind::Creature,
+            ObjectKind::Waypoint,
+            ObjectKind::Placeable,
+        ] {
+            let mut s = sim();
+            let area = s.world.spawn(ObjectKind::Area, "a");
+            let walker = s.world.spawn(ObjectKind::Creature, "walker");
+            let target = s.world.spawn(kind, "target");
+            s.world.get_mut(walker).unwrap().area = Some(area);
+            let t = s.world.get_mut(target).unwrap();
+            t.area = Some(area);
+            t.position = [10.0, 0.0, 9.0];
+            s.world.get_mut(walker).unwrap().commands.push(Command {
+                name: "CommandMoveToObject".into(),
+                target: Some(target),
+                seconds: 1.0,
+                max_range: Some(4.0),
+                ints: vec![1],
+                ..Default::default()
+            });
+            for _ in 0..100 {
+                s.tick(50);
+            }
+            let o = s.world.get(walker).unwrap();
+            assert!(o.commands.is_empty());
+            let distance = (10.0 - o.position[0]).abs();
+            assert!((3.5..=4.05).contains(&distance), "{kind:?}: {distance}");
+        }
     }
 
     #[test]
@@ -6049,6 +6079,7 @@ mod tests {
                 name: "CommandMoveToObject".into(),
                 target: Some(target),
                 seconds: min,
+                max_range: None,
                 ints: vec![1],
                 ..Default::default()
             });
@@ -6108,6 +6139,7 @@ mod tests {
                 target: Some(hero),
                 location: None,
                 seconds: 0.0,
+                max_range: None,
                 ints: Vec::new(),
                 strings: Vec::new(),
                 due: None,
@@ -6158,6 +6190,7 @@ mod tests {
             target: None,
             location: Some(to),
             seconds: 0.0,
+            max_range: None,
             ints: Vec::new(),
             strings: Vec::new(),
             due: None,
@@ -6302,6 +6335,7 @@ mod tests {
             target: Some(t),
             location: None,
             seconds: 0.0,
+            max_range: None,
             ints: vec![0],
             strings: Vec::new(),
             due: None,
@@ -6368,6 +6402,7 @@ mod tests {
             target: Some(t),
             location: None,
             seconds: 0.0,
+            max_range: None,
             ints: Vec::new(),
             strings: Vec::new(),
             due: None,
@@ -6418,6 +6453,7 @@ mod tests {
             target,
             location,
             seconds: 0.0,
+            max_range: None,
             ints: Vec::new(),
             strings: Vec::new(),
             due: None,
@@ -6644,6 +6680,7 @@ mod tests {
                 target: Some(t),
                 location: None,
                 seconds: 0.0,
+                max_range: None,
                 ints: Vec::new(),
                 strings: Vec::new(),
                 due: Some(u64::MAX / 2),
@@ -6670,6 +6707,7 @@ mod tests {
             target: Some(t),
             location: None,
             seconds: 0.0,
+            max_range: None,
             ints: Vec::new(),
             strings: Vec::new(),
             due: None,
@@ -6750,6 +6788,7 @@ mod tests {
             target: None,
             location: None,
             seconds: 0.0,
+            max_range: None,
             ints: Vec::new(),
             strings: Vec::new(),
             due: None,
@@ -6814,6 +6853,7 @@ mod tests {
                 facing: 0.0,
             }),
             seconds: 0.0,
+            max_range: None,
             ints: Vec::new(),
             strings: Vec::new(),
             due: Some(t0 + 10_000),
@@ -7039,6 +7079,7 @@ mod tests {
             target: None,
             location: None,
             seconds: 0.0,
+            max_range: None,
             ints: vec![run, 0],
             strings: Vec::new(),
             due: None,

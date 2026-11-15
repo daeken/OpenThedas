@@ -2814,6 +2814,7 @@ pub fn call(
                 target: None,
                 location: None,
                 seconds: 0.0,
+                max_range: None,
                 ints: Vec::new(),
                 strings: Vec::new(),
                 due: None,
@@ -2827,9 +2828,8 @@ pub fn call(
                 arrived: false,
                 path: Vec::new(),
             };
-            // Only the first float is kept (a wait's seconds, a move's minimum range): a
-            // later one (CommandMoveToObject's fMaxRange) used to land there when the first
-            // was 0.
+            // The first float is a wait's seconds or a move's minimum range. Keep
+            // MoveToObject's second float as its maximum (0x66f260, clamp at 0x66f312).
             let mut first_float = true;
             for (p, v) in f.params.iter().zip(a) {
                 match (&p.ty, v) {
@@ -2837,6 +2837,9 @@ pub fn call(
                     (Type::Float, Value::Float(x)) if first_float => {
                         first_float = false;
                         c.seconds = *x;
+                    }
+                    (Type::Float, Value::Float(x)) if n == "CommandMoveToObject" => {
+                        c.max_range = Some(x.max(c.seconds));
                     }
                     (Type::Int, Value::Int(x)) => c.ints.push(*x),
                     (Type::String | Type::Resource, Value::String(s) | Value::Resource(s)) => {
@@ -7513,6 +7516,41 @@ mod tests {
     }
 
     #[test]
+    fn move_to_object_builder_keeps_both_ranges_and_old_saves_keep_the_minimum() {
+        let table = Arc::new(EngineTable::parse(b"#define ENGINE_STRUCTURE_2 command\n\
+            command CommandMoveToObject(object o, int r, float min, int original, float max) = 560;\n").unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        for (min, max, want) in [(0.0, 4.0, 4.0), (3.0, 1.0, 3.0), (2.0, 5.0, 5.0)] {
+            let value = run(
+                &mut s,
+                OBJECT_INVALID,
+                "CommandMoveToObject",
+                &[
+                    Value::Object(9),
+                    Value::Int(1),
+                    Value::Float(min),
+                    Value::Int(0),
+                    Value::Float(max),
+                ],
+            )
+            .unwrap();
+            let Value::Engine { handle, .. } = value else {
+                panic!("command")
+            };
+            let Some(EngineData::Command(c)) = s.world.handle(handle) else {
+                panic!("command data")
+            };
+            assert_eq!((c.seconds, c.max_range), (min, Some(want)));
+            let mut json = serde_json::to_value(c).unwrap();
+            let restored: Command = serde_json::from_value(json.clone()).unwrap();
+            assert_eq!(&restored, c);
+            json.as_object_mut().unwrap().remove("max_range");
+            let old: Command = serde_json::from_value(json).unwrap();
+            assert_eq!((old.seconds, old.max_range), (min, None));
+        }
+    }
+
+    #[test]
     fn origins_scripted_heartbeat_setters_require_a_creature() {
         let table = Arc::new(
             EngineTable::parse(
@@ -10407,6 +10445,7 @@ mod tests {
                 target: None,
                 location: None,
                 seconds: 0.0,
+                max_range: None,
                 ints: vec![],
                 strings: vec![],
                 due: Some(5000),

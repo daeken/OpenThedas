@@ -1932,6 +1932,7 @@ impl Server {
                 target: Some(target),
                 location: None,
                 seconds: 0.0,
+                max_range: None,
                 ints: vec![ability],
                 strings: vec![tag],
                 due: None,

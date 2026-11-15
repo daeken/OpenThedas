@@ -306,6 +306,10 @@ pub struct Command {
     pub target: Option<ObjectId>,
     pub location: Option<Location>,
     pub seconds: f32,
+    /// `CommandMoveToObject`'s fMaxRange, raised to fMinRange by its builder
+    /// (DAOrigins.exe 0x66f260). Older saves used only `seconds` (fMinRange).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_range: Option<f32>,
     pub ints: Vec<i32>,
     pub strings: Vec<String>,
     /// When the command finishes, set when it reaches the front of the queue.
