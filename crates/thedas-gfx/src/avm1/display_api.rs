@@ -146,8 +146,20 @@ pub fn display_get(vm: &mut Vm, d: DisplayId, name: &str) -> Option<Value> {
     let is_text = matches!(o.kind, Kind::Text(_));
     let num = |n: f64| Some(Value::Number(n));
     match name {
-        "_x" => return num(o.matrix.tx as f64 / 20.0),
-        "_y" => return num(o.matrix.ty as f64 / 20.0),
+        "_x" => {
+            let offset = o
+                .text()
+                .map(|t| (t.bounds.0 as f64 * o.scale_rotation().0 * 20.0).trunc())
+                .unwrap_or(0.0);
+            return num((o.matrix.tx as f64 + offset) / 20.0);
+        }
+        "_y" => {
+            let offset = o
+                .text()
+                .map(|t| (t.bounds.1 as f64 * o.scale_rotation().1 * 20.0).trunc())
+                .unwrap_or(0.0);
+            return num((o.matrix.ty as f64 + offset) / 20.0);
+        }
         "_xscale" => return num(o.scale_rotation().0 * 100.0),
         "_yscale" => return num(o.scale_rotation().1 * 100.0),
         "_rotation" => return num(o.scale_rotation().2),
@@ -267,7 +279,20 @@ pub fn display_set(vm: &mut Vm, d: DisplayId, name: &str, v: &Value) -> bool {
         "_x" | "_y" => {
             let x = n(vm);
             if let (true, Some(o)) = (x.is_finite(), vm.display.get_mut(d)) {
-                let t = (x * 20.0).trunc() as f32;
+                // TextField positions include the scaled field bounds. Authored
+                // fields can have a negative origin inside their placement matrix.
+                let offset = o
+                    .text()
+                    .map(|t| {
+                        let (sx, sy, _) = o.scale_rotation();
+                        if name == "_x" {
+                            t.bounds.0 as f64 * sx
+                        } else {
+                            t.bounds.1 as f64 * sy
+                        }
+                    })
+                    .unwrap_or(0.0);
+                let t = ((x * 20.0).trunc() - (offset * 20.0).trunc()) as f32;
                 if name == "_x" {
                     o.matrix.tx = t;
                 } else {

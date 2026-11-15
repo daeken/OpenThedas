@@ -2441,6 +2441,43 @@ mod queue_tests {
     }
 
     #[test]
+    fn text_positions_include_scaled_authored_bounds() {
+        let (mut p, field) = input_player();
+        let o = p.vm.display.get_mut(field).unwrap();
+        o.matrix = crate::swf::Matrix::translate(40.0, 40.0);
+        o.text_mut().unwrap().bounds = (-1.95, -2.0, 100.0, 20.0);
+        let value = p.vm.display_object(field);
+        let position = |vm: &mut Vm, name| {
+            let value = vm.get(&value, name);
+            vm.to_number(&value)
+        };
+        assert!((position(&mut p.vm, "_x") - 0.05).abs() < 0.001);
+        assert_eq!(position(&mut p.vm, "_y"), 0.0);
+        p.vm.set(&value, "_x", Value::Number(10.07));
+        p.vm.set(&value, "_y", Value::Number(-5.07));
+        assert_eq!(position(&mut p.vm, "_x"), 10.05);
+        assert_eq!(position(&mut p.vm, "_y"), -5.05);
+        let o = p.vm.display.get_mut(field).unwrap();
+        o.set_scale_rotation(2.0, 3.0, 45.0);
+        p.vm.set(&value, "_x", Value::Number(30.0));
+        p.vm.set(&value, "_y", Value::Number(40.0));
+        assert_eq!(position(&mut p.vm, "_x"), 30.0);
+        assert_eq!(position(&mut p.vm, "_y"), 40.0);
+        assert_eq!(
+            p.vm.display.get(field).unwrap().text().unwrap().bounds.0,
+            -1.95
+        );
+
+        let root = p.vm.root;
+        let clip = create_empty(&mut p.vm, root, "clip", 50).unwrap();
+        let value = p.vm.display_object(clip);
+        p.vm.set(&value, "_x", Value::Number(12.07));
+        p.vm.set(&value, "_y", Value::Number(-8.07));
+        assert_eq!(p.vm.get(&value, "_x"), Value::Number(12.05));
+        assert_eq!(p.vm.get(&value, "_y"), Value::Number(-8.05));
+    }
+
+    #[test]
     fn mouse_caret_and_drag_selection_use_transformed_text_coordinates() {
         let (mut p, field) = input_player();
         let o = p.vm.display.get_mut(field).unwrap();
