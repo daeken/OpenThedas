@@ -4651,6 +4651,20 @@ pub fn call(
                 return ok(Value::Int(action));
             }
             let o = h.object(id);
+            // A body bag opens for looting: `placeable_core` calls `OpenInventory` only for
+            // PLACEABLE_ACTION_OPEN_INVENTORY, and the bag's type (placeable_types row 16,
+            // "Body Bag") has no state controller to give it an action, as a chest's has.
+            // Provisional: DAOrigins.exe's GetPlaceableAction is not traced; the exe reads
+            // the template's IsBodyBag into the placeable (0x750683, setter 0x74bd70).
+            if o.is_some_and(|o| {
+                o.template
+                    .eq_ignore_ascii_case(crate::inventory::BODY_BAG_TEMPLATE)
+            }) {
+                return ok(Value::Int(constant(
+                    &h.sim.table,
+                    "PLACEABLE_ACTION_OPEN_INVENTORY",
+                )));
+            }
             let dest = o.is_some_and(|o| {
                 o.locals
                     .strings
@@ -12543,6 +12557,32 @@ mod coverage_tests {
     fn sim() -> Sim {
         let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
         Sim::new(Arc::new(Vfs::new()), table, 1)
+    }
+
+    #[test]
+    fn a_body_bag_opens_for_looting_and_other_placeables_are_used() {
+        let table = Arc::new(
+            EngineTable::parse(
+                b"int PLACEABLE_ACTION_USE = 5;\n\
+                  int PLACEABLE_ACTION_OPEN_INVENTORY = 11;\n\
+                  int GetPlaceableAction(object oPlaceable) = 1;\n",
+            )
+            .unwrap(),
+        );
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        let foe = s.world.spawn(ObjectKind::Creature, "foe");
+        s.world.get_mut(foe).unwrap().money = 5;
+        let bag = s.spawn_body_bag(foe, false).unwrap();
+        // placeable_core opens a container only for PLACEABLE_ACTION_OPEN_INVENTORY.
+        assert_eq!(
+            run(&mut s, bag, "GetPlaceableAction", &[Value::Object(bag)]),
+            Some(Value::Int(11))
+        );
+        let lever = s.world.spawn(ObjectKind::Placeable, "lever");
+        assert_eq!(
+            run(&mut s, lever, "GetPlaceableAction", &[Value::Object(lever)]),
+            Some(Value::Int(5))
+        );
     }
 
     /// Calls engine function `name` as `caller`.
