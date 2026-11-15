@@ -124,6 +124,9 @@ pub const FINISH_SCENE: &str = "_global.GUISystem.FinishSceneFromGame";
 /// after starting a movie and when the resolution changes.
 pub const LAYOUT: &str = "_global.MovieUtils.UpdateAllLayouts";
 
+/// What `bound` holds for a name in a sticky group: kept by every bind.
+const STICKY: u64 = u64::MAX;
+
 #[derive(Default)]
 struct State {
     values: BTreeMap<String, UiValue>,
@@ -136,6 +139,8 @@ struct State {
     bound: std::collections::HashMap<String, u64>,
     /// Counts binds (see `bound`).
     binds: u64,
+    /// The names each sticky group (see [`GameBridge::bind_sticky`]) sets.
+    sticky: std::collections::HashMap<String, Vec<String>>,
     /// Bumped whenever a value changes, appears or goes (see [`GameBridge::generation`]).
     generation: u64,
     /// The generation each value last changed, appeared or went at.
@@ -258,6 +263,73 @@ impl GameBridge {
         }
     }
 
+    /// Sets a group of values that every [`GameBridge::bind`] keeps until the group is set
+    /// again or dropped: for values that change rarely, so that building them every frame is
+    /// not needed. Names the group had before and no longer has are gone.
+    pub fn bind_sticky(&self, group: &str, values: Vec<(String, UiValue)>) {
+        let Ok(mut guard) = self.state.lock() else {
+            return;
+        };
+        let s = &mut *guard;
+        let next = s.generation + 1;
+        let mut changed = false;
+        let old = s.sticky.remove(group).unwrap_or_default();
+        let mut names = Vec::with_capacity(values.len());
+        for (k, v) in values {
+            if !s.unanswered.is_empty() {
+                s.unanswered.remove(&k);
+            }
+            match s.values.get_mut(&k) {
+                Some(cur) => {
+                    if *cur != v {
+                        *cur = v;
+                        changed = true;
+                        s.changed.insert(k.clone(), next);
+                    }
+                }
+                None => {
+                    s.values.insert(k.clone(), v);
+                    changed = true;
+                    s.changed.insert(k.clone(), next);
+                }
+            }
+            s.bound.insert(k.clone(), STICKY);
+            names.push(k);
+        }
+        let keep: std::collections::HashSet<&String> = names.iter().collect();
+        for k in old {
+            if !keep.contains(&k) {
+                s.bound.remove(&k);
+                s.values.remove(&k);
+                s.changed.insert(k, next);
+                changed = true;
+            }
+        }
+        s.sticky.insert(group.to_string(), names);
+        if changed {
+            s.generation = next;
+        }
+    }
+
+    /// Removes a sticky group's values.
+    pub fn drop_sticky(&self, group: &str) {
+        let Ok(mut guard) = self.state.lock() else {
+            return;
+        };
+        let s = &mut *guard;
+        let next = s.generation + 1;
+        let mut changed = false;
+        for k in s.sticky.remove(group).unwrap_or_default() {
+            s.bound.remove(&k);
+            s.values.remove(&k);
+            s.changed.insert(k, next);
+            changed = true;
+        }
+        if changed {
+            s.generation = next;
+        }
+    }
+
     /// Binds the engine's whole state (e.g. [`crate::binding::sim_values`] every frame):
     /// values the last bind set that are not in `values` are gone (a conversation's earlier
     /// replies, a party member who left); values the movies set themselves are kept.
@@ -300,7 +372,7 @@ impl GameBridge {
         }
         let (values, last) = (&mut s.values, &mut s.changed);
         s.bound.retain(|k, b| {
-            let keep = *b == bind;
+            let keep = *b == bind || *b == STICKY;
             if !keep {
                 values.remove(k);
                 last.insert(k.clone(), next);
