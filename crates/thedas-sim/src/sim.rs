@@ -2615,11 +2615,11 @@ impl Sim {
             crate::nav::route_avoiding(&g, from, to, &locked)
         };
         let Some(p) = unlocked_route.or_else(|| crate::nav::route(&g, from, to)) else {
-            // Origins 0x73ea80 tries a physics-tested direct path after a failed search
+            // Origins 0x73ea80 tries a collision-tested direct path after a failed search
             // only when |start.z - goal.z| <= 0.5 (0x73ee88, constant 0xb1b7b4).
             // Status 5/8 then stops locomotion and returns INVALID_PATH (-4) in
             // 0x7a9130. Do not turn a failed tall route into a walk through the level.
-            // The flat fallback's physics test and DA2's path failures remain untraced.
+            // The flat fallback's collision test and DA2's path failures remain untraced.
             if self.game == thedas_vfs::Game::Origins && (from[2] - to[2]).abs() > 0.5 {
                 return Routed::InvalidPath;
             }

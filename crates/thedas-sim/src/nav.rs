@@ -391,7 +391,7 @@ pub enum Routed {
     /// Only through this closed door.
     Door(thedas_script::vm::ObjectId),
     /// A known-grid path failed, with too much height difference for the native
-    /// physics-tested direct fallback (DAOrigins.exe 0x73ee88).
+    /// collision-tested direct fallback (DAOrigins.exe 0x73ee88).
     InvalidPath,
     /// No route known: the provisional straight-line fallback.
     Straight,

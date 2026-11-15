@@ -13,7 +13,7 @@ this is distinct from inventing a path after the search failed.
 
 After certain failed search statuses, 0x73ee88..0x73eead tests the absolute start/goal
 height difference against the float 0.5 at 0xb1b7b4. A difference greater than 0.5 skips
-the fallback. At or below the threshold, 0x685920 performs a physics test. Only a passing
+the fallback. At or below the threshold, 0x685920 tests the centre and two radius-offset ground segments. Only a passing
 test builds the fallback through 0xa62f30, 0xa62990, 0xa629c0 and 0xa62b90; otherwise the
 helper returns status 5.
 
@@ -32,7 +32,7 @@ approaches fail with -4 through the existing command-completion path.
 Successful paths can still climb or descend by more than 0.5 m overall. The guard only
 applies after pathfinding failed. Missing navigation data, the flatter straight fallback
 and DA2 retain their prior behavior. The native endpoint-adjustment logic, full status
-mapping and physics fallback still need separate work; our grid failure is not proof of
+mapping and collision fallback still need separate work; our grid failure is not proof of
 the native pathfinder's answer for every position.
 
 ## Trigger investigation that exposed it
