@@ -1984,6 +1984,7 @@ impl Server {
                 arrived: false,
                 da2_target_prepared: false,
                 path: Vec::new(),
+                turned_at: None,
             };
             if let Some(o) = sim.world.get_mut(hero) {
                 o.commands.clear();

@@ -34,6 +34,7 @@ fn command(sim: &Sim, ty: &str, name: &str) -> Command {
         arrived: false,
         da2_target_prepared: false,
         path: Vec::new(),
+        turned_at: None,
     }
 }
 
