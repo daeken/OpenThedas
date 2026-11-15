@@ -877,13 +877,34 @@ impl PadPlay {
     /// portrait's button asks (`Sim::request_level_up`); the inventory and tactics screens
     /// open as their keys open them. `None` when no tutorial waits for a screen.
     fn tutorial_screen(&mut self, host: &mut dyn Host) -> Option<String> {
-        let waits = {
+        // What a tutorial that waits for no screen waits for: the key that unpauses
+        // (Space), or a move order (a click on the ground).
+        let (unpause, move_order) = {
             let live = host.live()?;
-            let mut sim = live.sim();
+            let sim = live.sim();
             let t = sim.world.training;
             if t.mode == 0 || t.expected == 0 {
                 return None;
             }
+            (
+                t.expected == sim.event_type("TRAINING_UNPAUSE"),
+                t.expected == sim.event_type("TRAINING_MOVEMENT_COMMAND_ISSUED"),
+            )
+        };
+        if unpause {
+            host.live()?.toggle_pause();
+            return Some("unpaused (the tutorial waits for it)".into());
+        }
+        if move_order {
+            // The leader is ordered a few steps ahead, as the click would order it; the
+            // game stays paused as the lesson holds it.
+            walk(host, Vec2::new(0.0, 1.0), false)?;
+            return Some("move order given (the tutorial waits for it)".into());
+        }
+        let waits = {
+            let live = host.live()?;
+            let mut sim = live.sim();
+            let t = sim.world.training;
             let waits = |sim: &thedas_sim::Sim, name: &str| {
                 t.expected == sim.event_type(&format!("TRAINING_{name}"))
             };
