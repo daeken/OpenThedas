@@ -2815,8 +2815,12 @@ impl DeferredPass {
         let mut out: Vec<(f32, GpuLight)> = d3d
             .lights()
             .iter()
-            .chain(&self.effect_lights)
-            .chain(&self.own_lights)
+            .chain(
+                self.effect_lights
+                    .iter()
+                    .chain(&self.own_lights)
+                    .filter(|l| !beside_level_light(l, d3d.lights())),
+            )
             .filter_map(|l| self.light(l, &planes, camera.position, characters))
             .collect();
         if out.len() > MAX_LIGHTS {
@@ -3139,7 +3143,7 @@ const EMITTER_REACH_PER: f32 = 4.0;
 /// The light an emitter's living particles give, as a point light at their glow-weighted
 /// centre (ours: the original's particles light nothing). `None` when they show none.
 pub fn emitter_light(e: &crate::particles::EmitterState) -> Option<SceneLight> {
-    if e.opacity <= 0.0 || e.particles.is_empty() {
+    if e.opacity <= 0.0 || e.particles.is_empty() || light_shaft(&e.blueprint.material) {
         return None;
     }
     let mut total = Vec3::ZERO;
@@ -3188,6 +3192,30 @@ pub fn emitter_light(e: &crate::particles::EmitterState) -> Option<SceneLight> {
 /// A position rounded to whole centimetres, to match a light set's lights to the scene's.
 fn centimetres(p: Vec3) -> [i32; 3] {
     (p * 100.0).round().as_ivec3().to_array()
+}
+
+/// Whether an additive emitter's material draws a light shaft, sunbeam or lit dust (the
+/// level's `fxe_day_beam`, `fxe_day_sunshine`, `fxe_day_dust_shine`): it shows light that
+/// is already there, it doesn't give any (provisional: by name).
+fn light_shaft(material: &str) -> bool {
+    let m = material.to_ascii_lowercase();
+    ["beam", "shine", "shaft", "ray_", "godray"]
+        .iter()
+        .any(|k| m.contains(k))
+}
+
+/// Whether emitter light `l` sits within 1.5 m of one of the level's static lights: a torch
+/// or brazier the level already lights (its lamp is authored beside the flame), which an
+/// emitter light would light twice.
+fn beside_level_light(l: &SceneLight, scene: &[SceneLight]) -> bool {
+    let SceneLight::Point { position, name, .. } = l else {
+        return false;
+    };
+    name.starts_with("emitter ")
+        && scene.iter().any(|s| {
+            matches!(s, SceneLight::Point { position: p, is_static: true, .. }
+                if p.distance(*position) < 1.5)
+        })
 }
 
 /// The six planes (`n·p + w ≥ 0` inside) of a view-projection with depth 0..1.
@@ -3300,6 +3328,42 @@ mod tests {
         assert_eq!(RenderPath::default(), RenderPath::Faithful);
         assert_eq!(RenderPath::Faithful.toggled(), RenderPath::Deferred);
         assert_eq!(RenderPath::Deferred.toggled().name(), "faithful");
+    }
+
+    #[test]
+    fn light_shafts_and_lit_torches_give_no_emitter_light() {
+        assert!(light_shaft("fxe_day_beam"));
+        assert!(light_shaft("FXE_Day_SunShine"));
+        assert!(light_shaft("fxe_day_dust_shine"));
+        assert!(!light_shaft("fx_firetorchfb_add"));
+        assert!(!light_shaft("Sum_Conj_04"));
+        let point = |name: &str, at: Vec3, is_static: bool| SceneLight::Point {
+            position: at,
+            color: Vec3::ONE,
+            radius: 5.0,
+            name: name.into(),
+            domain: None,
+            is_static,
+            version: 1,
+            intensity: 1.0,
+            flicker: None,
+            room: None,
+        };
+        let level = [point("lamp_001_RT", Vec3::new(0.0, 0.0, 2.0), true)];
+        let flame = point(
+            "emitter fx_firetorchfb_add",
+            Vec3::new(0.3, 0.0, 2.2),
+            false,
+        );
+        let spell = point("emitter Sum_Conj_04", Vec3::new(6.0, 0.0, 0.5), false);
+        assert!(beside_level_light(&flame, &level));
+        assert!(!beside_level_light(&spell, &level));
+        // Only emitter lights are dropped, and only beside static lights.
+        assert!(!beside_level_light(&level[0], &level));
+        assert!(!beside_level_light(
+            &flame,
+            &[point("x", Vec3::new(0.3, 0.0, 2.0), false)]
+        ));
     }
 
     #[test]
