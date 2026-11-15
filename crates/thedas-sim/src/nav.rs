@@ -1190,7 +1190,10 @@ mod tests {
         let mut at = from;
         for q in &p {
             let d = ((q[0] - at[0]).powi(2) + (q[1] - at[1]).powi(2)).sqrt();
-            assert!(d <= 2.0 * LEG_SPACING && d >= LEG_SPACING * 0.5, "{p:?}");
+            assert!(
+                (LEG_SPACING * 0.5..=2.0 * LEG_SPACING).contains(&d),
+                "{p:?}"
+            );
             at = *q;
         }
     }
