@@ -449,6 +449,28 @@ pub struct DrawLights {
     pub points: Vec<(Vec3, f32, Vec3)>,
     /// The other lights (not `IsStatic`), in slot order D, E.
     pub dynamic: Vec<(Vec3, f32, Vec3)>,
+    /// For the slots (A, B, C, then D, E) whose light flickers, the light's index in the
+    /// list the lights were picked from: the shaders get its colour times its flicker
+    /// factor that frame ([`ConstantContext::flicker`]).
+    pub flicker: [Option<u32>; 5],
+}
+
+impl DrawLights {
+    /// Whether any of the draw's lights flickers, so that its light registers change from
+    /// frame to frame.
+    pub fn flickers(&self) -> bool {
+        self.flicker.iter().any(Option::is_some)
+    }
+}
+
+/// The index a flickering light is known by in [`DrawLights::flicker`].
+fn flicker_slot(l: &SceneLight, index: usize) -> Option<u32> {
+    match l {
+        SceneLight::Point {
+            flicker: Some(_), ..
+        } => u32::try_from(index).ok(),
+        _ => None,
+    }
 }
 
 /// Which of the light manager's lists a draw reads, by its material's `RenderClass`
@@ -578,9 +600,10 @@ pub fn pick_lights(
 /// the original appears to keep. With no reference for those views it waits for one.
 /// Provisional.
 pub fn pick_level_lights(lights: &[SceneLight], sphere: (Vec3, f32), domain: i64) -> DrawLights {
-    let mut cands: Vec<(f32, Vec3, f32, Vec3)> = lights
+    let mut cands: Vec<(f32, Vec3, f32, Vec3, Option<u32>)> = lights
         .iter()
-        .filter_map(|l| match l {
+        .enumerate()
+        .filter_map(|(i, l)| match l {
             SceneLight::Point {
                 position,
                 color,
@@ -600,19 +623,21 @@ pub fn pick_level_lights(lights: &[SceneLight], sphere: (Vec3, f32), domain: i64
                 let t = (d / radius).clamp(0.0, 1.0);
                 let att = (t * std::f32::consts::FRAC_PI_2).cos().powi(2);
                 let weight = (color.x + color.y + color.z) * att.max(1e-3);
-                Some((weight, *position, *radius, *color))
+                Some((weight, *position, *radius, *color, flicker_slot(l, i)))
             }
             SceneLight::Ambient { .. } => None,
         })
         .collect();
     cands.sort_by(|a, b| b.0.total_cmp(&a.0));
+    cands.truncate(3);
+    let mut flicker = [None; 5];
+    for (slot, c) in cands.iter().enumerate() {
+        flicker[slot] = c.4;
+    }
     DrawLights {
-        points: cands
-            .into_iter()
-            .take(3)
-            .map(|(_, p, r, c)| (p, r, c))
-            .collect(),
+        points: cands.into_iter().map(|(_, p, r, c, _)| (p, r, c)).collect(),
         dynamic: Vec::new(),
+        flicker,
     }
 }
 
@@ -629,9 +654,10 @@ fn pick_where(
     sphere: (Vec3, f32),
     keep: impl Fn(Option<i64>, Option<i64>) -> bool,
 ) -> DrawLights {
-    let mut points: Vec<(f32, (Vec3, f32, Vec3))> = Vec::new();
-    let mut dynamic: Vec<(f32, (Vec3, f32, Vec3))> = Vec::new();
-    for l in lights {
+    type Candidate = (f32, (Vec3, f32, Vec3), Option<u32>);
+    let mut points: Vec<Candidate> = Vec::new();
+    let mut dynamic: Vec<Candidate> = Vec::new();
+    for (i, l) in lights.iter().enumerate() {
         let SceneLight::Point {
             position,
             color,
@@ -658,16 +684,28 @@ fn pick_where(
             } else {
                 &mut dynamic
             };
-            list.push((w, (*position, *radius, *color * *intensity)));
+            list.push((
+                w,
+                (*position, *radius, *color * *intensity),
+                flicker_slot(l, i),
+            ));
         }
     }
-    let best = |mut v: Vec<(f32, (Vec3, f32, Vec3))>, n: usize| {
+    let mut flicker = [None; 5];
+    let mut best = |mut v: Vec<Candidate>, n: usize, first: usize| {
         v.sort_by(|a, b| b.0.total_cmp(&a.0));
-        v.into_iter().take(n).map(|(_, l)| l).collect()
+        v.truncate(n);
+        for (slot, c) in v.iter().enumerate() {
+            flicker[first + slot] = c.2;
+        }
+        v.into_iter().map(|(_, l, _)| l).collect()
     };
+    let points = best(points, 3, 0);
+    let dynamic = best(dynamic, 2, 3);
     DrawLights {
-        points: best(points, 3),
-        dynamic: best(dynamic, 2),
+        points,
+        dynamic,
+        flicker,
     }
 }
 
@@ -859,6 +897,9 @@ pub struct ConstantContext<'a> {
     /// The level's winds this frame ([`TreeConstants::wind`] picks one); empty holds the
     /// trees still.
     pub winds: &'a [WindFrame],
+    /// This frame's flicker factor of each light [`DrawLights::flicker`] names (see
+    /// [`crate::flicker`]); a light it has no factor for gives its colour unchanged.
+    pub flicker: &'a [f32],
 }
 
 /// The ambient term's base (see the module docs): zero at every Graphics Detail setting
@@ -1051,13 +1092,22 @@ impl ConstantContext<'_> {
     fn light_params(&self) -> Vec<[f32; 4]> {
         let mut r = vec![[0.0f32; 4]; 13];
         let slots = [0usize, 5, 7];
+        // A flickering light's colour times its factor this frame (light +0x1bc, 0x46b4b4).
+        let factor = |slot: usize| {
+            self.lights.flicker[slot]
+                .and_then(|i| self.flicker.get(i as usize))
+                .copied()
+                .unwrap_or(1.0)
+        };
         for (i, (p, radius, c)) in self.lights.points.iter().take(3).enumerate() {
             let at = slots[i];
+            let c = *c * factor(i);
             r[at] = [p.x, p.y, p.z, *radius];
             r[at + 1] = [c.x, c.y, c.z, 1.0];
         }
         // D and E: positions in 9 and 10, colours in 11 and 12 (0xae7fc8, 0xae7fd4).
         for (i, (p, radius, c)) in self.lights.dynamic.iter().take(2).enumerate() {
+            let c = *c * factor(3 + i);
             r[9 + i] = [p.x, p.y, p.z, *radius];
             r[11 + i] = [c.x, c.y, c.z, 1.0];
         }
@@ -1358,6 +1408,13 @@ impl ConstantContext<'_> {
     /// draw was made. Mirrors the cases of [`ConstantContext::value`].
     pub fn per_frame(&self, c: &Constant) -> bool {
         let usage = find_param(self.material, &c.name).and_then(|p| p.usage.as_deref());
+        // A flickering light's colour changes every frame.
+        if self.lights.flickers()
+            && (matches!(usage, Some("LightsArray" | "LightsArrayDirected"))
+                || c.name == "g_vLightParams")
+        {
+            return true;
+        }
         matches!(
             usage.unwrap_or(""),
             "ModelViewProjectionTrans"
@@ -1641,6 +1698,7 @@ mod tests {
         let lights = DrawLights {
             points: vec![(Vec3::new(1.0, 2.0, 3.0), 12.0, Vec3::new(0.5, 0.25, 0.0)); 2],
             dynamic: Vec::new(),
+            flicker: [None; 5],
         };
         let lm = LightmapRef {
             texture: "lm.dds".into(),
@@ -1668,6 +1726,7 @@ mod tests {
             partition: None,
             tree: None,
             winds: &[],
+            flicker: &[],
         };
         let t = table(vec![
             constant(
@@ -1803,6 +1862,7 @@ mod tests {
             partition: None,
             tree: None,
             winds: &[],
+            flicker: &[],
         };
         let c = cc.fill(Some(&table(vec![constant(
             "mml_vTintColor",
@@ -1937,6 +1997,7 @@ mod tests {
             partition: None,
             tree: None,
             winds: &[],
+            flicker: &[],
         };
         let c = cc.fill(Some(&t));
         // The bones carry the draw's placement: the vertex shader takes no world matrix.
@@ -2128,6 +2189,7 @@ mod tests {
             partition: None,
             tree: None,
             winds: &[],
+            flicker: &[],
         };
         let c = cc.fill(Some(&t));
         assert_eq!(c.floats[13..17], DEBUG_CONTROL);
@@ -2201,6 +2263,7 @@ mod tests {
                 partition: None,
                 tree: None,
                 winds: &[],
+                flicker: &[],
             };
             let c = cc.fill(Some(&table(vec![constant(
                 "aur_mWorld",
@@ -2230,6 +2293,7 @@ mod tests {
             is_static: true,
             version: 0,
             intensity: 1.0,
+            flicker: None,
             room,
         }
     }
@@ -2263,6 +2327,90 @@ mod tests {
         // The level's own rule scales the colour too.
         let level = pick_level_lights(&lights[..1], (Vec3::ZERO, 1.0), DOMAIN_LEVEL);
         assert_eq!(level.points[0].2, Vec3::splat(0.5));
+    }
+
+    #[test]
+    fn a_flickering_lights_colour_follows_its_factor_every_frame() {
+        let mut torch = point(1.5, 5.0, None, None);
+        if let SceneLight::Point { flicker, .. } = &mut torch {
+            *flicker = Some(crate::flicker::Flicker {
+                variation: 0.5,
+                period: 0.075,
+                period_delta: 0.025,
+            });
+        }
+        let mut dynamic = torch.clone();
+        if let SceneLight::Point { is_static, .. } = &mut dynamic {
+            *is_static = false;
+        }
+        let lights = vec![point(1.0, 5.0, None, None), torch, dynamic];
+        let picked = pick_lights(
+            &lights,
+            &HashMap::new(),
+            (Vec3::ZERO, 1.0),
+            None,
+            LightClass::Level,
+        );
+        // Slot B (the torch, second by R - d) and D name their lights; A holds steady.
+        assert_eq!(picked.flicker, [None, Some(1), None, Some(2), None]);
+        assert!(picked.flickers());
+        let level = pick_level_lights(&lights[..2], (Vec3::ZERO, 1.0), DOMAIN_LEVEL);
+        assert_eq!(level.flicker[..2], [None, Some(1)]);
+        let material = SceneMaterial {
+            mao: "m.mao".into(),
+            object: MaterialObject::parse(
+                br#"<MaterialObject Name="m"><Material Name="m.mat"/></MaterialObject>"#,
+            )
+            .unwrap(),
+            definition: None,
+            semantic: "Default".into(),
+            render_class: None,
+            technique: None,
+        };
+        let factors = [9.0, 0.5, 1.5];
+        let cc = ConstantContext {
+            view: Mat4::IDENTITY,
+            projection: Mat4::IDENTITY,
+            world: Mat4::IDENTITY,
+            camera: Vec3::ZERO,
+            material: &material,
+            lightmap: None,
+            lights: &picked,
+            ambient: Vec3::ZERO,
+            bones: &[],
+            irradiance: None,
+            sun: None,
+            fog: crate::atmosphere::fog_params(None),
+            sky: None,
+            clouds: crate::atmosphere::cloud_params(None, None),
+            time: 0.0,
+            shadow: NO_SHADOW_DATA,
+            partition: None,
+            tree: None,
+            winds: &[],
+            flicker: &factors,
+        };
+        let r = cc.light_params();
+        assert_eq!(r[1], [1.0, 1.0, 1.0, 1.0]);
+        assert_eq!(r[6], [0.5, 0.5, 0.5, 1.0]);
+        assert_eq!(r[11], [1.5, 1.5, 1.5, 1.0]);
+        let params = constant(
+            "g_vLightParams",
+            RegisterSet::Float4,
+            0,
+            13,
+            ParamClass::Vector,
+        );
+        assert!(cc.per_frame(&params));
+        let steady = DrawLights {
+            flicker: [None; 5],
+            ..picked.clone()
+        };
+        let cc = ConstantContext {
+            lights: &steady,
+            ..cc
+        };
+        assert!(!cc.per_frame(&params));
     }
 
     #[test]

@@ -272,7 +272,16 @@ debug views now include the ground. Terrain also joins the point-shadow caster l
   flames, embers, spell effects), in the level's, its objects' and the visual effects'
   renderers, gives the deferred pass a point light each frame at its particles' glow-
   weighted centre, its colour their hue and its strength rising with the light they show
-  (`deferred::emitter_light`, constants tuned by eye). Lights without a room reach every
+  (`deferred::emitter_light`, constants tuned by eye). Its colour also takes the
+  particle texture's tint (its alpha-weighted mean colour over a small mip, brightest channel
+  one; `deferred::texture_tint`), since some effects, lightning for one, carry their colour
+  in the texture rather than the particles. Two kinds give none: light-shaft and
+  lit-dust effects (`fxe_day_beam`, `fxe_day_sunshine`, `fxe_day_dust_shine`, matched by
+  name), which show light rather than give it, and any emitter within 1.5 m of a level static
+  light, a torch or brazier the level already lights with its own lamp, or within 3 m of a
+  visual effect's own light (effects carry authored lights their animations drive, #971). Before this, the
+  Cousland hall camera was 40% brighter than the faithful frame (mean 69.3 against 49.6; 41.2
+  after). `THEDAS_DEFERRED_EMITTER_LIGHTS=0` turns emitter lights off. Lights without a room reach every
   room; room boxes do not reliably identify the floor of a multi-storey area.
   `THEDAS_DEFERRED_LOG_LIGHTS=1` logs a frame's lights and shadow slots. Original idea
   below kept for what is left:
@@ -420,19 +429,35 @@ the next coverage step.
 what the shipped lightmaps say the original bake's lights were, fitted by `thedas-bake` (see
 `docs/lightmaps/baker-spec.md` §7; the sets are derived from game data and live outside the
 repository, in OpenThedas-testdata `lightmap/lightsets/<level>.lightset.json`). It does nothing
-in the `baked` and `hybrid` modes or when unset.
+when unset or in the `baked` mode; `hybrid` takes only the shadow reaches.
 
 - Level surfaces (not objects or characters) take their room's baked ambient in place of the
   probe, encoded as the lightmaps store light (linear^(1/1.5)), uniform over the hemisphere.
 - The set's baked-only fill lights join the light list after the shadow slots are chosen
   (never shadowed), nearest first into what room it has left. Each belongs to the room its
   fitted atlas lights. The lighting pass marks them by colour w = 2: the bake's linear
-  falloff max(0, 1 − d/R), no highlight, level surfaces only.
+  falloff max(0, 1 − d/R), no highlight, level surfaces only. They are summed linear and
+  encoded with the room's ambient as the bake encoded its texels:
+  `(ambient^1.5 + Σ fills)^(1/1.5)`, then the ambient occlusion as before.
+- **Shadow reach.** The bake's shadow pass reached only `shadow_reach` of a light's radius,
+  and not at all for lights it left out (`in_alpha` false), so the shipped alpha masks static
+  light beyond that. Wherever runtime visibility replaces the lightmap's mask (`realtime`, and
+  `hybrid`'s slotted static lights), a set light lights only within `shadow_reach × R`. The
+  reach rides in the light record's domain code as a fraction below 0.5
+  (`domain + 0.4 · (1 − reach)`), which every domain test still reads correctly.
+- **Occlusion.** With lightmaps off the level's point lights take the SSAO term too, as the
+  bake multiplied its alpha (static lights) by its occlusion pass (specular by at least 0.2).
 
 On the Cousland hall camera, against the `baked` frame, `realtime` differs by a mean of 20.4
 levels per channel (−18 bias) and `realtime` with the light set by 10.6 (+8.6); on two Lake
-Calenhad terrain views 6.1–6.5 and 0.5. Not yet: the static lights' baked twins, the
-occlusion the lightmaps carry, fill visibility.
+Calenhad terrain views 6.1–6.5 and 0.5. With the reach, encoding and occlusion above
+(same binary, Cousland): 21.4 without the set, 11.4 with it before the reach, 10.4 with it.
+`hybrid` with the set's reaches stays within 1.9 of `baked` (1.8 without them).
+
+Tried and left out: the static lights' baked twins (the RGB pass had a light at every static
+light's place, at its fitted brightness) as fills, unshadowed or sharing the static light's
+cube: both made the Cousland frame further from `baked` (11.9, 12.1), as the fits' brightness
+outliers and the twins' missing bake shadows overshoot. Fill visibility is still missing.
 
 ## Real-time bounce
 
