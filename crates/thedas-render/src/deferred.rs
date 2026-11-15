@@ -58,6 +58,10 @@ mod alpha_gpu_tests;
 mod reflection_gpu_tests;
 
 #[cfg(test)]
+#[path = "deferred_sun_tests.rs"]
+mod sun_gpu_tests;
+
+#[cfg(test)]
 #[path = "deferred_terrain_gpu_tests.rs"]
 mod terrain_gpu_tests;
 
@@ -178,6 +182,7 @@ struct TileUniforms {
 struct SunUniforms {
     data: [[f32; 4]; 9],
     direction: [f32; 4],
+    /// x: shadow maps enabled, y: skip filter samples with a known result.
     enabled: [u32; 4],
 }
 
@@ -256,6 +261,7 @@ pub(crate) struct DeferredPass {
     shadow_reuse: Option<bool>,
     fused_reflections: Option<bool>,
     tight_tiles: Option<bool>,
+    sun_early_exit: Option<bool>,
     light_masks: Option<bool>,
     opaque_gbuffer: Option<bool>,
     specialized_gbuffer: Option<bool>,
@@ -982,6 +988,7 @@ impl DeferredPass {
             shadow_reuse: None,
             fused_reflections: None,
             tight_tiles: None,
+            sun_early_exit: None,
             light_masks: None,
             opaque_gbuffer: None,
             specialized_gbuffer: None,
@@ -1057,6 +1064,10 @@ impl DeferredPass {
 
     pub(crate) fn set_tight_tiles(&mut self, enabled: Option<bool>) {
         self.tight_tiles = enabled;
+    }
+
+    pub(crate) fn set_sun_early_exit(&mut self, enabled: Option<bool>) {
+        self.sun_early_exit = enabled;
     }
 
     pub(crate) fn set_light_masks(&mut self, enabled: Option<bool>) {
@@ -1340,7 +1351,7 @@ impl DeferredPass {
                         array_stride: std::mem::size_of::<DeferredVertex>() as u64,
                         step_mode: wgpu::VertexStepMode::Vertex,
                         attributes: &wgpu::vertex_attr_array![
-                            0 => Float32x3, 1 => Float32x3, 2 => Float32x2, 3 => Float32x2, 4 => Float32x4, 5 => Float32x4
+                            0 => Float32x3, 1 => Float32x3, 2 => Float32x2, 3 => Float32x2, 4 => Float32x4, 5 => Float32x4, 6 => Float32x4, 7 => Float32x3
                         ],
                     })],
                 },
@@ -1399,7 +1410,7 @@ impl DeferredPass {
                         array_stride: std::mem::size_of::<DeferredVertex>() as u64,
                         step_mode: wgpu::VertexStepMode::Vertex,
                         attributes: &wgpu::vertex_attr_array![
-                            0 => Float32x3, 1 => Float32x3, 2 => Float32x2, 3 => Float32x2, 4 => Float32x4, 5 => Float32x4
+                            0 => Float32x3, 1 => Float32x3, 2 => Float32x2, 3 => Float32x2, 4 => Float32x4, 5 => Float32x4, 6 => Float32x4, 7 => Float32x3
                         ],
                     })],
                 },
@@ -2215,7 +2226,10 @@ impl DeferredPass {
             direction: sun_dir.to_array(),
             enabled: [
                 u32::from(d3d.sun_shadows().is_some() && crate::config::CONFIG.sun_shadows),
-                0,
+                u32::from(
+                    self.sun_early_exit
+                        .unwrap_or(crate::config::CONFIG.sun_early_exit),
+                ),
                 0,
                 0,
             ],

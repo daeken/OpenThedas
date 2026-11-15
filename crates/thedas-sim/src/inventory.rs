@@ -139,7 +139,7 @@ impl Sim {
                 let held = self
                     .world
                     .get(who)
-                    .and_then(|o| o.effects.iter().find(|x| **x == e).cloned());
+                    .and_then(|o| o.effects.iter().find(|x| x.same_payload(&e)).cloned());
                 if let Some(held) = held {
                     self.remove_effect(who, &held);
                 }

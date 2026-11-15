@@ -64,7 +64,7 @@ worker threads exist. Discard warm-up frames and pair adjacent opposite modes.
    |---|---|---|
    | 0 | `Rgba8Unorm` | albedo rgb; alpha material code: Static1 (0), prop (64/255), Low terrain (128/255), character (192/255), other terrain (1) |
    | 1 | `Rgba8Unorm` | specular mask rgb (`mml_tSpecularMask`), specular power code (its alpha) |
-   | 2 | `Rgba16Float` | normal (octahedral xy, world space, from `mml_tNormalMap` through a derivative-built tangent frame), room index, specular falloff (`mml_vFalloffParams`, as Static1's vertex shader works it out) |
+   | 2 | `Rgba16Float` | normal (octahedral xy, world space, from `mml_tNormalMap` through the mesh's tangent frame, with derivative fallback), room index, specular falloff (`mml_vFalloffParams`, as Static1's vertex shader works it out) |
    | 3 | `Rgba16Float` | fused baked ambient/reflection/emission RGB and baked visibility; separate-pass modes retain lightmap or probe irradiance RGB; floats preserve HDR probes |
 
    Position comes back from depth. 24 bytes a pixel (32 under wgpu's attachment accounting),
@@ -142,8 +142,8 @@ must affect bounce independently of reflection. Fusion is selected for the whole
 G-buffer, including object contributors, on each frame; renderer switches, target resizes
 and shadow updates do not reuse stale reflection pixels.
 
-Static1's material tint and the meshes' own tangents remain to come (the G-buffer builds
-a tangent frame from screen derivatives).
+Static1's material tint remains to come. The G-buffer uses authored mesh tangent frames
+where complete, with screen derivatives as a fallback (see the controls below).
 
 **Deferred draws**: the level's own opaque draws with Static1's shaders
 (`Static1.psh`, or `Static1_Fast.psh` at Low; no alpha test, no blending), not
@@ -227,7 +227,8 @@ This is our deferred material approximation, not shader parity: character rim li
 skin scattering, gore/heraldry and remote-material effects are not represented yet. Hair,
 unsupported alpha-tested and blended materials, lower-detail Char2 and other unsupported families
 still draw forward; the known cutouts described below can supply point-shadow coverage. Tangent
-frames still come from derivatives. Probe assignments remain those made at scene load.
+frames use the authored mesh basis where complete. Probe assignments remain those made at
+scene load.
 The float lightmap target may change baked-image rounding slightly.
 
 Terrain's G-buffer material decodes MaskV's three layer indices with point sampling and
@@ -235,8 +236,8 @@ blends their palette texels using MaskA/MaskA2's eight weights. The material sup
 dimensions, padding, UV scales and each layer's specular colour/power. Explicit gradients
 keep tile wrapping from choosing the wrong mip. Terrain uses TEXCOORD0 for its lightmap,
 normal-map palette at Medium/High, vertex normals and no specular at Low, and the original
-vertex-interpolated specular distance factor. As with Static1, its tangent frame comes from
-screen derivatives rather than the raw mesh tangents.
+vertex-interpolated specular distance factor. As with Static1, its tangent frame uses the
+raw mesh tangents and binormals where complete, falling back to screen derivatives.
 
 The lighting keeps Terrain1's `lm.a²` static diffuse mask (Terrain3 at Low uses `lm.a` once) and
 `0.75 * runtime_visibility * lm.a + 0.25` specular mask; bounce uses the same 15% shadow
@@ -397,6 +398,23 @@ whole-gameplay FPS; shared-machine load can still affect absolute values.
 Rendering environment controls are read once per process. Set them before starting the
 engine; paired benchmarks use renderer overrides instead of changing the environment.
 
+G-buffer surfaces and their separate reflection pass use the mesh's declared `TANGENT0`
+and `BINORMAL0`. The deferred-only vertex stream decodes the authored formats, skins both
+vectors with the same four weights as positions/normals, then applies the world's linear
+transform. As in Static1/Prop1, the full basis is interpolated without independently
+normalizing or orthogonalizing its columns; mirrored handedness and vector lengths survive.
+Normal maps retain their alpha/green XY packing and reconstructed Z. Missing, nonfinite,
+zero or coplanar frames retain the previous UV/position derivative frame. An interpolated
+validity marker also keeps triangles with invalid vertex frames on the fallback, except
+within a 0.0001 interpolation tolerance at a valid edge; posed/interpolated degeneracy is
+checked again per fragment. `THEDAS_DEFERRED_MESH_TANGENTS=0` retains the derivative frame
+for all these surfaces. The control is read once during deferred stream planning. Hair's
+authored strand tangent and translated tree bases keep their existing handling. Faithful
+vertex streams and shader inputs are unchanged. The deferred stream grows from 72 to 100
+bytes per vertex; G-buffer attachment formats and storage stay unchanged. The derivative
+control retains the old equations, but the changed shader interface can alter rounding;
+it is not a pixel-exact copy of an older binary.
+
 Rigid Static1 and terrain draws use dedicated G-buffer entry points, sharing the same
 material equations while allowing unrelated face/eye/tint branches to be removed. Their
 vertex entry point reads positions/normals directly, omitting the identity bone palette.
@@ -487,6 +505,16 @@ for every draw. The default uses a separate fragment entry point with no reachab
 discard for draws without an alpha test. Material sampling and G-buffer outputs are
 shared with the cutout pipeline. Cutouts retain authored comparisons, opacity and clip;
 faded draws retain forward rendering. Draw order and depth tests are unchanged.
+
+`THEDAS_DEFERRED_SUN_EARLY_EXIT=0` retains every original sun-filter tap for
+comparisons. The default omits map reads when the final grazing-angle floor clamps
+visibility to one, and omits the four near-map green taps when the centre depth
+already selects full visibility. Shadowed near receivers and the far PCF retain
+their complete filters, white-border rule, distance fade and grazing floor.
+The shared G-buffer, separate reflection and forward lighting use this same
+function. The control is read once; the per-renderer
+`THEDAS_BENCH_DEFERRED_COMPARE=sun-early-exit` override alternates it in one capture
+and restores the configured policy afterwards.
 
 ## Order of work
 

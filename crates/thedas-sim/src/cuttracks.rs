@@ -337,7 +337,7 @@ pub struct AnimationTrack {
     /// Field 5403 (+0x64): seconds into the animation it starts at.
     pub offset: f32,
     /// Field 5408 (+0xb4): the animation's root motion as the cutscene file bakes it, keys of
-    /// (seconds into the animation, x, y, z) in the actor's own frame. Empty for a pose.
+    /// (seconds since the track started, x, y, z) in cutscene space. Empty for a pose.
     pub root_positions: Vec<[f32; 4]>,
     /// Field 5409 (+0xbc): the root's turn, keys of (seconds, x, y, z, w).
     pub root_rotations: Vec<[f32; 5]>,
@@ -360,18 +360,21 @@ impl AnimationTrack {
     }
 
     /// How far the animation's root motion has moved and turned the actor `t` seconds into
-    /// the cutscene: the root keys at the animation's time, in the actor's own frame.
+    /// the cutscene: the baked root keys at the track's elapsed time, in cutscene space.
     /// `None` before the track starts, for a track without root keys and for one that
     /// holds its actor ([`AnimationTrack::root_held`]).
     ///
     /// The executable's track update (0x7d92e0) samples the two key lists (0xa38de0,
-    /// 0xa38d20), turns the position into the actor's frame (0x7d3c80) and sets the actor's
+    /// 0xa38d20), turns the position by retained animation turns (0x7d3c80) and sets the actor's
     /// position to its own plus that, and its rotation to its own times the turn (0x4cb640);
     /// the track's end (0x7d9450) leaves the last keys in place, so the actor stays where
     /// the animation took it (a quarter turn keeps the actor turned).
     ///
-    /// Provisional: the keys are taken as linear between samples, and what fields 5405,
-    /// 5411 and 5413 switch is not traced.
+    /// The root sampler receives track elapsed time, independently of the animation's
+    /// speed and offset (0x7db7b4); the baked keys already account for those settings.
+    /// Provisional: the keys are taken as linear between samples; overlapping root tracks,
+    /// the retained-turn flags and the special actor anchoring a placed cutscene are not
+    /// fully modelled (see `docs/notes/cutscene-root-space.md`).
     pub fn root_at(&self, t: f32) -> Option<([f32; 3], [f32; 4])> {
         if self.root_held
             || t < self.start
@@ -384,7 +387,7 @@ impl AnimationTrack {
         let at = if t >= self.end - 1e-5 {
             f32::MAX
         } else {
-            self.time_at(t)
+            t - self.start
         };
         // The keys either side of `at` and how far between them it is.
         fn span<const N: usize>(keys: &[[f32; N]], at: f32) -> Option<(usize, usize, f32)> {
@@ -1000,12 +1003,16 @@ impl Actor {
                 _ => normalize(rot),
             };
         }
-        // Each animation's root motion moves the actor on from there, in the file's order,
-        // and stays once its track has ended (see [`AnimationTrack::root_at`]).
+        // Baked translations are already in cutscene space: 0x7d3c80 turns them by
+        // retained animation turns (0x7d3a90), not by the actor's stage orientation.
+        // Rotating them by pose.rotation makes a staged actor walk sideways/backwards.
+        // Each animation moves on from the preceding ones, in the file's order.
+        let mut root_turn = [0.0, 0.0, 0.0, 1.0];
         for (step, turn) in self.animations.iter().filter_map(|a| a.root_at(t)) {
-            let moved = rotate(pose.rotation, step);
+            let moved = rotate(root_turn, step);
             pose.position = [0, 1, 2].map(|i| pose.position[i] + moved[i]);
             pose.rotation = normalize(mul(pose.rotation, turn));
+            root_turn = normalize(mul(root_turn, turn));
         }
         pose
     }
@@ -2654,7 +2661,7 @@ mod tests {
             tree: "x.cub".into(),
             speed: 1.0,
             offset: 0.0,
-            // One metre along the actor's own +Y over two seconds, and a quarter turn left.
+            // One metre along the cutscene's +Y over two seconds, and a quarter turn left.
             root_positions: vec![[0.0, 0.0, 0.0, 0.0], [2.0, 0.0, 1.0, 0.0]],
             root_rotations: vec![[0.0, 0.0, 0.0, 0.0, 1.0], [2.0, 0.0, 0.0, h, h]],
             root_held: false,
@@ -2662,6 +2669,14 @@ mod tests {
         assert_eq!(turn.root_at(1.9), None);
         let (p, r) = turn.root_at(3.0).unwrap();
         assert!((p[1] - 0.5).abs() < 1e-5);
+        // Speed and offset change the pose clock, but the exported root keys are already
+        // baked on the track clock (0x7db400 passes these two clocks separately).
+        let retimed = AnimationTrack {
+            speed: 3.0,
+            offset: 7.0,
+            ..turn.clone()
+        };
+        assert_eq!(retimed.root_at(3.0), turn.root_at(3.0));
         assert!((facing_of(r).unwrap() - facing_of([0.0, 0.0, 0.0, 1.0]).unwrap()).abs() > 1.0);
         // Past its end the last keys hold.
         let (p, r) = turn.root_at(60.0).unwrap();
@@ -2680,8 +2695,7 @@ mod tests {
         };
         assert_eq!(pose.root_at(3.0), None);
 
-        // On an actor that stands at (10, 0, 0) turned a quarter left (its +Y is world -X):
-        // the step goes along world -X, and two such tracks turn it half way round.
+        // The actor's quarter turn must not rotate the baked translation a second time.
         let mut a = Actor {
             id: 1,
             name: "a".into(),
@@ -2711,17 +2725,29 @@ mod tests {
         let before = a.stage_pose_at(1.0, none);
         assert_eq!(before.position, [10.0, 0.0, 0.0]);
         let after = a.stage_pose_at(9.0, none);
-        assert!((after.position[0] - 9.0).abs() < 1e-4 && after.position[1].abs() < 1e-4);
+        assert!((after.position[0] - 10.0).abs() < 1e-4 && (after.position[1] - 1.0).abs() < 1e-4);
         // A half turn about Z: (0, 0, 1, 0) up to sign.
         assert!(after.rotation[2].abs() > 0.999 && after.rotation[3].abs() < 1e-3);
+        // A jump to a differently turned stage place must not turn the displacement
+        // either (Beraht's walk-in uses this combination, rather than an actor base).
+        a.places.push(PlaceTrack {
+            start: 0.0,
+            end: 100.0,
+            place: "mark".into(),
+            look_at: None,
+        });
+        let staged = a.stage_pose_at(9.0, &|_| Some(([20.0, 30.0, 0.0], [0.0, 0.0, 1.0, 0.0])));
+        assert!((staged.position[0] - 20.0).abs() < 1e-4);
+        assert!((staged.position[1] - 31.0).abs() < 1e-4);
+        a.places.clear();
         a.animations.push(AnimationTrack {
             start: 5.0,
             end: 7.0,
             ..turn
         });
         let twice = a.stage_pose_at(9.0, none);
-        // The second step is taken in the frame the first left: along world -Y.
-        assert!((twice.position[0] - 9.0).abs() < 1e-4 && (twice.position[1] + 1.0).abs() < 1e-4);
+        // The first animation's retained quarter turn rotates the next step towards -X.
+        assert!((twice.position[0] - 9.0).abs() < 1e-4 && (twice.position[1] - 1.0).abs() < 1e-4);
         assert!((twice.rotation[2].abs() - h).abs() < 1e-3);
     }
 

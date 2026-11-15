@@ -5,6 +5,7 @@ use std::sync::LazyLock;
 pub(crate) struct Config {
     pub punch: bool,
     pub objects: bool,
+    pub mesh_tangents: bool,
     pub terrain: bool,
     pub faces: bool,
     pub fronds: bool,
@@ -26,6 +27,7 @@ pub(crate) struct Config {
     pub depth_lights: bool,
     pub direct_terrain_layers: bool,
     pub sun_shadows: bool,
+    pub sun_early_exit: bool,
     pub shadow_reuse: bool,
     pub shadow_cull: bool,
     pub ground_mask: bool,
@@ -47,6 +49,7 @@ pub(crate) static CONFIG: LazyLock<Config> = LazyLock::new(|| {
     Config {
         punch: enabled("THEDAS_DEFERRED_PUNCH"),
         objects: enabled("THEDAS_DEFERRED_OBJECTS"),
+        mesh_tangents: enabled("THEDAS_DEFERRED_MESH_TANGENTS"),
         terrain: enabled("THEDAS_DEFERRED_TERRAIN"),
         faces: enabled("THEDAS_DEFERRED_FACES"),
         fronds: enabled("THEDAS_DEFERRED_FRONDS"),
@@ -68,6 +71,7 @@ pub(crate) static CONFIG: LazyLock<Config> = LazyLock::new(|| {
         depth_lights: enabled("THEDAS_DEFERRED_DEPTH_LIGHTS"),
         direct_terrain_layers: enabled("THEDAS_DEFERRED_DIRECT_TERRAIN_LAYERS"),
         sun_shadows: enabled("THEDAS_DEFERRED_SUN_SHADOWS"),
+        sun_early_exit: enabled("THEDAS_DEFERRED_SUN_EARLY_EXIT"),
         shadow_reuse: enabled("THEDAS_DEFERRED_SHADOW_REUSE"),
         shadow_cull: enabled("THEDAS_DEFERRED_SHADOW_CULL"),
         ground_mask: enabled("THEDAS_DEFERRED_GROUND_MASK"),

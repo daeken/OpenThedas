@@ -79,8 +79,7 @@ fn origins_has_no_health(kind: ObjectKind) -> bool {
 /// default), a creator (`OBJECT_INVALID` for any) and a duration type
 /// (`EFFECT_DURATION_TYPE_INVALID`, 0, for any). DAOrigins.exe agrees on the ability: the one
 /// handler of both queries (0x673d70) turns −1 into 0, and its filter (0xa64950) skips the
-/// ability test for 0. Provisional: `GetEffects`' effect id filter is not applied (effects
-/// carry no ids yet).
+/// ability test for 0.
 #[derive(Clone, Copy, Debug)]
 struct EffectFilter {
     ty: i32,
@@ -849,7 +848,7 @@ fn apply_visual_or_effect(h: &mut ScriptHost, target: ObjectId, e: Effect) {
     if let (Some(replay), Some(o)) = (replay, h.sim.world.get_mut(target)) {
         let mut kept = false;
         o.effects.retain(|e| {
-            if *e != replay {
+            if !e.same_payload(&replay) {
                 return true;
             }
             let first = !kept;
@@ -1435,8 +1434,28 @@ pub fn call(
             h.object(obj(a, 0)).map_or([0.0; 3], |o| o.position),
         )),
         "SetPosition" => {
-            if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
-                o.position = vector(a, 1);
+            let id = obj(a, 0);
+            let mut position = vector(a, 1);
+            // DAOrigins.exe 0x6554b0: a creature with bSafePosition set (default
+            // TRUE) searches within 5 m, check and snap on. Only result 1 moves it;
+            // non-creatures and bSafePosition FALSE use the requested point directly.
+            if (a.len() < 3 || int(a, 2) != 0)
+                && h.object(id).is_some_and(|o| o.kind == ObjectKind::Creature)
+            {
+                let area = h.object(id).and_then(|o| o.area).unwrap_or(OBJECT_INVALID);
+                let how = crate::nav::SafeSearch {
+                    radius: 5.0,
+                    body_radius: h.sim.capsule_radius(id),
+                    mover: Some(id),
+                    standable_keeps: true,
+                };
+                let Some(found) = h.sim.safe_search(area, position, how) else {
+                    return void();
+                };
+                position = found;
+            }
+            if let Some(o) = h.sim.world.get_mut(id) {
+                o.position = position;
             }
             void()
         }
@@ -2461,18 +2480,39 @@ pub fn call(
 
         // --- Effects ----------------------------------------------------------------------
         "Effect" => {
-            let hd = h.sim.world.store(EngineData::Effect(Effect {
+            let hd = h.sim.world.store_new_effect(Effect {
                 ty: int(a, 0),
                 creator: Some(caller),
                 ..Default::default()
-            }));
+            });
             ok(Value::Engine {
                 ty: ty.effect,
                 handle: Some(hd),
             })
         }
-        "GetEffectType" | "GetEffectAbilityID" | "GetEffectInteger" | "GetEffectFloat"
-        | "GetEffectObject" | "GetEffectCreator" => {
+        "GetEffectType"
+        | "GetEffectAbilityID"
+        | "GetEffectInteger"
+        | "GetEffectFloat"
+        | "GetEffectObject"
+        | "GetEffectCreator"
+        | "GetEffectID"
+        | "GetEffectDurationType"
+        | "GetEffectFlags"
+        | "GetEffectAnimation"
+        | "GetEffectString" => {
+            // Shared native getter 0x65c270: ID is +0x20 (function 614),
+            // duration +0x28, flags +0x3c, animation +0x34. Invalid scalar
+            // queries return -1. Indexed strings use 0x651270.
+            if matches!(
+                name,
+                "GetEffectID" | "GetEffectDurationType" | "GetEffectFlags" | "GetEffectAnimation"
+            ) && !matches!(
+                h.sim.world.handle(handle(a, 0)),
+                Some(EngineData::Effect(_))
+            ) {
+                return ok(Value::Int(-1));
+            }
             let e = match h.sim.world.handle(handle(a, 0)) {
                 Some(EngineData::Effect(e)) => e.clone(),
                 _ => Effect::default(),
@@ -2481,6 +2521,17 @@ pub fn call(
             ok(match name {
                 "GetEffectType" => Value::Int(e.ty),
                 "GetEffectAbilityID" => Value::Int(e.ability),
+                "GetEffectID" => Value::Int(e.id),
+                "GetEffectDurationType" => Value::Int(e.duration_type),
+                "GetEffectFlags" => Value::Int(e.flags),
+                "GetEffectAnimation" => Value::Int(e.animation),
+                "GetEffectString" => Value::String(
+                    usize::try_from(int(a, 1))
+                        .ok()
+                        .and_then(|i| e.strings.get(i))
+                        .cloned()
+                        .unwrap_or_default(),
+                ),
                 "GetEffectInteger" => Value::Int(e.ints.get(i).copied().unwrap_or(0)),
                 "GetEffectFloat" => Value::Float(e.floats.get(i).copied().unwrap_or(0.0)),
                 "GetEffectCreator" => Value::Object(e.creator.unwrap_or(OBJECT_INVALID)),
@@ -2592,7 +2643,7 @@ pub fn call(
                 ints: vec![int(a, 2)],
                 ..Default::default()
             };
-            let hd = h.sim.world.store(EngineData::Effect(e));
+            let hd = h.sim.world.store_new_effect(e);
             let ability = (a.len() > 5).then(|| int(a, 5));
             if let Some(e) = applied_effect(h, Some(hd), int(a, 3), float(a, 4), obj(a, 0), ability)
             {
@@ -2690,6 +2741,8 @@ pub fn call(
                         .map(|v| v.effect.clone()),
                 );
             }
+            let effect_id = if a.len() > 5 { int(a, 5) } else { -1 };
+            list.retain(|e| effect_id == -1 || e.id == effect_id);
             let items = list
                 .into_iter()
                 .map(|e| Value::Engine {
@@ -2700,6 +2753,142 @@ pub fn call(
             ok(Value::Array {
                 elem: Type::Engine(ty.effect),
                 items,
+            })
+        }
+        "GetEffectsByCreator" => {
+            // 0x673fb0 queries the creator's area: object effect lists first, then
+            // the area's own list (including visual effects applied at locations).
+            let creator = obj(a, 0);
+            let area = h.object(creator).and_then(|o| {
+                if o.kind == ObjectKind::Area {
+                    Some(o.id)
+                } else {
+                    o.area
+                }
+            });
+            // Unlike 0x673d70, this handler does not normalize ability -1.
+            let ability = int(a, 1);
+            let filter = EffectFilter {
+                ty: int(a, 2),
+                ability: (ability != 0).then_some(ability),
+                creator: Some(creator),
+                duration_type: 0,
+            };
+            let mut list = Vec::new();
+            if let Some(area) = area {
+                for o in h
+                    .sim
+                    .world
+                    .objects
+                    .values()
+                    .filter(|o| o.area == Some(area))
+                {
+                    list.extend(o.effects.iter().filter(|e| filter.matches(e)).cloned());
+                }
+                if let Some(o) = h.object(area) {
+                    list.extend(o.effects.iter().filter(|e| filter.matches(e)).cloned());
+                }
+                list.extend(
+                    h.sim
+                        .world
+                        .location_vfx
+                        .iter()
+                        .filter(|v| v.area == area && filter.matches(&v.effect))
+                        .map(|v| v.effect.clone()),
+                );
+            }
+            let items = list
+                .into_iter()
+                .map(|e| Value::Engine {
+                    ty: ty.effect,
+                    handle: Some(h.sim.world.store(EngineData::Effect(e))),
+                })
+                .collect();
+            ok(Value::Array {
+                elem: Type::Engine(ty.effect),
+                items,
+            })
+        }
+        "RemoveEffectsByCreator" => {
+            // 0x674690 requires a creature creator, then visits creatures in its
+            // area. 0x7a0c90 preserves duration types 4, 5 and 6 even when matched.
+            let creator = obj(a, 0);
+            let area = h
+                .object(creator)
+                .filter(|o| o.kind == ObjectKind::Creature)
+                .and_then(|o| o.area);
+            let ability = int(a, 1);
+            let mut gone = Vec::new();
+            if let Some(area) = area {
+                for o in h
+                    .sim
+                    .world
+                    .objects
+                    .values()
+                    .filter(|o| o.kind == ObjectKind::Creature && o.area == Some(area))
+                {
+                    for e in &o.effects {
+                        if e.creator == Some(creator)
+                            && (ability == 0 || e.ability == ability)
+                            && !(4..=6).contains(&e.duration_type)
+                        {
+                            gone.push((o.id, e.clone()));
+                        }
+                    }
+                }
+            }
+            for (target, effect) in gone {
+                h.sim.remove_effect(target, &effect);
+            }
+            void()
+        }
+        "GetVisualEffectLocation" => {
+            // 0x6646b0 accepts only type 4: a location-applied effect uses its
+            // stored point; an object-applied effect follows the object's current pose.
+            let effect = h.sim.world.handle(handle(a, 0)).and_then(|v| match v {
+                EngineData::Effect(e) if e.ty == 4 => Some(e),
+                _ => None,
+            });
+            let same = |x: &Effect, e: &Effect| if e.id != 0 { x.id == e.id } else { x == e };
+            let location = effect
+                .and_then(|e| {
+                    if let Some(location) = e.visual_location {
+                        Some(location)
+                    } else if let Some(target) = e.visual_target {
+                        // A removed explicit target stays invalid; another applied copy
+                        // with the same identity must not supply its location.
+                        h.location_of(target)
+                    } else {
+                        // Older saves did not retain the application context.
+                        h.sim
+                            .world
+                            .location_vfx
+                            .iter()
+                            .find(|v| same(&v.effect, e))
+                            .map(|v| Location {
+                                area: v.area,
+                                position: v.position,
+                                facing: v.facing,
+                            })
+                            .or_else(|| {
+                                h.sim
+                                    .world
+                                    .objects
+                                    .values()
+                                    .find(|o| o.effects.iter().any(|x| same(x, e)))
+                                    .and_then(|o| h.location_of(o.id))
+                            })
+                    }
+                })
+                .unwrap_or(Location {
+                    area: OBJECT_INVALID,
+                    position: [0.0; 3],
+                    facing: 0.0,
+                });
+            let hd = h.sim.world.store(EngineData::Location(location));
+            ok(Value::Engine {
+                ty: ty.location,
+                handle: Some(hd),
             })
         }
         "RemoveEffect" => {
@@ -2737,18 +2926,20 @@ pub fn call(
         "AddItemVisualEffect" => {
             let item = obj(a, 0);
             let permanent = constant(&h.sim.table, "EFFECT_DURATION_TYPE_PERMANENT");
+            let mut effect = Effect {
+                ty: 4,
+                duration_type: permanent,
+                ints: vec![int(a, 1)],
+                ..Default::default()
+            };
+            h.sim.world.identify_effect(&mut effect);
             if let Some(o) = h
                 .sim
                 .world
                 .get_mut(item)
                 .filter(|o| o.kind == ObjectKind::Item)
             {
-                o.effects.push(Effect {
-                    ty: 4,
-                    duration_type: permanent,
-                    ints: vec![int(a, 1)],
-                    ..Default::default()
-                });
+                o.effects.push(effect);
             }
             void()
         }
@@ -2825,6 +3016,7 @@ pub fn call(
                 cancellable: false,
                 impacted: false,
                 arrived: false,
+                da2_target_prepared: false,
                 path: Vec::new(),
             };
             // Only the first float is kept (a wait's seconds, a move's minimum range): a
@@ -3109,7 +3301,7 @@ pub fn call(
                 strings: vec![string(a, 1)],
                 ..Default::default()
             };
-            let hd = h.sim.world.store(EngineData::Effect(e));
+            let hd = h.sim.world.store_new_effect(e);
             ok(Value::Engine {
                 ty: ty.effect,
                 handle: Some(hd),
@@ -3229,9 +3421,9 @@ pub fn call(
                     if e.duration_type != instant {
                         h.sim.world.next_vfx += 1;
                         let handle = h.sim.world.next_vfx;
-                        if e.id == 0 {
-                            e.id = (handle as i32).saturating_add(1_000_000);
-                        }
+                        h.sim.world.identify_effect(&mut e);
+                        e.visual_target = None;
+                        e.visual_location = Some(l);
                         let now = h.sim.world.time_ms;
                         let entry = crate::world::LocationVfx {
                             handle,
@@ -3327,14 +3519,20 @@ pub fn call(
             let who = obj(a, 0);
             let running = h.sim.world.get_mut(who).and_then(|o| {
                 if o.commands.first().is_some_and(|c| c.due.is_some()) {
-                    Some(o.commands.remove(0).ty)
+                    Some(o.commands.remove(0))
                 } else {
                     None
                 }
             });
-            if let Some(ty) = running {
+            if let Some(cmd) = running {
+                if cmd.name == "CommandUseAbility" {
+                    h.sim.complete_da2_combat_target(who);
+                }
                 let mut ev = h.sim.new_event("COMMAND_COMPLETE", Some(who));
-                ev.ints = vec![ty, constant(&h.sim.table, "COMMAND_FAILED_COMMAND_CLEARED")];
+                ev.ints = vec![
+                    cmd.ty,
+                    constant(&h.sim.table, "COMMAND_FAILED_COMMAND_CLEARED"),
+                ];
                 h.sim.world.queue_event(0, who, ev, None);
             }
             void()
@@ -3342,11 +3540,17 @@ pub fn call(
         "ClearAllCommands" => {
             let who = obj(a, 0);
             let running = h.sim.world.get_mut(who).and_then(|o| {
-                let first = o.commands.first().map(|c| c.ty);
+                let first = o
+                    .commands
+                    .first()
+                    .map(|c| (c.ty, c.name == "CommandUseAbility"));
                 o.commands.clear();
                 first
             });
-            if let Some(ty) = running {
+            if let Some((ty, ability)) = running {
+                if ability {
+                    h.sim.complete_da2_combat_target(who);
+                }
                 let mut ev = h.sim.new_event("COMMAND_COMPLETE", Some(who));
                 ev.ints = vec![ty, constant(&h.sim.table, "COMMAND_RESULT_INVALID")];
                 h.sim.world.queue_event(0, who, ev, None);
@@ -4294,9 +4498,7 @@ pub fn call(
                 (obj(a, 0), int(a, 1), int(a, 2) != 0, int(a, 3) != 0);
             if success {
                 if let Some(next) = placeable_transition(h.sim, id, action, variation) {
-                    if let Some(o) = h.sim.world.get_mut(id) {
-                        o.fields.insert("State".into(), next);
-                    }
+                    h.sim.set_placeable_state(id, next);
                 }
             }
             void()
@@ -4456,9 +4658,12 @@ pub fn call(
                 0
             }))
         }
-        "SetPlaceableState" | "SetPlotGiver" | "SetAutoLevelUp" | "SetFollowerApprovalEnabled" => {
+        "SetPlaceableState" => {
+            h.sim.set_placeable_state(obj(a, 0), int(a, 1));
+            void()
+        }
+        "SetPlotGiver" | "SetAutoLevelUp" | "SetFollowerApprovalEnabled" => {
             let field = match name {
-                "SetPlaceableState" => "State",
                 "SetPlotGiver" => "PlotGiver",
                 "SetAutoLevelUp" => "AutoLevelUp",
                 _ => "ApprovalEnabled",
@@ -4501,16 +4706,12 @@ pub fn call(
         // --- Combat and perception (see `combat`) ------------------------------------------
         "GetCombatState" => ok(b(h.object(obj(a, 0)).is_some_and(|o| o.combat.in_combat))),
         "SetCombatState" => {
-            if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
-                o.combat.in_combat = int(a, 1) != 0;
-            }
+            h.sim.set_combat_state(obj(a, 0), int(a, 1) != 0);
             void()
         }
         "GetAttackTarget" => ok(Value::Object(
-            h.object(obj(a, 0))
-                .and_then(|o| o.commands.first())
-                .filter(|c| c.name == "CommandAttack")
-                .and_then(|c| c.target)
+            h.sim
+                .script_attack_target(obj(a, 0))
                 .unwrap_or(OBJECT_INVALID),
         )),
         "IsObjectHostile" => ok(b(h.sim.hostile(obj(a, 0), obj(a, 1)))),
@@ -4743,7 +4944,7 @@ pub fn call(
                 hostile: name == "EffectModifyPropertyHostile",
                 ..Default::default()
             };
-            let hd = h.sim.world.store(EngineData::Effect(e));
+            let hd = h.sim.world.store_new_effect(e);
             ok(Value::Engine {
                 ty: ty.effect,
                 handle: Some(hd),
@@ -4880,7 +5081,7 @@ pub fn call(
                     ..Default::default()
                 }
             };
-            let hd = h.sim.world.store(EngineData::Effect(e));
+            let hd = h.sim.world.store_new_effect(e);
             ok(Value::Engine {
                 ty: ty.effect,
                 handle: Some(hd),
@@ -5584,9 +5785,10 @@ fn placeable_transition(sim: &Sim, id: ObjectId, action: i32, variation: bool) -
     if int(0x52be_3c5e)? != action {
         return None;
     }
-    let next = int(0xa2b4_782c)?;
-    let alt = int(0x5ad0_780d).filter(|&v| v > 0);
-    Some(if variation { alt.unwrap_or(next) } else { next })
+    let next = int(if variation { 0x5ad0_780d } else { 0xa2b4_782c })? as u16;
+    // 0x74fc40 skips the action's absent unsigned-short target before invoking
+    // the ordinary setter. An explicit SetPlaceableState(-1) still reaches it.
+    (next != u16::MAX).then_some(i32::from(next))
 }
 
 /// A placeable's default action in its current state, from its type's state controller:
@@ -7508,6 +7710,605 @@ mod tests {
             script: "test".into(),
         };
         call(&mut h, caller, &f, a).unwrap().unwrap()
+    }
+
+    fn effect_accessors_sim() -> Sim {
+        let table = EngineTable::parse(b"#define ENGINE_STRUCTURE_3 effect\n\
+            #define ENGINE_STRUCTURE_1 location\n\
+            int EFFECT_DURATION_TYPE_INSTANT = 1;\n\
+            int EFFECT_DURATION_TYPE_PERMANENT = 3;\n\
+            effect Effect(int t) = 19;\n\
+            int GetEffectID(effect e) = 614;\n\
+            int GetEffectDurationType(effect e) = 608;\n\
+            int GetEffectFlags(effect e) = 605;\n\
+            int GetEffectAnimation(effect e) = 607;\n\
+            string GetEffectString(effect e, int i) = 689;\n\
+            effect SetEffectFlags(effect e, int f) = 609;\n\
+            effect[] GetEffects(object o, int t = 0, int a = 0, object c = OBJECT_INVALID, int d = 0, int i = -1) = 712;\n\
+            effect[] GetEffectsByCreator(object o, int a = 0, int t = 0) = 713;\n\
+            void RemoveEffectsByCreator(object o, int a = 0) = 139;\n\
+            location GetVisualEffectLocation(effect e) = 186;\n\
+            void Engine_ApplyEffectAtLocation(int d, effect e, location l, float f, object c) = 595;\n").unwrap();
+        Sim::new(Arc::new(Vfs::new()), Arc::new(table), 1)
+    }
+
+    #[test]
+    fn effect_ids_survive_copies_and_saves_and_scalar_getters_read_their_fields() {
+        let mut s = effect_accessors_sim();
+        let first = run(&mut s, 1, "Effect", &[Value::Int(4)]).unwrap();
+        let second = run(&mut s, 1, "Effect", &[Value::Int(4)]).unwrap();
+        let id = |s: &mut Sim, e: &Value| run(s, 1, "GetEffectID", std::slice::from_ref(e));
+        assert_eq!(id(&mut s, &first), Some(Value::Int(1)));
+        assert_eq!(id(&mut s, &second), Some(Value::Int(2)));
+        let changed = run(
+            &mut s,
+            1,
+            "SetEffectFlags",
+            &[first.clone(), Value::Int(42)],
+        )
+        .unwrap();
+        assert_eq!(id(&mut s, &changed), Some(Value::Int(1)));
+        assert_eq!(
+            run(&mut s, 1, "GetEffectFlags", &[changed]),
+            Some(Value::Int(42))
+        );
+        let hd = s.world.store(EngineData::Effect(Effect {
+            ty: 4,
+            duration_type: 3,
+            animation: 77,
+            strings: vec!["vfx".into()],
+            ..Default::default()
+        }));
+        let e = Value::Engine {
+            ty: s.types.effect,
+            handle: Some(hd),
+        };
+        assert_eq!(
+            run(&mut s, 1, "GetEffectDurationType", std::slice::from_ref(&e)),
+            Some(Value::Int(3))
+        );
+        assert_eq!(
+            run(&mut s, 1, "GetEffectAnimation", std::slice::from_ref(&e)),
+            Some(Value::Int(77))
+        );
+        assert_eq!(
+            run(&mut s, 1, "GetEffectString", &[e.clone(), Value::Int(0)]),
+            Some(Value::String("vfx".into()))
+        );
+        assert_eq!(
+            run(&mut s, 1, "GetEffectString", &[e, Value::Int(-1)]),
+            Some(Value::String(String::new()))
+        );
+        let invalid = Value::Engine {
+            ty: s.types.effect,
+            handle: None,
+        };
+        assert_eq!(id(&mut s, &invalid), Some(Value::Int(-1)));
+        let bytes = s.save_json().unwrap();
+        s.load_json(&bytes).unwrap();
+        assert_eq!(id(&mut s, &first), Some(Value::Int(1)));
+        let third = run(&mut s, 1, "Effect", &[Value::Int(4)]).unwrap();
+        assert_eq!(id(&mut s, &third), Some(Value::Int(3)));
+        let mut old: serde_json::Value = serde_json::from_slice(&s.save_json().unwrap()).unwrap();
+        old["world"]
+            .as_object_mut()
+            .unwrap()
+            .remove("next_effect_id");
+        s.load_json(&serde_json::to_vec(&old).unwrap()).unwrap();
+        let fourth = run(&mut s, 1, "Effect", &[Value::Int(4)]).unwrap();
+        assert_eq!(id(&mut s, &fourth), Some(Value::Int(4)));
+    }
+
+    #[test]
+    fn effect_creator_queries_are_area_local_and_removal_keeps_death_durations() {
+        let mut s = effect_accessors_sim();
+        let area = s.world.spawn(ObjectKind::Area, "a");
+        let elsewhere = s.world.spawn(ObjectKind::Area, "b");
+        let creator = s.world.spawn(ObjectKind::Creature, "creator");
+        let target = s.world.spawn(ObjectKind::Creature, "target");
+        let placeable = s.world.spawn(ObjectKind::Placeable, "placeable");
+        let distant = s.world.spawn(ObjectKind::Creature, "distant");
+        for id in [creator, target, placeable] {
+            s.world.get_mut(id).unwrap().area = Some(area);
+        }
+        s.world.get_mut(distant).unwrap().area = Some(elsewhere);
+        for (owner, ability, duration, source) in [
+            (target, 10, 3, creator),
+            (target, 20, 3, creator),
+            (target, 10, 6, creator),
+            (target, 10, 3, target),
+            (placeable, 10, 3, creator),
+            (distant, 10, 3, creator),
+            (area, 10, 3, creator),
+        ] {
+            s.apply_effect(
+                owner,
+                Effect {
+                    ty: 1012,
+                    creator: Some(source),
+                    ability,
+                    duration_type: duration,
+                    ..Default::default()
+                },
+            );
+        }
+        let count = |s: &mut Sim, ability, kind| {
+            let Some(Value::Array { items, .. }) = run(
+                s,
+                creator,
+                "GetEffectsByCreator",
+                &[
+                    Value::Object(creator),
+                    Value::Int(ability),
+                    Value::Int(kind),
+                ],
+            ) else {
+                panic!("effects")
+            };
+            items.len()
+        };
+        assert_eq!(count(&mut s, 0, 0), 5);
+        assert_eq!(count(&mut s, 10, 1012), 4);
+        assert_eq!(count(&mut s, 10, 4), 0);
+        assert_eq!(count(&mut s, -1, 0), 0);
+        let e = s.world.get(target).unwrap().effects[0].clone();
+        let Some(Value::Array { items, .. }) = run(
+            &mut s,
+            creator,
+            "GetEffects",
+            &[
+                Value::Object(target),
+                Value::Int(0),
+                Value::Int(0),
+                Value::Object(OBJECT_INVALID),
+                Value::Int(0),
+                Value::Int(e.id),
+            ],
+        ) else {
+            panic!("effects")
+        };
+        assert_eq!(items.len(), 1);
+        run(
+            &mut s,
+            creator,
+            "RemoveEffectsByCreator",
+            &[Value::Object(creator), Value::Int(10)],
+        );
+        assert_eq!(s.world.get(target).unwrap().effects.len(), 3);
+        assert_eq!(s.world.get(placeable).unwrap().effects.len(), 1);
+        assert_eq!(s.world.get(distant).unwrap().effects.len(), 1);
+        assert_eq!(s.world.get(area).unwrap().effects.len(), 1);
+        assert_eq!(count(&mut s, 10, 1012), 3);
+        // Removal identifies the effect even after a caller edits its returned copy.
+        let mut e = s.world.get(target).unwrap().effects[0].clone();
+        e.flags = 123;
+        assert!(s.remove_effect(target, &e));
+        let raw = Effect {
+            ty: 1012,
+            creator: Some(creator),
+            duration_type: 3,
+            ..Default::default()
+        };
+        s.apply_effect(target, raw.clone());
+        assert!(s.remove_effect(target, &raw));
+    }
+
+    #[test]
+    fn visual_effect_locations_follow_the_applied_copy_or_keep_the_location() {
+        let mut s = effect_accessors_sim();
+        let effect_type = s.types.effect;
+        let location_type = s.types.location;
+        let area = s.world.spawn(ObjectKind::Area, "a");
+        let a = s.world.spawn(ObjectKind::Creature, "one");
+        let b = s.world.spawn(ObjectKind::Creature, "two");
+        for id in [a, b] {
+            s.world.get_mut(id).unwrap().area = Some(area);
+        }
+        let effect = Effect {
+            ty: 4,
+            duration_type: 3,
+            ..Default::default()
+        };
+        let hd = s.world.store_new_effect(effect);
+        let Some(EngineData::Effect(e)) = s.world.handle(Some(hd)).cloned() else {
+            panic!("effect")
+        };
+        for id in [a, b] {
+            s.apply_effect(id, e.clone());
+        }
+        for (id, p) in [(a, [1.0, 2.0, 3.0]), (b, [4.0, 5.0, 6.0])] {
+            s.world.get_mut(id).unwrap().position = p;
+            let e = s.world.get(id).unwrap().effects[0].clone();
+            let hd = s.world.store(EngineData::Effect(e));
+            let effect = Value::Engine {
+                ty: effect_type,
+                handle: Some(hd),
+            };
+            let Some(Value::Engine { handle, .. }) =
+                run(&mut s, id, "GetVisualEffectLocation", &[effect])
+            else {
+                panic!("location")
+            };
+            assert!(
+                matches!(s.world.handle(handle), Some(EngineData::Location(l)) if l.position == p && l.area == area)
+            );
+        }
+        let at = Location {
+            area,
+            position: [8.0, 9.0, 10.0],
+            facing: 45.0,
+        };
+        let lh = s.world.store(EngineData::Location(at));
+        let effect = Value::Engine {
+            ty: effect_type,
+            handle: Some(hd),
+        };
+        run(
+            &mut s,
+            a,
+            "Engine_ApplyEffectAtLocation",
+            &[
+                Value::Int(3),
+                effect,
+                Value::Engine {
+                    ty: location_type,
+                    handle: Some(lh),
+                },
+                Value::Float(0.0),
+                Value::Object(a),
+            ],
+        );
+        let e = s.world.location_vfx[0].effect.clone();
+        let eh = s.world.store(EngineData::Effect(e));
+        let Some(Value::Engine { handle, .. }) = run(
+            &mut s,
+            a,
+            "GetVisualEffectLocation",
+            &[Value::Engine {
+                ty: effect_type,
+                handle: Some(eh),
+            }],
+        ) else {
+            panic!("location")
+        };
+        assert_eq!(s.world.handle(handle), Some(&EngineData::Location(at)));
+        // Copies attached to a destroyed object do not pick up another copy's pose.
+        let e = s.world.get(a).unwrap().effects[0].clone();
+        s.world.objects.remove(&a);
+        let eh = s.world.store(EngineData::Effect(e));
+        let Some(Value::Engine { handle, .. }) = run(
+            &mut s,
+            0,
+            "GetVisualEffectLocation",
+            &[Value::Engine {
+                ty: effect_type,
+                handle: Some(eh),
+            }],
+        ) else {
+            panic!("location")
+        };
+        assert!(
+            matches!(s.world.handle(handle), Some(EngineData::Location(l)) if l.area == OBJECT_INVALID)
+        );
+    }
+
+    fn state_controlled_placeable() -> (Sim, ObjectId) {
+        let table = Arc::new(
+            EngineTable::parse(
+                b"void SetPlaceableState(object o, int state) = 1;\n\
+                  void SetPlaceableActionResult(object o, int a, int s, int v = 0) = 2;\n",
+            )
+            .unwrap(),
+        );
+        let mut sim = Sim::new(Arc::new(Vfs::new()), table, 1);
+        let tables = crate::m2da::Tables::empty();
+        let mut appearance = vec![Cell::Empty; 8];
+        appearance.push(Cell::String("statecnt_fixture\0".into()));
+        tables.insert(
+            "#93",
+            &["a", "b", "c", "d", "e", "f", "g", "h", "#9a320a51"],
+            vec![(5, appearance)],
+        );
+        // Sparse IDs distinguish the controller's row count from its row IDs.
+        tables.insert(
+            "statecnt_fixture",
+            &["ID", "#52be3c5e", "#a2b4782c", "#5ad0780d"],
+            [0, 10, 99]
+                .into_iter()
+                .map(|id| {
+                    (
+                        id,
+                        vec![Cell::Int(id), Cell::Int(3), Cell::Int(9), Cell::Int(2)],
+                    )
+                })
+                .collect(),
+        );
+        sim.world.tables = Arc::new(tables);
+        let id = sim.world.spawn(ObjectKind::Placeable, "controlled");
+        let o = sim.world.get_mut(id).unwrap();
+        o.appearance = 5;
+        o.fields.insert("Appearance".into(), 5);
+        o.fields.insert("AnimContState".into(), 0);
+        (sim, id)
+    }
+
+    #[test]
+    fn origins_placeable_state_setter_uses_unsigned_controller_bounds() {
+        let (mut sim, id) = state_controlled_placeable();
+        sim.world.get_mut(id).unwrap().appearance = 65_541;
+        for (request, expected) in [(65_538, 2), (3, 0), (-65_535, 1), (-1, 0)] {
+            run(
+                &mut sim,
+                id,
+                "SetPlaceableState",
+                &[Value::Object(id), Value::Int(request)],
+            );
+            assert_eq!(
+                sim.world.get(id).unwrap().fields.get("State"),
+                Some(&expected)
+            );
+        }
+        sim.world.get_mut(id).unwrap().fields.remove("State");
+        run(
+            &mut sim,
+            id,
+            "SetPlaceableState",
+            &[Value::Object(id), Value::Int(65_536)],
+        );
+        assert!(!sim.world.get(id).unwrap().fields.contains_key("State"));
+        // The same-state return precedes the bounds check, even for a legacy state.
+        sim.world
+            .get_mut(id)
+            .unwrap()
+            .fields
+            .insert("State".into(), 3);
+        run(
+            &mut sim,
+            id,
+            "SetPlaceableState",
+            &[Value::Object(id), Value::Int(65_539)],
+        );
+        assert_eq!(sim.world.get(id).unwrap().fields.get("State"), Some(&3));
+        assert!(sim.world.destroy_at.is_empty());
+        assert!(sim.world.nav_patches.is_empty());
+    }
+
+    #[test]
+    fn origins_placeable_state_requires_a_loaded_nonempty_controller() {
+        let (mut sim, id) = state_controlled_placeable();
+        sim.world.tables().insert(
+            "#93",
+            &["#9a320a51"],
+            vec![
+                (5, vec![Cell::String("missing".into())]),
+                (6, vec![Cell::String("empty".into())]),
+                (7, vec![Cell::String(String::new())]),
+            ],
+        );
+        sim.world.tables().insert("empty", &["ID"], vec![]);
+        // An empty controller name must not select the nonempty animation table 0.
+        sim.world
+            .tables()
+            .insert("#0", &["ID"], vec![(0, vec![Cell::Int(0)])]);
+        for appearance in [5, 6, 7, 8] {
+            sim.world.get_mut(id).unwrap().appearance = appearance;
+            run(
+                &mut sim,
+                id,
+                "SetPlaceableState",
+                &[Value::Object(id), Value::Int(2)],
+            );
+            assert!(!sim.world.get(id).unwrap().fields.contains_key("State"));
+        }
+        sim.world.tables().insert(
+            "#93",
+            &["#9a320a51"],
+            vec![(5, vec![Cell::String("statecnt_fixture".into())])],
+        );
+        for kind in [ObjectKind::Creature, ObjectKind::Item, ObjectKind::Area] {
+            let other = sim.world.spawn(kind, "other");
+            sim.world.get_mut(other).unwrap().appearance = 5;
+            run(
+                &mut sim,
+                id,
+                "SetPlaceableState",
+                &[Value::Object(other), Value::Int(2)],
+            );
+            assert!(!sim.world.get(other).unwrap().fields.contains_key("State"));
+        }
+        let count = sim.world.objects.len();
+        run(
+            &mut sim,
+            id,
+            "SetPlaceableState",
+            &[Value::Object(OBJECT_INVALID), Value::Int(2)],
+        );
+        assert_eq!(sim.world.objects.len(), count);
+        sim.game = thedas_vfs::Game::DragonAge2;
+        run(
+            &mut sim,
+            id,
+            "SetPlaceableState",
+            &[Value::Object(id), Value::Int(-65_535)],
+        );
+        assert_eq!(
+            sim.world.get(id).unwrap().fields.get("State"),
+            Some(&-65_535)
+        );
+    }
+
+    #[test]
+    fn origins_placeable_action_results_use_the_state_setter() {
+        let (mut sim, id) = state_controlled_placeable();
+        for (success, variation, expected) in [(0, 0, None), (1, 1, Some(2)), (1, 0, Some(0))] {
+            sim.world.get_mut(id).unwrap().fields.remove("State");
+            run(
+                &mut sim,
+                id,
+                "SetPlaceableActionResult",
+                &[
+                    Value::Object(id),
+                    Value::Int(3),
+                    Value::Int(success),
+                    Value::Int(variation),
+                ],
+            );
+            assert_eq!(
+                sim.world.get(id).unwrap().fields.get("State").copied(),
+                expected
+            );
+        }
+        for sentinel in [-1, 65_535, -65_537, 131_071] {
+            sim.world.tables().insert(
+                "statecnt_fixture",
+                &["ID", "#52be3c5e", "#a2b4782c", "#5ad0780d"],
+                vec![(
+                    0,
+                    vec![
+                        Cell::Int(0),
+                        Cell::Int(3),
+                        Cell::Int(sentinel),
+                        Cell::Int(sentinel),
+                    ],
+                )],
+            );
+            for variation in [0, 1] {
+                sim.world.get_mut(id).unwrap().fields.remove("State");
+                run(
+                    &mut sim,
+                    id,
+                    "SetPlaceableActionResult",
+                    &[
+                        Value::Object(id),
+                        Value::Int(3),
+                        Value::Int(1),
+                        Value::Int(variation),
+                    ],
+                );
+                assert!(!sim.world.get(id).unwrap().fields.contains_key("State"));
+            }
+        }
+        for (next, alternate, variation, expected) in [
+            (2, -1, 0, Some(2)),
+            (2, -1, 1, None),
+            (-1, 2, 1, Some(2)),
+            (2, 0, 1, None),
+            (2, 65_535, 1, None),
+            (65_538, -1, 0, Some(2)),
+        ] {
+            sim.world.tables().insert(
+                "statecnt_fixture",
+                &["ID", "#52be3c5e", "#a2b4782c", "#5ad0780d"],
+                [0, 1, 2]
+                    .into_iter()
+                    .map(|state| {
+                        (
+                            state,
+                            vec![
+                                Cell::Int(state),
+                                Cell::Int(3),
+                                Cell::Int(next),
+                                Cell::Int(alternate),
+                            ],
+                        )
+                    })
+                    .collect(),
+            );
+            sim.world.get_mut(id).unwrap().fields.remove("State");
+            run(
+                &mut sim,
+                id,
+                "SetPlaceableActionResult",
+                &[
+                    Value::Object(id),
+                    Value::Int(3),
+                    Value::Int(1),
+                    Value::Int(variation),
+                ],
+            );
+            assert_eq!(
+                sim.world.get(id).unwrap().fields.get("State").copied(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn set_position_searches_only_safe_creature_moves_within_five_metres() {
+        let table = Arc::new(
+            EngineTable::parse(b"void SetPosition(object o, vector v, int safe = 1) = 22;\n")
+                .unwrap(),
+        );
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        let area = s.world.spawn(ObjectKind::Area, "a");
+        let creature = s.world.spawn(ObjectKind::Creature, "creature");
+        let placeable = s.world.spawn(ObjectKind::Placeable, "placeable");
+        for id in [creature, placeable] {
+            let o = s.world.get_mut(id).unwrap();
+            o.area = Some(area);
+            o.facing = 123.0;
+        }
+        s.area_layouts.insert(area, "open".into());
+        let mut data = vec![1; 64];
+        data[18] = 9;
+        s.nav_grids.insert(
+            "open".into(),
+            Some(Arc::new(thedas_formats::level::NavGrid {
+                columns: 8,
+                rows: 8,
+                cell_size: 0.5,
+                clearance: 2.0,
+                base: [10.0, 10.0, 0.0],
+                normal: [0.0, 0.0, 1.0],
+                data,
+                heights: vec![16.0; 64],
+                surfaces: Vec::new(),
+            })),
+        );
+        let before = [12.25, 12.25, 7.0];
+        for (id, requested, safe, succeeds, snaps) in [
+            (creature, [12.25, 12.25, 3.0], 1, true, true),
+            (creature, [11.25, 11.25, 3.0], 1, false, false),
+            (creature, [9.4, 12.0, 3.0], 1, true, true),
+            (creature, [4.0, 12.0, 3.0], 1, false, false),
+            (creature, [11.25, 11.25, 3.0], 0, true, false),
+            (placeable, [11.25, 11.25, 3.0], 1, true, false),
+        ] {
+            s.world.get_mut(id).unwrap().position = before;
+            run(
+                &mut s,
+                id,
+                "SetPosition",
+                &[
+                    Value::Object(id),
+                    Value::Vector(requested),
+                    Value::Int(safe),
+                ],
+            );
+            let o = s.world.get(id).unwrap();
+            assert_eq!((o.area, o.facing), (Some(area), 123.0));
+            if snaps {
+                assert_eq!(o.position[2], 1.0);
+                assert!(crate::nav::on_walkable(
+                    &s.loaded_nav_grid(area).unwrap(),
+                    o.position
+                ));
+            } else {
+                assert_eq!(o.position, if succeeds { requested } else { before });
+            }
+        }
+        // Default safe flag is on, and an occupied point is not search result 1.
+        let blocker = s.world.spawn(ObjectKind::Creature, "blocker");
+        s.world.get_mut(blocker).unwrap().area = Some(area);
+        s.world.get_mut(blocker).unwrap().position = [12.25, 12.25, 1.0];
+        s.world.get_mut(creature).unwrap().position = before;
+        run(
+            &mut s,
+            creature,
+            "SetPosition",
+            &[Value::Object(creature), Value::Vector([12.25, 12.25, 3.0])],
+        );
+        assert_eq!(s.world.get(creature).unwrap().position, before);
     }
 
     #[test]
@@ -9518,7 +10319,7 @@ mod tests {
             "c5",
             "c6",
             "c7",
-            "Controller",
+            "#9a320a51",
         ];
         let row = |id: i64, ctl: &str| {
             let mut v: Vec<Cell> = (0..8).map(Cell::Int).collect();
@@ -9543,10 +10344,17 @@ mod tests {
         t.insert(
             "statecnt_door",
             &["ID", "#52be3c5e", "#a2b4782c", "#5ad0780d"],
-            vec![st(0, 1, 2, 4), st(1, 3, 0, 0), st(2, 2, 0, 0)],
+            vec![
+                st(0, 1, 2, 4),
+                st(1, 3, 0, 0),
+                st(2, 2, 0, 0),
+                st(3, 0, 0, 0),
+                st(4, 2, 0, 0),
+            ],
         );
         s.world.tables = Arc::new(t);
         let door = s.world.spawn(ObjectKind::Placeable, "door");
+        s.world.get_mut(door).unwrap().appearance = 93;
         s.world.get_mut(door).unwrap().fields.extend([
             ("Appearance".to_string(), 93),
             ("AnimContState".to_string(), 1),
@@ -10432,6 +11240,7 @@ mod tests {
                 cancellable: false,
                 impacted: false,
                 arrived: false,
+                da2_target_prepared: false,
                 path: vec![],
             });
         assert_eq!(
@@ -11042,43 +11851,55 @@ mod coverage_tests {
 
     #[test]
     fn da2_area_load_visual_replays_reconcile_saved_copies() {
-        let table = EngineTable::parse(
-            format!("{LDF}\nint EVENT_TYPE_AREALOADSAVE_POSTLOADEXIT = 43;\n").as_bytes(),
-        )
-        .unwrap();
-        let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(table), 7);
-        s.game = thedas_vfs::Game::DragonAge2;
-        let area = s.world.spawn(ObjectKind::Area, "area");
-        let wall = s.world.spawn(ObjectKind::Placeable, "wall");
-        s.world.get_mut(wall).unwrap().area = Some(area);
-        let fire = Effect {
-            ty: 4,
-            creator: Some(area),
-            duration_type: 3,
-            ints: vec![600001],
-            ..Default::default()
-        };
-        let other = Effect {
-            ints: vec![600002],
-            ..fire.clone()
-        };
-        // An older snapshot may already contain several copies. Only the exact
-        // environmental visual reissued by the load handler is reconciled.
-        s.world.get_mut(wall).unwrap().effects = vec![fire.clone(), other.clone(), fire.clone()];
-        for _ in 0..3 {
-            s.load_game(s.save_game()).unwrap();
-            let event = s.new_event("AREALOADSAVE_POSTLOADEXIT", None);
-            let event = Some(s.world.store(EngineData::Event(event)));
-            let mut h = ScriptHost {
-                sim: &mut s,
-                event,
-                script: "area".into(),
+        for identified in [false, true] {
+            let table = EngineTable::parse(
+                format!("{LDF}\nint EVENT_TYPE_AREALOADSAVE_POSTLOADEXIT = 43;\n").as_bytes(),
+            )
+            .unwrap();
+            let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(table), 7);
+            s.game = thedas_vfs::Game::DragonAge2;
+            let area = s.world.spawn(ObjectKind::Area, "area");
+            let wall = s.world.spawn(ObjectKind::Placeable, "wall");
+            s.world.get_mut(wall).unwrap().area = Some(area);
+            let mut fire = Effect {
+                ty: 4,
+                creator: Some(area),
+                duration_type: 3,
+                ints: vec![600001],
+                ..Default::default()
             };
-            apply_visual_or_effect(&mut h, wall, fire.clone());
-            assert_eq!(
-                s.world.get(wall).unwrap().effects,
-                [fire.clone(), other.clone()]
-            );
+            let mut other = Effect {
+                ints: vec![600002],
+                ..fire.clone()
+            };
+            if identified {
+                s.world.identify_effect(&mut fire);
+                s.world.identify_effect(&mut other);
+            }
+            // An older snapshot may already contain several copies. Only the exact
+            // environmental visual reissued by the load handler is reconciled.
+            s.world.get_mut(wall).unwrap().effects =
+                vec![fire.clone(), other.clone(), fire.clone()];
+            for _ in 0..3 {
+                s.load_game(s.save_game()).unwrap();
+                let event = s.new_event("AREALOADSAVE_POSTLOADEXIT", None);
+                let event = Some(s.world.store(EngineData::Event(event)));
+                let mut replay = fire.clone();
+                if identified {
+                    replay.id = 0;
+                    s.world.identify_effect(&mut replay);
+                }
+                let mut h = ScriptHost {
+                    sim: &mut s,
+                    event,
+                    script: "area".into(),
+                };
+                apply_visual_or_effect(&mut h, wall, replay);
+                assert_eq!(
+                    s.world.get(wall).unwrap().effects,
+                    [fire.clone(), other.clone()]
+                );
+            }
         }
     }
 
