@@ -181,6 +181,9 @@ pub fn route_avoiding(
     let start = nearest_walkable(g, from)?;
     let goal = nearest_walkable(g, to)?;
     let idx = |c: (u32, u32)| (c.1 * g.columns + c.0) as usize;
+    // The cells a route may use: the search and the straightening of its route
+    // ([`straighten`]) both go by this, and step between cells by [`passable`].
+    let free = |c: (u32, u32)| walkable(g, c) && !blocked.contains(&idx(c));
     let h = |c: (u32, u32)| {
         let (dx, dy) = (
             (c.0 as f32 - goal.0 as f32).abs(),
@@ -213,14 +216,13 @@ pub fn route_avoiding(
                 .collect();
             pts.pop();
             pts.push(to);
-            return Some(pts);
+            return Some(straighten(g, from, &pts, &free));
         }
         expanded += 1;
         if expanded > SEARCH_LIMIT {
             return None;
         }
         let base = cost.get(&idx(c)).copied().unwrap_or(f32::MAX);
-        let hc = height(g, c);
         for (dx, dy) in [
             (-1, 0),
             (1, 0),
@@ -236,17 +238,8 @@ pub fn route_avoiding(
                 continue;
             }
             let n = (x as u32, y as u32);
-            let free = |c: (u32, u32)| walkable(g, c) && !blocked.contains(&idx(c));
-            if !free(n) || (height(g, n) - hc).abs() > MAX_STEP {
+            if !passable(g, c, n, &free) {
                 continue;
-            }
-            // No cutting corners past blocked cells.
-            if dx != 0 && dy != 0 {
-                let a = ((c.0 as i32 + dx) as u32, c.1);
-                let b = (c.0, (c.1 as i32 + dy) as u32);
-                if !free(a) || !free(b) {
-                    continue;
-                }
             }
             let step = if dx != 0 && dy != 0 {
                 std::f32::consts::SQRT_2
@@ -262,6 +255,103 @@ pub fn route_avoiding(
         }
     }
     None
+}
+
+/// The longest stretch of a route [`straighten`] takes in one straight line, in cells.
+const STRAIGHT_REACH: usize = 24;
+
+/// A route of cell centres (`pts`, walked from `from`) as straight legs: from each point the
+/// walker goes straight on to the furthest of the next [`STRAIGHT_REACH`] points the line to
+/// which crosses only free cells (see [`straight_clear`]), with points put back along each
+/// leg a cell apart at the ground's height there, so the walk still follows the floor.
+///
+/// The 8-connected search's own route turns in 45° steps from cell centre to cell centre,
+/// and its first leg runs from wherever the walker stands to the next cell's centre, which
+/// can be beside or behind it. The walker faces each leg as it walks it, so a route made
+/// again every frame (the pad's stick and the movement keys order a walk a little ahead
+/// each frame) swung the hero's facing by 45° or more from frame to frame, and it walked a
+/// zigzag. Provisional: DAOrigins.exe's path follower and its smoothing are not traced.
+fn straighten(
+    g: &NavGrid,
+    from: [f32; 3],
+    pts: &[[f32; 3]],
+    free: &impl Fn((u32, u32)) -> bool,
+) -> Vec<[f32; 3]> {
+    let mut out = Vec::with_capacity(pts.len());
+    let mut at = from;
+    let mut i = 0;
+    while i < pts.len() {
+        let mut j = i;
+        while j + 1 < pts.len()
+            && j + 1 - i < STRAIGHT_REACH
+            && straight_clear(g, at, pts[j + 1], free)
+        {
+            j += 1;
+        }
+        // The cells passed over on the way, a cell apart, at the floor's height.
+        let to = pts[j];
+        let (dx, dy) = (to[0] - at[0], to[1] - at[1]);
+        let steps = ((dx * dx + dy * dy).sqrt() / g.cell_size).floor() as usize;
+        if j > i {
+            for k in 1..steps {
+                let f = k as f32 / steps as f32;
+                let p = [at[0] + dx * f, at[1] + dy * f, 0.0];
+                let z = g
+                    .cell(p)
+                    .map_or(at[2] + (to[2] - at[2]) * f, |c| height(g, c));
+                out.push([p[0], p[1], z]);
+            }
+        }
+        out.push(to);
+        at = to;
+        i = j + 1;
+    }
+    out
+}
+
+/// Whether a walker can step from cell `c` to the neighbouring cell `n` (8-connected): `n`
+/// is `free`, their heights differ by at most [`MAX_STEP`], and a diagonal step cuts no
+/// corner of a cell that is not free. The route search and [`straight_clear`] both step by
+/// this, so a straightened route goes only where the search could have.
+fn passable(g: &NavGrid, c: (u32, u32), n: (u32, u32), free: &impl Fn((u32, u32)) -> bool) -> bool {
+    if !free(n) || (height(g, n) - height(g, c)).abs() > MAX_STEP {
+        return false;
+    }
+    c.0 == n.0 || c.1 == n.1 || (free((n.0, c.1)) && free((c.0, n.1)))
+}
+
+/// Whether a walker can go in a straight line from `a` to `b`: it starts on a `free` cell,
+/// and each cell the line passes into is one the route search could step to from the last
+/// ([`passable`]). A line starting off the grid or on a cell that is not free is not
+/// straight-clear.
+fn straight_clear(
+    g: &NavGrid,
+    a: [f32; 3],
+    b: [f32; 3],
+    free: &impl Fn((u32, u32)) -> bool,
+) -> bool {
+    let Some(mut prev) = g.cell(a) else {
+        return false;
+    };
+    if !free(prev) {
+        return false;
+    }
+    let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+    let n = (((dx * dx + dy * dy).sqrt() / (g.cell_size * 0.25)).ceil() as usize).max(1);
+    for k in 1..=n {
+        let f = k as f32 / n as f32;
+        let Some(c) = g.cell([a[0] + dx * f, a[1] + dy * f, 0.0]) else {
+            return false;
+        };
+        if c == prev {
+            continue;
+        }
+        if !passable(g, prev, c, free) {
+            return false;
+        }
+        prev = c;
+    }
+    true
 }
 
 /// `placeable_types.gda`: a placeable appearance's state controller (`StateCnt_Door`,
@@ -1013,6 +1103,94 @@ impl Sim {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An open floor of `w` by `h` one-metre cells.
+    fn floor(w: u32, h: u32) -> NavGrid {
+        NavGrid {
+            columns: w,
+            rows: h,
+            cell_size: 1.0,
+            clearance: 2.0,
+            base: [0.0, 0.0, 0.0],
+            normal: [0.0, 0.0, 1.0],
+            data: vec![1u8; (w * h) as usize],
+            heights: vec![0.0; (w * h) as usize],
+            surfaces: Vec::new(),
+        }
+    }
+
+    fn heading(a: [f32; 3], b: [f32; 3]) -> f32 {
+        (b[1] - a[1]).atan2(b[0] - a[0]).to_degrees()
+    }
+
+    #[test]
+    fn an_open_floor_is_crossed_in_one_heading_from_where_the_walker_stands() {
+        let g = floor(12, 12);
+        // Standing near a cell's corner, going a little off the grid's eight directions:
+        // the search's own route turns 45° on the way and starts toward the next cell's
+        // centre, beside the walker.
+        let from = [0.9, 0.1, 0.0];
+        let to = [9.5, 4.5, 0.0];
+        let p = route(&g, from, to).unwrap();
+        assert_eq!(*p.last().unwrap(), to);
+        let want = heading(from, to);
+        let mut at = from;
+        for q in &p {
+            assert!(
+                (heading(at, *q) - want).abs() < 0.5,
+                "{at:?} -> {q:?} turns off the line to {to:?} ({p:?})"
+            );
+            at = *q;
+        }
+        // Points a cell apart, so the walk still follows the floor's height.
+        assert!(p.len() >= 8, "{p:?}");
+    }
+
+    #[test]
+    fn a_straightened_route_does_not_cut_through_a_closed_doorway_beside_a_corner() {
+        // A wall down column 3 (rows 0 to 2) ends at a closed doorway (3,3), with open floor
+        // past it at (3,4): the route goes round by row 4, and no straight leg crosses the
+        // doorway's cell or clips its corner.
+        let mut g = floor(7, 5);
+        for y in 0..3 {
+            g.data[(y * 7 + 3) as usize] = 10;
+        }
+        let door = 3 * 7 + 3;
+        let blocked: std::collections::HashSet<usize> = [door as usize].into_iter().collect();
+        let from = [1.5, 1.5, 0.0];
+        let to = [5.5, 1.5, 0.0];
+        let p = route_avoiding(&g, from, to, &blocked).unwrap();
+        let mut at = from;
+        for q in &p {
+            for k in 0..=200 {
+                let f = k as f32 / 200.0;
+                let x = [at[0] + (q[0] - at[0]) * f, at[1] + (q[1] - at[1]) * f, 0.0];
+                let c = g.cell(x).unwrap();
+                assert!(
+                    walkable(&g, c) && (c.1 * 7 + c.0) != door,
+                    "{at:?} -> {q:?} crosses {c:?} in {p:?}"
+                );
+            }
+            at = *q;
+        }
+        assert!(p.iter().any(|q| q[1] > 4.0), "round by row 4: {p:?}");
+    }
+
+    #[test]
+    fn a_straightened_route_still_goes_round_a_wall() {
+        let g = grid();
+        let p = route(&g, [0.5, 0.5, 0.0], [4.5, 0.5, 0.0]).unwrap();
+        let free = |c: (u32, u32)| walkable(&g, c);
+        let mut at = [0.5, 0.5, 0.0];
+        for q in &p {
+            assert!(
+                straight_clear(&g, at, *q, &free),
+                "{at:?} -> {q:?} in {p:?}"
+            );
+            at = *q;
+        }
+        assert!(p.iter().any(|q| q[1] > 2.0), "over the top row: {p:?}");
+    }
 
     /// A 5x3 grid with a wall down column 2 except at the top row.
     fn grid() -> NavGrid {

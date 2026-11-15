@@ -375,6 +375,14 @@ pub fn present(shown: &mut Presentation, name: &str, args: &[String]) -> bool {
             shown.paperdoll_drags = 0;
             false
         }
+        thedas_sim::chargen::MSG_END => {
+            // Inventory and character record share this pose. Character creation must
+            // leave them at their default turn and tilt; the end still reaches the sim.
+            shown.paperdoll_yaw = 0.0;
+            shown.paperdoll_pitch = 0.0;
+            shown.paperdoll_drags = 0;
+            false
+        }
         SET_ITEM_FILTER => {
             shown.item_filter = args
                 .first()
@@ -704,6 +712,43 @@ mod tests {
         assert_eq!(p.paperdoll_pitch, 0.0);
         present(&mut p, CHARGEN_START, &[]);
         assert_eq!((p.paperdoll_yaw, p.paperdoll_drags), (0.0, 0));
+    }
+
+    #[test]
+    fn chargen_end_resets_the_shared_paperdoll_pose_and_reaches_the_simulation() {
+        use thedas_sim::world::ObjectKind;
+        let mut s = sim();
+        let module = s.world.spawn(ObjectKind::Module, "module");
+        let hero = s.world.spawn(ObjectKind::Creature, "hero");
+        s.world.module = Some(module);
+        s.world.hero = Some(hero);
+        s.world.chargen = Some(hero);
+        let sim = Arc::new(Mutex::new(s));
+        let shown = Arc::new(Mutex::new(Presentation::default()));
+        let handler = handler_for(sim.clone(), shown.clone());
+        assert!(handler(PAPERDOLL_PRESET, &["1".into()]).is_some());
+        assert!(handler(PAPERDOLL_DRAG, &["-80".into(), "40".into()]).is_some());
+        {
+            let p = shown.lock().unwrap();
+            assert_ne!(p.paperdoll_yaw, 0.0);
+            assert_ne!(p.paperdoll_pitch, 0.0);
+            assert_eq!(p.paperdoll_drags, 1);
+        }
+        // As the movie sends it. Consuming this as presentation-only input would leave
+        // character creation open in the simulation.
+        assert!(
+            handler(
+                thedas_sim::chargen::MSG_END,
+                &[hero.to_string(), "0".into(), "2".into()],
+            )
+            .is_some()
+        );
+        assert_eq!(sim.lock().unwrap().world.chargen, None);
+        let p = shown.lock().unwrap();
+        assert_eq!(
+            (p.paperdoll_yaw, p.paperdoll_pitch, p.paperdoll_drags),
+            (0.0, 0.0, 0),
+        );
     }
 
     #[test]

@@ -851,8 +851,110 @@ impl Stage {
         Vec::new()
     }
 
-    /// Renders every movie and blends the frames over `base` (straight RGBA) on the CPU.
+    /// [`Stage::capture_over`] drawing straight onto `base` on the GPU.
+    fn capture_direct(&mut self, base: &mut Rgba) -> Result<(), UiError> {
+        let (device, queue) = (self.gpu.device.clone(), self.gpu.queue.clone());
+        let (w, h) = (base.width, base.height);
+        if w == 0 || h == 0 || base.pixels.len() != (w * h * 4) as usize {
+            return Err(UiError::Render("capture base size".into()));
+        }
+        let size = wgpu::Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        };
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("ui capture"),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let mut pixels = base.pixels.clone();
+        crate::premultiply(&mut pixels);
+        queue.write_texture(
+            texture.as_image_copy(),
+            &pixels,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(w * 4),
+                rows_per_image: Some(h),
+            },
+            size,
+        );
+        let row = (w * 4).div_ceil(256) * 256;
+        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("ui capture"),
+            size: u64::from(row) * u64::from(h),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = device.create_command_encoder(&Default::default());
+        self.draw_into(&mut encoder, &texture);
+        encoder.copy_texture_to_buffer(
+            texture.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(row),
+                    rows_per_image: Some(h),
+                },
+            },
+            size,
+        );
+        queue.submit(Some(encoder.finish()));
+        let (tx, rx) = std::sync::mpsc::channel();
+        buffer.slice(..).map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        rx.recv()
+            .ok()
+            .and_then(|r| r.ok())
+            .ok_or_else(|| UiError::Render("reading the capture back".into()))?;
+        let data = buffer
+            .slice(..)
+            .get_mapped_range()
+            .map_err(|e| UiError::Render(format!("reading the capture back: {e}")))?;
+        for y in 0..h as usize {
+            let s = y * row as usize;
+            let line = &data[s..s + (w * 4) as usize];
+            base.pixels[y * (w * 4) as usize..(y + 1) * (w * 4) as usize].copy_from_slice(line);
+        }
+        drop(data);
+        buffer.unmap();
+        // Back to straight alpha.
+        for p in base.pixels.chunks_exact_mut(4) {
+            let a = u32::from(p[3]);
+            if a > 0 && a < 255 {
+                for c in &mut p[..3] {
+                    *c = ((u32::from(*c) * 255 + a / 2) / a).min(255) as u8;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Draws every movie, in order, over `target` (the frame) into `encoder` (see
+    /// [`crate::direct`]).
+    pub fn draw_into(&mut self, encoder: &mut wgpu::CommandEncoder, target: &wgpu::Texture) {
+        for m in &mut self.movies {
+            m.draw_into(encoder, target);
+        }
+    }
+
+    /// Renders every movie and blends the frames over `base` (straight RGBA): drawn
+    /// straight onto it on the GPU (see [`crate::direct`]), or else blended on the CPU.
     pub fn capture_over(&mut self, base: &mut Rgba) -> Result<(), UiError> {
+        if crate::direct() {
+            return self.capture_direct(base);
+        }
         // The movies' multiplied clips first, onto the picture under the whole interface
         // (see `UiMovie::render_multiply`).
         for m in self.movies.iter_mut().filter(|m| !m.multiplies_over()) {
