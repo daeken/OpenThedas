@@ -416,6 +416,8 @@ fn floaty_scale(d: f32) -> f64 {
 }
 
 pub struct UiLayer {
+    /// What building the interface's values reuses between frames.
+    value_cache: thedas_ui::binding::ValueCache,
     pub stage: Stage,
     composite: Option<Composite>,
     device: wgpu::Device,
@@ -897,6 +899,7 @@ impl UiLayer {
         );
         stage.open_all(names);
         Self {
+            value_cache: Default::default(),
             stage,
             composite: None,
             device: ctx.device.clone(),
@@ -2248,7 +2251,11 @@ impl UiLayer {
             let shown = self.shown.lock().map(|s| s.clone()).unwrap_or_default();
             self.stage
                 .bridge
-                .bind(thedas_ui::binding::sim_values_for(&sim, &shown));
+                .bind(thedas_ui::binding::sim_values_cached(
+                    &sim,
+                    &shown,
+                    &mut self.value_cache,
+                ));
             let waits = thedas_ui::binding::awaits_continue(&sim);
             let cutscene = sim.world.cutscene.is_some();
             let line = thedas_ui::binding::conversation(&sim).map(|d| {
