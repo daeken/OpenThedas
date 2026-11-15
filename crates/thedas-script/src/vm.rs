@@ -136,6 +136,13 @@ pub type VmResult<T> = Result<T, VmError>;
 
 /// What a script can ask of the engine.
 pub trait Host {
+    /// Compares two handles of the same engine type for EQUAL/NEQUAL, including
+    /// engine cells inside script structs. Hosts with engine data can implement
+    /// their type's value/identity rules; the default retains handle equality.
+    fn engine_equal(&self, _ty: u8, a: Option<u64>, b: Option<u64>) -> bool {
+        a == b
+    }
+
     /// Runs engine function `f` for the script running on `caller`. `args` are in declaration
     /// order (vectors as [`Value::Vector`]). Return `None` for void functions; a `None` for a
     /// non-void function pushes the return type's default.
@@ -165,6 +172,15 @@ pub trait Host {
 #[derive(Default)]
 pub struct NullHost {
     pub calls: Vec<(String, Vec<Value>)>,
+}
+
+fn engine_cell_equal(host: &dyn Host, a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Engine { ty: at, handle: a }, Value::Engine { ty: bt, handle: b }) => {
+            at == bt && host.engine_equal(*at, *a, *b)
+        }
+        _ => a == b,
+    }
 }
 
 impl Host for NullHost {
@@ -426,12 +442,15 @@ impl Vm {
                     }
                     let b = st.stack.split_off(st.stack.len() - n);
                     let a = st.stack.split_off(st.stack.len() - n);
-                    a == b
+                    a.iter().zip(&b).all(|(a, b)| engine_cell_equal(host, a, b))
                 } else {
                     let b = pop(st)?;
                     let a = pop(st)?;
                     match (&a, &b) {
                         (Value::Float(x), Value::Float(y)) => x == y,
+                        (Value::Engine { .. }, Value::Engine { .. }) => {
+                            engine_cell_equal(host, &a, &b)
+                        }
                         // Resources are strings to the original VM: scripts compare a
                         // resource with a string literal ("NONE") with EQUALSS/NEQUALSS.
                         (Value::String(x), Value::String(y)) => x == y,
@@ -943,6 +962,69 @@ mod tests {
 
     fn i32b(v: i32) -> [u8; 4] {
         v.to_be_bytes()
+    }
+
+    #[test]
+    fn engine_comparisons_delegate_for_scalars_and_struct_members() {
+        struct EqualityHost;
+        impl Host for EqualityHost {
+            fn engine_equal(&self, ty: u8, a: Option<u64>, b: Option<u64>) -> bool {
+                // Deliberately differs from handle equality, even for one handle.
+                ty == 1 && a != b
+            }
+
+            fn action(
+                &mut self,
+                _: ObjectId,
+                f: &Function,
+                _: Vec<Value>,
+            ) -> VmResult<Option<Value>> {
+                Ok(Some(Value::Engine {
+                    ty: 1,
+                    handle: Some(u64::from(f.id)),
+                }))
+            }
+        }
+        let table = Arc::new(
+            EngineTable::parse(
+                b"#define ENGINE_STRUCTURE_1 location\nlocation A() = 1;\nlocation B() = 2;\n",
+            )
+            .unwrap(),
+        );
+        for (op, invert) in [(0x0b, false), (0x0c, true)] {
+            for structure in [false, true] {
+                for second in [1, 2] {
+                    let mut body = Vec::new();
+                    for id in [1, second] {
+                        if structure {
+                            body.extend([0x04, 0x03, 0, 0, 0, 7]);
+                        }
+                        body.extend([0x05, 0, 0, id, 0]);
+                    }
+                    body.extend([op, if structure { 0x24 } else { 0x31 }]);
+                    if structure {
+                        body.extend(8_u16.to_be_bytes());
+                    }
+                    body.extend([0x20, 0]);
+                    let ncs = Arc::new(Ncs::parse(&assemble(&body)).unwrap());
+                    let got = Vm::new(ncs, table.clone())
+                        .run(&mut EqualityHost, 7)
+                        .unwrap();
+                    assert_eq!(got.value, Some(Value::Int(((second == 2) ^ invert) as i32)));
+                }
+            }
+        }
+        let a = Value::Engine {
+            ty: 0,
+            handle: Some(1),
+        };
+        let b = Value::Engine {
+            ty: 1,
+            handle: Some(1),
+        };
+        assert!(!engine_cell_equal(&EqualityHost, &a, &b));
+        assert!(engine_cell_equal(&NullHost::default(), &a, &a));
+        assert!(!engine_cell_equal(&NullHost::default(), &a, &b));
     }
 
     #[test]

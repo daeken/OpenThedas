@@ -34,6 +34,7 @@ mod deferred_tiles;
 pub mod distortion;
 pub mod fxaa;
 pub mod gpu;
+pub mod lightset;
 pub mod look;
 pub mod material;
 pub mod msaa;

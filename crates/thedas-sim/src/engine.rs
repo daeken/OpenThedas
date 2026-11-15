@@ -1158,6 +1158,12 @@ pub fn call(
         // --- Objects ----------------------------------------------------------------------
         "GetModule" => ok(Value::Object(h.sim.world.module.unwrap_or(OBJECT_INVALID))),
         "GetHero" => ok(Value::Object(h.sim.world.hero.unwrap_or(OBJECT_INVALID))),
+        // Origins command 438 (0x661870 -> 0x5d5ca0) reads the player's controlled
+        // object id at +0x5c, also used by GetMainControlled (0x660ae0). It does
+        // not read the conversation owner or require an open conversation.
+        "GetPCSpeaker" if h.sim.game == thedas_vfs::Game::Origins => ok(Value::Object(
+            h.sim.world.controlled().unwrap_or(OBJECT_INVALID),
+        )),
         "GetPartyLeader" | "GetMainControlled" => ok(Value::Object(
             h.sim.world.controlled().unwrap_or(OBJECT_INVALID),
         )),
@@ -3020,6 +3026,7 @@ pub fn call(
                 da2_target_prepared: false,
                 path: Vec::new(),
                 turned_at: None,
+                is_static: false,
             };
             // The first float is a wait's seconds or a move's minimum range. Keep
             // MoveToObject's second float as its maximum (0x66f260, clamp at 0x66f312).
@@ -3156,11 +3163,87 @@ pub fn call(
             })
         }
         "AddCommand" => {
-            let Some(EngineData::Command(c)) = h.sim.world.handle(handle(a, 1)).cloned() else {
+            let Some(EngineData::Command(mut c)) = h.sim.world.handle(handle(a, 1)).cloned() else {
                 return ok(Value::Int(0));
             };
             let target = obj(a, 0);
-            let front = int(a, 2) != 0;
+            let origins = h.sim.game == thedas_vfs::Game::Origins;
+            let front = if origins {
+                int(a, 2) == 1
+            } else {
+                int(a, 2) != 0
+            };
+            if origins {
+                let Some(o) = h.sim.world.get(target) else {
+                    return ok(Value::Int(0));
+                };
+                // DAOrigins.exe 0x66e0e0 -> 0x73cd10: front/back chooses a place in
+                // the waiting queue, independently of the active executor. Add behavior
+                // clears the active command; it is never pushed back to resume later.
+                // The defaults come from table 94, with a different column when the
+                // incoming type matches the active one (0x73cddd..0x73ce24).
+                c.is_static = int(a, 3) != 0;
+                // GetCurrentCommand can supply this payload again. Native execution
+                // state belongs to the executor, so the newly admitted copy is fresh.
+                c.due = None;
+                c.from = None;
+                c.turned_at = None;
+                c.approach = None;
+                c.ring_wait = false;
+                c.arrived = false;
+                c.impacted = false;
+                c.after_impact_ms = None;
+                c.cancellable_at = None;
+                c.cancellable = false;
+                c.da2_target_prepared = false;
+                if c.name != "CommandMoveToMultiLocations" {
+                    c.path.clear();
+                }
+                let running = o.commands.first().filter(|c| c.due.is_some());
+                let same = running.map_or(0, |c| c.ty) == c.ty;
+                let changed_target = o.kind == ObjectKind::Creature
+                    && c.target.unwrap_or(OBJECT_INVALID)
+                        != h.sim.script_attack_target(target).unwrap_or(OBJECT_INVALID);
+                let behavior = a.get(4).map_or(-1, |_| int(a, 4));
+                let behavior = if behavior == -1 {
+                    h.sim.world.tables().get(94, "").map_or(0, |table| {
+                        cell_int(table.cell_by_hash(
+                            if same { 0x7569_547a } else { 0xed36_668a },
+                            c.ty as i64,
+                        ))
+                    })
+                } else {
+                    behavior
+                };
+                // 1 clears only the active command; 2 also clears ordinary waiting
+                // commands. Native behavior 3 clears the waiting queue on a target
+                // change. Static commands survive all three (0x73c930, 0x73c730).
+                if matches!(behavior, 1..=3) {
+                    let o = h.sim.world.get_mut(target).unwrap();
+                    if behavior == 2 || (behavior == 3 && changed_target) {
+                        o.commands.retain(|c| c.due.is_some() || c.is_static);
+                    }
+                    let cleared = o
+                        .commands
+                        .first()
+                        .is_some_and(|c| c.due.is_some() && !c.is_static)
+                        .then(|| o.commands.remove(0));
+                    if let Some(cleared) = cleared {
+                        let result = constant(&h.sim.table, "COMMAND_FAILED_COMMAND_CLEARED");
+                        let mut ev = h.sim.new_event("COMMAND_COMPLETE", Some(target));
+                        ev.ints = vec![cleared.ty, result];
+                        h.sim.world.trace.push(TraceEntry::Command {
+                            t,
+                            object: target,
+                            command: cleared.name.clone(),
+                            status: format!("failed {result}"),
+                        });
+                        h.sim.world.get_mut(target).unwrap().combat.previous_command =
+                            Some(cleared);
+                        h.sim.world.queue_event(0, target, ev, None);
+                    }
+                }
+            }
             if front
                 && h.sim.game == thedas_vfs::Game::DragonAge2
                 && h.sim.world.get(target).is_some_and(|o| {
@@ -3180,7 +3263,12 @@ pub fn call(
             match h.sim.world.get_mut(target) {
                 Some(o) => {
                     if front {
-                        o.commands.insert(0, c);
+                        // The native active executor is separate from the waiting queue.
+                        // Keep its simulation front in place if add behavior left it alive.
+                        let at = usize::from(
+                            origins && o.commands.first().is_some_and(|c| c.due.is_some()),
+                        );
+                        o.commands.insert(at, c);
                     } else {
                         o.commands.push(c);
                     }
@@ -3987,7 +4075,10 @@ pub fn call(
             void()
         }
         // DAOrigins.exe (0x65d9a0 -> 0x6976b0): a target that is the owner itself means the
-        // hero; the owner must be an active, living creature. Nothing here looks at the game
+        // hero. The owner may be a creature or placeable: +0x70's virtual +0x6c is the
+        // eligibility check 0x699fa0 in both vtables, not a creature-type test. Current
+        // health virtual +0x120 rejects dead owners (placeable: 0x750f50). See
+        // docs/notes/origins-placeable-conversations.md. Nothing here looks at the game
         // mode: a conversation may start in combat (and replaces it, see
         // `Sim::start_conversation`).
         // DA2 command 440 (0x512660 -> 0x504c60 -> 0x5b15f0) resolves
@@ -4009,9 +4100,16 @@ pub fn call(
             if target == owner {
                 target = h.sim.world.hero.unwrap_or(target);
             }
-            let can = h
-                .object(owner)
-                .is_some_and(|o| o.kind == ObjectKind::Creature && o.active && !o.dead);
+            let can = h.object(owner).is_some_and(|o| {
+                o.active
+                    && match o.kind {
+                        ObjectKind::Creature => !o.dead,
+                        ObjectKind::Placeable if h.sim.game == thedas_vfs::Game::Origins => {
+                            origins_placeable_health(o) > 0
+                        }
+                        _ => false,
+                    }
+            });
             let ok_ = can && h.sim.start_conversation(target, owner, &string(a, 2));
             ok(b(ok_))
         }
@@ -6380,6 +6478,165 @@ mod tests {
         assert_eq!(s.world.get(hero).unwrap().combat.cooldowns.len(), 6);
         s.world.time_ms = 3000;
         assert!(list(&mut s, hero, 0, 1).is_empty());
+    }
+
+    #[test]
+    fn origins_get_pc_speaker_returns_the_controlled_party_member_without_a_conversation() {
+        let table = EngineTable::parse(b"object GetPCSpeaker() = 438;").unwrap();
+        let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(table), 1);
+        let owner = s.world.spawn(ObjectKind::Placeable, "sarcophagus");
+        assert_eq!(
+            run(&mut s, owner, "GetPCSpeaker", &[]),
+            Some(Value::Object(OBJECT_INVALID))
+        );
+        let hero = s.world.spawn(ObjectKind::Creature, "hero");
+        let follower = s.world.spawn(ObjectKind::Creature, "follower");
+        s.world.hero = Some(hero);
+        s.world.get_mut(hero).unwrap().followers.push(follower);
+        assert_eq!(
+            run(&mut s, owner, "GetPCSpeaker", &[]),
+            Some(Value::Object(hero))
+        );
+        s.world.controlled = Some(follower);
+        assert_eq!(
+            run(&mut s, owner, "GetPCSpeaker", &[]),
+            Some(Value::Object(follower))
+        );
+        s.game = thedas_vfs::Game::DragonAge2;
+        let f = s.table.function_by_name("GetPCSpeaker").cloned().unwrap();
+        let mut h = ScriptHost {
+            sim: &mut s,
+            event: None,
+            script: "test".into(),
+        };
+        assert!(call(&mut h, owner, &f, &[]).is_none());
+    }
+
+    #[test]
+    fn origins_begin_conversation_opens_placeable_dialog_and_checks_its_current_health() {
+        use thedas_formats::Value as G;
+        use thedas_formats::gff4::{
+            FieldDef, FourCC, Gff4, List, StructData, StructId, StructTemplate, Version,
+        };
+        let g = Gff4 {
+            version: Version::V40,
+            platform: FourCC::new(b"PC  "),
+            file_type: FourCC::new(b"CONV"),
+            file_version: FourCC::new(b"V0.1"),
+            templates: vec![
+                StructTemplate {
+                    label: FourCC::new(b"CONV"),
+                    fields: vec![
+                        FieldDef {
+                            label: 12000,
+                            type_code: 4,
+                            flags: 0x8000,
+                            offset: 0,
+                        },
+                        FieldDef {
+                            label: 12002,
+                            type_code: 1,
+                            flags: 0xc000,
+                            offset: 4,
+                        },
+                    ],
+                    size: 8,
+                },
+                StructTemplate {
+                    label: FourCC::new(b"NTRY"),
+                    fields: vec![],
+                    size: 0,
+                },
+            ],
+            structs: vec![
+                StructData {
+                    template: 0,
+                    values: vec![
+                        G::List(Some(List::U32(vec![0]))),
+                        G::List(Some(List::Struct(vec![Some(StructId(1))]))),
+                    ],
+                },
+                StructData {
+                    template: 1,
+                    values: vec![],
+                },
+            ],
+            root: StructId(0),
+            shared_strings: None,
+        };
+        let dir =
+            std::env::temp_dir().join(format!("thedas-placeable-dialog-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("sarcophagus.dlg");
+        std::fs::write(&file, g.write().unwrap()).unwrap();
+        let mut vfs = Vfs::new();
+        vfs.push_files(&[file], "synthetic placeable conversation");
+        let table = EngineTable::parse(
+            b"int BeginConversation(object target, object owner, resource conversation) = 440;",
+        )
+        .unwrap();
+        let mut s = Sim::new(Arc::new(vfs), Arc::new(table), 1);
+        let hero = s.world.spawn(ObjectKind::Creature, "hero");
+        let owner = s.world.spawn(ObjectKind::Placeable, "sarcophagus");
+        s.world.hero = Some(hero);
+        s.world.get_mut(owner).unwrap().dialog = Some("sarcophagus".into());
+        for (current, active, saved_dead, allowed) in [
+            (1, true, false, true),
+            (1, true, true, true),
+            (0, true, false, false),
+            (-1, true, false, false),
+            (32768, true, false, false),
+            (65537, true, false, true),
+            (1, false, false, false),
+        ] {
+            let o = s.world.get_mut(owner).unwrap();
+            o.fields.insert("Health".into(), current);
+            o.active = active;
+            o.dead = saved_dead;
+            for resource in ["", "sarcophagus.dlg"] {
+                assert_eq!(
+                    run(
+                        &mut s,
+                        hero,
+                        "BeginConversation",
+                        &[
+                            Value::Object(owner),
+                            Value::Object(owner),
+                            Value::Resource(resource.into()),
+                        ]
+                    ),
+                    Some(Value::Int(i32::from(allowed))),
+                    "current={current}, active={active}, saved_dead={saved_dead}",
+                );
+                if allowed {
+                    let c = s.talk.as_ref().unwrap();
+                    assert_eq!((c.owner, c.player), (owner, hero));
+                    assert_eq!(c.dlg.name, "sarcophagus");
+                } else {
+                    assert!(s.talk.is_none());
+                }
+                s.end_conversation();
+            }
+        }
+        // Older saves can carry an explicit property current instead of the template field.
+        let o = s.world.get_mut(owner).unwrap();
+        o.active = true;
+        o.fields.insert("Health".into(), 1);
+        o.properties.insert(7, (100.0, 0.0));
+        assert_eq!(
+            run(
+                &mut s,
+                hero,
+                "BeginConversation",
+                &[
+                    Value::Object(hero),
+                    Value::Object(owner),
+                    Value::Resource(String::new()),
+                ]
+            ),
+            Some(Value::Int(0))
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -11371,6 +11628,7 @@ mod tests {
                 da2_target_prepared: false,
                 path: vec![],
                 turned_at: None,
+                is_static: false,
             });
         assert_eq!(
             conjuring(&mut s),

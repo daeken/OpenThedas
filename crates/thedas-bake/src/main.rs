@@ -70,6 +70,13 @@ struct Args {
     /// With --fit: look for this many missing (baked-only) lights in the residual.
     #[arg(long, default_value_t = 0)]
     discover: usize,
+    /// Merge the per-atlas fits under this directory (`fit-*/fit.txt`) into
+    /// `<dir>/<level>.lightset.json` and exit.
+    #[arg(long)]
+    lightset: Option<PathBuf>,
+    /// List the level's lightmap atlases and exit.
+    #[arg(long)]
+    list: bool,
     /// Fit every n-th texel.
     #[arg(long, default_value_t = 2)]
     stride: u32,
@@ -87,6 +94,12 @@ fn main() -> Result<()> {
     let started = Instant::now();
     let scene = AreaScene::load(&vfs, &level)?;
     let bake = BakeScene::new(&scene, &vfs);
+    if args.list {
+        for (a, regions) in &bake.atlases {
+            println!("{a} {}", regions.len());
+        }
+        return Ok(());
+    }
     if let Ok(model) = std::env::var("THEDAS_BAKE_FIND") {
         for (ri, r) in bake.regions.iter().enumerate() {
             let d = &scene.draws[r.draw];
@@ -192,6 +205,9 @@ fn main() -> Result<()> {
         });
     }
 
+    if let Some(dir) = &args.lightset {
+        return lightset(dir, &level, &points, &names, &ambient);
+    }
     // A fit's results replace the RGB pass's light brightness and the room ambients.
     if let Some(path) = &args.use_fit {
         let text = std::fs::read_to_string(path)?;
@@ -602,7 +618,7 @@ fn fit(
     {
         let sat: Vec<&fit::Row> = rows
             .iter()
-            .filter(|r| r.terms.iter().map(|t| t.1).sum::<f32>() >= 0.45 && r.shipped[3] >= 24)
+            .filter(|r| r.reach.iter().any(|&(_, q)| q < 0.5))
             .collect();
         println!(
             "  occlusion models over {} saturated, lit texels",
@@ -638,9 +654,9 @@ fn fit(
                 ("(1-t/L)^2", 2),
                 ("(1-t/L)^0.5", 3),
             ] {
-                for li in [0.5f32, 1.0, 1.5, 2.0, 3.0, 5.0] {
+                for li in [1.0f32, 1.5, 2.0, 3.0, 4.0, 5.0] {
                     for lo in [0.0f32, -0.5, -1.0, -1.5, -2.0] {
-                        for pw in [1.0f32, 1.0 / 1.5, 0.5] {
+                        for pw in [1.0f32, 1.0 / 1.5, 0.5, 1.5, 2.0] {
                             let (mut se, mut n) = (0.0f64, 0);
                             for r in &sat {
                                 let hits = match cosine {
@@ -938,6 +954,123 @@ fn fit(
             ));
         }
     }
+    // The shadow pass without occlusion: alpha / green = sm / lm_g (both carry the same
+    // occlusion), and lm_g comes from the fitted lightmap model. By light-strength quintile,
+    // on texels one light alone reaches.
+    if let Some(lf) = &last {
+        let mut per: BTreeMap<usize, Vec<(f64, f64)>> = BTreeMap::new();
+        for r in &rows {
+            let ([(i, t)], Some(room)) = (r.terms.as_slice(), r.room) else {
+                continue;
+            };
+            let (i, t) = (*i as usize, *t as f64);
+            if r.shipped[1] < 12 || r.shipped[3] == 0 {
+                continue;
+            }
+            let lin = lf.ambient[room as usize].y as f64
+                + lf.light_scale[i] * lights[i].color.y as f64 * t;
+            let lm_g = lin.max(0.0).powf(1.0 / settings.gamma as f64);
+            let sm = r.shipped[3] as f64 / r.shipped[1] as f64 * lm_g;
+            per.entry(i).or_default().push((t, sm));
+        }
+        for (i, mut pts) in per {
+            if pts.len() < 100 {
+                continue;
+            }
+            pts.sort_by(|a, b| a.0.total_cmp(&b.0));
+            let q: Vec<String> = pts
+                .chunks(pts.len().div_ceil(6))
+                .map(|c| {
+                    let mut v: Vec<f64> = c.iter().map(|p| p.1).collect();
+                    v.sort_by(f64::total_cmp);
+                    format!("S≈{:.3}: sm {:.2}", c[c.len() / 2].0, v[v.len() / 2])
+                })
+                .collect();
+            println!(
+                "  occlusion-free shadow pass {:24} {} texels: {}",
+                names.get(i).map(String::as_str).unwrap_or("?"),
+                pts.len(),
+                q.join(" | ")
+            );
+        }
+    }
+    // The alpha curve, light by light: on open texels that one light alone reaches, with
+    // alpha below saturation, regress ln(alpha) on ln(S): the slope is the curve's exponent
+    // and the intercept gives that light's scale (alpha = (k·S)^e).
+    {
+        let mut per: BTreeMap<usize, Vec<(f64, f64)>> = BTreeMap::new();
+        for r in &rows {
+            if let ([(i, t)], [(_, q)]) = (r.terms.as_slice(), r.reach.as_slice())
+                && open_model(r) >= 0.98
+                && r.shipped[3] > 10
+                && r.shipped[3] < 245
+                && *t > 0.0
+            {
+                let q = *q as f64;
+                let cos = *t as f64 / (1.0 - q).max(1e-6);
+                let feature = match std::env::var("THEDAS_BAKE_ALPHA_FEATURE").as_deref() {
+                    Ok("falloff") => 1.0 - q,
+                    Ok("cos") => cos,
+                    Ok("cos2") => (std::f64::consts::FRAC_PI_2 * q).cos().powi(2) * cos,
+                    Ok("invsq") => cos / (q * q).max(1e-4),
+                    _ => *t as f64,
+                };
+                per.entry(*i as usize)
+                    .or_default()
+                    .push((feature.max(1e-9).ln(), (r.shipped[3] as f64 / 255.0).ln()));
+            }
+        }
+        for (i, pts) in per.iter() {
+            if pts.len() < 100 {
+                continue;
+            }
+            // Median alpha by feature quintile.
+            let mut sorted = pts.clone();
+            sorted.sort_by(|a, b| a.0.total_cmp(&b.0));
+            let q: Vec<String> = sorted
+                .chunks(sorted.len().div_ceil(5))
+                .map(|c| {
+                    let mut a: Vec<f64> = c.iter().map(|p| p.1.exp() * 255.0).collect();
+                    a.sort_by(f64::total_cmp);
+                    format!(
+                        "S≈{:.3}: α̃ {:.0} [{:.0}..{:.0}]",
+                        c[c.len() / 2].0.exp(),
+                        a[a.len() / 2],
+                        a[a.len() / 10],
+                        a[a.len() * 9 / 10]
+                    )
+                })
+                .collect();
+            println!(
+                "  alpha by S quintile {}: {}",
+                names.get(*i).map(String::as_str).unwrap_or("?"),
+                q.join(" | ")
+            );
+            let i = *i;
+            let n = pts.len() as f64;
+            let (mx, my) = (
+                pts.iter().map(|p| p.0).sum::<f64>() / n,
+                pts.iter().map(|p| p.1).sum::<f64>() / n,
+            );
+            let sxy: f64 = pts.iter().map(|p| (p.0 - mx) * (p.1 - my)).sum();
+            let sxx: f64 = pts.iter().map(|p| (p.0 - mx).powi(2)).sum();
+            let e = sxy / sxx;
+            let b = my - e * mx;
+            let k = (b / e).exp();
+            let resid = (pts
+                .iter()
+                .map(|p| (p.1 - (b + e * p.0)).powi(2))
+                .sum::<f64>()
+                / n)
+                .sqrt();
+            println!(
+                "  alpha curve {:28} {} texels: exponent {e:.3}, scale k {k:.3}, ln-residual {resid:.3}, runtime colour {:?}",
+                names.get(i).map(String::as_str).unwrap_or("?"),
+                pts.len(),
+                lights[i].color
+            );
+        }
+    }
     // Which lights the shadow pass took: a light whose texels (those no other light reaches)
     // are mostly dark in the shipped alpha did not cast into it.
     let mut solo: BTreeMap<usize, (usize, usize)> = BTreeMap::new();
@@ -964,6 +1097,114 @@ fn fit(
     }
     std::fs::create_dir_all(&args.out)?;
     std::fs::write(args.out.join("fit.txt"), out)?;
+    Ok(())
+}
+
+/// The fitted light set: what the shipped lightmaps say the bake's lights were, merged over
+/// every atlas's fit (see docs/lightmaps/baker-spec.md, "Light sets").
+fn lightset(
+    dir: &Path,
+    level: &str,
+    points: &[BakeLight],
+    names: &[String],
+    ambient: &BTreeMap<String, Vec3>,
+) -> Result<()> {
+    use serde_json::json;
+    let mut rooms: BTreeMap<String, (Vec3, u32)> = BTreeMap::new();
+    let mut scale: Vec<(f64, u32)> = vec![(0.0, 0); points.len()];
+    let mut noshadow: Vec<u32> = vec![0; points.len()];
+    let mut atlases = 0u32;
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let Some(atlas) = name.strip_prefix("fit-") else {
+            continue;
+        };
+        let Ok(text) = std::fs::read_to_string(path.join("fit.txt")) else {
+            continue;
+        };
+        atlases += 1;
+        for line in text.lines() {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            match f.as_slice() {
+                ["ambient", room, r, g, b, ..] => {
+                    let e = rooms.entry(room.to_string()).or_insert((Vec3::ZERO, 0));
+                    e.0 += Vec3::new(r.parse()?, g.parse()?, b.parse()?);
+                    e.1 += 1;
+                }
+                ["light", i, k, ..] => {
+                    let (i, k): (usize, f64) = (i.parse()?, k.parse()?);
+                    if k > 0.0
+                        && let Some(e) = scale.get_mut(i)
+                    {
+                        e.0 += k;
+                        e.1 += 1;
+                    }
+                }
+                ["noshadow", i] => {
+                    if let Some(e) = noshadow.get_mut(i.parse::<usize>()?) {
+                        *e += 1;
+                    }
+                }
+                ["found", x, y, z, r, cr, cg, cb] => found.push(json!({
+                    "position": [x.parse::<f32>()?, y.parse::<f32>()?, z.parse::<f32>()?],
+                    "radius": r.parse::<f32>()?,
+                    "color": [cr.parse::<f32>()?, cg.parse::<f32>()?, cb.parse::<f32>()?],
+                    "atlas": atlas,
+                })),
+                _ => {}
+            }
+        }
+    }
+    let lights: Vec<_> = points
+        .iter()
+        .enumerate()
+        .map(|(i, l)| {
+            let (kind, position, radius) = match l.kind {
+                LightKind::Point { position, radius } => ("point", position.to_array(), radius),
+                LightKind::Directional { toward } => ("sun", toward.to_array(), 0.0),
+                LightKind::Ambient => ("ambient", [0.0; 3], 0.0),
+            };
+            let (sum, n) = scale[i];
+            json!({
+                "name": names.get(i),
+                "kind": kind,
+                "position": position,
+                "radius": radius,
+                "color": l.color.to_array(),
+                "baked_brightness": if n > 0 { Some(sum / n as f64) } else { None },
+                "fitted_atlases": n,
+                "in_alpha": noshadow[i] == 0,
+            })
+        })
+        .collect();
+    let rooms: serde_json::Map<String, serde_json::Value> = rooms
+        .into_iter()
+        .map(|(room, (sum, n))| {
+            let c = sum / n as f32;
+            (
+                room.clone(),
+                json!({
+                    "baked_ambient": c.to_array(),
+                    "runtime_ambient": ambient.get(&room).map(|a| a.to_array()),
+                }),
+            )
+        })
+        .collect();
+    let doc = json!({
+        "level": level,
+        "atlases_fitted": atlases,
+        "note": "Fitted from the shipped lightmaps by thedas-bake --fit; see docs/lightmaps/baker-spec.md. Linear colours; baked light = colour × baked_brightness × max(0, 1 − d/radius) × |N·L|, gamma 1.5 in the lightmap.",
+        "rooms": rooms,
+        "lights": lights,
+        "found": found,
+    });
+    let out = dir.join(format!("{level}.lightset.json"));
+    std::fs::write(&out, serde_json::to_string_pretty(&doc)?)?;
+    eprintln!("wrote {} ({atlases} atlases)", out.display());
     Ok(())
 }
 
