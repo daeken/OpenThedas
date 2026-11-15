@@ -394,10 +394,10 @@ fn sample(
                 (toward.normalize_or_zero(), c, f32::INFINITY, 1.0)
             }
         };
-        if c.max_element() <= 0.0 || nf.dot(dir) <= 0.0 {
-            continue;
-        }
-        if !(l.in_lightmap || l.cast_shadows) {
+        // The RGB pass needs a positive colour; the shadow pass only the light's reach (its
+        // brightness there is the shadow job's own, not the RGB pass's fitted one).
+        let rgb = l.in_lightmap && c.max_element() > 0.0;
+        if f <= 0.0 || nf.dot(dir) <= 0.0 || !(rgb || l.cast_shadows) {
             continue;
         }
         let vis = match (l.kind, settings.light_size) {
@@ -415,7 +415,7 @@ fn sample(
         if vis <= 0.0 {
             continue;
         }
-        if l.in_lightmap {
+        if rgb {
             light += c * ng.dot(dir).abs() * vis;
         }
         lit |= l.cast_shadows;
