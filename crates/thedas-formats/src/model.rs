@@ -39,6 +39,12 @@ pub mod field {
     /// Whether a mesh casts the engine's run-time (shadow partition) shadows; xoreos's
     /// `MMHMeshCastRuntimeShadow`.
     pub const MESH_CAST_RUNTIME_SHADOW: u32 = 6176;
+    /// Whether a mesh casts shadows into the baked lightmaps (`MMHMeshCastBakedShadow`; read
+    /// by the toolset's LightMapper.py as `GFF_MMH_MESH_CAST_BAKED_SHADOW`).
+    pub const MESH_CAST_BAKED_SHADOW: u32 = 6177;
+    /// Whether a mesh receives a baked lightmap (`GFF_MMH_MESH_RECEIVE_BAKED_SHADOW` in the
+    /// toolset's LightMapper.py).
+    pub const MESH_RECEIVE_BAKED_SHADOW: u32 = 6301;
     /// Whether a mesh is cut away when the game camera is high (`CutAway`, named by
     /// DAOrigins.exe's XML-to-GFF property table; read by the mesh blueprint at 0x595025).
     pub const MESH_CUT_AWAY: u32 = 6193;
@@ -112,6 +118,11 @@ pub struct MeshRef {
     /// submission queue's shadow groups draw into the shadow partitions. `None` when the
     /// node does not say.
     pub cast_runtime_shadow: Option<bool>,
+    /// Whether the mesh casts shadows into the baked lightmaps (6177); `None` when the node
+    /// does not say.
+    pub cast_baked_shadow: Option<bool>,
+    /// Whether the mesh receives a baked lightmap (6301); `None` when the node does not say.
+    pub receive_baked_shadow: Option<bool>,
     /// Whether the mesh fades out and is cut away while the game camera is high above the
     /// party (6193, `CutAway`): ceilings and roofs.
     pub cut_away: bool,
@@ -439,6 +450,12 @@ fn finish_node(
                     .collect::<TypedResult<_>>()?,
                 cast_runtime_shadow: d
                     .opt_i64(id, field::MESH_CAST_RUNTIME_SHADOW)?
+                    .map(|v| v != 0),
+                cast_baked_shadow: d
+                    .opt_i64(id, field::MESH_CAST_BAKED_SHADOW)?
+                    .map(|v| v != 0),
+                receive_baked_shadow: d
+                    .opt_i64(id, field::MESH_RECEIVE_BAKED_SHADOW)?
                     .map(|v| v != 0),
                 cut_away: d.opt_i64(id, field::MESH_CUT_AWAY)?.is_some_and(|v| v != 0),
             }),
