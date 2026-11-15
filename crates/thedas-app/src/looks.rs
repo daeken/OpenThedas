@@ -265,9 +265,12 @@ impl Looks {
 
     pub fn report(&self, id: ObjectId) -> serde_json::Value {
         self.trackers.get(&id).map_or(serde_json::Value::Null, |t| {
+            let poses = t.poses();
             serde_json::json!({
                 "tracking": t.tracking(), "target": t.target().map(|p| p.to_array()),
-                "eyes": t.on[EYES], "head": t.on[HEAD],
+                "returning_to_rest": !t.tracking(),
+                "eyes": t.on[EYES] && poses[EYES].is_some(),
+                "head": t.on[HEAD] && poses[HEAD].is_some(),
             })
         })
     }
