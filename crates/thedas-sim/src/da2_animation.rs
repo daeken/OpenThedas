@@ -319,8 +319,9 @@ impl Sim {
             let cmd = o.commands.first()?;
             let abilities = self.world.tables().get(1, "")?;
             let flags = number(abilities.cell_by_hash(0x650e_5503, i64::from(ability)))? as i32;
-            // Modern preparation 0x640e43 copies bit 1 into animation task bool 8.
-            if flags & 2 == 0 || sample.motion.is_empty() {
+            // 0x640e43 copies bit 0 into task bool 7 (translation). Bit 1 /
+            // bool 8 only permits turning; 0x6d9215 skips travel without bool 7.
+            if flags & 1 == 0 || sample.motion.is_empty() {
                 return None;
             }
             let mut scale = 1.;
@@ -504,6 +505,24 @@ mod tests {
             cancel: None,
             motion: motion_keys(&motion_fixture()).unwrap(),
         };
+        let moving_tables = sim.world.tables.clone();
+        let turning_only = crate::m2da::Tables::empty();
+        turning_only.insert(
+            "#1",
+            &["ID", "#650e5503"],
+            vec![(71, vec![Cell::Int(71), Cell::Int(2)])],
+        );
+        sim.world.tables = Arc::new(turning_only);
+        sim.start_da2_animation_motion(who, 71, &sample, 1.);
+        assert!(
+            sim.world
+                .get(who)
+                .unwrap()
+                .combat
+                .animation_motion
+                .is_none()
+        );
+        sim.world.tables = moving_tables;
         sim.start_da2_animation_motion(who, 71, &sample, 1.);
         sim.tick(500);
         let midway = sim.world.get(who).unwrap().position;

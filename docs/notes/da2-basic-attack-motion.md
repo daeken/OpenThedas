@@ -14,6 +14,8 @@ Read-only inspection of the player's DA2 analysis image establishes:
 - Modern preparation at 0x640e43 reads ability column 0x650e5503. Bit 0 becomes
   task boolean 7 and bit 1 becomes task boolean 8 (0x64151d..0x641534). The
   modern executor copies them to animation task 37 at 0x6d85b7..0x6d85e2.
+  Boolean 7 permits translation (0x6d9215); boolean 8 permits turning. Ranged
+  basic attacks with only bit 1 set must not acquire lunge translation.
 - Task 37's processor at 0x6d8860 supplies an animation-controller movement
   request, through 0x52ec70. Animation locomotion is separate from the cast's
   impact event and its remaining tail.
