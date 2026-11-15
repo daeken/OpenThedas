@@ -326,6 +326,13 @@ pub struct UiMovie {
     own_texture: Option<wgpu::Texture>,
 }
 
+impl UiMovie {
+    /// Engine tokens this movie has registered to read, in registration order.
+    pub fn observed_tokens(&self) -> impl Iterator<Item = &str> {
+        self.observers.iter().map(|(_, token)| token.as_str())
+    }
+}
+
 /// Clips a movie draws with the `multiply` blend onto what is under the interface (the
 /// "New Quest" banner's blood splash darkens the game's picture). The movie renders into
 /// its own transparent texture, where a multiply has nothing under it, so these clips are

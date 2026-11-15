@@ -92,6 +92,9 @@ fn cut_scene_lights(
 type ObjectsKey = Vec<(u32, Vec<String>)>;
 
 /// The level of the current area, drawn first; built when the area's layout changes.
+#[path = "live_report.rs"]
+mod report_snapshot;
+
 pub struct LiveLevel {
     pub layout: String,
     pub vfs: Arc<Vfs>,

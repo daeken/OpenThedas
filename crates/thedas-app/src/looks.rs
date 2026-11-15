@@ -263,6 +263,15 @@ impl Looks {
         self.trackers.contains_key(&id)
     }
 
+    pub fn report(&self, id: ObjectId) -> serde_json::Value {
+        self.trackers.get(&id).map_or(serde_json::Value::Null, |t| {
+            serde_json::json!({
+                "tracking": t.tracking(), "target": t.target().map(|p| p.to_array()),
+                "eyes": t.on[EYES], "head": t.on[HEAD],
+            })
+        })
+    }
+
     /// Advances creature `id`'s tracker by `dt` seconds towards `sight` (none: it lets go
     /// and turns back to rest, at the speed scale `away`), and gives the pose animations to
     /// lay over its clip.

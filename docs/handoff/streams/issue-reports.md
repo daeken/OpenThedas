@@ -24,12 +24,46 @@ and an nginx site on the test server. Paths below are relative to the folder hol
      case-sensitivity, mod layers (`player_layers`), status, coverage counters, frame stats,
      snapshot ages and marked `regions`;
    - `log.txt`: the last 400 log lines, from a tee around env_logger;
+   - `log.full.txt`: the session log up to the press, bounded to 20,000 physical lines and
+     8 MiB (individual messages truncate at 16 KiB). `report.json.log` gives retained and
+     dropped line counts. Both logs use the same tee/filter;
+   - `presentation.json`: the camera's mode, position, direction/target, field of view and
+     explore zoom; each drawn creature/placeable candidate's id/tag, last placement vs.
+     sim position, cached skeleton roots vs. rest/sim, facing, animation resources and
+     layers (seconds, 30 fps frame coordinate, length, weight, additive/absolute/phase),
+     head/eye tracking target, actual renderer opacity and attached VFX. Scene candidates
+     include offscreen/shadow-only objects, labelled by `seen_in_view_or_shadow`; fully
+     hidden objects are omitted. Cinematic/free cameras store a point 1 m down the actual
+     view direction rather than inventing a focus distance (`target_kind` says which).
+     Near-camera emitters (within 50 m, at most 512) include position, material, particle
+     count, opacity and animation overrides. Sound starts cover the last 10 s, at most
+     512 successful event requests, or `null` with audio disabled. The interface lists
+     open movies, contexts/screens, and the bridge's current observed/HUD values, capped
+     at 1024 values / 8192 nodes / 512 characters per string (lists/objects cap at 64,
+     nesting at 8). Counts/limits make truncation visible;
+   - `frames.json`: the last 600 raw frame times, oldest first, each with sim time, area,
+     loading/cutscene/conversation flags, screens and cheap renderer draw statistics.
+     These counts describe loaded scene draws, skipped draws and particle draws, not
+     per-pass GPU visibility. The existing summary stays in `report.json.frames`;
+   - `options.ini` (the active `--settings` file, else the data-folder default) and
+     `launcher.json` from the data folder, when present. The worker parses and sanitizes
+     them: key/token/password/secret/credential/authorization/webhook fields are dropped,
+     recursively in JSON and by field/section in INI; INI comments are discarded.
+     Invalid/unreadable or over-1-MiB configs are omitted with a warning. Home paths in all
+     new files become `~` locally as well as in uploads;
    - `input.txt`: the last 120 s of input;
    - `trace.json`: `Trace::recent` (the sim's last 4000 command, log, dialog, plot, failed-script
      and missing entries);
    - `journal_checkpoint.json` and `journal.jsonl`: the sim stream's journal, which replays the
      session exactly;
    - `note.txt`.
+   The press clones the save and reads already cached presentation data. Save serialization,
+   journal copying, JSON/config/log writes, screenshot writes, and marked PNG encoding run
+   on a dedicated worker. Completion (including the control reply/upload) waits for that
+   worker without blocking the frame loop. Journal file handles plus the length at the
+   press pin the checkpoint/log even if a checkpoint is rotated or inputs are appended.
+   `report.json.capture_ms` and the `report: captured state` log measure snapshot overhead;
+   screenshot readback remains the existing frame-capture path.
 2. **Mark spots** (mouse and pad). After F8 the player is offered "Mark spots", drags a box
    around each problem and types a note for it. Each spot's note is followed by "Mark another
    spot" / "Done marking"; Done goes straight to the overall note. F8, Enter or Escape (B or
@@ -47,7 +81,10 @@ and an nginx site on the test server. Paths below are relative to the folder hol
    - Home-folder paths become `~` and the install path is dropped.
    - The total is kept under Discord's 10 MB. Order of giving way: the screenshot first goes to
      half size, then the journal is left out (`journal_left_out` in the uploaded report.json),
-     then the screenshot is dropped.
+     then the supplemental files give way in order: `log.full.txt`, `frames.json`,
+     `options.ini`, `launcher.json` (`files_left_out` records why), then the screenshot is
+     dropped. `presentation.json` always stays. Local files remain available even when
+     left out of an upload.
    - `sent.json` in the folder records the Discord message id.
 5. **Track.** `report_sync.py` runs every 3 minutes on the Mac.
    - It opens a GitHub issue labelled `player-report` for each new game report in
@@ -171,7 +208,8 @@ exact commit in a detached worktree (`OpenThedas-wt/report-mac`, target `report-
 
 ## How to test this area
 
-Use a scratch HOME and a control port of your own; this stream used 7900-7909.
+Use a scratch HOME and the control port assigned by the current job brief (report-capture:
+8049 only). Run builds and hidden-window probes through `cargo-slot.sh`, with `-j 2`.
 
 - `report/drive_report.py APP SAVE [PORT] [RUN_MS]`: report files; `POPUP=1` for the typed note;
   `THEDAS_REPORT_UPLOAD=1` plus a copied `discord-webhook` or `update-url` to really send.
@@ -186,6 +224,10 @@ Use a scratch HOME and a control port of your own; this stream used 7900-7909.
 - Unit tests: `cargo test -p thedas-app report:: upload:: update::`. They cover the ring,
   regions, the zip writer and reader, redaction, offers, sent-report scanning and the message
   format.
+  Capture tests additionally cover animation time/weights, 2 cm root offsets, bounded HUD
+  values, raw-frame context/eviction, full-log limits, worker completion/cancellation,
+  config sanitization, pinned journal prefixes, archive membership/redaction and upload
+  omission order. `thedas-audio` tests cover the sound-start ring.
 - Steps: `key f8` drives a report from `--steps` and `--control`; the `report` control command
   takes `"note"`.
 
@@ -204,8 +246,9 @@ Use a scratch HOME and a control port of your own; this stream used 7900-7909.
 
 ## Known gaps and ideas
 
-- The screenshot readback and `save_json` run on the frame thread (about 20 ms per snapshot on a
-  big save). Serializing on a worker would remove the hitch.
+- Screenshot readback and the periodic before-save ring still run on the frame thread.
+  F8's save serialization and file writes run on its worker; the save's in-memory clone
+  and the presentation snapshot stay at the press.
 - The update offer needs the HUD's popup layer; before a game it waits.
 - The Windows exes are console-subsystem, so a log window opens beside the game.
 - Mac packages are unsigned and Apple silicon only; there is no app bundle (the icon is set at

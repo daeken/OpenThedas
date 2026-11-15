@@ -2846,6 +2846,12 @@ impl App {
             }
             return;
         }
+        let capture_started = Instant::now();
+        let capture = report::Capture {
+            presentation: report::presentation_snapshot(self),
+            settings: self.settings.clone(),
+            data_dir: saves::data_dir(),
+        };
         let mut info = json!({
             "build": report::build_info(),
             "settings": self.started_with,
@@ -2888,17 +2894,19 @@ impl App {
                 info["game"]["hero"] = json!(sim.world.hero.map(|h| sim.display_name(h)));
                 info["game"]["area_name"] = json!(sim.world.area.map(|a| sim.display_name(a)));
                 info["game"]["coverage"] = sim.world.trace.coverage();
-                match sim.save_json() {
-                    Ok(b) => now_save = Some(b),
-                    Err(e) => log::warn!("report: the game's state: {e}"),
-                }
+                now_save = Some(report::ReportSave::Game(Box::new(sim.save_game())));
                 trace = serde_json::to_value(&sim.world.trace.recent).ok();
                 drop(sim);
                 pause = !live.paused;
             }
         }
-        let dir = self.recorder.start(now_save, trace, journal, info);
-        log::info!("report: started in {}", dir.display());
+        info["capture_ms"] = json!(capture_started.elapsed().as_secs_f64() * 1000.0);
+        let dir = self.recorder.start(now_save, trace, journal, info, capture);
+        log::info!(
+            "report: captured state in {:.2} ms; started in {}",
+            capture_started.elapsed().as_secs_f64() * 1000.0,
+            dir.display()
+        );
         // The frame as presented, read back as the next one is drawn; drawn again
         // offscreen where the surface cannot be read back.
         let readable = self
@@ -3111,7 +3119,8 @@ impl App {
     /// One frame of reports: a snapshot of the game when one is due, and a report under
     /// way finished once its screenshot and note are in.
     fn report_frame(&mut self, dt_ms: f64) {
-        self.recorder.frame(dt_ms);
+        let context = report::frame_context(self);
+        self.recorder.frame(dt_ms, context);
         for a in std::mem::take(&mut self.mark_answers) {
             self.mark_answer(a);
         }

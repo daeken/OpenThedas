@@ -16,7 +16,7 @@ use std::collections::BTreeSet;
 use thedas_sim::Sim;
 use thedas_ui::stage::Stage;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
 pub enum Screen {
     Hud,
     Cutscene,
