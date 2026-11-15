@@ -313,12 +313,12 @@ fn segment(keys: &[Key], t: f32) -> Option<(&Key, &Key, f32)> {
     Some((a, b, f.clamp(0.0, 1.0)))
 }
 
-fn sample_rotation(keys: &[Key], t: f32) -> Option<Quat> {
+pub(crate) fn sample_rotation(keys: &[Key], t: f32) -> Option<Quat> {
     let (a, b, f) = segment(keys, t)?;
     Some(quat(a.value).slerp(quat(b.value), f))
 }
 
-fn sample_translation(keys: &[Key], t: f32) -> Option<Vec3> {
+pub(crate) fn sample_translation(keys: &[Key], t: f32) -> Option<Vec3> {
     let (a, b, f) = segment(keys, t)?;
     let v = |k: &Key| Vec3::new(k.value[0], k.value[1], k.value[2]);
     Some(v(a).lerp(v(b), f))
