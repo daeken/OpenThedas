@@ -1965,6 +1965,7 @@ impl Server {
             };
             let ty = thedas_sim::sim::constant(&sim.table, "COMMAND_TYPE_USE_ABILITY");
             let cmd = thedas_sim::world::Command {
+                is_static: false,
                 ty,
                 name: "CommandUseAbility".into(),
                 target: Some(target),

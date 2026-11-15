@@ -2015,6 +2015,19 @@ impl Sim {
         // Level-up (mode 1) only starts when someone asked for it (`request_level_up`), so
         // it is left for them to finish.
         if self.chargen_policy == ChargenPolicy::QuickStart && mode == 0 {
+            if self.game == thedas_vfs::Game::DragonAge2
+                && let Some([gender, race, class, background]) = self.da2_chargen_preset(creature)
+            {
+                // sys_chargen rebuilds the selected class, then applies the preset's
+                // background/variant and its equipment from chargen_dae. Exit 1 keeps
+                // that choice; exit 0 would replace it with the generic starter gear.
+                self.chargen_event("CHARGEN_SELECT_GENDER", vec![gender, 1], Vec::new());
+                self.chargen_event("CHARGEN_SELECT_RACE", vec![race, 0], Vec::new());
+                self.chargen_event("CHARGEN_SELECT_CLASS", vec![class, 0], Vec::new());
+                self.chargen_event("CHARGEN_SELECT_BACKGROUND", vec![background], Vec::new());
+                self.chargen_event("CHARGEN_END", vec![mode, 1], Vec::new());
+                return;
+            }
             // Dragon Age II's `sys_chargen` gives the hero no class when creation simply
             // ends, and its prologue reads the class from the class abilities that choosing
             // one grants. So the quick start chooses as a player would: male (gender 1),
@@ -2496,6 +2509,7 @@ impl Sim {
                 da2_target_prepared: false,
                 path: Vec::new(),
                 turned_at: None,
+                is_static: false,
             };
             // A follow move already under way goes on from where it has got to.
             if ours {
@@ -3498,14 +3512,31 @@ impl Sim {
             })
             .collect();
         let mut best: Option<(u64, ObjectId)> = None;
+        let mut origins_prepared = false;
         for (id, under_way, cmd) in fronts {
             if let Some(due) = under_way {
+                // An earlier actor's preparation script may have cleared this front.
+                // Its cached deadline must not complete the replacement command.
+                if origins_prepared
+                    && self
+                        .world
+                        .get(id)
+                        .and_then(|o| o.commands.first())
+                        .and_then(|c| c.due)
+                        != Some(due)
+                {
+                    continue;
+                }
                 if best.is_none_or(|(b, bid)| (due, id) < (b, bid)) {
                     best = Some((due, id));
                 }
                 continue;
             }
             let Some(mut cmd) = cmd else { continue };
+            if origins_prepared && self.world.get(id).and_then(|o| o.commands.first()) != Some(&cmd)
+            {
+                continue;
+            }
             let due = match cmd.due {
                 Some(d) => {
                     if self.game == thedas_vfs::Game::DragonAge2 {
@@ -3641,6 +3672,18 @@ impl Sim {
                     let attack_ms = if cmd.name == "CommandAttack"
                         || cmd.name == "CommandUseAbility"
                     {
+                        if !da2 {
+                            origins_prepared = true;
+                            // Native preparation already owns an active command when
+                            // COMMAND_PENDING runs. Its script may AddCommand or clear
+                            // it; do not mistake it for an unstarted waiting command.
+                            cmd.due = Some(now);
+                            if let Some(c) =
+                                self.world.get_mut(id).and_then(|o| o.commands.first_mut())
+                            {
+                                c.due = cmd.due;
+                            }
+                        }
                         if cmd.name == "CommandAttack" {
                             self.start_attack(id, cmd.target.unwrap_or(OBJECT_INVALID), cmd.ty);
                         } else {
@@ -3654,8 +3697,10 @@ impl Sim {
                             self.start_ability(id, &cmd);
                         }
                         let still = self.world.get(id).and_then(|o| o.commands.first()).cloned();
-                        if still.as_ref().map(|c| (&c.name, c.target))
-                            != Some((&cmd.name, cmd.target))
+                        if (!da2 && still.as_ref() != Some(&cmd))
+                            || (da2
+                                && still.as_ref().map(|c| (&c.name, c.target))
+                                    != Some((&cmd.name, cmd.target)))
                         {
                             continue;
                         }
@@ -3812,6 +3857,24 @@ impl Sim {
             if best.is_none_or(|(b, bid)| (due, id) < (b, bid)) {
                 best = Some((due, id));
             }
+        }
+        // A later actor's script can also invalidate the best deadline already chosen.
+        // Rescan active deadlines only in that case; fresh replacements still need start.
+        if origins_prepared
+            && best.is_some_and(|(due, id)| {
+                self.world
+                    .get(id)
+                    .and_then(|o| o.commands.first())
+                    .and_then(|c| c.due)
+                    != Some(due)
+            })
+        {
+            best = self
+                .world
+                .objects
+                .values()
+                .filter_map(|o| Some((o.commands.first()?.due?, o.id)))
+                .min();
         }
         best
     }
@@ -4888,7 +4951,9 @@ impl Sim {
             });
             return;
         };
-        if replace {
+        if self.game == thedas_vfs::Game::DragonAge2 {
+            self.discard_da2_template_inventory(id, replace);
+        } else if replace {
             let old = self
                 .world
                 .get_mut(id)
@@ -5314,6 +5379,307 @@ impl ScriptHost<'_> {
 
 #[cfg(test)]
 mod tests {
+    fn add_command_sim() -> Sim {
+        let ldf = "#define ENGINE_STRUCTURE_2 command\n\
+            command CommandWait(float seconds) = 1;\n\
+            int AddCommand(object who, command cmd, int front, int fixed, int behavior) = 2;\n\
+            command CommandAttack(object target) = 3;\n\
+            int COMMAND_TYPE_ATTACK = 1;\n\
+            int COMMAND_TYPE_WAIT = 13;\n\
+            int EVENT_TYPE_COMMAND_COMPLETE = 1004;\n\
+            int EVENT_TYPE_COMMAND_PENDING = 1006;\n\
+            int COMMAND_FAILED_COMMAND_CLEARED = -2;\n";
+        Sim::new(
+            Arc::new(Vfs::new()),
+            Arc::new(EngineTable::parse(ldf.as_bytes()).unwrap()),
+            1,
+        )
+    }
+
+    fn add_command(
+        s: &mut Sim,
+        who: ObjectId,
+        command: Command,
+        front: i32,
+        fixed: i32,
+        behavior: i32,
+    ) {
+        let hd = s.world.store(crate::world::EngineData::Command(command));
+        let f = s.table.function_by_name("AddCommand").unwrap().clone();
+        let ty = s.types.command;
+        let args = [
+            Value::Object(who),
+            Value::Engine {
+                ty,
+                handle: Some(hd),
+            },
+            Value::Int(front),
+            Value::Int(fixed),
+            Value::Int(behavior),
+        ];
+        let mut host = ScriptHost {
+            sim: s,
+            event: None,
+            script: "test".into(),
+        };
+        assert_eq!(
+            crate::engine::call(&mut host, who, &f, &args)
+                .unwrap()
+                .unwrap(),
+            Some(Value::Int(1))
+        );
+    }
+
+    #[test]
+    fn origins_add_command_keeps_or_clears_the_active_executor_without_requeueing() {
+        for (behavior, front, fixed, same_target) in [
+            (0, 1, false, false),
+            (0, 0, false, false),
+            (1, 1, false, false),
+            (1, 0, false, false),
+            (2, 1, false, false),
+            (3, 1, false, false),
+            (3, 1, false, true),
+            (2, 1, true, false),
+        ] {
+            let mut s = add_command_sim();
+            let who = s.world.spawn(ObjectKind::Creature, "actor");
+            let active = Command {
+                ty: 1,
+                name: "CommandAttack".into(),
+                target: same_target.then_some(123),
+                due: Some(2000),
+                from: Some(([1., 2., 3.], 0)),
+                approach: Some([4., 5., 3.]),
+                is_static: fixed,
+                ..Default::default()
+            };
+            let waiting = Command {
+                ty: 41,
+                name: "CommandTurn".into(),
+                ..Default::default()
+            };
+            let must_finish = Command {
+                ty: 13,
+                name: "CommandWait".into(),
+                is_static: true,
+                ..Default::default()
+            };
+            s.world.get_mut(who).unwrap().commands =
+                vec![active.clone(), waiting.clone(), must_finish.clone()];
+            let incoming = Command {
+                ty: 39,
+                name: "CommandSheatheWeapons".into(),
+                target: Some(123),
+                ..Default::default()
+            };
+            add_command(&mut s, who, incoming.clone(), front, 1, behavior);
+            let commands = &s.world.get(who).unwrap().commands;
+            let cleared = behavior != 0 && !fixed;
+            let mut expected = Vec::new();
+            if !cleared {
+                expected.push(active);
+            }
+            let mut incoming = incoming;
+            incoming.is_static = true;
+            if front == 1 {
+                expected.push(incoming.clone());
+            }
+            if behavior < 2 || (behavior == 3 && same_target) {
+                expected.push(waiting);
+            }
+            expected.push(must_finish);
+            if front == 0 {
+                expected.push(incoming);
+            }
+            assert_eq!(
+                commands, &expected,
+                "behavior={behavior}, front={front}, fixed={fixed}"
+            );
+            let events: Vec<_> = s.world.queue.values().filter(|q| q.target == who).collect();
+            assert_eq!(events.len(), usize::from(cleared));
+            if cleared {
+                assert_eq!(events[0].event.ints, vec![1, -2]);
+                assert_eq!(
+                    s.world
+                        .get(who)
+                        .unwrap()
+                        .combat
+                        .previous_command
+                        .as_ref()
+                        .unwrap()
+                        .ty,
+                    1
+                );
+            }
+            // Static admission survives saves, while old saves need no new field.
+            let saved = s.save_json().unwrap();
+            s.load_json(&saved).unwrap();
+            assert_eq!(s.world.get(who).unwrap().commands, expected);
+        }
+    }
+
+    #[test]
+    fn origins_readding_the_current_payload_has_fresh_execution_state() {
+        let mut s = add_command_sim();
+        let who = s.world.spawn(ObjectKind::Creature, "actor");
+        let active = Command {
+            ty: 1,
+            name: "CommandAttack".into(),
+            due: Some(2000),
+            from: Some(([0.; 3], 10)),
+            approach: Some([3., 0., 0.]),
+            path: vec![[3., 0., 0.]],
+            ..Default::default()
+        };
+        s.world.get_mut(who).unwrap().commands.push(active.clone());
+        add_command(&mut s, who, active.clone(), 1, 0, 0);
+        let commands = &s.world.get(who).unwrap().commands;
+        assert_eq!(commands[0], active);
+        let mut fresh = active;
+        fresh.due = None;
+        fresh.from = None;
+        fresh.approach = None;
+        fresh.path.clear();
+        assert_eq!(commands[1], fresh);
+        assert_eq!(s.next_command(), Some((2000, who)));
+    }
+
+    #[test]
+    fn da2_add_command_keeps_its_existing_front_insertion() {
+        let mut s = add_command_sim();
+        s.game = thedas_vfs::Game::DragonAge2;
+        let who = s.world.spawn(ObjectKind::Creature, "actor");
+        let active = Command {
+            name: "CommandWait".into(),
+            due: Some(2000),
+            ..Default::default()
+        };
+        s.world.get_mut(who).unwrap().commands.push(active.clone());
+        let incoming = Command {
+            name: "CommandTurn".into(),
+            ..Default::default()
+        };
+        add_command(&mut s, who, incoming.clone(), 1, 1, 2);
+        assert_eq!(s.world.get(who).unwrap().commands, vec![incoming, active]);
+        assert!(s.world.queue.is_empty());
+    }
+
+    #[test]
+    fn origins_add_command_defaults_depend_on_the_active_type() {
+        for active_ty in [1, 13] {
+            let mut s = add_command_sim();
+            let who = s.world.spawn(ObjectKind::Creature, "actor");
+            // The different-type column says hard clear. With the same active type,
+            // the separate (absent here) column defaults to don't clear.
+            s.world.tables.insert(
+                "#94",
+                &["AddBehavior"],
+                vec![(13, vec![thedas_formats::gda::Cell::Int(2)])],
+            );
+            let active = Command {
+                ty: active_ty,
+                name: "CommandWait".into(),
+                due: Some(2000),
+                ..Default::default()
+            };
+            s.world.get_mut(who).unwrap().commands.push(active.clone());
+            let incoming = Command {
+                ty: 13,
+                name: "CommandWait".into(),
+                seconds: 1.,
+                ..Default::default()
+            };
+            add_command(&mut s, who, incoming.clone(), 1, 0, -1);
+            if active_ty == 13 {
+                assert_eq!(s.world.get(who).unwrap().commands, vec![active, incoming]);
+                assert_eq!(s.next_command(), Some((2000, who)));
+            } else {
+                assert_eq!(s.world.get(who).unwrap().commands, vec![incoming]);
+                assert_eq!(s.next_command(), Some((1000, who)));
+            }
+        }
+    }
+
+    #[test]
+    fn origins_add_command_during_pending_sees_an_active_command() {
+        for (behavior, other_actor) in [(0_i32, 0), (1, 0), (1, 1), (1, -1)] {
+            let mut s = add_command_sim();
+            // NCS object constants 0/1 mean SELF/INVALID, so give actors ordinary ids.
+            let area = s.world.spawn(ObjectKind::Area, "arena");
+            let earlier = (other_actor < 0).then(|| s.world.spawn(ObjectKind::Creature, "earlier"));
+            s.world.trace.keep = true;
+            let who = s.world.spawn(ObjectKind::Creature, "actor");
+            let target = s.world.spawn(ObjectKind::Creature, "target");
+            let recipient = if other_actor != 0 {
+                let other = earlier.unwrap_or_else(|| s.world.spawn(ObjectKind::Creature, "other"));
+                s.world.get_mut(other).unwrap().commands.push(Command {
+                    ty: 13,
+                    name: "CommandWait".into(),
+                    due: Some(1),
+                    ..Default::default()
+                });
+                other
+            } else {
+                who
+            };
+            for actor in [who, target, recipient] {
+                s.world.get_mut(actor).unwrap().area = Some(area);
+            }
+            s.world.get_mut(target).unwrap().position = [1., 0., 0.];
+            s.world.get_mut(who).unwrap().script = Some("pending.ncs".into());
+            // Our own COMMAND_PENDING script inserts the same attack. With soft
+            // clear, its replacement must remain fresh even though name/target match.
+            let mut code = Vec::new();
+            for value in [behavior, 0, 1] {
+                code.extend([0x04, 0x03]);
+                code.extend(value.to_be_bytes());
+            }
+            code.extend([0x04, 0x06]);
+            code.extend(target.to_be_bytes());
+            code.extend([0x05, 0, 0, 3, 1, 0x04, 0x06]);
+            code.extend(recipient.to_be_bytes());
+            code.extend([0x05, 0, 0, 2, 5, 0x1b, 0]);
+            code.extend((-4_i32).to_be_bytes());
+            code.extend([0x20, 0]);
+            let mut bytes = b"NCS V1.0B".to_vec();
+            bytes.extend(((13 + code.len()) as u32).to_be_bytes());
+            bytes.extend(code);
+            s.add_script("pending.ncs", Ncs::parse(&bytes).unwrap());
+            s.order_attack(who, target);
+            s.world.get_mut(who).unwrap().commands[0].arrived = true;
+            let next = s.next_command();
+            assert!(
+                s.world.trace.script_errors.is_empty(),
+                "{:?}",
+                s.world.trace.entries
+            );
+            let commands = &s.world.get(recipient).unwrap().commands;
+            if other_actor != 0 {
+                let (due, actor) = next.unwrap();
+                assert_eq!(actor, who);
+                assert!(due > 1);
+                assert_eq!(commands.len(), 1);
+                assert_eq!(commands[0].due, None);
+            } else if behavior == 0 {
+                assert!(next.is_some());
+                assert_eq!(commands.len(), 2, "{:?}", s.world.trace.entries);
+                assert!(commands[0].due.is_some());
+                assert_eq!(commands[1].due, None);
+            } else {
+                assert_eq!(next, None);
+                assert_eq!(commands.len(), 1);
+                assert_eq!(commands[0].due, None);
+                assert!(
+                    s.world
+                        .queue
+                        .values()
+                        .any(|q| q.target == who && q.event.ints == vec![1, -2])
+                );
+            }
+        }
+    }
+
     #[test]
     fn da2_basic_no_action_preserves_a_command_prepended_by_its_script() {
         let ldf = "#define ENGINE_STRUCTURE_2 command\n\
@@ -5748,6 +6114,7 @@ mod tests {
             da2_target_prepared: false,
             path: Vec::new(),
             turned_at: None,
+            is_static: false,
         });
         let t0 = s.world.time_ms;
         s.fail_front_command(c, "COMMAND_FAILED_PATH_ACTION_REQUIRED");
@@ -6383,6 +6750,7 @@ mod tests {
             da2_target_prepared: false,
             path: Vec::new(),
             turned_at: None,
+            is_static: false,
         });
         assert!(s.walk(hero, [10.0, 0.0, 0.0], None));
         let p = s.world.get(al).unwrap().position;
@@ -6478,6 +6846,7 @@ mod tests {
             da2_target_prepared: false,
             path: Vec::new(),
             turned_at: None,
+            is_static: false,
         };
         let o = s.world.get_mut(id).unwrap();
         o.commands.push(cmd("CommandPlayAnimation", 0.0));
@@ -6523,6 +6892,7 @@ mod tests {
             da2_target_prepared: false,
             path: Vec::new(),
             turned_at: None,
+            is_static: false,
         });
         s.tick(1);
         let o = s.world.get(id).unwrap();
@@ -6642,6 +7012,7 @@ mod tests {
             da2_target_prepared: false,
             path: Vec::new(),
             turned_at: None,
+            is_static: false,
         });
         s.tick(1);
         let o = s.world.get(id).unwrap();
@@ -6847,6 +7218,7 @@ mod tests {
                 da2_target_prepared: false,
                 path: Vec::new(),
                 turned_at: None,
+                is_static: false,
             });
         }
         s.tick(1);
@@ -6900,6 +7272,7 @@ mod tests {
             da2_target_prepared: false,
             path: Vec::new(),
             turned_at: None,
+            is_static: false,
         };
         s.world.get_mut(id).unwrap().commands.push(walk());
         // 5 m/s: two seconds in, ten metres along.
@@ -7047,6 +7420,7 @@ mod tests {
             da2_target_prepared: false,
             path: Vec::new(),
             turned_at: None,
+            is_static: false,
         };
         let blow = crate::world::Effect {
             ty: 1024,
@@ -7116,6 +7490,7 @@ mod tests {
             da2_target_prepared: false,
             path: Vec::new(),
             turned_at: None,
+            is_static: false,
         });
         // At 5 m/s: five metres after a second.
         s.tick(1000);
@@ -7169,6 +7544,7 @@ mod tests {
             da2_target_prepared: false,
             path: Vec::new(),
             turned_at: None,
+            is_static: false,
         };
         let walk = cmd(
             "CommandMoveToLocation",
@@ -7398,6 +7774,7 @@ mod tests {
                 da2_target_prepared: false,
                 path: Vec::new(),
                 turned_at: None,
+                is_static: false,
             });
             crowd.push(c);
         }
@@ -7427,6 +7804,7 @@ mod tests {
             da2_target_prepared: false,
             path: Vec::new(),
             turned_at: None,
+            is_static: false,
         });
         // It walks to just outside the crowd and waits; the ring is still full, so the
         // attack fails and its owner hears so.
@@ -7510,6 +7888,7 @@ mod tests {
             da2_target_prepared: false,
             path: Vec::new(),
             turned_at: None,
+            is_static: false,
         };
         // Away to 5 m from the target, on the line through the mover.
         let mut c = cmd("CommandMoveAwayFromObject");
@@ -7577,6 +7956,7 @@ mod tests {
             da2_target_prepared: false,
             path: Vec::new(),
             turned_at: None,
+            is_static: false,
         });
         let mut arrived = None;
         for k in 1..=400 {
@@ -7805,6 +8185,7 @@ mod tests {
             da2_target_prepared: false,
             path: Vec::new(),
             turned_at: None,
+            is_static: false,
         };
         assert_eq!(
             s.command_speed(human, &walk(0)),

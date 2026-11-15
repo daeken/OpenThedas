@@ -323,13 +323,16 @@ pub struct Event {
     pub vectors: Vec<[f32; 3]>,
 }
 
-/// A queued command (`AddCommand`). Provisional: commands complete as soon as the executor
-/// reaches them, except `Wait`, which lasts its duration.
+/// A command payload and its simulation execution state. An active command stays at the
+/// front of its object's vector; the remaining entries are the waiting queue.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Command {
     /// `COMMAND_TYPE_*`.
     pub ty: i32,
     pub name: String,
+    /// Origins' AddCommand bStatic: ordinary add behavior cannot clear this command.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_static: bool,
     pub target: Option<ObjectId>,
     pub location: Option<Location>,
     pub seconds: f32,

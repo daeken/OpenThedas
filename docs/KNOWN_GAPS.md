@@ -169,7 +169,6 @@ Concrete defects found during the code read. Each is small and independent.
 
 | ID | What |
 | --- | --- |
-| `SCR-059` | A command pushed to the front leaves the displaced command with its old timer |
 | `SCR-074` | Commands and unmodelled engine structures still compare handles; Origins effect/location/event equality is traced and fixed |
 | `SIM-148` | The module's start position is parsed and never used (barely visible: single player's start area is left at once) |
 | `RND-043` | Alpha-tested casters are skipped, so foliage, fences and hair cast no sun shadow |
