@@ -1275,7 +1275,14 @@ mod body_bag_tests {
 
     /// A `gen_ip_bodybag.utp` with the fields that matter here, in a resource stack.
     fn sim_with_bag_template() -> Sim {
-        let dir = std::env::temp_dir().join(format!("thedas-bodybag-{}", std::process::id()));
+        // Each test writes its own template: truncating a shared file can make the
+        // other test read an empty GFF while it builds its body bag.
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "thedas-bodybag-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("gen_ip_bodybag.utp");
         let field = |label: &str, value: G3| Field {
