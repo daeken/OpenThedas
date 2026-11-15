@@ -106,6 +106,7 @@ pub fn clip_snapshot(animator: &Animator, clip: &Clip) -> J {
         "length_frames_30fps": animation.map(|a| a.length * 30.0),
         "looping": clip.looping, "blend_weight": clip.weight, "absolute": clip.absolute,
         "additive": animation.map(|a| a.additive), "phase": clip.phase,
+        "translation_scale": clip.translation_scale, "unscaled": animation.map(|a| a.unscaled),
         "layers": clip.layers.iter().map(|c| clip_snapshot(animator, c)).collect::<Vec<_>>(),
     })
 }
@@ -204,6 +205,7 @@ mod tests {
             name: "fixture.ani".into(),
             length: 2.0,
             additive: true,
+            unscaled: false,
             tracks: vec![],
             scalars: vec![],
             colors: vec![],

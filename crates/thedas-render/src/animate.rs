@@ -595,6 +595,7 @@ mod tests {
             name: "fixture".into(),
             length: 2.0,
             additive: false,
+            unscaled: false,
             tracks: vec![],
             scalars: vec![],
             colors: vec![],
