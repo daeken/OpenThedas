@@ -61,7 +61,7 @@ d0bcc32c, main and this branch alone both wipe at t=1488427 with byte-identical
 complete end states; placement alone wipes at t=1483127. The refreshed integration
 still wipes at t=1414027 and reproduces its earlier complete end state exactly.
 Available level-ups/rest and a separate manual-input run did not clear the older
-integration either. Zero script errors and developer healing/kill aids are used.
+integration either. All runs have zero script errors and zero developer healing/kill aids.
 The cause of the changed main-baseline outcome is unproven.
 
 The earlier pre-Ogre replay still wipes on refreshed main and placement with
