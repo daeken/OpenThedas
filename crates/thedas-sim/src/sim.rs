@@ -579,8 +579,8 @@ pub enum PartyPickerPolicy {
     Player,
 }
 
-/// Looks up an integer constant from the engine table (0 if absent).
-/// Movement speed (m/s) for a creature whose appearance gives none. Provisional.
+/// Movement-speed fallback (m/s): Origins 0xa63120 initializes the appearance lookup's
+/// output to 5.0 (0xae7308); 0xa2cc80 leaves it untouched when the table is unavailable.
 pub const DEFAULT_SPEED: f32 = 5.0;
 
 /// `apr_base.gda` speed columns DAOrigins.exe's locomotion reads (0xa6b4f6-0xa6b5ad,

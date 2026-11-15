@@ -287,8 +287,46 @@ pub fn item_category(sim: &Sim, item: u32) -> ItemCategory {
     }
 }
 
+/// What the interface keeps between frames to build its values faster (see
+/// [`sim_values_cached`]).
+#[derive(Default)]
+pub struct ValueCache {
+    derived: std::collections::HashMap<u32, Derived>,
+}
+
+/// A creature's derived properties (total and modifier by property) and the simulation time
+/// they were worked out at.
+struct Derived {
+    at_ms: u64,
+    rows: Vec<(i32, f32, f32)>,
+}
+
+/// How long a creature's derived properties are reused (simulation milliseconds): they come
+/// from its base properties, equipment and effects, which change a few times a minute, while
+/// working them out for every property of every party member each frame was the biggest cost
+/// of building the values (half of it). The current values (health and mana bars) are read
+/// fresh each frame.
+const DERIVED_MS: u64 = 250;
+
+/// [`sim_values_for`] reusing what [`ValueCache`] holds.
+pub fn sim_values_cached(
+    sim: &Sim,
+    shown: &Presentation,
+    cache: &mut ValueCache,
+) -> BTreeMap<String, UiValue> {
+    sim_values_with(sim, shown, Some(cache))
+}
+
 /// [`sim_values`] with the interface's own choices.
 pub fn sim_values_for(sim: &Sim, shown: &Presentation) -> BTreeMap<String, UiValue> {
+    sim_values_with(sim, shown, None)
+}
+
+fn sim_values_with(
+    sim: &Sim,
+    shown: &Presentation,
+    mut cache: Option<&mut ValueCache>,
+) -> BTreeMap<String, UiValue> {
     let mut v = BTreeMap::new();
     let mut set = |k: String, x: UiValue| {
         v.insert(k, x);
@@ -378,19 +416,58 @@ pub fn sim_values_for(sim: &Sim, shown: &Presentation) -> BTreeMap<String, UiVal
         ];
         // The character record shows each attribute as its base and what gear and effects
         // add (`Base`, `Modifier`); `Total` is both, as the game's PROPERTY_VALUE_TOTAL.
-        for (p, (base, cur)) in &o.properties {
-            let total = if depletable.contains(p) && *p != 0 {
-                sim.depletable_max(id, *p)
-            } else {
-                sim.property_total(id, *p)
-            };
-            v.insert(format!("{prefix}.Attributes.{p}.Current"), num(*cur));
-            v.insert(format!("{prefix}.Attributes.{p}.Total"), num(total));
-            v.insert(format!("{prefix}.Attributes.{p}.Base"), num(*base));
-            v.insert(
-                format!("{prefix}.Attributes.{p}.Modifier"),
-                num(sim.property_modifier(id, *p)),
-            );
+        // Properties the creature has no value of (resistances, mostly) read as their total
+        // of nothing: what derivation, gear and effects give. Provisional: the character
+        // record's rows are taken to be properties 1 to 60.
+        let want = o.properties.len() + (1..=60).filter(|p| !o.properties.contains_key(p)).count();
+        let now = sim.world.time_ms;
+        let fresh =
+            |d: &Derived| d.rows.len() == want && d.at_ms <= now && now - d.at_ms < DERIVED_MS;
+        let cached = cache
+            .as_deref()
+            .and_then(|c| c.derived.get(&id))
+            .filter(|d| fresh(d))
+            .map(|d| d.rows.clone());
+        let rows = cached.unwrap_or_else(|| {
+            let mut rows = Vec::with_capacity(want);
+            for p in o.properties.keys() {
+                let total = if depletable.contains(p) && *p != 0 {
+                    sim.depletable_max(id, *p)
+                } else {
+                    sim.property_total(id, *p)
+                };
+                rows.push((*p, total, sim.property_modifier(id, *p)));
+            }
+            for p in 1..=60 {
+                if !o.properties.contains_key(&p) {
+                    rows.push((p, sim.property_total(id, p), sim.property_modifier(id, p)));
+                }
+            }
+            if let Some(c) = cache.as_deref_mut() {
+                c.derived.insert(
+                    id,
+                    Derived {
+                        at_ms: now,
+                        rows: rows.clone(),
+                    },
+                );
+            }
+            rows
+        });
+        for (p, total, modifier) in rows {
+            match o.properties.get(&p) {
+                Some((base, cur)) => {
+                    v.insert(format!("{prefix}.Attributes.{p}.Current"), num(*cur));
+                    v.insert(format!("{prefix}.Attributes.{p}.Total"), num(total));
+                    v.insert(format!("{prefix}.Attributes.{p}.Base"), num(*base));
+                    v.insert(format!("{prefix}.Attributes.{p}.Modifier"), num(modifier));
+                }
+                None => {
+                    v.insert(format!("{prefix}.Attributes.{p}.Total"), num(total));
+                    v.insert(format!("{prefix}.Attributes.{p}.Base"), num(0));
+                    v.insert(format!("{prefix}.Attributes.{p}.Modifier"), num(modifier));
+                }
+            }
         }
         v.insert(
             format!("{prefix}.Stats.Race"),
@@ -399,23 +476,6 @@ pub fn sim_values_for(sim: &Sim, shown: &Presentation) -> BTreeMap<String, UiVal
         // The auto-level option is off (the player spends the points).
         v.insert(format!("{prefix}.Stats.AutoLevelUp"), num(0));
         v.insert(format!("{prefix}.InCombat"), num(o.combat.in_combat as u8));
-        // Properties the creature has no value of (resistances, mostly) read as their
-        // total of nothing: what derivation, gear and effects give. Provisional: the
-        // character record's rows are taken to be properties 1 to 60.
-        for p in 1..=60 {
-            if o.properties.contains_key(&p) {
-                continue;
-            }
-            v.insert(
-                format!("{prefix}.Attributes.{p}.Total"),
-                num(sim.property_total(id, p)),
-            );
-            v.insert(format!("{prefix}.Attributes.{p}.Base"), num(0));
-            v.insert(
-                format!("{prefix}.Attributes.{p}.Modifier"),
-                num(sim.property_modifier(id, p)),
-            );
-        }
     };
     for (i, id) in members.iter().enumerate() {
         creature(&format!("Party.Members.{i}"), *id);
