@@ -3038,6 +3038,18 @@ mod queue_tests {
         p.vm.display.get_mut(parent).unwrap().matrix = crate::swf::Matrix::translate(0.5, 0.5);
         let size = display_api::local_bounds(&p.vm, root).unwrap();
         assert_eq!((size.width(), size.height()), (837 * 20, 604 * 20));
+        // Inverse shears cancel before the leaf's box is transformed. An
+        // intermediate axis-aligned box would retain the shear's extra height.
+        p.vm.display.get_mut(parent).unwrap().matrix = crate::swf::Matrix {
+            b: 1.0,
+            ..crate::swf::Matrix::IDENTITY
+        };
+        p.vm.display.get_mut(child).unwrap().matrix = crate::swf::Matrix {
+            b: -1.0,
+            ..crate::swf::Matrix::IDENTITY
+        };
+        assert_eq!(p.vm.get(&value, "_width"), Value::Number(837.0));
+        assert_eq!(p.vm.get(&value, "_height"), Value::Number(604.0));
     }
 
     #[test]

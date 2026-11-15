@@ -6,7 +6,7 @@ use super::object::{DONT_ENUM, Kind as OKind, NativeFn};
 use super::value::{ObjId, Str, Value, number_to_string};
 use super::{HostValue, Vm};
 use crate::display::{DisplayId, Kind};
-use crate::swf::{BlendMode, Rect, TextAlign};
+use crate::swf::{BlendMode, Matrix, Rect, TextAlign};
 use crate::text::{AutoSize, FormatPatch};
 
 fn arg(args: &[Value], i: usize) -> Value {
@@ -40,6 +40,12 @@ pub fn display_value(vm: &mut Vm, d: DisplayId) -> Value {
 
 /// `d`'s bounds in its own space (twips), `None` when it has no content.
 pub fn local_bounds(vm: &Vm, d: DisplayId) -> Option<Rect> {
+    bounds_transformed(vm, d, Matrix::IDENTITY)
+}
+
+/// Compose the transform before measuring each leaf. Transforming an already
+/// rounded subtree box accumulates twip errors and widens nested rotations.
+fn bounds_transformed(vm: &Vm, d: DisplayId, matrix: Matrix) -> Option<Rect> {
     let o = vm.display.get(d)?;
     let mut acc: Option<Rect> = None;
     let mut add = |r: Rect| {
@@ -96,34 +102,38 @@ pub fn local_bounds(vm: &Vm, d: DisplayId) -> Option<Rect> {
             }
         }
     }
-    let children: Vec<DisplayId> = o.children.values().copied().collect();
-    for c in children {
-        if let Some(r) = local_bounds(vm, c) {
-            if let Some(co) = vm.display.get(c) {
-                add(co.matrix.transform_rect(&r));
-            }
-        }
+    let mut acc = acc.map(|bounds| matrix.transform_rect(&bounds));
+    for child in o.children.values() {
+        let Some(object) = vm.display.get(*child) else { continue };
+        let Some(bounds) = bounds_transformed(vm, *child, matrix.mul(&object.matrix)) else { continue };
+        acc = Some(match acc {
+            None => bounds,
+            Some(current) => Rect {
+                x_min: current.x_min.min(bounds.x_min),
+                x_max: current.x_max.max(bounds.x_max),
+                y_min: current.y_min.min(bounds.y_min),
+                y_max: current.y_max.max(bounds.y_max),
+            },
+        });
     }
     acc
 }
 
 fn bounds_in(vm: &Vm, d: DisplayId, space: Option<DisplayId>) -> Rect {
-    let Some(b) = local_bounds(vm, d) else {
-        let m = vm.display.world_matrix(d);
-        let (x, y) = m.apply(0.0, 0.0);
-        return Rect {
+    let world = vm.display.world_matrix(d);
+    let matrix = match space.map(|s| vm.display.world_matrix(s).invert()) {
+        Some(Some(inv)) => inv.mul(&world),
+        _ => world,
+    };
+    bounds_transformed(vm, d, matrix).unwrap_or_else(|| {
+        let (x, y) = world.apply(0.0, 0.0);
+        Rect {
             x_min: x as i32,
             x_max: x as i32,
             y_min: y as i32,
             y_max: y as i32,
-        };
-    };
-    let world = vm.display.world_matrix(d);
-    let m = match space.map(|s| vm.display.world_matrix(s).invert()) {
-        Some(Some(inv)) => inv.mul(&world),
-        _ => world,
-    };
-    m.transform_rect(&b)
+        }
+    })
 }
 
 fn clip_frames(vm: &Vm, d: DisplayId) -> Option<(u16, u16)> {
