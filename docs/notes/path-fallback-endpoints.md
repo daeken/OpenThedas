@@ -118,10 +118,14 @@ context (**0x73efae–0x73efb9**); the ordinary executor maps path failures 5/8 
 
 ## Implementation boundary
 
-OpenThedas still has a provisional grid A*. The merged height-guard PR
-[#915](https://github.com/daeken/OpenThedas/pull/915) rejects tall failed Origins
-routes; flatter failures and missing-grid movement retain a provisional direct fallback. It does not implement these endpoint repairs or the
-flat ground-segment query.
+OpenThedas still has a provisional grid A*. The landed follower
+[#917](https://github.com/daeken/OpenThedas/pull/917) adds direct-route checks,
+recursive midpoint shortcuts, 2 m resampling and the Origins body-yaw law. It does
+not supply the native 3×3 body clearance, corner relaxation or hierarchical search.
+The height guard [#915](https://github.com/daeken/OpenThedas/pull/915) rejects tall
+failed Origins routes; flatter failures and missing-grid movement retain a
+provisional direct fallback. Neither change implements these endpoint repairs or
+the flat ground-segment query.
 
 The flat segment mask 0x24 matches the simulator's sight mask. However, its ground-height
 helper **0x685430** also has a **0x2000000** query branch
