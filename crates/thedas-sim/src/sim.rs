@@ -72,6 +72,13 @@ pub struct EngineTypes {
 }
 
 pub struct Sim {
+    /// Character creation's face lists (`chargenmorphcfg.xml`) by (list, race and gender),
+    /// parsed once: the interface asks for them every frame.
+    face_lists: std::sync::Mutex<std::collections::HashMap<(String, String), Vec<String>>>,
+    /// Head presets (`.mop`) by name, parsed once (`None`: missing or unreadable).
+    morph_presets: std::sync::Mutex<
+        std::collections::HashMap<String, Option<Arc<thedas_formats::morph::MorphPreset>>>,
+    >,
     pub world: World,
     /// What loading the last save found of older builds' damage (see
     /// [`crate::save::SaveIssue`]).
@@ -392,16 +399,54 @@ pub const FORMATION: [[f32; 2]; 11] = [
     [3.5, -1.0],
 ];
 
+/// Arrival calls 0x7605b0 with flag 1 (0x6c75a2), selecting the compact table
+/// at 0xc0d2f0 rather than the ordinary follow formation.
+const ARRIVAL_FORMATION: [[f32; 2]; 11] = [
+    [-1.0, -0.5],
+    [1.0, -0.5],
+    [0.0, -1.0],
+    [-2.0, -1.0],
+    [2.0, -1.0],
+    [-3.0, -1.0],
+    [3.0, -1.0],
+    [-1.0, -2.0],
+    [1.0, -2.0],
+    [-3.0, -2.0],
+    [3.0, -2.0],
+];
+
 /// Where follower slot `k` (from 0) stands with a leader at `p` heading `facing` (DAOrigins.exe
 /// 0x760810 -> 0x7605b0 -> 0xa38a40): the [`FORMATION`] entry turned by the leader's heading.
 /// Provisional: slots past the table (the exe picks a random point within 4 m) take its last.
 pub fn behind(p: [f32; 3], facing: f32, k: usize) -> [f32; 3] {
+    formation_position(p, facing, FORMATION[k.min(FORMATION.len() - 1)])
+}
+
+fn formation_position(p: [f32; 3], facing: f32, [x, y]: [f32; 2]) -> [f32; 3] {
     let heading = crate::world::heading_of(facing).to_radians();
     let (fx, fy) = (heading.dcos(), heading.dsin());
     // The leader's right: forward turned a quarter turn clockwise.
     let (rx, ry) = (fy, -fx);
-    let [x, y] = FORMATION[k.min(FORMATION.len() - 1)];
     [p[0] + x * rx + y * fx, p[1] + x * ry + y * fy, p[2]]
+}
+
+/// A mover's body facing (degrees) after turning `dt` seconds toward `want`, as
+/// DAOrigins.exe's body-yaw update turns it (0xa63b20-0xa63cd9): for the shortest signed
+/// difference `e`, it turns `min(|e|, 180·dt/T)` degrees that way, where
+/// `T = 0.4 - 0.28·|e|/180` s is worked out afresh from what is left each tick (0.4 at
+/// 0xae7128, 0.28 at 0xb596e8, 180 at 0xaf7ed8). So about 450°/s near the way it goes, 692°/s
+/// a quarter turn off and 1,500°/s turned right round, the same walking or running; it
+/// snaps once a step would pass the way. Differences under 1e-6° are left (0xb596b8). Not
+/// ported: the follower's filter on the asked-for way before this (0xa63fd7-0xa64026, a
+/// blend toward the route's way of `1 - 0.9^ceil(d / 0.075)` for a step of `d` metres).
+pub(crate) fn turn_toward(facing: f32, want: f32, dt: f32) -> f32 {
+    let e = (want - facing + 180.0).rem_euclid(360.0) - 180.0;
+    if e.abs() <= 1e-6 || dt <= 0.0 {
+        return facing;
+    }
+    let t = 0.4 - 0.28 * e.abs() / 180.0;
+    let step = e.abs().min(180.0 * dt / t);
+    (facing + step.copysign(e)).rem_euclid(360.0)
 }
 
 /// The horizontal direction of the leg of the route from `from` through `points` that a
@@ -553,8 +598,8 @@ pub enum PartyPickerPolicy {
     Player,
 }
 
-/// Looks up an integer constant from the engine table (0 if absent).
-/// Movement speed (m/s) for a creature whose appearance gives none. Provisional.
+/// Movement-speed fallback (m/s): Origins 0xa63120 initializes the appearance lookup's
+/// output to 5.0 (0xae7308); 0xa2cc80 leaves it untouched when the table is unavailable.
 pub const DEFAULT_SPEED: f32 = 5.0;
 
 /// `apr_base.gda` speed columns DAOrigins.exe's locomotion reads (0xa6b4f6-0xa6b5ad,
@@ -589,6 +634,8 @@ impl Sim {
             })
             .collect();
         Sim {
+            face_lists: Default::default(),
+            morph_presets: Default::default(),
             world: World::new(tables, seed),
             vfs,
             table,
@@ -909,11 +956,48 @@ impl Sim {
         let Some(rg) = self.face_race_gender(id) else {
             return Vec::new();
         };
-        self.vfs
+        let key = (list.to_string(), rg);
+        if let Some(v) = self
+            .face_lists
+            .lock()
+            .ok()
+            .and_then(|m| m.get(&key).cloned())
+        {
+            return v;
+        }
+        let v = self
+            .vfs
             .read("chargenmorphcfg.xml")
             .ok()
-            .and_then(|(xml, _)| thedas_formats::morph::face_config_list(&xml, list, &rg).ok())
-            .unwrap_or_default()
+            .and_then(|(xml, _)| thedas_formats::morph::face_config_list(&xml, list, &key.1).ok())
+            .unwrap_or_default();
+        if let Ok(mut m) = self.face_lists.lock() {
+            m.insert(key, v.clone());
+        }
+        v
+    }
+
+    /// A head preset (`NAME.mop`), parsed once.
+    pub fn morph_preset(&self, name: &str) -> Option<Arc<thedas_formats::morph::MorphPreset>> {
+        let key = name.to_ascii_lowercase();
+        if let Some(p) = self
+            .morph_presets
+            .lock()
+            .ok()
+            .and_then(|m| m.get(&key).cloned())
+        {
+            return p;
+        }
+        let p = self
+            .vfs
+            .read(&format!("{name}.mop"))
+            .ok()
+            .and_then(|(d, _)| thedas_formats::morph::MorphPreset::parse(&d).ok())
+            .map(Arc::new);
+        if let Ok(mut m) = self.morph_presets.lock() {
+            m.insert(key, p.clone());
+        }
+        p
     }
 
     /// The face character creation's face screen starts on for a creature: the first head
@@ -1225,6 +1309,7 @@ impl Sim {
         self.advance_da2_projectiles();
         self.regenerate(elapsed);
         self.decay_corpses(elapsed);
+        self.kick_ambient_creatures(elapsed);
         self.advance_script_heartbeats(elapsed);
         self.update_threat(elapsed);
         self.expire_effects();
@@ -1837,19 +1922,7 @@ impl Sim {
         self.world.store = None;
         self.world.chanter_board = None;
         let old = self.world.area;
-        let party: Vec<ObjectId> = self
-            .world
-            .hero
-            .into_iter()
-            .chain(
-                self.world
-                    .hero
-                    .and_then(|h| self.world.get(h))
-                    .map(|h| h.followers.clone())
-                    .unwrap_or_default(),
-            )
-            .chain(self.party_pool())
-            .collect();
+        let party = self.arriving_party();
         // The party leaves the old area: its script hears each member go
         // (EVENT_TYPE_EXIT, creator and object 0 the member), before the area unloads.
         if let Some(old) = old {
@@ -1864,6 +1937,12 @@ impl Sim {
         // The old area unloads: its objects go inactive, remembering whether they were
         // active for when the party comes back.
         if let Some(old) = old {
+            // DAOrigins.exe 0x6c5e94 ends every ambient dialog at area unload, including
+            // those owned by party members who are about to travel with the player.
+            if self.game == thedas_vfs::Game::Origins {
+                self.clear_ambient(OBJECT_INVALID);
+                self.world.ambient_lines.clear();
+            }
             for o in self.world.objects.values_mut() {
                 if o.area == Some(old) && !party.contains(&o.id) || o.id == old {
                     o.parked = Some(o.active);
@@ -1876,20 +1955,10 @@ impl Sim {
             Ok(new) => {
                 self.place_party_on_map(area);
                 self.travel_arrived();
-                let at = self
-                    .world
-                    .hero
-                    .and_then(|h| self.world.get(h))
-                    .map(|h| (h.position, h.facing));
-                for (k, id) in party.iter().skip(1).enumerate() {
+                // `arrive` has already placed every member at a searched formation slot.
+                for id in party.iter().skip(1) {
                     self.following.remove(id);
-                    let before_area = self.world.get(*id).and_then(|o| o.area);
                     if let Some(o) = self.world.get_mut(*id) {
-                        o.area = Some(new);
-                        if let Some((p, facing)) = at {
-                            o.position = behind(p, facing, k);
-                            o.facing = facing;
-                        }
                         // What a member was doing in the old area ends with it: a move under
                         // way would otherwise carry on from where it began there, putting
                         // the member back at its old coordinates in the new area (Daveth
@@ -1902,7 +1971,6 @@ impl Sim {
                         ev.objects = vec![*id];
                         self.world.queue_event(0, new, ev, None);
                     }
-                    self.da2_encounter_area_changed(*id, before_area);
                 }
             }
             Err(e) => {
@@ -2213,6 +2281,7 @@ impl Sim {
         let routed = match self.route_and_approach(id, to) {
             (crate::nav::Routed::Path(p), _) => Some(p),
             (crate::nav::Routed::Straight, _) => None,
+            (crate::nav::Routed::InvalidPath, _) => return false,
             (crate::nav::Routed::Door(d), up_to) => {
                 door = Some(d);
                 if up_to.is_empty() {
@@ -2423,6 +2492,7 @@ impl Sim {
                 arrived: false,
                 da2_target_prepared: false,
                 path: Vec::new(),
+                turned_at: None,
             };
             // A follow move already under way goes on from where it has got to.
             if ours {
@@ -2451,14 +2521,10 @@ impl Sim {
         let (pos, area) = (o.position, o.area);
         let now: Vec<ObjectId> = self
             .world
-            .objects
-            .values()
-            .filter(|t| {
-                t.kind == ObjectKind::Trigger
-                    && t.active
-                    && t.area == area
-                    && crate::engine::in_trigger(pos, t)
-            })
+            .trigger_ids()
+            .iter()
+            .filter_map(|&t| self.world.get(t))
+            .filter(|t| t.active && t.area == area && crate::engine::in_trigger(pos, t))
             .map(|t| t.id)
             .collect();
         let before = self.world.in_triggers.get(&id).cloned().unwrap_or_default();
@@ -2499,8 +2565,9 @@ impl Sim {
     /// that is replaced before it finishes so starts the next one from there, as continuous
     /// movement does, crossing the triggers on the way.
     /// The route a mover takes from where it is to `to` in its area: the area's pathing
-    /// grid's route (see `nav::route`), as waypoints ending at `to`; empty (a straight line)
-    /// when there is no grid, either end is off it or no route exists.
+    /// grid's route (see `nav::route`), as waypoints ending at `to`. A failed Origins grid
+    /// route with more than 0.5 m of height difference fails; the other unknown routes
+    /// still use the provisional straight-line fallback.
     ///
     /// Closed doors block the way (see `Sim::closed_doors`): when the only route passes
     /// through one, the result is that door (the original fails such a move with
@@ -2613,6 +2680,14 @@ impl Sim {
             crate::nav::route_avoiding(&g, from, to, &locked)
         };
         let Some(p) = unlocked_route.or_else(|| crate::nav::route(&g, from, to)) else {
+            // Origins 0x73ea80 tries a collision-tested direct path after a failed search
+            // only when |start.z - goal.z| <= 0.5 (0x73ee88, constant 0xb1b7b4).
+            // Status 5/8 then stops locomotion and returns INVALID_PATH (-4) in
+            // 0x7a9130. Do not turn a failed tall route into a walk through the level.
+            // The flat fallback's collision test and DA2's path failures remain untraced.
+            if self.game == thedas_vfs::Game::Origins && (from[2] - to[2]).abs() > 0.5 {
+                return Routed::InvalidPath;
+            }
             return Routed::Straight;
         };
         if blocked.is_empty() {
@@ -2758,24 +2833,26 @@ impl Sim {
         let now = self.world.time_ms;
         // (mover, start, start time, due, the points after the start)
         type Move = (ObjectId, [f32; 3], u64, u64, Vec<[f32; 3]>);
-        let moving: Vec<Move> =
-            self.world
-                .objects
-                .values()
-                .filter_map(|o| {
-                    let c = o.commands.first()?;
-                    let (from, t0) = c.from?;
-                    let due = c.due?;
-                    let points = if c.path.is_empty() {
+        // Only creatures and placeables carry commands that move (see `World::actor_ids`).
+        let actors = self.world.actor_ids();
+        let moving: Vec<Move> = actors
+            .iter()
+            .filter_map(|&id| self.world.get(id))
+            .filter_map(|o| {
+                let c = o.commands.first()?;
+                let (from, t0) = c.from?;
+                let due = c.due?;
+                let points =
+                    if c.path.is_empty() {
                         vec![c.approach.or(c.location.map(|l| l.position)).or_else(|| {
                             c.target.and_then(|t| self.world.get(t)).map(|t| t.position)
                         })?]
                     } else {
                         c.path.clone()
                     };
-                    Some((o.id, from, t0, due, points))
-                })
-                .collect();
+                Some((o.id, from, t0, due, points))
+            })
+            .collect();
         for (id, from, t0, due, points) in moving {
             if due <= t0 {
                 continue;
@@ -2842,10 +2919,22 @@ impl Sim {
                 }
                 self.update_triggers(id);
             }
+            let da2 = self.game == thedas_vfs::Game::DragonAge2;
             if let Some(o) = self.world.get_mut(id) {
                 o.position = p;
                 if let Some((dx, dy)) = dir {
-                    o.facing = crate::world::facing_toward(dx, dy);
+                    let want = crate::world::facing_toward(dx, dy);
+                    // Dragon Age II's follower is not traced: it faces the way at once.
+                    if da2 {
+                        o.facing = want;
+                    } else {
+                        let since = o.commands.first().and_then(|c| c.turned_at).unwrap_or(t0);
+                        let dt = now.saturating_sub(since) as f32 / 1000.0;
+                        o.facing = turn_toward(o.facing, want, dt);
+                        if let Some(c) = o.commands.first_mut() {
+                            c.turned_at = Some(now);
+                        }
+                    }
                 }
             }
             if was != p {
@@ -3390,14 +3479,31 @@ impl Sim {
     /// The earliest-finishing front command, starting the clock on fronts that have none.
     fn next_command(&mut self) -> Option<(u64, ObjectId)> {
         let now = self.world.time_ms;
-        let fronts: Vec<(ObjectId, Command)> = self
+        // A command under way in Origins is only its due time: copying every front command
+        // each pass (path, strings) cost a lot in busy areas. Commands to start, and every
+        // DA2 command, are copied as before.
+        let da2 = self.game == thedas_vfs::Game::DragonAge2;
+        let fronts: Vec<(ObjectId, Option<u64>, Option<Command>)> = self
             .world
             .objects
             .values()
-            .filter_map(|o| o.commands.first().map(|c| (o.id, c.clone())))
+            .filter_map(|o| {
+                let c = o.commands.first()?;
+                Some(match c.due {
+                    Some(d) if !da2 => (o.id, Some(d), None),
+                    _ => (o.id, None, Some(c.clone())),
+                })
+            })
             .collect();
         let mut best: Option<(u64, ObjectId)> = None;
-        for (id, mut cmd) in fronts {
+        for (id, under_way, cmd) in fronts {
+            if let Some(due) = under_way {
+                if best.is_none_or(|(b, bid)| (due, id) < (b, bid)) {
+                    best = Some((due, id));
+                }
+                continue;
+            }
+            let Some(mut cmd) = cmd else { continue };
             let due = match cmd.due {
                 Some(d) => {
                     if self.game == thedas_vfs::Game::DragonAge2 {
@@ -3493,6 +3599,10 @@ impl Sim {
                                 match self.route_to(id, stop) {
                                     crate::nav::Routed::Path(p) => p,
                                     crate::nav::Routed::Straight => Vec::new(),
+                                    crate::nav::Routed::InvalidPath => {
+                                        self.fail_front_command(id, "COMMAND_FAILED_INVALID_PATH");
+                                        continue;
+                                    }
                                     crate::nav::Routed::Door(door) => {
                                         self.fail_blocked(id, door);
                                         continue;
@@ -3665,6 +3775,10 @@ impl Sim {
                             } {
                                 crate::nav::Routed::Path(p) => p,
                                 crate::nav::Routed::Straight => Vec::new(),
+                                crate::nav::Routed::InvalidPath => {
+                                    self.fail_front_command(id, "COMMAND_FAILED_INVALID_PATH");
+                                    continue;
+                                }
                                 crate::nav::Routed::Door(door) => {
                                     self.fail_blocked(id, door);
                                     continue;
@@ -3879,10 +3993,19 @@ impl Sim {
                     self.move_object(id, p, Some(a));
                 }
             }
+            // A walk that was under way ends facing as the walker's body faces: DAOrigins.exe's
+            // ordinary arrival stops and resets the route (0x6a9430 -> 0xa63ac0) and sets no
+            // facing, so the bearing the order was given with (the player's click, a held
+            // stick's aim) does not snap onto the body at the end. Jumps, placements and
+            // Dragon Age II's moves (its follower not traced) take the location's facing.
+            let keeps_facing =
+                walked && cmd.from.is_some() && self.game != thedas_vfs::Game::DragonAge2;
             if let Some(obj) = self.world.get_mut(id) {
                 obj.position = l.position;
                 obj.area = Some(l.area);
-                obj.facing = l.facing;
+                if !keeps_facing {
+                    obj.facing = l.facing;
+                }
             }
         }
         self.da2_encounter_area_changed(id, before_area);
@@ -4231,11 +4354,26 @@ impl Sim {
         Ok(area)
     }
 
-    /// The party arrives in an area: the hero stands at the waypoint (or the first one),
-    /// new objects get `SPAWN`, the area its load events and the hero's `ENTER`.
+    /// The travelling members, in party order, followed by inactive recruits. A recruit
+    /// already in the active party occurs only once, including for EXIT/ENTER delivery.
+    fn arriving_party(&self) -> Vec<ObjectId> {
+        let mut members = crate::engine::party_of(self);
+        for id in self.party_pool() {
+            if !members.contains(&id) {
+                members.push(id);
+            }
+        }
+        members
+    }
+
+    /// DAOrigins.exe 0x6c73c0: the controlled leader takes the transition target,
+    /// followers its compact formation slots (0x7605b0, flag 1). Each creature's point
+    /// passes through 0x73e370 with radius 20, check and ground snap on; a failed search
+    /// keeps the requested point. Save loading restores the world without calling this.
+    /// Provisional: the standable test is the grid approximation in `nav.rs`, formation
+    /// mirroring is not modelled, and slots past the table use its last entry.
     fn arrive(&mut self, area: ObjectId, waypoint: Option<&str>, spawned: Vec<ObjectId>) {
-        // Place the hero.
-        if let Some(hero) = self.world.hero {
+        if let Some(leader) = self.world.controlled() {
             let wp = self
                 .world
                 .objects
@@ -4243,14 +4381,41 @@ impl Sim {
                 .filter(|o| o.kind == ObjectKind::Waypoint && o.area == Some(area))
                 .find(|o| waypoint.is_none_or(|w| o.tag.eq_ignore_ascii_case(w)))
                 .map(|o| (o.position, o.facing));
-            let h = self.world.get_mut(hero).expect("hero exists");
-            let before_area = h.area;
-            h.area = Some(area);
-            if let Some((p, f)) = wp {
-                h.position = p;
-                h.facing = f;
+            let target = wp.or_else(|| self.world.get(leader).map(|o| (o.position, o.facing)));
+            let members = self.arriving_party();
+            let leader_index = members.iter().position(|&id| id == leader).unwrap_or(0);
+            for (i, id) in members.into_iter().enumerate() {
+                let before_area = self.world.get(id).and_then(|o| o.area);
+                if let Some((p, facing)) = target {
+                    // 0x631d90: member zero takes the controlled member's slot when
+                    // another party member leads; every other member keeps index - 1.
+                    let slot = if i == 0 { leader_index } else { i }.saturating_sub(1);
+                    let p = if id == leader {
+                        p
+                    } else {
+                        formation_position(
+                            p,
+                            facing,
+                            ARRIVAL_FORMATION[slot.min(ARRIVAL_FORMATION.len() - 1)],
+                        )
+                    };
+                    let how = crate::nav::SafeSearch {
+                        radius: 20.0,
+                        body_radius: self.capsule_radius(id),
+                        mover: Some(id),
+                        standable_keeps: true,
+                    };
+                    let position = self.safe_search(area, p, how).unwrap_or(p);
+                    if let Some(o) = self.world.get_mut(id) {
+                        o.position = position;
+                        o.facing = facing;
+                    }
+                }
+                if let Some(o) = self.world.get_mut(id) {
+                    o.area = Some(area);
+                }
+                self.da2_encounter_area_changed(id, before_area);
             }
-            self.da2_encounter_area_changed(hero, before_area);
         }
 
         // Load events (order provisional, see the module docs).
@@ -5175,6 +5340,28 @@ mod tests {
     }
 
     #[test]
+    fn a_movers_body_turns_at_the_exes_residual_rate() {
+        // DAOrigins.exe 0xa63b20: the first step of a turn at 33 ms.
+        // (Right round, either way is the short way.)
+        let off = |a: f32| (a + 180.0).rem_euclid(360.0) - 180.0;
+        for (e, step) in [(30.0, 16.81), (45.0, 18.0), (90.0, 22.85), (180.0, 49.5)] {
+            let got = off(turn_toward(0.0, e, 0.033));
+            assert!((got.abs() - step).abs() < 0.01, "{e}: {got} vs {step}");
+            if e < 180.0 {
+                assert!(got > 0.0, "{e}: {got}");
+                // The other way round too.
+                let back = off(turn_toward(0.0, -e, 0.033));
+                assert!((back + step).abs() < 0.01, "-{e}: {back}");
+            }
+        }
+        // Across north it takes the short way, and it snaps to the way once a step would
+        // pass it.
+        assert!((turn_toward(350.0, 10.0, 0.033) - 6.10).abs() < 0.01);
+        assert_eq!(turn_toward(100.0, 101.0, 0.1), 101.0);
+        assert_eq!(turn_toward(100.0, 180.0, 0.0), 100.0);
+    }
+
+    #[test]
     fn dragon_age_2_reference_functions_run_as_their_twins() {
         let ldf = "#define ENGINE_STRUCTURE_0 event\n\
             event Event(int nType) = 0;\n\
@@ -5477,6 +5664,7 @@ mod tests {
             arrived: false,
             da2_target_prepared: false,
             path: Vec::new(),
+            turned_at: None,
         });
         let t0 = s.world.time_ms;
         s.fail_front_command(c, "COMMAND_FAILED_PATH_ACTION_REQUIRED");
@@ -5811,6 +5999,117 @@ mod tests {
     }
 
     #[test]
+    fn arrival_searches_the_waypoint_and_compact_slots_before_enter_events() {
+        for leader_index in [0, 2] {
+            let mut s = sim();
+            let old = s.world.spawn(ObjectKind::Area, "old");
+            let area = s.world.spawn(ObjectKind::Area, "next");
+            s.world.get_mut(area).unwrap().template = "next".into();
+            s.world.area = Some(old);
+            s.area_layouts.insert(area, "open".into());
+            s.nav_grids.insert(
+                "open".into(),
+                Some(Arc::new(thedas_formats::level::NavGrid {
+                    columns: 40,
+                    rows: 40,
+                    cell_size: 0.5,
+                    clearance: 2.0,
+                    base: [0.0; 3],
+                    normal: [0.0, 0.0, 1.0],
+                    data: vec![1; 1600],
+                    heights: vec![16.0; 1600],
+                    surfaces: Vec::new(),
+                })),
+            );
+            let members: Vec<_> = (0..4)
+                .map(|i| {
+                    let id = s.world.spawn(ObjectKind::Creature, &format!("member{i}"));
+                    let o = s.world.get_mut(id).unwrap();
+                    o.area = Some(old);
+                    o.position = [-10.0, -10.0, 3.0];
+                    id
+                })
+                .collect();
+            s.world.hero = Some(members[0]);
+            s.world.controlled = Some(members[leader_index]);
+            s.world.get_mut(members[0]).unwrap().followers = members[1..].to_vec();
+            let waypoint = s.world.spawn(ObjectKind::Waypoint, "entry");
+            let w = s.world.get_mut(waypoint).unwrap();
+            w.area = Some(area);
+            w.position = [10.0, 10.0, 3.0];
+            w.facing = 270.0;
+            s.area_transition("next", "entry");
+            let offsets = [[-1.0, -0.5], [1.0, -0.5], [0.0, -1.0]];
+            for (i, &id) in members.iter().enumerate() {
+                let slot = if i == 0 { leader_index } else { i }.saturating_sub(1);
+                // Facing 270: forward +X, right -Y.
+                let [x, y] = if i == leader_index {
+                    [0.0; 2]
+                } else {
+                    offsets[slot]
+                };
+                let want = [10.0 + y, 10.0 - x];
+                let o = s.world.get(id).unwrap();
+                assert!((o.position[0] - want[0]).abs() < 1e-5);
+                assert!((o.position[1] - want[1]).abs() < 1e-5);
+                assert_eq!(o.position[2], 1.0, "member {i}: {:?}", o.position);
+                assert_eq!((o.area, o.facing), (Some(area), 270.0));
+            }
+            let entering: Vec<_> = s
+                .world
+                .queue
+                .values()
+                .filter(|q| q.target == area && q.event.objects.len() == 1)
+                .map(|q| q.event.objects[0])
+                .collect();
+            assert_eq!(entering, members);
+            // Loading a save must retain its exact positions, including an unsafe one.
+            s.world.get_mut(members[0]).unwrap().position = [40.0, 50.0, 6.0];
+            let saved = s.save_game();
+            s.load_game(saved).unwrap();
+            assert_eq!(s.world.get(members[0]).unwrap().position, [40.0, 50.0, 6.0]);
+        }
+    }
+
+    #[test]
+    fn arrival_keeps_blocked_points_and_searches_off_grid() {
+        let mut s = sim();
+        let area = s.world.spawn(ObjectKind::Area, "a");
+        let hero = s.world.spawn(ObjectKind::Creature, "hero");
+        s.world.hero = Some(hero);
+        let wp = s.world.spawn(ObjectKind::Waypoint, "entry");
+        s.world.get_mut(wp).unwrap().area = Some(area);
+        s.area_layouts.insert(area, "open".into());
+        let mut data = vec![1; 64];
+        data[18] = 9;
+        s.nav_grids.insert(
+            "open".into(),
+            Some(Arc::new(thedas_formats::level::NavGrid {
+                columns: 8,
+                rows: 8,
+                cell_size: 0.5,
+                clearance: 2.0,
+                base: [10.0, 10.0, 0.0],
+                normal: [0.0, 0.0, 1.0],
+                data,
+                heights: vec![16.0; 64],
+                surfaces: Vec::new(),
+            })),
+        );
+        for requested in [[11.25, 11.25, 3.0], [9.4, 12.0, 3.0], [-11.0, 12.0, 3.0]] {
+            s.world.get_mut(wp).unwrap().position = requested;
+            s.arrive(area, Some("entry"), Vec::new());
+            let p = s.world.get(hero).unwrap().position;
+            if requested[0] == 9.4 {
+                assert_eq!(p[2], 1.0);
+                assert!(p[0] >= 10.0);
+            } else {
+                assert_eq!(p, requested, "a non-success keeps the requested point");
+            }
+        }
+    }
+
+    #[test]
     fn the_party_leaves_and_enters_areas() {
         let mut s = sim();
         let hero = s.world.spawn(ObjectKind::Creature, "hero");
@@ -6000,6 +6299,7 @@ mod tests {
             arrived: false,
             da2_target_prepared: false,
             path: Vec::new(),
+            turned_at: None,
         });
         assert!(s.walk(hero, [10.0, 0.0, 0.0], None));
         let p = s.world.get(al).unwrap().position;
@@ -6094,6 +6394,7 @@ mod tests {
             arrived: false,
             da2_target_prepared: false,
             path: Vec::new(),
+            turned_at: None,
         };
         let o = s.world.get_mut(id).unwrap();
         o.commands.push(cmd("CommandPlayAnimation", 0.0));
@@ -6138,6 +6439,7 @@ mod tests {
             arrived: false,
             da2_target_prepared: false,
             path: Vec::new(),
+            turned_at: None,
         });
         s.tick(1);
         let o = s.world.get(id).unwrap();
@@ -6256,6 +6558,7 @@ mod tests {
             arrived: false,
             da2_target_prepared: false,
             path: Vec::new(),
+            turned_at: None,
         });
         s.tick(1);
         let o = s.world.get(id).unwrap();
@@ -6460,6 +6763,7 @@ mod tests {
                 arrived: false,
                 da2_target_prepared: false,
                 path: Vec::new(),
+                turned_at: None,
             });
         }
         s.tick(1);
@@ -6512,6 +6816,7 @@ mod tests {
             arrived: false,
             da2_target_prepared: false,
             path: Vec::new(),
+            turned_at: None,
         };
         s.world.get_mut(id).unwrap().commands.push(walk());
         // 5 m/s: two seconds in, ten metres along.
@@ -6658,6 +6963,7 @@ mod tests {
             arrived: false,
             da2_target_prepared: false,
             path: Vec::new(),
+            turned_at: None,
         };
         let blow = crate::world::Effect {
             ty: 1024,
@@ -6726,6 +7032,7 @@ mod tests {
             arrived: false,
             da2_target_prepared: false,
             path: Vec::new(),
+            turned_at: None,
         });
         // At 5 m/s: five metres after a second.
         s.tick(1000);
@@ -6778,6 +7085,7 @@ mod tests {
             arrived: false,
             da2_target_prepared: false,
             path: Vec::new(),
+            turned_at: None,
         };
         let walk = cmd(
             "CommandMoveToLocation",
@@ -7006,6 +7314,7 @@ mod tests {
                 arrived: false,
                 da2_target_prepared: false,
                 path: Vec::new(),
+                turned_at: None,
             });
             crowd.push(c);
         }
@@ -7034,6 +7343,7 @@ mod tests {
             arrived: false,
             da2_target_prepared: false,
             path: Vec::new(),
+            turned_at: None,
         });
         // It walks to just outside the crowd and waits; the ring is still full, so the
         // attack fails and its owner hears so.
@@ -7116,6 +7426,7 @@ mod tests {
             arrived: false,
             da2_target_prepared: false,
             path: Vec::new(),
+            turned_at: None,
         };
         // Away to 5 m from the target, on the line through the mover.
         let mut c = cmd("CommandMoveAwayFromObject");
@@ -7182,6 +7493,7 @@ mod tests {
             arrived: false,
             da2_target_prepared: false,
             path: Vec::new(),
+            turned_at: None,
         });
         let mut arrived = None;
         for k in 1..=400 {
@@ -7409,6 +7721,7 @@ mod tests {
             arrived: false,
             da2_target_prepared: false,
             path: Vec::new(),
+            turned_at: None,
         };
         assert_eq!(
             s.command_speed(human, &walk(0)),

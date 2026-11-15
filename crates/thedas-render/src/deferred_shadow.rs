@@ -1325,6 +1325,33 @@ mod tests {
 
     /// The lighting shader picks a face by the major axis of the direction from the light;
     /// that face's frustum must hold the point.
+    /// `deferred.wgsl`'s `face_basis` (forward, right, up per face) must agree with
+    /// [`faces`]: the bounce gather turns cube texels back into directions with it.
+    #[test]
+    fn the_bounce_face_basis_matches_the_cube_faces() {
+        let basis: [[Vec3; 3]; 6] = [
+            [Vec3::X, Vec3::NEG_Y, Vec3::Z],
+            [Vec3::NEG_X, Vec3::Y, Vec3::Z],
+            [Vec3::Y, Vec3::X, Vec3::Z],
+            [Vec3::NEG_Y, Vec3::NEG_X, Vec3::Z],
+            [Vec3::Z, Vec3::NEG_X, Vec3::Y],
+            [Vec3::NEG_Z, Vec3::X, Vec3::Y],
+        ];
+        let at = Vec3::new(1.0, 2.0, 3.0);
+        let f = faces(at, 8.0);
+        for (face, [forward, right, up]) in basis.iter().enumerate() {
+            for (x, y) in [(0.3, -0.4), (-0.7, 0.2), (0.0, 0.0)] {
+                let dir = (*forward + *right * x + *up * y).normalize();
+                let c = f[face] * (at + dir * 4.0).extend(1.0);
+                let ndc = c.truncate() / c.w;
+                assert!(
+                    (ndc.x - x).abs() < 1e-4 && (ndc.y - y).abs() < 1e-4,
+                    "face {face}: ({x}, {y}) projects to {ndc}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn each_direction_lands_in_its_major_axis_face() {
         let at = Vec3::new(3.0, -2.0, 1.0);

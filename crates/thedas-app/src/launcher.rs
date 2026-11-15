@@ -64,6 +64,10 @@ impl Launch {
                 };
             }
         }
+        // A hand-edited value the game would refuse (it exits on an unknown `--lighting`).
+        if !["baked", "hybrid", "realtime"].contains(&play.lighting.as_str()) {
+            play.lighting = "baked".into();
+        }
         Launch {
             install: install.root.clone(),
             args: play.args(),
@@ -1225,6 +1229,25 @@ impl Ui {
                 });
                 ui.end_row();
 
+                ui.label("Deferred lighting");
+                ui.horizontal(|ui| {
+                    ui.radio_value(&mut play.lighting, "baked".to_string(), "Baked")
+                        .on_hover_text("The lightmaps as the original uses them");
+                    ui.radio_value(
+                        &mut play.lighting,
+                        "hybrid".to_string(),
+                        "Real-time shadows",
+                    )
+                    .on_hover_text("Baked bounce light; every light's shadows real-time");
+                    ui.radio_value(
+                        &mut play.lighting,
+                        "realtime".to_string(),
+                        "Real-time (experimental)",
+                    )
+                    .on_hover_text("No lightmaps: light probes, SSAO and real-time shadows");
+                });
+                ui.end_row();
+
                 ui.label("Intro movies");
                 ui.checkbox(&mut play.intro, "Play the logos and intro before the menu");
                 ui.end_row();
@@ -2085,6 +2108,21 @@ mod tests {
         assert_eq!(l.install, PathBuf::from("/nowhere/dao"));
         assert!(l.args.iter().any(|a| a == "--no-intro"));
         assert_eq!(l.keys.as_deref(), Some(Path::new("/k/erfpasswords.txt")));
+        // A bad hand-edited lighting value falls back, a good one is kept.
+        cfg.play.lighting = "bogus".into();
+        assert!(
+            Launch::of(&cfg, &inst)
+                .args
+                .join(" ")
+                .contains("--lighting baked")
+        );
+        cfg.play.lighting = "hybrid".into();
+        assert!(
+            Launch::of(&cfg, &inst)
+                .args
+                .join(" ")
+                .contains("--lighting hybrid")
+        );
     }
 
     #[test]

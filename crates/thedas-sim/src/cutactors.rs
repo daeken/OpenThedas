@@ -65,6 +65,9 @@ pub struct Bound {
     /// The actor keeps to the walkmesh (see the module docs).
     #[serde(default)]
     pub snaps: bool,
+    /// DA2 named-stage release rules, saved with the prepared pose.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub da2_stage: bool,
 }
 
 /// What a conversation line's cutscene is played in.
@@ -87,6 +90,47 @@ pub struct LineCut {
     /// DA2 performance bindings, activated when this line is taken. Full DA2
     /// performance placement is separate from this world-state side effect.
     pub activate: Vec<String>,
+    /// DA2's own stage and end poses; separate from Origins' presentation tracks.
+    pub da2_stage: Option<Da2Stage>,
+}
+
+/// A DA2 line performance placed on a named area stage (CUT field 5024).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Da2Stage {
+    pub tag: String,
+    pub leave_at_end: bool,
+    pub tracks: Arc<Tracks>,
+}
+
+impl Da2Stage {
+    fn from_performance(g: &Gff4) -> Option<Self> {
+        let cut = crate::cutscene::cut_root(g)?;
+        let tag = g.field(cut, 5024)?.as_str()?.trim_end_matches('\0').trim();
+        // Relative placement has its own native context. Do not substitute the
+        // authoring-stage filename (5017) for that context or for an area tag.
+        if tag.is_empty() || matches!(tag, "[Owner Relative]" | "[Speaker Relative]") {
+            return None;
+        }
+        let mut tracks = Tracks::from_cut(g, cut);
+        for (actor, id) in tracks
+            .actors
+            .iter_mut()
+            .zip(crate::cutscene::structs(g, cut, 5200))
+        {
+            actor.snaps = g
+                .field(id, 5235)
+                .and_then(Value::as_i64)
+                .is_some_and(|n| n != 0);
+        }
+        Some(Self {
+            tag: tag.to_string(),
+            leave_at_end: g
+                .field(cut, 5028)
+                .and_then(Value::as_i64)
+                .is_none_or(|n| n != 0),
+            tracks: Arc::new(tracks),
+        })
+    }
 }
 
 const FIELD_LINES: u32 = 12002;
@@ -123,6 +167,7 @@ pub fn line_cuts(g: &Gff4) -> Vec<LineCut> {
                     .is_some_and(|v| v != 0),
                 tracks: cut.map(|c| Arc::new(Tracks::from_cut(g, c))),
                 activate: Vec::new(),
+                da2_stage: None,
             }
         })
         .collect()
@@ -176,12 +221,13 @@ impl Sim {
                     crate::cnv::line_performance_ids(&g)
                         .into_iter()
                         .map(|line| {
-                            let activate = line
-                                .and_then(|id| performances.get(&id))
+                            let performance = line.and_then(|id| performances.get(&id));
+                            let activate = performance
                                 .map(crate::cnv::performance_actor_tags)
                                 .unwrap_or_default();
                             LineCut {
                                 activate,
+                                da2_stage: performance.and_then(Da2Stage::from_performance),
                                 ..Default::default()
                             }
                         })
@@ -192,6 +238,46 @@ impl Sim {
         let cuts = Arc::new(cuts);
         self.line_cuts.insert(key, cuts.clone());
         cuts
+    }
+
+    /// Prepare the release poses when DA2 takes a named-stage performance
+    /// (0x5a36dc: take -> place -> 0x587db0). World positions stay put while it plays.
+    pub(crate) fn bind_da2_stage(
+        &mut self,
+        stage: &Da2Stage,
+        owner: ObjectId,
+        player: ObjectId,
+    ) -> Vec<Bound> {
+        let Some(placement) = self.conversation_placement(Some(&stage.tag), false, owner, player)
+        else {
+            return Vec::new();
+        };
+        let mut bound = self.bind_cutscene_actors(
+            &stage.tracks,
+            Some(LineContext {
+                owner,
+                player,
+                unstaged: false,
+                placement,
+            }),
+        );
+        for b in &mut bound {
+            // DA2 5028 controls all taken objects, including the player and props.
+            b.restore = !stage.leave_at_end;
+            b.da2_stage = true;
+            if stage.leave_at_end
+                && b.snaps
+                && let Some((at, _)) = &mut b.end
+                && let Some(z) = self
+                    .world
+                    .get(b.object)
+                    .and_then(|o| o.area)
+                    .and_then(|area| self.floor_at(area, *at))
+            {
+                at[2] = z;
+            }
+        }
+        bound
     }
 
     /// The object a cutscene actor names (see the module docs), in the current area.
@@ -272,11 +358,22 @@ impl Sim {
         };
         let owner = line.map(|l| l.owner);
         let mut out: Vec<Bound> = Vec::new();
+        let mut bindings = std::collections::HashMap::new();
         for (index, a) in tracks.actors.iter().enumerate() {
             let Some(name) = a.tag.as_deref() else {
                 continue;
             };
-            let Some(id) = self.cutscene_actor_object(name, owner, player) else {
+            let id = if self.game == thedas_vfs::Game::DragonAge2 {
+                // The native take path caches a binding name before claiming
+                // its object. A repeated FOLLOWER label must not consume another
+                // companion when a second resource actor uses that label.
+                *bindings
+                    .entry(name)
+                    .or_insert_with(|| self.bound_actor_object(name, owner, player, &out))
+            } else {
+                self.cutscene_actor_object(name, owner, player)
+            };
+            let Some(id) = id else {
                 continue;
             };
             if out.iter().any(|b| b.object == id) {
@@ -302,9 +399,37 @@ impl Sim {
                 end,
                 restore,
                 snaps: a.snaps,
+                da2_stage: false,
             });
         }
         out
+    }
+
+    /// DA2 0x59bd80 resolves FOLLOWER aliases against the active party and the
+    /// objects already claimed by this performance. The label's number is not
+    /// a party index: each plain alias takes the first unclaimed non-hero.
+    fn bound_actor_object(
+        &self,
+        name: &str,
+        owner: Option<ObjectId>,
+        player: Option<ObjectId>,
+        claimed: &[Bound],
+    ) -> Option<ObjectId> {
+        let name = name.trim();
+        if self.game == thedas_vfs::Game::DragonAge2
+            && name.starts_with("FOLLOWER")
+            && name.encode_utf16().count() >= 10
+        {
+            let mut party = crate::engine::party_of(self)
+                .into_iter()
+                .filter(|id| Some(*id) != self.world.hero);
+            return if let Some(tag) = name.strip_prefix("FOLLOWER:") {
+                party.find(|id| self.world.get(*id).is_some_and(|o| o.tag == tag))
+            } else {
+                party.find(|id| !claimed.iter().any(|b| b.object == *id))
+            };
+        }
+        self.cutscene_actor_object(name, owner, player)
     }
 
     /// A cutscene ends: the objects it took are put back or left at their end poses (see
@@ -315,16 +440,17 @@ impl Sim {
                 continue;
             };
             let (area, kind) = (o.area, o.kind);
+            let da2_stage = self.game == thedas_vfs::Game::DragonAge2 && b.da2_stage;
             let unmoved = o.position == b.position && o.facing == b.facing;
-            let (mut at, facing) = if b.restore || kind == ObjectKind::Placeable {
+            let (mut at, facing) = if b.restore || kind == ObjectKind::Placeable && !da2_stage {
                 (b.position, b.facing)
             } else {
                 match b.end {
-                    Some(end) if unmoved => end,
+                    Some(end) if unmoved || da2_stage => end,
                     _ => continue,
                 }
             };
-            if !b.restore && b.snaps {
+            if !b.restore && b.snaps && !da2_stage {
                 if let Some(z) = area.and_then(|a| self.floor_at(a, at)) {
                     at[2] = z;
                 }
@@ -390,6 +516,7 @@ mod tests {
                 end: None,
                 restore: false,
                 snaps: false,
+                da2_stage: false,
             }],
             placement: None,
         });
@@ -443,6 +570,227 @@ mod tests {
         s.world.get_mut(near).unwrap().facing = 90.0;
         s.world.hero = Some(hero);
         (s, hero, hunter, near)
+    }
+
+    #[test]
+    fn da2_stage_end_poses_are_prepared_once_and_survive_reload() {
+        for leave_at_end in [false, true] {
+            let (mut s, hero, hunter, _) = sim();
+            s.game = thedas_vfs::Game::DragonAge2;
+            let prop = s.world.spawn(ObjectKind::Placeable, "prop");
+            let area = s.world.area;
+            s.world.get_mut(prop).unwrap().area = area;
+            let stage = Da2Stage {
+                tag: "talk".into(),
+                leave_at_end,
+                tracks: Arc::new(Tracks {
+                    actors: vec![
+                        actor("hunter", [0.0, 2.0, 0.0], 0.0),
+                        actor("PLAYER", [1.0, 0.0, 0.0], 90.0),
+                        actor("prop", [2.0, 0.0, 0.0], 0.0),
+                        actor("hunter", [99.0; 3], 0.0),
+                        actor("missing", [99.0; 3], 0.0),
+                    ],
+                    ..Tracks::default()
+                }),
+            };
+            let bound = s.bind_da2_stage(&stage, hunter, hero);
+            assert_eq!(bound.len(), 3, "duplicate and missing bindings are ignored");
+            assert_eq!(
+                s.world.get(hero).unwrap().position,
+                [0.0; 3],
+                "taking does not teleport the world actor"
+            );
+            let before = bound
+                .iter()
+                .map(|b| (b.object, (b.position, b.facing)))
+                .collect::<Vec<_>>();
+            let expected = bound
+                .iter()
+                .map(|b| (b.object, b.end.unwrap()))
+                .collect::<Vec<_>>();
+            let saved = serde_json::to_string(&bound).unwrap();
+            let restored: Vec<Bound> = serde_json::from_str(&saved).unwrap();
+            assert_eq!(bound, restored);
+            // Release uses the prepared record even if something moves the actor
+            // or the hero crosses to a different nearest stage while it plays.
+            for b in &bound {
+                s.world.get_mut(b.object).unwrap().position = [900.0; 3];
+            }
+            s.release_cutscene_actors(restored);
+            for (id, (at, facing)) in if leave_at_end { expected } else { before } {
+                let o = s.world.get(id).unwrap();
+                assert_eq!(o.position, at);
+                assert_eq!(o.facing, facing);
+            }
+            if leave_at_end {
+                let p = s.world.get(hero).unwrap();
+                assert!((p.position[0] - 10.0).abs() < 1e-4 && (p.position[1] - 1.0).abs() < 1e-4);
+                assert!((p.facing - 180.0).abs() < 1e-3);
+                assert!(
+                    (s.world.get(prop).unwrap().position[1] - 2.0).abs() < 1e-4,
+                    "DA2 props use their end pose too"
+                );
+            }
+            let missing = Da2Stage {
+                tag: "absent".into(),
+                ..stage
+            };
+            assert!(s.bind_da2_stage(&missing, hunter, hero).is_empty());
+        }
+    }
+
+    #[test]
+    fn old_bound_records_keep_origins_release_rules() {
+        let (mut s, hero, hunter, _) = sim();
+        let tracks = Tracks {
+            actors: vec![actor("hunter", [2.0; 3], 0.0)],
+            ..Tracks::default()
+        };
+        let bound = s.bind_cutscene_actors(
+            &tracks,
+            Some(LineContext {
+                owner: hunter,
+                player: hero,
+                unstaged: false,
+                placement: Placement::NONE,
+            }),
+        );
+        let json = serde_json::to_string(&bound).unwrap();
+        assert!(!json.contains("da2_stage"));
+        let old: Vec<Bound> = serde_json::from_str(&json).unwrap();
+        assert!(!old[0].da2_stage);
+        s.world.get_mut(hunter).unwrap().position = [50.0; 3];
+        s.release_cutscene_actors(old);
+        assert_eq!(s.world.get(hunter).unwrap().position, [50.0; 3]);
+    }
+
+    #[test]
+    fn da2_stage_reads_the_runtime_tag_and_release_switch() {
+        use thedas_formats::gff4::{FieldDef, FourCC, List, StructData, StructTemplate, Version};
+        let template = |name: &[u8; 4], labels: &[u32]| StructTemplate {
+            label: FourCC::new(name),
+            size: 0,
+            fields: labels
+                .iter()
+                .map(|&label| FieldDef {
+                    label,
+                    type_code: 0,
+                    flags: 0,
+                    offset: 0,
+                })
+                .collect(),
+        };
+        let mut g = Gff4 {
+            version: Version::V40,
+            platform: FourCC::new(b"PC  "),
+            file_type: FourCC::new(b"LINE"),
+            file_version: FourCC::new(b"V1.0"),
+            templates: vec![
+                template(b"LINE", &[31100]),
+                template(b"CUT ", &[5017, 5024, 5028, 5200]),
+                template(b"ACTR", &[5216, 5221, 5222, 5235]),
+            ],
+            structs: vec![
+                StructData {
+                    template: 0,
+                    values: vec![Value::Struct(Some(StructId(1)))],
+                },
+                StructData {
+                    template: 1,
+                    values: vec![
+                        Value::String(Some("authoring.stg\0".into())),
+                        Value::String(Some("runtime_tag\0".into())),
+                        Value::U8(0),
+                        Value::List(Some(List::Struct(vec![Some(StructId(2))]))),
+                    ],
+                },
+                StructData {
+                    template: 2,
+                    values: vec![
+                        Value::String(Some("OWNER\0".into())),
+                        Value::Vec3([1.0, 2.0, 3.0]),
+                        Value::Quat([0.0, 0.0, 0.0, 1.0]),
+                        Value::U8(255),
+                    ],
+                },
+            ],
+            root: StructId(0),
+            shared_strings: None,
+        };
+        let stage = Da2Stage::from_performance(&g).unwrap();
+        assert_eq!(stage.tag, "runtime_tag");
+        assert!(!stage.leave_at_end);
+        assert_eq!(stage.tracks.stage_file.as_deref(), Some("authoring.stg"));
+        assert_eq!(stage.tracks.actors[0].end_position, [1.0, 2.0, 3.0]);
+        assert!(stage.tracks.actors[0].snaps);
+        g.structs[1].values[2] = Value::U8(255);
+        assert!(Da2Stage::from_performance(&g).unwrap().leave_at_end);
+        for unsupported in ["", "[Owner Relative]", "[Speaker Relative]"] {
+            g.structs[1].values[1] = Value::String(Some(unsupported.into()));
+            assert!(Da2Stage::from_performance(&g).is_none());
+        }
+    }
+
+    #[test]
+    fn a_da2_conversation_releases_its_stage_after_reload_and_on_advance() {
+        use crate::dialog::{Dlg, Node, PlotRef};
+        for game in [thedas_vfs::Game::Origins, thedas_vfs::Game::DragonAge2] {
+            let (mut s, hero, owner, _) = sim();
+            s.game = game;
+            let line = |text: &str, children: Vec<usize>| Node {
+                reply: false,
+                strref: None,
+                text: Some(text.into()),
+                speaker: "OWNER".into(),
+                listener: String::new(),
+                condition: PlotRef::default(),
+                action: PlotRef::default(),
+                children,
+                show_once: 0,
+                cnv_flags: Some(1),
+                ambient: false,
+                cutscene: None,
+            };
+            let mut reply = line("Continue.", vec![2]);
+            reply.reply = true;
+            let dlg = Dlg {
+                name: "named_stage".into(),
+                starts: vec![0],
+                nodes: vec![line("First.", vec![1]), reply, line("Last.", vec![])],
+            };
+            s.line_cuts.insert(
+                dlg.name.clone(),
+                Arc::new(vec![
+                    LineCut {
+                        da2_stage: Some(Da2Stage {
+                            tag: "talk".into(),
+                            leave_at_end: true,
+                            tracks: Arc::new(Tracks {
+                                actors: vec![actor("OWNER", [0.0, 2.0, 0.0], 0.0)],
+                                ..Tracks::default()
+                            }),
+                        }),
+                        ..LineCut::default()
+                    },
+                    LineCut::default(),
+                ]),
+            );
+            let before = s.world.get(owner).unwrap().position;
+            assert!(s.open_conversation(hero, owner, dlg, None));
+            assert_eq!(s.world.get(owner).unwrap().position, before);
+            let snapshot = serde_json::to_string(&s.snapshot()).unwrap();
+            s.restore(serde_json::from_str(&snapshot).unwrap());
+            s.choose_reply(0);
+            let at = s.world.get(owner).unwrap().position;
+            if game == thedas_vfs::Game::DragonAge2 {
+                assert!((at[0] - 8.0).abs() < 1e-4 && at[1].abs() < 1e-4);
+            } else {
+                assert_eq!(at, before);
+            }
+            s.end_conversation();
+            assert_eq!(s.world.get(owner).unwrap().position, at);
+        }
     }
 
     #[test]
@@ -530,5 +878,69 @@ mod tests {
             s.conversation_placement(Some("none"), false, hunter, hero)
                 .is_none()
         );
+    }
+    #[test]
+    fn da2_follower_aliases_take_unclaimed_active_party_members_in_order() {
+        for game in [thedas_vfs::Game::Origins, thedas_vfs::Game::DragonAge2] {
+            let (mut s, hero, first, _) = sim();
+            s.game = game;
+            let second = s.world.spawn(ObjectKind::Creature, "second");
+            let third = s.world.spawn(ObjectKind::Creature, "third");
+            let reserve = s.world.spawn(ObjectKind::Creature, "reserve");
+            let area = s.world.area;
+            for id in [second, third, reserve] {
+                s.world.get_mut(id).unwrap().area = area;
+            }
+            s.world.get_mut(hero).unwrap().followers = vec![first, second, third];
+            let tracks = Tracks {
+                actors: vec![
+                    actor("second", [0.0; 3], 0.0),
+                    actor("PLAYER", [0.0; 3], 0.0),
+                    actor("FOLLOWER 99", [1.0; 3], 0.0),
+                    actor("FOLLOWER 99", [9.0; 3], 0.0),
+                    actor("FOLLOWER 1", [2.0; 3], 0.0),
+                    actor("FOLLOWER 2", [3.0; 3], 0.0),
+                    actor("FOLLOWER:second", [4.0; 3], 0.0),
+                    actor("FOLLOWER:reserve", [5.0; 3], 0.0),
+                ],
+                ..Tracks::default()
+            };
+            let bound = s.bind_cutscene_actors(
+                &tracks,
+                Some(LineContext {
+                    owner: first,
+                    player: hero,
+                    unstaged: false,
+                    placement: Placement::NONE,
+                }),
+            );
+            let expected = if game == thedas_vfs::Game::DragonAge2 {
+                vec![second, hero, first, third]
+            } else {
+                vec![second, hero]
+            };
+            assert_eq!(bound.iter().map(|b| b.object).collect::<Vec<_>>(), expected);
+            if game == thedas_vfs::Game::DragonAge2 {
+                assert_eq!(bound[2].actor, 2);
+                assert_eq!(bound[3].actor, 4);
+                assert_eq!(bound[2].end.unwrap().0, [1.0; 3]);
+                assert_eq!(bound[3].end.unwrap().0, [2.0; 3]);
+            }
+            let explicit = Tracks {
+                actors: vec![actor("FOLLOWER:third", [0.0; 3], 0.0)],
+                ..Tracks::default()
+            };
+            let explicit_bound = s.bind_cutscene_actors(&explicit, None);
+            assert_eq!(
+                explicit_bound.iter().map(|b| b.object).collect::<Vec<_>>(),
+                if game == thedas_vfs::Game::DragonAge2 {
+                    vec![third]
+                } else {
+                    vec![]
+                }
+            );
+            s.world.get_mut(hero).unwrap().followers.clear();
+            assert!(s.bind_cutscene_actors(&explicit, None).is_empty());
+        }
     }
 }

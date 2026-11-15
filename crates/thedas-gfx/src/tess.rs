@@ -18,6 +18,9 @@ pub struct Vertex {
     pub uv: [f32; 2],
     /// Straight RGBA (solid fills; white otherwise).
     pub color: [u8; 4],
+    /// For edge anti-aliasing: the direction (object space, unit length) the shader pushes
+    /// this vertex out by about a pixel on screen; zero for ordinary vertices.
+    pub extrude: [f32; 2],
 }
 
 /// What a group of triangles is painted with.
@@ -271,6 +274,7 @@ fn tessellate_shape_with_rule(
             {
                 continue;
             }
+            let buf = fringe(&buf);
             push_fill(&mut solid, &mut out, style, &buf, size);
         }
     }
@@ -335,6 +339,7 @@ fn tessellate_shape_with_rule(
             continue;
         }
         let fill = style.fill.clone().unwrap_or(Fill::Solid(style.color));
+        let buf = fringe(&buf);
         push_fill(&mut solid, &mut out, &fill, &buf, size);
     }
     if !solid.indices.is_empty() {
@@ -347,18 +352,26 @@ fn push_fill(
     solid: &mut Mesh,
     out: &mut Vec<Mesh>,
     style: &Fill,
-    buf: &VertexBuffers<[f32; 2], u32>,
+    buf: &Fringed,
     size: &dyn Fn(u16) -> Option<(f32, f32)>,
 ) {
     match style {
         Fill::Solid(c) => {
             let base = solid.vertices.len() as u32;
             let color = [c.r, c.g, c.b, c.a];
-            solid.vertices.extend(buf.vertices.iter().map(|p| Vertex {
-                pos: *p,
-                uv: [0.0; 2],
-                color,
-            }));
+            solid
+                .vertices
+                .extend(buf.vertices.iter().map(|(p, e, outer)| Vertex {
+                    pos: *p,
+                    uv: [0.0; 2],
+                    color: [
+                        color[0],
+                        color[1],
+                        color[2],
+                        if *outer { 0 } else { color[3] },
+                    ],
+                    extrude: *e,
+                }));
             solid.indices.extend(buf.indices.iter().map(|i| i + base));
         }
         Fill::Bitmap {
@@ -378,13 +391,14 @@ fn push_fill(
                 vertices: buf
                     .vertices
                     .iter()
-                    .map(|p| {
+                    .map(|(p, e, outer)| {
                         // The bitmap matrix maps image pixels to shape space (twips).
                         let (u, v) = inv.apply(p[0], p[1]);
                         Vertex {
                             pos: *p,
                             uv: [u / w, v / h],
-                            color: [255; 4],
+                            color: [255, 255, 255, if *outer { 0 } else { 255 }],
+                            extrude: *e,
                         }
                     })
                     .collect(),
@@ -407,16 +421,130 @@ fn push_fill(
                 vertices: buf
                     .vertices
                     .iter()
-                    .map(|p| Vertex {
+                    .map(|(p, e, outer)| Vertex {
                         pos: *p,
                         uv: [0.0; 2],
-                        color: [255; 4],
+                        color: [255, 255, 255, if *outer { 0 } else { 255 }],
+                        extrude: *e,
                     })
                     .collect(),
                 indices: buf.indices.clone(),
             });
         }
     }
+}
+
+/// A tessellated fill with its anti-aliasing fringe: (position, extrusion, outer) per
+/// vertex.
+struct Fringed {
+    vertices: Vec<([f32; 2], [f32; 2], bool)>,
+    indices: Vec<u32>,
+    /// For each outer vertex (after the originals), the vertex it was copied from.
+    sources: Vec<u32>,
+}
+
+/// Adds Scaleform-style edge anti-aliasing to a tessellated fill: along every outline edge
+/// (an edge only one triangle uses) a strip whose outer side the vertex shader pushes out
+/// by about a pixel, fading to transparent. The strip has no area in object space, so the
+/// fill's shape (and a mask's rectangle) is unchanged.
+fn fringe(buf: &VertexBuffers<[f32; 2], u32>) -> Fringed {
+    fringe_of(&buf.vertices, &buf.indices)
+}
+
+fn fringe_of(positions: &[[f32; 2]], tris: &[u32]) -> Fringed {
+    let buf = VertexBuffers {
+        vertices: positions.to_vec(),
+        indices: tris.to_vec(),
+    };
+    let mut vertices: Vec<([f32; 2], [f32; 2], bool)> =
+        buf.vertices.iter().map(|p| (*p, [0.0; 2], false)).collect();
+    let mut indices = buf.indices.clone();
+    let mut sources = Vec::new();
+    // Edge -> (uses, the triangle's third vertex).
+    let mut edges: std::collections::HashMap<(u32, u32), (u32, u32)> =
+        std::collections::HashMap::new();
+    for t in buf.indices.chunks_exact(3) {
+        for (a, b, c) in [(t[0], t[1], t[2]), (t[1], t[2], t[0]), (t[2], t[0], t[1])] {
+            let key = (a.min(b), a.max(b));
+            let e = edges.entry(key).or_insert((0, c));
+            e.0 += 1;
+        }
+    }
+    let p = |i: u32| buf.vertices.get(i as usize).copied().unwrap_or_default();
+    // Outward normals of the outline edges, summed at their vertices.
+    let mut normals: std::collections::HashMap<u32, [f32; 2]> = std::collections::HashMap::new();
+    let mut outline: Vec<(u32, u32)> = Vec::new();
+    for (&(a, b), &(uses, third)) in &edges {
+        if uses != 1 {
+            continue;
+        }
+        let (pa, pb, pc) = (p(a), p(b), p(third));
+        let (dx, dy) = (pb[0] - pa[0], pb[1] - pa[1]);
+        let len = (dx * dx + dy * dy).sqrt();
+        if len < 1e-6 {
+            continue;
+        }
+        let mut n = [-dy / len, dx / len];
+        if n[0] * (pc[0] - pa[0]) + n[1] * (pc[1] - pa[1]) > 0.0 {
+            n = [-n[0], -n[1]];
+        }
+        for v in [a, b] {
+            let s = normals.entry(v).or_insert([0.0; 2]);
+            s[0] += n[0];
+            s[1] += n[1];
+        }
+        outline.push((a, b));
+    }
+    // One outer copy of each outline vertex, pushed along its averaged normal.
+    let mut outer: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+    let mut order: Vec<u32> = normals.keys().copied().collect();
+    order.sort_unstable();
+    for v in order {
+        let n = normals[&v];
+        let len = (n[0] * n[0] + n[1] * n[1]).sqrt();
+        let n = if len > 1e-6 {
+            [n[0] / len, n[1] / len]
+        } else {
+            [0.0; 2]
+        };
+        outer.insert(v, vertices.len() as u32);
+        vertices.push((p(v), n, true));
+        sources.push(v);
+    }
+    outline.sort_unstable();
+    for (a, b) in outline {
+        let (oa, ob) = (outer[&a], outer[&b]);
+        indices.extend([a, b, ob, a, ob, oa]);
+    }
+    Fringed {
+        vertices,
+        indices,
+        sources,
+    }
+}
+
+/// Adds the edge anti-aliasing fringe (see [`fringe`]) to a mesh built directly (text
+/// backgrounds, borders, underlines, carets): outer vertices copy their source's colour
+/// and texture coordinate, fully transparent.
+pub fn fringe_mesh(m: &mut Mesh) {
+    if m.indices.is_empty() {
+        return;
+    }
+    let positions: Vec<[f32; 2]> = m.vertices.iter().map(|v| v.pos).collect();
+    let f = fringe_of(&positions, &m.indices);
+    let base = m.vertices.len();
+    for (k, src) in f.sources.iter().enumerate() {
+        let Some(v) = m.vertices.get(*src as usize).copied() else {
+            continue;
+        };
+        let e = f.vertices[base + k].1;
+        m.vertices.push(Vertex {
+            color: [v.color[0], v.color[1], v.color[2], 0],
+            extrude: e,
+            ..v
+        });
+    }
+    m.indices = f.indices;
 }
 
 /// A glyph outline (one implicit fill) as triangles in EM units.
@@ -464,6 +592,7 @@ pub fn tessellate_polygon(points: &[(f32, f32)], color: [u8; 4]) -> Option<Mesh>
                 pos: *p,
                 uv: [0.0; 2],
                 color,
+                extrude: [0.0; 2],
             })
             .collect(),
         indices: buf.indices,
@@ -661,7 +790,22 @@ mod tests {
         ];
         let m = tessellate_shape(&[red], &[], &recs, &|_| None);
         assert_eq!(m.len(), 1);
-        assert_eq!(m[0].indices.len(), 6);
+        // Two triangles, then a fringe quad (two degenerate triangles) per outline edge.
+        assert_eq!(m[0].indices.len(), 6 + 4 * 6);
         assert_eq!(m[0].vertices[0].color, [255, 0, 0, 255]);
+        let outer: Vec<_> = m[0]
+            .vertices
+            .iter()
+            .filter(|v| v.extrude != [0.0; 2])
+            .collect();
+        assert_eq!(outer.len(), 4);
+        for v in outer {
+            assert_eq!(v.color[3], 0);
+            // Corners push out diagonally, away from the square.
+            let len = (v.extrude[0].powi(2) + v.extrude[1].powi(2)).sqrt();
+            assert!((len - 1.0).abs() < 1e-4);
+            let centre = [50.0 - v.pos[0], 50.0 - v.pos[1]];
+            assert!(v.extrude[0] * centre[0] + v.extrude[1] * centre[1] < 0.0);
+        }
     }
 }
