@@ -28,6 +28,8 @@ either null pointer, then selects the following rules:
   do not affect this identity. Two independently constructed valid effects
   with identical parameters still differ. The sim already preserves IDs
   through copies and setters; this change uses those IDs instead of handles.
+  Constructor `0xa652a0` first clears the ID, then assigns the counter only
+  for a nonzero effect type (`0xa65311`–`0xa65343`), leaving defaults at ID zero.
 - Command (type 2) calls `0x7420a0`, comparing its header and optional
   polymorphic payload; player (type 5) compares pointers. Command payload
   reconstruction and the unmodelled item-property/player values are outside
