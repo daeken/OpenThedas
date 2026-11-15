@@ -4,8 +4,8 @@ What is wrong or missing in OpenThedas compared with the original Dragon Age: Or
 detail as we can currently give. The [README](../README.md) says what works; this says what does
 not, so that people (and agents) can pick items up in parallel without stepping on each other.
 
-Last full pass: 2026-11-12, at main `f5ae46b`. Last refresh: 2026-11-13 16:45 UTC, at main
-`b48ed11`. The counts measured against a real install were added at `477f24e`. It is refreshed with the
+Last full pass: 2026-11-12, at main `f5ae46b`. Last refresh: 2026-11-15 07:55 UTC, at main
+`62e94ba` (the inventory counts below match the items in each area file). The counts measured against a real install were added at `477f24e`. It is refreshed with the
 README status.
 
 ## How to read it
@@ -35,13 +35,13 @@ so an untraced item starts with a trace, not with a guess.
 | Area | File | Inventory items |
 | --- | --- | --- |
 | Simulation and gameplay | [gaps/simulation.md](gaps/simulation.md) | 160 (`SIM-`), plus ability coverage by family |
-| Script VM and engine functions | [gaps/scripting.md](gaps/scripting.md) | 96 (`SCR-`), plus the measured lists of unimplemented functions, unraised events, idle commands and stored-only effects |
-| Rendering | [gaps/rendering.md](gaps/rendering.md) | 152 (`RND-`) |
+| Script VM and engine functions | [gaps/scripting.md](gaps/scripting.md) | 83 (`SCR-`), plus the measured lists of unimplemented functions, unraised events, idle commands and stored-only effects |
+| Rendering | [gaps/rendering.md](gaps/rendering.md) | 153 (`RND-`) |
 | Interface, input and controller | [gaps/ui.md](gaps/ui.md) | 180 (`UI-`), plus the movies never opened and the values no screen gets answered |
 | Audio | [gaps/audio.md](gaps/audio.md) | 55 (`AUD-`) |
-| Cameras, cutscene presentation, startup | [gaps/cameras-cutscenes.md](gaps/cameras-cutscenes.md) | 41 (`CAM-`) |
-| File formats and file system | [gaps/formats.md](gaps/formats.md) | 47 (`FMT-`), plus a table of every resource type and the tables and types nothing reads |
-| Tooling, platforms and project | [gaps/tooling.md](gaps/tooling.md) | 23 (`TOOL-`) |
+| Cameras, cutscene presentation, startup | [gaps/cameras-cutscenes.md](gaps/cameras-cutscenes.md) | 40 (`CAM-`) |
+| File formats and file system | [gaps/formats.md](gaps/formats.md) | 45 (`FMT-`), plus a table of every resource type and the tables and types nothing reads |
+| Tooling, platforms and project | [gaps/tooling.md](gaps/tooling.md) | 22 (`TOOL-`) |
 | What a player sees (QA) | [gaps/qa.md](gaps/qa.md) | open findings, accepted differences, content coverage |
 
 ## The big pieces

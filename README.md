@@ -23,7 +23,7 @@ on Windows, `~/.openthedas` elsewhere.
 
 ## Status
 
-Last updated 2026-11-14 00:30 UTC, main 55ed7d7
+Last updated 2026-11-15 07:55 UTC, main 62e94ba
 
 For everything that is wrong or missing, in detail and split into items that can be picked up in
 parallel, see [docs/KNOWN_GAPS.md](docs/KNOWN_GAPS.md).
@@ -35,6 +35,8 @@ Legend: ✅ done, 🟡 partial, ⬜ not started. QA notes come from QA runs 8–
 - 🟡 **Character creation**: full flow with the original's stage, blended camera presets and portrait.
   - Appearance menu: preset, hair, beard, the exe's per-race eye and nose shapes, makeup and complexion. Also colour sliders, difficulty and name.
   - Partial: the remaining face-shape sliders and hair-colour details.
+  - The Portrait sliders frame the portrait, and the camera reaches the face along the exe's traced blend (#689, #885). Dragging the hero turns it, and on the face preset tilts the camera, as the exe does; the turn no longer carries over into the inventory paperdoll (#889, #909).
+  - The face lists and head presets are cached, which took character creation from about 5 fps to full speed (#903).
   - QA flagged attribute arrows that never show a disabled state.
 - 🟡 **Conversations and cutscenes**:
   - Done:
@@ -48,7 +50,12 @@ Legend: ✅ done, 🟡 partial, ⬜ not started. QA notes come from QA runs 8–
     - speaker and listener turn head and eyes to each other, and cutscene actors follow their head-tracking tracks;
     - a cutscene animation's baked root motion moves the actor and stays after the clip (a character who turns stays turned), actors hold their base pose (seated characters sit), and cutscene props, actor visibility and weapon draws are played;
     - cutscene cameras shake as their shake tracks ask;
-    - line cutscene cameras are placed with their cutscene's stage, and ActionJumpToCamera puts the camera on stage cameras: the City Elf Vaughan scene plays as staged shots.
+    - line cutscene cameras are placed with their cutscene's stage, and ActionJumpToCamera puts the camera on stage cameras: the City Elf Vaughan scene plays as staged shots;
+    - lip sync: the speaker's face moves with the line's FaceFX animation, evaluated as the exe evaluates the face graph, on conversation lines, cutscene lines and lines said in passing, timed by the voice's playback clock (#693, #725, #729). The bone blend and the rig lookup are provisional (`AUD-052`, `CAM-013`), and narration mixed into a cutscene's sound is not animated;
+    - walk cycles in cutscenes keep looping while their position track moves the actor, so passers-by no longer slide with stiff legs (#690), and Beraht's walk-in in the Dwarf Commoner opening follows its baked path instead of turning sideways (#871);
+    - party members a cutscene does not cast are hidden while it plays, as the exe does (the hero no longer stands in the Dwarf Commoner brazier; #728, #731, confirmed by trace in #894);
+    - a conversation's voice waits for the loading screen to come down (#900), and a tutorial that starts during a conversation no longer pauses the game (#682);
+    - ambient conversations are cancelled when their area unloads, as the exe does, so one started at Flemeth's hut no longer opens its replies in Lothering (#897).
   - Open:
     - cameras and actors linked with LinkToActor are placed (provisional: links use the target's root frame);
     - a cutscene's last view is held only for the conversation line that queued it (provisional), which frames the City Elf opening as the original does and frees the next reply's shot;
@@ -66,6 +73,12 @@ Legend: ✅ done, 🟡 partial, ⬜ not started. QA notes come from QA runs 8–
   - The field of view narrows from 60° to 42.5° toward the far, tactical end of zoom, as the exe does. Page Up and Page Down zoom.
   - Creatures glance at the player's character while exploring.
   - Creatures placed by an area stand on its floor, as the exe projects them (this was the "see-through guard" in the Dust Town opening).
+  - Movement:
+    - routes are walked in straight legs instead of 45° grid steps, so the hero no longer swings back and forth while walking with the stick, keys or a click (#907). The exe's own path follower is not traced yet, so this is provisional;
+    - starts and stops blend as the exe's movement controller does (#908), turning starts and turns in place play the exe's turn clips (#914), and the running cycle walks, leans and paces by the traced rules (#916);
+    - walking into a closed door with the stick or keys opens it (#654); a walk to a creature ends against it or at its range (#727, #883); a failed route across a large height difference fails as in the exe instead of walking straight (#915).
+  - Placement uses the exe's safe-location search: `GetSafeLocation` (#694), jumps to objects and locations (#713, #874), `SetPosition` with its safe flag (#886), and party arrivals in a new area, where followers take the compact formation slots (#878). The search tests standable ground against the pathing grid, which is provisional.
+  - Ambient creatures are started by the engine as in the exe, so they sit, lean, work and walk; the Dwarf Commoner's mother now sits in her chair (#902).
 - 🟡 **Combat and simulation**:
   - NWScript VM with a large share of the engine functions; melee and ability timing; threat; AI-driven party; tactics; loot.
   - Containers hold their template's items and open on USE with the original loot panel (Take All, Close).
@@ -84,6 +97,8 @@ Legend: ✅ done, 🟡 partial, ⬜ not started. QA notes come from QA runs 8–
   - Visual effects applied at places (the Proving crowd) are exposed to rendering and drawn.
   - A finishing move lands the kill the rules stored for it, so bosses (whose death is always a finishing move) can die; before this the Dalish origin's bear could not be killed. Provisional: the blow lands when the command ends, not at the animation's hit event.
   - A walker turned aside by a body no longer walks back to the waypoint it stood on (this stalled the Tower's third floor).
+  - `DoAutoSave` writes the autosave slot (#680). Item restrictions run through `SetCanUseItem` and the restriction scripts, so class-only and companion-only gear is no longer usable by anyone (#697). Fatigue works through the scripts (#677), and worn items' stats are scaled by material (#685).
+  - Many single engine functions were traced and matched since the last update (health and death queries, type conversions, inventory queries, heartbeats, placeable health and destruction; the `SCR-` items in [gaps/scripting.md](docs/gaps/scripting.md) list what remains).
   - Not every script engine function is implemented.
 - 🟡 **Party, inventory, journal and other UI screens**:
   - Wired to the simulation: inventory (with paperdoll and item examine), character record, level-up, store, tactics, journal and codex, options, area map, HUD notifications and the screen tab bar.
@@ -98,6 +113,8 @@ Legend: ✅ done, 🟡 partial, ⬜ not started. QA notes come from QA runs 8–
   - The auto-pause and show-tutorials options reach the simulation.
   - Level Up shows the member's portrait. In combat each party portrait shows what that member is doing, and hovering a portrait shows the class.
   - Ability, talent and spell lists are built as the exe builds them. A new codex entry shows the large alert only at the plot priorities the exe uses.
+  - Store tabs filter both lists and buy-back lists what was traded (#655). Taking one item from a chest works, and Escape closes it (#662). The HUD's weapon set button and the / key switch weapon sets (#666).
+  - A tutorial hint's "View in Codex" button opens the journal on that entry (#899).
   - Open: screens have not all been audited against the original.
 - 🟡 **Rendering**:
   - Working: areas, terrain, sky, fog, clouds, bloom, colour grading, dynamic sun shadows (Low to High detail) and the original shaders.
@@ -108,12 +125,18 @@ Legend: ✅ done, 🟡 partial, ⬜ not started. QA notes come from QA runs 8–
   - Level terrain and static meshes take no ambient light nodes, as traced; this removed a green cast from daylight ground.
   - Each area is graded with its own colour curve and brightness, contrast, hue and saturation from the area table, as the exe does. Daylight areas now match the original's brightness and warmth (QA: alienage and Commons).
   - Looking down from high above the party cuts away ceilings marked for it in the models, with the exe's height threshold and 0.2 s fade.
+  - Anti-aliasing: multisampling as the original does it, chosen with the options menu's Anti-Aliasing slider, which lists the sample counts the device supports (#720, #734), with alpha-to-coverage for cut-outs (#736). An FXAA pass over the finished frame (#706) is also available. Sun shadow bounds are rounded to whole metres as the exe does, so shadows no longer slide as the camera moves (#904). The aiming reticle draws under the creatures (#701).
   - Only per-frame shader constants are rewritten per draw, and first-use work is done at the end of a load, which took about a fifth off frame time and removed the stutter after arriving in an area.
   - Open:
     - Trees, bushes and grass are real geometry from a clean-room SpeedTree generator written from our own spec (`docs/speedtree/`): trunks, branches, fronds, leaf cards and mesh leaves, with the game's distance rule for switching to billboards, batched per ground cell. Branches, fronds, leaf cards and mesh leaves draw with the game's own shaders, with its fades between distance levels (#427, #431, #432), and sway by the game's wind simulation fed from the level's wind file (#462, #463, #470). The far billboards are a stand-in that does not fade in, and which wind copy a tree takes is provisional (`RND-075`, `RND-076`).
     - Emitters in a cut-away model do not fade with it.
   - The backend stays on wgpu, and its types are kept inside `thedas-render`.
   - Every shader, the original's 610 and ours, is checked in tests against wgpu's translation for Direct3D 12, Vulkan and OpenGL. On a machine that offers only OpenGL (some virtual machines) the game runs there; an effect the backend refuses is logged once and left out. Untested on real OpenGL hardware.
+- 🟡 **Deferred renderer** (optional, ours; not parity work): a second way to draw the same scenes, chosen with `--renderer faithful|deferred`, the launcher's Renderer choice or **F11** in game. The faithful path stays the default and the reference. Design and status: [docs/deferred.md](docs/deferred.md).
+  - Level geometry, terrain, objects, characters, trees and most materials go into a shared G-buffer and are lit per pixel by every light in reach, with no three-light cap.
+  - Glowing particles (torches, braziers, spells) light the level (#724). Point lights cast shadows from up to sixteen lights (#739, #892), and the sun's cascades are shared with the faithful path (#742).
+  - `--lighting baked|hybrid|realtime` (or the launcher's Deferred lighting choice) picks how the baked lightmaps are used: baked (default), hybrid (baked bounce with real-time shadows), or real-time (experimental, probes and SSAO in place of lightmaps) (#755, #905). A real-time one-bounce pass adds bounce light from dynamic lights, and in real-time mode from static lights and the sun (#911, #918).
+  - Static1 materials keep their authored tint after deferred lighting (#890).
 - 🟡 **Audio**:
   - Merged:
     - playback: FMOD event (`.fev`) and bank (`.fsb`) playback, mixer, the exe's slider-to-dB volume mapping, event and sound-definition pitch, and per-play random pitch and volume, so repeated sounds vary;
@@ -122,19 +145,29 @@ Legend: ✅ done, 🟡 partial, ⬜ not started. QA notes come from QA runs 8–
     - movement: footsteps by walkmesh surface, foley and vegetation rustles, as traced;
     - effects: UI sounds, boot movie sound, script PlaySound, animation sound events (swings, armour foley) and bodyfalls; blows sound at the hit frame with the weapon's action;
     - voices: conversation and cutscene voice-over, sound-set and engine barks with the exe's sound-set player (counts, shuffle bag, gender), creature sound-set events, party picker lines, the chargen voice preview.
+  - Also merged: cutscene music cues (#686); occlusion that ignores what a sound stands on and never occludes voice-over (#659), with the listener at the leader's head (#672); animation sounds from the creature's body and head emitters (#700).
   - Also merged: the ducking of world sound in conversations, cutscenes, death and loads (#392), music volume triggers, area music carrying on across areas that share a theme, and placeables' animation sounds.
   - Not yet: voice-over positioning, and the master and secondary reverb chain. (The PlayMusic and StopMusic script calls do nothing in the original either, traced in #395.)
   - Sound is off with `--control` (unless `--audio`) and in headless captures.
-- 🟡 **Controller**: Xbox 360-style layout; menus and in-game screens use focus navigation, and A dismisses tutorial popups, then opens the screen a paused training lesson waits for (level-up, inventory, tactics). The PC right-click radial menu doesn't exist as a movie in the game data, so LT opens a quickbar picker instead. RT+A switches weapon sets (the / key; the HUD's swap button). In the inventory A equips and unequips and Y puts a usable item in the first free quickbar slot; on Tactics the pad reaches the Presets and Behaviour pickers; B in an open dropdown closes only the list.
+- 🟡 **Controller**: Xbox 360-style layout; menus and in-game screens use focus navigation, and A dismisses tutorial popups, then opens the screen a paused training lesson waits for (level-up, inventory, tactics). The PC right-click radial menu doesn't exist as a movie in the game data, so LT opens a quickbar picker instead. RT+A switches weapon sets (the / key; the HUD's swap button). In the inventory A equips and unequips and Y puts a usable item in the first free quickbar slot; on Tactics the pad reaches the Presets and Behaviour pickers; B in an open dropdown closes only the list. Every tutorial step, including the move-order and unpause steps, can be finished on the pad (#899). A chest opens with focus in its list (#662, #673), and the store's lists skip the scrollbar (#655).
 - ✅ **Saves**: F5/F9 quick save and load, save/load screens with a picture of the game for each save made in a window, typed names. Revision 7 fills older saves' empty containers.
 - 🟡 **Journal saves and resume**: while you play, the game keeps a checkpoint (an ordinary save) and a log of every input since it in the data folder's `journal/`, with a new checkpoint on each area change, after a load and every few game minutes. If a session ends unexpectedly (a crash, a killed process), the start menu offers to resume it, replaying the log so the game comes back as it was; `--resume` does the same from the command line. Only interactive play keeps a journal (not `--capture`, `--steps` or `--control` runs, unless `--journal`).
 - 🟡 **Keyboard and mouse**: W, S, Q and E walk the leader relative to the camera and A and D turn the camera, as the game's key map binds them; click to move, hover names, and name and health floaties shown as the original shows them (hovered, targeted, or with Tab held). Selection rings are drawn under party members and fighting enemies (when an enemy shows its ring is provisional).
-- ✅ **Performance**: frustum culling, shadow caching and skinned-draw culling (Lothering about 8 ms, the chapel about 1.5 ms offscreen). Model node trees are read with a heap stack, so small worker-thread stacks are safe.
+- ✅ **Performance**: frustum culling, shadow caching and skinned-draw culling (Lothering about 8 ms, the chapel about 1.5 ms offscreen). Model node trees are read with a heap stack, so small worker-thread stacks are safe. Creature posing is cached and threaded (#711), camera sweeps and perception lookups are cheaper (#714, #719), and the interface looks for what the mouse is over only when the mouse moved (#698, #717).
+- ✅ **Development aids**: the window title shows frame-rate figures once a second (frame rate, 1% low, 90th and 99th percentile and slowest frame times), and the log repeats them about every ten seconds, so hidden-window runs can be measured too (#681, #692). `THEDAS_UI_PROFILE=1` profiles each interface movie (#698, #903). The MCP server's `load` and `load_state` take `cutscenes: "play"` to keep cutscenes playing instead of skipping them, and `status` reports the policy (#737, #875).
 - 🟡 **DLC and add-ins**: encrypted DLC archives are read (passwords from a keys file the player supplies, recovered from the player's own GOG Ultimate Edition executable, or on other editions found once from each archive's own digest and kept in the player's data folder; nothing is shipped). Every enabled add-in's `core` folder is mounted, and its `module` folder only when it extends the base campaign, so stand-alone campaigns cannot replace base-game files. Add-ins are found from the original's `AddIns.xml` registry as well as from manifests, which brings in the promotional items' add-ins. The add-ins' area-list scripts run as in the original, so a new game hands out the first DLC item; DLC map pins and camp additions do not appear yet (`FMT-047`). Install paths are matched without regard to case, so the game runs from a case-sensitive file system.
 - 🟡 **Issue reports**: F8, both sticks clicked or the menu's Report Issue entry saves a report to the data folder and, in test builds, sends it to the project. You can mark spots on the screen first, each with its own note. Fixes come back as updates; see [Issue reports and updates](#issue-reports-and-updates).
-- 🟡 **Mods**: an ordered list of mod layers sits above the whole resource stack (later entries win; nothing is extracted over the game's files), `.dazip` packages in the list are unpacked into a cache and join as add-ins, and the original's folders in the player's Documents are read in the original's places. `.7z` archives are unpacked into the same cache. `THEDAS_MODS=none` turns all of it off; `thedas mods <install>` lists the layers. How to use it: [docs/mods.md](docs/mods.md).
+- 🟡 **Mods**: an ordered list of mod layers sits above the whole resource stack (later entries win; nothing is extracted over the game's files), `.dazip` packages in the list are unpacked into a cache and join as add-ins, and the original's folders in the player's Documents are read in the original's places. `.7z` archives are unpacked into the same cache. `.rar` archives are read too (#716). Resource order inside a folder and the loose data folders follow the exe (#723, #743), each add-in in a `.dazip` is mounted by its own manifest item with its type and version checks (#691, #756), the writable user folders are complete (#758), and `Offers/` is mounted as the original does (#710). `THEDAS_MODS=none` turns all of it off; `thedas mods <install>` lists the layers. How to use it: [docs/mods.md](docs/mods.md).
 - 🟡 **Mod mode**: tools over the running game, opened with F10 or the game menu's Mod Mode entry; the game keeps running under them. An inspector (Ctrl+click a creature or placeable) shows what it is and what it is animating; an animation scrubber holds, steps, slows and loops the picked creature's animation and can file a report for one frame; a conversation launcher starts any conversation out of order and shows and sets the plot flags its lines read; a world-state browser shows and edits variables and plot flags, with undo. Every change goes through the simulation's commands, so it is in the journal. An object can be exported to Blender as glTF (`.glb`, its textures as PNGs, and a manifest of where each part came from), and with "Live edits" on (or `--mod-workspace`) a texture PNG saved from that export becomes the game's texture in the data folder's `workspace/override/` straight away.
-- 🟡 **DA2**: early. Point `--install` at a Dragon Age II install and the game path runs the campaign's own start script into the Gallows. Levels draw with DA2's own shaders, normal maps and baked lightmaps, props take their per-vertex lighting, and the sky has its clouds (Lowtown, Hightown, the Gallows, the alienage). Characters are dressed, with their own heads, hair and beards from their head morphs, and Hawke plays his idle. DA2's own engine functions are being added. Not playable yet: no fog verified against the original, no shadows or water reflections, and most of the interface is missing.
+  - Blender round trip: meshes saved from Blender replace the game's (#661), an object moved there moves in the game (#667), meshes can be weighted to new bones (#671), painted textures and new materials come back (#678), and animations export as glTF clips (#699). Objects can be moved, spawned and removed through journaled commands (#664).
+  - For play-testers: play any animation of a creature, mark frames and report them together, and start any conversation from any line (#683).
+  - **Save edits as a mod** packs the live edits into a zip in the data folder's `mods-made/`, an ordinary mod that others can add to their mod list (#901).
+- 🟡 **Launcher**: starting the game with no install (or with `--launcher`) opens a launcher. On first run a setup wizard finds Dragon Age installs (Steam, GOG, EA, and inside Wine, CrossOver, Whisky, Heroic, Lutris and Bottles prefixes), asks for the DLC keys file, and then shows pages to pick a game, manage mods (with what each mod changes and which files conflict), set play options (including the renderer) and press Play (#657, #732). Its controls are exposed through AccessKit to screen readers and UI automation on Windows, macOS and Linux, and QA can script it by accessible name (#709, #872). Plan: [docs/launcher.md](docs/launcher.md).
+  - A Download page fetches the game's Windows files from Steam (Origins and DA2) or GOG (Origins) with the player's own account; credentials are never saved (#668). Provisional: no real sign-in or download has been tested yet, and GOG's signed-address step has not been seen working.
+- 🟡 **DA2**: early. Point `--install` at a Dragon Age II install and the game path runs the campaign's own start script into the Gallows. Levels draw with DA2's own shaders, normal maps and baked lightmaps, props take their per-vertex lighting, and the sky has its clouds (Lowtown, Hightown, the Gallows, the alienage). Characters are dressed, with their own heads, hair and beards from their head morphs, and Hawke plays his idle. Levels have dynamic sun shadows (#679), and the conversation camera frames faces with DA2's depth of field (#705).
+  - The prologue plays headless from a new game, through character creation, the ogre, Flemeth and on to the framing story (#660, #665, #696). On a fresh run the fight after the ogre still wipes the party; the cause is diagnosed as a missing AI input, not yet fixed (#869).
+  - From a saved Gallows checkpoint, Act 1 runs through Varric's lead, Darktown and Anders's clinic. The world map's night button selects the night map (#868), and Karl's Chantry confrontation activates its actors and places them by their performances (#877, #895, #898). Combat, stats, encounters, level-up, abilities, projectiles and conversation history landed on 2026-11-14. Details: [docs/handoff/streams/da2.md](docs/handoff/streams/da2.md).
+  - Not playable yet: no fog verified against the original, no water reflections, and most of the interface is missing.
 
 ### Known blockers
 
@@ -146,6 +179,7 @@ None open. The Proving armour chest was fixed by #253 and #254.
 - 🟡 **Dwarf Noble**: intro cutscene plays and the opening is explorable. Cutscene actors are not animated yet.
 - 🟡 **Dwarf Commoner**: intro cutscene cameras play and the camera starts inside the house. The path plays forward through the tavern and the Proving.
   - Oskias sits and the duel can be finished with the pad.
+  - The hero no longer stands in the brazier during the intro, Beraht's walk-in follows its path, the passers-by walk, and the mother sits in her chair (#690, #731, #871, #902).
 - 🟡 **City Elf**: explorable from inside the room. Cyrion waiting in the next room matches the data. Vaughan's scene plays as staged shots.
 - 🟡 **Dalish Elf**: intro cutscene plays and the journal lists the origin quest. After the opening talk the three hunters stay on their marks facing the hero.
 - 🟡 **Mage**: explorable.
@@ -174,7 +208,12 @@ Materials outside the Static1 family fall back to a hand-written stand-in unless
 `--shaders all`.
 
 The interface is the game's own Scaleform movies, played by our own `thedas-gfx` player on the
-renderer's wgpu device: the main menu, start menu and HUD movies load, render with their fonts
+renderer's wgpu device. Ruffle has been removed; `thedas-gfx` is the only player (#726, #818).
+It draws straight into the frame from cached draw lists, with merged draw calls, text from an
+anti-aliased glyph atlas and edge anti-aliasing instead of multisampling (#906, #910, #912,
+#919), and it renders the movies' glow and shadow filters, blend modes, dynamic masks and text
+selection (#738, #768, #771, #773).
+The main menu, start menu and HUD movies load, render with their fonts
 and atlas images, and talk to the engine through the same `fscommand`/`ExternalInterface`
 protocol the game used. The HUD and screens read engine values bound to the simulation.
 
