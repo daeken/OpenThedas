@@ -387,9 +387,10 @@ impl Sim {
         };
         let creatures: Vec<(ObjectId, [f32; 3])> = self
             .world
-            .objects
-            .values()
-            .filter(|o| o.kind == ObjectKind::Creature && o.area == Some(area))
+            .creature_ids()
+            .iter()
+            .filter_map(|&id| self.world.get(id))
+            .filter(|o| o.area == Some(area))
             .map(|o| (o.id, o.position))
             .collect();
         // What the pair test reads of each creature, looked up once a tick rather than once
@@ -684,9 +685,10 @@ impl Sim {
         let rates = [(health, regen(self, health)), (mana, regen(self, mana))];
         let living: Vec<ObjectId> = self
             .world
-            .objects
-            .values()
-            .filter(|o| o.kind == ObjectKind::Creature && !o.dead)
+            .creature_ids()
+            .iter()
+            .filter_map(|&id| self.world.get(id))
+            .filter(|o| !o.dead)
             .map(|o| o.id)
             .collect();
         for id in living {
