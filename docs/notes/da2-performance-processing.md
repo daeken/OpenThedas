@@ -182,6 +182,16 @@ type 9 as movement speed. The native effect executor remains to be audited.
 The animation-selection branch and the target-effect branch provide separate
 inputs for a future persistent-locomotion replay.
 
+The supplied fresh_02 chain gives a separate, earlier real-Blightlands control
+on main `b5f9b5d9` and candidate `b247acc9`. Both wipe on the team6 route before
+Aveline joins, using ordinary potions and zero new developer heals. Bethany and
+Carver each receive 100 regular one-second HEARTBEAT2 events on main and 115 on
+the candidate. Their completed Use Ability commands number 31/22 on main and
+36/17 on the candidate. Hawke completes 11 and 19 respectively. Both traces have
+zero script errors. This fresh replay also narrows global processing starvation
+while leaving individual ability and damage parity open. Its supplied source
+chain includes earlier healplayer use.
+
 Damage, health, chargen inputs and Karl combat are owned by the separate
 damage investigation. No balance adjustment or processing heuristic is
 introduced by this note.
