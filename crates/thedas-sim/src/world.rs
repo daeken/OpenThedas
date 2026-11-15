@@ -154,6 +154,10 @@ pub struct Object {
     /// creature +0xc8c).
     #[serde(default)]
     pub decay_forced: bool,
+    /// The ambient system's kick clock (milliseconds; the exe's creature +0xc84): runs
+    /// while the creature's ambient system is enabled (see [`crate::ambient`]). Saved.
+    #[serde(default, skip_serializing_if = "crate::ambient::is_zero")]
+    pub ambient_ms: f32,
     /// A head morph kept on the creature itself (`.mor` resource, no extension), as
     /// character creation leaves the player's face; others take theirs from their
     /// template's `Appearance Data`. Saved.
@@ -255,6 +259,7 @@ impl Object {
             died_at: None,
             decay_ms: 0,
             decay_forced: false,
+            ambient_ms: 0.0,
             head_morph: None,
             face_choices: BTreeMap::new(),
             immortal: false,
