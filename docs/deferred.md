@@ -272,7 +272,16 @@ debug views now include the ground. Terrain also joins the point-shadow caster l
   flames, embers, spell effects), in the level's, its objects' and the visual effects'
   renderers, gives the deferred pass a point light each frame at its particles' glow-
   weighted centre, its colour their hue and its strength rising with the light they show
-  (`deferred::emitter_light`, constants tuned by eye). Lights without a room reach every
+  (`deferred::emitter_light`, constants tuned by eye). Its colour also takes the
+  particle texture's tint (its alpha-weighted mean colour over a small mip, brightest channel
+  one; `deferred::texture_tint`), since some effects, lightning for one, carry their colour
+  in the texture rather than the particles. Two kinds give none: light-shaft and
+  lit-dust effects (`fxe_day_beam`, `fxe_day_sunshine`, `fxe_day_dust_shine`, matched by
+  name), which show light rather than give it, and any emitter within 1.5 m of a level static
+  light, a torch or brazier the level already lights with its own lamp, or within 3 m of a
+  visual effect's own light (effects carry authored lights their animations drive, #971). Before this, the
+  Cousland hall camera was 40% brighter than the faithful frame (mean 69.3 against 49.6; 41.2
+  after). `THEDAS_DEFERRED_EMITTER_LIGHTS=0` turns emitter lights off. Lights without a room reach every
   room; room boxes do not reliably identify the floor of a multi-storey area.
   `THEDAS_DEFERRED_LOG_LIGHTS=1` logs a frame's lights and shadow slots. Original idea
   below kept for what is left:

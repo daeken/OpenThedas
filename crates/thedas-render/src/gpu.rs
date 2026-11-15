@@ -152,6 +152,37 @@ impl GpuContext {
     }
 }
 
+/// An effect's light `since` seconds into its effect, its prop's model placed at `placed`:
+/// placed through its nodes as the effect's animations pose them, with the colour and
+/// radius they set (`<light>_color`, `<light>_radius`; else its own).
+fn effect_light(
+    l: &crate::scene::PropLight,
+    placed: glam::Mat4,
+    since: f32,
+) -> crate::scene::SceneLight {
+    let mut light = l.light.clone();
+    let rate = l.rate.as_ref();
+    let in_model = rate
+        .and_then(|r| r.in_model_at(since))
+        .unwrap_or(l.in_model);
+    if let crate::scene::SceneLight::Point {
+        position,
+        color,
+        radius,
+        ..
+    } = &mut light
+    {
+        *position = (placed * in_model).transform_point3(glam::Vec3::ZERO);
+        if let Some(c) = rate.and_then(|r| r.color_at(since)) {
+            *color = glam::Vec3::new(c[0], c[1], c[2]);
+        }
+        if let Some(r) = rate.and_then(|r| r.radius_at(since)) {
+            *radius = r;
+        }
+    }
+    light
+}
+
 pub(crate) struct GpuTexture {
     pub view: wgpu::TextureView,
     pub kind: DdsKind,
@@ -534,6 +565,14 @@ impl RenderCache {
     }
 }
 
+/// A transparent item of a frame (see [`AreaRenderer::transparent_order`]): a blended draw
+/// (by index into `blended`) or a particle draw.
+#[derive(Clone, Copy, Debug)]
+enum Transparent {
+    Draw(usize),
+    Particles(usize),
+}
+
 #[derive(Clone, Copy)]
 enum DrawRef {
     StandIn(usize),
@@ -583,6 +622,9 @@ pub struct AreaRenderer {
     /// address, the list held so that the address stays its own): skinning reads them
     /// every frame.
     rest_inverses: HashMap<usize, (Arc<Vec<glam::Mat4>>, Vec<glam::Mat4>)>,
+    /// Per prop, its visual effects' lights as they stand this frame (see
+    /// [`Self::effect_lights`]).
+    effect_lights: Vec<Vec<crate::scene::SceneLight>>,
     /// (scene draw index, draw) in drawing order.
     opaque: Vec<(usize, DrawRef)>,
     blended: Vec<(usize, DrawRef)>,
@@ -610,6 +652,10 @@ pub struct AreaRenderer {
     updated: bool,
     /// The scene's particle emitters, as [`AreaScene::emitters`] orders them.
     pub emitters: Vec<crate::particles::EmitterState>,
+    /// Each emitter's texture tint (its alpha-weighted mean colour, brightest channel 1),
+    /// which its light takes on top of its particles' colour (see
+    /// [`crate::deferred::emitter_light`]).
+    emitter_tints: Vec<glam::Vec3>,
     /// The clock when the props were first posed, which their effects' timelines run from
     /// ([`crate::scene::EffectTimeline`]).
     pub effects_epoch: Option<f64>,
@@ -1113,6 +1159,7 @@ impl AreaRenderer {
             d3d,
             posed_props: Vec::new(),
             rest_inverses: HashMap::new(),
+            effect_lights: Vec::new(),
             opaque,
             blended,
             only_draws: None,
@@ -1171,6 +1218,21 @@ impl AreaRenderer {
             light: StandInLight::default(),
             stats,
             cut_away: scene.cut_away.clone(),
+            emitter_tints: {
+                let mut tints: HashMap<usize, glam::Vec3> = HashMap::new();
+                scene
+                    .emitters
+                    .iter()
+                    .map(|e| {
+                        *tints.entry(e.material).or_insert_with(|| {
+                            scene
+                                .materials
+                                .get(e.material)
+                                .map_or(glam::Vec3::ONE, |m| crate::deferred::texture_tint(vfs, m))
+                        })
+                    })
+                    .collect()
+            },
             cut_away_emitters: scene
                 .emitters
                 .iter()
@@ -1218,11 +1280,20 @@ impl AreaRenderer {
     /// The lights its glowing particle emitters give the deferred path this frame (see
     /// [`crate::deferred::emitter_light`]); the faithful path has none of these.
     pub fn emitter_lights(&self) -> Vec<crate::scene::SceneLight> {
+        if !crate::config::CONFIG.emitter_lights {
+            return Vec::new();
+        }
         self.d3d
             .glowing_emitters()
             .into_iter()
-            .filter_map(|i| self.emitters.get(i))
-            .filter_map(crate::deferred::emitter_light)
+            .filter_map(|i| {
+                let tint = self
+                    .emitter_tints
+                    .get(i)
+                    .copied()
+                    .unwrap_or(glam::Vec3::ONE);
+                crate::deferred::emitter_light_tinted(self.emitters.get(i)?, tint)
+            })
             .collect()
     }
 
@@ -1586,14 +1657,113 @@ impl AreaRenderer {
                 })
                 .unwrap_or(glam::Mat4::IDENTITY);
             if let Some(state) = self.emitters.get_mut(e.emitter) {
-                state.world = transform * follow * e.in_model;
                 // Timed from the first posing, when the scene was built.
                 let epoch = *self.effects_epoch.get_or_insert(self.time);
-                state.rate = e
+                let since = (self.time - epoch) as f32;
+                let in_model = e
                     .rate
                     .as_ref()
-                    .and_then(|r| r.at((self.time - epoch) as f32));
+                    .and_then(|r| r.in_model_at(since))
+                    .unwrap_or(e.in_model);
+                state.world = transform * follow * in_model;
+                state.rate = e.rate.as_ref().and_then(|r| r.at(since));
+                state.color = e.rate.as_ref().and_then(|r| r.color_at(since));
+                let own = state.blueprint.age_scale_multiplier;
+                state.scale = e.rate.as_ref().and_then(|r| r.scale_at(since, own));
             }
+        }
+        // Its visual effects' lights, likewise.
+        let since = (self.time - *self.effects_epoch.get_or_insert(self.time)) as f32;
+        let lights: Vec<crate::scene::SceneLight> = p
+            .lights
+            .iter()
+            .map(|l| {
+                let follow = l
+                    .follows
+                    .and_then(|(s, n)| {
+                        let (rest, pose) = pose_of(s)?;
+                        Some(*pose.get(n)? * rest.get(n)?.inverse())
+                    })
+                    .unwrap_or(glam::Mat4::IDENTITY);
+                effect_light(l, transform * follow, since)
+            })
+            .collect();
+        if self.effect_lights.len() <= prop {
+            self.effect_lights.resize(prop + 1, Vec::new());
+        }
+        self.effect_lights[prop] = lights;
+    }
+
+    /// The lights of the props' visual effects as they stand this frame (each placed and
+    /// coloured as its effect's animations have it): what the other renderers of the
+    /// frame add to their lights (see [`Self::set_extra_lights`]).
+    pub fn effect_lights(&self) -> Vec<crate::scene::SceneLight> {
+        self.effect_lights.iter().flatten().cloned().collect()
+    }
+
+    /// Places the props' visual effects' lights `at` seconds into their timelines, from
+    /// where the props were placed, and lights this renderer's own draws with them (the
+    /// viewer's `--vfx`, where the effects share the level's renderer).
+    fn place_own_effect_lights(&mut self, scene: &AreaScene, at: f32) {
+        let lights: Vec<crate::scene::SceneLight> = scene
+            .props
+            .iter()
+            .flat_map(|p| {
+                p.lights
+                    .iter()
+                    .map(move |l| effect_light(l, p.transform, at))
+            })
+            .collect();
+        if !lights.is_empty() {
+            self.d3d.set_extra_lights(&lights);
+        }
+    }
+
+    /// Starts the props' visual effects where no animator poses the props (the viewer's
+    /// `--vfx`): every effect emitter at its timeline's rate `at` seconds in, placed as built.
+    pub fn start_prop_effects(&mut self, scene: &AreaScene, at: f32) {
+        self.effects_epoch.get_or_insert(self.time);
+        self.place_own_effect_lights(scene, at);
+        for p in &scene.props {
+            for e in &p.emitters {
+                if let Some(state) = self.emitters.get_mut(e.emitter) {
+                    state.rate = e.rate.as_ref().and_then(|r| r.at(at));
+                    if let Some(m) = e.rate.as_ref().and_then(|r| r.in_model_at(at)) {
+                        state.world = p.transform * m;
+                    }
+                    state.color = e.rate.as_ref().and_then(|r| r.color_at(at));
+                    let own = state.blueprint.age_scale_multiplier;
+                    state.scale = e.rate.as_ref().and_then(|r| r.scale_at(at, own));
+                }
+            }
+        }
+    }
+
+    /// Plays the props' visual effects for `seconds` where no animator poses the props (the
+    /// viewer's `--vfx` captures): in 30 steps a second, each effect emitter takes its
+    /// timeline's rate (impact, then the looping duration) before the clock advances.
+    pub fn play_prop_effects(&mut self, scene: &AreaScene, seconds: f64) {
+        let step: f64 = 1.0 / 30.0;
+        let start = self.time;
+        self.effects_epoch.get_or_insert(start);
+        let mut t = 0.0;
+        while t < seconds {
+            for p in &scene.props {
+                for e in &p.emitters {
+                    if let Some(state) = self.emitters.get_mut(e.emitter) {
+                        state.rate = e.rate.as_ref().and_then(|r| r.at(t as f32));
+                        if let Some(m) = e.rate.as_ref().and_then(|r| r.in_model_at(t as f32)) {
+                            state.world = p.transform * m;
+                        }
+                        state.color = e.rate.as_ref().and_then(|r| r.color_at(t as f32));
+                        let own = state.blueprint.age_scale_multiplier;
+                        state.scale = e.rate.as_ref().and_then(|r| r.scale_at(t as f32, own));
+                    }
+                }
+            }
+            self.place_own_effect_lights(scene, t as f32);
+            self.advance_time(step.min(seconds - t));
+            t += step;
         }
     }
 
@@ -2137,54 +2307,113 @@ impl AreaRenderer {
             |r: &DrawRef| matches!(*r, DrawRef::D3d(i) if self.d3d.is_faded(&self.d3d.draws[i]));
         let solid = self.opaque.iter().filter(|(_, r)| opaque && !faded(r));
         let faded_opaque = self.opaque.iter().filter(|(_, r)| transparent && faded(r));
-        let blended = self.blended.iter().filter(|_| transparent);
-        for (di, r) in solid.chain(faded_opaque).chain(blended) {
-            if self
-                .only_draws
-                .as_ref()
-                .is_some_and(|only| !only.contains(di))
-            {
+        for (di, r) in solid.chain(faded_opaque) {
+            self.draw_one(pass, *di, r, deferred);
+        }
+        if !transparent {
+            return;
+        }
+        // The blended draws and the particles (the emitters' render classes are
+        // transparent), in the submission queue's order.
+        for t in self.transparent_order() {
+            match t {
+                Transparent::Draw(k) => {
+                    let (di, r) = &self.blended[k];
+                    self.draw_one(pass, *di, r, deferred);
+                }
+                Transparent::Particles(k) if self.only_draws.is_none() => {
+                    self.d3d.draw_particle(pass, k);
+                }
+                Transparent::Particles(_) => {}
+            }
+        }
+    }
+
+    /// This frame's blended draws (by index into `blended`) and particle draws in the order
+    /// DAOrigins.exe's submission queue draws them: by [`TransparencyGroup`], and within a
+    /// sorted group farthest first from the camera (a particle draw by its emitter's
+    /// position). Ties keep the scene's order, which keeps a multi-pass draw's passes in
+    /// turn. Provisional: the queue sorts each renderer's draws apart from the others'
+    /// (the level's, the objects', the effects') only as far as this renderer goes.
+    fn transparent_order(&self) -> Vec<Transparent> {
+        use crate::d3d_gpu::TransparencyGroup;
+        let camera = self.d3d.camera_at();
+        let mut items: Vec<(TransparencyGroup, f32, Transparent)> = Vec::new();
+        for (k, (_, r)) in self.blended.iter().enumerate() {
+            let (group, distance) = match *r {
+                DrawRef::D3d(i) => {
+                    let g = self.d3d.transparency_group(i);
+                    let d = if g.sorted() {
+                        self.d3d.distance(i, camera)
+                    } else {
+                        0.0
+                    };
+                    (g, d)
+                }
+                DrawRef::StandIn(_) => (TransparencyGroup::Geometry, f32::MAX),
+            };
+            items.push((group, distance, Transparent::Draw(k)));
+        }
+        for (k, p) in self.d3d.particles.iter().enumerate() {
+            if !self.d3d.particle_drawn(k) {
                 continue;
             }
-            let d = match *r {
-                DrawRef::StandIn(i) => &self.stand_in[i],
-                DrawRef::D3d(i) => {
-                    if !self.d3d.in_view(i)
-                        || (deferred
-                            && !self.d3d.is_faded(&self.d3d.draws[i])
-                            && self.deferred.as_ref().is_some_and(|p| p.takes(i)))
-                    {
-                        continue;
-                    }
-                    let d = &self.d3d.draws[i];
-                    let mesh = &self.meshes[d.mesh];
-                    if (deferred || self.deferred_frame)
-                        && self
-                            .deferred
-                            .as_ref()
-                            .is_some_and(|p| p.draw_forward(pass, i, &self.d3d, mesh))
-                    {
-                        continue;
-                    }
-                    self.d3d.draw(pass, d, &mesh.indices, mesh.count);
-                    continue;
+            let at = self
+                .emitters
+                .get(p.emitter)
+                .map_or(camera, |e| e.world.w_axis.truncate());
+            items.push((
+                TransparencyGroup::Geometry,
+                at.distance(camera),
+                Transparent::Particles(k),
+            ));
+        }
+        items.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.total_cmp(&a.1)));
+        items.into_iter().map(|(_, _, t)| t).collect()
+    }
+
+    /// Draws one opaque or blended draw (see [`Self::draw_forward`]).
+    fn draw_one(&self, pass: &mut wgpu::RenderPass<'_>, di: usize, r: &DrawRef, deferred: bool) {
+        if self
+            .only_draws
+            .as_ref()
+            .is_some_and(|only| !only.contains(&di))
+        {
+            return;
+        }
+        let d = match *r {
+            DrawRef::StandIn(i) => &self.stand_in[i],
+            DrawRef::D3d(i) => {
+                if !self.d3d.in_view(i)
+                    || (deferred
+                        && !self.d3d.is_faded(&self.d3d.draws[i])
+                        && self.deferred.as_ref().is_some_and(|p| p.takes(i)))
+                {
+                    return;
                 }
-            };
-            let mesh = &self.meshes[d.mesh];
-            pass.set_bind_group(0, &self.frame_group, &[]);
-            pass.set_pipeline(&self.pipelines[d.pipeline].0);
-            pass.set_bind_group(1, &self.material_groups[d.material_group], &[]);
-            pass.set_bind_group(2, &self.lightmap_groups[d.lightmap_group], &[]);
-            pass.set_bind_group(3, &self.draw_group, &[d.uniform_offset]);
-            pass.set_vertex_buffer(0, mesh.vertices.slice(..));
-            pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
-            pass.draw_indexed(0..mesh.count, 0, 0..1);
-        }
-        // Particles last, over everything else (the emitters' render classes are
-        // transparent).
-        if transparent && self.only_draws.is_none() {
-            self.d3d.draw_particles(pass, false);
-        }
+                let d = &self.d3d.draws[i];
+                let mesh = &self.meshes[d.mesh];
+                if (deferred || self.deferred_frame)
+                    && self
+                        .deferred
+                        .as_ref()
+                        .is_some_and(|p| p.draw_forward(pass, i, &self.d3d, mesh))
+                {
+                    return;
+                }
+                self.d3d.draw(pass, d, &mesh.indices, mesh.count);
+                return;
+            }
+        };
+        let mesh = &self.meshes[d.mesh];
+        pass.set_bind_group(0, &self.frame_group, &[]);
+        pass.set_pipeline(&self.pipelines[d.pipeline].0);
+        pass.set_bind_group(1, &self.material_groups[d.material_group], &[]);
+        pass.set_bind_group(2, &self.lightmap_groups[d.lightmap_group], &[]);
+        pass.set_bind_group(3, &self.draw_group, &[d.uniform_offset]);
+        pass.set_vertex_buffer(0, mesh.vertices.slice(..));
+        pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
+        pass.draw_indexed(0..mesh.count, 0, 0..1);
     }
 
     /// Records the level's frame buffer effects over `target`, a frame this renderer (and
@@ -2591,6 +2820,65 @@ fn create_pipeline(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_effects_light_takes_its_animations_colour_and_radius() {
+        use crate::scene::{EffectRate, EffectTimeline, PropLight, SceneLight};
+        use glam::{Mat4, Vec3};
+        use thedas_formats::anim::{ColorTrack, ScalarTrack};
+        let glow = EffectRate {
+            length: 1.0,
+            birthrate: None,
+            range: None,
+            color: Some(ColorTrack {
+                target: "flame_c_color".into(),
+                keys: vec![(0.0, [0.0, 0.0, 0.0, 1.0]), (1.0, [1.6, 0.6, 0.2, 1.0])],
+            }),
+            scale_x: None,
+            scale_y: None,
+            nodes: Vec::new(),
+            radius: Some(ScalarTrack {
+                target: "flame_c_radius".into(),
+                keys: vec![(0.0, 3.0), (1.0, 5.0)],
+            }),
+        };
+        let light = PropLight {
+            light: SceneLight::Point {
+                position: Vec3::ZERO,
+                color: Vec3::ONE,
+                radius: 1.0,
+                name: "flame_c".into(),
+                domain: None,
+                is_static: false,
+                version: 0,
+                intensity: 1.0,
+                flicker: None,
+                room: None,
+            },
+            in_model: Mat4::from_translation(Vec3::new(0.0, 0.0, 1.0)),
+            follows: None,
+            rate: Some(EffectTimeline {
+                age: 0.0,
+                lasting: false,
+                impact: Some(glow),
+                duration: None,
+                chain: Vec::new(),
+                above: Mat4::IDENTITY,
+            }),
+        };
+        let placed = Mat4::from_translation(Vec3::new(10.0, 0.0, 0.0));
+        let SceneLight::Point {
+            position,
+            color,
+            radius,
+            ..
+        } = super::effect_light(&light, placed, 0.5)
+        else {
+            panic!()
+        };
+        assert_eq!(position, Vec3::new(10.0, 0.0, 1.0));
+        assert!(color.distance(Vec3::new(0.8, 0.3, 0.1)) < 1e-5);
+        assert_eq!(radius, 4.0);
+    }
 
     /// A level can be built on a worker thread (the load screen's) and handed back: the
     /// renderer moves between threads and the GPU context is shared.

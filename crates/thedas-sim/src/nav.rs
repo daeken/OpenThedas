@@ -982,7 +982,8 @@ impl Sim {
             return Vec::new();
         };
         let mut out = Vec::new();
-        for o in self.world.objects.values() {
+        let actors = self.world.actor_ids();
+        for o in actors.iter().filter_map(|&id| self.world.get(id)) {
             if o.kind != crate::world::ObjectKind::Placeable || o.area != Some(area) || !o.active {
                 continue;
             }
@@ -1067,7 +1068,8 @@ impl Sim {
         let tables = self.world.tables();
         let types = tables.get(0, "placeable_types")?;
         let mut placed: Vec<(thedas_script::vm::ObjectId, String, [f32; 3], f32)> = Vec::new();
-        for o in self.world.objects.values() {
+        let actors = self.world.actor_ids();
+        for o in actors.iter().filter_map(|&id| self.world.get(id)) {
             if o.kind != crate::world::ObjectKind::Placeable || o.area != Some(area) || !o.active {
                 continue;
             }
