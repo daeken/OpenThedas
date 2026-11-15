@@ -4,8 +4,8 @@ What is wrong or missing in OpenThedas compared with the original Dragon Age: Or
 detail as we can currently give. The [README](../README.md) says what works; this says what does
 not, so that people (and agents) can pick items up in parallel without stepping on each other.
 
-Last full pass: 2026-11-12, at main `f5ae46b`. Last refresh: 2026-11-15 07:55 UTC, at main
-`62e94ba` (the inventory counts below match the items in each area file). The counts measured against a real install were added at `477f24e`. It is refreshed with the
+Last full pass: 2026-11-12, at main `f5ae46b`. Last refresh: 2026-11-15 08:05 UTC, at main
+`7f91dda` (the inventory counts below match the items in each area file). The counts measured against a real install were added at `477f24e`. It is refreshed with the
 README status.
 
 ## How to read it
