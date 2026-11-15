@@ -6,7 +6,7 @@ use super::object::{DONT_ENUM, Kind as OKind, NativeFn};
 use super::value::{ObjId, Str, Value, number_to_string};
 use super::{HostValue, Vm};
 use crate::display::{DisplayId, Kind};
-use crate::swf::{BlendMode, Rect, TextAlign};
+use crate::swf::{BlendMode, Matrix, Rect, TextAlign};
 use crate::text::{AutoSize, FormatPatch};
 
 fn arg(args: &[Value], i: usize) -> Value {
@@ -40,6 +40,12 @@ pub fn display_value(vm: &mut Vm, d: DisplayId) -> Value {
 
 /// `d`'s bounds in its own space (twips), `None` when it has no content.
 pub fn local_bounds(vm: &Vm, d: DisplayId) -> Option<Rect> {
+    bounds_transformed(vm, d, Matrix::IDENTITY)
+}
+
+/// Compose the transform before measuring each leaf. Transforming an already
+/// rounded subtree box accumulates twip errors and widens nested rotations.
+fn bounds_transformed(vm: &Vm, d: DisplayId, matrix: Matrix) -> Option<Rect> {
     let o = vm.display.get(d)?;
     let mut acc: Option<Rect> = None;
     let mut add = |r: Rect| {
@@ -96,34 +102,42 @@ pub fn local_bounds(vm: &Vm, d: DisplayId) -> Option<Rect> {
             }
         }
     }
-    let children: Vec<DisplayId> = o.children.values().copied().collect();
-    for c in children {
-        if let Some(r) = local_bounds(vm, c) {
-            if let Some(co) = vm.display.get(c) {
-                add(co.matrix.transform_rect(&r));
-            }
-        }
+    let mut acc = acc.map(|bounds| matrix.transform_rect(&bounds));
+    for child in o.children.values() {
+        let Some(object) = vm.display.get(*child) else {
+            continue;
+        };
+        let Some(bounds) = bounds_transformed(vm, *child, matrix.mul(&object.matrix)) else {
+            continue;
+        };
+        acc = Some(match acc {
+            None => bounds,
+            Some(current) => Rect {
+                x_min: current.x_min.min(bounds.x_min),
+                x_max: current.x_max.max(bounds.x_max),
+                y_min: current.y_min.min(bounds.y_min),
+                y_max: current.y_max.max(bounds.y_max),
+            },
+        });
     }
     acc
 }
 
 fn bounds_in(vm: &Vm, d: DisplayId, space: Option<DisplayId>) -> Rect {
-    let Some(b) = local_bounds(vm, d) else {
-        let m = vm.display.world_matrix(d);
-        let (x, y) = m.apply(0.0, 0.0);
-        return Rect {
+    let world = vm.display.world_matrix(d);
+    let matrix = match space.map(|s| vm.display.world_matrix(s).invert()) {
+        Some(Some(inv)) => inv.mul(&world),
+        _ => world,
+    };
+    bounds_transformed(vm, d, matrix).unwrap_or_else(|| {
+        let (x, y) = world.apply(0.0, 0.0);
+        Rect {
             x_min: x as i32,
             x_max: x as i32,
             y_min: y as i32,
             y_max: y as i32,
-        };
-    };
-    let world = vm.display.world_matrix(d);
-    let m = match space.map(|s| vm.display.world_matrix(s).invert()) {
-        Some(Some(inv)) => inv.mul(&world),
-        _ => world,
-    };
-    m.transform_rect(&b)
+        }
+    })
 }
 
 fn clip_frames(vm: &Vm, d: DisplayId) -> Option<(u16, u16)> {
@@ -146,8 +160,20 @@ pub fn display_get(vm: &mut Vm, d: DisplayId, name: &str) -> Option<Value> {
     let is_text = matches!(o.kind, Kind::Text(_));
     let num = |n: f64| Some(Value::Number(n));
     match name {
-        "_x" => return num(o.matrix.tx as f64 / 20.0),
-        "_y" => return num(o.matrix.ty as f64 / 20.0),
+        "_x" => {
+            let offset = o
+                .text()
+                .map(|t| (t.bounds.0 as f64 * o.scale_rotation().0 * 20.0).trunc())
+                .unwrap_or(0.0);
+            return num((o.matrix.tx as f64 + offset) / 20.0);
+        }
+        "_y" => {
+            let offset = o
+                .text()
+                .map(|t| (t.bounds.1 as f64 * o.scale_rotation().1 * 20.0).trunc())
+                .unwrap_or(0.0);
+            return num((o.matrix.ty as f64 + offset) / 20.0);
+        }
         "_xscale" => return num(o.scale_rotation().0 * 100.0),
         "_yscale" => return num(o.scale_rotation().1 * 100.0),
         "_rotation" => return num(o.scale_rotation().2),
@@ -267,7 +293,20 @@ pub fn display_set(vm: &mut Vm, d: DisplayId, name: &str, v: &Value) -> bool {
         "_x" | "_y" => {
             let x = n(vm);
             if let (true, Some(o)) = (x.is_finite(), vm.display.get_mut(d)) {
-                let t = (x * 20.0).trunc() as f32;
+                // TextField positions include the scaled field bounds. Authored
+                // fields can have a negative origin inside their placement matrix.
+                let offset = o
+                    .text()
+                    .map(|t| {
+                        let (sx, sy, _) = o.scale_rotation();
+                        if name == "_x" {
+                            t.bounds.0 as f64 * sx
+                        } else {
+                            t.bounds.1 as f64 * sy
+                        }
+                    })
+                    .unwrap_or(0.0);
+                let t = ((x * 20.0).trunc() - (offset * 20.0).trunc()) as f32;
                 if name == "_x" {
                     o.matrix.tx = t;
                 } else {
@@ -461,9 +500,26 @@ pub fn display_set(vm: &mut Vm, d: DisplayId, name: &str, v: &Value) -> bool {
 /// Resizes an auto-sized field's box to its text.
 pub fn apply_autosize(vm: &mut Vm, d: DisplayId) {
     let fonts = vm.fonts.clone();
+    let movie = vm.movie.clone();
+    let host = &mut vm.host;
     let Some(t) = vm.display.get_mut(d).and_then(|o| o.text_mut()) else {
         return;
     };
+    t.resolve_images(|src| {
+        if let Some(image) = movie.image(src) {
+            return Some(crate::text::ImageResource {
+                url: image.file.clone(),
+                width: image.width as f32,
+                height: image.height as f32,
+            });
+        }
+        host.image_size(src)
+            .map(|(w, h)| crate::text::ImageResource {
+                url: src.to_string(),
+                width: w as f32,
+                height: h as f32,
+            })
+    });
     if t.auto_size == AutoSize::None {
         return;
     }
@@ -749,10 +805,7 @@ fn mc_unload_movie(vm: &mut Vm, this: Value, _: &[Value]) -> Value {
 
 fn bitmap_load(vm: &mut Vm, this: Value, args: &[Value]) -> Value {
     let name = vm.to_str(&arg(args, 0));
-    let image = vm.movie.exports.get(&name.to_ascii_lowercase())
-        .and_then(|id| vm.movie.characters.get(id))
-        .or_else(|| vm.movie.characters.values().find(|c| matches!(c, crate::swf::Character::Image(i) if i.export_name.eq_ignore_ascii_case(&name))));
-    let Some(crate::swf::Character::Image(image)) = image else {
+    let Some(image) = vm.movie.image(&name) else {
         return Value::Null;
     };
     let (url, width, height) = (image.file.clone(), image.width, image.height);

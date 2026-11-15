@@ -57,7 +57,7 @@ How the list was built:
 | Item | Original | Ours | Evidence | Size | Depends on |
 |---|---|---|---|---|---|
 | Tooltip box height | Scale9 tooltip box sized to text. | Historical player issue; recheck native scale9 tooltip layout. | handoff-ui.md Tooltips | M | Own-player capture verification |
-| Store coin images | Inline coin images in prices (`<img align='baseline'>`). | Host inline-image layout places coins; native inline layout remains incomplete. | Parked | M | Native inline-image layout |
+| Store coin images | Inline coin images in prices (`<img align='baseline'>`). | Native baseline image layout is implemented. Price fields retain host placement pending equivalence checks. | Verify helper equivalence | M | Original-game price captures |
 | Inventory | Equipment/backpack fully works by mouse. | `Equipment.N.StackSize`, `CanChangeEquipment`, `CanSwitchWeaponSets` and `Party.BackpackSort` are unanswered. Backpack items' `AbilityInstance` (usable items) too. | Unanswered list | S | — |
 | Journal | Quest givers and destinations on the map (`Journal.PlotGivers`, `PlotDestinations`), offers (`PlotList.N.OfferId`), remembers the last codex entry. | Unanswered. `undefined.QuestCompleted` is a path bug on our side. | Unanswered list | S–M | Sim plot data |
 | Journal text for Dwarf/City Elf openings | — | Empty because the sim has no flag text yet. Correct as far as it goes. | Earlier QA | — | Sim |
@@ -222,7 +222,7 @@ voice previews, `LoadModule`, `QuitGame`. Anything else is logged once as not ha
 - **UI-046** **Device-font text switched to outlines.** Original: Scaleform draws device-font fields with its font library (comment). Ours: `UseOutlines` is set on such fields. Evidence: `crates/thedas-formats/src/gfx.rs:395`. Size: S. Depends: none. Kind: provisional.
 - **UI-047** **Scaling-grid rule below corner size not traced.** Original: not traced. Ours: Flash's rule for a sprite scaled smaller than its corners is guessed. Evidence: `crates/thedas-formats/src/gfx/scale9.rs:14`. Size: S. Depends: none. Kind: provisional.
 - **UI-048** **Atlas cropping inferred.** Original: not traced. Ours: `OffsetAndScale` and `OriginalImageSize` are read from the shipped atlas files. Evidence: `crates/thedas-ui/src/atlas.rs:6`. Size: S. Depends: none. Kind: provisional.
-- **UI-049** **Inline images in text laid out by the host.** Original: not traced. Ours: `<img>` is replaced by spaces and the image placed centred on its line; `align`, `vspace`, `hspace` and lines the field wraps itself are not followed, and a 1-2 pixel gutter is guessed. Evidence: `crates/thedas-ui/src/lib.rs:796`, `crates/thedas-ui/src/lib.rs:894`. Size: M. Depends: none. Kind: provisional.
+- **UI-049** **Inline-image host-helper equivalence.** Original: not traced. Ours: native `<img>` layout resolves bitmap sizes, baseline offsets, horizontal spacing, alignment and wrapped/scrolled lines. Existing movie text still passes through the host helper, which substitutes spaces and centres images with approximate gutters. Verify equivalence against the original before replacing that helper. Evidence: `crates/thedas-gfx/src/text.rs`, `crates/thedas-ui/src/lib.rs` (`layout_inline_images`). Size: M. Depends: none. Kind: provisional.
 
 ### Front end and options
 

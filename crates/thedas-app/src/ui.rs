@@ -1722,10 +1722,9 @@ impl UiLayer {
     /// Cancels an unanswered engine question, including one waiting behind a script's
     /// dialog. It must not appear later after its caller has given up or finished.
     pub fn cancel_text_popup(&mut self, id: u32) {
-        if !self.text_popup.as_ref().is_some_and(|p| p.id == id) {
+        let Some(popup) = self.text_popup.take_if(|p| p.id == id) else {
             return;
-        }
-        let popup = self.text_popup.take().unwrap();
+        };
         if self.stage.dialog_prompt().as_deref() == Some(&popup.prompt) {
             self.stage.call_in(
                 thedas_ui::stage::POPUP_LAYER,
@@ -1903,15 +1902,15 @@ impl UiLayer {
             }
             return;
         }
+        // ShowDialogBox silently refuses a second live box. Once it closes, leave
+        // a tick to collect its answer before replacing shared values such as
+        // InputText. Do not focus or change the policy of the dialog ahead of us.
+        if self.stage.dialog_prompt().is_some() {
+            popup.frames = 0;
+            return;
+        }
         popup.frames += 1;
         if popup.frames == 2 {
-            // ShowDialogBox silently refuses a second live box. Wait for the actual
-            // dialog to close; do not focus it or apply our report's free-text policy
-            // to a script's name prompt in the meantime.
-            if self.stage.dialog_prompt().is_some() {
-                popup.frames = 1;
-                return;
-            }
             popup.write_values(&self.stage.bridge);
             let up = self.stage.call_in(
                 thedas_ui::stage::POPUP_LAYER,
@@ -3827,6 +3826,9 @@ mod tests {
                 "_global.PopupLayer.ms_mcPopup.Buttons_mc.Button2_mc.SimulateButtonPush",
                 &[],
             );
+            // Match the app: it tries to show pending questions before draining
+            // callbacks from the preceding input event.
+            ui.show_text_popup();
             ui.stage.tick(1000.0 / 30.0);
         };
         let field = "_global.PopupLayer.ms_mcPopup.TextInput_mc.TextField";
@@ -3854,6 +3856,11 @@ mod tests {
                 ui.ask_free_text(2, "Report", "", "Save", "Keep here");
             } else {
                 close(&mut ui);
+                assert!(ui.stage.dialog_prompt().is_none());
+                assert_eq!(
+                    ui.stage.bridge.value("GUIPopupLayer.InputText"),
+                    Some(thedas_ui::UiValue::String("Rowan".into()))
+                );
             }
             pump(&mut ui);
             assert!(crate::box_shows(&mut ui, "Report"));

@@ -85,6 +85,11 @@ The player lives in `crates/thedas-gfx`:
 4. **`text`**: HTML-subset parser (p, br, font face/size/color, b, i, u, img), layout with
    word wrap, autosize, `textAutoSize` shrink, shadows; glyphs from the font library's
    DefineFont3 outlines, rasterised into a glyph atlas at the drawn size.
+   Native inline images resolve exported bitmap names and host image URLs before
+   measurement. Intrinsic or explicit dimensions, horizontal spacing, baseline `vspace`,
+   paragraph alignment and word wrapping share the text layout. Positive `vspace` raises
+   the image and negative values lower it. Images render with scrolling and field clipping,
+   inherit display transforms/alpha and reuse the field's revision-keyed mesh cache.
    Focused fields track a selection anchor and caret. Ctrl+A and `Selection.setSelection`
    replace/delete the selected range; Shift navigation extends it. Selection getters and
    setters translate script UTF-16 indices to the text storage's character boundaries.
@@ -102,9 +107,16 @@ The player lives in `crates/thedas-gfx`:
    dynamic line adds no measured height. Input fields retain that line's height.
    Closing multiline HTML paragraphs retain their delimiters, including empty
    paragraphs; single-line fields ignore paragraph and break tags.
+   `shadowStyle` keeps all `s{x,y}{x,y}...` shadow offsets, including repeats, and
+   supports explicit `t{x,y}{x,y}...` text passes. An s-only style keeps text at the
+   origin. Invalid/non-finite offsets are ignored. The 53 movies setting this property
+   use three s-only values, all covered by the parser regression.
    Leading is included once for a single line, and between subsequent lines.
    A newline within an HTML span carries the first span's line metrics forward until
    another span begins at a line boundary, matching the credits' mixed-size headings.
+   TextField `_x` and `_y` include the scaled authored bounds origin. Reads and writes
+   retain that origin, so helpers place inline tooltip dividers at the field's actual
+   position, including fields whose edit-text bounds start at negative coordinates.
 5. **`render`**: wgpu. Shapes are tessellated once per character (lyon) into cached vertex
    buffers; bitmaps (atlas DDS pages) uploaded once; scale9 drawn natively. Colour transform
    and blend mode per draw; multiply and the few other modes against the scene picture,
@@ -144,6 +156,10 @@ The player lives in `crates/thedas-gfx`:
 - Display `_x`/`_y` writes truncate to whole twips (1/20 pixel) toward zero.
   Rounding each fractional credits-scroll update instead compounds a position
   difference over time, despite matching the movie's timer rate.
+- Script-visible bounds compose each leaf's transform before measuring and round
+  transformed points to the nearest twip with ties to even. Rounding the far edge
+  outwards inflated the area map's 604-pixel viewport to 604.1 pixels,
+  changing the map scale, centring and marker placement.
 - Compare hidden-window captures of the menu, chargen, HUD, inventory and conversation
   against the previous own-player build. Exercise the dwarf commoner and human noble
   chargen click-through as well as the simulation gates.
@@ -176,7 +192,8 @@ The player lives in `crates/thedas-gfx`:
 - Export-backed `BitmapData.loadBitmap` and `MovieClip.attachBitmap` let the shared host
   inline-image helper place copper/silver/gold icons in inventory and store prices. Timeline
   jumps distinguish text characters, so the unaffordable-price state can replace gold text
-  with its authored red definition. Native text-layout `<img>` rendering remains separate.
+  with its authored red definition. This helper remains in place while its approximate
+  centred-image placement is compared with native baseline image layout.
 - `MovieClip.duplicateMovieClip` constructs a fresh instance of the registered class with
   the source's transform, colour, drawing and clip events. The host can now add its Mod Mode
   button alongside Report Issue using the same menu setup on the player.
@@ -184,8 +201,7 @@ The player lives in `crates/thedas-gfx`:
   Dragging extends the selection, including outside the field until release; Shift-click
   retains its anchor. Picking uses the field's inverse world transform and the layout's
   aligned, wrapped and scrolled character advances, including spaces and missing glyphs.
-- Remaining work includes complete text `shadowStyle`, native inline `<img>` layout,
-  cached bitmap alpha masks, and broader interaction parity.
+- Remaining work includes cached bitmap alpha masks and broader interaction parity.
 - Tools: `cargo run -p thedas-ui --example capture -- INSTALL OUT.png MOVIES [FRAMES]
   [WxH]` captures the player once and reports timings. `SF_CAPTURE_SETUP` supplies optional
   `call`/`set` steps. This replaces the former `sidebyside` comparison example.
