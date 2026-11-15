@@ -90,6 +90,9 @@ fn shade(i: V) -> vec4<f32> {
     if (mode == 1) {
         let t = sample_tex(slot, smp_index, i.uv, gx, gy);
         c = vec4<f32>(t.rgb / max(t.a, 0.00001), t.a);
+    } else if (mode == 5) {
+        let t = sample_tex(slot, smp_index, i.uv, gx, gy);
+        c = vec4<f32>(i.color.rgb, i.color.a * t.a);
     } else if (mode >= 2) {
         let g = vec2<f32>(
             d.g0.x * i.local.x + d.g0.y * i.local.y + d.g0.z,
@@ -169,6 +172,11 @@ fn shader_source(bindless: bool) -> String {
         source
     }
 }
+
+/// Glyph atlas pages are this many pixels square.
+const GLYPH_PAGE: u32 = 1024;
+/// The paint of atlas glyphs: the texture's coverage times the vertex colour.
+const GLYPH_PAINT: f32 = 5.0;
 
 /// The most texture slots a bindless table holds.
 const MAX_SLOTS: u32 = 4096;
@@ -405,7 +413,10 @@ pub struct Renderer {
     cpu_shapes: HashMap<(u16, u16), Vec<CpuShape>>,
     scale9: HashMap<(DisplayId, [u32; 8]), Vec<Arc<GpuMesh>>>,
     glyphs: HashMap<(usize, usize), Arc<GlyphMesh>>,
-    texts: HashMap<DisplayId, (u64, Vec<Arc<GpuMesh>>)>,
+    texts: HashMap<DisplayId, (u64, u64, Vec<Arc<GpuMesh>>)>,
+    /// The glyph atlas: packing, and each page's texture.
+    glyph_packer: crate::glyphs::Packer,
+    glyph_pages: Vec<(wgpu::Texture, crate::gpu::Tex)>,
     /// Drawing-API meshes by clip, with a hash of the drawing they were made from.
     drawings: HashMap<DisplayId, (u64, Vec<Arc<GpuMesh>>)>,
     /// Quads of images loaded into clips, by URL and size.
@@ -557,6 +568,8 @@ impl Renderer {
             scale9: HashMap::new(),
             glyphs: HashMap::new(),
             texts: HashMap::new(),
+            glyph_packer: crate::glyphs::Packer::new(GLYPH_PAGE),
+            glyph_pages: Vec::new(),
             drawings: HashMap::new(),
             bitmap_quads: HashMap::new(),
             stats: RenderStats::default(),
@@ -1315,6 +1328,83 @@ impl Renderer {
         out
     }
 
+    /// Glyph `index` of `font` rasterised at `px` pixels per em into the atlas; `None` when
+    /// it has no pixels or is too large for it (the outline is drawn instead).
+    fn atlas_glyph(
+        &mut self,
+        font: &Arc<crate::swf::Font>,
+        index: usize,
+        px: f32,
+    ) -> Option<crate::glyphs::Placed> {
+        if !(1.0..=160.0).contains(&px) {
+            return None;
+        }
+        let key = (Arc::as_ptr(font) as usize, index, (px * 4.0).round() as u32);
+        if let Some(p) = self.glyph_packer.get(key) {
+            return p;
+        }
+        let records = font.glyphs.get(index).map(|g| g.outline.as_slice())?;
+        let bitmap = crate::glyphs::rasterize(records, px / font.em);
+        let placed = bitmap.and_then(|b| {
+            let (page, x, y) = self.glyph_packer.place(b.w, b.h)?;
+            while self.glyph_pages.len() <= page {
+                let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("gfx glyph atlas"),
+                    size: wgpu::Extent3d {
+                        width: GLYPH_PAGE,
+                        height: GLYPH_PAGE,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                    view_formats: &[],
+                });
+                let tex = self.make_tex(&texture, crate::gpu::SAMPLER_CLAMP);
+                self.glyph_pages.push((texture, tex));
+            }
+            // White, premultiplied by coverage.
+            let px: Vec<u8> = b.alpha.iter().flat_map(|&a| [a, a, a, a]).collect();
+            self.queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &self.glyph_pages[page].0,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d { x, y, z: 0 },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &px,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(b.w * 4),
+                    rows_per_image: Some(b.h),
+                },
+                wgpu::Extent3d {
+                    width: b.w,
+                    height: b.h,
+                    depth_or_array_layers: 1,
+                },
+            );
+            let s = GLYPH_PAGE as f32;
+            Some(crate::glyphs::Placed {
+                page,
+                uv: [
+                    x as f32 / s,
+                    y as f32 / s,
+                    (x + b.w) as f32 / s,
+                    (y + b.h) as f32 / s,
+                ],
+                left: b.left as f32,
+                top: b.top as f32,
+                w: b.w as f32,
+                h: b.h as f32,
+            })
+        });
+        self.glyph_packer.insert(key, placed);
+        placed
+    }
+
     fn glyph(&mut self, font: &Arc<crate::swf::Font>, index: usize) -> Arc<GlyphMesh> {
         let key = (Arc::as_ptr(font) as usize, index);
         self.glyphs
@@ -1330,19 +1420,25 @@ impl Renderer {
             .clone()
     }
 
+    /// `pxs`: target pixels per local pixel when the field is drawn upright and evenly
+    /// scaled (glyphs come from the atlas, rasterised at that size); `None` draws the glyphs'
+    /// outlines.
     fn text_meshes(
         &mut self,
         player: &mut Player,
         images: &mut dyn Images,
         d: DisplayId,
+        pxs: Option<f32>,
     ) -> Vec<Arc<GpuMesh>> {
         let fonts = player.vm.fonts.clone();
         let Some(t) = player.vm.display.get_mut(d).and_then(|o| o.text_mut()) else {
             return Vec::new();
         };
+        // Quarter-pixel steps: a field that only moves keeps its glyphs.
+        let px_key = pxs.map(|p| (p * 64.0).round() as u64).unwrap_or(u64::MAX);
         let rev = t.revision;
-        if let Some((r, m)) = self.texts.get(&d) {
-            if *r == rev {
+        if let Some((r, k, m)) = self.texts.get(&d) {
+            if *r == rev && *k == px_key {
                 return m.clone();
             }
         }
@@ -1503,6 +1599,8 @@ impl Renderer {
         m.vertices.clear();
         m.indices.clear();
         let mut shadow_mesh = m.clone();
+        let mut text_pages: std::collections::BTreeMap<usize, Mesh> = Default::default();
+        let mut shadow_pages: std::collections::BTreeMap<usize, Mesh> = Default::default();
         for (offset, is_shadow) in style
             .shadows
             .iter()
@@ -1510,8 +1608,7 @@ impl Renderer {
             .chain(style.text.iter().map(|offset| (offset, false)))
         {
             for (g, dy) in &glyphs {
-                let mesh = self.glyph(&g.font, g.glyph);
-                let scale = g.size * 20.0 / g.font.em;
+                let placed = pxs.and_then(|p| self.atlas_glyph(&g.font, g.glyph, g.size * p));
                 let (ox, oy, c) = if is_shadow {
                     (offset.0, offset.1, shadow_color)
                 } else {
@@ -1525,6 +1622,40 @@ impl Renderer {
                         },
                     )
                 };
+                if let (Some(pl), Some(p)) = (placed, pxs) {
+                    let pages = if is_shadow {
+                        &mut shadow_pages
+                    } else {
+                        &mut text_pages
+                    };
+                    let target = pages.entry(pl.page).or_insert_with(|| Mesh {
+                        paint: Paint::Solid,
+                        vertices: Vec::new(),
+                        indices: Vec::new(),
+                    });
+                    let x0 = (bx + g.x + ox) * 20.0 + pl.left / p * 20.0;
+                    let y0 = (by + g.y + dy + oy) * 20.0 + pl.top / p * 20.0;
+                    let (x1, y1) = (x0 + pl.w / p * 20.0, y0 + pl.h / p * 20.0);
+                    let base = target.vertices.len() as u32;
+                    for (x, y, u, v) in [
+                        (x0, y0, pl.uv[0], pl.uv[1]),
+                        (x1, y0, pl.uv[2], pl.uv[1]),
+                        (x1, y1, pl.uv[2], pl.uv[3]),
+                        (x0, y1, pl.uv[0], pl.uv[3]),
+                    ] {
+                        target.vertices.push(Vertex {
+                            pos: [x, y],
+                            uv: [u, v],
+                            color: [c[0], c[1], c[2], 255],
+                        });
+                    }
+                    target
+                        .indices
+                        .extend([base, base + 1, base + 2, base, base + 2, base + 3]);
+                    continue;
+                }
+                let mesh = self.glyph(&g.font, g.glyph);
+                let scale = g.size * 20.0 / g.font.em;
                 let target = if is_shadow { &mut shadow_mesh } else { &mut m };
                 let base = target.vertices.len() as u32;
                 for p in &mesh.0 {
@@ -1541,9 +1672,17 @@ impl Renderer {
             }
         }
         out.extend(self.upload_colored(&shadow_mesh, None, 0.0, Matrix::IDENTITY, true));
+        for (page, mesh) in &shadow_pages {
+            let tex = self.glyph_pages.get(*page).map(|p| p.1.clone());
+            out.extend(self.upload_colored(mesh, tex, GLYPH_PAINT, Matrix::IDENTITY, true));
+        }
         out.extend(self.upload(&m, None, 0.0, Matrix::IDENTITY));
+        for (page, mesh) in &text_pages {
+            let tex = self.glyph_pages.get(*page).map(|p| p.1.clone());
+            out.extend(self.upload(mesh, tex, GLYPH_PAINT, Matrix::IDENTITY));
+        }
         out.extend(self.upload(&caret_mesh, None, 0.0, Matrix::IDENTITY));
-        self.texts.insert(d, (rev, out.clone()));
+        self.texts.insert(d, (rev, px_key, out.clone()));
         out
     }
 
@@ -1771,7 +1910,15 @@ impl Renderer {
                 let (id, r) = (*id, o.ratio);
                 self.shape_meshes(player, images, id, r)
             }
-            Kind::Text(_) => self.text_meshes(player, images, d),
+            Kind::Text(_) => {
+                // Upright, evenly scaled fields take their glyphs from the atlas.
+                let upright = world.b.abs() < 1e-5
+                    && world.c.abs() < 1e-5
+                    && world.a > 0.0
+                    && (world.a - world.d).abs() <= world.a * 1e-3;
+                let pxs = upright.then(|| world.a * view.k * 20.0);
+                self.text_meshes(player, images, d, pxs)
+            }
             Kind::Bitmap { url, width, height } => {
                 let (url, w, h) = (url.clone(), *width, *height);
                 let key = (url.clone(), w.to_bits(), h.to_bits());
