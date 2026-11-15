@@ -5151,6 +5151,10 @@ fn numeric_as_declared(v: Value, ret: &thedas_script::ldf::Type) -> Value {
 }
 
 impl Host for ScriptHost<'_> {
+    fn engine_equal(&self, ty: u8, a: Option<u64>, b: Option<u64>) -> bool {
+        crate::engine_equality::equal(self, ty, a, b)
+    }
+
     fn action(
         &mut self,
         caller: ObjectId,
