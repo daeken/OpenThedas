@@ -1893,7 +1893,7 @@ impl App {
             g.reticle
                 .draw(&g.ctx.device, &mut encoder, &view, size, &lines);
         }
-        g.ui.composite(&mut encoder, &view, g.config.format);
+        g.ui.composite(&mut encoder, &frame.texture, g.config.format);
         // The pad's pointer goes over the interface.
         let ctx = self
             .pad
