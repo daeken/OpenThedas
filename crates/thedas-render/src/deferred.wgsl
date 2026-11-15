@@ -469,7 +469,7 @@ fn basic_gbuffer_material(in: VsOut, object: bool) -> GBufferSample {
     let s = surface(in);
     var out: GBuffer;
     let diffuse = textureSample(diffuse_tex, wrap_smp, in.uv0);
-    out.albedo = vec4<f32>(diffuse.rgb, 0.0);
+    out.albedo = vec4<f32>(diffuse.rgb, draw.material.z / 255.0);
     out.specular = textureSample(spec_tex, wrap_smp, in.uv0);
     out.normal = vec4<f32>(oct_encode(s.n), draw.room.x, s.falloff);
     out.lightmap = textureSample(lightmap_tex, clamp_smp, in.uv_lm);
@@ -661,6 +661,8 @@ struct Lighting {
     depth_plane: vec4<f32>,
     // xy: target size, z: fused base, w: light rejection flags
     size: vec4<f32>,
+    // Spare material codes index Static1's reciprocal RGB divisor and alpha scale.
+    static_tints: array<vec4<f32>, 256>,
 };
 
 struct Light {
@@ -956,6 +958,11 @@ fn highlight(n: vec3<f32>, h: vec3<f32>, power: f32, hair: HairLight) -> vec3<f3
     return vec3<f32>(pow(max(dot(n, h), 1e-6), power));
 }
 
+fn static_tint_colour(colour: vec3<f32>, factors: vec4<f32>) -> vec3<f32> {
+    // The authored Static1 instruction saturates BEFORE multiplying by 1-tint.a.
+    return clamp(colour * factors.rgb, vec3<f32>(0.0), vec3<f32>(1.0)) * factors.a;
+}
+
 // Both opaque pixels and ordered forward materials use this light list, membership,
 // falloff and visibility. Forward receivers supply their own position/material and
 // ambient visibility, so they never sample the opaque G-buffer as their surface.
@@ -1120,6 +1127,9 @@ fn light_surface(frag: vec4<f32>, p: vec3<f32>, ga: vec4<f32>, spec: vec4<f32>,
     }
 
     // The level's fog, as Static1 applies it.
+    if (material != 0u && !object && !terrain) {
+        colour = static_tint_colour(colour, lighting.static_tints[material]);
+    }
     let to_eye = p - lighting.eye.xyz;
     let f = max(min(exp(-dot(to_eye, to_eye) * lighting.fog0.w), 1.0), lighting.fog1.x);
     colour = f * (colour - lighting.fog0.rgb) + lighting.fog0.rgb;

@@ -84,6 +84,9 @@ pub struct LineCut {
     pub stage: Option<String>,
     pub unstaged: bool,
     pub tracks: Option<Arc<Tracks>>,
+    /// DA2 performance bindings, activated when this line is taken. Full DA2
+    /// performance placement is separate from this world-state side effect.
+    pub activate: Vec<String>,
 }
 
 const FIELD_LINES: u32 = 12002;
@@ -119,6 +122,7 @@ pub fn line_cuts(g: &Gff4) -> Vec<LineCut> {
                     .and_then(Value::as_i64)
                     .is_some_and(|v| v != 0),
                 tracks: cut.map(|c| Arc::new(Tracks::from_cut(g, c))),
+                activate: Vec::new(),
             }
         })
         .collect()
@@ -154,6 +158,32 @@ impl Sim {
             .ok()
             .and_then(|(data, _)| Gff4::parse(&data).ok())
             .map(|g| line_cuts(&g))
+            .or_else(|| {
+                if self.game != thedas_vfs::Game::DragonAge2 {
+                    return None;
+                }
+                let (data, _) = self.vfs.read(&format!("{key}.cnv")).ok()?;
+                let g = Gff4::parse(&data).ok()?;
+                if !crate::cnv::is_cnv(&g) {
+                    return None;
+                }
+                let performances = self.conversation_performances(&key);
+                Some(
+                    crate::cnv::line_performance_ids(&g)
+                        .into_iter()
+                        .map(|line| {
+                            let activate = line
+                                .and_then(|id| performances.get(&id))
+                                .map(crate::cnv::performance_actor_tags)
+                                .unwrap_or_default();
+                            LineCut {
+                                activate,
+                                ..Default::default()
+                            }
+                        })
+                        .collect(),
+                )
+            })
             .unwrap_or_default();
         let cuts = Arc::new(cuts);
         self.line_cuts.insert(key, cuts.clone());
