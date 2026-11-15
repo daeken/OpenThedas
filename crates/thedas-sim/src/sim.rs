@@ -3000,18 +3000,18 @@ impl Sim {
             if was == wanted {
                 continue;
             }
-            let mut at = self.slide_past_bodies(id, was, wanted).unwrap_or(wanted);
+            let at = self.slide_past_bodies(id, was, wanted).unwrap_or(wanted);
             if was == at {
                 continue;
             }
-            if let Some(area) = area {
-                if self.door_sight(area).blocks(was, at) {
-                    continue;
-                }
-                if let Some(g) = self.nav_grid(area) {
-                    at = crate::nav::walkable_reach(&g, was, at).unwrap_or(was);
-                }
+            if let Some(area) = area
+                && self.door_sight(area).blocks(was, at)
+            {
+                continue;
             }
+            // Task 37 drives the actor controller, not a pathfinding route. In
+            // particular, Origins' grid walkability mask is not a DA2 motion
+            // constraint: authored DA2 placements can be outside that mask.
             // Use the same trigger-crossing samples as ordinary locomotion.
             let steps = (crate::engine::dist(was, at) / TRIGGER_STEP).ceil().max(1.) as usize;
             for i in 1..=steps {

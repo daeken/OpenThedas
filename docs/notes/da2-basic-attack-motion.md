@@ -48,14 +48,21 @@ tail does not restart the curve. Completing, interrupting, replacing or
 canceling the command stops its motion. No extra damage recipient, attack
 bonus, health adjustment or ability-specific 3310 override is introduced.
 
-Translation uses the existing headless body sliding, walkable-grid clipping
-and closed-door collision approximations, with ordinary trigger crossings.
+Translation uses the existing headless body sliding and closed-door collision
+approximations, with ordinary trigger crossings. It must not require an Origins
+walkable-grid start cell: the real prologue's authored starting point is on a
+DA2 cell that fails that mask. The initial live replay retained the correct
+motion context but discarded every displacement at this extra grid check,
+leaving the original zero-damage result unchanged. Native task 37 requests actor
+controller motion without that pathfinding predicate, and DA2's ordinary routing
+already retains a straight fallback when no grid route can be found.
 This is not a complete native PhysX controller or animation blend graph.
 Root rotation, native controller blending, arbitrary target-node bounds,
-vertical steps and exact collision response remain separate work. The
+terrain/static-wall collision, vertical steps and exact collision response remain separate work. The
 existing turn-to-target approximation supplies the initial orientation.
 Target-distance warping here covers object-targeted attacks; ground-targeted
-motion retains the unwarped curve.
+motion retains the unwarped curve. Old in-flight saves lacking a motion context
+are not retrofitted; subsequent casts acquire it normally.
 Origins neither creates nor advances this DA2 motion state; its absent
 optional save field remains omitted.
 

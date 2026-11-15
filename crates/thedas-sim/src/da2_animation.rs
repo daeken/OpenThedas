@@ -484,6 +484,26 @@ mod tests {
         let (mut sim, who) = running();
         let target = sim.world.spawn(ObjectKind::Creature, "target");
         sim.world.get_mut(target).unwrap().position = [0., 8., 0.];
+        let area = sim.world.spawn(ObjectKind::Area, "arena");
+        sim.world.area = Some(area);
+        for id in [who, target] {
+            sim.world.get_mut(id).unwrap().area = Some(area);
+        }
+        // The real prologue's placement is outside the Origins walkability
+        // mask. A valid animation-controller request must still move there.
+        let grid = thedas_formats::level::NavGrid {
+            columns: 12,
+            rows: 12,
+            cell_size: 1.,
+            clearance: 2.,
+            base: [-2., -1., 0.],
+            normal: [0., 0., 1.],
+            data: vec![12; 144],
+            heights: vec![0.; 144],
+            surfaces: Vec::new(),
+        };
+        assert!(!crate::nav::on_walkable(&grid, [0.; 3]));
+        sim.changed_nav_grids.insert(area, Arc::new(grid));
         let tables = crate::m2da::Tables::empty();
         tables.insert(
             "#1",
