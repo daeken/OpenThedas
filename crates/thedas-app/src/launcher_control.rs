@@ -20,7 +20,8 @@
 //!   dialogs can't be driven), e.g. `choose C:\Games\DAO; click Pick a folder…`.
 //! - `wait [seconds]`: until no search, download or mod check is running (default 300 s).
 //! - `run <ms>`: lets the launcher run that long.
-//! - `tree`: every named control and text on the page: role, name, value, enabled, checked.
+//! - `tree`: every named control and text on the page: role, name, value, enabled, checked,
+//!   expanded (when it can expand or collapse).
 //! - `status`: the page, the footer's message, the installs, whether a search or download runs.
 //! - `screenshot` (`shot <file.png>` as a step): the window as drawn, a PNG (base64 under
 //!   `"png"` in a reply).
@@ -28,7 +29,8 @@
 //!   so a search or a page change that is still settling is waited for): `page <Name>`,
 //!   `heading <text>`, `text <text>` / `no text <text>` (any control or label whose name
 //!   contains it), `focus <text>` (the focused control's name), `enabled <name>` /
-//!   `disabled <name>`, `installs <n>`, `message <text>` (the footer), `launch <text>` (what
+//!   `disabled <name>`, `expanded <name>` / `collapsed <name>`, `installs <n>`,
+//!   `message <text>` (the footer), `launch <text>` (what
 //!   Play would run) / `no launch`. Matching ignores case.
 //! - `mkinstall <folder> [da2]`: makes a stand-in game install (just the folders the launcher
 //!   recognises one by, no game data) for a script to find or pick.
@@ -231,6 +233,7 @@ pub struct Widget {
     pub value: Option<String>,
     pub enabled: bool,
     pub checked: Option<bool>,
+    pub expanded: Option<bool>,
     pub clickable: bool,
     pub focusable: bool,
 }
@@ -295,6 +298,7 @@ impl Tree {
                 value: if n.role() == Role::Label { None } else { value },
                 enabled: !n.is_disabled(),
                 checked: n.toggled().map(|t| t == Toggled::True),
+                expanded: n.is_expanded(),
                 clickable,
                 focusable,
             });
@@ -374,6 +378,9 @@ pub fn widgets_json(ws: &[Widget]) -> J {
                 }
                 if let Some(c) = w.checked {
                     o["checked"] = json!(c);
+                }
+                if let Some(expanded) = w.expanded {
+                    o["expanded"] = json!(expanded);
                 }
                 if w.clickable && w.role != Role::Label {
                     o["clickable"] = json!(true);
@@ -787,6 +794,14 @@ fn expect(
                 None => fail("nothing has focus".into()),
             }
         }
+        "expanded" | "collapsed" => {
+            let want = kind == "expanded";
+            match find(widgets, value, |_| true) {
+                Ok(w) if w.expanded == Some(want) => Ok(()),
+                Ok(w) => fail(format!("{:?} has expanded state {:?}", w.name, w.expanded)),
+                Err(e) => fail(e),
+            }
+        }
         "enabled" | "disabled" => {
             let want = kind == "enabled";
             match widgets
@@ -946,6 +961,7 @@ mod tests {
         assert!(ok("message hi").is_ok());
         assert!(ok("no launch").is_ok());
         assert!(ok("focus continue").is_ok());
+        assert!(ok("collapsed Continue").is_err());
         for bad in [
             "page Play",
             "heading Welcome",
@@ -982,6 +998,7 @@ mod tests {
             value: None,
             enabled: true,
             checked: None,
+            expanded: None,
             clickable,
             focusable: clickable,
         }
@@ -1032,5 +1049,43 @@ mod tests {
             focus: NodeId(1),
         });
         assert_eq!(t.widgets().len(), 1);
+    }
+
+    #[test]
+    fn disclosure_state_reaches_the_script_and_follows_updates() {
+        let mut node = Node::new(Role::DisclosureTriangle);
+        node.set_label("Don't have the game?");
+        let mut tree = Tree::default();
+        for expanded in [true, false, true] {
+            node.set_expanded(expanded);
+            tree.update(&accesskit::TreeUpdate {
+                nodes: vec![(NodeId(1), node.clone())],
+                tree: Some(accesskit::TreeInfo::new(NodeId(1))),
+                tree_id: TreeId::ROOT,
+                focus: NodeId(1),
+            });
+            let widgets = tree.widgets();
+            assert_eq!(widgets_json(&widgets)[0]["expanded"], expanded);
+            let state = if expanded { "expanded" } else { "collapsed" };
+            let other = if expanded { "collapsed" } else { "expanded" };
+            assert!(
+                expect(
+                    &format!("{state} Don't have the game?"),
+                    &widgets,
+                    None,
+                    &json!({})
+                )
+                .is_ok()
+            );
+            assert!(
+                expect(
+                    &format!("{other} Don't have the game?"),
+                    &widgets,
+                    None,
+                    &json!({})
+                )
+                .is_err()
+            );
+        }
     }
 }
