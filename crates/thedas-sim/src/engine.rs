@@ -4155,6 +4155,21 @@ pub fn call(
                     .unwrap_or(0),
             ))
         }
+        "ShowAsAllyOnMap" if h.sim.game == thedas_vfs::Game::Origins => {
+            if let Some(o) = h
+                .sim
+                .world
+                .get_mut(obj(a, 0))
+                .filter(|o| o.kind == ObjectKind::Creature)
+            {
+                o.fields
+                    .insert("ShowAsAllyOnMap".into(), i32::from(int(a, 1) != 0));
+            }
+            void()
+        }
+        "GetPlaceablePopupText" if h.sim.game == thedas_vfs::Game::Origins => {
+            ok(Value::String(h.sim.placeable_popup_text(obj(a, 0))))
+        }
         "GetPlaceableKeyTag" => ok(Value::String(
             h.object(obj(a, 0))
                 .and_then(|o| o.text_fields.get("KeyName").cloned())
@@ -6175,6 +6190,67 @@ mod tests {
     use thedas_vfs::Vfs;
 
     use super::*;
+
+    #[test]
+    fn map_popup_natives_keep_ally_flag_separate_from_hostility() {
+        let table = Arc::new(EngineTable::parse(b"void ShowAsAllyOnMap(object o, int b) = 364;\nstring GetPlaceablePopupText(object o) = 356;").unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        let creature = s.world.spawn(ObjectKind::Creature, "creature");
+        let door = s.world.spawn(ObjectKind::Placeable, "door");
+        s.world.get_mut(creature).unwrap().team = 9;
+        assert!(!s.show_as_ally_on_map(creature));
+        for flag in [-2, 0, 1] {
+            for id in [creature, door, OBJECT_INVALID] {
+                assert_eq!(
+                    run(
+                        &mut s,
+                        creature,
+                        "ShowAsAllyOnMap",
+                        &[Value::Object(id), Value::Int(flag)]
+                    ),
+                    None
+                );
+            }
+            assert_eq!(s.show_as_ally_on_map(creature), flag != 0);
+            assert!(!s.show_as_ally_on_map(door));
+            assert_eq!(s.world.get(creature).unwrap().team, 9);
+        }
+        s.world
+            .get_mut(door)
+            .unwrap()
+            .text_fields
+            .insert("LocPopupText".into(), "Open the gate".into());
+        s.world
+            .get_mut(creature)
+            .unwrap()
+            .text_fields
+            .insert("LocPopupText".into(), "ignored".into());
+        for (id, text) in [
+            (door, "Open the gate"),
+            (creature, ""),
+            (OBJECT_INVALID, ""),
+        ] {
+            assert_eq!(
+                run(
+                    &mut s,
+                    creature,
+                    "GetPlaceablePopupText",
+                    &[Value::Object(id)]
+                ),
+                Some(Value::String(text.into()))
+            );
+        }
+        s.game = thedas_vfs::Game::DragonAge2;
+        assert_eq!(
+            run(
+                &mut s,
+                creature,
+                "GetPlaceablePopupText",
+                &[Value::Object(door)]
+            ),
+            None
+        );
+    }
 
     const LDF: &str = "void SetCooldown(object o, int n, float f, string s) = 1;\n\
         void DoAutoSave() = 9001;\n\
