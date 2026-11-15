@@ -2524,14 +2524,10 @@ impl Sim {
         let (pos, area) = (o.position, o.area);
         let now: Vec<ObjectId> = self
             .world
-            .objects
-            .values()
-            .filter(|t| {
-                t.kind == ObjectKind::Trigger
-                    && t.active
-                    && t.area == area
-                    && crate::engine::in_trigger(pos, t)
-            })
+            .trigger_ids()
+            .iter()
+            .filter_map(|&t| self.world.get(t))
+            .filter(|t| t.active && t.area == area && crate::engine::in_trigger(pos, t))
             .map(|t| t.id)
             .collect();
         let before = self.world.in_triggers.get(&id).cloned().unwrap_or_default();
@@ -2840,24 +2836,26 @@ impl Sim {
         let now = self.world.time_ms;
         // (mover, start, start time, due, the points after the start)
         type Move = (ObjectId, [f32; 3], u64, u64, Vec<[f32; 3]>);
-        let moving: Vec<Move> =
-            self.world
-                .objects
-                .values()
-                .filter_map(|o| {
-                    let c = o.commands.first()?;
-                    let (from, t0) = c.from?;
-                    let due = c.due?;
-                    let points = if c.path.is_empty() {
+        // Only creatures and placeables carry commands that move (see `World::actor_ids`).
+        let actors = self.world.actor_ids();
+        let moving: Vec<Move> = actors
+            .iter()
+            .filter_map(|&id| self.world.get(id))
+            .filter_map(|o| {
+                let c = o.commands.first()?;
+                let (from, t0) = c.from?;
+                let due = c.due?;
+                let points =
+                    if c.path.is_empty() {
                         vec![c.approach.or(c.location.map(|l| l.position)).or_else(|| {
                             c.target.and_then(|t| self.world.get(t)).map(|t| t.position)
                         })?]
                     } else {
                         c.path.clone()
                     };
-                    Some((o.id, from, t0, due, points))
-                })
-                .collect();
+                Some((o.id, from, t0, due, points))
+            })
+            .collect();
         for (id, from, t0, due, points) in moving {
             if due <= t0 {
                 continue;
@@ -3483,14 +3481,31 @@ impl Sim {
     /// The earliest-finishing front command, starting the clock on fronts that have none.
     fn next_command(&mut self) -> Option<(u64, ObjectId)> {
         let now = self.world.time_ms;
-        let fronts: Vec<(ObjectId, Command)> = self
+        // A command under way in Origins is only its due time: copying every front command
+        // each pass (path, strings) cost a lot in busy areas. Commands to start, and every
+        // DA2 command, are copied as before.
+        let da2 = self.game == thedas_vfs::Game::DragonAge2;
+        let fronts: Vec<(ObjectId, Option<u64>, Option<Command>)> = self
             .world
             .objects
             .values()
-            .filter_map(|o| o.commands.first().map(|c| (o.id, c.clone())))
+            .filter_map(|o| {
+                let c = o.commands.first()?;
+                Some(match c.due {
+                    Some(d) if !da2 => (o.id, Some(d), None),
+                    _ => (o.id, None, Some(c.clone())),
+                })
+            })
             .collect();
         let mut best: Option<(u64, ObjectId)> = None;
-        for (id, mut cmd) in fronts {
+        for (id, under_way, cmd) in fronts {
+            if let Some(due) = under_way {
+                if best.is_none_or(|(b, bid)| (due, id) < (b, bid)) {
+                    best = Some((due, id));
+                }
+                continue;
+            }
+            let Some(mut cmd) = cmd else { continue };
             let due = match cmd.due {
                 Some(d) => {
                     if self.game == thedas_vfs::Game::DragonAge2 {
