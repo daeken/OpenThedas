@@ -1400,6 +1400,7 @@ impl Sim {
             da2_target_prepared: false,
             path: Vec::new(),
             turned_at: None,
+            is_static: false,
         };
         self.da2_default_attack_command(&mut cmd);
         if let Some(o) = self.world.get_mut(attacker) {
@@ -1516,6 +1517,7 @@ impl Sim {
             da2_target_prepared: false,
             path: Vec::new(),
             turned_at: None,
+            is_static: false,
         };
         if let Some(o) = self.world.get_mut(who).filter(|o| o.commands.is_empty()) {
             o.commands.push(cmd);
@@ -1583,7 +1585,13 @@ impl Sim {
             .world
             .get(id)
             .and_then(|o| o.commands.first())
-            .is_some_and(|c| c.name == cmd.name && c.ints == cmd.ints && c.target == cmd.target);
+            .is_some_and(|c| {
+                if self.game == thedas_vfs::Game::Origins {
+                    c == cmd
+                } else {
+                    c.name == cmd.name && c.ints == cmd.ints && c.target == cmd.target
+                }
+            });
         if !still {
             return;
         }
@@ -3743,6 +3751,7 @@ mod tests {
                 da2_target_prepared: false,
                 path: Vec::new(),
                 turned_at: None,
+                is_static: false,
             });
         s.world.get_mut(rogue).unwrap().combat.attack = Some(AttackResult {
             results: [0, 2],
