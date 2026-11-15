@@ -3987,7 +3987,10 @@ pub fn call(
             void()
         }
         // DAOrigins.exe (0x65d9a0 -> 0x6976b0): a target that is the owner itself means the
-        // hero; the owner must be an active, living creature. Nothing here looks at the game
+        // hero. The owner may be a creature or placeable: +0x70's virtual +0x6c is the
+        // eligibility check 0x699fa0 in both vtables, not a creature-type test. Current
+        // health virtual +0x120 rejects dead owners (placeable: 0x750f50). See
+        // docs/notes/origins-placeable-conversations.md. Nothing here looks at the game
         // mode: a conversation may start in combat (and replaces it, see
         // `Sim::start_conversation`).
         // DA2 command 440 (0x512660 -> 0x504c60 -> 0x5b15f0) resolves
@@ -4009,9 +4012,16 @@ pub fn call(
             if target == owner {
                 target = h.sim.world.hero.unwrap_or(target);
             }
-            let can = h
-                .object(owner)
-                .is_some_and(|o| o.kind == ObjectKind::Creature && o.active && !o.dead);
+            let can = h.object(owner).is_some_and(|o| {
+                o.active
+                    && match o.kind {
+                        ObjectKind::Creature => !o.dead,
+                        ObjectKind::Placeable if h.sim.game == thedas_vfs::Game::Origins => {
+                            origins_placeable_health(o) > 0
+                        }
+                        _ => false,
+                    }
+            });
             let ok_ = can && h.sim.start_conversation(target, owner, &string(a, 2));
             ok(b(ok_))
         }
@@ -6380,6 +6390,133 @@ mod tests {
         assert_eq!(s.world.get(hero).unwrap().combat.cooldowns.len(), 6);
         s.world.time_ms = 3000;
         assert!(list(&mut s, hero, 0, 1).is_empty());
+    }
+
+    #[test]
+    fn origins_begin_conversation_opens_placeable_dialog_and_checks_its_current_health() {
+        use thedas_formats::Value as G;
+        use thedas_formats::gff4::{
+            FieldDef, FourCC, Gff4, List, StructData, StructId, StructTemplate, Version,
+        };
+        let g = Gff4 {
+            version: Version::V40,
+            platform: FourCC::new(b"PC  "),
+            file_type: FourCC::new(b"CONV"),
+            file_version: FourCC::new(b"V0.1"),
+            templates: vec![
+                StructTemplate {
+                    label: FourCC::new(b"CONV"),
+                    fields: vec![
+                        FieldDef {
+                            label: 12000,
+                            type_code: 4,
+                            flags: 0x8000,
+                            offset: 0,
+                        },
+                        FieldDef {
+                            label: 12002,
+                            type_code: 1,
+                            flags: 0xc000,
+                            offset: 4,
+                        },
+                    ],
+                    size: 8,
+                },
+                StructTemplate {
+                    label: FourCC::new(b"NTRY"),
+                    fields: vec![],
+                    size: 0,
+                },
+            ],
+            structs: vec![
+                StructData {
+                    template: 0,
+                    values: vec![
+                        G::List(Some(List::U32(vec![0]))),
+                        G::List(Some(List::Struct(vec![Some(StructId(1))]))),
+                    ],
+                },
+                StructData {
+                    template: 1,
+                    values: vec![],
+                },
+            ],
+            root: StructId(0),
+            shared_strings: None,
+        };
+        let dir =
+            std::env::temp_dir().join(format!("thedas-placeable-dialog-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("sarcophagus.dlg");
+        std::fs::write(&file, g.write().unwrap()).unwrap();
+        let mut vfs = Vfs::new();
+        vfs.push_files(&[file], "synthetic placeable conversation");
+        let table = EngineTable::parse(
+            b"int BeginConversation(object target, object owner, resource conversation) = 440;",
+        )
+        .unwrap();
+        let mut s = Sim::new(Arc::new(vfs), Arc::new(table), 1);
+        let hero = s.world.spawn(ObjectKind::Creature, "hero");
+        let owner = s.world.spawn(ObjectKind::Placeable, "sarcophagus");
+        s.world.hero = Some(hero);
+        s.world.get_mut(owner).unwrap().dialog = Some("sarcophagus".into());
+        for (current, active, saved_dead, allowed) in [
+            (1, true, false, true),
+            (1, true, true, true),
+            (0, true, false, false),
+            (-1, true, false, false),
+            (32768, true, false, false),
+            (65537, true, false, true),
+            (1, false, false, false),
+        ] {
+            let o = s.world.get_mut(owner).unwrap();
+            o.fields.insert("Health".into(), current);
+            o.active = active;
+            o.dead = saved_dead;
+            for resource in ["", "sarcophagus.dlg"] {
+                assert_eq!(
+                    run(
+                        &mut s,
+                        hero,
+                        "BeginConversation",
+                        &[
+                            Value::Object(owner),
+                            Value::Object(owner),
+                            Value::Resource(resource.into()),
+                        ]
+                    ),
+                    Some(Value::Int(i32::from(allowed))),
+                    "current={current}, active={active}, saved_dead={saved_dead}",
+                );
+                if allowed {
+                    let c = s.talk.as_ref().unwrap();
+                    assert_eq!((c.owner, c.player), (owner, hero));
+                    assert_eq!(c.dlg.name, "sarcophagus");
+                } else {
+                    assert!(s.talk.is_none());
+                }
+                s.end_conversation();
+            }
+        }
+        // Older saves can carry an explicit property current instead of the template field.
+        let o = s.world.get_mut(owner).unwrap();
+        o.active = true;
+        o.fields.insert("Health".into(), 1);
+        o.properties.insert(7, (100.0, 0.0));
+        assert_eq!(
+            run(
+                &mut s,
+                hero,
+                "BeginConversation",
+                &[
+                    Value::Object(hero),
+                    Value::Object(owner),
+                    Value::Resource(String::new()),
+                ]
+            ),
+            Some(Value::Int(0))
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
