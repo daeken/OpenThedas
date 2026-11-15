@@ -1916,7 +1916,7 @@ impl Renderer {
                     && world.c.abs() < 1e-5
                     && world.a > 0.0
                     && (world.a - world.d).abs() <= world.a * 1e-3;
-                let pxs = upright.then(|| world.a * view.k * 20.0);
+                let pxs = upright.then_some(world.a * view.k * 20.0);
                 self.text_meshes(player, images, d, pxs)
             }
             Kind::Bitmap { url, width, height } => {
