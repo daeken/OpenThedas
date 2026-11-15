@@ -1070,6 +1070,9 @@ enum ResumeOffer {
 
 /// The ids of the offer to resume and of the box saying it failed.
 const RESUME_ID: u32 = 0x5245_5355;
+/// The question shown when the way back to the start menu fails (no answer is acted on).
+const RETURN_FAILED_ID: u32 = 0x5245_5446;
+
 const RESUME_FAILED_ID: u32 = RESUME_ID + 1;
 
 /// When `written` was, said as how long ago from `now`.
@@ -4757,7 +4760,18 @@ impl App {
             if matches!(r, ui::FrontEnd::StartMenu) {
                 match live::Live::open(&self.install, &self.module, start, &self.shaders) {
                     Ok(l) => self.install_live(l),
-                    Err(e) => log::warn!("front end: {r:?} failed: {e:#}"),
+                    Err(e) => {
+                        log::warn!("front end: {r:?} failed: {e:#}");
+                        // Say so: the game just carries on, which looks like a dead button.
+                        if let Some(g) = self.gfx.as_mut() {
+                            g.ui.ask_choice(
+                                RETURN_FAILED_ID,
+                                &format!("The start menu could not be opened: {e:#}"),
+                                "OK",
+                                "OK",
+                            );
+                        }
+                    }
                 }
                 continue;
             }
