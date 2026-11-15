@@ -523,6 +523,7 @@ mod tests {
         assert_eq!(sim.world.get(who).unwrap().position, at_impact);
         sim.tick(200);
         assert_eq!(sim.world.get(who).unwrap().position, at_impact);
+        sim.world.get_mut(who).unwrap().commands.clear();
         sim.order_wait(who, 1.);
         sim.tick(100);
         assert!(
