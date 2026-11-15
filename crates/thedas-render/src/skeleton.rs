@@ -418,6 +418,7 @@ mod tests {
             length: 1.0,
             additive: false,
             scalars: Vec::new(),
+            colors: Vec::new(),
             tracks: vec![Track {
                 bone: "shoulder".into(),
                 channel: Channel::Rotation,
@@ -463,6 +464,7 @@ mod tests {
             length: 1.0,
             additive,
             scalars: Vec::new(),
+            colors: Vec::new(),
             tracks: vec![Track {
                 bone: bone.into(),
                 channel: Channel::Rotation,
@@ -549,6 +551,7 @@ mod tests {
             length: 1.0,
             additive: true,
             scalars: Vec::new(),
+            colors: Vec::new(),
             tracks: vec![Track {
                 bone: "elbow".into(),
                 channel: Channel::Translation,
