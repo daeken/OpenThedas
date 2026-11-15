@@ -291,6 +291,10 @@ impl Sim {
                 .or_default()
                 .extend(writes);
             self.changed_nav_grids.insert(area, Arc::new(changed));
+            // Doorway cells are derived from the walkable grid. A locked PWK
+            // uses kind 8; after unlocking, its kind-7 cells must participate in
+            // the closed-but-openable doorway approximation again.
+            self.door_cells.remove(&area);
         }
     }
 }

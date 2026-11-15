@@ -5948,6 +5948,26 @@ mod tests {
             s.world.nav_patches, before,
             "the closed PWK replaces the open footprint"
         );
+        let locked_cells = s
+            .closed_doors(area)
+            .into_iter()
+            .find(|(id, _)| *id == door)
+            .unwrap()
+            .1;
+        s.set_placeable_state(door, 0);
+        let unlocked_cells = s
+            .closed_doors(area)
+            .into_iter()
+            .find(|(id, _)| *id == door)
+            .unwrap()
+            .1;
+        assert!(
+            unlocked_cells
+                .iter()
+                .any(|cell| !locked_cells.contains(cell)),
+            "unlocking must refresh cached doorway cells"
+        );
+        s.set_placeable_state(door, 1);
         let saved = s.save_json().unwrap();
         s.load_json(&saved).unwrap();
         assert_eq!(s.world.get(door).unwrap().fields["State"], 1);
