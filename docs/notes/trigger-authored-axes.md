@@ -39,7 +39,10 @@ Origins-only trace. No save fields change.
 The native `IsInTrigger` handler **0x66da90** actually queries the creature's cached
 membership list at +0xba8 (**0x66dadb–0x66daea**); OpenThedas still performs a
 geometric query there. This change does not claim to recover that cache's timing.
-Edge-boundary comparisons, movement sampling frequency (SIM-008), and event
-creator/payload rules also remain separate work. The regression tests use interior
+Edge-boundary comparisons and movement sampling frequency (SIM-008) also remain
+separate work. A follow-up read of **0x6ae100 → 0x799850 → 0x698850** shows that
+the event creator is the creature, while object slot 0 holds the trigger ID
+(**0x6988f3–0x698903**). Our object slot still holds the creature; correcting that
+payload is independent of the coordinate change. The regression tests use interior
 points away from boundaries, verify that height alone causes no EXIT, and preserve
 the existing DA2 query behavior.

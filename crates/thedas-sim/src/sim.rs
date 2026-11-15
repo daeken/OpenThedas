@@ -6123,7 +6123,6 @@ mod tests {
         assert_eq!(s.world.in_triggers.get(&c), Some(&vec![tr]));
         let ev = &s.world.queue.values().next().unwrap().event;
         assert_eq!(ev.ty, s.event_type("ENTER"));
-        assert_eq!(ev.objects, vec![c]);
         s.world.queue.clear();
         s.move_object(c, [12.0, 20.0, -130.0], None);
         assert!(s.world.queue.is_empty(), "height alone does not leave");
