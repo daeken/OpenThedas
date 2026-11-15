@@ -21,6 +21,8 @@ const NEW_SAVE: u32 = 336_242;
 /// The mage class (`CLASS_WIZARD`, `cla_base.gda` row 2; the scripts' constant, not the
 /// engine's).
 const CLASS_WIZARD: i32 = 2;
+/// `ItemUtils.ITEM_ABILITY_INVALID`: the ability id the movies take as none.
+const ITEM_ABILITY_INVALID: i32 = 200_000;
 
 fn num(v: impl Into<f64>) -> UiValue {
     UiValue::Number(v.into())
@@ -81,6 +83,9 @@ pub fn sim_values(sim: &Sim) -> BTreeMap<String, UiValue> {
 /// keeps for it.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Presentation {
+    /// An item or ability is being dragged between movies (`GUI.StartDragging` until the
+    /// button is released): `GUI.Dragging` reads 1, which the movies' drop targets look for.
+    pub dragging: bool,
     /// The inventory screen's item category tab (`GUIInventory.SetItemListFilter`, see
     /// [`ItemCategory`]); 0 shows every item.
     pub item_filter: i32,
@@ -636,6 +641,7 @@ fn sim_values_with(
             );
         }
     }
+    v.insert("GUI.Dragging".into(), num(shown.dragging as u8));
     v.insert("Paperdoll.CameraMode".into(), num(shown.paperdoll_preset));
     // The creature in character creation as its paperdoll shows it (chargen.gfx's
     // `Paperdoll.PaperCreature`), with the portrait drawn of it, which the appearance page's
@@ -1510,7 +1516,11 @@ fn item(sim: &Sim, prefix: &str, id: u32, v: &mut BTreeMap<String, UiValue>) {
     set("EquippableSlots", num(mask));
     set("StackSize", field("StackSize", 1));
     set("Cost", num(sim.item_value(id)));
-    set("AbilityID", field("AbilityID", -1));
+    // An item that gives no ability reads as `ItemUtils.ITEM_ABILITY_INVALID` (200000, in the
+    // movies' code): the inventory drags such items inside itself (to equip them), and the
+    // others out to the quickbar too.
+    let ability = o.fields.get("AbilityID").copied().filter(|a| *a > 0);
+    set("AbilityID", num(ability.unwrap_or(ITEM_ABILITY_INVALID)));
     set("RecipeID", field("CraftingRecipeID", 0));
     set("Unique", field("Unique", 0));
     let irremovable = if sim.game == thedas_vfs::Game::Origins {
