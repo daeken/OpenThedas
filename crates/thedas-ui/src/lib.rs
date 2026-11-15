@@ -293,6 +293,12 @@ pub fn direct() -> bool {
     *DIRECT.get_or_init(|| std::env::var("THEDAS_UI_DIRECT").map_or(true, |v| v != "0"))
 }
 
+/// `THEDAS_TOKEN_LOG`: log every value pushed to a movie's observers.
+fn token_log() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("THEDAS_TOKEN_LOG").is_some())
+}
+
 pub struct UiMovie {
     pub name: String,
     player: own::OwnMovie,
@@ -310,6 +316,8 @@ pub struct UiMovie {
     fresh: Vec<String>,
     /// How many inline images each text field (by its index, see `avm1::IMG_TAKE`) shows.
     inline_images: std::collections::HashMap<u32, usize>,
+    /// The bridge generation of the last push (see [`UiMovie::sync_tokens`]).
+    synced: Option<u64>,
     /// Clips the movie blends with `multiply` onto the game's picture, drawn in a pass of
     /// their own (see [`MultiplyPass`]), and the texture that pass is copied to.
     multiply_pass: Option<MultiplyPass>,
@@ -488,6 +496,7 @@ impl UiMovie {
             sent: Default::default(),
             fresh: Vec::new(),
             inline_images: Default::default(),
+            synced: None,
             multiply_pass: None,
             multiply_texture: None,
             above_texture: None,
@@ -503,9 +512,25 @@ impl UiMovie {
 
     /// Runs what the movies put off past the host's last step: post-load functions, then
     /// inline-image layout.
+    /// Runs what the glue left for after the step (deferred `onLoad` work, text fields
+    /// that took inline images), when it left anything: the checks read the glue's queues
+    /// without running script, so an idle movie's tick allocates nothing for them.
     fn after_step(&mut self) {
-        self.call(avm1::POST_LOAD_RUN, &[]);
-        self.layout_inline_images();
+        if self.queued("_global.thedas_after.length") > 0 {
+            self.call(avm1::POST_LOAD_RUN, &[]);
+        }
+        if self.queued("_global.thedas_imgtf.length") > 0 {
+            self.layout_inline_images();
+        }
+    }
+
+    /// The number at `path` (an array's `length`), read without running any script; 0 when
+    /// there is none.
+    fn queued(&mut self, path: &str) -> usize {
+        match self.player.player.get_value(path) {
+            thedas_gfx::avm1::value::Value::Number(n) if n >= 1.0 => n as usize,
+            _ => 0,
+        }
     }
 
     /// Draws the inline images of the text fields that took new text (see
@@ -881,14 +906,23 @@ impl UiMovie {
     /// value that changed to `TokenManager.cm_mapCallbacks[id](value)`. `value` answers a
     /// token or returns `None` (the observer is then left alone). Returns the tokens nothing
     /// answered. Provisional, from the movies' bytecode.
-    pub fn sync_tokens(&mut self, value: &dyn Fn(&str) -> Option<UiValue>) -> Vec<String> {
+    /// Only observers whose value changed since the last push (see
+    /// [`protocol::GameBridge::observe`]), and those held back then, are looked at: an idle
+    /// HUD pushes nothing and looks nothing up.
+    pub fn sync_tokens(&mut self, bridge: &protocol::GameBridge) -> Vec<String> {
         const TM: &str = "_global.TokenManager";
-        self.fresh.clear();
-        let take = |m: &mut Self, list: &str| match m
-            .call(&format!("{TM}.{list}.splice"), &[UiValue::Number(0.0)])
-        {
-            UiValue::List(v) => v,
-            _ => Vec::new(),
+        // Those registered last time were held back then: they hear their values now.
+        let deferred = std::mem::take(&mut self.fresh);
+        let take = |m: &mut Self, list: &str| {
+            // Most ticks register nothing: check before splicing (which runs script and
+            // makes an array).
+            if m.queued(&format!("{TM}.{list}.length")) == 0 {
+                return Vec::new();
+            }
+            match m.call(&format!("{TM}.{list}.splice"), &[UiValue::Number(0.0)]) {
+                UiValue::List(v) => v,
+                _ => Vec::new(),
+            }
         };
         let added = take(self, "AddTokenObserverBatchData");
         for t in added.chunks(3) {
@@ -921,18 +955,30 @@ impl UiMovie {
                 self.sent.remove(&id);
             }
         }
+        let since = self.synced;
+        let asks: Vec<(&str, bool)> = self
+            .observers
+            .iter()
+            .map(|(id, token)| (token.as_str(), since.is_none() || deferred.contains(id)))
+            .collect();
+        let (generation, found) = bridge.observe(&asks, since.unwrap_or(0));
+        self.synced = Some(generation);
         let mut missing = Vec::new();
-        let trace = std::env::var_os("THEDAS_TOKEN_LOG").is_some();
-        for (id, token) in self.observers.clone() {
+        let trace = token_log();
+        let pushes: Vec<(String, String, Option<UiValue>)> = self
+            .observers
+            .iter()
+            .zip(found)
             // Registered just now: heard from on the next push, once the clips placed with
             // the registering one exist (inventory.gfx's equipment layout hid nothing when
             // pushed at once). Pushing at once as well (#182) made conversation.gfx loop: its
             // reply and subtitle callbacks place their clips anew, which register anew, so
             // every push re-placed them and the replies never showed.
-            if self.fresh.contains(&id) {
-                continue;
-            }
-            match value(&token) {
+            .filter(|((id, _), _)| !self.fresh.contains(id))
+            .filter_map(|((id, token), f)| f.map(|v| (id.clone(), token.clone(), v)))
+            .collect();
+        for (id, token, value) in pushes {
+            match value {
                 Some(v) => {
                     if self.sent.get(&id) != Some(&v) {
                         if trace {
