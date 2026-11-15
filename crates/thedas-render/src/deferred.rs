@@ -3237,17 +3237,26 @@ fn light_shaft(material: &str) -> bool {
         .any(|k| m.contains(k))
 }
 
-/// Whether emitter light `l` sits within 1.5 m of one of the level's static lights: a torch
-/// or brazier the level already lights (its lamp is authored beside the flame), which an
-/// emitter light would light twice.
+/// Whether emitter light `l` sits beside an authored light that already lights what it
+/// would: within 1.5 m of one of the level's static lights (a torch or brazier's lamp), or
+/// within 3 m of any other light that isn't an emitter's (a visual effect's own light, which
+/// its animations colour and size). An emitter light there would light it twice.
 fn beside_level_light(l: &SceneLight, scene: &[SceneLight]) -> bool {
     let SceneLight::Point { position, name, .. } = l else {
         return false;
     };
     name.starts_with("emitter ")
-        && scene.iter().any(|s| {
-            matches!(s, SceneLight::Point { position: p, is_static: true, .. }
-                if p.distance(*position) < 1.5)
+        && scene.iter().any(|s| match s {
+            SceneLight::Point {
+                position: p,
+                is_static,
+                name,
+                ..
+            } => {
+                let reach = if *is_static { 1.5 } else { 3.0 };
+                !name.starts_with("emitter ") && p.distance(*position) < reach
+            }
+            _ => false,
         })
 }
 
@@ -3391,12 +3400,15 @@ mod tests {
         let spell = point("emitter Sum_Conj_04", Vec3::new(6.0, 0.0, 0.5), false);
         assert!(beside_level_light(&flame, &level));
         assert!(!beside_level_light(&spell, &level));
-        // Only emitter lights are dropped, and only beside static lights.
+        // Only emitter lights are dropped.
         assert!(!beside_level_light(&level[0], &level));
-        assert!(!beside_level_light(
-            &flame,
-            &[point("x", Vec3::new(0.3, 0.0, 2.0), false)]
-        ));
+        // A visual effect's own (dynamic) light within 3 m takes over from its particles'.
+        let fx = |x| [point("flame_c", Vec3::new(x, 0.0, 2.0), false)];
+        assert!(beside_level_light(&flame, &fx(2.0)));
+        assert!(!beside_level_light(&flame, &fx(5.0)));
+        // Other emitter lights don't count.
+        let other = [point("emitter x", Vec3::new(0.3, 0.0, 2.0), false)];
+        assert!(!beside_level_light(&flame, &other));
     }
 
     #[test]
