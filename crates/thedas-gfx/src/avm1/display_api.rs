@@ -104,8 +104,12 @@ fn bounds_transformed(vm: &Vm, d: DisplayId, matrix: Matrix) -> Option<Rect> {
     }
     let mut acc = acc.map(|bounds| matrix.transform_rect(&bounds));
     for child in o.children.values() {
-        let Some(object) = vm.display.get(*child) else { continue };
-        let Some(bounds) = bounds_transformed(vm, *child, matrix.mul(&object.matrix)) else { continue };
+        let Some(object) = vm.display.get(*child) else {
+            continue;
+        };
+        let Some(bounds) = bounds_transformed(vm, *child, matrix.mul(&object.matrix)) else {
+            continue;
+        };
         acc = Some(match acc {
             None => bounds,
             Some(current) => Rect {
