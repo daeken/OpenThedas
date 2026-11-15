@@ -199,6 +199,52 @@ impl Host for OwnHost {
     }
 }
 
+/// Time a movie spends in script and rendering, logged every few seconds when
+/// `THEDAS_UI_PROFILE` is set (a development aid: `RUST_LOG=thedas_ui=info`).
+#[derive(Default)]
+struct Profile {
+    ticks: u64,
+    renders: u64,
+    script_us: u64,
+    render_us: u64,
+    build_us: u64,
+    submit_us: u64,
+    draws: u64,
+    uploads: u64,
+    texts: u64,
+    shapes: u64,
+    since: Option<std::time::Instant>,
+}
+
+impl Profile {
+    fn report(&mut self, movie: &str) {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var_os("THEDAS_UI_PROFILE").is_some()) {
+            return;
+        }
+        let since = *self.since.get_or_insert_with(std::time::Instant::now);
+        if since.elapsed().as_secs_f64() < 3.0 || self.ticks == 0 {
+            return;
+        }
+        let t = self.ticks as f64;
+        let r = self.renders.max(1) as f64;
+        log::info!(
+            "ui profile {movie}: {} ticks, {} renders; per tick script {:.2} ms, render {:.2} ms; per render build {:.2} ms, submit {:.2} ms, {:.0} draws, {:.1} uploads, {:.1} texts rebuilt, {:.1} shapes tessellated",
+            self.ticks,
+            self.renders,
+            self.script_us as f64 / t / 1000.0,
+            self.render_us as f64 / t / 1000.0,
+            self.build_us as f64 / r / 1000.0,
+            self.submit_us as f64 / r / 1000.0,
+            self.draws as f64 / r,
+            self.uploads as f64 / r,
+            self.texts as f64 / r,
+            self.shapes as f64 / r,
+        );
+        *self = Self::default();
+    }
+}
+
 /// A movie on our player, with its renderer.
 pub struct OwnMovie {
     pub player: Player,
@@ -206,6 +252,7 @@ pub struct OwnMovie {
     images: ImageFetch,
     size: (u32, u32),
     gpu: Gpu,
+    profile: Profile,
 }
 
 impl OwnMovie {
@@ -238,6 +285,7 @@ impl OwnMovie {
             images,
             size,
             gpu: gpu.clone(),
+            profile: Profile::default(),
         };
         m.resize(size);
         Ok(m)
@@ -264,7 +312,11 @@ impl OwnMovie {
     }
 
     pub fn tick(&mut self, dt_ms: f64) {
+        let started = std::time::Instant::now();
         self.player.tick(dt_ms);
+        self.profile.script_us += started.elapsed().as_micros() as u64;
+        self.profile.ticks += 1;
+        self.profile.report(&self.player.vm.name);
     }
 
     pub fn run_frame(&mut self) {
@@ -274,8 +326,22 @@ impl OwnMovie {
 
     pub fn render(&mut self) {
         let mut images = self.images.clone();
-        self.renderer
+        let started = std::time::Instant::now();
+        let drew = self
+            .renderer
             .render_if_dirty(&mut self.player, &mut images, self.size);
+        if drew {
+            let r = &self.renderer.stats;
+            let p = &mut self.profile;
+            p.render_us += started.elapsed().as_micros() as u64;
+            p.renders += 1;
+            p.draws += r.draws as u64;
+            p.uploads += r.uploads as u64;
+            p.texts += r.texts_rebuilt as u64;
+            p.shapes += r.shapes_tessellated as u64;
+            p.build_us += r.build_us;
+            p.submit_us += r.submit_us;
+        }
     }
 
     pub fn set_engine_image(&mut self, name: &str, url: Option<&str>) {
