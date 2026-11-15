@@ -2,6 +2,7 @@
 //! [`AreaScene`], plus offscreen capture.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use thedas_formats::dds::{Dds, DdsFormat, DdsKind};
 use thedas_vfs::Vfs;
@@ -578,6 +579,10 @@ pub struct AreaRenderer {
     d3d: crate::d3d_gpu::D3dPass,
     /// Which props have been posed at least once (see [`Self::prop_seen`]).
     posed_props: Vec<bool>,
+    /// Each skeleton's rest matrices inverted, by the rest list they were made from (its
+    /// address, the list held so that the address stays its own): skinning reads them
+    /// every frame.
+    rest_inverses: HashMap<usize, (Arc<Vec<glam::Mat4>>, Vec<glam::Mat4>)>,
     /// (scene draw index, draw) in drawing order.
     opaque: Vec<(usize, DrawRef)>,
     blended: Vec<(usize, DrawRef)>,
@@ -1107,6 +1112,7 @@ impl AreaRenderer {
             stand_in,
             d3d,
             posed_props: Vec::new(),
+            rest_inverses: HashMap::new(),
             opaque,
             blended,
             only_draws: None,
@@ -1459,6 +1465,23 @@ impl AreaRenderer {
         self.d3d.seen_draws()
     }
 
+    /// Places prop `prop` at `transform` in `poses`. `posed` says whether the poses are new
+    /// since the prop was last placed: when they are not, its draws keep the bones they
+    /// were given (a skinning palette is in the model's space, so moving the prop leaves it
+    /// as it is).
+    /// `rest` inverted, node by node (kept: see `rest_inverses`).
+    fn rest_inverse(&mut self, rest: &Arc<Vec<glam::Mat4>>) -> &[glam::Mat4] {
+        let key = Arc::as_ptr(rest) as usize;
+        if !self.rest_inverses.contains_key(&key) {
+            // Rest lists no one else holds any longer go.
+            self.rest_inverses
+                .retain(|_, (r, _)| Arc::strong_count(r) > 1);
+            let inverse = rest.iter().map(|m| m.inverse()).collect();
+            self.rest_inverses.insert(key, (rest.clone(), inverse));
+        }
+        &self.rest_inverses[&key].1
+    }
+
     pub fn pose_prop(
         &mut self,
         ctx: &GpuContext,
@@ -1466,6 +1489,7 @@ impl AreaRenderer {
         prop: usize,
         transform: glam::Mat4,
         poses: &crate::skeleton::Poses,
+        posed: bool,
     ) {
         let Some(p) = scene.props.get(prop) else {
             return;
@@ -1478,6 +1502,8 @@ impl AreaRenderer {
         let attached: std::collections::HashSet<usize> =
             p.attachments.iter().flat_map(|a| a.draws.clone()).collect();
         let pose_of = |s: usize| poses.get(&s);
+        // Each skeleton's skinning matrices, made once for all of its meshes.
+        let mut skins: Vec<(usize, Vec<glam::Mat4>)> = Vec::new();
         for d in p.draws.clone() {
             if attached.contains(&d) {
                 continue;
@@ -1507,9 +1533,27 @@ impl AreaRenderer {
                 self.set_transform(ctx, d, transform * follow * in_model);
             } else {
                 self.set_transform(ctx, d, transform * in_model);
+                if !posed && !self.d3d.bones(d).is_empty() {
+                    continue;
+                }
+                let at = match skins.iter().position(|(k, _)| *k == skin.skeleton) {
+                    Some(at) => at,
+                    None => {
+                        let inverse = self.rest_inverse(rest);
+                        skins.push((
+                            skin.skeleton,
+                            pose.iter().zip(inverse).map(|(p, r)| *p * *r).collect(),
+                        ));
+                        skins.len() - 1
+                    }
+                };
                 self.d3d.set_bones(
                     d,
-                    crate::skeleton::palette_rows(rest, pose, &skin.palette, skin.mesh_node),
+                    crate::skeleton::palette_rows_skinned(
+                        &skins[at].1,
+                        &skin.palette,
+                        skin.mesh_node,
+                    ),
                 );
             }
         }

@@ -23,9 +23,35 @@ pub struct FillLight {
     pub atlas: Option<String>,
 }
 
+/// What the fit says one of the level's own lights was in the bake.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SetLight {
+    pub position: Vec3,
+    /// Its baked twin's brightness in the RGB pass (times the light's colour), when seen.
+    pub baked_brightness: Option<f32>,
+    /// Whether the shadow (alpha) pass took the light.
+    pub in_alpha: bool,
+    /// The share of its radius the shadow pass reached (the bake radius).
+    pub shadow_reach: f32,
+}
+
+impl SetLight {
+    /// How far (as a share of its radius) the light's baked shadow reached: none at all when
+    /// the shadow pass left it out.
+    pub fn reach(&self) -> f32 {
+        if self.in_alpha {
+            self.shadow_reach.clamp(0.0, 1.0)
+        } else {
+            0.0
+        }
+    }
+}
+
 /// A level's fitted light set.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct LightSet {
+    /// The level's own point lights, as the fit saw them in the bake.
+    pub lights: Vec<SetLight>,
     /// Each room's baked ambient (linear), by lower-case room name.
     pub ambient: HashMap<String, Vec3>,
     /// The baked-only fill lights, with the copies neighbouring atlases' fits found merged.
@@ -76,7 +102,29 @@ impl LightSet {
                 });
             }
         }
+        let lights = doc
+            .get("lights")
+            .and_then(|l| l.as_array())
+            .into_iter()
+            .flatten()
+            .filter(|l| l.get("kind").and_then(|k| k.as_str()) == Some("point"))
+            .filter_map(|l| {
+                Some(SetLight {
+                    position: l.get("position").and_then(vec3)?,
+                    baked_brightness: l
+                        .get("baked_brightness")
+                        .and_then(|b| b.as_f64())
+                        .map(|b| b as f32),
+                    in_alpha: l.get("in_alpha").and_then(|a| a.as_bool()).unwrap_or(true),
+                    shadow_reach: l
+                        .get("shadow_reach")
+                        .and_then(|r| r.as_f64())
+                        .map_or(1.0, |r| r as f32),
+                })
+            })
+            .collect();
         Some(LightSet {
+            lights,
             ambient,
             fills: merge(&found),
         })
@@ -138,7 +186,12 @@ mod tests {
         let text = r#"{
             "level": "test",
             "rooms": {"Room_1": {"baked_ambient": [0.1, 0.2, 0.3], "runtime_ambient": null}},
-            "lights": [],
+            "lights": [
+                {"name": "lamp", "kind": "point", "position": [4, 5, 6], "radius": 8,
+                 "color": [1, 1, 1], "baked_brightness": 0.8, "in_alpha": true, "shadow_reach": 0.85},
+                {"name": "fill", "kind": "point", "position": [7, 5, 6], "radius": 8,
+                 "color": [1, 1, 1], "baked_brightness": null, "in_alpha": false, "shadow_reach": 1}
+            ],
             "found": [
                 {"position": [1, 2, 3], "radius": 6, "color": [0.2, 0.0, 0.0], "atlas": "a"},
                 {"position": [1, 2, 3], "radius": 6, "color": [0.4, 0.0, 0.0], "atlas": "a"},
@@ -152,6 +205,11 @@ mod tests {
         assert!((set.fills[0].color.x - 0.3).abs() < 1e-6);
         assert_eq!(set.fills[1].position, Vec3::new(9.0, 2.0, 3.0));
         assert_eq!(set.fills[0].atlas.as_deref(), Some("a"));
+        assert_eq!(set.lights.len(), 2);
+        assert_eq!(set.lights[0].baked_brightness, Some(0.8));
+        assert!((set.lights[0].reach() - 0.85).abs() < 1e-6);
+        assert_eq!(set.lights[1].baked_brightness, None);
+        assert_eq!(set.lights[1].reach(), 0.0);
         assert!(LightSet::parse("[]").is_none());
     }
 }
