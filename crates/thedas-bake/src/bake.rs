@@ -642,6 +642,24 @@ pub fn probe(
         hit.t
     );
     for l in lights {
+        if let LightKind::Directional { toward } = l.kind {
+            let dir = toward.normalize_or_zero();
+            let b = settings.shadow_bias;
+            let hit = scene
+                .bvh
+                .closest_casting(sp + dir * b, dir, 0.0, f32::INFINITY);
+            let _ = writeln!(
+                s,
+                "  sun toward {dir} cos {:.3} blocked by {}",
+                nf.dot(dir),
+                hit.map(|h| format!(
+                    "{} at {:.2}",
+                    name(scene.bvh.tris[h.tri as usize].draw),
+                    h.t
+                ))
+                .unwrap_or_else(|| "nothing".into())
+            );
+        }
         if let LightKind::Point { position, radius } = l.kind {
             let to = position - sp;
             let d = to.length();
