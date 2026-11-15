@@ -1396,6 +1396,7 @@ impl Sim {
             arrived: false,
             da2_target_prepared: false,
             path: Vec::new(),
+            turned_at: None,
         };
         self.da2_default_attack_command(&mut cmd);
         if let Some(o) = self.world.get_mut(attacker) {
@@ -1511,6 +1512,7 @@ impl Sim {
             arrived: false,
             da2_target_prepared: false,
             path: Vec::new(),
+            turned_at: None,
         };
         if let Some(o) = self.world.get_mut(who).filter(|o| o.commands.is_empty()) {
             o.commands.push(cmd);
@@ -3737,6 +3739,7 @@ mod tests {
                 arrived: false,
                 da2_target_prepared: false,
                 path: Vec::new(),
+                turned_at: None,
             });
         s.world.get_mut(rogue).unwrap().combat.attack = Some(AttackResult {
             results: [0, 2],

@@ -3019,6 +3019,7 @@ pub fn call(
                 arrived: false,
                 da2_target_prepared: false,
                 path: Vec::new(),
+                turned_at: None,
             };
             // The first float is a wait's seconds or a move's minimum range. Keep
             // MoveToObject's second float as its maximum (0x66f260, clamp at 0x66f312).
@@ -11369,6 +11370,7 @@ mod tests {
                 arrived: false,
                 da2_target_prepared: false,
                 path: vec![],
+                turned_at: None,
             });
         assert_eq!(
             conjuring(&mut s),
