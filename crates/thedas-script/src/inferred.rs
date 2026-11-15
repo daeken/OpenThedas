@@ -25,6 +25,21 @@ fn p(ty: Type, name: &str, default: Option<&str>) -> Param {
 pub fn inferred() -> Vec<Function> {
     vec![
         Function {
+            id: 396,
+            name: "AddToParty".into(),
+            ret: Type::Void,
+            params: vec![
+                p(Type::Object, "oCreature", None),
+                p(Type::Object, "oUnusedPlayer", None),
+            ],
+        },
+        Function {
+            id: 397,
+            name: "RemoveFromParty".into(),
+            ret: Type::Void,
+            params: vec![p(Type::Object, "oCreature", None)],
+        },
+        Function {
             id: 859,
             name: "Inferred859_GetIntArray".into(),
             ret: Type::Array(Box::new(Type::Int)),

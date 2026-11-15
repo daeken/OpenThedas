@@ -3750,13 +3750,44 @@ pub fn call(
                     .unwrap_or(hero_default),
             ))
         }
-        "SetFollowerState" => {
-            let (who, state) = (obj(a, 0), int(a, 1));
+        "SetFollowerState" | "AddToParty" | "RemoveFromParty" => {
+            let legacy = name != "SetFollowerState";
+            if legacy
+                && (h.sim.game != thedas_vfs::Game::Origins
+                    || !matches!((name, f.id), ("AddToParty", 396) | ("RemoveFromParty", 397)))
+            {
+                return None;
+            }
+            let who = obj(a, 0);
+            if legacy
+                && (!h
+                    .object(who)
+                    .is_some_and(|o| o.kind == ObjectKind::Creature)
+                    || !h
+                        .sim
+                        .world
+                        .party
+                        .and_then(|p| h.object(p))
+                        .is_some_and(|p| p.kind == ObjectKind::Party))
+            {
+                return void();
+            }
+            // 0x65e560/0x65e5c0 call the same 0x63b9a0 state setter as
+            // SetFollowerState, with literal 1/0. AddToParty's player is unused.
+            let state = match name {
+                "AddToParty" => 1,
+                "RemoveFromParty" => 0,
+                _ => int(a, 1),
+            };
             if h.object(who).is_none() {
                 return void();
             }
-            let active = state == constant(&h.sim.table, "FOLLOWER_STATE_ACTIVE")
-                || state == constant(&h.sim.table, "FOLLOWER_STATE_LOCKEDACTIVE");
+            let active = if legacy {
+                name == "AddToParty"
+            } else {
+                state == constant(&h.sim.table, "FOLLOWER_STATE_ACTIVE")
+                    || state == constant(&h.sim.table, "FOLLOWER_STATE_LOCKEDACTIVE")
+            };
             if let Some(o) = h.sim.world.get_mut(who) {
                 o.fields.insert("FollowerState".into(), state);
             }
@@ -6531,6 +6562,152 @@ mod tests {
             script: "test".into(),
         };
         assert!(call(&mut h, owner, &f, &[]).is_none());
+    }
+
+    fn legacy_party_sim() -> (Sim, ObjectId, ObjectId) {
+        let table = EngineTable::parse(b"void SetFollowerState(object o, int s) = 706;\nint FOLLOWER_STATE_ACTIVE = 1;\nint FOLLOWER_STATE_LOCKEDACTIVE = 5;\n").unwrap().with_inferred();
+        let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(table), 1);
+        let module = s.world.spawn(ObjectKind::Module, "module");
+        s.world.module = Some(module);
+        let hero = s.world.spawn(ObjectKind::Creature, "hero");
+        s.world.hero = Some(hero);
+        let party = s.world.spawn(ObjectKind::Party, "party");
+        s.world.party = Some(party);
+        let other = s.world.spawn(ObjectKind::Creature, "other");
+        let h = s.world.get_mut(hero).unwrap();
+        h.position = [1.0, 2.0, 3.0];
+        h.group = 8;
+        let o = s.world.get_mut(other).unwrap();
+        o.active = false;
+        o.area = Some(module);
+        (s, hero, other)
+    }
+
+    #[test]
+    fn legacy_party_natives_match_literal_follower_states_and_ignore_the_old_player_argument() {
+        let (mut legacy, hero, other) = legacy_party_sim();
+        let (mut modern, _, _) = legacy_party_sim();
+        assert_eq!(
+            legacy.table.function_for_call(396, 2).unwrap().name,
+            "AddToParty"
+        );
+        assert_eq!(
+            legacy.table.function_for_call(397, 1).unwrap().name,
+            "RemoveFromParty"
+        );
+        for player in [OBJECT_INVALID, hero, other] {
+            run(
+                &mut legacy,
+                hero,
+                "AddToParty",
+                &[Value::Object(other), Value::Object(player)],
+            );
+            run(
+                &mut modern,
+                hero,
+                "SetFollowerState",
+                &[Value::Object(other), Value::Int(1)],
+            );
+            assert_eq!(
+                serde_json::to_value(&legacy.world).unwrap(),
+                serde_json::to_value(&modern.world).unwrap()
+            );
+            assert_eq!(legacy.world.get(hero).unwrap().followers, vec![other]);
+            let o = legacy.world.get(other).unwrap();
+            assert_eq!(o.fields.get("FollowerState"), Some(&1));
+            assert_eq!(o.group, 8);
+            assert_eq!(o.position, [1.0, 2.0, 3.0]);
+            assert!(o.active);
+        }
+        for _ in 0..2 {
+            run(
+                &mut legacy,
+                hero,
+                "RemoveFromParty",
+                &[Value::Object(other)],
+            );
+            run(
+                &mut modern,
+                hero,
+                "SetFollowerState",
+                &[Value::Object(other), Value::Int(0)],
+            );
+            assert_eq!(
+                serde_json::to_value(&legacy.world).unwrap(),
+                serde_json::to_value(&modern.world).unwrap()
+            );
+            assert!(legacy.world.get(hero).unwrap().followers.is_empty());
+            assert_eq!(
+                legacy.world.get(other).unwrap().fields.get("FollowerState"),
+                Some(&0)
+            );
+            assert!(
+                legacy.world.queue.is_empty(),
+                "these handlers do not synthesize party-picker notifications"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_party_natives_require_the_player_party_and_a_creature() {
+        let (mut s, hero, other) = legacy_party_sim();
+        let item = s.world.spawn(ObjectKind::Item, "item");
+        for id in [item, OBJECT_INVALID, 123456789] {
+            run(
+                &mut s,
+                hero,
+                "AddToParty",
+                &[Value::Object(id), Value::Object(hero)],
+            );
+            run(&mut s, hero, "RemoveFromParty", &[Value::Object(id)]);
+        }
+        assert!(s.world.get(hero).unwrap().followers.is_empty());
+        assert!(
+            !s.world
+                .get(item)
+                .unwrap()
+                .fields
+                .contains_key("FollowerState")
+        );
+        s.world.party = None;
+        run(
+            &mut s,
+            hero,
+            "AddToParty",
+            &[Value::Object(other), Value::Object(hero)],
+        );
+        run(&mut s, hero, "RemoveFromParty", &[Value::Object(other)]);
+        assert!(
+            !s.world
+                .get(other)
+                .unwrap()
+                .fields
+                .contains_key("FollowerState")
+        );
+    }
+
+    #[test]
+    fn legacy_party_natives_leave_da2_dispatch_unchanged() {
+        let (mut s, hero, other) = legacy_party_sim();
+        s.game = thedas_vfs::Game::DragonAge2;
+        for name in ["AddToParty", "RemoveFromParty"] {
+            let f = s.table.function_by_name(name).unwrap().clone();
+            let mut h = ScriptHost {
+                sim: &mut s,
+                event: None,
+                script: "test".into(),
+            };
+            assert!(
+                call(
+                    &mut h,
+                    hero,
+                    &f,
+                    &[Value::Object(other), Value::Object(hero)]
+                )
+                .is_none()
+            );
+        }
+        assert!(s.world.get(hero).unwrap().followers.is_empty());
     }
 
     #[test]
