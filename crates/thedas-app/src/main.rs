@@ -3120,6 +3120,11 @@ impl App {
     /// way finished once its screenshot and note are in.
     fn report_frame(&mut self, dt_ms: f64) {
         let context = report::frame_context(self);
+        let dt_ms = self
+            .gfx
+            .as_ref()
+            .and_then(|g| g.frames.last_frame_ms())
+            .unwrap_or(dt_ms);
         self.recorder.frame(dt_ms, context);
         for a in std::mem::take(&mut self.mark_answers) {
             self.mark_answer(a);
