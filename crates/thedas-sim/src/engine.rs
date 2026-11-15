@@ -1158,6 +1158,12 @@ pub fn call(
         // --- Objects ----------------------------------------------------------------------
         "GetModule" => ok(Value::Object(h.sim.world.module.unwrap_or(OBJECT_INVALID))),
         "GetHero" => ok(Value::Object(h.sim.world.hero.unwrap_or(OBJECT_INVALID))),
+        // Origins command 438 (0x661870 -> 0x5d5ca0) reads the player's controlled
+        // object id at +0x5c, also used by GetMainControlled (0x660ae0). It does
+        // not read the conversation owner or require an open conversation.
+        "GetPCSpeaker" if h.sim.game == thedas_vfs::Game::Origins => ok(Value::Object(
+            h.sim.world.controlled().unwrap_or(OBJECT_INVALID),
+        )),
         "GetPartyLeader" | "GetMainControlled" => ok(Value::Object(
             h.sim.world.controlled().unwrap_or(OBJECT_INVALID),
         )),
@@ -6390,6 +6396,38 @@ mod tests {
         assert_eq!(s.world.get(hero).unwrap().combat.cooldowns.len(), 6);
         s.world.time_ms = 3000;
         assert!(list(&mut s, hero, 0, 1).is_empty());
+    }
+
+    #[test]
+    fn origins_get_pc_speaker_returns_the_controlled_party_member_without_a_conversation() {
+        let table = EngineTable::parse(b"object GetPCSpeaker() = 438;").unwrap();
+        let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(table), 1);
+        let owner = s.world.spawn(ObjectKind::Placeable, "sarcophagus");
+        assert_eq!(
+            run(&mut s, owner, "GetPCSpeaker", &[]),
+            Some(Value::Object(OBJECT_INVALID))
+        );
+        let hero = s.world.spawn(ObjectKind::Creature, "hero");
+        let follower = s.world.spawn(ObjectKind::Creature, "follower");
+        s.world.hero = Some(hero);
+        s.world.get_mut(hero).unwrap().followers.push(follower);
+        assert_eq!(
+            run(&mut s, owner, "GetPCSpeaker", &[]),
+            Some(Value::Object(hero))
+        );
+        s.world.controlled = Some(follower);
+        assert_eq!(
+            run(&mut s, owner, "GetPCSpeaker", &[]),
+            Some(Value::Object(follower))
+        );
+        s.game = thedas_vfs::Game::DragonAge2;
+        let f = s.table.function_by_name("GetPCSpeaker").cloned().unwrap();
+        let mut h = ScriptHost {
+            sim: &mut s,
+            event: None,
+            script: "test".into(),
+        };
+        assert!(call(&mut h, owner, &f, &[]).is_none());
     }
 
     #[test]

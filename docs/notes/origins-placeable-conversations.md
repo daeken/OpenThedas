@@ -58,3 +58,22 @@ plate's creator. That information is lost: the fix does not guess a creator on
 load. Resume the supplied earlier `dwarf_noble_03_bdn200ar_ruined_taig.json`
 and enter the chamber freshly. Saves made after the fix preserve creators through
 save/reload, covered by a synthetic ENTER/EXIT/heartbeat test.
+
+## The signet-ring reply
+
+With those two blockers removed, the shipped chamber probe sets all three plate
+flags and CAN_SOLVE, but CAN_USE_RING stays false: `GetPCSpeaker` was unanswered.
+The plot condition compares that function's result with the hero before offering
+the ring reply.
+
+In the same pinned exe, command 438 at `0x661870` calls `0x5d5ca0`, which reads
+the player record at global `0xc327ec` + `0xd0`, returning its `+0x5c` object id
+(or OBJECT_INVALID without a player record). This is the controlled creature:
+`GetMainControlled`'s handler `0x660ae0` calls the same getter. `0x69d540` changes
+that id at `0x69d58e` using the selected object's id, reached from the party
+control path `0x62f260`. It is independent of conversation state or owner.
+
+Origins now answers `GetPCSpeaker` with the existing controlled-party-member
+lookup. A regression test covers no player, the hero, a selected follower, and
+the unchanged unanswered DA2 path. This also works during reply conditions,
+when the conversation walker temporarily owns the conversation outside `talk`.
