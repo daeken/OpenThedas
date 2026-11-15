@@ -1071,6 +1071,7 @@ impl DeferredPass {
                             is_static: true,
                             version: 0,
                             intensity: 1.0,
+                            flicker: None,
                             room: f.atlas.as_deref().and_then(atlas_room),
                         })
                         .collect()
@@ -3158,6 +3159,7 @@ pub fn emitter_light(e: &crate::particles::EmitterState) -> Option<SceneLight> {
         is_static: false,
         version: 1,
         intensity: 1.0,
+        flicker: None,
         room: None,
     })
 }

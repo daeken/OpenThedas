@@ -68,6 +68,7 @@ fn cut_scene_lights(
                     domain,
                     is_static,
                     version,
+                    flicker,
                     ..
                 } => Some(SceneLight::Point {
                     position: placed.transform_point3(*position),
@@ -78,6 +79,7 @@ fn cut_scene_lights(
                     is_static: *is_static,
                     version: *version,
                     intensity: l.show.intensity.unwrap_or(1.0),
+                    flicker: *flicker,
                     room: None,
                 }),
                 SceneLight::Ambient { .. } => None,
