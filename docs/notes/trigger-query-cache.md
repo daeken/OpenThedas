@@ -18,11 +18,11 @@ is refreshed. The helper **0x6ae2b0** independently searches the same list throu
 **0x8663a0**.
 
 OpenThedas already stores creature membership in `World::in_triggers` and refreshes
-it during `Sim::update_triggers`. The Origins script query can use that existing
+it during `Sim::update_triggers`. The Origins script query now uses that existing
 list rather than testing geometry at query time. DA2's current geometric query is
 outside this trace. The change requires no new saved field.
 
-The synthetic regression should check false before a refresh, true after entering,
+The synthetic regression checks false before a refresh, true after entering,
 the retained cached answer after a direct position edit, false after the next
 refresh, rejection of a non-creature first argument, and unchanged DA2 geometry
 queries. Querying must not queue membership events as a side effect.
