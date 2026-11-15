@@ -2532,7 +2532,9 @@ impl Sim {
 
     /// Queues ENTER for triggers a creature is now in and EXIT for ones it left. Origins'
     /// outline test is on XY (0x799130), with authored offsets translated without facing
-    /// rotation (0x7997cf). Provisional: the creature is the event's creator and object 0.
+    /// rotation (0x7997cf). Origins' sender (0x698850) gives the events the creature as
+    /// creator and event target, integer 0 = 0, and the receiving trigger in object slot 0.
+    /// DA2 keeps its provisional payload; membership timing is separate.
     pub fn update_triggers(&mut self, id: ObjectId) {
         let Some(o) = self.world.get(id) else { return };
         if o.kind != ObjectKind::Creature {
@@ -2552,7 +2554,13 @@ impl Sim {
             let other = if name == "ENTER" { &before } else { &now };
             for &t in list.iter().filter(|t| !other.contains(t)) {
                 let mut ev = self.new_event(name, Some(id));
-                ev.objects = vec![id];
+                if self.game == thedas_vfs::Game::Origins {
+                    ev.target = Some(id);
+                    ev.ints = vec![0];
+                    ev.objects = vec![t];
+                } else {
+                    ev.objects = vec![id];
+                }
                 self.world.queue_event(0, t, ev, None);
             }
         }
@@ -6604,13 +6612,96 @@ mod tests {
             .values()
             .map(|q| (q.target, q.event.objects.clone()))
             .collect();
-        assert_eq!(q, vec![(tr, vec![c])]);
+        assert_eq!(q, vec![(tr, vec![tr])]);
         s.world.queue.clear();
         s.move_object(c, [10.2, 10.2, 0.0], None);
         assert!(s.world.queue.is_empty(), "still inside: no new event");
         s.move_object(c, [20.0, 10.0, 0.0], None);
         assert_eq!(s.world.queue.len(), 1);
         assert!(!s.world.in_triggers.contains_key(&c));
+    }
+
+    #[test]
+    fn trigger_event_fields_reach_scripts_with_distinct_target_and_receiver() {
+        let table = Arc::new(
+            EngineTable::parse(
+                b"#define ENGINE_STRUCTURE_0 event\n\
+                event GetCurrentEvent() = 0;\n\
+                object GetEventCreator(event e) = 1;\n\
+                object GetEventTarget(event e) = 2;\n\
+                object GetEventObject(event e, int index) = 3;\n\
+                void SetLocalObject(object o, string key, object value) = 4;\n\
+                int GetEventInteger(event e, int index) = 5;\n\
+                int GetEventType(event e) = 6;\n\
+                void SetLocalInt(object o, string key, int value) = 7;\n\
+                int EVENT_TYPE_ENTER = 8;\nint EVENT_TYPE_EXIT = 9;\n",
+            )
+            .unwrap(),
+        );
+        // Store the fields returned by the event getters on OBJECT_SELF. This tests the
+        // event after delivery, where an absent event target defaults to the receiver.
+        let mut body = Vec::new();
+        for (key, getter, indexed, integer) in [
+            ("creator", 1, false, false),
+            ("target", 2, false, false),
+            ("object0", 3, true, false),
+            ("integer0", 5, true, true),
+            ("type", 6, false, true),
+        ] {
+            if indexed {
+                body.extend([0x04, 0x03, 0, 0, 0, 0]);
+            }
+            body.extend([0x05, 0x00, 0, 0, 0]); // GetCurrentEvent()
+            body.extend([0x05, 0x00, 0, getter, if indexed { 2 } else { 1 }]);
+            body.extend([0x04, 0x05]);
+            body.extend((key.len() as u16).to_be_bytes());
+            body.extend(key.as_bytes());
+            body.extend([0x04, 0x06, 0, 0, 0, 0]); // OBJECT_SELF
+            body.extend([0x05, 0x00, 0, if integer { 7 } else { 4 }, 3]);
+        }
+        body.extend([0x20, 0x00]);
+        let mut bytes = b"NCS V1.0B".to_vec();
+        bytes.extend(((13 + body.len()) as u32).to_be_bytes());
+        bytes.extend(body);
+        let script = Ncs::parse(&bytes).unwrap();
+        for game in [thedas_vfs::Game::Origins, thedas_vfs::Game::DragonAge2] {
+            let mut s = Sim::new(Arc::new(Vfs::new()), table.clone(), 7);
+            s.game = game;
+            s.add_script("event_fields", script.clone());
+            let area = s.world.spawn(ObjectKind::Area, "a");
+            let tr = s.world.spawn(ObjectKind::Trigger, "t");
+            let c = s.world.spawn(ObjectKind::Creature, "c");
+            let t = s.world.get_mut(tr).unwrap();
+            t.area = Some(area);
+            t.position = [10.0, 10.0, 0.0];
+            t.script = Some("event_fields".into());
+            t.geometry = vec![
+                [-1.0, -1.0, 0.0],
+                [1.0, -1.0, 0.0],
+                [1.0, 1.0, 0.0],
+                [-1.0, 1.0, 0.0],
+            ];
+            s.world.get_mut(c).unwrap().area = Some(area);
+            for (pos, ty) in [([10.0, 10.0, 0.0], 8), ([20.0, 10.0, 0.0], 9)] {
+                s.move_object(c, pos, None);
+                let mut queued = std::mem::take(&mut s.world.queue).into_values();
+                let q = queued.next().unwrap();
+                assert!(queued.next().is_none());
+                assert_eq!(q.target, tr);
+                s.deliver(q.target, q.event, q.script);
+                let locals = &s.world.get(tr).unwrap().locals;
+                assert_eq!(locals.objects.get("creator"), Some(&c));
+                let (target, object0) = if game == thedas_vfs::Game::Origins {
+                    (c, tr)
+                } else {
+                    (tr, c)
+                };
+                assert_eq!(locals.objects.get("target"), Some(&target));
+                assert_eq!(locals.objects.get("object0"), Some(&object0));
+                assert_eq!(locals.ints.get("integer0"), Some(&0));
+                assert_eq!(locals.ints.get("type"), Some(&ty));
+            }
+        }
     }
 
     #[test]
