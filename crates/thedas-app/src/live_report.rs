@@ -44,7 +44,7 @@ impl Live {
                     "first_draw_world": objects.renderer.draw_world(prop.draws.start).map(|m| m.to_cols_array()),
                     "animations": clip.as_ref().map(|c| crate::report::clip_snapshot(&self.animator, c)),
                     "look_at": self.looks.report(*id), "opacity": opacity,
-                    "camera_fade": self.opacity.get(id),
+                    "fade_multiplier": self.opacity.get(id),
                     "attached_vfx": self.effects.as_ref().map(|effects| effects.key.iter()
                         .filter(|(owner, _, _)| owner == id)
                         .flat_map(|(_, _, keys)| keys).collect::<Vec<_>>()).unwrap_or_default(),
