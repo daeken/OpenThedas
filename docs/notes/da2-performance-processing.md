@@ -67,6 +67,12 @@ Its observed decisions include:
   Ability has an exception. The insertion helpers are `0x5c47f0` for the
   front and `0x72ce60` for the back.
 
+Comparator `0x60fe40` checks command type, the static-state field and the
+origin field first. When both parameter objects exist it delegates to their
+virtual `+8` comparison; a nonzero comparison rejects equality. It does not
+compare the executor's elapsed/deadline state or the entire runtime record.
+The individual parameter-object comparisons remain to be audited.
+
 The `commands` table supplies different add policies for movement, attack,
 and ability commands, including different same-type and different-type
 behavior for Use Ability. The script API's front argument alone therefore
