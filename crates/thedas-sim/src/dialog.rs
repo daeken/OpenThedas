@@ -1845,6 +1845,49 @@ mod tests {
     }
 
     #[test]
+    fn repeated_player_talk_commands_wait_for_an_origins_ambient_line() {
+        for game in [thedas_vfs::Game::Origins, thedas_vfs::Game::DragonAge2] {
+            let (mut sim, hero, npc) = passers_by();
+            sim.game = game;
+            sim.table = std::sync::Arc::new(
+                thedas_script::EngineTable::parse(b"int EVENT_TYPE_DIALOGUE = 18;").unwrap(),
+            );
+            sim.world.trace.keep = true;
+            let area = sim.world.spawn(crate::world::ObjectKind::Area, "street");
+            sim.world.area = Some(area);
+            sim.world.get_mut(hero).unwrap().area = Some(area);
+            sim.world.get_mut(npc).unwrap().area = Some(area);
+            assert!(sim.open_conversation(hero, npc, remarks("beggar", &["one"], true), None));
+            assert_eq!(
+                said(&sim),
+                ["one"],
+                "the speaker starts in the current area"
+            );
+            let requested = |sim: &Sim| {
+                sim.world.trace.entries.iter().any(|e| {
+                    matches!(e, TraceEntry::EventQueued { target, ty: 18, .. } if *target == npc)
+                })
+            };
+            // The actual click path dispatches DIALOGUE to creature_core/rules_core;
+            // testing BeginConversation alone misses UT_Talk's ClearAmbientDialogs.
+            for _ in 0..6 {
+                sim.order_talk(hero, npc);
+                sim.tick(600);
+            }
+            assert_eq!(requested(&sim), game != thedas_vfs::Game::Origins);
+            assert_eq!(said(&sim), ["one"]);
+            sim.tick(u64::from(AMBIENT_LINE_MS));
+            sim.world.trace.entries.clear();
+            sim.order_talk(hero, npc);
+            sim.tick(600);
+            assert!(
+                requested(&sim),
+                "a new click is accepted after the line ends"
+            );
+        }
+    }
+
+    #[test]
     fn a_speaker_says_one_ambient_conversation_and_can_be_stopped() {
         let (mut sim, hero, npc) = passers_by();
         let d = remarks("guard", &["one", "two"], false);
