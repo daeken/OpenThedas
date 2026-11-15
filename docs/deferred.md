@@ -358,6 +358,26 @@ debug views now include the ground. Terrain also joins the point-shadow caster l
 - With baked lighting on, static lights and static geometry still depend on `lm.a`.
   The experimental lightmaps-off mode below lets static lights use the point-shadow pool.
 
+## Lightmap modes
+
+The deferred path's treatment of the baked lightmaps is chosen once per process:
+`thedas-app --lighting baked|hybrid|realtime`, the launcher's "Deferred lighting" choice,
+`thedas_render::set_baked_lighting` before the first renderer is made, or
+`THEDAS_DEFERRED_BAKED_LIGHTING` (`0` realtime, `bounce`/`hybrid` hybrid). The faithful
+path ignores it.
+
+- `baked` (default): lightmap RGB is the baked bounce, alpha the baked direct visibility,
+  as Static1 uses them.
+- `hybrid`: the lightmaps keep only their bounce. Static point lights compete with the
+  dynamic ones for the sixteen cube shadow slots; a static light holding one takes its
+  cube's visibility in place of the baked mask (and, like a dynamic light, not the sun's
+  mask). Where a sun cascade covers a point, the sun takes the cascade's visibility alone.
+  Lights without a cube and the sun outside the cascades keep the baked mask, so nothing
+  leaks where runtime visibility is unknown. Characters and placeables now shadow the
+  level's own torches and the sun's light the same way the lightmaps shadowed static
+  geometry. The bounce stays baked: it does not move with doors, characters or spells.
+- `realtime`: below.
+
 ## Real-time lighting in place of lightmaps (experimental)
 
 Lightmap rgb is the baked bounce and the baked-only lights; `lm.a` the baked visibility.
