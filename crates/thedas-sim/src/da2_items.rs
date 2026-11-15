@@ -15,6 +15,74 @@ fn number(cell: Option<&Cell>) -> Option<f32> {
 }
 
 impl Sim {
+    /// Native item-effect initialization (0x57c8f0 -> 0x56ef50): passive type 1
+    /// and types above 4 build the row's effect; 0/3/4 do not, and type 2 uses
+    /// a separate on-hit wrapper. Parameters are filled by 0x54d7d0, with the
+    /// selected parameter scaled exactly as the item-power query does.
+    pub(crate) fn da2_item_property_effects(
+        &self,
+        item: ObjectId,
+        properties: &[(i32, i32)],
+    ) -> Vec<crate::world::Effect> {
+        let Some(table) = self.world.tables.get(12001, "") else {
+            return Vec::new();
+        };
+        properties
+            .iter()
+            .filter_map(|&(property, power)| {
+                let row = i64::from(property);
+                let get = |column| number(table.cell_by_hash(column, row)).unwrap_or(0.);
+                let int = |column| crate::engine::cell_int(table.cell_by_hash(column, row));
+                let kind = int(0x12a0_2374);
+                if kind != 1 && kind <= 4 {
+                    return None;
+                }
+                let ty = int(0x3ba0_7a8a);
+                if ty == 0 {
+                    return None;
+                }
+                let mut ints = vec![int(0xa363_0beb), int(0xba78_3aaa)];
+                let mut floats = vec![get(0x8619_84a9), get(0x9f02_b5e8)];
+                // Use this entry's power, including when removing a property that
+                // has already been taken out of the item's live property list.
+                match int(0x3600_1b03) {
+                    selected @ (1 | 2) => {
+                        let base = self.da2_item_power_before_parameter(
+                            item,
+                            property,
+                            power as f32,
+                            &mut vec![property],
+                        );
+                        let parameter = &mut ints[(selected - 1) as usize];
+                        // 0x54dad7/0x54daf4 multiply the stored float base by the
+                        // integer field, add 0.5, then truncate. Keep that product
+                        // wider until conversion; the float query rounds it earlier.
+                        *parameter = (f64::from(base) * f64::from(*parameter) + 0.5) as i32;
+                    }
+                    selected @ (3 | 4) => {
+                        floats[(selected - 3) as usize] = self.da2_scale_item_power(
+                            item,
+                            property,
+                            power as f32,
+                            &mut vec![property],
+                        );
+                    }
+                    _ => {}
+                }
+                Some(crate::world::Effect {
+                    ty,
+                    creator: Some(item),
+                    ints,
+                    floats,
+                    // Native 0x56f0a2: the internal lifetime for an equipped
+                    // item's effect is 4, distinct from script permanent (3).
+                    duration_type: 4,
+                    ..Default::default()
+                })
+            })
+            .collect()
+    }
+
     pub(crate) fn da2_item_property_ids(&self, item: ObjectId, desired: i32) -> Vec<i32> {
         if !self
             .world
@@ -81,7 +149,7 @@ impl Sim {
         result
     }
 
-    fn da2_scale_item_power(
+    fn da2_item_power_before_parameter(
         &self,
         item: ObjectId,
         property: i32,
@@ -154,13 +222,35 @@ impl Sim {
             };
             value *= base * material;
         }
+        value
+    }
+
+    fn da2_scale_item_power(
+        &self,
+        item: ObjectId,
+        property: i32,
+        power: f32,
+        stack: &mut Vec<i32>,
+    ) -> f32 {
+        let Some(table) = self.world.tables.get(12001, "") else {
+            return 0.;
+        };
+        let row = i64::from(property);
+        if !table.rows.contains_key(&row) {
+            return 0.;
+        }
+        let get = |hash| number(table.cell_by_hash(hash, row)).unwrap_or(0.);
+        let mut value = self.da2_item_power_before_parameter(item, property, power, stack);
         let kind = get(0x3600_1b03) as i32;
-        value *= match kind {
-            1 => get(0xa363_0beb),
-            2 => get(0xba78_3aaa),
-            3 => get(0x8619_84a9),
-            4 => get(0x9f02_b5e8),
-            _ => 1.,
+        value = match kind {
+            1 | 2 => {
+                let column = if kind == 1 { 0xa363_0beb } else { 0xba78_3aaa };
+                let parameter = crate::engine::cell_int(table.cell_by_hash(column, row));
+                (f64::from(value) * f64::from(parameter)) as f32
+            }
+            3 => value * get(0x8619_84a9),
+            4 => value * get(0x9f02_b5e8),
+            _ => value,
         };
         if matches!(kind, 3 | 4) && get(0x6e49_06c5) != 0. {
             // 0x52fb40 rounds absolute magnitude, with a minimum magnitude of one.
@@ -283,5 +373,173 @@ mod tests {
         // A malformed damage property referring to its own damage type terminates.
         s.world.get_mut(item).unwrap().item_properties = Some(vec![(107, 1)]);
         assert_eq!(s.da2_item_property_power(item, 107, true), 0.);
+    }
+
+    fn worn_sim() -> (Sim, ObjectId) {
+        let table = EngineTable::parse(
+            b"int PROPERTY_DEPLETABLE_HEALTH = 7;\nint EFFECT_DURATION_TYPE_INSTANT = 1;\n",
+        )
+        .unwrap();
+        let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(table), 1);
+        s.game = thedas_vfs::Game::DragonAge2;
+        let cols = [
+            "#12a02374",
+            "#3ba07a8a",
+            "#a3630beb",
+            "#ba783aaa",
+            "#861984a9",
+            "#9f02b5e8",
+            "#36001b03",
+            "#7687ce29",
+            "#6f9cff68",
+            "#6e4906c5",
+            "#3da734c4",
+        ];
+        let row = |kind, effect, property| {
+            vec![
+                Cell::Int(kind),
+                Cell::Int(effect),
+                Cell::Int(property),
+                Cell::Int(0),
+                Cell::Float(0.5),
+                Cell::Float(0.25),
+                Cell::Int(3),
+                Cell::Float(1.),
+                Cell::Float(2.),
+                Cell::Int(1),
+                Cell::Int(1),
+            ]
+        };
+        s.world.tables().insert(
+            "#12001",
+            &cols,
+            vec![
+                (700, row(1, 104, 7)),
+                (701, row(5, 104, 26)),
+                (702, row(2, 104, 7)),
+                (703, row(3, 104, 7)),
+                (704, row(4, 104, 7)),
+                (705, row(6, 0, 7)),
+                (
+                    706,
+                    vec![
+                        Cell::Int(1),
+                        Cell::Int(104),
+                        Cell::Int(2),
+                        Cell::Int(16_777_217),
+                        Cell::Float(0.5),
+                        Cell::Float(0.25),
+                        Cell::Int(1),
+                        Cell::Float(0.),
+                        Cell::Float(1.2),
+                        Cell::Int(0),
+                        Cell::Int(1),
+                    ],
+                ),
+                (
+                    707,
+                    vec![
+                        Cell::Int(1),
+                        Cell::Int(104),
+                        Cell::Int(16_777_217),
+                        Cell::Int(0),
+                        Cell::Float(0.5),
+                        Cell::Float(0.25),
+                        Cell::Int(1),
+                        Cell::Float(0.),
+                        Cell::Float(1.000_000_119_209_289_6),
+                        Cell::Int(0),
+                        Cell::Int(1),
+                    ],
+                ),
+            ],
+        );
+        let item = s.world.spawn(ObjectKind::Item, "armor");
+        let o = s.world.get_mut(item).unwrap();
+        o.fields.insert("Level".into(), 4);
+        o.item_properties = Some(vec![
+            (700, 2),
+            (701, 1),
+            (702, 1),
+            (703, 1),
+            (704, 1),
+            (705, 1),
+        ]);
+        (s, item)
+    }
+
+    #[test]
+    fn worn_da2_properties_build_scaled_effects_from_the_da2_table() {
+        let (mut s, item) = worn_sim();
+        let effects = s.property_effects(item);
+        assert_eq!(effects.len(), 2, "passive and base-item effects only");
+        assert_eq!(effects[0].ty, 104);
+        assert_eq!(effects[0].ints, [7, 0]);
+        assert_eq!(effects[0].floats, [6., 0.25]);
+        assert_eq!(effects[1].ints, [26, 0]);
+        assert_eq!(effects[1].floats, [3., 0.25]);
+        for e in &effects {
+            assert_eq!(e.creator, Some(item));
+            assert_eq!(e.duration_type, 4);
+        }
+        // The native effect builder rounds selected integer fields even though
+        // the corresponding GetItemPropertyPower query returns the raw float.
+        s.world.get_mut(item).unwrap().item_properties = Some(vec![(706, 2)]);
+        let raw = s.da2_item_property_power(item, 706, true);
+        assert!((raw - 4.8).abs() < 0.00001);
+        let e = &s.property_effects(item)[0];
+        assert_eq!(e.ints, [5, 16_777_217]);
+        assert_eq!(e.floats, [0.5, 0.25]);
+        // Native integer-field conversion precedes the query's f32 return.
+        s.world.get_mut(item).unwrap().item_properties = Some(vec![(707, 1)]);
+        assert_eq!(s.da2_item_property_power(item, 707, true), 16_777_220.);
+        assert_eq!(s.property_effects(item)[0].ints, [16_777_219, 0]);
+    }
+
+    #[test]
+    fn worn_da2_properties_follow_add_remove_and_unequip_without_duplicating() {
+        let (mut s, item) = worn_sim();
+        s.world.get_mut(item).unwrap().item_properties = Some(vec![(700, 2)]);
+        let wearer = s.world.spawn(ObjectKind::Creature, "wearer");
+        let o = s.world.get_mut(wearer).unwrap();
+        o.properties.insert(7, (100., 100.));
+        o.equipment.insert(0, item);
+        s.wear(wearer, item, 0);
+        assert_eq!(s.world.get(wearer).unwrap().effects.len(), 1);
+        assert!(s.add_item_property(item, 701, 1));
+        assert!(!s.add_item_property(item, 701, 1));
+        assert_eq!(s.world.get(wearer).unwrap().effects.len(), 2);
+        // Removal has already edited the live item list before it constructs
+        // the old effect payload, so its original entry power must still work.
+        assert!(s.remove_item_property(item, 700));
+        let effects = &s.world.get(wearer).unwrap().effects;
+        assert_eq!(effects.len(), 1);
+        assert_eq!(effects[0].ints[0], 26);
+        s.take_off(wearer, item, 0);
+        assert!(s.world.get(wearer).unwrap().effects.is_empty());
+    }
+
+    #[test]
+    fn replacing_da2_template_equipment_discards_its_effects_and_optional_backpack() {
+        let (mut s, item) = worn_sim();
+        let wearer = s.world.spawn(ObjectKind::Creature, "wearer");
+        let spare = s.world.spawn(ObjectKind::Item, "spare");
+        let o = s.world.get_mut(wearer).unwrap();
+        o.properties.insert(7, (100., 100.));
+        // An older malformed snapshot can wear an item absent from inventory.
+        o.inventory = vec![spare];
+        o.equipment.insert(0, item);
+        s.wear(wearer, item, 0);
+        assert_eq!(s.world.get(wearer).unwrap().effects.len(), 2);
+        s.discard_da2_template_inventory(wearer, false);
+        let o = s.world.get(wearer).unwrap();
+        assert_eq!(o.inventory, [spare]);
+        assert!(o.equipment.is_empty());
+        assert!(o.effects.is_empty());
+        assert!(s.world.get(item).is_none());
+        assert!(s.world.get(spare).is_some());
+        s.discard_da2_template_inventory(wearer, true);
+        assert!(s.world.get(wearer).unwrap().inventory.is_empty());
+        assert!(s.world.get(spare).is_none());
     }
 }

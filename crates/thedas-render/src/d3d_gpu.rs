@@ -1242,7 +1242,16 @@ fn fade_constants(
 /// Whether `program` draws into the distortion mask: `DADistortionMask.mat`'s passes, by
 /// their state.
 fn is_distortion(program: &D3dProgram) -> bool {
+    // Origins names the pass by its state file (`DistortionMask.sta`); Dragon Age II's
+    // compiled `vfx.mat` names it by its shaders (`vfx_distortionmask_p0.psh`), whose
+    // output is a distortion offset, not a colour: drawn into the frame, a heat haze shows
+    // as a flat olive disc.
     program.name.ends_with("+distortionmask.sta")
+        || program
+            .name
+            .split('+')
+            .nth(1)
+            .is_some_and(|ps| ps.starts_with("vfx_distortionmask_"))
 }
 
 /// The depth bias of a blended pass that tests depth without writing it: a hair's second
