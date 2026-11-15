@@ -48,10 +48,30 @@ impl Default for Format {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Image {
     pub src: String,
-    pub width: f32,
-    pub height: f32,
+    pub width: Option<f32>,
+    pub height: Option<f32>,
     pub hspace: f32,
     pub vspace: f32,
+    pub resource: Option<ImageResource>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ImageResource {
+    pub url: String,
+    pub width: f32,
+    pub height: f32,
+}
+
+impl Image {
+    pub fn size(&self) -> (f32, f32) {
+        let natural = self.resource.as_ref();
+        (
+            self.width
+                .unwrap_or_else(|| natural.map_or(0.0, |r| r.width)),
+            self.height
+                .unwrap_or_else(|| natural.map_or(0.0, |r| r.height)),
+        )
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -287,6 +307,22 @@ impl TextField {
         self.invalidate();
     }
 
+    /// Resolve intrinsic sizes before script measurements or autosizing use the layout.
+    pub fn resolve_images(&mut self, mut resolve: impl FnMut(&str) -> Option<ImageResource>) {
+        let mut changed = false;
+        for span in &mut self.spans {
+            if let Piece::Image(image) = &mut span.piece {
+                if image.resource.is_none() {
+                    image.resource = resolve(&image.src);
+                    changed |= image.resource.is_some();
+                }
+            }
+        }
+        if changed {
+            self.invalidate();
+        }
+    }
+
     /// `htmlText` as Flash writes it back.
     pub fn html_text(&self) -> String {
         if !self.html {
@@ -326,7 +362,21 @@ impl TextField {
                 out.push_str(uo);
                 match &sp.piece {
                     Piece::Text(t) => out.push_str(&escape(t)),
-                    Piece::Image(i) => out.push_str(&format!("<IMG SRC=\"{}\">", i.src)),
+                    Piece::Image(i) => {
+                        out.push_str(&format!(
+                            "<IMG SRC=\"{}\" ALIGN=\"BASELINE\"",
+                            escape(&i.src)
+                        ));
+                        for (name, value) in [("WIDTH", i.width), ("HEIGHT", i.height)] {
+                            if let Some(value) = value {
+                                out.push_str(&format!(" {name}=\"{value}\""));
+                            }
+                        }
+                        out.push_str(&format!(
+                            " HSPACE=\"{}\" VSPACE=\"{}\">",
+                            i.hspace, i.vspace
+                        ));
+                    }
                 }
                 out.push_str(uc);
                 out.push_str(ic);
@@ -775,14 +825,19 @@ pub fn parse_html(html: &str, base: &Format, multiline: bool) -> Vec<Span> {
                 }
             }
             "img" => {
-                let n = |k| get(k).and_then(|v| v.parse::<f32>().ok());
+                let n = |k| {
+                    get(k)
+                        .and_then(|v| v.parse::<f32>().ok())
+                        .filter(|v| v.is_finite() && v.abs() <= i32::MAX as f32 / 20.0)
+                };
                 out.push(Span {
                     piece: Piece::Image(Image {
                         src: get("src").unwrap_or("").to_string(),
-                        width: n("width").unwrap_or(0.0),
-                        height: n("height").unwrap_or(0.0),
-                        hspace: n("hspace").unwrap_or(8.0),
-                        vspace: n("vspace").unwrap_or(8.0),
+                        width: n("width").map(|v| v.max(0.0)),
+                        height: n("height").map(|v| v.max(0.0)),
+                        hspace: n("hspace").unwrap_or(0.0),
+                        vspace: n("vspace").unwrap_or(0.0),
+                        resource: None,
                     }),
                     format: fmt.clone(),
                 });
@@ -964,7 +1019,7 @@ pub fn layout(t: &TextField, fonts: &dyn Fonts) -> Layout {
     let mut para_start = true;
     let word_width = |w: &Word| -> f32 {
         if let Some((img, _, _)) = &w.image {
-            return img.width + 2.0 * img.hspace;
+            return img.size().0 + 2.0 * img.hspace;
         }
         w.chars
             .iter()
@@ -1025,7 +1080,11 @@ pub fn layout(t: &TextField, fonts: &dyn Fonts) -> Layout {
             }
             if let Some((img, _, _)) = &w.image {
                 any = true;
-                ascent = ascent.max(img.height + img.vspace);
+                // Scaleform supports baseline alignment. vspace is a baseline
+                // displacement, positive upwards, rather than vertical padding.
+                ascent = ascent.max(img.size().1 + img.vspace);
+                descent = descent.max(-img.vspace);
+                content_descent = content_descent.max(-img.vspace);
             }
         }
         line_format = fmt0.clone();
@@ -1101,9 +1160,12 @@ pub fn layout(t: &TextField, fonts: &dyn Fonts) -> Layout {
         let mut prev: Option<char> = None;
         for w in words {
             if let Some((img, _, index)) = &w.image {
-                line.images
-                    .push((img.clone(), x + img.hspace, base - img.height));
-                let adv = img.width + 2.0 * img.hspace;
+                line.images.push((
+                    img.clone(),
+                    x + img.hspace,
+                    base - img.size().1 - img.vspace,
+                ));
+                let adv = img.size().0 + 2.0 * img.hspace;
                 line.characters.push(CharacterBox {
                     index: *index,
                     x,
@@ -1253,6 +1315,83 @@ mod tests {
     impl Fonts for NoFonts {
         fn font(&self, _: &str, _: bool, _: bool) -> Option<Arc<Font>> {
             None
+        }
+    }
+
+    #[test]
+    fn inline_images_share_text_alignment_wrapping_and_baselines() {
+        let mut t = TextField::new(
+            Arc::new(EditText {
+                height: 200,
+                html: true,
+                multiline: true,
+                read_only: true,
+                ..Default::default()
+            }),
+            None,
+        );
+        t.bounds = (0.0, 0.0, 44.0, 100.0);
+        t.set_html("<p align='right'>A<img src='coin' width='8' height='6' hspace='2' vspace='-3' align='baseline'>B</p>");
+        let l = t.layout(&NoFonts);
+        let line = &l.lines[0];
+        assert_eq!((line.width, line.ascent, line.descent), (22.0, 8.0, 3.0));
+        assert_eq!((line.images[0].1, line.images[0].2), (27.0, 7.0));
+        assert_eq!(line.characters[1].advance, 12.0);
+        assert_eq!(l.height, 11.0);
+
+        t.word_wrap = true;
+        t.bounds.2 = 24.0;
+        t.set_html("A<img src='coin' width='16' height='12' vspace='4'>B");
+        let l = t.layout(&NoFonts);
+        assert_eq!(l.lines.len(), 3);
+        assert_eq!(l.lines[1].images[0].2, l.lines[1].top);
+        assert_eq!(l.lines[1].ascent, 16.0);
+        assert_eq!(l.lines[2].start, 2);
+        assert_eq!(l.caret_position(1), Some((1, GUTTER)));
+    }
+
+    #[test]
+    fn inline_image_attributes_and_intrinsic_sizes_survive_html_roundtrip() {
+        let mut t = TextField::new(
+            Arc::new(EditText {
+                html: true,
+                ..Default::default()
+            }),
+            None,
+        );
+        t.set_html("<img src='a&amp;b' width='0' hspace='2.5' vspace='-10' align='baseline'>");
+        t.resolve_images(|src| {
+            assert_eq!(src, "a&b");
+            Some(ImageResource {
+                url: "coin.dds".into(),
+                width: 24.0,
+                height: 16.0,
+            })
+        });
+        let Piece::Image(image) = &t.spans[0].piece else {
+            panic!("image")
+        };
+        assert_eq!(image.size(), (0.0, 16.0));
+        assert_eq!(image.resource.as_ref().unwrap().url, "coin.dds");
+        let revision = t.revision;
+        t.resolve_images(|_| panic!("a resolved image should stay cached"));
+        assert_eq!(t.revision, revision);
+        let html = t.html_text();
+        let spans = parse_html(&html, &t.default_format, false);
+        let Piece::Image(image) = &spans[0].piece else {
+            panic!("image")
+        };
+        assert_eq!(image.src, "a&b");
+        assert_eq!(image.width, Some(0.0));
+        assert_eq!(image.height, None);
+        assert_eq!((image.hspace, image.vspace), (2.5, -10.0));
+        for value in ["NaN", "inf", "-inf", "1e38"] {
+            t.set_html(&format!("<img src='missing' width='{value}' height='{value}' hspace='{value}' vspace='{value}'>"));
+            let Piece::Image(image) = &t.spans[0].piece else {
+                panic!("image")
+            };
+            assert_eq!(image.size(), (0.0, 0.0));
+            assert_eq!((image.hspace, image.vspace), (0.0, 0.0));
         }
     }
 

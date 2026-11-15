@@ -839,6 +839,220 @@ fn reaches(l: Light, room: u32) -> bool {
     return (bits & (1u << (room % 32u))) != 0u;
 }
 
+// Whether either sun cascade holds `p` (its map coordinates fall inside), so its runtime
+// visibility is known there.
+fn sun_covered(p: vec3<f32>) -> bool {
+    if (sun.enabled.x == 0u || sun.direction.w < 0.5) {
+        return false;
+    }
+    let q = vec4<f32>(p, 1.0);
+    let sd = sun.data;
+    if (dot(sd[8], q) > 0.0) {
+        let t = vec3<f32>(dot(sd[0], q), dot(sd[1], q), dot(sd[2], q)) / dot(sd[3], q);
+        return all(t.xy >= vec2<f32>(0.0)) && all(t.xy <= vec2<f32>(1.0));
+    }
+    let t = vec3<f32>(dot(sd[4], q), dot(sd[5], q), dot(sd[6], q))
+        / dot(vec4<f32>(sd[7].xyz, 1.0), q);
+    return all(t.xy >= vec2<f32>(0.0)) && all(t.xy <= vec2<f32>(1.0));
+}
+
+// ---------------------------------------------------------------------------------------
+// Real-time bounce (ours; see docs/deferred.md "Real-time bounce"). One bounce of the
+// shadowed point lights: each cube texel is the first surface the light reaches, so it is
+// lit, and relights what sees it. Gathered at half resolution; the lighting pass adds it
+// to the ambient term.
+
+@group(3) @binding(0) var bounce_tex: texture_2d<f32>;
+
+// The grey every bounce surface reflects with (its albedo is not in the cube maps).
+const BOUNCE_ALBEDO: f32 = 0.4;
+// Samples per cube face per light, in a 2 x 2 stratified grid jittered per pixel.
+const BOUNCE_SAMPLES: u32 = 4u;
+
+// A cube face's forward, right and up, as `deferred_shadow::faces` looks along them
+// (`Mat4::look_to_rh(eye, forward, up)`: right = forward x up, up' = right x forward).
+fn face_basis(face: i32) -> mat3x3<f32> {
+    switch face {
+        case 0: { return mat3x3<f32>(vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, -1.0, 0.0), vec3<f32>(0.0, 0.0, 1.0)); }
+        case 1: { return mat3x3<f32>(vec3<f32>(-1.0, 0.0, 0.0), vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(0.0, 0.0, 1.0)); }
+        case 2: { return mat3x3<f32>(vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, 0.0, 1.0)); }
+        case 3: { return mat3x3<f32>(vec3<f32>(0.0, -1.0, 0.0), vec3<f32>(-1.0, 0.0, 0.0), vec3<f32>(0.0, 0.0, 1.0)); }
+        case 4: { return mat3x3<f32>(vec3<f32>(0.0, 0.0, 1.0), vec3<f32>(-1.0, 0.0, 0.0), vec3<f32>(0.0, 1.0, 0.0)); }
+        default: { return mat3x3<f32>(vec3<f32>(0.0, 0.0, -1.0), vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, 1.0, 0.0)); }
+    }
+}
+
+// The world direction through texel `t` (0..511) of cube face `face`.
+fn face_direction(face: i32, t: vec2<f32>) -> vec3<f32> {
+    let b = face_basis(face);
+    let ndc = vec2<f32>((t.x + 0.5) / 512.0 * 2.0 - 1.0, 1.0 - (t.y + 0.5) / 512.0 * 2.0);
+    return normalize(b[0] + ndc.x * b[1] + ndc.y * b[2]);
+}
+
+// Interleaved gradient noise: a per-pixel jitter that a small blur hides.
+fn bounce_noise(p: vec2<f32>) -> f32 {
+    return fract(52.9829189 * fract(dot(p, vec2<f32>(0.06711056, 0.00583715))));
+}
+
+fn bounce_point(face: i32, origin: vec2<i32>, t: vec2<i32>, lp: vec3<f32>) -> vec4<f32> {
+    let d = textureLoad(shadow_maps, origin + t, face, 0).x;
+    return vec4<f32>(lp + face_direction(face, vec2<f32>(t)) * d, d);
+}
+
+@fragment
+fn fs_bounce(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
+    let flags = sun.enabled.w;
+    let px = vec2<i32>(frag.xy) * 2;
+    let depth = textureLoad(g_depth, px, 0).x;
+    if (flags == 0u || depth >= 1.0) {
+        return vec4<f32>(0.0);
+    }
+    let x = world_at(px, depth);
+    let gn = textureLoad(g_normal, px, 0);
+    let nx = oct_decode(gn.xy);
+    let room = u32(gn.z + 0.5);
+    let jitter = vec2<f32>(bounce_noise(frag.xy), bounce_noise(frag.yx + vec2<f32>(17.0, 5.0)));
+    // Each sample stands for a sixth of a face's quarter: its solid angle.
+    let omega = 4.0 * PI / (6.0 * f32(BOUNCE_SAMPLES));
+    var sum = vec3<f32>(0.0);
+    for (var i = 0u; i < lighting.counts.x; i = i + 1u) {
+        let l = lights[i];
+        if (l.shadow.x < 0.0) {
+            continue;
+        }
+        let is_static = l.colour.w > 0.5;
+        if ((is_static && (flags & 2u) == 0u) || (!is_static && (flags & 1u) == 0u)) {
+            continue;
+        }
+        if (!reaches(l, room)) {
+            continue;
+        }
+        let lp = l.position.xyz;
+        let radius = l.position.w;
+        // Bounced light reaches about as far again as the light itself.
+        if (distance(x, lp) > radius * 2.0) {
+            continue;
+        }
+        let origin = vec2<i32>(l.shadow.zw);
+        for (var face = 0; face < 6; face = face + 1) {
+            for (var k = 0u; k < BOUNCE_SAMPLES; k = k + 1u) {
+                let cell = vec2<f32>(f32(k % 2u), f32(k / 2u));
+                let u = (cell + fract(jitter + vec2<f32>(f32(face) * 0.371, f32(i) * 0.713))) * 0.5;
+                let t = vec2<i32>(u * 510.0);
+                let y = bounce_point(face, origin, t, lp);
+                if (y.w >= radius) {
+                    continue;
+                }
+                // The bounce surface's normal from its neighbours in the map, facing the light.
+                let y1 = bounce_point(face, origin, t + vec2<i32>(1, 0), lp);
+                let y2 = bounce_point(face, origin, t + vec2<i32>(0, 1), lp);
+                let dir = normalize(y.xyz - lp);
+                var ny = -dir;
+                if (y1.w < radius && y2.w < radius) {
+                    let c = cross(y1.xyz - y.xyz, y2.xyz - y.xyz);
+                    if (dot(c, c) > 1e-12) {
+                        ny = normalize(c);
+                        if (dot(ny, lp - y.xyz) < 0.0) {
+                            ny = -ny;
+                        }
+                    }
+                }
+                if (dot(ny, -dir) <= 0.0) {
+                    continue;
+                }
+                // Irradiance at the patch times its area: the light's colour and falloff
+                // times the sample's solid angle and squared distance (the cosines cancel).
+                let c = cos(y.w / radius * PI * 0.5);
+                let flux = l.colour.rgb * (c * c) * omega * y.w * y.w;
+                let w = x - y.xyz;
+                let r2 = max(dot(w, w), 0.25 * omega * y.w * y.w + 0.05);
+                let r = sqrt(r2);
+                let cos_y = max(dot(ny, w) / r, 0.0);
+                let cos_x = max(dot(nx, -w) / r, 0.0);
+                sum = sum + BOUNCE_ALBEDO * flux * cos_y * cos_x / (PI * r2);
+            }
+        }
+    }
+    if ((flags & 4u) != 0u && lighting.sun_dir.w > 0.5) {
+        sum = sum + sun_bounce(x, nx, frag.xy);
+    }
+    return vec4<f32>(sum, 1.0);
+}
+
+// Sunlight bounced off what the screen shows near `x` (normal `nx`): sixteen points of a
+// 3 m hemisphere, each the visible surface there, lit by the sun through its cascades and
+// reflecting its own G-buffer albedo. A cube-map gather can't do this for the sun: its
+// shadow maps see a roof, not the sunlit floor under a window. Off-screen surfaces are
+// missed, so the bounce fades at the frame's edges.
+fn sun_bounce(x: vec3<f32>, nx: vec3<f32>, frag: vec2<f32>) -> vec3<f32> {
+    let radius = 3.0;
+    let count = 16u;
+    let axis = select(vec3<f32>(0.0, 0.0, 1.0), vec3<f32>(0.0, 1.0, 0.0), abs(nx.z) > 0.95);
+    let t = normalize(cross(axis, nx));
+    let b = cross(nx, t);
+    let ls = -lighting.sun_dir.xyz;
+    let spin = bounce_noise(frag) * 6.2831853;
+    // Each sample stands for its share of the hemisphere's surface.
+    let area = 2.0 * PI * radius * radius / f32(count);
+    var sum = vec3<f32>(0.0);
+    for (var i = 0u; i < count; i = i + 1u) {
+        let f = (f32(i) + 0.5) / f32(count);
+        let angle = f32(i) * 2.39996323 + spin;
+        let z = 0.1 + 0.9 * f;
+        let xy = sqrt(1.0 - z * z);
+        let direction = t * (cos(angle) * xy) + b * (sin(angle) * xy) + nx * z;
+        let sample = x + direction * radius * (0.25 + 0.75 * fract(f * 7.0 + spin));
+        let clip = lighting.view_proj * vec4<f32>(sample, 1.0);
+        if (clip.w <= 0.0 || clip.z < 0.0 || clip.z >= clip.w) {
+            continue;
+        }
+        let ndc = clip.xy / clip.w;
+        let pixel = vec2<i32>(floor(vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5) * lighting.size.xy + 0.5));
+        if (any(pixel < vec2<i32>(0)) || any(pixel >= vec2<i32>(lighting.size.xy))) {
+            continue;
+        }
+        let depth = textureLoad(g_depth, pixel, 0).x;
+        if (depth >= 1.0) {
+            continue;
+        }
+        let y = world_at(pixel, depth);
+        let ny = oct_decode(textureLoad(g_normal, pixel, 0).xy);
+        let lit = max(dot(ny, ls), 0.0);
+        if (lit <= 0.0) {
+            continue;
+        }
+        let w = x - y;
+        let r2 = max(dot(w, w), 0.25 * area + 0.05);
+        let r = sqrt(r2);
+        let cos_y = max(dot(ny, w) / r, 0.0);
+        let cos_x = max(dot(nx, -w) / r, 0.0);
+        if (cos_y * cos_x <= 0.0) {
+            continue;
+        }
+        let albedo = textureLoad(g_albedo, pixel, 0).rgb;
+        let e = lighting.sun_colour.rgb * lit * sun_visibility(y, ny, false);
+        sum = sum + albedo * e * area * cos_y * cos_x / (PI * r2);
+    }
+    return sum;
+}
+
+// The bounce at full-resolution pixel `px` (depth `depth`): the four nearest half-
+// resolution samples, weighted by how close their depth is (so edges don't bleed).
+fn bounce_at(px: vec2<i32>, depth: f32) -> vec3<f32> {
+    let size = vec2<i32>(textureDimensions(bounce_tex));
+    let base = max((px - vec2<i32>(1)) / 2, vec2<i32>(0));
+    var sum = vec3<f32>(0.0);
+    var weight = 0.0;
+    for (var k = 0; k < 4; k = k + 1) {
+        let q = clamp(base + vec2<i32>(k % 2, k / 2), vec2<i32>(0), size - vec2<i32>(1));
+        let dq = textureLoad(g_depth, q * 2, 0).x;
+        let w = 1.0 / (1.0 + abs(dq - depth) * 2000.0);
+        sum = sum + textureLoad(bounce_tex, q, 0).rgb * w;
+        weight = weight + w;
+    }
+    return sum / max(weight, 1e-6);
+}
+
 fn point_uses_baked_mask(is_static: bool, material: u32) -> bool {
     // Props and characters have probes, not baked direct-light visibility.
     return is_static && material != 64u && material != 192u;
@@ -931,7 +1145,16 @@ fn lighting_pixel(frag: vec4<f32>, baked: bool) -> vec4<f32> {
     if (u32(round(ga.a * 255.0)) == 32u) { return vec4<f32>(0.0, 0.0, 0.0, 1.0); }
     let spec = textureLoad(g_specular, px, 0);
     let gn = textureLoad(g_normal, px, 0);
-    let lm = textureLoad(g_lightmap, px, 0);
+    var lm = textureLoad(g_lightmap, px, 0);
+    // Real-time bounce joins the ambient term (fused frames store albedo times ambient).
+    if (sun.enabled.w != 0u) {
+        let fused = baked || lighting.size.z > 0.5;
+        let b = bounce_at(px, depth);
+        lm = vec4<f32>(lm.rgb + select(b, b * ga.rgb, fused), lm.a);
+    }
+    if (!baked && lighting.counts.y == 13u) {
+        return vec4<f32>(bounce_at(px, depth), 1.0);
+    }
     var ao = 1.0;
     if (!baked) {
         let n = oct_decode(gn.xy);
@@ -1090,19 +1313,30 @@ fn light_surface(frag: vec4<f32>, p: vec3<f32>, ga: vec4<f32>, spec: vec4<f32>,
         }
       }
     }
+    var diff_sun = vec3<f32>(0.0);
+    var spec_sun = vec3<f32>(0.0);
     if (lighting.sun_dir.w > 0.5) {
         let ls = -lighting.sun_dir.xyz;
         let ndl = dot(n, ls);
         if (strands || ndl >= 0.0) {
             let diffuse_response = select(ndl, max(ndl * 0.75 + 0.25, 0.0), strands);
-            diff_s = diff_s + diffuse_response * lighting.sun_colour.rgb;
+            diff_sun = diffuse_response * lighting.sun_colour.rgb;
             if (compute_specular) {
                 let h = normalize(v + ls);
-                spec_s = spec_s + highlight(n, h, power, hair) * lighting.sun_colour.rgb;
+                spec_sun = highlight(n, h, power, hair) * lighting.sun_colour.rgb;
             }
         }
     }
     let sun_shade = sun_visibility(p, n, !terrain_low && !object);
+    // The hybrid mode: where a runtime cascade covers the point, the sun takes that
+    // visibility alone, not the lightmap's baked mask; elsewhere it keeps the mask.
+    if (sun.enabled.z != 0u && !object && sun_covered(p)) {
+        diff_d = diff_d + diff_sun * sun_shade;
+        spec_d = spec_d + spec_sun * sun_shade;
+    } else {
+        diff_s = diff_s + diff_sun;
+        spec_s = spec_s + spec_sun;
+    }
     // Static1: alpha masks baked direct visibility once; RGB is baked bounce,
     // dimmed by only 15% in a runtime shadow (exploration camera w = 0).
     // Dynamic lights have their own visibility and never take this sun mask.
