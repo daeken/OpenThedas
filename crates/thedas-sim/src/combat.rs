@@ -187,6 +187,32 @@ fn dist(a: [f32; 3], b: [f32; 3]) -> f32 {
     ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt()
 }
 
+/// Perception's sight-line memo: the area and collision it was made for (area, solid,
+/// placeables, by pointer), and per ordered pair of creatures their positions (as bits)
+/// and whether the line was blocked.
+#[derive(Default)]
+pub struct SightMemo {
+    /// The area and the geometry the lines were worked out against. The geometry is held,
+    /// not just named, so a newer copy at a reused address can never pass for it.
+    made_for: Option<SightGeometry>,
+    lines: std::collections::HashMap<(ObjectId, ObjectId), ([u32; 3], [u32; 3], bool)>,
+}
+
+type SightGeometry = (
+    ObjectId,
+    Option<std::sync::Arc<crate::collision::Collision>>,
+    Option<std::sync::Arc<crate::collision::Collision>>,
+    Option<std::sync::Arc<thedas_formats::level::NavGrid>>,
+);
+
+fn same_arc<T>(a: &Option<std::sync::Arc<T>>, b: &Option<std::sync::Arc<T>>) -> bool {
+    match (a, b) {
+        (Some(x), Some(y)) => std::sync::Arc::ptr_eq(x, y),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
 impl Sim {
     /// DA2 0x4dd1a0 reads the creature's combat record, including a stale/dead target;
     /// scripts validate the returned id themselves. Origins retains its queue-based view.
@@ -476,7 +502,20 @@ impl Sim {
                 .filter(|q| ((q[0] - p[0]).powi(2) + (q[1] - p[1]).powi(2)).sqrt() <= STAND_ASIDE)
                 .unwrap_or(p)
         };
-        let wall = |a: [f32; 3], b: [f32; 3]| match &solid {
+        // A sight line whose ends have not moved and whose geometry is the same as last
+        // time is answered from the memo (ambient creatures mostly stand still).
+        let mut memo = std::mem::take(&mut self.sight_memo);
+        let current = memo.made_for.as_ref().is_some_and(|m| {
+            m.0 == area && same_arc(&m.1, &solid) && same_arc(&m.2, &props) && same_arc(&m.3, &grid)
+        });
+        if !current {
+            memo = SightMemo {
+                made_for: Some((area, solid.clone(), props.clone(), grid.clone())),
+                lines: Default::default(),
+            };
+        }
+        let memo = std::cell::RefCell::new(memo);
+        let wall_raw = |a: [f32; 3], b: [f32; 3]| match &solid {
             Some(c) => {
                 let (a, b) = (stand(a), stand(b));
                 c.sight_blocked_standing(a, b)
@@ -487,6 +526,18 @@ impl Sim {
             None => grid
                 .as_ref()
                 .is_some_and(|g| crate::nav::wall_between(g, a, b)),
+        };
+        let bits = |p: [f32; 3]| p.map(f32::to_bits);
+        let wall = |x: ObjectId, y: ObjectId, a: [f32; 3], b: [f32; 3]| {
+            let (ka, kb) = (bits(a), bits(b));
+            if let Some(&(pa, pb, v)) = memo.borrow().lines.get(&(x, y)) {
+                if pa == ka && pb == kb {
+                    return v;
+                }
+            }
+            let v = wall_raw(a, b);
+            memo.borrow_mut().lines.insert((x, y), (ka, kb, v));
+            v
         };
         for (i, &(id, pos)) in creatures.iter().enumerate() {
             let alive = facts[i].0;
@@ -531,7 +582,9 @@ impl Sim {
                         if tracked {
                             d <= VISUAL_RANGE && !blocked(pos, p)
                         } else {
-                            d <= ring && !blocked(pos, p) && (!hostile(i, j) || !wall(pos, p))
+                            d <= ring
+                                && !blocked(pos, p)
+                                && (!hostile(i, j) || !wall(id, o, pos, p))
                         }
                     })
                     .map(|(j, _)| j)
@@ -597,6 +650,7 @@ impl Sim {
                 obj.combat.perceived_hostile = now_hostile;
             }
         }
+        self.sight_memo = std::mem::take(&mut *memo.borrow_mut());
         self.update_game_mode();
     }
 
