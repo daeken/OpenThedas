@@ -153,7 +153,8 @@ fn ui_value(value: &UiValue, budget: &mut usize, depth: usize, truncated: &mut b
     }
     *budget -= 1;
     match value {
-        UiValue::Undefined | UiValue::Null => J::Null,
+        UiValue::Undefined => json!({ "undefined": true }),
+        UiValue::Null => J::Null,
         UiValue::Bool(v) => json!(v),
         UiValue::Number(v) => json!(v),
         UiValue::String(v) => {
@@ -236,6 +237,7 @@ mod tests {
     fn hud_values_are_bounded_and_credentials_are_dropped() {
         let values = BTreeMap::from([
             ("Party.Health".into(), UiValue::Number(80.0)),
+            ("GUI.NotReady".into(), UiValue::Undefined),
             ("GUI.Token".into(), UiValue::String("secret".into())),
             (
                 "Inventory.Items".into(),
@@ -245,6 +247,10 @@ mod tests {
         let observed = BTreeSet::from(["Party.Health", "Inventory.Items", "GUI.Token"]);
         let result = ui_values(&values, &observed);
         assert_eq!(result["items"]["Party.Health"], 80.0);
+        assert_eq!(
+            result["items"]["GUI.NotReady"],
+            json!({ "undefined": true })
+        );
         assert_eq!(result["truncated"], true);
         assert!(result["items"].get("GUI.Token").is_none());
         assert_eq!(result["items"]["Inventory.Items"]["total"], 500);
