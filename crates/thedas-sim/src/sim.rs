@@ -2161,10 +2161,13 @@ impl Sim {
     /// How fast a command moves its owner: a move ordered not to run
     /// (`CommandMoveToLocation`'s or `CommandMoveToObject`'s `bRunToLocation` FALSE) walks,
     /// at the appearance's walk speed (column 0x958f23c8, 1.54 for humans; the locomotion's
-    /// mode 1 in 0xa63120); anything else runs ([`Sim::move_speed`]).
+    /// mode 1 in 0xa63120). Origins' combat stance overrides both walk and run with
+    /// column 0x0dc3ebb2 (0xa6312e..0xa63151); anything else runs (`Sim::move_speed`).
     pub fn command_speed(&self, id: ObjectId, cmd: &Command) -> f32 {
         let walks = cmd.name.starts_with("CommandMoveTo") && cmd.ints.first() == Some(&0);
-        if walks {
+        let combat_stance = self.game == thedas_vfs::Game::Origins
+            && self.world.get(id).is_some_and(|o| o.combat.in_combat);
+        if walks && !combat_stance {
             if let Some(v) = self.appearance_speed(id, COL_WALK) {
                 return v * self.speed_multiplier(id);
             }
@@ -7191,10 +7194,16 @@ mod tests {
         };
         assert_eq!(
             s.command_speed(human, &walk(0)),
-            1.54,
-            "told not to run: a walk"
+            4.66,
+            "Origins combat stance overrides the walk command's gait"
         );
         assert_eq!(s.command_speed(human, &walk(1)), 4.66);
+        s.game = thedas_vfs::Game::DragonAge2;
+        assert_eq!(s.command_speed(human, &walk(0)), 1.54, "DA2 unchanged");
+        s.game = thedas_vfs::Game::Origins;
+        s.world.get_mut(human).unwrap().combat.in_combat = false;
+        assert_eq!(s.command_speed(human, &walk(0)), 1.54, "ordinary walk");
+        assert_eq!(s.command_speed(human, &walk(1)), 6.0, "ordinary run");
         assert_eq!(
             s.move_speed(other),
             DEFAULT_SPEED,
