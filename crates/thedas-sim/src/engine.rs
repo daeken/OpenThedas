@@ -2368,6 +2368,17 @@ pub fn call(
                 return ok(b(done));
             }
             let set = a.get(3).map_or(-1, |_| int(a, 3));
+            let active = h
+                .object(who)
+                .and_then(|o| o.fields.get("ActiveWeaponSet"))
+                .copied()
+                .unwrap_or(0);
+            let inactive = matches!(set, 0 | 1)
+                && set != active
+                && crate::world::WEAPON_SET_SLOTS.contains(&slot);
+            if h.sim.equipment_slot_locked(who, item, slot, inactive) {
+                return ok(b(false));
+            }
             let ok_ = h.object(item).is_some();
             if ok_ && h.sim.world.get(who).is_some() {
                 // Off wherever it was, and what the slot held comes off (the engine's side
@@ -2921,6 +2932,33 @@ pub fn call(
         // integer 0, and gives it to the item. It stays on the item for presentation.
         // DAOrigins.exe (0x665510) sets the item's indestructible flag (0x752c30); kept
         // in the item's fields.
+        "SetItemIrremovable" if h.sim.game == thedas_vfs::Game::Origins => {
+            if let Some(o) = h
+                .sim
+                .world
+                .get_mut(obj(a, 0))
+                .filter(|o| o.kind == ObjectKind::Item)
+            {
+                o.fields
+                    .insert("Irremovable".into(), i32::from(int(a, 1) != 0));
+            }
+            void()
+        }
+        "IsItemIrremovable" if h.sim.game == thedas_vfs::Game::Origins => {
+            ok(b(h.sim.item_irremovable(obj(a, 0))))
+        }
+        "SetCanChangeEquipment" if h.sim.game == thedas_vfs::Game::Origins => {
+            if let Some(o) = h
+                .sim
+                .world
+                .get_mut(obj(a, 0))
+                .filter(|o| o.kind == ObjectKind::Creature)
+            {
+                o.fields
+                    .insert("CanChangeEquipment".into(), i32::from(int(a, 1) != 0));
+            }
+            void()
+        }
         "SetItemIndestructible" => {
             if let Some(o) = h
                 .sim

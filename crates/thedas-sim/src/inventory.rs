@@ -60,6 +60,43 @@ const STACK_FIELDS: [&str; 6] = [
     "StoreFlag",
 ];
 impl Sim {
+    /// Origins' item flag, independent of the plot-item flag.
+    pub fn item_irremovable(&self, item: ObjectId) -> bool {
+        self.world.get(item).is_some_and(|o| {
+            o.kind == ObjectKind::Item && o.fields.get("Irremovable").copied().unwrap_or(0) != 0
+        })
+    }
+
+    /// Equipment access exposed to the Origins inventory screen.
+    pub fn can_change_equipment(&self, who: ObjectId) -> bool {
+        self.game != thedas_vfs::Game::Origins
+            || self.world.get(who).is_some_and(|o| {
+                o.kind == ObjectKind::Creature
+                    && o.fields.get("CanChangeEquipment").copied().unwrap_or(1) != 0
+            })
+    }
+
+    pub(crate) fn equipment_slot_locked(
+        &self,
+        who: ObjectId,
+        item: ObjectId,
+        slot: i32,
+        inactive: bool,
+    ) -> bool {
+        self.game == thedas_vfs::Game::Origins
+            && self
+                .world
+                .get(who)
+                .and_then(|o| {
+                    if inactive {
+                        o.other_set.get(&slot)
+                    } else {
+                        o.equipment.get(&slot)
+                    }
+                })
+                .is_some_and(|&old| old != item && self.item_irremovable(old))
+    }
+
     /// The effects an item's properties put on whoever wears it. DA2 uses its native
     /// item_properties schema and parameter builder in da2_items. For Origins, each template
     /// property of the worn kind gives `itemprps.gda`'s effect with its `Int0`/`Int1`,
@@ -442,6 +479,9 @@ impl Sim {
     /// `INVENTORY_SLOT_INVALID` for wherever it fits. What `who` wore there goes to the
     /// backpack. Returns whether it was equipped.
     pub fn equip_item(&mut self, who: ObjectId, item: ObjectId, slot: i32) -> bool {
+        if !self.can_change_equipment(who) {
+            return false;
+        }
         let party = crate::engine::party_of(self);
         let fits = self.item_slots(item);
         // No slot given (INVENTORY_SLOT_INVALID, as a double click sends): the first the item
@@ -465,6 +505,14 @@ impl Sim {
             return false;
         }
         if !self.party_backpack().contains(&item) && self.wearer(item).is_none() {
+            return false;
+        }
+        if self.game == thedas_vfs::Game::Origins
+            && (self.equipment_slot_locked(who, item, slot, false)
+                || self
+                    .wearer(item)
+                    .is_some_and(|m| self.item_irremovable(item) || !self.can_change_equipment(m)))
+        {
             return false;
         }
         // Whoever wore it gives it up, and what `who` wore in the slot comes off: both hear
@@ -540,6 +588,11 @@ impl Sim {
     /// The player takes `item` off party member `who`; it stays in the backpack. Returns
     /// whether `who` wore it.
     pub fn unequip_item(&mut self, who: ObjectId, item: ObjectId) -> bool {
+        if !self.can_change_equipment(who)
+            || (self.game == thedas_vfs::Game::Origins && self.item_irremovable(item))
+        {
+            return false;
+        }
         if !crate::engine::party_of(self).contains(&who) {
             return false;
         }
@@ -1114,6 +1167,9 @@ impl Sim {
             .copied()
             .find(|s| !taken.contains_key(s))
             .or_else(|| slots.first().copied())?;
+        if self.equipment_slot_locked(who, item, slot, false) {
+            return None;
+        }
         self.unequip(who, item);
         if let Some(old) = self.world.get(who)?.equipment.get(&slot).copied() {
             self.unequip(who, old);
@@ -1381,6 +1437,184 @@ mod screen_tests {
         h.inventory = items.to_vec();
         h.equipment.insert(0, items[0]);
         (s, hero, ally, items)
+    }
+
+    fn equipment_flags_sim() -> (Sim, ObjectId, ObjectId, [ObjectId; 3]) {
+        let (mut s, hero, ally, items) = party();
+        s.table = Arc::new(
+            EngineTable::parse(
+                b"\
+            int INVENTORY_SLOT_INVALID = 255;\n\
+            void SetItemIrremovable(object o, int b) = 375;\n\
+            int IsItemIrremovable(object o) = 376;\n\
+            void SetCanChangeEquipment(object o, int b) = 391;\n\
+            int EquipItem(object o, object i, int s = 255, int w = -1) = 392;\n\
+            int UnequipItem(object o, object i) = 393;\n",
+            )
+            .unwrap(),
+        );
+        (s, hero, ally, items)
+    }
+
+    fn equipment_flags_call(
+        s: &mut Sim,
+        name: &str,
+        args: &[thedas_script::vm::Value],
+    ) -> Option<thedas_script::vm::Value> {
+        let f = s.table.function_by_name(name).unwrap().clone();
+        let mut h = crate::sim::ScriptHost {
+            sim: s,
+            event: None,
+            script: "test".into(),
+        };
+        crate::engine::call(&mut h, OBJECT_INVALID, &f, args)
+            .unwrap()
+            .unwrap()
+    }
+
+    #[test]
+    fn equipment_flags_native_round_trip_is_independent_of_plot_and_normalizes_booleans() {
+        use thedas_script::vm::Value::{Int, Object};
+        let (mut s, hero, _, items) = equipment_flags_sim();
+        s.world.get_mut(items[0]).unwrap().plot = true;
+        assert_eq!(
+            equipment_flags_call(&mut s, "IsItemIrremovable", &[Object(items[0])]),
+            Some(Int(0))
+        );
+        for (value, expected) in [(-3, 1), (0, 0), (19, 1)] {
+            equipment_flags_call(
+                &mut s,
+                "SetItemIrremovable",
+                &[Object(items[0]), Int(value)],
+            );
+            assert_eq!(
+                equipment_flags_call(&mut s, "IsItemIrremovable", &[Object(items[0])]),
+                Some(Int(expected))
+            );
+            assert!(s.world.get(items[0]).unwrap().plot);
+        }
+        equipment_flags_call(&mut s, "SetCanChangeEquipment", &[Object(hero), Int(0)]);
+        assert!(!s.can_change_equipment(hero));
+        equipment_flags_call(&mut s, "SetCanChangeEquipment", &[Object(hero), Int(-1)]);
+        assert!(s.can_change_equipment(hero));
+        let saved: crate::World =
+            serde_json::from_slice(&serde_json::to_vec(&s.world).unwrap()).unwrap();
+        assert_eq!(
+            saved.get(items[0]).unwrap().fields.get("Irremovable"),
+            Some(&1)
+        );
+        assert_eq!(
+            saved.get(hero).unwrap().fields.get("CanChangeEquipment"),
+            Some(&1)
+        );
+    }
+
+    #[test]
+    fn equipment_flags_locked_occupant_blocks_script_and_player_replacement() {
+        use thedas_script::vm::Value::{Int, Object};
+        let (mut s, hero, _, items) = equipment_flags_sim();
+        equipment_flags_call(&mut s, "SetItemIrremovable", &[Object(items[0]), Int(1)]);
+        assert!(!s.equip_item(hero, items[1], 0));
+        assert!(!s.unequip_item(hero, items[0]));
+        assert_eq!(
+            equipment_flags_call(
+                &mut s,
+                "EquipItem",
+                &[Object(hero), Object(items[1]), Int(0), Int(-1)]
+            ),
+            Some(Int(0))
+        );
+        assert_eq!(
+            s.world.get(hero).unwrap().equipment.get(&0),
+            Some(&items[0])
+        );
+        equipment_flags_call(&mut s, "SetItemIrremovable", &[Object(items[0]), Int(0)]);
+        assert!(s.equip_item(hero, items[1], 0));
+    }
+
+    #[test]
+    fn equipment_flags_player_cannot_take_locked_gear_from_another_member_or_change_disabled_gear()
+    {
+        use thedas_script::vm::Value::{Int, Object};
+        let (mut s, hero, ally, items) = equipment_flags_sim();
+        equipment_flags_call(&mut s, "SetItemIrremovable", &[Object(items[0]), Int(1)]);
+        assert!(!s.equip_item(ally, items[0], 0));
+        equipment_flags_call(&mut s, "SetItemIrremovable", &[Object(items[0]), Int(0)]);
+        equipment_flags_call(&mut s, "SetCanChangeEquipment", &[Object(hero), Int(0)]);
+        assert!(!s.equip_item(ally, items[0], 0));
+        assert!(!s.equip_item(hero, items[1], 0));
+        assert!(!s.unequip_item(hero, items[0]));
+        // The native unequip path performs the transfer directly, independently
+        // of the inventory screen's access and item-removal controls.
+        equipment_flags_call(&mut s, "SetItemIrremovable", &[Object(items[0]), Int(1)]);
+        assert_eq!(
+            equipment_flags_call(&mut s, "UnequipItem", &[Object(hero), Object(items[0])]),
+            Some(Int(1))
+        );
+    }
+
+    #[test]
+    fn equipment_flags_cover_inactive_equipment_and_leave_invalid_kinds_alone() {
+        use thedas_script::vm::Value::{Int, Object};
+        let (mut s, hero, _, items) = equipment_flags_sim();
+        let h = s.world.get_mut(hero).unwrap();
+        h.equipment.clear();
+        h.other_set.insert(0, items[0]);
+        equipment_flags_call(&mut s, "SetItemIrremovable", &[Object(items[0]), Int(1)]);
+        assert_eq!(
+            equipment_flags_call(
+                &mut s,
+                "EquipItem",
+                &[Object(hero), Object(items[1]), Int(0), Int(1)]
+            ),
+            Some(Int(0))
+        );
+        for id in [hero, OBJECT_INVALID] {
+            equipment_flags_call(&mut s, "SetItemIrremovable", &[Object(id), Int(1)]);
+            assert_eq!(
+                equipment_flags_call(&mut s, "IsItemIrremovable", &[Object(id)]),
+                Some(Int(0))
+            );
+        }
+        equipment_flags_call(&mut s, "SetCanChangeEquipment", &[Object(items[0]), Int(0)]);
+        assert!(
+            !s.world
+                .get(items[0])
+                .unwrap()
+                .fields
+                .contains_key("CanChangeEquipment")
+        );
+    }
+
+    #[test]
+    fn equipment_flags_da2_dispatch_and_equipment_access_are_unchanged() {
+        use thedas_script::vm::Value::{Int, Object};
+        let (mut s, hero, _, items) = equipment_flags_sim();
+        s.game = thedas_vfs::Game::DragonAge2;
+        for name in [
+            "SetItemIrremovable",
+            "IsItemIrremovable",
+            "SetCanChangeEquipment",
+        ] {
+            let f = s.table.function_by_name(name).unwrap().clone();
+            let mut h = crate::sim::ScriptHost {
+                sim: &mut s,
+                event: None,
+                script: "test".into(),
+            };
+            assert!(crate::engine::call(&mut h, hero, &f, &[Object(items[0]), Int(1)]).is_none());
+        }
+        s.world
+            .get_mut(hero)
+            .unwrap()
+            .fields
+            .insert("CanChangeEquipment".into(), 0);
+        s.world
+            .get_mut(items[0])
+            .unwrap()
+            .fields
+            .insert("Irremovable".into(), 1);
+        assert!(s.equip_item(hero, items[1], 0));
     }
 
     #[test]
