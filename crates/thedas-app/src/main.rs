@@ -556,6 +556,7 @@ fn capture(
                         | "lighting"
                         | "specialized-gbuffer"
                         | "specialized-lighting"
+                        | "forward-lighting"
                         | "early-light-reject"
                         | "depth-lights"
                         | "terrain-layers"
@@ -566,7 +567,7 @@ fn capture(
                 )
             }) {
                 bail!(
-                    "THEDAS_BENCH_DEFERRED_COMPARE must be all, tiles, shadows, faithful, reflections, tile-frusta, light-masks, opaque-gbuffer, lighting, specialized-gbuffer, specialized-lighting, early-light-reject, depth-lights, terrain-layers, pass-cost, fronds, trees or tree-shadows"
+                    "THEDAS_BENCH_DEFERRED_COMPARE must be all, tiles, shadows, faithful, reflections, tile-frusta, light-masks, opaque-gbuffer, lighting, specialized-gbuffer, specialized-lighting, forward-lighting, early-light-reject, depth-lights, terrain-layers, pass-cost, fronds, trees or tree-shadows"
                 );
             }
             let comparison = std::env::var("THEDAS_BENCH_SHADOW_COMPARE").ok();
@@ -613,6 +614,8 @@ fn capture(
                             level
                                 .renderer
                                 .set_deferred_specialized_lighting(Some(enabled));
+                        } else if compare == "forward-lighting" {
+                            level.renderer.set_deferred_forward_lighting(Some(enabled));
                         } else if compare == "lighting" {
                             level.renderer.set_deferred_tight_tiles(Some(enabled));
                             level.renderer.set_deferred_light_masks(Some(enabled));
@@ -678,6 +681,7 @@ fn capture(
                     level.renderer.set_deferred_opaque_gbuffer(None);
                     level.renderer.set_deferred_specialized_gbuffer(None);
                     level.renderer.set_deferred_specialized_lighting(None);
+                    level.renderer.set_deferred_forward_lighting(None);
                     level.renderer.set_deferred_early_light_reject(None);
                     level.renderer.set_deferred_depth_lights(None);
                     level.renderer.set_deferred_direct_terrain_layers(None);
@@ -3895,6 +3899,12 @@ impl App {
                 }
                 log.push(format!("shift {}", if down { "down" } else { "up" }));
             }
+            Step::MouseLeave => {
+                if let Some(g) = self.gfx.as_mut() {
+                    g.ui.mouse_leave();
+                }
+                log.push("mouse left the window".into());
+            }
             Step::Picker => {
                 if let Some(l) = self.live.as_ref() {
                     l.sim().input(
@@ -5054,6 +5064,7 @@ impl ApplicationHandler for App {
                 self.looking = false;
                 if let Some(g) = self.gfx.as_mut() {
                     g.ui.stage.set_shift(false);
+                    g.ui.mouse_leave();
                 }
             }
             WindowEvent::RedrawRequested => {
@@ -5858,6 +5869,8 @@ enum Step {
     Hover(f64, f64),
     /// Hold or release Shift for pointer input (`shift down`, `shift up`).
     Shift(bool),
+    /// The pointer leaves the window (`leave`), clearing movie hover.
+    MouseLeave,
     /// F1-F4: party member n leads.
     Leader(usize),
     /// 1-9, 0: the quickbar's slot n is used.
@@ -6443,6 +6456,7 @@ fn parse_step(s: &str) -> Result<Step> {
             "up" => false,
             _ => bail!("shift takes down or up"),
         }),
+        "leave" if arg.is_empty() => Step::MouseLeave,
         "rpress" | "rrelease" => {
             let (x, y) = arg.split_once(',').context("rpress takes x,y")?;
             Step::RightAt(x.trim().parse()?, y.trim().parse()?, verb == "rpress")
@@ -6720,6 +6734,13 @@ fn main() -> Result<()> {
                             layer.stage.set_shift(down);
                         }
                         println!("shift {}", if down { "down" } else { "up" });
+                    }
+                    Step::MouseLeave => {
+                        hovering = false;
+                        if let Some((layer, _)) = played.as_mut() {
+                            layer.mouse_leave();
+                        }
+                        println!("mouse left the window");
                     }
                     &Step::Press(x, y) | &Step::Release(x, y) => {
                         let down = matches!(step, Step::Press(..));
@@ -7719,8 +7740,8 @@ mod tests {
             ]
         );
         assert_eq!(
-            parse_steps("hover 5,6; key F4").unwrap(),
-            vec![Step::Hover(5.0, 6.0), Step::Leader(3)]
+            parse_steps("hover 5,6; leave; key F4").unwrap(),
+            vec![Step::Hover(5.0, 6.0), Step::MouseLeave, Step::Leader(3)]
         );
         assert_eq!(
             parse_steps("rclick 1,2; dclick 3,4").unwrap(),

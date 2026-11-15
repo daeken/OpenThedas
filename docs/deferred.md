@@ -100,10 +100,17 @@ worker threads exist. Discard warm-up frames and pair adjacent opposite modes.
    `THEDAS_DEFERRED_MESH_LEAVES=0` and `THEDAS_DEFERRED_LEAF_CARDS=0` each keep that
    family forward. The material survey and remaining coverage
    are recorded in [the inventory](notes/deferred-material-coverage.md).
-5. Everything not deferred draws forward with its original shaders over that colour and
-   depth. In a shared deferred frame, all renderers first draw their remaining opaque
-   geometry (including hair depth cores and unsupported materials). Blended and faded
-   geometry and particles then draw against the completed opaque depth, before the MSAA
+5. Eyelashes and all four compatible hair passes use the shared deferred lights and
+   shadows in their existing forward phases, preserving sampled coverage, depth tests,
+   culling and source-alpha blending. Hair retains its packed channels, noise tint and
+   two strand lobes; degenerate strand vectors use a finite tangent fallback. Runtime
+   fades and incompatible inputs keep the complete family on its faithful shaders.
+   `THEDAS_DEFERRED_FORWARD_LIGHTING=0` disables this planning; it is read once.
+   [The material note](notes/deferred-material-coverage.md#ordered-character-lighting)
+   describes admission and remaining coverage. Other materials draw with their original
+   shaders over that colour and depth. All renderers first draw their remaining opaque
+   geometry. Blended and faded geometry, ordered hair families and particles then draw
+   against the completed opaque depth, before the MSAA
    resolve and frame effects. This keeps a forward object from overwriting particles or
    water in front of it. Draw order within each renderer stays authored; this is not a
    global transparency sort or order-independent transparency. Distortion still uses its
@@ -165,8 +172,9 @@ G-buffer values nor depth, so SSAO and later forward geometry see through them. 
 opacity maps keep the faithful fallback. `THEDAS_DEFERRED_PUNCH=0` keeps these draws
 forward. Alpha coverage is binary at the G-buffer's single sample, including with MSAA.
 Cutout point shadows use the independent textured-caster plan; these cards never enter
-the opaque cube-shadow pipeline. Prop punch, eyelashes, hair and other blended materials
-retain their own forward equations.
+the opaque cube-shadow pipeline. Prop punch and unsupported blended materials retain
+their original forward equations. Compatible eyelash/hair colour uses the ordered
+lighting path described above.
 
 Single-pass, depth-writing `Char1` / `Ch1Alph` character cutouts also share the G-buffer
 when their pass alpha-tests without blending. The ordinary, NoTint, MulTint, ArmourTint
@@ -377,6 +385,8 @@ compares the eight terrain-layer comparisons with direct palette selection;
 `depth-lights` compares screen tiles with additional view-depth masks;
 `early-light-reject` compares early squared-distance rejection;
 `pass-cost` switches these four controls together.
+`forward-lighting` compares faithful and shared deferred lighting for the planned
+eyelash/hair receivers, preserving their forward geometry phases in both cases.
 Start with `--renderer deferred` so planning is already complete, keep `--time`, camera,
 resolution and AA fixed, and discard the first twenty frames before comparing adjacent
 pairs. `bench comparison modes` labels control frames 0 and test frames 1. Overrides

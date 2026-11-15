@@ -71,6 +71,9 @@ pub struct PlotInfo {
     /// expression over other flags that the plot file itself stores (see [`Composite`]).
     /// Read from the file but not yet consulted by the flag read.
     pub composites: BTreeMap<i32, Composite>,
+    /// DA2 simple-flag links (13306): setting the source copies its value to each
+    /// `(plot GUID, flag)` in file order, including when the value did not change.
+    pub linked_flags: BTreeMap<i32, Vec<(String, i32)>>,
 }
 
 /// A Dragon Age II composite flag: a boolean expression over flags of this or other plots.
@@ -175,6 +178,8 @@ pub struct Plots {
     loaded: bool,
     /// Defined flags being answered by their plot scripts, innermost last.
     asking: Vec<(String, i32)>,
+    /// Active DA2 link propagation; bounds cycles in malformed plot metadata.
+    propagating: Vec<(String, i32)>,
     /// While a report is being made (see [`Sim::conversation_conditions`]), every flag read,
     /// outermost first.
     pub(crate) reads: Option<Vec<FlagRead>>,
@@ -240,7 +245,8 @@ pub fn parse_plo(data: &[u8], resref: &str) -> Vec<PlotInfo> {
 /// Origins' initial flag bits, 13300 the simple flags and 13501 the composite flags. A simple
 /// flag holds 13200 its id, 13302 a reward-like number and 13303 its journal text; flag names
 /// are not shipped, so every flag's name is empty. Not read yet: a simple flag's 13304
-/// (a resource), 13306 (flags of other plots) and 13320 lists.
+/// (a resource) and 13320 lists. Field 13306's value propagation is traced in
+/// `docs/notes/da2-plot-links.md`.
 fn da2_plot(g: &Gff4, resref: &str) -> Option<PlotInfo> {
     let p = g.root;
     let guid = s(g, p, 13000)?;
@@ -268,6 +274,18 @@ fn da2_plot(g: &Gff4, resref: &str) -> Option<PlotInfo> {
         let Some(id) = int(f, 13200) else { continue };
         let id = id as i32;
         info.flags.insert(id, String::new());
+        let links = structs(g, f, 13306)
+            .into_iter()
+            .filter_map(|link| {
+                Some((
+                    s(g, link, 13100)?.to_ascii_uppercase(),
+                    int(link, 13101)? as i32,
+                ))
+            })
+            .collect::<Vec<_>>();
+        if !links.is_empty() {
+            info.linked_flags.insert(id, links);
+        }
         if let Some(r) = int(f, 13302).filter(|&r| r != 0) {
             info.rewards.insert(id, r as i32);
         }
@@ -360,6 +378,7 @@ pub fn plots_from_gff4(g: &Gff4, resref: &str) -> Vec<PlotInfo> {
             finals,
             pauses: g.field(p, 13023).and_then(|v| v.as_i64()).unwrap_or(0) != 0,
             composites: BTreeMap::new(),
+            linked_flags: BTreeMap::new(),
         });
     }
     out
@@ -585,7 +604,7 @@ impl Sim {
             self.world.plots.insert((key.clone(), flag), value);
             // A stored flag with journal text makes the quest's latest entry; a tutorial's
             // newly set flag queues its popup.
-            if value {
+            if value && self.game != thedas_vfs::Game::DragonAge2 {
                 if let Some(info) = self.plot_info(plot) {
                     self.note_journal_flag(&info, flag);
                     if !old {
@@ -609,6 +628,38 @@ impl Sim {
             flag,
             value,
         });
+        // DragonAge2.exe 0x6d9fa0 stores the source, then recursively sets its
+        // 13306 links (0x6da2af..0x6da320), before invoking the source's script.
+        // Both the value and the script/owner arguments are forwarded, even for
+        // clears and repeated sets. Origins has no such metadata.
+        if !defined && self.game == thedas_vfs::Game::DragonAge2 {
+            let source = (key.clone(), flag);
+            if !self.plots.propagating.contains(&source) {
+                self.plots.propagating.push(source);
+                let links = self
+                    .plot_info(plot)
+                    .and_then(|p| p.linked_flags.get(&flag).cloned())
+                    .unwrap_or_default();
+                for (target, target_flag) in links {
+                    if !self
+                        .plots
+                        .propagating
+                        .contains(&(target.clone(), target_flag))
+                    {
+                        self.set_plot_flag(&target, target_flag, value, call_script, owner);
+                    }
+                }
+                self.plots.propagating.pop();
+            }
+            if value {
+                if let Some(info) = self.plot_info(plot) {
+                    self.note_journal_flag(&info, flag);
+                    if !old {
+                        self.queue_tutorial(&info, flag);
+                    }
+                }
+            }
+        }
         if call_script || defined {
             if let Some(script) = self.plot_info(plot).and_then(|p| p.script.clone()) {
                 let ev = self.plot_event("SET_PLOT", &key, flag, value as i32, old as i32, owner);
@@ -825,7 +876,7 @@ mod tests {
                         13000, 13001, 13002, 13003, 13004, 13006, 13050, 13300, 13501, 3,
                     ],
                 ),
-                tmpl(b"SIMP", &[13200, 13302, 13303]),
+                tmpl(b"SIMP", &[13200, 13302, 13303, 13306]),
                 tmpl(b"COMP", &[13200, 13502, 13520]),
                 tmpl(b"PFLG", &[13100, 13101]),
                 tmpl(b"CLAS", &[13521, 13522]),
@@ -852,6 +903,7 @@ mod tests {
                         Value::U8(3),
                         Value::I32(55),
                         Value::Tlk(TlkString { id: 9, text: None }),
+                        list(&[3]),
                     ],
                 ),
                 st(2, vec![Value::U16(256), list(&[3]), list(&[4, 5])]),
@@ -875,6 +927,7 @@ mod tests {
         assert_eq!(p.flags.keys().copied().collect::<Vec<_>>(), vec![3, 256]);
         assert_eq!(p.rewards.get(&3), Some(&55));
         assert_eq!(p.journal.get(&3), Some(&9));
+        assert_eq!(p.linked_flags[&3], vec![("FFEE".into(), 12)]);
         let c = &p.composites[&256];
         assert_eq!(c.operands, vec![("FFEE".to_string(), 12)]);
         // not(FFEE flag 12)
@@ -882,5 +935,115 @@ mod tests {
         assert_eq!(c.eval(&mut |g, f| g == "FFEE" && f == 12), Some(false));
         // The caller's resource name wins when it gives one.
         assert_eq!(plots_from_gff4(&g, "plt_x")[0].resref, "plt_x");
+    }
+
+    fn linked_plot(guid: &str, links: &[(&str, i32)]) -> PlotInfo {
+        PlotInfo {
+            guid: guid.into(),
+            resref: format!("plt_{guid}"),
+            linked_flags: BTreeMap::from([(
+                0,
+                links.iter().map(|(p, f)| (p.to_string(), *f)).collect(),
+            )]),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn da2_plot_links_copy_sets_clears_and_repeated_values_in_order() {
+        let mut s = Sim::new(
+            Arc::new(Vfs::new()),
+            Arc::new(thedas_script::EngineTable::default()),
+            1,
+        );
+        s.game = thedas_vfs::Game::DragonAge2;
+        s.world.trace.keep = true;
+        s.plots.insert(linked_plot("A", &[("B", 0), ("C", 0)]));
+        s.plots.insert(linked_plot("B", &[("D", 0)]));
+        // An active metadata cycle is stopped without losing other links.
+        s.plots.insert(linked_plot("C", &[("A", 0), ("E", 1)]));
+        s.plots.insert(linked_plot("D", &[]));
+        s.plots.insert(linked_plot("E", &[]));
+        for value in [true, true, false, false] {
+            s.world.trace.entries.clear();
+            // Disturb the target independently: an unchanged source write must
+            // still copy the requested value into it.
+            s.world.plots.insert(("D".into(), 0), !value);
+            s.set_plot_flag("A", 0, value, false, OBJECT_INVALID);
+            for (plot, flag) in [("A", 0), ("B", 0), ("C", 0), ("D", 0), ("E", 1)] {
+                assert_eq!(s.get_plot_flag(plot, flag, false, OBJECT_INVALID), value);
+            }
+            let changes: Vec<_> = s
+                .world
+                .trace
+                .entries
+                .iter()
+                .filter_map(|e| match e {
+                    TraceEntry::PlotFlag { plot, .. } => Some(plot.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(changes, ["A", "B", "D", "C", "E"]);
+            assert!(s.plots.propagating.is_empty());
+        }
+        // The new path never applies to Origins, even with injected metadata.
+        s.game = thedas_vfs::Game::Origins;
+        s.set_plot_flag("A", 0, true, false, OBJECT_INVALID);
+        assert!(!s.get_plot_flag("B", 0, false, OBJECT_INVALID));
+    }
+
+    #[test]
+    fn da2_linked_scripts_run_before_source_and_inherit_owner_and_call_flag() {
+        use thedas_script::{EngineTable, ncs::Ncs};
+        let ldf = "#define ENGINE_STRUCTURE_0 event\n\
+            event GetCurrentEvent() = 1;\n\
+            object GetEventObject(event ev, int index) = 2;\n\
+            void SetLocalObject(object who, string key, object value) = 3;\n\
+            int EVENT_TYPE_SET_PLOT = 27;\n";
+        let mut s = Sim::new(
+            Arc::new(Vfs::new()),
+            Arc::new(EngineTable::parse(ldf.as_bytes()).unwrap()),
+            1,
+        );
+        s.game = thedas_vfs::Game::DragonAge2;
+        s.world.trace.keep = true;
+        let hero = s.world.spawn(crate::world::ObjectKind::Creature, "hero");
+        let owner = s.world.spawn(crate::world::ObjectKind::Creature, "owner");
+        s.world.hero = Some(hero);
+        for (name, links) in [("A", vec![("B", 0)]), ("B", vec![])] {
+            let mut plot = linked_plot(name, &links);
+            plot.script = Some(name.into());
+            s.plots.insert(plot);
+            // Own script: remember the SET_PLOT event's owner on the hero.
+            let mut code = vec![0x04, 0x03, 0, 0, 0, 0, 0x05, 0, 0, 1, 0, 0x05, 0, 0, 2, 2];
+            code.extend([0x04, 0x05, 0, 1]);
+            code.extend(name.as_bytes());
+            code.extend([0x04, 0x06]);
+            code.extend(0_u32.to_be_bytes()); // OBJECT_SELF (the plot's hero).
+            code.extend([0x05, 0, 0, 3, 3, 0x20, 0]);
+            let mut bytes = b"NCS V1.0B".to_vec();
+            bytes.extend(((13 + code.len()) as u32).to_be_bytes());
+            bytes.extend(code);
+            s.add_script(name, Ncs::parse(&bytes).unwrap());
+        }
+        s.set_plot_flag("A", 0, true, false, owner);
+        assert!(s.world.get(hero).unwrap().locals.objects.is_empty());
+        s.world.trace.entries.clear();
+        s.set_plot_flag("A", 0, false, true, owner);
+        let calls: Vec<_> = s
+            .world
+            .trace
+            .entries
+            .iter()
+            .filter_map(|e| match e {
+                TraceEntry::ScriptStart { script, .. } => Some(script.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(calls, ["B", "A"]);
+        let locals = &s.world.get(hero).unwrap().locals.objects;
+        assert_eq!(locals.get("A"), Some(&owner));
+        assert_eq!(locals.get("B"), Some(&owner));
+        assert!(s.world.trace.script_errors.is_empty());
     }
 }

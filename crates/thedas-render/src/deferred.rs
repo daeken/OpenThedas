@@ -5,7 +5,8 @@
 //! per pixel with every light in reach: the sum Static1.psh works out per object for three
 //! lights (`notes/frame-gamma-lightmap-trace.md`), over all of them. Everything else (water,
 //! sky, tree billboards, unsupported character, blended and multi-pass materials, particles) is drawn
-//! afterwards by the faithful pass, with its original shaders, over that colour and depth.
+//! afterwards over that colour and depth. Compatible hair/eyelash passes share its lights
+//! through their authored forward phases; other materials use their faithful shaders.
 //!
 //! Nothing here changes how the faithful path draws: with [`RenderPath::Faithful`] this
 //! module is not reached, and its GPU objects are not even made.
@@ -25,6 +26,9 @@ use crate::scene::{AreaScene, DOMAIN_CHARACTERS, DOMAIN_LEVEL, SceneLight};
 
 #[path = "deferred_light_masks.rs"]
 mod light_masks;
+
+#[path = "deferred_forward.rs"]
+mod forward;
 
 #[path = "deferred_trees.rs"]
 mod trees;
@@ -139,7 +143,8 @@ struct DrawData {
     /// The assigned irradiance probe's twelve rows (RGB).
     probe: [[f32; 4]; 12],
     tint: [[f32; 4]; 10],
-    /// x: 0 level, 1 prop, 2 character; y: emissive; z: tint; w: 1 face, 2 eye.
+    /// x: 0 level, 1 prop, 2 character; y: emissive; z: tint;
+    /// w: 1 face, 2 eye, 3 forward hair, 4 forward eyelash.
     material: [f32; 4],
     tint_color: [f32; 4],
     character: crate::deferred_character::CharacterData,
@@ -189,6 +194,8 @@ struct GpuLight {
 /// One draw the deferred pass takes from the faithful one.
 #[derive(Clone, Debug)]
 struct PlanDraw {
+    /// Ordered forward pipeline, absent for G-buffer geometry.
+    forward: Option<usize>,
     alpha_test: bool,
     /// 0: general material, 1: Static1, 2: terrain, 3: unlit Black.
     kind: usize,
@@ -211,6 +218,10 @@ struct PlanDraw {
 /// renderer is made, and its GPU objects, made the first time a frame is drawn deferred.
 pub(crate) struct DeferredPass {
     draws: Vec<PlanDraw>,
+    forward_draws: Vec<Option<usize>>,
+    forward_states: Vec<thedas_formats::state::PassState>,
+    forward_tangents: HashMap<usize, Vec<[f32; 4]>>,
+    forward_enabled: Option<bool>,
     trees: trees::Plan,
     tree_shadows: tree_shadow::Plan,
     tree_shadows_enabled: Option<bool>,
@@ -220,6 +231,7 @@ pub(crate) struct DeferredPass {
     /// Diffuse, normal, specular, lightmap, cube, terrain masks, tint and emissive.
     groups: Vec<[wgpu::TextureView; 12]>,
     group_samplers: Vec<Option<wgpu::Sampler>>,
+    group_noise_samplers: Vec<Option<wgpu::Sampler>>,
     vertices: HashMap<usize, Vec<DeferredVertex>>,
     skin_count: usize,
     /// Per faithful draw (index into [`D3dPass::draws`]): whether this pass draws it.
@@ -260,6 +272,7 @@ pub(crate) struct Contributor<'a> {
 }
 
 struct Gpu {
+    forward: forward::Gpu,
     trees: trees::Gpu,
     tree_shadows: tree_shadow::Gpu,
     /// By cull mode: none, back, front.
@@ -444,6 +457,7 @@ impl DeferredPass {
         } else {
             HashMap::new()
         };
+        let forward_materials = forward::materials(ctx, vfs, cache, scene, d3d);
         let mut texture = |names: &[Option<String>], ty: TextureType, fallback: [u8; 4]| {
             names
                 .iter()
@@ -456,11 +470,16 @@ impl DeferredPass {
         let mut group_of: HashMap<(usize, String, Option<usize>, String), usize> = HashMap::new();
         let mut groups = Vec::new();
         let mut group_samplers = Vec::new();
+        let mut group_noise_samplers = Vec::new();
+        let mut forward_states = Vec::new();
+        let mut forward_draws = vec![None; d3d.draws.len()];
+        let mut forward_tangents = HashMap::new();
         let mut draws = Vec::new();
         let mut data = Vec::new();
         let mut takes = vec![false; d3d.draws.len()];
         let mut vertices = HashMap::new();
         let mut skin_count = 1; // Slot zero is identity for rigid meshes.
+        let mut skin_slot_of = HashMap::new();
         let objects_enabled = crate::config::CONFIG.objects;
         let terrain_enabled = crate::config::CONFIG.terrain;
         let faces_enabled = crate::config::CONFIG.faces;
@@ -474,6 +493,7 @@ impl DeferredPass {
             let alpha = punch
                 .get(&k)
                 .filter(|_| objects_enabled || !crate::deferred_alpha::character(&program.name));
+            let forward = forward_materials.get(&k);
             let taken = !d3d.is_blended(d)
                 && !d.multipass
                 && (faces_enabled
@@ -493,9 +513,29 @@ impl DeferredPass {
                 // return to the faithful colour pass and leave the point-caster set.
                 && (cutaway_enabled || !scene.cut_away.contains(&d.draw))
                 && item.lightmap.as_ref().is_none_or(|l| l.planes().is_none());
-            let Some(m) = taken.then(|| scene.materials.get(item.material)).flatten() else {
+            let forward = forward.filter(|_| {
+                item.lod.is_none()
+                    && item.lightmap.is_none()
+                    && item
+                        .skin
+                        .as_ref()
+                        .is_none_or(|s| s.palette.len() <= crate::deferred_mesh::BONES)
+                    && (cutaway_enabled || !scene.cut_away.contains(&d.draw))
+            });
+            let Some(m) = (taken || forward.is_some())
+                .then(|| scene.materials.get(item.material))
+                .flatten()
+            else {
                 continue;
             };
+            if let Some(f) = forward {
+                let Some(tangents) = scene.meshes.get(d.mesh).and_then(|mesh| {
+                    forward::tangents(mesh, matches!(f.family, forward::Family::Hair(_)))
+                }) else {
+                    continue;
+                };
+                forward_tangents.entry(d.mesh).or_insert(tangents);
+            }
             if let std::collections::hash_map::Entry::Vacant(entry) = vertices.entry(d.mesh) {
                 let Some(v) = scene
                     .meshes
@@ -511,8 +551,11 @@ impl DeferredPass {
             let is_black = black(program);
             let is_face = program.name.starts_with("face1.");
             let is_eye = program.name.starts_with("eye0.");
-            let is_object =
-                object_material(program) || crate::deferred_alpha::character(&program.name);
+            let is_hair = forward.is_some_and(|f| matches!(f.family, forward::Family::Hair(_)));
+            let is_object = forward.is_some()
+                || object_material(program)
+                || crate::deferred_alpha::character(&program.name);
+            let alpha = forward.map(|f| &f.alpha).or(alpha);
             // The probe's cubemap as the faithful pass binds it (see `d3d::sampler_texture`).
             let cube = item.probe.and_then(|p| scene.probes.get(p)).map(|p| {
                 let name = p.name.to_ascii_lowercase();
@@ -528,6 +571,7 @@ impl DeferredPass {
                 .or_insert_with(|| {
                     let param = |p: &str| [m.texture(p), crate::d3d::texture_default(m, p)];
                     group_samplers.push(alpha.map(|a| a.sampler.clone()));
+                    group_noise_samplers.push(forward.and_then(|f| f.noise_sampler.clone()));
                     groups.push([
                         alpha.map(|a| a.diffuse.clone()).unwrap_or_else(|| {
                             texture(
@@ -541,15 +585,17 @@ impl DeferredPass {
                             )
                         }),
                         // A flat normal in DXT5nm's channels (x in alpha, y in green).
-                        texture(
-                            &param(if is_terrain {
-                                "normal"
-                            } else {
-                                "mml_tNormalMap"
-                            }),
-                            tex2d,
-                            [128, 128, 128, 128],
-                        ),
+                        forward.and_then(|f| f.noise.clone()).unwrap_or_else(|| {
+                            texture(
+                                &param(if is_terrain {
+                                    "normal"
+                                } else {
+                                    "mml_tNormalMap"
+                                }),
+                                tex2d,
+                                [128, 128, 128, 128],
+                            )
+                        }),
                         texture(
                             &param(if is_face {
                                 "mml_tAgeNormalMap"
@@ -654,8 +700,18 @@ impl DeferredPass {
             }
             let reflection =
                 crate::d3d::material_vector(m, "mml_fSpecularReflectionMult").map_or(1.0, |v| v[0]);
-            takes[k] = true;
+            takes[k] = forward.is_none();
+            let forward_pipeline = forward.map(|_| {
+                forward_draws[k] = Some(draws.len());
+                if let Some(index) = forward_states.iter().position(|p| *p == program.pass) {
+                    index
+                } else {
+                    forward_states.push(program.pass);
+                    forward_states.len() - 1
+                }
+            });
             draws.push(PlanDraw {
+                forward: forward_pipeline,
                 alpha_test: alpha.is_some(),
                 kind: if is_black {
                     3
@@ -674,15 +730,17 @@ impl DeferredPass {
                 sphere: item.sphere,
                 room: item.room_id,
                 skin_slot: if item.skin.is_some() {
-                    let i = skin_count;
-                    skin_count += 1;
-                    i
+                    *skin_slot_of.entry(d.draw).or_insert_with(|| {
+                        let i = skin_count;
+                        skin_count += 1;
+                        i
+                    })
                 } else {
                     0
                 },
                 // Textured cutouts use the independent forward-cutout caster plan;
                 // never submit their full card through the opaque cube pipeline.
-                casts: item.cast_shadow != Some(false) && alpha.is_none(),
+                casts: forward.is_none() && item.cast_shadow != Some(false) && alpha.is_none(),
             });
             data.push(DrawData {
                 lightmap: item.lightmap.as_ref().map_or([0.0, 0.0, 1.0, 1.0], |l| {
@@ -767,7 +825,11 @@ impl DeferredPass {
                     } else {
                         1.0
                     },
-                    if is_face {
+                    if is_hair {
+                        3.0
+                    } else if forward.is_some() {
+                        4.0
+                    } else if is_face {
                         1.0
                     } else if is_eye {
                         2.0
@@ -776,7 +838,14 @@ impl DeferredPass {
                     },
                 ],
                 tint_color: crate::d3d::material_vector(m, "mml_vTintColor").unwrap_or([0.0; 4]),
-                character: crate::deferred_character::CharacterData::new(m),
+                character: {
+                    let mut c = crate::deferred_character::CharacterData::new(m);
+                    if is_hair {
+                        c.eye = crate::d3d::material_vector(m, "mml_vHairParameters")
+                            .unwrap_or([1.0, 200.0, 30.0, 10.0]);
+                    }
+                    c
+                },
                 alpha: alpha.map_or([0.0; 4], |a| a.test),
             });
         }
@@ -792,6 +861,7 @@ impl DeferredPass {
         let trees = trees::Plan::new(scene, d3d, &mut takes);
         let tree_shadows = tree_shadow::Plan::new(scene, d3d);
         if crate::config::CONFIG.log_materials {
+            forward::log_materials(d3d, &forward_draws, false);
             // Count planned faithful passes, including offscreen and inactive LODs.
             // Keep this at load time so even large foliage scenes pay once.
             let mut counts: HashMap<&str, [usize; 2]> = HashMap::new();
@@ -815,7 +885,12 @@ impl DeferredPass {
                 log::info!("deferred-particle emitters={emitters} program={program}");
             }
             let mut reasons: HashMap<(&str, &str), usize> = HashMap::new();
-            for (_, d) in d3d.draws.iter().enumerate().filter(|(k, _)| !takes[*k]) {
+            for (_, d) in d3d
+                .draws
+                .iter()
+                .enumerate()
+                .filter(|(k, _)| !takes[*k] && forward_draws[*k].is_none())
+            {
                 let program = d3d.program(d);
                 let item = scene.draws.get(d.draw);
                 let reason = if scene.cut_away.contains(&d.draw) {
@@ -846,8 +921,9 @@ impl DeferredPass {
             }
         }
         log::info!(
-            "deferred: {} of {} draws ({} terrain, {} props, {} character materials, {} skinned, {} tree materials), planned in {:.1} ms ({} static draws)",
-            draws.len() + trees.len(),
+            "deferred: {} G-buffer + {} ordered forward of {} draws ({} terrain, {} props, {} character materials, {} skinned, {} tree materials), planned in {:.1} ms ({} static draws)",
+            draws.iter().filter(|d| d.forward.is_none()).count() + trees.len(),
+            forward_draws.iter().flatten().count(),
             d3d.draws.len(),
             data.iter().filter(|d| d.room[2] > 0.5).count(),
             data.iter().filter(|d| d.material[0] == 1.0).count(),
@@ -859,16 +935,28 @@ impl DeferredPass {
         );
         log::info!(
             "deferred: {} punch G-buffer draws",
-            data.iter().filter(|d| d.alpha[0] > 0.5).count()
+            draws
+                .iter()
+                .zip(&data)
+                .filter(|(d, data)| d.forward.is_none() && data.alpha[0] > 0.5)
+                .count()
         );
         log::info!(
             "deferred: {} character cutout G-buffer draws",
-            data.iter()
-                .filter(|d| d.material[0] > 0.5 && d.alpha[0] > 0.5)
+            draws
+                .iter()
+                .zip(&data)
+                .filter(|(d, data)| d.forward.is_none()
+                    && data.material[0] > 0.5
+                    && data.alpha[0] > 0.5)
                 .count()
         );
         (!draws.is_empty() || !cutouts.is_empty() || !trees.is_empty()).then(|| DeferredPass {
             draws,
+            forward_draws,
+            forward_states,
+            forward_tangents,
+            forward_enabled: None,
             trees,
             tree_shadows,
             tree_shadows_enabled: None,
@@ -877,6 +965,7 @@ impl DeferredPass {
             data,
             groups,
             group_samplers,
+            group_noise_samplers,
             vertices,
             skin_count,
             takes,
@@ -906,6 +995,56 @@ impl DeferredPass {
     /// Whether faithful draw `k` (an index into [`D3dPass::draws`]) is this pass's to draw.
     pub(crate) fn takes(&self, k: usize) -> bool {
         self.takes.get(k).copied().unwrap_or(false)
+    }
+
+    pub(crate) fn set_forward_lighting(&mut self, enabled: Option<bool>) {
+        self.forward_enabled = enabled;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn forward_draw_count(&self) -> usize {
+        self.forward_draws.iter().flatten().count()
+    }
+
+    /// Replaces this one draw in its existing ordered forward phase. Fades use the
+    /// faithful material's own fade/remote controls until represented here.
+    pub(crate) fn draw_forward(
+        &self,
+        pass: &mut wgpu::RenderPass<'_>,
+        k: usize,
+        d3d: &D3dPass,
+        mesh: &GpuMesh,
+    ) -> bool {
+        if !self
+            .forward_enabled
+            .unwrap_or(crate::config::CONFIG.forward_lighting)
+            || self.refused
+            || d3d.is_faded(&d3d.draws[k])
+        {
+            return false;
+        }
+        let Some(i) = self.forward_draws.get(k).copied().flatten() else {
+            return false;
+        };
+        let Some(gpu) = &self.gpu else { return false };
+        let (Some(lights), Some(sun)) = (&gpu.forward.lights, &gpu.forward.sun) else {
+            return false;
+        };
+        let d = &self.draws[i];
+        pass.set_pipeline(&gpu.forward.pipelines[d.forward.expect("forward pipeline")]);
+        pass.set_bind_group(
+            0,
+            &gpu.scene_group,
+            &[(i * DRAW_STRIDE) as u32, (d.skin_slot * SKIN_STRIDE) as u32],
+        );
+        pass.set_bind_group(1, &gpu.material_groups[d.group], &[]);
+        pass.set_bind_group(2, lights, &[]);
+        pass.set_bind_group(3, sun, &[]);
+        pass.set_vertex_buffer(0, gpu.vertices[&d.mesh].slice(..));
+        pass.set_vertex_buffer(1, gpu.forward.tangents[&d.mesh].slice(..));
+        pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
+        pass.draw_indexed(0..mesh.count, 0, 0..1);
+        true
     }
 
     pub(crate) fn set_shadow_reuse(&mut self, enabled: Option<bool>) {
@@ -1010,7 +1149,7 @@ impl DeferredPass {
         Some(&self.gpu.as_ref()?.targets.as_ref()?.views[0])
     }
 
-    fn build(&self, ctx: &GpuContext, color_format: wgpu::TextureFormat) -> Gpu {
+    fn build(&self, ctx: &GpuContext, color_format: wgpu::TextureFormat, samples: u32) -> Gpu {
         let device = &ctx.device;
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("deferred"),
@@ -1109,6 +1248,26 @@ impl DeferredPass {
                 buffer_entry(2, f, uniform),
                 buffer_entry(3, f, uniform),
                 buffer_entry(4, f, uniform),
+            ],
+        });
+        let forward_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("deferred forward lights"),
+            entries: &[
+                buffer_entry(0, f, uniform),
+                buffer_entry(1, f, uniform),
+                buffer_entry(2, f, uniform),
+                buffer_entry(3, f, uniform),
+                buffer_entry(4, f, uniform),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: f,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2Array,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
         let targets_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -1389,8 +1548,12 @@ impl DeferredPass {
             .groups
             .iter()
             .zip(&self.group_samplers)
+            .zip(&self.group_noise_samplers)
             .map(
-                |([d, n, s, l, e, mv, ma, ma2, tint, emissive, td, tn], sampler)| {
+                |(
+                    ([d, n, s, l, e, mv, ma, ma2, tint, emissive, td, tn], sampler),
+                    noise_sampler,
+                )| {
                     device.create_bind_group(&wgpu::BindGroupDescriptor {
                         label: Some("deferred material"),
                         layout: &material_layout,
@@ -1419,7 +1582,9 @@ impl DeferredPass {
                             },
                             wgpu::BindGroupEntry {
                                 binding: 5,
-                                resource: wgpu::BindingResource::Sampler(&clamp),
+                                resource: wgpu::BindingResource::Sampler(
+                                    noise_sampler.as_ref().unwrap_or(&clamp),
+                                ),
                             },
                             wgpu::BindGroupEntry {
                                 binding: 6,
@@ -1532,6 +1697,17 @@ impl DeferredPass {
             (cull_index(d.cull), d.group, d.mesh)
         });
         Gpu {
+            forward: forward::Gpu::new(
+                device,
+                color_format,
+                samples,
+                &scene_layout,
+                &material_layout,
+                &forward_layout,
+                &sun_layout,
+                &self.forward_states,
+                &self.forward_tangents,
+            ),
             trees: self.trees.build(device, &frame_buffer),
             tree_shadows: self.tree_shadows.build(device),
             gbuffer,
@@ -1630,6 +1806,7 @@ impl DeferredPass {
         self.trees.prepare(d3d, &mut self.takes);
         if crate::config::CONFIG.log_materials && !self.logged_materials {
             self.logged_materials = true;
+            forward::log_materials(d3d, &self.forward_draws, true);
             let mut counts: HashMap<&str, [usize; 2]> = HashMap::new();
             for (k, d) in d3d
                 .draws
@@ -1650,7 +1827,7 @@ impl DeferredPass {
         }
         if self.gpu.is_none() {
             self.gpu = checked(&ctx.device, "the deferred renderer", || {
-                self.build(ctx, color_format)
+                self.build(ctx, color_format, d3d.samples())
             });
             if self.gpu.is_none() {
                 self.refused = true;
@@ -2047,6 +2224,42 @@ impl DeferredPass {
             .write_buffer(&gpu.sun_buffer, 0, bytemuck::bytes_of(&sun));
         ctx.queue
             .write_buffer(&gpu.lighting_buffer, 0, bytemuck::bytes_of(&lighting));
+        if gpu.forward.own_lights.is_none() {
+            let mut entries: Vec<_> = [
+                &gpu.lighting_buffer,
+                &gpu.light_buffer,
+                &gpu.faces_buffer,
+                &gpu.tile_buffer,
+                &gpu.mask_buffer,
+            ]
+            .into_iter()
+            .enumerate()
+            .map(|(binding, buffer)| wgpu::BindGroupEntry {
+                binding: binding as u32,
+                resource: buffer.as_entire_binding(),
+            })
+            .collect();
+            entries.push(wgpu::BindGroupEntry {
+                binding: 5,
+                resource: wgpu::BindingResource::TextureView(
+                    &gpu.shadows.as_ref().expect("point shadows").view,
+                ),
+            });
+            gpu.forward.own_lights = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("deferred shared forward lights"),
+                layout: &gpu.forward.layout,
+                entries: &entries,
+            }));
+        }
+        gpu.forward.lights = gpu.forward.own_lights.clone();
+        gpu.forward.sun = gpu.sun_group.clone();
+        for c in contributors.iter_mut() {
+            c.pass.forward_enabled = self.forward_enabled;
+            if let Some(g) = &mut c.pass.gpu {
+                g.forward.lights = gpu.forward.lights.clone();
+                g.forward.sun = gpu.forward.sun.clone();
+            }
+        }
         if let Some(p) = profile.as_deref_mut() {
             p.mark("deferred_prepare");
         }
@@ -2477,7 +2690,11 @@ fn draw_all(
     let (mut pipeline, mut group) = (usize::MAX, usize::MAX);
     for &i in &gpu.order {
         let d = &draws[i];
-        if !d3d.in_view(d.k) || d3d.is_faded(&d3d.draws[d.k]) || (!gbuffer && d.kind == 3) {
+        if d.forward.is_some()
+            || !d3d.in_view(d.k)
+            || d3d.is_faded(&d3d.draws[d.k])
+            || (!gbuffer && d.kind == 3)
+        {
             continue;
         }
         let Some(mesh) = meshes.get(d.mesh) else {

@@ -130,6 +130,9 @@ pub struct Vm {
     /// The visible area in stage units (`Stage.width`/`height`).
     pub stage_size: (f64, f64),
     pub mouse_pos: (f64, f64),
+    /// Whether the window currently contains the pointer. Keep its last coordinates
+    /// separately so leaving does not move captured text or clip drags.
+    pub mouse_in_stage: bool,
     pub keys_down: HashSet<u32>,
     pub last_key: u32,
     pub focus: Option<DisplayId>,

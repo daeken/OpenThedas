@@ -812,7 +812,8 @@ impl Sim {
         // conversation is a game mode request (0x697765), and a running conversation does
         // not give way (its +0x28 is false), so the request waits in the mode controller's
         // pending list (0x6414a0, 0x640c60). Its start is chosen when it starts.
-        if !ambient(self) && self.talk.as_ref().is_some_and(|t| !t.ended) {
+        if !ambient(self) && (self.talk.as_ref().is_some_and(|t| !t.ended) || self.dialog_advancing)
+        {
             self.world.pending_talks.push((initiator, target, d));
             return true;
         }
@@ -833,10 +834,13 @@ impl Sim {
             ambient_run: ambient(self),
             ..c
         };
+        let advancing = self.dialog_advancing;
+        self.dialog_advancing |= self.game == thedas_vfs::Game::DragonAge2 && !c.ambient_run;
         let c = match start {
             Some(s) => self.speak(c, s),
             None => Conversation { ended: true, ..c },
         };
+        self.dialog_advancing = advancing;
         if ambient(self) {
             // One at a time for a speaker: a new one takes the place of the one it was
             // saying. Provisional: what DAOrigins.exe does with a second ambient
@@ -1072,6 +1076,14 @@ impl Sim {
 
     /// Picks reply `choice` (an index into the current replies).
     pub fn choose_reply(&mut self, choice: usize) -> Option<DialogState> {
+        let advancing = self.dialog_advancing;
+        self.dialog_advancing |= self.game == thedas_vfs::Game::DragonAge2;
+        let result = self.advance_reply(choice);
+        self.dialog_advancing = advancing;
+        result
+    }
+
+    fn advance_reply(&mut self, choice: usize) -> Option<DialogState> {
         let mut c = self.talk.take()?;
         let Some(&reply) = c.replies.get(choice) else {
             self.talk = Some(c);
