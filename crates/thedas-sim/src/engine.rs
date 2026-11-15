@@ -2830,22 +2830,36 @@ pub fn call(
                 _ => None,
             });
             let same = |x: &Effect, e: &Effect| if e.id != 0 { x.id == e.id } else { x == e };
-            let location = effect.and_then(|e| {
-                if let Some(location) = e.visual_location {
-                    Some(location)
-                } else if let Some(target) = e.visual_target {
-                    // A removed explicit target stays invalid; another applied copy
-                    // with the same identity must not supply its location.
-                    h.location_of(target)
-                } else {
-                    // Older saves did not retain the application context.
-                    h.sim.world.location_vfx.iter().find(|v| same(&v.effect, e))
-                        .map(|v| Location { area: v.area, position: v.position, facing: v.facing })
-                        .or_else(|| h.sim.world.objects.values()
-                            .find(|o| o.effects.iter().any(|x| same(x, e)))
-                            .and_then(|o| h.location_of(o.id)))
-                }
-            })
+            let location = effect
+                .and_then(|e| {
+                    if let Some(location) = e.visual_location {
+                        Some(location)
+                    } else if let Some(target) = e.visual_target {
+                        // A removed explicit target stays invalid; another applied copy
+                        // with the same identity must not supply its location.
+                        h.location_of(target)
+                    } else {
+                        // Older saves did not retain the application context.
+                        h.sim
+                            .world
+                            .location_vfx
+                            .iter()
+                            .find(|v| same(&v.effect, e))
+                            .map(|v| Location {
+                                area: v.area,
+                                position: v.position,
+                                facing: v.facing,
+                            })
+                            .or_else(|| {
+                                h.sim
+                                    .world
+                                    .objects
+                                    .values()
+                                    .find(|o| o.effects.iter().any(|x| same(x, e)))
+                                    .and_then(|o| h.location_of(o.id))
+                            })
+                    }
+                })
                 .unwrap_or(Location {
                     area: OBJECT_INVALID,
                     position: [0.0; 3],
@@ -7851,6 +7865,8 @@ mod tests {
     #[test]
     fn visual_effect_locations_follow_the_applied_copy_or_keep_the_location() {
         let mut s = effect_accessors_sim();
+        let effect_type = s.types.effect;
+        let location_type = s.types.location;
         let area = s.world.spawn(ObjectKind::Area, "a");
         let a = s.world.spawn(ObjectKind::Creature, "one");
         let b = s.world.spawn(ObjectKind::Creature, "two");
@@ -7874,7 +7890,7 @@ mod tests {
             let e = s.world.get(id).unwrap().effects[0].clone();
             let hd = s.world.store(EngineData::Effect(e));
             let effect = Value::Engine {
-                ty: s.types.effect,
+                ty: effect_type,
                 handle: Some(hd),
             };
             let Some(Value::Engine { handle, .. }) =
@@ -7893,7 +7909,7 @@ mod tests {
         };
         let lh = s.world.store(EngineData::Location(at));
         let effect = Value::Engine {
-            ty: s.types.effect,
+            ty: effect_type,
             handle: Some(hd),
         };
         run(
@@ -7904,7 +7920,7 @@ mod tests {
                 Value::Int(3),
                 effect,
                 Value::Engine {
-                    ty: s.types.location,
+                    ty: location_type,
                     handle: Some(lh),
                 },
                 Value::Float(0.0),
@@ -7918,7 +7934,7 @@ mod tests {
             a,
             "GetVisualEffectLocation",
             &[Value::Engine {
-                ty: s.types.effect,
+                ty: effect_type,
                 handle: Some(eh),
             }],
         ) else {
@@ -7929,9 +7945,20 @@ mod tests {
         let e = s.world.get(a).unwrap().effects[0].clone();
         s.world.objects.remove(&a);
         let eh = s.world.store(EngineData::Effect(e));
-        let Some(Value::Engine { handle, .. }) = run(&mut s, 0, "GetVisualEffectLocation",
-            &[Value::Engine { ty: s.types.effect, handle: Some(eh) }]) else { panic!("location") };
-        assert!(matches!(s.world.handle(handle), Some(EngineData::Location(l)) if l.area == OBJECT_INVALID));
+        let Some(Value::Engine { handle, .. }) = run(
+            &mut s,
+            0,
+            "GetVisualEffectLocation",
+            &[Value::Engine {
+                ty: effect_type,
+                handle: Some(eh),
+            }],
+        ) else {
+            panic!("location")
+        };
+        assert!(
+            matches!(s.world.handle(handle), Some(EngineData::Location(l)) if l.area == OBJECT_INVALID)
+        );
     }
 
     #[test]
