@@ -244,11 +244,19 @@ impl Player {
     /// Plays one frame: enter-frame handlers, then every playing timeline advances.
     pub fn run_frame(&mut self) {
         let clips = all_clips(&self.vm);
+        // Only clips that listen are queued: a HUD has hundreds of clips and a handful of
+        // handlers, and queueing every clip for a lookup cost more than the scripts did.
+        // Provisional: a handler a clip gains from another's handler in the same frame
+        // first runs on the next frame (Flash dispatches to every clip and looks then).
+        let mut by_proto: HashMap<ObjId, bool> = Default::default();
         for c in &clips {
             if self.vm.display.get(*c).is_none() {
                 continue;
             }
             let events = clip_events(&self.vm, *c, clip_event::ENTER_FRAME);
+            if events.is_empty() && !listens(&mut self.vm, *c, &mut by_proto) {
+                continue;
+            }
             self.vm
                 .queue
                 .push_back(Queued::Event(*c, "onEnterFrame", events));
@@ -810,6 +818,30 @@ fn all_clips(vm: &Vm) -> Vec<DisplayId> {
         }
     }
     out
+}
+
+/// Whether clip `d` has an `onEnterFrame` of its own or from its prototypes (looked up once
+/// a frame for each prototype, in `by_proto`).
+fn listens(vm: &mut Vm, d: DisplayId, by_proto: &mut HashMap<ObjId, bool>) -> bool {
+    let Some(id) = display_api::display_value(vm, d).as_object() else {
+        return false;
+    };
+    let Some(o) = vm.heap.get(id) else {
+        return false;
+    };
+    if o.props.get("onEnterFrame").is_some() {
+        return true;
+    }
+    let Some(proto) = o.proto else {
+        return false;
+    };
+    if let Some(&b) = by_proto.get(&proto) {
+        return b;
+    }
+    let f = vm.get(&Value::Object(proto), "onEnterFrame");
+    let b = matches!(&f, Value::Object(o) if vm.is_function(*o));
+    by_proto.insert(proto, b);
+    b
 }
 
 fn clip_events(vm: &Vm, d: DisplayId, flag: u32) -> Vec<crate::swf::Actions> {
