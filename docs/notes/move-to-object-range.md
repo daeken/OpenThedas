@@ -54,7 +54,7 @@ checkpoint identifies the first differing completion precisely:
   different starting points.
 - The introduction is owned by trigger `lot100tr_party_talk`, centered at
   (267.82733,154.11592). Its script handles ENTER (8), checks the party's
-  `CAMP_EVENT_BEFORE_LOTHERING` flag and that the entering creature is controlled,
+  `CAMP_EVENT_BEFORE_LOTHERING` flag and `IsFollower` on the entering creature,
   then starts `party_camp.dlg`. It does not issue MoveToObject or wait for the
   ambush command's completion or perception. On the old branch that walk misses the
   trigger and leaves the flag set; camp entry later consumes it, selecting the
