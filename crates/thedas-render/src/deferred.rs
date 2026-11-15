@@ -472,13 +472,12 @@ impl DeferredPass {
         let started = std::time::Instant::now();
         // Experimental: a fitted light set for the lightmaps-off mode (see `crate::lightset`).
         // The hybrid mode takes only the set's shadow reaches.
-        let light_set = if crate::config::CONFIG.baked_lighting
-            && !crate::config::CONFIG.realtime_direct
-        {
-            None
-        } else {
-            crate::lightset::LightSet::for_level(&scene.level)
-        };
+        let light_set =
+            if crate::config::CONFIG.baked_lighting && !crate::config::CONFIG.realtime_direct {
+                None
+            } else {
+                crate::lightset::LightSet::for_level(&scene.level)
+            };
         let lightmaps_off = !crate::config::CONFIG.baked_lighting;
         let punch_enabled = crate::config::CONFIG.punch;
         let punch: HashMap<usize, _> = if punch_enabled {
@@ -1073,20 +1072,6 @@ impl DeferredPass {
                                 .then_some(d.room_id)?
                         })
                     };
-<<<<<<< HEAD
-                    set.fills.iter().map(|f| SceneLight::Point {
-                        position: f.position,
-                        color: f.color,
-                        radius: f.radius,
-                        name: "baked fill".into(),
-                        domain: None,
-                        is_static: true,
-                        version: 0,
-                        intensity: 1.0,
-                        room: f.atlas.as_deref().and_then(atlas_room),
-                    })
-                    .collect()
-=======
                     set.fills
                         .iter()
                         .map(|f| SceneLight::Point {
@@ -1102,7 +1087,6 @@ impl DeferredPass {
                             room: f.atlas.as_deref().and_then(atlas_room),
                         })
                         .collect()
->>>>>>> origin/main
                 })
                 .unwrap_or_default(),
             refused: false,
