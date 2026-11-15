@@ -32,6 +32,7 @@ mod deferred_shadow;
 mod deferred_terrain;
 mod deferred_tiles;
 pub mod distortion;
+pub mod flicker;
 pub mod fxaa;
 pub mod gpu;
 pub mod lightset;

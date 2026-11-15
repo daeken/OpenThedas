@@ -15,10 +15,13 @@ Marks: **[V]** read from the toolset's code; **[F]** found by fitting the shippe
 [F] The public driver (`LightMapper.py` 1.0.3, dated 2 December 2009, a month after release)
 cannot be what made the shipped atlases:
 
-- its shadow pass is binary per sample (`monochrome`, §3), but the shipped alpha rises
-  smoothly with the static lights' summed falloff and saturates (§6);
 - its occlusion is five rays per sample, which leaves visible noise; the shipped atlases are
-  smooth.
+  smooth, and their occlusion is distance-weighted and clamped (§6);
+- several shipped lights were baked with a smaller radius than the one they ship with, and
+  meshes that cast no baked shadow (MMH 6177 = 0) did not occlude (§6).
+
+Its shadow pass, though, is the shipped one: binary per light (`monochrome`, §2), once the
+occlusion both channels share is divided out (§6).
 
 The script's own history says "1.0.3: fixing sunlight direction and shadows". So the toolset's
 code tells us the conventions (atlas mapping, the RGBA combination, light falloff, film), and
@@ -160,13 +163,17 @@ falloff × |cos| × visibility, and occlusion ray hit distances, then fits.
   light strength for most lights (lamp_007, lamp_011, fireplaces, bounce_005): the shipped
   shadow pass is the toolset's monochrome one. Some lights (lamp_009, lamp_010, bounce_008)
   step from 0 to 1 well inside their runtime radius: their bake radius was smaller (about
-  two thirds) than the exported one. So the √min(1, 3S) curve below only stands in for an
-  occlusion model we have not matched yet (the shipped occlusion is darker under ceilings,
-  plateauing near 220/255 on open floors); with the current occlusion model it still scores
-  better (alpha MAE 19.5 / 6.5 on room1100 / room1400 against 19.8 / 9.0 monochrome).
-  Next: fit occlusion on the occlusion-free texels' alpha, then return to `Monochrome`
-  with per-light bake radii.
-- **Former reading (kept for the record): alpha rises with light strength.** Over the static lights, with S = Σ max(0, 1 − d/R)·|cos|·
+  two thirds) than the exported one.
+- **Monochrome with fitted bake radii is now the recipe** (`--shipped`). `--fit` finds each
+  shadow-casting light's bake radius as the share of its exported radius that best splits lit
+  from dark alpha on the texels it alone reaches (`radius i s` in fit.txt): Cousland's lamps
+  0.80–0.90, fireplaces 0.90–0.95; `sun_fake_static` and some window fills are not in the
+  shadow pass at all. It also fits the occlusion model on the texels the monochrome pass fully
+  lights, where alpha is occlusion alone; the best is still (1 − t/1.5)² weighting,
+  clamp(−1 + 2v), unscaled. Against the √min(1, 3S) stand-in, both levels improve on mean
+  alpha error: Cousland 13.6 → 10.3 levels (texels within 4 levels 35.4 → 37.3%; RMSE 37.6 →
+  39.2), Lake Calenhad 8.3 → 6.4 (70.1 → 73.6%; RMSE 33.2 → 32.7). RGB is unchanged.
+- **Former reading (superseded; `--shadow-intensity 3,0.5`): alpha rises with light strength.** Over the static lights, with S = Σ max(0, 1 − d/R)·|cos|·
   visibility (no colour), shipped alpha ÷ occlusion ≈ √min(1, 3S): 0.47 at S = 0.075, 0.73
   at 0.175, 0.96 at 0.325, saturated beyond 0.35 (`--shadow-intensity 3,0.5`). Other falloff
   shapes (quadratic, cos², smoothstep) fit no better. [I] A shadow job without `monochrome`
@@ -192,10 +199,12 @@ falloff × |cos| × visibility, and occlusion ray hit distances, then fits.
 - **Shadows are hard.** Sampling point lights as spheres (`--light-size`) makes the fit worse
   at every size tried (0.25–1).
 - Whole level, each atlas fitted then baked (Cousland, 88 atlases, 19.2M texels): mean error
-  RGB 9.4 / 8.2 / 8.8, alpha 15.0 levels (RMSE 17 / 15 / 16 and 42); 35% of texels within 4
-  levels on every channel. Alpha is the weakest part (window and fake-sun fills).
+  RGB 9.4 / 8.2 / 8.8, alpha 10.3 levels with `--shipped` (RMSE 17 / 15 / 16 and 39); 37% of
+  texels within 4 levels on every channel. Alpha is the weakest part (window and fake-sun
+  fills).
 - **Exteriors** (Lake Calenhad `lak100d`, 71 terrain/LOD atlases, 26.3M texels): mean error RGB
-  4.0 / 4.1 / 3.8, alpha 8.3 levels; 70% of texels within 4 levels on every channel. The sun
+  4.0 / 4.1 / 3.8, alpha 6.4 levels with `--shipped`; 74% of texels within 4 levels on every
+  channel. The sun
   is in the shadow pass only (its fitted RGB brightness is ≈ 0, as the editor routing says);
   the baked ambient is a dim green, about (0.06, 0.09, 0.06); water surfaces are not part of
   the bake scene (terrain under the lake is sunlit in the shipped alpha).
@@ -215,7 +224,8 @@ it is derived from game data, it lives outside the repository, in OpenThedas-tes
 - `lights[]`: every level light (the bake's order: non-character points, then the sun) with
   `name`, `kind`, `position` (for the sun, the direction toward it), `radius`, runtime
   `color`; `baked_brightness`: mean fitted RGB-pass brightness where it was seen
-  (`null` = not seen); `in_alpha`: whether the shadow pass took it.
+  (`null` = not seen); `in_alpha`: whether the shadow pass took it; `shadow_reach`: the share
+  of its radius the shadow pass reached (the bake radius; 1 when not fitted).
 - `found[]`: baked-only lights recovered from the RGB residual: `position`, `radius`,
   `color` (colour × brightness), and the `atlas` whose fit found them. Fits of neighbouring
   atlases can find the same light twice.
@@ -231,6 +241,8 @@ lightmapped part and writes per atlas a PNG (ours | shipped | |difference| × 4,
 alpha) and `report.txt` with per-channel MAE/RMSE/bias. `--fit` instead fits light
 brightnesses and room ambients and reports how the shadow and occlusion passes explain
 alpha; `--probe X,Y` explains one atlas texel (surface, each light's term, what blocks the
-occlusion rays). The fitted variants: `--ao-model L,E,LO,P`, `--shadow-intensity K,E`,
+occlusion rays). `--shipped --use-fit fit.txt` is the closest reproduction (the fitted
+occlusion, one-texel dilation and the toolset's monochrome shadow pass, plus a fit's lights,
+bake radii and ambients). The parts: `--ao-model L,E,LO,P[,HI]`, `--shadow-intensity K,E`,
 `--dilate N`, `--use-fit fit.txt` (a `--fit` run's light brightnesses and room ambients),
 `--light-size R,N`; `--ao-converged N` and `--ao-length L` vary the toolset's own occlusion.
