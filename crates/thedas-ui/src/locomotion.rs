@@ -28,7 +28,10 @@
 //!   turned (0xa6aea9); a standing creature turned past 30° plays `turnl90` / `turnr90`
 //!   (state 16, 0xa6aff0) at `min(1.3, 120° · length / angle)` times speed. The clips
 //!   barely turn the body (their root turns under 20°): the exe turns the creature while
-//!   they play, so the facing drawn turns from the old to the new over the clip.
+//!   they play (the simulation's turn law for movers, `thedas_sim`'s `turn_toward`). The
+//!   start's angle is between the body and the way it sets off (this frame's step). Where
+//!   the simulation turns a creature at once (a standing creature faced elsewhere), the
+//!   facing drawn turns from the old to the new over the clip.
 //!
 //! - **The cycle** (0xa6b7a0): `Run` against `Walk` by speed (the speed over the run
 //!   speed once past the walk speed), the run leaning into turns (`runleanl` /
@@ -429,6 +432,11 @@ impl Locomotion {
                 let d = [p[0] - m.position[0], p[1] - m.position[1]];
                 d[0] * d[0] + d[1] * d[1] > 1e-6
             });
+            // The way it is going (the facing that looks along this frame's step).
+            let heading = gait.last.and_then(|(p, _)| {
+                let (dx, dy) = (m.position[0] - p[0], m.position[1] - p[1]);
+                (dx * dx + dy * dy > 1e-6).then(|| thedas_sim::world::facing_toward(dx, dy))
+            });
             let last_moved = match gait.last {
                 Some((_, at)) if !(running || moved) => at,
                 _ => now,
@@ -469,6 +477,7 @@ impl Locomotion {
                 &trees,
                 moving,
                 m.facing,
+                heading,
                 pace,
                 now,
                 dt,
@@ -600,6 +609,7 @@ fn step(
     trees: &[String],
     moving: bool,
     facing: f32,
+    heading: Option<f32>,
     pace: Pace,
     now: u64,
     dt: f32,
@@ -622,9 +632,13 @@ fn step(
     match (gait.phase, moving) {
         (Phase::Idle | Phase::Stopping | Phase::Turning, true) => {
             // A start facing away turns as it goes (0xa6aea9: under 45° straight, under
-            // 157.5° a quarter turn, else a half turn; the side by the turn's sign).
-            let side = if turn > 0.0 { 'l' } else { 'r' };
-            let start = match turn.abs() {
+            // 157.5° a quarter turn, else a half turn; the side by the turn's sign). The
+            // angle is between the body and the way it sets off: the simulation turns the
+            // body over the first steps (its turn law), so the way is this frame's step
+            // when it has one.
+            let away = heading.map_or(turn, |h| turned(drawn, h));
+            let side = if away > 0.0 { 'l' } else { 'r' };
+            let start = match away.abs() {
                 a if a < 45.0 => START.to_string(),
                 a if a < 157.5 => format!("pauseturn{side}90runf"),
                 _ => format!("pauseturn{side}180runf"),
@@ -638,7 +652,9 @@ fn step(
                 gait.play(&start, now);
                 gait.standing.to(0.0, CLEAR_RATE);
                 gait.start_next = None;
-                gait.turn = (start != START).then_some(Turn {
+                // The body is drawn turning over the clip only where the simulation turned it
+                // at once; where it turns the body itself, its facing is drawn.
+                gait.turn = (start != START && turned_now && turn.abs() >= 45.0).then_some(Turn {
                     from: drawn,
                     by: turn,
                     start: now,
@@ -988,6 +1004,7 @@ mod tests {
                     &trees,
                     moving,
                     0.0,
+                    None,
                     PACE,
                     *t,
                     d as f32 / 1000.0,
@@ -1054,11 +1071,11 @@ mod tests {
         let mut g = Gait::idle();
         g.trees = trees.clone();
         step(
-            &mut g, &mut clips, &sim, &trees, false, 90.0, PACE, 1000, 0.0,
+            &mut g, &mut clips, &sim, &trees, false, 90.0, None, PACE, 1000, 0.0,
         );
         // Turned 60° anticlockwise in place: the left turn, at 120·0.8/60 → capped 1.3×.
         step(
-            &mut g, &mut clips, &sim, &trees, false, 150.0, PACE, 1010, 0.01,
+            &mut g, &mut clips, &sim, &trees, false, 150.0, None, PACE, 1010, 0.01,
         );
         assert_eq!(g.phase, Phase::Turning);
         assert_eq!(g.clip.as_ref().unwrap().0, "turnl90");
@@ -1068,10 +1085,10 @@ mod tests {
         assert_eq!(g.drawn_facing(1010 + 700), None);
         // Run off the other way: a half turn to the right as it starts.
         step(
-            &mut g, &mut clips, &sim, &trees, false, 150.0, PACE, 2000, 0.99,
+            &mut g, &mut clips, &sim, &trees, false, 150.0, None, PACE, 2000, 0.99,
         );
         step(
-            &mut g, &mut clips, &sim, &trees, true, 340.0, PACE, 2010, 0.01,
+            &mut g, &mut clips, &sim, &trees, true, 340.0, None, PACE, 2010, 0.01,
         );
         assert_eq!(g.phase, Phase::Starting);
         assert_eq!(g.clip.as_ref().unwrap().0, "pauseturnr180runf");

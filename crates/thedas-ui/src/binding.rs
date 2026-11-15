@@ -287,8 +287,116 @@ pub fn item_category(sim: &Sim, item: u32) -> ItemCategory {
     }
 }
 
+/// What the interface keeps between frames to build its values faster (see
+/// [`sim_values_cached`]).
+#[derive(Default)]
+pub struct ValueCache {
+    /// By group (`Party.Members.0`, `Inventory`): what it was built for and when.
+    groups: std::collections::HashMap<String, Built>,
+    /// The groups this frame's values have.
+    seen: std::collections::HashSet<String>,
+    /// Groups to set until replaced: (group, rows), for
+    /// [`crate::protocol::GameBridge::bind_sticky`].
+    pub updates: Vec<(String, Vec<(String, UiValue)>)>,
+    /// Groups no longer shown.
+    pub drops: Vec<String>,
+}
+
+/// A group of values as set into the bridge: what it was built for (a creature, say), and when.
+struct Built {
+    token: u64,
+    at: std::time::Instant,
+    ttl: std::time::Duration,
+}
+
+impl ValueCache {
+    /// Whether `group` must be built again (not built yet, built for another `token`, or
+    /// older than its lifetime); notes it as shown.
+    fn stale(&mut self, group: &str, token: u64) -> bool {
+        self.seen.insert(group.to_string());
+        self.groups
+            .get(group)
+            .is_none_or(|b| b.token != token || b.at.elapsed() >= b.ttl)
+    }
+
+    /// Hands over a built group, to stay until `ttl` has passed.
+    fn put(&mut self, group: &str, token: u64, ttl_ms: u64, rows: Vec<(String, UiValue)>) {
+        self.groups.insert(
+            group.to_string(),
+            Built {
+                token,
+                at: std::time::Instant::now(),
+                ttl: std::time::Duration::from_millis(ttl_ms),
+            },
+        );
+        self.updates.push((group.to_string(), rows));
+    }
+
+    /// Ends a frame: groups that were not shown go.
+    fn finish(&mut self) {
+        let (groups, seen, drops) = (&mut self.groups, &self.seen, &mut self.drops);
+        groups.retain(|k, _| {
+            let keep = seen.contains(k);
+            if !keep {
+                drops.push(k.clone());
+            }
+            keep
+        });
+        self.seen.clear();
+    }
+}
+
+/// How long a creature's derived properties are left as they are (milliseconds of real time,
+/// so a paused game's inventory screen still shows an equipped item's effect): they come
+/// from its base properties, equipment and effects, which change a few times a minute, while
+/// building them for every property of every party member each frame was most of the cost of
+/// building the values. They are handed over once (in `updates`) and stay bound; the current
+/// values (health and mana bars) are built fresh each frame.
+const DERIVED_MS: u64 = 200;
+
+/// How long the inventory, quickbar and key bindings are left as they are (see
+/// [`DERIVED_MS`]).
+const SECTION_MS: u64 = 150;
+
+/// Builds a section of values with `build`, or leaves what the cache holds for it.
+fn section(
+    cache: &mut Option<&mut ValueCache>,
+    group: &str,
+    token: u64,
+    v: &mut BTreeMap<String, UiValue>,
+    build: impl FnOnce(&mut BTreeMap<String, UiValue>),
+) {
+    match cache.as_deref_mut() {
+        Some(c) => {
+            if c.stale(group, token) {
+                let mut rows = BTreeMap::new();
+                build(&mut rows);
+                c.put(group, token, SECTION_MS, rows.into_iter().collect());
+            }
+        }
+        None => build(v),
+    }
+}
+
+/// [`sim_values_for`] reusing what [`ValueCache`] holds.
+pub fn sim_values_cached(
+    sim: &Sim,
+    shown: &Presentation,
+    cache: &mut ValueCache,
+) -> BTreeMap<String, UiValue> {
+    sim_values_with(sim, shown, Some(cache))
+}
+
 /// [`sim_values`] with the interface's own choices.
 pub fn sim_values_for(sim: &Sim, shown: &Presentation) -> BTreeMap<String, UiValue> {
+    sim_values_with(sim, shown, None)
+}
+
+fn sim_values_with(
+    sim: &Sim,
+    shown: &Presentation,
+    mut cache: Option<&mut ValueCache>,
+) -> BTreeMap<String, UiValue> {
     let mut v = BTreeMap::new();
     let mut set = |k: String, x: UiValue| {
         v.insert(k, x);
@@ -317,7 +425,7 @@ pub fn sim_values_for(sim: &Sim, shown: &Presentation) -> BTreeMap<String, UiVal
         );
     }
     let tables = sim.world.tables();
-    let mut creature = |prefix: &str, id: u32| {
+    let mut creature = |prefix: &str, id: u32, sticky: bool| {
         let Some(o) = sim.world.get(id) else { return };
         v.insert(prefix.to_string(), num(id));
         v.insert(format!("{prefix}.ID"), num(id));
@@ -378,19 +486,56 @@ pub fn sim_values_for(sim: &Sim, shown: &Presentation) -> BTreeMap<String, UiVal
         ];
         // The character record shows each attribute as its base and what gear and effects
         // add (`Base`, `Modifier`); `Total` is both, as the game's PROPERTY_VALUE_TOTAL.
-        for (p, (base, cur)) in &o.properties {
-            let total = if depletable.contains(p) && *p != 0 {
-                sim.depletable_max(id, *p)
-            } else {
-                sim.property_total(id, *p)
+        // Properties the creature has no value of (resistances, mostly) read as their total
+        // of nothing: what derivation, gear and effects give. Provisional: the character
+        // record's rows are taken to be properties 1 to 60.
+        let want = o.properties.len() + (1..=60).filter(|p| !o.properties.contains_key(p)).count();
+        let mut cache = if sticky { cache.as_deref_mut() } else { None };
+        let fresh = match cache.as_deref_mut() {
+            Some(c) => {
+                let stale = c.stale(prefix, u64::from(id) << 32 | want as u64);
+                // The current values change as the creature is hurt or tires.
+                for (p, (_, cur)) in &o.properties {
+                    v.insert(format!("{prefix}.Attributes.{p}.Current"), num(*cur));
+                }
+                !stale
+            }
+            None => false,
+        };
+        if !fresh {
+            let mut rows: Vec<(String, UiValue)> = Vec::with_capacity(want * 3);
+            let mut put = |p: i32, total: f32, base: f32, modifier: f32| {
+                rows.push((format!("{prefix}.Attributes.{p}.Total"), num(total)));
+                rows.push((format!("{prefix}.Attributes.{p}.Base"), num(base)));
+                rows.push((format!("{prefix}.Attributes.{p}.Modifier"), num(modifier)));
             };
-            v.insert(format!("{prefix}.Attributes.{p}.Current"), num(*cur));
-            v.insert(format!("{prefix}.Attributes.{p}.Total"), num(total));
-            v.insert(format!("{prefix}.Attributes.{p}.Base"), num(*base));
-            v.insert(
-                format!("{prefix}.Attributes.{p}.Modifier"),
-                num(sim.property_modifier(id, *p)),
-            );
+            for (p, (base, _)) in &o.properties {
+                let total = if depletable.contains(p) && *p != 0 {
+                    sim.depletable_max(id, *p)
+                } else {
+                    sim.property_total(id, *p)
+                };
+                put(*p, total, *base, sim.property_modifier(id, *p));
+            }
+            for p in 1..=60 {
+                if !o.properties.contains_key(&p) {
+                    put(
+                        p,
+                        sim.property_total(id, p),
+                        0.0,
+                        sim.property_modifier(id, p),
+                    );
+                }
+            }
+            match cache {
+                Some(c) => c.put(prefix, u64::from(id) << 32 | want as u64, DERIVED_MS, rows),
+                None => {
+                    for (p, (_, cur)) in &o.properties {
+                        v.insert(format!("{prefix}.Attributes.{p}.Current"), num(*cur));
+                    }
+                    v.extend(rows);
+                }
+            }
         }
         v.insert(
             format!("{prefix}.Stats.Race"),
@@ -399,36 +544,19 @@ pub fn sim_values_for(sim: &Sim, shown: &Presentation) -> BTreeMap<String, UiVal
         // The auto-level option is off (the player spends the points).
         v.insert(format!("{prefix}.Stats.AutoLevelUp"), num(0));
         v.insert(format!("{prefix}.InCombat"), num(o.combat.in_combat as u8));
-        // Properties the creature has no value of (resistances, mostly) read as their
-        // total of nothing: what derivation, gear and effects give. Provisional: the
-        // character record's rows are taken to be properties 1 to 60.
-        for p in 1..=60 {
-            if o.properties.contains_key(&p) {
-                continue;
-            }
-            v.insert(
-                format!("{prefix}.Attributes.{p}.Total"),
-                num(sim.property_total(id, p)),
-            );
-            v.insert(format!("{prefix}.Attributes.{p}.Base"), num(0));
-            v.insert(
-                format!("{prefix}.Attributes.{p}.Modifier"),
-                num(sim.property_modifier(id, p)),
-            );
-        }
     };
     for (i, id) in members.iter().enumerate() {
-        creature(&format!("Party.Members.{i}"), *id);
+        creature(&format!("Party.Members.{i}"), *id, true);
     }
     if let Some(c) = controlled.or(hero) {
-        creature("GUI.SelectedChar", c);
+        creature("GUI.SelectedChar", c, true);
     }
     // The creature in character generation or level-up, as levelup.gfx reads it: its
     // attributes and points (34 attribute, 35 skill, 36 talent, 38 specialization), with
     // what equipment adds as each attribute's Modifier. The screen spends the points itself
     // unless the auto-level option (`Stats.AutoLevelUp`) is on; it is off. Provisional.
     if let Some(c) = sim.world.chargen {
-        creature("CharGenCreature", c);
+        creature("CharGenCreature", c, false);
         if let Some(o) = sim.world.get(c) {
             for (p, (base, _)) in &o.properties {
                 v.insert(
@@ -697,7 +825,14 @@ pub fn sim_values_for(sim: &Sim, shown: &Presentation) -> BTreeMap<String, UiVal
         .filter(|o| o.kind == ObjectKind::Creature && o.active)
         .count();
     set("Area.CreatureCount".into(), num(creatures as f64));
-    inventory(sim, controlled.or(hero), shown.item_filter, &mut v);
+    let who = controlled.or(hero);
+    section(
+        &mut cache,
+        "Inventory",
+        u64::from(who.unwrap_or(0)) << 8 | u64::from(shown.item_filter as u8),
+        &mut v,
+        |v| inventory(sim, who, shown.item_filter, v),
+    );
     store(sim, shown, &mut v);
     party_picker(sim, shown, &mut v);
     saves(sim, shown, &mut v);
@@ -751,7 +886,9 @@ pub fn sim_values_for(sim: &Sim, shown: &Presentation) -> BTreeMap<String, UiVal
             UiValue::String(key.into()),
         );
     }
-    key_mappings(sim, &mut v);
+    section(&mut cache, "KeyMappings", 0, &mut v, |v| {
+        key_mappings(sim, v)
+    });
     // The start menu (startmenu2.gfx): its buttons show (`GameMode.ShowStartMenuContents`),
     // no other campaigns are installed (`Client.ModuleInfoList`), and there is no online
     // account or welcome message about one. Provisional: the version string is this port's.
@@ -870,10 +1007,15 @@ pub fn sim_values_for(sim: &Sim, shown: &Presentation) -> BTreeMap<String, UiVal
         v.insert("GUI.MinimapOpen".into(), num(1));
     }
     if let Some(who) = controlled.or(hero) {
-        quickbar(sim, who, &mut v);
+        section(&mut cache, "Quickbar", u64::from(who), &mut v, |v| {
+            quickbar(sim, who, v)
+        });
         heroic_stats(sim, who, hero.unwrap_or(who), &mut v);
     }
     script_popup(sim, &mut v);
+    if let Some(c) = cache {
+        c.finish();
+    }
     v
 }
 

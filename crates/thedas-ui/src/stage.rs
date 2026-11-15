@@ -550,8 +550,10 @@ impl Stage {
         let mut finished = Vec::new();
         for m in &mut self.movies {
             let started = std::time::Instant::now();
-            let missing = m.sync_tokens(&|t| bridge.value(t));
-            bridge.note_unanswered(missing);
+            let missing = m.sync_tokens(&bridge);
+            if !missing.is_empty() {
+                bridge.note_unanswered(missing);
+            }
             let synced = started.elapsed();
             m.tick(dt_ms);
             profile::note(&m.name, synced, started.elapsed() - synced);
