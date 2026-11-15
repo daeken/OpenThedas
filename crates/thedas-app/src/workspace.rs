@@ -38,6 +38,122 @@ pub fn blender_dir() -> PathBuf {
     dir().join("blender")
 }
 
+/// Where packed mods go: `mods-made/` in the player's data folder.
+pub fn mods_made_dir() -> PathBuf {
+    crate::saves::data_dir().join("mods-made")
+}
+
+/// A packed mod.
+#[derive(Debug)]
+pub struct Packed {
+    /// The `.zip`, ready for a line of `mods.txt`.
+    pub path: PathBuf,
+    pub files: usize,
+    pub bytes: u64,
+}
+
+/// Packs the live edits (`workspace/override`) into `mods-made/<name>.zip`: a mod the mod
+/// list reads as it is, and that unpacks into the original's `override` folder.
+pub fn pack(name: &str) -> Result<Packed, String> {
+    pack_from(&override_dir(), &mods_made_dir(), name)
+}
+
+/// [`pack`] with the folders given. The zip holds each file of `from` under its path there,
+/// sorted, and a `<name>.txt` beside it says what it holds and how to use it. An existing
+/// pack of that name is replaced; nothing in `from` is touched.
+pub fn pack_from(from: &Path, to: &Path, name: &str) -> Result<Packed, String> {
+    use std::io::Write;
+    let name: String = name
+        .trim()
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || " -_.()".contains(c) {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let name = name
+        .trim_matches(|c: char| c == '.' || c == ' ')
+        .to_string();
+    if name.is_empty() {
+        return Err("Give the mod a name".into());
+    }
+    let mut files = Vec::new();
+    collect(from, from, &mut files);
+    files.sort();
+    if files.is_empty() {
+        return Err(format!(
+            "Nothing to pack: {} has no files (save a texture or a model back from Blender first)",
+            from.display()
+        ));
+    }
+    std::fs::create_dir_all(to).map_err(|e| format!("{}: {e}", to.display()))?;
+    let zip_path = to.join(format!("{name}.zip"));
+    let partial = to.join(format!(".{name}-{}.partial", std::process::id()));
+    let mut bytes = 0u64;
+    {
+        let file =
+            std::fs::File::create(&partial).map_err(|e| format!("{}: {e}", partial.display()))?;
+        let mut zip = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        for rel in &files {
+            let data =
+                std::fs::read(from.join(rel)).map_err(|e| format!("{}: {e}", rel.display()))?;
+            bytes += data.len() as u64;
+            zip.start_file(rel.to_string_lossy().replace('\\', "/"), options)
+                .map_err(|e| e.to_string())?;
+            zip.write_all(&data).map_err(|e| e.to_string())?;
+        }
+        zip.finish().map_err(|e| e.to_string())?;
+    }
+    std::fs::rename(&partial, &zip_path).map_err(|e| {
+        let _ = std::fs::remove_file(&partial);
+        format!("{}: {e}", zip_path.display())
+    })?;
+    let mut note = format!(
+        "{name}: {} file(s) from the live edits of OpenThedas mod mode.\n\n\
+         To use it, add this line to mods.txt (later lines win):\n{}\n\n\
+         For the original game, unpack the zip into packages/core/override in your \
+         Documents/BioWare/Dragon Age folder.\n\nFiles:\n",
+        files.len(),
+        zip_path.display()
+    );
+    for rel in &files {
+        note.push_str(&format!("  {}\n", rel.to_string_lossy().replace('\\', "/")));
+    }
+    let _ = std::fs::write(to.join(format!("{name}.txt")), note);
+    Ok(Packed {
+        path: zip_path,
+        files: files.len(),
+        bytes,
+    })
+}
+
+/// Every file under `dir`, as a path relative to `root` (hidden files are left out).
+fn collect(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in rd.flatten() {
+        let path = entry.path();
+        if entry.file_name().to_string_lossy().starts_with('.') {
+            continue;
+        }
+        match entry.file_type() {
+            Ok(t) if t.is_dir() => collect(root, &path, out),
+            Ok(t) if t.is_file() => {
+                if let Ok(rel) = path.strip_prefix(root) {
+                    out.push(rel.to_path_buf());
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Mounts the workspace (`on`) or takes it down. Says what it did, or why not.
 pub fn mount(on: bool) -> Result<String, String> {
     if !on {
@@ -455,6 +571,53 @@ mod tests {
             pixels: rgba.to_vec(),
         })
         .unwrap()
+    }
+
+    #[test]
+    fn live_edits_pack_into_a_mod_the_list_can_mount() {
+        let base = std::env::temp_dir().join(format!("thedas-pack-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (from, to) = (base.join("override"), base.join("made"));
+        // Nothing to pack, and a name that is nothing.
+        std::fs::create_dir_all(&from).unwrap();
+        assert!(
+            pack_from(&from, &to, "x")
+                .unwrap_err()
+                .contains("Nothing to pack")
+        );
+        std::fs::write(from.join("a.dds"), b"texture").unwrap();
+        std::fs::create_dir_all(from.join("sub")).unwrap();
+        std::fs::write(from.join("sub/b.msh"), b"mesh").unwrap();
+        std::fs::write(from.join(".imported"), b"not a mod file").unwrap();
+        assert!(pack_from(&from, &to, " .. ").is_err());
+
+        let packed = pack_from(&from, &to, "My / mod").unwrap();
+        assert_eq!((packed.files, packed.bytes), (2, 11));
+        assert_eq!(packed.path, to.join("My _ mod.zip"));
+        assert!(
+            std::fs::read_to_string(to.join("My _ mod.txt"))
+                .unwrap()
+                .contains("sub/b.msh")
+        );
+        // The mod list mounts it as it is, flattening folders to file names.
+        let mut vfs = Vfs::new();
+        vfs.push_zip(&packed.path, None, "mod:made").unwrap();
+        assert_eq!(vfs.read("a.dds").unwrap().0, b"texture");
+        assert_eq!(vfs.read("b.msh").unwrap().0, b"mesh");
+        assert!(vfs.lookup(".imported").is_none());
+        // Packing again replaces it, and leaves nothing half-written behind.
+        std::fs::write(from.join("a.dds"), b"newer").unwrap();
+        pack_from(&from, &to, "My / mod").unwrap();
+        let mut vfs = Vfs::new();
+        vfs.push_zip(&packed.path, None, "mod:made").unwrap();
+        assert_eq!(vfs.read("a.dds").unwrap().0, b"newer");
+        assert!(
+            std::fs::read_dir(&to)
+                .unwrap()
+                .flatten()
+                .all(|e| !e.file_name().to_string_lossy().ends_with(".partial"))
+        );
+        std::fs::remove_dir_all(&base).unwrap();
     }
 
     #[test]
