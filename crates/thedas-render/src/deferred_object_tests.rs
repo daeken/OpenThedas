@@ -29,6 +29,41 @@ fn skin_transforms_positions_and_normals_and_materials_keep_hdr_and_tint() {
                     select(0.0, 1.0, point_uses_baked_mask(true, 192u)),
                     select(0.0, 1.0, point_uses_baked_mask(true, 0u)),
                     select(0.0, 1.0, point_uses_baked_mask(true, 128u))); }}
+                if (p.x >= 16.0) {{
+                    if (p.x >= 26.0) {{
+                        let colours = array<vec3<f32>, 6>(vec3<f32>(0.2, 0.4, 0.8), vec3<f32>(2.0, -0.5, 0.3),
+                            vec3<f32>(0.3, 0.3, 0.3), vec3<f32>(0.3), vec3<f32>(0.3), vec3<f32>(0.3));
+                        let factors = array<vec4<f32>, 6>(vec4<f32>(2.0, 4.0, 0.5, 0.5), vec4<f32>(2.0, 4.0, 0.5, 0.5),
+                            vec4<f32>(2.0, 4.0, 0.5, 0.0), vec4<f32>(2.0, 4.0, 0.5, 1.0),
+                            vec4<f32>(2.0, 4.0, 0.5, -1.0), vec4<f32>(-2.0, 4.0, 0.5, 2.0));
+                        let i = u32(p.x) - 26u;
+                        return vec4<f32>(static_tint_colour(colours[i], factors[i]), 1.0);
+                    }}
+                    let input = VsIn(vec3<f32>(p.xy, 0.0), vec3<f32>(0.0, 0.0, 1.0),
+                        p.xy, p.xy, weights, indices, vec4<f32>(0.0, 2.0, 0.0, 1.0), vec3<f32>(3.0, 0.0, 0.0));
+                    var vertex = gbuffer_skinned(input);
+                    if (p.x < 17.0) {{ return vertex.tangent; }}
+                    if (p.x < 18.0) {{ return vec4<f32>(vertex.binormal, 1.0); }}
+                    var nm = vec4<f32>(0.5, 0.5, 0.5, 1.0);
+                    if (p.x >= 19.0 && p.x < 20.0) {{ nm = vec4<f32>(0.5, 1.0, 0.5, 0.5); }}
+                    if (p.x >= 20.0 && p.x < 21.0) {{ nm = vec4<f32>(0.5); }}
+                    if (p.x >= 21.0) {{
+                        vertex = gbuffer_vertex(input, input.position, input.normal, input.tangent.xyz, input.binormal);
+                    }}
+                    if (p.x >= 22.0) {{
+                        vertex.world = vec3<f32>(p.xy, 0.0);
+                        vertex.normal = vec3<f32>(0.0, 0.0, 1.0);
+                        vertex.uv0 = p.xy;
+                        vertex.tangent.w = 0.0;
+                    }}
+                    if (p.x >= 23.0 && p.x < 24.0) {{
+                        vertex.tangent = vec4<f32>(vertex.binormal, 1.0);
+                    }}
+                    if (p.x >= 24.0 && p.x < 25.0) {{ vertex.tangent.w = 0.5; }}
+                    let mapped = surface_normal(vertex, nm).n;
+                    if (p.x < 25.0) {{ return vec4<f32>(mapped, 1.0); }}
+                    return vec4<f32>(0.0);
+                }}
                 let face = compose_face(vec4<f32>(0.2, 0.4, 0.6, 0.8), vec4<f32>(0.6, 0.8, 1.0, 0.4),
                     vec4<f32>(0.5), vec4<f32>(0.5, 0.7, 0.5, 0.6), vec4<f32>(0.5, 0.6, 0.5, 0.7),
                     vec4<f32>(1.0, 0.0, 0.0, 0.0), vec4<f32>(1.0, 0.0, 0.0, 0.0),
@@ -92,9 +127,23 @@ fn skin_transforms_positions_and_normals_and_materials_keep_hdr_and_tint() {
     data.character.eye = [30.0, 0.75, 75.0, 0.5];
     let draw = DrawUniforms {
         mvp: Mat4::IDENTITY.to_cols_array_2d(),
-        world: Mat4::IDENTITY.to_cols_array_2d(),
+        world: Mat4::from_scale_rotation_translation(
+            Vec3::new(2.0, 3.0, 4.0),
+            glam::Quat::IDENTITY,
+            Vec3::new(10.0, 20.0, 30.0),
+        )
+        .to_cols_array_2d(),
         data,
     };
+    let frame_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: None,
+        contents: bytemuck::bytes_of(&FrameUniforms {
+            eye: [0.0, 0.0, 10.0, 1.0],
+            fixup: [0.0; 4],
+            fog: [0.0; 4],
+        }),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
     let draw_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: None,
         contents: bytemuck::bytes_of(&draw),
@@ -122,6 +171,10 @@ fn skin_transforms_positions_and_normals_and_materials_keep_hdr_and_tint() {
         layout: &pipeline.get_bind_group_layout(0),
         entries: &[
             wgpu::BindGroupEntry {
+                binding: 0,
+                resource: frame_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
                 binding: 1,
                 resource: draw_buffer.as_entire_binding(),
             },
@@ -134,7 +187,7 @@ fn skin_transforms_positions_and_normals_and_materials_keep_hdr_and_tint() {
     let target = device.create_texture(&wgpu::TextureDescriptor {
         label: None,
         size: wgpu::Extent3d {
-            width: 16,
+            width: 32,
             height: 1,
             depth_or_array_layers: 1,
         },
@@ -148,7 +201,7 @@ fn skin_transforms_positions_and_normals_and_materials_keep_hdr_and_tint() {
     let view = target.create_view(&Default::default());
     let readback = device.create_buffer(&wgpu::BufferDescriptor {
         label: None,
-        size: 256,
+        size: 512,
         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
         mapped_at_creation: false,
     });
@@ -185,7 +238,7 @@ fn skin_transforms_positions_and_normals_and_materials_keep_hdr_and_tint() {
             buffer: &readback,
             layout: wgpu::TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: Some(256),
+                bytes_per_row: Some(512),
                 rows_per_image: Some(1),
             },
         },
@@ -199,7 +252,7 @@ fn skin_transforms_positions_and_normals_and_materials_keep_hdr_and_tint() {
     device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
     rx.recv().unwrap().unwrap();
     let mapped = readback.slice(..).get_mapped_range().unwrap();
-    let actual: &[f32] = bytemuck::cast_slice(&mapped[..256]);
+    let actual: &[f32] = bytemuck::cast_slice(&mapped[..512]);
     let expected = [
         [6.25, 1.25, 3.75, 1.0],
         [0.25, 0.75, 0.0, 1.0],
@@ -217,6 +270,22 @@ fn skin_transforms_positions_and_normals_and_materials_keep_hdr_and_tint() {
         [0.75, 0.75, 0.75, 29.0 / 255.0],
         [0.5, 0.5, 0.5, 74.0 / 255.0],
         [0.5; 4],
+        [-3.0, 1.5, 0.0, 1.0], // Skin/world translations do not affect basis directions.
+        [1.5, 6.75, 0.0, 1.0],
+        [-0.8944272, 0.4472136, 0.0, 1.0],
+        [0.21693046, 0.97618705, 0.0, 1.0],
+        [0.0, 0.0, 1.0, 1.0],
+        [0.0, 1.0, 0.0, 1.0], // Rigid authored tangent differs from UV derivatives.
+        [1.0, 0.0, 0.0, 1.0], // Missing, degenerate and incomplete triangle frames fall back.
+        [1.0, 0.0, 0.0, 1.0],
+        [1.0, 0.0, 0.0, 1.0],
+        [0.0; 4],
+        [0.2, 0.5, 0.2, 1.0],   // Static tint saturates before alpha scaling.
+        [0.5, 0.0, 0.075, 1.0], // HDR and negative inputs reach the authored clamp.
+        [0.0, 0.0, 0.0, 1.0],
+        [0.6, 1.0, 0.15, 1.0],
+        [-0.6, -1.0, -0.15, 1.0],
+        [0.0, 2.0, 0.3, 1.0], // Scaling after saturation can leave [0, 1].
     ];
     for (actual, expected) in actual.iter().zip(expected.iter().flatten()) {
         assert!((actual - expected).abs() < 0.0001, "{actual} != {expected}");

@@ -2418,6 +2418,7 @@ impl Sim {
                 cancellable: false,
                 impacted: false,
                 arrived: false,
+                da2_target_prepared: false,
                 path: Vec::new(),
             };
             // A follow move already under way goes on from where it has got to.
@@ -3306,6 +3307,9 @@ impl Sim {
         else {
             return;
         };
+        if c.name == "CommandUseAbility" {
+            self.complete_da2_combat_target(id);
+        }
         let t = self.world.time_ms;
         self.world.trace.push(TraceEntry::Command {
             t,
@@ -3354,7 +3358,6 @@ impl Sim {
                     if self.game == thedas_vfs::Game::DragonAge2
                         && cmd.name == "CommandUseAbility"
                         && cmd.ints.first() == Some(&1)
-                        && matches!(self.approach_point(id, &cmd), Approach::InReach)
                     {
                         let original = cmd.clone();
                         let chosen = self.choose_da2_basic_attack(id, &mut cmd);
@@ -3377,6 +3380,7 @@ impl Sim {
                             if let Some(o) = self.world.get_mut(id) {
                                 o.combat.previous_command = Some(o.commands.remove(slot));
                             }
+                            self.complete_da2_combat_target(id);
                             let mut ev = self.new_event("COMMAND_COMPLETE", Some(id));
                             ev.ints = vec![cmd.ty, if result == 1 { 1 } else { -3 }];
                             self.world.queue_event(APPROACH_CHECK_MS, id, ev, None);
@@ -3393,6 +3397,7 @@ impl Sim {
                             continue;
                         }
                     }
+                    self.prepare_da2_combat_target(id, &cmd);
                     // An attack asks its owner's script for the result first, which may
                     // also set how long it takes.
                     // An attacker out of reach walks up first (the attack starts when it
@@ -3695,8 +3700,36 @@ impl Sim {
 
     /// Completes an object's front command: applies its movement and tells the object.
     fn finish_command(&mut self, id: ObjectId) {
+        // DAOrigins.exe 0x7a4100 searches with radius 20, snap and check enabled
+        // (the builder 0x670010 sets the check). Only result 1 places the jumper;
+        // a standable-but-blocked point or an exhausted search fails with -1.
+        let jump = self.world.get(id).and_then(|o| {
+            o.commands
+                .first()
+                .filter(|c| c.name == "CommandJumpToLocation")
+                .map(|c| c.location)
+        });
+        let jump_location = if let Some(location) = jump {
+            let found = location.and_then(|l| {
+                let how = crate::nav::SafeSearch {
+                    radius: 20.0,
+                    body_radius: self.capsule_radius(id),
+                    mover: Some(id),
+                    standable_keeps: true,
+                };
+                self.safe_search(l.area, l.position, how)
+                    .map(|position| crate::world::Location { position, ..l })
+            });
+            let Some(location) = found else {
+                self.fail_front_command(id, "COMMAND_FAILED");
+                return;
+            };
+            Some(location)
+        } else {
+            None
+        };
         let before_area = self.world.get(id).and_then(|o| o.area);
-        let Some(cmd) = self.world.get_mut(id).and_then(|o| {
+        let Some(mut cmd) = self.world.get_mut(id).and_then(|o| {
             if o.commands.is_empty() {
                 None
             } else {
@@ -3705,6 +3738,9 @@ impl Sim {
         }) else {
             return;
         };
+        if let Some(location) = jump_location {
+            cmd.location = Some(location);
+        }
         // A jump to an object lands beside it, where DAOrigins.exe's executor puts it
         // ([`Sim::jump_to_object_spot`]); with no such spot the jumper stays put.
         if cmd.name == "CommandJumpToObject" {
@@ -3822,6 +3858,9 @@ impl Sim {
                 let ev = self.use_event(id, t);
                 self.deliver(t, ev, None);
             }
+        }
+        if cmd.name == "CommandUseAbility" {
+            self.complete_da2_combat_target(id);
         }
         if let Some(o) = self.world.get_mut(id) {
             o.combat.previous_command = Some(cmd.clone());
@@ -5015,6 +5054,7 @@ mod tests {
         let target = s.world.spawn(ObjectKind::Creature, "target");
         s.world.get_mut(who).unwrap().area = Some(area);
         s.world.get_mut(target).unwrap().area = Some(area);
+        s.world.get_mut(target).unwrap().position = [30., 0., 0.];
         s.world.get_mut(who).unwrap().script = Some("choose.ncs".into());
         // Own script: prepend CommandWait(0.25), then decline the placeholder
         // attack with SetCommandResult(attacker, 1).
@@ -5032,16 +5072,14 @@ mod tests {
         bytes.extend(code);
         s.add_script("choose.ncs", Ncs::parse(&bytes).unwrap());
         s.order_attack(who, target);
-        // A modern default attack must finish its approach with the same
-        // arrival tolerance as the old attack, then enter selection once.
-        let (arrival, _) = s.next_command().unwrap();
-        assert!(s.world.get(who).unwrap().commands[0].approach.is_some());
-        s.tick(arrival);
+        // Native preparation chooses before approach. A no-action selection
+        // does not start a walk and must leave the script's prepended wait intact.
+        assert_eq!(s.next_command(), None);
         let commands = &s.world.get(who).unwrap().commands;
         assert_eq!(commands.len(), 1);
         assert_eq!(commands[0].name, "CommandWait");
         assert_eq!(commands[0].seconds, 0.25);
-        assert_eq!(s.next_command(), Some((arrival + 250, who)));
+        assert_eq!(s.next_command(), Some((250, who)));
     }
 
     #[test]
@@ -5312,6 +5350,7 @@ mod tests {
             cancellable: false,
             impacted: false,
             arrived: false,
+            da2_target_prepared: false,
             path: Vec::new(),
         });
         let t0 = s.world.time_ms;
@@ -5834,6 +5873,7 @@ mod tests {
             cancellable: false,
             impacted: false,
             arrived: false,
+            da2_target_prepared: false,
             path: Vec::new(),
         });
         assert!(s.walk(hero, [10.0, 0.0, 0.0], None));
@@ -5927,6 +5967,7 @@ mod tests {
             cancellable: false,
             impacted: false,
             arrived: false,
+            da2_target_prepared: false,
             path: Vec::new(),
         };
         let o = s.world.get_mut(id).unwrap();
@@ -5970,6 +6011,7 @@ mod tests {
             cancellable: false,
             impacted: false,
             arrived: false,
+            da2_target_prepared: false,
             path: Vec::new(),
         });
         s.tick(1);
@@ -5978,6 +6020,85 @@ mod tests {
         assert_eq!(o.equipment.get(&0), Some(&axe), "the axe is in hand");
         assert_eq!(o.other_set.get(&0), Some(&bow));
         assert_eq!(o.fields.get("ActiveWeaponSet"), Some(&1));
+    }
+
+    #[test]
+    fn location_jumps_require_a_safe_point_and_keep_the_requested_facing() {
+        // 0x7a4100 accepts only search result 1, unlike GetSafeLocation, which
+        // also keeps a standable-but-blocked point. The body must not block itself.
+        for (requested, occupied, succeeds) in [
+            ([12.25, 12.25, 3.0], false, true),
+            ([11.25, 11.25, 3.0], false, false),
+            ([12.25, 12.25, 3.0], true, false),
+            ([9.4, 12.0, 3.0], false, true),
+            ([-11.0, 12.0, 3.0], false, false),
+        ] {
+            let mut s = sim();
+            s.table = Arc::new(
+                EngineTable::parse(format!("{LDF}\nint COMMAND_FAILED = -1;\n").as_bytes())
+                    .unwrap(),
+            );
+            let area = s.world.spawn(ObjectKind::Area, "a");
+            let mut data = vec![1; 64];
+            data[18] = 9;
+            s.area_layouts.insert(area, "open".into());
+            s.nav_grids.insert(
+                "open".into(),
+                Some(Arc::new(thedas_formats::level::NavGrid {
+                    columns: 8,
+                    rows: 8,
+                    cell_size: 0.5,
+                    clearance: 2.0,
+                    base: [10.0, 10.0, 0.0],
+                    normal: [0.0, 0.0, 1.0],
+                    data,
+                    heights: vec![16.0; 64],
+                    surfaces: Vec::new(),
+                })),
+            );
+            let id = s.world.spawn(ObjectKind::Creature, "jumper");
+            let before = [12.25, 12.25, 7.0];
+            let o = s.world.get_mut(id).unwrap();
+            o.area = Some(area);
+            o.position = before;
+            o.facing = 90.0;
+            o.commands.push(Command {
+                name: "CommandJumpToLocation".into(),
+                location: Some(crate::world::Location {
+                    area,
+                    position: requested,
+                    facing: 270.0,
+                }),
+                ..Default::default()
+            });
+            if occupied {
+                let other = s.world.spawn(ObjectKind::Creature, "blocker");
+                let o = s.world.get_mut(other).unwrap();
+                o.area = Some(area);
+                o.position = requested;
+            }
+            s.finish_command(id);
+            let o = s.world.get(id).unwrap();
+            assert!(o.commands.is_empty());
+            if succeeds {
+                assert_eq!(o.position[2], 1.0);
+                assert_eq!(o.facing, 270.0);
+                assert!(crate::nav::on_walkable(
+                    &s.loaded_nav_grid(area).unwrap(),
+                    o.position
+                ));
+                if requested[0] >= 10.0 {
+                    assert_eq!(o.position[..2], requested[..2]);
+                }
+            } else {
+                assert_eq!((o.position, o.facing), (before, 90.0));
+            }
+            let completion = s.world.queue.values().find(|q| q.target == id).unwrap();
+            assert_eq!(
+                completion.event.ints,
+                vec![0, if succeeds { 1 } else { -1 }]
+            );
+        }
     }
 
     #[test]
@@ -6008,6 +6129,7 @@ mod tests {
             cancellable: false,
             impacted: false,
             arrived: false,
+            da2_target_prepared: false,
             path: Vec::new(),
         });
         s.tick(1);
@@ -6156,6 +6278,7 @@ mod tests {
                 cancellable: false,
                 impacted: false,
                 arrived: false,
+                da2_target_prepared: false,
                 path: Vec::new(),
             });
         }
@@ -6207,6 +6330,7 @@ mod tests {
             cancellable: false,
             impacted: false,
             arrived: false,
+            da2_target_prepared: false,
             path: Vec::new(),
         };
         s.world.get_mut(id).unwrap().commands.push(walk());
@@ -6352,6 +6476,7 @@ mod tests {
             cancellable: false,
             impacted: false,
             arrived: false,
+            da2_target_prepared: false,
             path: Vec::new(),
         };
         let blow = crate::world::Effect {
@@ -6419,6 +6544,7 @@ mod tests {
             cancellable: false,
             impacted: false,
             arrived: false,
+            da2_target_prepared: false,
             path: Vec::new(),
         });
         // At 5 m/s: five metres after a second.
@@ -6470,6 +6596,7 @@ mod tests {
             cancellable: false,
             impacted: false,
             arrived: false,
+            da2_target_prepared: false,
             path: Vec::new(),
         };
         let walk = cmd(
@@ -6697,6 +6824,7 @@ mod tests {
                 cancellable: false,
                 impacted: false,
                 arrived: false,
+                da2_target_prepared: false,
                 path: Vec::new(),
             });
             crowd.push(c);
@@ -6724,6 +6852,7 @@ mod tests {
             cancellable: false,
             impacted: false,
             arrived: false,
+            da2_target_prepared: false,
             path: Vec::new(),
         });
         // It walks to just outside the crowd and waits; the ring is still full, so the
@@ -6805,6 +6934,7 @@ mod tests {
             cancellable: false,
             impacted: false,
             arrived: false,
+            da2_target_prepared: false,
             path: Vec::new(),
         };
         // Away to 5 m from the target, on the line through the mover.
@@ -6870,6 +7000,7 @@ mod tests {
             cancellable: false,
             impacted: false,
             arrived: false,
+            da2_target_prepared: false,
             path: Vec::new(),
         });
         let mut arrived = None;
@@ -7096,6 +7227,7 @@ mod tests {
             cancellable: false,
             impacted: false,
             arrived: false,
+            da2_target_prepared: false,
             path: Vec::new(),
         };
         assert_eq!(

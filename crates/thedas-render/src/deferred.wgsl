@@ -81,6 +81,8 @@ struct VsIn {
     @location(3) uv1: vec2<f32>,
     @location(4) weights: vec4<f32>,
     @location(5) indices: vec4<f32>,
+    @location(6) tangent: vec4<f32>,
+    @location(7) binormal: vec3<f32>,
 };
 
 struct VsOut {
@@ -91,9 +93,12 @@ struct VsOut {
     @location(3) world: vec3<f32>,
     @location(4) terrain_falloff: f32,
     @location(5) irradiance: vec3<f32>,
+    @location(6) tangent: vec4<f32>,
+    @location(7) binormal: vec3<f32>,
 };
 
-fn gbuffer_vertex(v: VsIn, position: vec3<f32>, normal: vec3<f32>) -> VsOut {
+fn gbuffer_vertex(v: VsIn, position: vec3<f32>, normal: vec3<f32>,
+    tangent: vec3<f32>, binormal: vec3<f32>) -> VsOut {
     let f = draw;
     var out: VsOut;
     // As Static1.vsh does it (`mul`, `mad`, `mad`, `add` by the matrix's columns), so the
@@ -106,6 +111,8 @@ fn gbuffer_vertex(v: VsIn, position: vec3<f32>, normal: vec3<f32>) -> VsOut {
     out.uv0 = v.uv0;
     out.uv_lm = select(v.uv1, v.uv0, f.room.z > 0.5) * f.lightmap.zw + f.lightmap.xy;
     out.normal = (f.world * vec4<f32>(normal, 0.0)).xyz;
+    out.tangent = vec4<f32>((f.world * vec4<f32>(tangent, 0.0)).xyz, v.tangent.w);
+    out.binormal = (f.world * vec4<f32>(binormal, 0.0)).xyz;
     out.world = (f.world * vec4<f32>(position, 1.0)).xyz;
     out.terrain_falloff = 2.0 - length(frame.eye.xyz - out.world) / 32.0;
     out.irradiance = vec3<f32>(0.0);
@@ -117,16 +124,22 @@ fn gbuffer_vertex(v: VsIn, position: vec3<f32>, normal: vec3<f32>) -> VsOut {
     return out;
 }
 
-@vertex
-fn vs_gbuffer(v: VsIn) -> VsOut {
+fn gbuffer_skinned(v: VsIn) -> VsOut {
     return gbuffer_vertex(v,
         skin_vector(vec4<f32>(v.position, 1.0), v.weights, v.indices),
-        skin_vector(vec4<f32>(v.normal, 0.0), v.weights, v.indices));
+        skin_vector(vec4<f32>(v.normal, 0.0), v.weights, v.indices),
+        skin_vector(vec4<f32>(v.tangent.xyz, 0.0), v.weights, v.indices),
+        skin_vector(vec4<f32>(v.binormal, 0.0), v.weights, v.indices));
+}
+
+@vertex
+fn vs_gbuffer(v: VsIn) -> VsOut {
+    return gbuffer_skinned(v);
 }
 
 @vertex
 fn vs_gbuffer_rigid(v: VsIn) -> VsOut {
-    return gbuffer_vertex(v, v.position, v.normal);
+    return gbuffer_vertex(v, v.position, v.normal, v.tangent.xyz, v.binormal);
 }
 
 struct GBuffer {
@@ -154,21 +167,29 @@ fn oct_encode(n: vec3<f32>) -> vec2<f32> {
 
 fn surface_normal(in: VsOut, nm: vec4<f32>) -> Surface {
     let d = draw;
-    // Tangent frame from the screen-space derivatives of position and texture coordinate
-    // (provisional: the meshes' own tangents and binormals, which Static1 reads, are not in
-    // the stand-in vertex format).
+    // Missing/degenerate mesh frames retain the derivative fallback. Evaluate the
+    // derivatives uniformly, before selecting the interpolated authored frame.
     let n_v = in.normal;
     let dp1 = dpdx(in.world);
     let dp2 = dpdy(in.world);
     let duv1 = dpdx(in.uv0);
     let duv2 = dpdy(in.uv0);
-    let dp2perp = cross(dp2, n_v);
-    let dp1perp = cross(n_v, dp1);
-    var t = dp2perp * duv1.x + dp1perp * duv2.x;
-    var b = dp2perp * duv1.y + dp1perp * duv2.y;
-    let scale = inverseSqrt(max(max(dot(t, t), dot(b, b)), 1e-20));
-    t = t * scale;
-    b = b * scale;
+    // Static1/Prop1 transform and interpolate the full authored basis without
+    // orthogonalizing or normalizing its individual columns. Preserve that,
+    // including mirrored UV seams and nonuniform world/skin transforms.
+    var t = in.tangent.xyz;
+    var b = in.binormal;
+    let volume = dot(cross(in.tangent.xyz, in.binormal), n_v);
+    let lengths = dot(in.tangent.xyz, in.tangent.xyz) * dot(in.binormal, in.binormal) * dot(n_v, n_v);
+    if (!(in.tangent.w >= 0.9999 && lengths > 1e-20 && volume * volume > lengths * 1e-8)) {
+        let dp2perp = cross(dp2, n_v);
+        let dp1perp = cross(n_v, dp1);
+        t = dp2perp * duv1.x + dp1perp * duv2.x;
+        b = dp2perp * duv1.y + dp1perp * duv2.y;
+        let scale = inverseSqrt(max(max(dot(t, t), dot(b, b)), 1e-20));
+        t = t * scale;
+        b = b * scale;
+    }
 
     let xy = nm.wy * 2.0 - 1.0;
     let z = sqrt(max(1.0 - dot(xy, xy), 0.0));
@@ -448,7 +469,7 @@ fn basic_gbuffer_material(in: VsOut, object: bool) -> GBufferSample {
     let s = surface(in);
     var out: GBuffer;
     let diffuse = textureSample(diffuse_tex, wrap_smp, in.uv0);
-    out.albedo = vec4<f32>(diffuse.rgb, 0.0);
+    out.albedo = vec4<f32>(diffuse.rgb, draw.material.z / 255.0);
     out.specular = textureSample(spec_tex, wrap_smp, in.uv0);
     out.normal = vec4<f32>(oct_encode(s.n), draw.room.x, s.falloff);
     out.lightmap = textureSample(lightmap_tex, clamp_smp, in.uv_lm);
@@ -640,6 +661,8 @@ struct Lighting {
     depth_plane: vec4<f32>,
     // xy: target size, z: fused base, w: light rejection flags
     size: vec4<f32>,
+    // Spare material codes index Static1's reciprocal RGB divisor and alpha scale.
+    static_tints: array<vec4<f32>, 256>,
 };
 
 struct Light {
@@ -935,6 +958,11 @@ fn highlight(n: vec3<f32>, h: vec3<f32>, power: f32, hair: HairLight) -> vec3<f3
     return vec3<f32>(pow(max(dot(n, h), 1e-6), power));
 }
 
+fn static_tint_colour(colour: vec3<f32>, factors: vec4<f32>) -> vec3<f32> {
+    // The authored Static1 instruction saturates BEFORE multiplying by 1-tint.a.
+    return clamp(colour * factors.rgb, vec3<f32>(0.0), vec3<f32>(1.0)) * factors.a;
+}
+
 // Both opaque pixels and ordered forward materials use this light list, membership,
 // falloff and visibility. Forward receivers supply their own position/material and
 // ambient visibility, so they never sample the opaque G-buffer as their surface.
@@ -1099,6 +1127,9 @@ fn light_surface(frag: vec4<f32>, p: vec3<f32>, ga: vec4<f32>, spec: vec4<f32>,
     }
 
     // The level's fog, as Static1 applies it.
+    if (material != 0u && !object && !terrain) {
+        colour = static_tint_colour(colour, lighting.static_tints[material]);
+    }
     let to_eye = p - lighting.eye.xyz;
     let f = max(min(exp(-dot(to_eye, to_eye) * lighting.fog0.w), 1.0), lighting.fog1.x);
     colour = f * (colour - lighting.fog0.rgb) + lighting.fog0.rgb;

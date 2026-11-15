@@ -314,3 +314,148 @@ fn baked_lighting_specialization_keeps_light_word_boundaries_and_fallbacks() {
         renderer.set_deferred_early_light_reject(None);
     }
 }
+
+#[test]
+fn static_tint_clamps_complete_lighting_and_tracks_fused_handoffs() {
+    let capture_dir =
+        std::env::var_os("THEDAS_TEST_STATIC_TINT_CAPTURE").map(std::path::PathBuf::from);
+    let ctx = match GpuContext::headless() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("skipping GPU test: {e}");
+            return;
+        }
+    };
+    let mut scene = super::forward_transparency_tests::scene(6.0, "static");
+    scene.static_draws = 1;
+    // Default diffuse is midgrey and the specular mask black. A bright light makes
+    // saturation order observable: red/green must clamp before the 0.5 scale.
+    scene.draws[0].cast_shadow = Some(false);
+    let lights = vec![crate::scene::SceneLight::Point {
+        position: Vec3::ZERO,
+        color: Vec3::splat(2.0),
+        radius: 1000.0,
+        name: "tint fixture".into(),
+        domain: None,
+        is_static: false,
+        version: 0,
+        intensity: 1.0,
+        room: None,
+    }];
+    scene.materials[0]
+        .object
+        .vectors
+        .push(("mml_vTintColor".into(), [0.5, 0.75, -1.0, 0.5]));
+    let mesh = &mut scene.meshes[0];
+    mesh.chunk.vertex_size = std::mem::size_of::<Vertex>() as u32;
+    mesh.chunk.elements = vec![VertexElement {
+        stream: 0,
+        offset: 0,
+        ty: DeclType::Float3,
+        usage: DeclUsage::Position,
+        usage_index: 0,
+    }];
+    mesh.raw_vertices = bytemuck::cast_slice(&mesh.vertices).to_vec();
+    let mut programs = ProgramRegistry::default();
+    programs.push_front(Box::new(Fixture));
+    for samples in [1, 4] {
+        let mut renderer = AreaRenderer::new_cached_with_path(
+            &ctx,
+            &Vfs::new(),
+            &scene,
+            &programs,
+            wgpu::TextureFormat::Rgba8Unorm,
+            &mut RenderCache {
+                samples,
+                ..Default::default()
+            },
+            crate::RenderPath::Deferred,
+        );
+        let camera = Camera::new(Vec3::ZERO, 0.0, 0.0);
+        renderer.set_effect_lights(lights.clone());
+        if let Some(dir) = &capture_dir {
+            std::fs::create_dir_all(dir).unwrap();
+            let mut untinted = scene.clone();
+            untinted.materials[0].object.vectors.clear();
+            let mut before = AreaRenderer::new_cached_with_path(
+                &ctx,
+                &Vfs::new(),
+                &untinted,
+                &programs,
+                wgpu::TextureFormat::Rgba8Unorm,
+                &mut RenderCache {
+                    samples,
+                    ..Default::default()
+                },
+                crate::RenderPath::Deferred,
+            );
+            before.set_effect_lights(lights.clone());
+            std::fs::write(
+                dir.join(format!("static-tint-fixture-{samples}x-before.rgba")),
+                before.capture(&ctx, &camera, 32, 32).unwrap(),
+            )
+            .unwrap();
+        }
+        for fused in [true, false, true, false, true] {
+            renderer.set_deferred_fused_reflections(Some(fused));
+            let image = renderer.capture(&ctx, &camera, 32, 32).unwrap();
+            if fused && let Some(dir) = &capture_dir {
+                std::fs::write(
+                    dir.join(format!("static-tint-fixture-{samples}x-after.rgba")),
+                    &image,
+                )
+                .unwrap();
+            }
+            let pass = renderer.deferred.as_ref().unwrap();
+            assert!(!pass.refused());
+            assert_eq!(pass.takes(0), fused);
+            let pixel = &image[(16 * 32 + 16) * 4..][..4];
+            if fused {
+                for (&c, expected) in pixel[..3].iter().zip([128, 128, 64]) {
+                    assert!((c as i32 - expected).abs() <= 1, "{samples}x: {pixel:?}");
+                }
+            } else {
+                assert_eq!(pixel, &[255, 0, 0, 255], "faithful fallback");
+            }
+        }
+        // A contributor's local tint index is also one, but must use a different
+        // shared code. Removing it must restore the level's tint on the next frame.
+        let mut object_scene = scene.clone();
+        object_scene.materials[0].object.vectors[0].1 = [0.0, 0.0, 0.0, 0.75];
+        object_scene.draws[0].transform = glam::Mat4::from_translation(Vec3::new(-2.0, 0.0, 0.0));
+        let mut object = AreaRenderer::new_cached_with_path(
+            &ctx,
+            &Vfs::new(),
+            &object_scene,
+            &programs,
+            wgpu::TextureFormat::Rgba8Unorm,
+            &mut RenderCache {
+                samples,
+                ..Default::default()
+            },
+            crate::RenderPath::Deferred,
+        );
+        for contributors in [true, false, true] {
+            let image = if contributors {
+                renderer
+                    .capture_with(&ctx, &camera, 32, 32, &mut [&mut object], None)
+                    .unwrap()
+            } else {
+                renderer.capture(&ctx, &camera, 32, 32).unwrap()
+            };
+            let pixel = &image[(16 * 32 + 16) * 4..][..4];
+            let expected = if contributors {
+                [64; 3]
+            } else {
+                [128, 128, 64]
+            };
+            assert!(
+                pixel[..3]
+                    .iter()
+                    .zip(expected)
+                    .all(|(&c, e)| (c as i32 - e).abs() <= 1),
+                "shared {samples}x: {pixel:?}"
+            );
+        }
+    }
+}

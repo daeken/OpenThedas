@@ -7,7 +7,7 @@ struct ForwardIn {
     @location(3) uv1: vec2<f32>,
     @location(4) weights: vec4<f32>,
     @location(5) indices: vec4<f32>,
-    @location(6) tangent: vec4<f32>,
+    @location(8) tangent: vec4<f32>,
 };
 
 struct ForwardOut {
@@ -21,10 +21,12 @@ struct ForwardOut {
 
 @vertex
 fn vs_forward(v: ForwardIn) -> ForwardOut {
-    let base = VsIn(v.position, v.normal, v.uv0, v.uv1, v.weights, v.indices);
+    let base = VsIn(v.position, v.normal, v.uv0, v.uv1, v.weights, v.indices,
+        vec4<f32>(0.0), vec3<f32>(0.0));
     let vertex = gbuffer_vertex(base,
         skin_vector(vec4<f32>(v.position, 1.0), v.weights, v.indices),
-        skin_vector(vec4<f32>(v.normal, 0.0), v.weights, v.indices));
+        skin_vector(vec4<f32>(v.normal, 0.0), v.weights, v.indices),
+        vec3<f32>(0.0), vec3<f32>(0.0));
     let tangent = skin_vector(vec4<f32>(v.tangent.xyz, 0.0), v.weights, v.indices);
     return ForwardOut(vertex.clip, vertex.uv0, vertex.world, vertex.normal,
         vertex.irradiance, (draw.world * vec4<f32>(tangent, 0.0)).xyz);

@@ -32,6 +32,7 @@ fn command(sim: &Sim, ty: &str, name: &str) -> Command {
         cancellable: false,
         impacted: false,
         arrived: false,
+        da2_target_prepared: false,
         path: Vec::new(),
     }
 }

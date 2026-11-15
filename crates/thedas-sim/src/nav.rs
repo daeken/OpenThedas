@@ -1283,6 +1283,7 @@ mod tests {
             cancellable: false,
             impacted: false,
             arrived: false,
+            da2_target_prepared: false,
             path: Vec::new(),
         });
         let r = 2.0 * s.capsule_radius(leader);
@@ -1371,6 +1372,7 @@ mod tests {
             cancellable: false,
             impacted: false,
             arrived: false,
+            da2_target_prepared: false,
             path: Vec::new(),
         });
         let r = 2.0 * s.capsule_radius(hero);
@@ -1486,6 +1488,7 @@ mod tests {
             cancellable: false,
             impacted: false,
             arrived: false,
+            da2_target_prepared: false,
             path: Vec::new(),
         });
         // Four metres in a straight line, but the wall sends it up through the gap: the
