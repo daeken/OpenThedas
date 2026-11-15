@@ -1,8 +1,7 @@
 # DA2 performance ownership and creature processing
 
-This is a static trace of the user's DA2 analysis executable, followed by a
-comparison with OpenThedas. No original-game session was run. Addresses identify
-that image rather than a portable ABI. Only our own prose is recorded here;
+This static trace of the user's DA2 analysis executable is followed by a
+comparison with OpenThedas. Addresses identify that particular image. Native
 disassembly, resources, checkpoints and drivers remain in external testdata.
 
 ## The processing gate
@@ -23,21 +22,21 @@ and the command update at `0x5a07da..0x5a07e6`.
 Release reaches `0x585b80` through `0x59c140`. Its creature tail resets
 locomotion again and sets `+0x794 & 8` at `0x58607c`. Thus there is a concrete
 take/update/release gate for ordinary creature processing. Release enables
-this gate; the observed record does not save and restore an earlier value of
+this gate. The observed record does not save and restore an earlier value of
 that bit.
 
-Several other switches occur in the same operation and have separate uses:
+Several other switches in the same operation have separate consumers.
 
 - Object `+0xeb & 0x80` also suppresses the animation-setting paths at
   `0x55f030` and `0x5dcec0`. Those functions' early returns alone do not
   identify the ordinary creature update gate.
-- `0x535520` calls `0x5a8900(false)`; `0x5355d0` calls it with true. This
+- `0x535520` calls `0x5a8900(false)`, and `0x5355d0` calls it with true. This
   writes object `+0xe9 & 4`. Its consumer at `0x5a89a0` has additional
   object/controller guards. Its complete purpose remains unclassified here.
 - The component returned by `0x52d500` is stored at creature `+0x7a0` and
-  constructed by `0x64ba50`. Take clears its byte `+0x1cc`; release sets it.
+  constructed by `0x64ba50`. Take clears its byte `+0x1cc`, and release sets it.
   Update `0x661ad0` returns immediately when that byte is zero. That update
-  contains direction/target/animation work; its full role is not established.
+  contains direction/target/animation work. Its full role remains unclassified.
 - Object `+0xe9 & 2` is cleared on take and set on release. The separate
   visual update at `0x5a0060` consumes it through virtual `+0x138` at
   `0x5a0158..0x5a016d`. It must not be conflated with creature `+0x794 & 8`.
@@ -47,10 +46,10 @@ Several other switches occur in the same operation and have separate uses:
 Script command 533 is registered at `0x527be4` with handler `0x4f0a20`.
 The handler resolves the object, copies the static-command argument into the
 command record, and calls `0x5cd3b0` with command, front/back choice and add
-behavior. The full admission function ends at `0x5cd591`; it contains no
+behavior. The full admission function ends at `0x5cd591`. It contains no
 test of the performance-taken bit or the creature processing gate above.
 
-Its observed decisions include:
+The observed admission decisions follow these rules.
 
 - Reject an absent command or command type zero. A Drive command also has a
   guarded rejection when the first pending command is Use Ability
@@ -69,7 +68,7 @@ Its observed decisions include:
 
 Comparator `0x60fe40` checks command type, the static-state field and the
 origin field first. When both parameter objects exist it delegates to their
-virtual `+8` comparison; a nonzero comparison rejects equality. It does not
+virtual `+8` comparison. A nonzero comparison rejects equality. It does not
 compare the executor's elapsed/deadline state or the entire runtime record.
 The individual parameter-object comparisons remain to be audited.
 
@@ -84,37 +83,37 @@ then calls `0x5c2470`. The ordinary creature path reaches it only after
 passing `+0x794 & 8`. Other object paths also call this queue update and
 require their own lifecycle audit before sharing a suspension rule.
 
-The resulting implementation boundary is ownership plus processing:
-commands may be accepted while an actor is held, but its ordinary creature
-tick waits for release. Take also clears work under the native static/current
+Commands may be accepted while an actor is held. Its ordinary creature tick
+waits for release. Take also clears work under the native static/current
 rules. Rejecting all commands during a conversation or merely pausing the
 old queue would each omit part of the observed lifecycle. Explicit event
-delivery has a separate path through `0x5c5df0 -> 0x5c2010`; no blanket
-script-event suspension is established by this trace.
+delivery has a separate path through `0x5c5df0 -> 0x5c2010` and requires its own
+ownership audit.
 
 ## Connection to IsMoving
 
 Command 388 uses wrapper `0x4ec600` and getter `0x52e550`. The getter reads
 creature `+0xa30`, which is locomotion component `+0xf0` at creature `+0x940`.
-Setter `0x8a3db0` maintains a persistent mode: zero is idle, modes 1/2 are
+It returns whether this persistent mode is nonzero, including modes 3 and 4.
+Setter `0x8a3db0` maintains the mode. Zero is idle, modes 1/2 are
 the walk/run choices, mode 3 retains the current speed while requesting a
 stop, and mode 4 is entered for a stationary facing change. The walk/run and
 soft-stop names are interpretations supported by the callers and field
-updates; the integer transitions are the directly observed facts.
+updates. The integer transitions are directly observed.
 
 Facing update `0x8a3e70` can request mode 4. Stop helper `0x8a60e0` changes
 1/2 to 3 and 4 to zero. Update `0x8c5c0b..0x8c5cb8` completes modes 3/4 under
 controller and heading checks. Thus queued movement and a displacement in
 the last tick are each insufficient representations of this getter.
 
-The full take calls `0x8c3da0` at `0x53d184`; release calls the same helper
+The full take calls `0x8c3da0` at `0x53d184`, and release calls the same helper
 at `0x58601b`. It sets a nonzero locomotion mode to zero, then resets the
 linked controller when present. This connects performance ownership to the
 getter's actual state and supplies a precise reset boundary for a future
 locomotion implementation.
 
 DA2 also has a directly traced body-heading step at `0x8a6110`. Its desired
-direction comes from locomotion `+0x90`; the current direction is in the
+direction comes from locomotion `+0x90`, and the current direction is in the
 update record at `+0x10`. It requires a nonzero mode and desired direction,
 with an additional independent-facing choice controlled by `+0xf8`.
 `0x8c8780` converts horizontal direction to degrees, and `0x8c8ff0` wraps the
@@ -124,17 +123,17 @@ and elapsed seconds `dt`, `0x8a6203..0x8a6240` limits the next turn by
 Differences below the approximately `1e-6` threshold return without rotating.
 The resulting direction is normalized before being written back.
 
-The constants are independently read from their float storage: milliseconds
-to seconds at `0xbe1a40`, inverse 180 at `0xbf3d54`, 0.28 at `0xc237f0`, 0.4
+Independent reads of float storage confirm milliseconds to seconds at
+`0xbe1a40`, inverse 180 at `0xbf3d54`, 0.28 at `0xc237f0`, 0.4
 at `0xc23498`, signed 180 at `0xbe0828/0xbe082c`, and epsilon at `0xc2442c`.
 Callers include ordinary movement `0x8b11e4` and the mode-3/4 update branch at
-`0x8c5be0`; another caller is `0x8a761b`. This confirms the same scalar yaw
+`0x8c5be0`, with another caller at `0x8a761b`. This confirms the same scalar yaw
 law previously traced for Origins. It does not establish identical route
 filtering, controller completion or all movement modes between the games.
 
 The retained `ability_core` script uses IsMoving in at least two materially
-different branches: bytecode `0x11c5` gates a target-dependent follow-up,
-whereas `0x20c4` selects between a moving additive animation and a queued
+different branches. Bytecode `0x11c5` gates a target-dependent follow-up.
+Bytecode `0x20c4` selects between a moving additive animation and a queued
 stationary animation (113 and 112 respectively). It also reads different
 combat-style columns for those choices. An always-false implementation can
 therefore affect command scheduling as well as presentation. These call
@@ -142,7 +141,7 @@ sites do not establish which branch caused a particular lost fight.
 
 ## Source comparison and replay limits
 
-DA2 line handling activates bound world objects; the separate
+DA2 line handling activates bound world objects. The separate
 placement/follower changes landed in #895/#898. Neither
 activation nor pose placement implements the processing lifecycle above.
 DA2 `AddCommand` appends/prepends directly and does not yet apply all the native
@@ -153,9 +152,9 @@ tests of take, held admission, release, cancellation and save/reload.
 Retained matched diagnostics contain 38 IsMoving fallbacks in the larger
 patrol ambush and 74 in the pre-Ogre replay, all from `ability_core.ncs`.
 Both traces contain zero script errors. These counts establish exercised
-missing input, not native outcomes or a proven cause of the wipes. The
+missing input. Native outcomes and wipe causality remain to be measured. The
 retained checkpoint epoch and driver differ from the newly supplied fresh
-chain; their combat timing must be reported separately.
+chain, requiring separate combat-timing reports.
 
 The retained pre-Ogre trace spans `839750..915150` ms. Its IsMoving callers
 are Hawke (35), Bethany (28) and Aveline (11). Bethany and Aveline each receive
@@ -163,7 +162,7 @@ are Hawke (35), Bethany (28) and Aveline (11). Bethany and Aveline each receive
 Completed Use Ability commands number 35, 27 and 12 respectively. Thus these
 actors are not globally starved of script/command processing in that replay.
 This does not classify individual ability branches or prove correct cinematic
-ownership; it narrows the processing-freeze hypothesis without changing combat
+ownership. It narrows the processing-freeze hypothesis without changing combat
 inputs. The old trace predates per-blow attack entries, so it cannot supply
 current attack tallies.
 
@@ -191,7 +190,7 @@ introduced by this note.
 
 DA2 translating creatures now use the existing elapsed-time yaw limiter, including
 its saved last-turn timestamp. Ordinary started moves retain their body heading
-at arrival instead of taking the original order's bearing. Native completion
+at arrival. Native completion
 `0x675fae -> 0x8a60e0` stops the follower without installing that bearing.
 Explicit jumps, placement and non-creature movers keep their facing behavior. Origins follows the
 same code it used before this DA2 extension.
