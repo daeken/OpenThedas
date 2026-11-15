@@ -21,6 +21,16 @@ s14 endpoints therefore arise during the intervening fight, after the changed fo
 placement and earlier combat/RNG history; they are not two different hero transition
 targets.
 
+Replaying s14 from the same main-side hut save isolates a local placement effect as well:
+the arrival binary ends the fight at (248.92763, 157.78262, 7.8125), while main ends at
+the main position above. In that save the follower order at transition is dog, Morrigan,
+Alistair. The compact slot calculation puts Morrigan at (253.53387, 118.60310) and Alistair
+at (252.51300, 118.14719), on the grid floor 7.8125. Those are their observed starting
+points for the subsequent follow commands. The old transition's later placement instead
+overwrites followers with ordinary formation points around the hero's already changed
+cutscene position. Thus local arrival placement can change the fight even with its
+incoming RNG and party state fixed; upstream differences also matter.
+
 s15 asks the harness to walk directly to the Chanter's Board, at approximately
 (346.4626, 199.41118, 1.17261). Main finds a grid path. The branch checkpoint has no grid
 path and `route_inner` returns `Routed::Straight`; `Sim::walk` then samples a direct line.
