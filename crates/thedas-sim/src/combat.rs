@@ -2738,7 +2738,7 @@ mod tests {
         s.world.get_mut(enemy).unwrap().position = [30., 0., 0.];
         s.order_ability(who, 3110, enemy, "");
         s.set_combat_state(who, true);
-        s.step(1);
+        s.tick(1);
         let cmd = &s.world.get(who).unwrap().commands[0];
         assert!(cmd.approach.is_some());
         assert!(cmd.da2_target_prepared);

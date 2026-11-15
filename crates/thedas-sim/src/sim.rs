@@ -5031,6 +5031,7 @@ mod tests {
         let target = s.world.spawn(ObjectKind::Creature, "target");
         s.world.get_mut(who).unwrap().area = Some(area);
         s.world.get_mut(target).unwrap().area = Some(area);
+        s.world.get_mut(target).unwrap().position = [30., 0., 0.];
         s.world.get_mut(who).unwrap().script = Some("choose.ncs".into());
         // Own script: prepend CommandWait(0.25), then decline the placeholder
         // attack with SetCommandResult(attacker, 1).
@@ -5048,16 +5049,14 @@ mod tests {
         bytes.extend(code);
         s.add_script("choose.ncs", Ncs::parse(&bytes).unwrap());
         s.order_attack(who, target);
-        // A modern default attack must finish its approach with the same
-        // arrival tolerance as the old attack, then enter selection once.
-        let (arrival, _) = s.next_command().unwrap();
-        assert!(s.world.get(who).unwrap().commands[0].approach.is_some());
-        s.tick(arrival);
+        // Native preparation chooses before approach. A no-action selection
+        // does not start a walk and must leave the script's prepended wait intact.
+        assert_eq!(s.next_command(), None);
         let commands = &s.world.get(who).unwrap().commands;
         assert_eq!(commands.len(), 1);
         assert_eq!(commands[0].name, "CommandWait");
         assert_eq!(commands[0].seconds, 0.25);
-        assert_eq!(s.next_command(), Some((arrival + 250, who)));
+        assert_eq!(s.next_command(), Some((250, who)));
     }
 
     #[test]
