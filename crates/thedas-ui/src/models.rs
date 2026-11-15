@@ -1287,10 +1287,12 @@ pub const LOCATION_VFX_IDS: ObjectId = 0xf000_0000;
 /// Where the ids of the instant ones among [`location_vfx_models`] start.
 pub const INSTANT_LOCATION_VFX_IDS: ObjectId = 0xf800_0000;
 
-/// The visual effects scripts applied at places in `area` (`World::location_vfx`, such as
-/// the Proving's crowd, and the instant ones just played there, `World::instant_location_vfx`:
-/// a spell's impact), each drawn as its `VFX_base.gda` row's model (`ModelName`:
-/// `fxe_sprite_arena_p` for 10011) where the effect was applied. They are not objects:
+/// The visual effects scripts applied at places in `area`. A lasting one
+/// (`World::location_vfx`, such as the Proving's crowd) is drawn as its `VFX_base.gda`
+/// row's model (`ModelName`: `fxe_sprite_arena_p` for 10011) where the effect was applied.
+/// An instant one just played there (`World::instant_location_vfx`: a spell's impact) is
+/// played as an effect, as an instant effect on an object is ([`visual_effects`]): its
+/// emitters follow the model's impact animation and stop after it. They are not objects:
 /// their ids are [`LOCATION_VFX_IDS`] (or [`INSTANT_LOCATION_VFX_IDS`]) plus the effect's
 /// handle, and their kind is `Area`. Provisional: the row's other columns (its type,
 /// attachment, scale) are not mirrored.
@@ -1298,35 +1300,51 @@ pub fn location_vfx_models(sim: &Sim, area: ObjectId) -> Vec<ObjectModel> {
     let Some(t) = sim.world.tables().get(0, "vfx_base") else {
         return Vec::new();
     };
-    let lasting = sim.world.location_vfx.iter().map(|v| {
-        let id = LOCATION_VFX_IDS.wrapping_add(v.handle as ObjectId);
-        (id, v.vfx, v.area, v.position, v.facing)
-    });
-    let instant = sim.world.instant_location_vfx.iter().map(|v| {
-        let id = INSTANT_LOCATION_VFX_IDS.wrapping_add(v.handle as ObjectId);
-        (id, v.vfx, v.area, v.position, v.facing)
-    });
-    lasting
-        .chain(instant)
-        .filter(|v| v.2 == area)
-        .filter_map(|(id, vfx, _, position, facing)| {
-            let model = text(t.cell("ModelName", vfx as i64))?.to_ascii_lowercase();
+    let model = |vfx: i32| text(t.cell("ModelName", vfx as i64)).map(|m| m.to_ascii_lowercase());
+    let at = |id: ObjectId, vfx: i32, position: [f32; 3], facing: f32| ObjectModel {
+        id,
+        tag: format!("vfx_{vfx}"),
+        kind: ObjectKind::Area,
+        models: Vec::new(),
+        attached: Vec::new(),
+        tints: Vec::new(),
+        morph: None,
+        hide_hair: false,
+        effects: Vec::new(),
+        motion: None,
+        position,
+        facing,
+    };
+    let lasting = sim
+        .world
+        .location_vfx
+        .iter()
+        .filter(|v| v.area == area)
+        .filter_map(|v| {
+            let id = LOCATION_VFX_IDS.wrapping_add(v.handle as ObjectId);
             Some(ObjectModel {
-                id,
-                tag: format!("vfx_{vfx}"),
-                kind: ObjectKind::Area,
-                models: vec![model],
-                attached: Vec::new(),
-                tints: Vec::new(),
-                morph: None,
-                hide_hair: false,
-                effects: Vec::new(),
-                motion: None,
-                position,
-                facing,
+                models: vec![model(v.vfx)?],
+                ..at(id, v.vfx, v.position, v.facing)
             })
-        })
-        .collect()
+        });
+    let instant = sim
+        .world
+        .instant_location_vfx
+        .iter()
+        .filter(|v| v.area == area)
+        .filter_map(|v| {
+            let id = INSTANT_LOCATION_VFX_IDS.wrapping_add(v.handle as ObjectId);
+            Some(ObjectModel {
+                effects: vec![EffectModel {
+                    model: model(v.vfx)?,
+                    key: format!("i{}_{}", v.vfx, v.started_ms),
+                    started_ms: Some(v.started_ms),
+                    lasting: false,
+                }],
+                ..at(id, v.vfx, v.position, v.facing)
+            })
+        });
+    lasting.chain(instant).collect()
 }
 
 /// [`area_models`] keeping what objects draw in `cache`.
@@ -1444,7 +1462,13 @@ mod tests {
         let drawn = location_vfx_models(&s, area);
         assert_eq!(drawn.len(), 1);
         assert_eq!(drawn[0].id, INSTANT_LOCATION_VFX_IDS + 3);
-        assert_eq!(drawn[0].models, ["fxm_impact"]);
+        // Played as an effect, from when it was played, and not kept.
+        assert!(drawn[0].models.is_empty());
+        let e = &drawn[0].effects[0];
+        assert_eq!(
+            (e.model.as_str(), e.started_ms, e.lasting),
+            ("fxm_impact", Some(0), false)
+        );
         assert_eq!(
             (drawn[0].position, drawn[0].facing),
             ([1.0, 2.0, 3.0], 45.0)
