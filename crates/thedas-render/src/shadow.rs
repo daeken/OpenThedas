@@ -12,6 +12,8 @@
 //!   0xc1e830). Each partition fits an orthographic box to it (0x4524d0 from the bounds
 //!   0x453240 gathers: the casters' spheres, 0x452570, clipped to the camera slice) and
 //!   its texture matrix is that projection times the bias `(0.5, −0.5)` (0x4523b0).
+//!   After smoothing, the X/Y minima are floored and maxima ceiled to whole light-space
+//!   metres (0x453309–0x4533b9); only the projection is rounded, not the saved bounds.
 //! - The submission queue (`dadefaultsub.sub.xml`'s `Shadow0_visible`/`Shadow1_visible`
 //!   groups) draws every shadow caster's material with its `PSSM` semantic into the
 //!   partition: `PSSMMesh.vsh` with `PSSMStatic.psh` (level geometry: depth and its square)
@@ -185,6 +187,10 @@ pub const BOX_SMOOTHING: f32 = 0.35;
 /// the box fitted now; the result is kept for the next frame (0x4533fa copies it to the
 /// slot's previous box). `previous` is what the last call returned: each partition's box
 /// when it had casters.
+/// The projection rounds the smoothed X/Y bounds out to whole metres (0x453309: maxima
+/// through `ceil` at 0x8e51d0, minima through `floor` at 0x8e6110). This keeps the shadow
+/// map from sliding by fractional texels as the camera moves. Depth and the saved box
+/// stay unrounded; quantizing that history instead would stall the smoothing.
 pub fn partitions_smoothed(
     camera: &crate::Camera,
     aspect: f32,
@@ -247,6 +253,14 @@ pub fn partitions_smoothed(
         if had_casters {
             kept[k] = Some((min, max));
         }
+        let (min, max) = if had_casters {
+            (
+                Vec3::new(min.x.floor(), min.y.floor(), min.z),
+                Vec3::new(max.x.ceil(), max.y.ceil(), max.z),
+            )
+        } else {
+            (min, max)
+        };
         let view_proj = ortho(min, max) * view;
         Partition {
             view_proj,
@@ -396,5 +410,59 @@ mod tests {
         // No casters over a slice: nothing kept, so the next frame starts afresh.
         let (_, none) = partitions_smoothed(&c, 16.0 / 9.0, d, [5.0, 15.0], &[], &kept);
         assert_eq!(none, [None, None]);
+    }
+
+    #[test]
+    fn slow_camera_walk_keeps_world_shadow_texels_stationary() {
+        // A large fixed caster keeps both slices populated. The camera walks 5 cm
+        // across the light, well inside the same whole-metre bounds. Previously a
+        // fixed receiver slid continuously through the map despite static geometry.
+        let mut c = cam();
+        let sun = Vec3::NEG_Z;
+        let casters = [(c.position, 100.0)];
+        let mut previous = [None, None];
+        let receiver = c.position + c.forward() * 3.0;
+        let mut first = None;
+        for _ in 0..60 {
+            let (parts, kept) =
+                partitions_smoothed(&c, 16.0 / 9.0, sun, [7.0, 20.0], &casters, &previous);
+            let uv = parts.map(|p| p.texture.project_point3(receiver).truncate());
+            if let Some(initial) = first {
+                assert_eq!(uv, initial);
+            } else {
+                first = Some(uv);
+            }
+            previous = kept;
+            c.position.x += 0.0008;
+        }
+    }
+
+    #[test]
+    fn projection_rounding_covers_negative_bounds_without_quantizing_history_or_depth() {
+        let c = cam();
+        let sun = Vec3::new(-0.48, -0.83, -0.3).normalize();
+        let caster = (c.position + c.forward() * 2.0 - sun * 1.5, 0.63);
+        let (parts, kept) =
+            partitions_smoothed(&c, 1.5, sun, [7.0, 20.0], &[caster], &[None, None]);
+        let view = light_view(sun);
+        for (part, bounds) in parts.iter().zip(kept) {
+            let Some((min, max)) = bounds else { continue };
+            assert!(min.x < 0.0 || min.y < 0.0);
+            assert_ne!(min, min.floor());
+            // The rounded projection contains the unrounded fit, including negative
+            // coordinates; z must still map the exact smoothed limits to 0 and 1.
+            let projected_min = part
+                .texture
+                .project_point3(view.inverse().transform_point3(min));
+            let projected_max = part
+                .texture
+                .project_point3(view.inverse().transform_point3(max));
+            assert!((0.0..=1.0).contains(&projected_min.x));
+            assert!((0.0..=1.0).contains(&projected_max.x));
+            assert!((0.0..=1.0).contains(&projected_min.y));
+            assert!((0.0..=1.0).contains(&projected_max.y));
+            assert!(projected_min.z.abs() < 1e-4);
+            assert!((projected_max.z - 1.0).abs() < 1e-4);
+        }
     }
 }
