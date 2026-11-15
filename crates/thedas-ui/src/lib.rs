@@ -15,6 +15,7 @@ pub mod binding;
 pub mod chains;
 pub mod input;
 pub mod keys;
+pub mod locomotion;
 pub mod minimap;
 pub mod models;
 pub mod options;
@@ -284,6 +285,14 @@ pub fn parse_focus_list(list: &str, scale: f64, offset: (f64, f64)) -> Vec<Focus
 }
 
 /// One Scaleform movie playing into an offscreen texture.
+/// Whether movies draw straight into the frame, over the game's picture, as the
+/// original's did (their blends acting on that picture, nothing copied), rather than each
+/// into a texture of its own composited after. On unless `THEDAS_UI_DIRECT=0`.
+pub fn direct() -> bool {
+    static DIRECT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DIRECT.get_or_init(|| std::env::var("THEDAS_UI_DIRECT").map_or(true, |v| v != "0"))
+}
+
 pub struct UiMovie {
     pub name: String,
     player: own::OwnMovie,
@@ -642,9 +651,15 @@ impl UiMovie {
         self.after_step();
     }
 
-    /// Renders the current frame into the texture.
+    /// Renders the current frame into the texture (or, drawing straight into the frame,
+    /// brings the draw list up to date; see [`direct`]).
     pub fn render(&mut self) {
         self.player.render();
+    }
+
+    /// Draws the movie over `target`, the frame, into `encoder` (see [`direct`]).
+    pub fn draw_into(&mut self, encoder: &mut wgpu::CommandEncoder, target: &wgpu::Texture) {
+        self.player.draw_into(encoder, target);
     }
 
     /// Whether the movie has a multiply pass (see [`MultiplyPass`]).
