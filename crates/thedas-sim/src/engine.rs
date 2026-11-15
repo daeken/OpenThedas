@@ -5732,11 +5732,7 @@ pub fn dist(a: [f32; 3], b: [f32; 3]) -> f32 {
 /// Whether a point is inside a trigger's XY outline. Origins' loader adds the trigger's
 /// position to its authored vertices without rotating them (0x7997cf..0x7997e8), and
 /// its membership test reads only XY (0x799130). DA2 retains the provisional rotation.
-pub fn in_trigger(
-    p: [f32; 3],
-    trigger: &crate::world::Object,
-    game: thedas_vfs::Game,
-) -> bool {
+pub fn in_trigger(p: [f32; 3], trigger: &crate::world::Object, game: thedas_vfs::Game) -> bool {
     if trigger.geometry.len() < 3 {
         return false;
     }
@@ -7744,10 +7740,8 @@ mod tests {
 
     #[test]
     fn origins_trigger_query_keeps_authored_axes_while_da2_keeps_rotation() {
-        let table = EngineTable::parse(
-            b"int IsInTrigger(object creature, object trigger) = 39;\n",
-        )
-        .unwrap();
+        let table = EngineTable::parse(b"int IsInTrigger(object creature, object trigger) = 39;\n")
+            .unwrap();
         let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(table), 1);
         let area = s.world.spawn(crate::world::ObjectKind::Area, "a");
         let c = s.world.spawn(crate::world::ObjectKind::Creature, "c");
