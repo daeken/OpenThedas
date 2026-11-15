@@ -55,6 +55,9 @@ pub enum AoeShape {
     Rect { width: f32, length: f32 },
 }
 
+/// A creature an area of effect may hold: its id, position and area.
+type Inhabitant = (ObjectId, [f32; 3], Option<ObjectId>);
+
 /// What an area-of-effect object keeps (see the module docs).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct AoeState {
@@ -183,15 +186,26 @@ impl Sim {
             .filter(|o| o.kind == ObjectKind::AreaOfEffect)
             .map(|o| o.id)
             .collect();
+        // The creatures an area of effect can hold, gathered once for all of them (scanning
+        // every object of the world once per area of effect cost a lot in busy areas). Only
+        // removing one runs scripts at once (its members' EXIT), so the list is gathered
+        // again after that; the scans themselves only queue events.
+        let mut creatures: Option<Vec<Inhabitant>> = None;
         for id in ids {
-            let Some(state) = self.world.get(id).and_then(|o| o.aoe.clone()) else {
+            let Some((expires, follows)) = self
+                .world
+                .get(id)
+                .and_then(|o| o.aoe.as_ref())
+                .map(|s| (s.expires, s.follows))
+            else {
                 continue;
             };
-            if state.expires.is_some_and(|t| t <= now) {
+            if expires.is_some_and(|t| t <= now) {
                 self.destroy_aoe(id);
+                creatures = None;
                 continue;
             }
-            if let Some(owner) = state.follows {
+            if let Some(owner) = follows {
                 let at = self.world.get(owner).map(|o| (o.position, o.area));
                 if let (Some((p, Some(area))), Some(o)) = (at, self.world.get_mut(id)) {
                     if o.area == Some(area) {
@@ -199,35 +213,58 @@ impl Sim {
                     }
                 }
             }
-            self.scan_aoe(id);
+            let list = creatures.get_or_insert_with(|| self.aoe_inhabitants());
+            let list = std::mem::take(list);
+            self.scan_aoe_among(id, &list);
+            creatures = Some(list);
         }
+    }
+
+    /// The living, active creatures, in the world's order, with where they stand.
+    fn aoe_inhabitants(&self) -> Vec<Inhabitant> {
+        self.world
+            .objects
+            .values()
+            .filter(|c| c.kind == ObjectKind::Creature && c.active && !c.dead)
+            .map(|c| (c.id, c.position, c.area))
+            .collect()
     }
 
     /// Sends ENTER for living, active creatures newly inside an area of effect and EXIT for
     /// members now outside (queued, as the engine queues them).
     fn scan_aoe(&mut self, id: ObjectId) {
+        let list = self.aoe_inhabitants();
+        self.scan_aoe_among(id, &list);
+    }
+
+    /// [`Sim::scan_aoe`] over `creatures` (from [`Sim::aoe_inhabitants`]).
+    fn scan_aoe_among(&mut self, id: ObjectId, creatures: &[Inhabitant]) {
         let Some(o) = self.world.get(id) else { return };
-        let Some(state) = o.aoe.clone() else { return };
+        let Some(state) = o.aoe.as_ref() else { return };
         let (area, center, facing) = (o.area, o.position, o.facing);
-        let script = o.script.clone();
         let mut members = state.members.clone();
         let mut changes: Vec<(ObjectId, bool)> = Vec::new();
-        for c in self.world.objects.values() {
-            if c.kind != ObjectKind::Creature || c.area != area || !c.active || c.dead {
+        for &(c, at, c_area) in creatures {
+            if c_area != area {
                 continue;
             }
-            let inside = state.shape.contains(center, facing, c.position);
-            let member = members.contains(&c.id);
+            let inside = state.shape.contains(center, facing, at);
+            let member = members.contains(&c);
             if inside && !member {
-                members.push(c.id);
-                changes.push((c.id, true));
+                members.push(c);
+                changes.push((c, true));
             } else if !inside && member {
-                members.retain(|&m| m != c.id);
-                changes.push((c.id, false));
+                members.retain(|&m| m != c);
+                changes.push((c, false));
             }
         }
+        if changes.is_empty() {
+            return;
+        }
+        let script = o.script.clone();
+        let state = state.clone();
         if let Some(s) = self.world.get_mut(id).and_then(|o| o.aoe.as_mut()) {
-            s.members = members;
+            s.members = members.clone();
         }
         for (c, enter) in changes {
             let ev = self.aoe_event(id, &state, c, enter);
