@@ -378,6 +378,60 @@ mod tests {
     }
 
     #[test]
+    fn state_initialization_respects_both_action_slots_without_enabling_scenery() {
+        use thedas_script::EngineTable;
+        use thedas_vfs::Vfs;
+        let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(EngineTable::default()), 7);
+        let tables = crate::m2da::Tables::empty();
+        tables.insert(
+            "#93",
+            &["#9a320a51"],
+            vec![(0, vec![Cell::String("controller".into())])],
+        );
+        // Sparse row IDs: runtime state indexes controller records by position.
+        tables.insert(
+            "controller",
+            &[
+                "ID",
+                "Label",
+                "s0",
+                "s1",
+                "s2",
+                "action0",
+                "next0",
+                "variation0",
+                "action1",
+                "next1",
+                "variation1",
+                "#86a27132",
+            ],
+            [(0, 0, 9), (10, 8, 0), (99, 0, 0)]
+                .into_iter()
+                .map(|(id, a, b)| {
+                    let mut cells = vec![Cell::Int(0); 12];
+                    cells[0] = Cell::Int(id);
+                    cells[5] = Cell::Int(a);
+                    cells[8] = Cell::Int(b);
+                    (id, cells)
+                })
+                .collect(),
+        );
+        s.world.tables = Arc::new(tables);
+        for initial in 0..3 {
+            for useable in [false, true] {
+                let id = s.world.spawn(ObjectKind::Placeable, "controlled");
+                let o = s.world.get_mut(id).unwrap();
+                o.interactive = useable;
+                o.fields.insert("InitialState".into(), initial);
+                s.init_placeable_state(id);
+                let o = s.world.get(id).unwrap();
+                assert_eq!(o.fields["State"], initial);
+                assert_eq!(o.interactive, useable && initial != 2);
+            }
+        }
+    }
+
+    #[test]
     fn walkmesh_install_copies_source_kinds_and_protects_destination_eight_and_above() {
         let source = grid(4, 1, vec![7, 1, 8, 6]);
         let mut destination = grid(4, 2, vec![1, 7, 8, 9, 0, 1, 6, 7]);
@@ -387,6 +441,13 @@ mod tests {
         let writes = write_walkmesh_cells(&mut destination, &source, [0.0, 1.0, 0.0], 0.0, false);
         assert_eq!(writes, BTreeMap::from([(4, 7), (6, 8), (7, 6)]));
         assert!(destination.heights.is_empty() && destination.surfaces.is_empty());
+        // Several source cells can map to one destination cell. The first
+        // protected kind encountered in column-then-row order wins.
+        let mut small = grid(2, 2, vec![7, 8, 9, 1]);
+        small.cell_size = 0.2;
+        let mut destination = grid(1, 1, vec![1]);
+        write_walkmesh_cells(&mut destination, &small, [0.0; 3], 0.0, false);
+        assert_eq!(destination.data, [9]);
     }
 
     #[test]
