@@ -888,7 +888,8 @@ fn creature_motion(sim: &Sim, o: &Object, standing: bool) -> Option<Motion> {
         list.iter().filter_map(|t| (*t).clone()).collect()
     };
     let fighting = o.combat.in_combat;
-    let style = weapon_style(sim, o).map(|s| format!("{s}.anb"));
+    // Looked up only where it is shown: it reads the creature's equipment.
+    let style = || weapon_style(sim, o).map(|s| format!("{s}.anb"));
     if o.dead && !standing {
         // From when it died, held on the last frame; a death of unknown time (a save from
         // before deaths were timed) shows the last frame. Dragon Age II's creatures die in
@@ -897,7 +898,7 @@ fn creature_motion(sim: &Sim, o: &Object, standing: bool) -> Option<Motion> {
         let time = o.died_at.map_or(f32::MAX, |t| secs(now.saturating_sub(t)));
         let reactions = tree(COL_DA2_REACTION_TREE);
         return Some(Motion {
-            trees: trees(&[&style, &ambient, &combat, &reactions]),
+            trees: trees(&[&style(), &ambient, &combat, &reactions]),
             actions: vec![action::DIE.into(), action::DA2_DIE.into()],
             time,
             looping: false,
@@ -929,7 +930,7 @@ fn creature_motion(sim: &Sim, o: &Object, standing: bool) -> Option<Motion> {
                 let length = o.combat.attack_ms.unwrap_or(DEFAULT_ATTACK_MS);
                 let start = due.saturating_sub(length);
                 return Some(Motion {
-                    trees: trees(&[&style, &combat, &ambient]),
+                    trees: trees(&[&style(), &combat, &ambient]),
                     actions: attack_actions(sim, o, due),
                     time: secs(now.saturating_sub(start)),
                     looping: false,
@@ -940,7 +941,7 @@ fn creature_motion(sim: &Sim, o: &Object, standing: bool) -> Option<Motion> {
     }
     Some(Motion {
         trees: if fighting {
-            trees(&[&style, &combat, &ambient])
+            trees(&[&style(), &combat, &ambient])
         } else {
             trees(&[&ambient, &combat])
         },
@@ -1136,6 +1137,37 @@ struct DrawnKey {
 }
 
 impl DrawnKey {
+    /// Whether `o` reads as this key: [`DrawnKey::of`] compared without building it (it is
+    /// asked of every object, every frame).
+    fn matches(&self, sim: &Sim, o: &Object) -> bool {
+        let field =
+            |id: ObjectId, f: &str| sim.world.get(id).and_then(|i| i.fields.get(f).copied());
+        self.corpse == o.fields.get(CORPSE_APPEARANCE).copied()
+            && self.template == o.template
+            && self.appearance == o.appearance
+            && self.gender == o.fields.get("Gender").copied()
+            && self.in_chargen == (sim.world.chargen == Some(o.id))
+            && self.in_combat == o.combat.in_combat
+            && self.equipment.len() == o.equipment.len()
+            && self
+                .equipment
+                .iter()
+                .zip(&o.equipment)
+                .all(|(k, (&slot, &item))| {
+                    *k == (
+                        slot,
+                        item,
+                        field(item, "BaseItem"),
+                        field(item, "ModelVariation"),
+                    )
+                })
+            && match &o.head_morph {
+                // A face is named with the choices made over it (see `of`).
+                Some(_) => self.head_morph == sim.face_name(o.id),
+                None => self.head_morph.is_none(),
+            }
+    }
+
     fn of(sim: &Sim, o: &Object) -> Self {
         let field =
             |id: ObjectId, f: &str| sim.world.get(id).and_then(|i| i.fields.get(f).copied());
@@ -1252,37 +1284,67 @@ pub fn visual_effects(sim: &Sim, o: &Object) -> Vec<EffectModel> {
 /// Where the ids of [`location_vfx_models`] start: above any object id the world hands out.
 pub const LOCATION_VFX_IDS: ObjectId = 0xf000_0000;
 
-/// The visual effects scripts applied at places in `area` (`World::location_vfx`, such as
-/// the Proving's crowd), each drawn as its `VFX_base.gda` row's model (`ModelName`:
-/// `fxe_sprite_arena_p` for 10011) where the effect was applied. They are not objects:
-/// their ids are [`LOCATION_VFX_IDS`] plus the effect's handle, and their kind is `Area`.
-/// Provisional: the row's other columns (its type, attachment, scale) are not mirrored.
+/// Where the ids of the instant ones among [`location_vfx_models`] start.
+pub const INSTANT_LOCATION_VFX_IDS: ObjectId = 0xf800_0000;
+
+/// The visual effects scripts applied at places in `area`. A lasting one
+/// (`World::location_vfx`, such as the Proving's crowd) is drawn as its `VFX_base.gda`
+/// row's model (`ModelName`: `fxe_sprite_arena_p` for 10011) where the effect was applied.
+/// An instant one just played there (`World::instant_location_vfx`: a spell's impact) is
+/// played as an effect, as an instant effect on an object is ([`visual_effects`]): its
+/// emitters follow the model's impact animation and stop after it. They are not objects:
+/// their ids are [`LOCATION_VFX_IDS`] (or [`INSTANT_LOCATION_VFX_IDS`]) plus the effect's
+/// handle, and their kind is `Area`. Provisional: the row's other columns (its type,
+/// attachment, scale) are not mirrored.
 pub fn location_vfx_models(sim: &Sim, area: ObjectId) -> Vec<ObjectModel> {
     let Some(t) = sim.world.tables().get(0, "vfx_base") else {
         return Vec::new();
     };
-    sim.world
+    let model = |vfx: i32| text(t.cell("ModelName", vfx as i64)).map(|m| m.to_ascii_lowercase());
+    let at = |id: ObjectId, vfx: i32, position: [f32; 3], facing: f32| ObjectModel {
+        id,
+        tag: format!("vfx_{vfx}"),
+        kind: ObjectKind::Area,
+        models: Vec::new(),
+        attached: Vec::new(),
+        tints: Vec::new(),
+        morph: None,
+        hide_hair: false,
+        effects: Vec::new(),
+        motion: None,
+        position,
+        facing,
+    };
+    let lasting = sim
+        .world
         .location_vfx
         .iter()
         .filter(|v| v.area == area)
         .filter_map(|v| {
-            let model = text(t.cell("ModelName", v.vfx as i64))?.to_ascii_lowercase();
+            let id = LOCATION_VFX_IDS.wrapping_add(v.handle as ObjectId);
             Some(ObjectModel {
-                id: LOCATION_VFX_IDS.wrapping_add(v.handle as ObjectId),
-                tag: format!("vfx_{}", v.vfx),
-                kind: ObjectKind::Area,
-                models: vec![model],
-                attached: Vec::new(),
-                tints: Vec::new(),
-                morph: None,
-                hide_hair: false,
-                effects: Vec::new(),
-                motion: None,
-                position: v.position,
-                facing: v.facing,
+                models: vec![model(v.vfx)?],
+                ..at(id, v.vfx, v.position, v.facing)
             })
-        })
-        .collect()
+        });
+    let instant = sim
+        .world
+        .instant_location_vfx
+        .iter()
+        .filter(|v| v.area == area)
+        .filter_map(|v| {
+            let id = INSTANT_LOCATION_VFX_IDS.wrapping_add(v.handle as ObjectId);
+            Some(ObjectModel {
+                effects: vec![EffectModel {
+                    model: model(v.vfx)?,
+                    key: format!("i{}_{}", v.vfx, v.started_ms),
+                    started_ms: Some(v.started_ms),
+                    lasting: false,
+                }],
+                ..at(id, v.vfx, v.position, v.facing)
+            })
+        });
+    lasting.chain(instant).collect()
 }
 
 /// [`area_models`] keeping what objects draw in `cache`.
@@ -1294,18 +1356,16 @@ pub fn area_models_cached(sim: &Sim, area: ObjectId, cache: &mut ModelCache) -> 
         .filter(|o| o.area == Some(area) && o.active)
         .filter(|o| matches!(o.kind, ObjectKind::Creature | ObjectKind::Placeable))
         .collect();
-    cache
-        .drawn
-        .retain(|id, _| objects.iter().any(|o| o.id == *id));
+    let present: std::collections::HashSet<ObjectId> = objects.iter().map(|o| o.id).collect();
+    cache.drawn.retain(|id, _| present.contains(id));
     objects
         .into_iter()
         .filter_map(|o| {
-            let key = DrawnKey::of(sim, o);
             let d = match cache.drawn.get(&o.id) {
-                Some((k, d)) if *k == key => d.clone(),
+                Some((k, d)) if k.matches(sim, o) => d.clone(),
                 _ => {
                     let d = object_models(sim, o);
-                    cache.drawn.insert(o.id, (key, d.clone()));
+                    cache.drawn.insert(o.id, (DrawnKey::of(sim, o), d.clone()));
                     d
                 }
             };
@@ -1330,6 +1390,91 @@ pub fn area_models_cached(sim: &Sim, area: ObjectId, cache: &mut ModelCache) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_drawn_key_matches_what_it_was_made_from_until_that_changes() {
+        use std::sync::Arc;
+        use thedas_script::EngineTable;
+        use thedas_vfs::Vfs;
+        let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(EngineTable::default()), 1);
+        let id = s.world.spawn(ObjectKind::Creature, "guard");
+        let item = s.world.spawn(ObjectKind::Item, "sword");
+        s.world
+            .get_mut(item)
+            .unwrap()
+            .fields
+            .insert("BaseItem".into(), 2);
+        let key = DrawnKey::of(&s, s.world.get(id).unwrap());
+        assert!(key.matches(&s, s.world.get(id).unwrap()));
+        s.world.get_mut(id).unwrap().equipment.insert(1, item);
+        assert!(!key.matches(&s, s.world.get(id).unwrap()));
+        let key = DrawnKey::of(&s, s.world.get(id).unwrap());
+        assert!(key.matches(&s, s.world.get(id).unwrap()));
+        // What the item is counts too.
+        s.world
+            .get_mut(item)
+            .unwrap()
+            .fields
+            .insert("ModelVariation".into(), 3);
+        assert!(!key.matches(&s, s.world.get(id).unwrap()));
+        let key = DrawnKey::of(&s, s.world.get(id).unwrap());
+        for change in [
+            |o: &mut Object| o.appearance += 1,
+            |o: &mut Object| o.combat.in_combat = true,
+            |o: &mut Object| o.head_morph = Some("hm_face".into()),
+            |o: &mut Object| {
+                o.fields.insert("Gender".into(), 2);
+            },
+        ] {
+            let was = s.world.get(id).unwrap().clone();
+            change(s.world.get_mut(id).unwrap());
+            assert!(!key.matches(&s, s.world.get(id).unwrap()));
+            *s.world.get_mut(id).unwrap() = was;
+            assert!(key.matches(&s, s.world.get(id).unwrap()));
+        }
+    }
+
+    #[test]
+    fn effects_played_at_places_are_drawn_while_kept() {
+        use std::sync::Arc;
+        use thedas_script::EngineTable;
+        use thedas_vfs::Vfs;
+        let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(EngineTable::default()), 1);
+        let area = s.world.spawn(ObjectKind::Area, "a");
+        s.world.tables().insert(
+            "vfx_base",
+            &["ModelName"],
+            vec![
+                (77, vec![Cell::String("FXC_Crowd".into())]),
+                (88, vec![Cell::String("fxm_impact".into())]),
+            ],
+        );
+        s.world
+            .instant_location_vfx
+            .push(thedas_sim::world::InstantLocationVfx {
+                handle: 3,
+                vfx: 88,
+                area,
+                position: [1.0, 2.0, 3.0],
+                facing: 45.0,
+                started_ms: 0,
+            });
+        let drawn = location_vfx_models(&s, area);
+        assert_eq!(drawn.len(), 1);
+        assert_eq!(drawn[0].id, INSTANT_LOCATION_VFX_IDS + 3);
+        // Played as an effect, from when it was played, and not kept.
+        assert!(drawn[0].models.is_empty());
+        let e = &drawn[0].effects[0];
+        assert_eq!(
+            (e.model.as_str(), e.started_ms, e.lasting),
+            ("fxm_impact", Some(0), false)
+        );
+        assert_eq!(
+            (drawn[0].position, drawn[0].facing),
+            ([1.0, 2.0, 3.0], 45.0)
+        );
+        assert!(location_vfx_models(&s, area + 1).is_empty());
+    }
 
     #[test]
     fn part_prefixes_follow_race_and_gender() {
