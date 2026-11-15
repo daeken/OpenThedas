@@ -628,6 +628,29 @@ pub enum SoundRequest {
     Music { name: String },
 }
 
+/// The ids of the world's creatures, of its creatures and placeables, and of its triggers, in
+/// id order: the
+/// per-tick updates that only look at creatures read these instead of walking every object
+/// (thousands of items and waypoints). Keyed by the object count and the next id, which
+/// every addition (`World::spawn`) and removal changes; an object's kind never changes.
+#[derive(Default)]
+struct KindIndex(std::sync::Mutex<Option<KindLists>>);
+
+/// (object count, next id, creatures, creatures and placeables, triggers)
+type KindLists = (
+    usize,
+    ObjectId,
+    Arc<Vec<ObjectId>>,
+    Arc<Vec<ObjectId>>,
+    Arc<Vec<ObjectId>>,
+);
+
+impl Clone for KindIndex {
+    fn clone(&self) -> Self {
+        KindIndex::default()
+    }
+}
+
 /// Everything a save holds. The trace and the tables are not saved: the trace starts afresh
 /// and the tables come from the resources of the simulation that loads the save.
 #[derive(Clone, Serialize, Deserialize)]
@@ -635,6 +658,10 @@ pub struct World {
     pub time_ms: u64,
     pub objects: BTreeMap<ObjectId, Object>,
     next_id: ObjectId,
+    /// The creatures and placeables, worked out from `objects` again whenever it has changed
+    /// size or gained an object (see [`World::creature_ids`]). Not saved.
+    #[serde(skip)]
+    kind_index: KindIndex,
     #[serde(with = "sorted")]
     pub handles: HashMap<u64, EngineData>,
     next_handle: u64,
@@ -942,6 +969,7 @@ impl World {
             time_ms: 0,
             objects: BTreeMap::new(),
             next_id: 1,
+            kind_index: KindIndex::default(),
             handles: HashMap::new(),
             next_handle: 1,
             next_effect_id: 0,
@@ -1029,6 +1057,56 @@ impl World {
                     .is_some_and(|h| h.followers.contains(&c))
         });
         chosen.or(hero)
+    }
+
+    fn kind_lists(&self) -> KindLists {
+        let key = (self.objects.len(), self.next_id);
+        let mut cache = self.kind_index.0.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(l) = cache.as_ref().filter(|l| (l.0, l.1) == key) {
+            return l.clone();
+        }
+        let creatures: Vec<ObjectId> = self
+            .objects
+            .values()
+            .filter(|o| o.kind == ObjectKind::Creature)
+            .map(|o| o.id)
+            .collect();
+        let actors: Vec<ObjectId> = self
+            .objects
+            .values()
+            .filter(|o| matches!(o.kind, ObjectKind::Creature | ObjectKind::Placeable))
+            .map(|o| o.id)
+            .collect();
+        let triggers: Vec<ObjectId> = self
+            .objects
+            .values()
+            .filter(|o| o.kind == ObjectKind::Trigger)
+            .map(|o| o.id)
+            .collect();
+        let l = (
+            key.0,
+            key.1,
+            Arc::new(creatures),
+            Arc::new(actors),
+            Arc::new(triggers),
+        );
+        *cache = Some(l.clone());
+        l
+    }
+
+    /// The world's creatures, in id order (the order `objects` iterates them).
+    pub fn creature_ids(&self) -> Arc<Vec<ObjectId>> {
+        self.kind_lists().2
+    }
+
+    /// The world's creatures and placeables, in id order.
+    pub fn actor_ids(&self) -> Arc<Vec<ObjectId>> {
+        self.kind_lists().3
+    }
+
+    /// The world's triggers, in id order.
+    pub fn trigger_ids(&self) -> Arc<Vec<ObjectId>> {
+        self.kind_lists().4
     }
 
     pub fn spawn(&mut self, kind: ObjectKind, tag: &str) -> ObjectId {
@@ -1235,6 +1313,26 @@ fn normal_difficulty() -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_creature_list_follows_spawns_and_removals() {
+        let mut w = World::new(Arc::new(crate::m2da::Tables::empty()), 1);
+        let a = w.spawn(ObjectKind::Creature, "a");
+        let _item = w.spawn(ObjectKind::Item, "i");
+        let p = w.spawn(ObjectKind::Placeable, "p");
+        let b = w.spawn(ObjectKind::Creature, "b");
+        assert_eq!(*w.creature_ids(), vec![a, b]);
+        assert_eq!(*w.actor_ids(), vec![a, p, b]);
+        let t = w.spawn(ObjectKind::Trigger, "t");
+        assert_eq!(*w.trigger_ids(), vec![t]);
+        // A removal, then an addition that brings the count back to what it was.
+        w.objects.remove(&a);
+        assert_eq!(*w.creature_ids(), vec![b]);
+        let c = w.spawn(ObjectKind::Creature, "c");
+        assert_eq!(*w.creature_ids(), vec![b, c]);
+        // A copy (a snapshot, a load) works it out afresh.
+        assert_eq!(*w.clone().creature_ids(), vec![b, c]);
+    }
 
     #[test]
     fn facings_are_rotations_with_models_looking_along_plus_y() {

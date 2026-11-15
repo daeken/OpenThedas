@@ -85,6 +85,8 @@ pub struct Animator {
     /// Each animation's track nodes on each skeleton (by the skeleton's index, then the
     /// animation's resource): see [`crate::skeleton::Skeleton::track_nodes`].
     track_nodes: HashMap<usize, HashMap<String, TrackNodes>>,
+    /// Each prop's poses as last computed (see [`Animator::pose_props`]).
+    last_poses: Vec<crate::skeleton::Poses>,
 }
 
 fn load<T>(
@@ -439,8 +441,18 @@ impl Animator {
         // The lookups first, in order (they fill the caches); then the posing, which reads
         // only what was looked up, spread over threads (a camp holds a hundred creatures,
         // each with several skeletons).
+        // A prop the last frame neither showed nor cast a shadow from keeps its pose
+        // (and place) until it is seen again: the pose is not drawn. Not traced against
+        // the original's animation updates (provisional; a modern saving).
+        let seen = renderer.seen_draws();
+        let posing: Vec<bool> = (0..props.len())
+            .map(|i| renderer.prop_seen(scene, i, &seen))
+            .collect();
         let mut jobs: Vec<(usize, usize, Prepared)> = Vec::new();
         for (i, (_, clip)) in props.iter().enumerate() {
+            if !posing[i] {
+                continue;
+            }
             if let Some(clip) = clip {
                 let mut clip = clip.clone();
                 if clip.looping {
@@ -463,8 +475,18 @@ impl Animator {
         for (i, s, p) in posed {
             by_prop[i].insert(s, p);
         }
-        for (i, ((transform, _), poses)) in props.iter().zip(&by_prop).enumerate() {
-            renderer.pose_prop(ctx, scene, i, *transform, poses);
+        // An unseen prop is placed again with the pose it was last given, so that it moves
+        // (and its attachments and effects with it) and is seen when it comes into view.
+        if self.last_poses.len() != props.len() {
+            self.last_poses = vec![Default::default(); props.len()];
+        }
+        for (i, ((transform, _), poses)) in props.iter().zip(by_prop).enumerate() {
+            if posing[i] {
+                renderer.pose_prop(ctx, scene, i, *transform, &poses);
+                self.last_poses[i] = poses;
+            } else {
+                renderer.pose_prop(ctx, scene, i, *transform, &self.last_poses[i]);
+            }
         }
     }
 }
