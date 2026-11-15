@@ -3327,14 +3327,20 @@ pub fn call(
             let who = obj(a, 0);
             let running = h.sim.world.get_mut(who).and_then(|o| {
                 if o.commands.first().is_some_and(|c| c.due.is_some()) {
-                    Some(o.commands.remove(0).ty)
+                    Some(o.commands.remove(0))
                 } else {
                     None
                 }
             });
-            if let Some(ty) = running {
+            if let Some(cmd) = running {
+                if cmd.name == "CommandUseAbility" {
+                    h.sim.complete_da2_combat_target(who);
+                }
                 let mut ev = h.sim.new_event("COMMAND_COMPLETE", Some(who));
-                ev.ints = vec![ty, constant(&h.sim.table, "COMMAND_FAILED_COMMAND_CLEARED")];
+                ev.ints = vec![
+                    cmd.ty,
+                    constant(&h.sim.table, "COMMAND_FAILED_COMMAND_CLEARED"),
+                ];
                 h.sim.world.queue_event(0, who, ev, None);
             }
             void()
@@ -3342,11 +3348,17 @@ pub fn call(
         "ClearAllCommands" => {
             let who = obj(a, 0);
             let running = h.sim.world.get_mut(who).and_then(|o| {
-                let first = o.commands.first().map(|c| c.ty);
+                let first = o
+                    .commands
+                    .first()
+                    .map(|c| (c.ty, c.name == "CommandUseAbility"));
                 o.commands.clear();
                 first
             });
-            if let Some(ty) = running {
+            if let Some((ty, ability)) = running {
+                if ability {
+                    h.sim.complete_da2_combat_target(who);
+                }
                 let mut ev = h.sim.new_event("COMMAND_COMPLETE", Some(who));
                 ev.ints = vec![ty, constant(&h.sim.table, "COMMAND_RESULT_INVALID")];
                 h.sim.world.queue_event(0, who, ev, None);
@@ -4501,16 +4513,12 @@ pub fn call(
         // --- Combat and perception (see `combat`) ------------------------------------------
         "GetCombatState" => ok(b(h.object(obj(a, 0)).is_some_and(|o| o.combat.in_combat))),
         "SetCombatState" => {
-            if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
-                o.combat.in_combat = int(a, 1) != 0;
-            }
+            h.sim.set_combat_state(obj(a, 0), int(a, 1) != 0);
             void()
         }
         "GetAttackTarget" => ok(Value::Object(
-            h.object(obj(a, 0))
-                .and_then(|o| o.commands.first())
-                .filter(|c| c.name == "CommandAttack")
-                .and_then(|c| c.target)
+            h.sim
+                .script_attack_target(obj(a, 0))
                 .unwrap_or(OBJECT_INVALID),
         )),
         "IsObjectHostile" => ok(b(h.sim.hostile(obj(a, 0), obj(a, 1)))),

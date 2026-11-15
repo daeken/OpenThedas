@@ -3308,6 +3308,9 @@ impl Sim {
         else {
             return;
         };
+        if c.name == "CommandUseAbility" {
+            self.complete_da2_combat_target(id);
+        }
         let t = self.world.time_ms;
         self.world.trace.push(TraceEntry::Command {
             t,
@@ -3830,6 +3833,9 @@ impl Sim {
                 let ev = self.use_event(id, t);
                 self.deliver(t, ev, None);
             }
+        }
+        if cmd.name == "CommandUseAbility" {
+            self.complete_da2_combat_target(id);
         }
         if let Some(o) = self.world.get_mut(id) {
             o.combat.previous_command = Some(cmd.clone());

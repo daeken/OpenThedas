@@ -86,6 +86,9 @@ pub const DEFAULT_ATTACK_MS: u64 = 1500;
 pub struct CombatData {
     /// `GetCombatState`.
     pub in_combat: bool,
+    /// DA2's `GetAttackTarget`: prepared combat target, independent of the command queue.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<ObjectId>,
     /// Creatures this one currently perceives.
     pub perceived: Vec<ObjectId>,
     /// Those of them it perceived as hostile (an appearance is announced again when a
@@ -185,6 +188,92 @@ fn dist(a: [f32; 3], b: [f32; 3]) -> f32 {
 }
 
 impl Sim {
+    /// DA2 0x4dd1a0 reads the creature's combat record, including a stale/dead target;
+    /// scripts validate the returned id themselves. Origins retains its queue-based view.
+    pub(crate) fn script_attack_target(&self, id: ObjectId) -> Option<ObjectId> {
+        let o = self.world.get(id)?;
+        if self.game == thedas_vfs::Game::DragonAge2 {
+            (o.kind == ObjectKind::Creature)
+                .then_some(o.combat.target)
+                .flatten()
+        } else {
+            o.commands
+                .first()
+                .filter(|c| c.name == "CommandAttack")
+                .and_then(|c| c.target)
+        }
+    }
+
+    /// Native modern preparation (0x640fd1..0x641016) preserves self casts and casts
+    /// between members of the party pool. Other admitted targets replace the stored id;
+    /// a ground cast can replace it with OBJECT_INVALID. Hostility is not a condition.
+    fn remember_da2_combat_target(&mut self, id: ObjectId, target: ObjectId) {
+        if self.game != thedas_vfs::Game::DragonAge2 || id == target {
+            return;
+        }
+        let party = crate::engine::party_of(self);
+        // The travel pool omits unavailable recruits. Native preparation's pool
+        // does include them (SetFollowerState 0x5f3280 -> 0x5f10e0).
+        let pool_member = |who| {
+            party.contains(&who)
+                || self
+                    .world
+                    .get(who)
+                    .and_then(|o| o.fields.get("FollowerState"))
+                    .is_some_and(|&state| {
+                        state != 0
+                            && [
+                                "FOLLOWER_STATE_ACTIVE",
+                                "FOLLOWER_STATE_AVAILABLE",
+                                "FOLLOWER_STATE_UNAVAILABLE",
+                                "FOLLOWER_STATE_SUSPENDED",
+                                "FOLLOWER_STATE_LOCKEDACTIVE",
+                            ]
+                            .iter()
+                            .any(|name| state == constant_of(self, name))
+                    })
+        };
+        if pool_member(id) && pool_member(target) {
+            return;
+        }
+        if let Some(o) = self
+            .world
+            .get_mut(id)
+            .filter(|o| o.kind == ObjectKind::Creature)
+        {
+            o.combat.target = (target != OBJECT_INVALID).then_some(target);
+        }
+    }
+
+    /// Modern completion 0x676288..0x6762a2 clears outside combat for active
+    /// party members and non-party followers. The cached native membership flag
+    /// (0x5a00b8 / 0x5a05bc) uses the active list, unlike preparation's pool test.
+    pub(crate) fn complete_da2_combat_target(&mut self, id: ObjectId) {
+        if self.game != thedas_vfs::Game::DragonAge2 {
+            return;
+        }
+        let member = crate::engine::party_of(self).contains(&id)
+            || self
+                .world
+                .hero
+                .and_then(|h| self.world.get(h))
+                .is_some_and(|h| h.escorts.contains(&id));
+        if member && let Some(o) = self.world.get_mut(id).filter(|o| !o.combat.in_combat) {
+            o.combat.target = None;
+        }
+    }
+
+    /// Native SetCombatState (0x583c70 -> 0x579dd0) clears the target on leaving
+    /// combat. Repeating the current state does not run the transition again.
+    pub(crate) fn set_combat_state(&mut self, id: ObjectId, on: bool) {
+        if let Some(o) = self.world.get_mut(id) {
+            if self.game == thedas_vfs::Game::DragonAge2 && o.combat.in_combat && !on {
+                o.combat.target = None;
+            }
+            o.combat.in_combat = on;
+        }
+    }
+
     /// How far a creature notices others, in metres: the `PrimaryRange` of its
     /// `PerceptionClass` row of ranges.gda (`PercepRngShrt` 10, `PercepRngMed` 30,
     /// `PercepRngLng` 40, `PercepRngMonster` 30, ...); a creature with none uses
@@ -1097,6 +1186,9 @@ impl Sim {
             }
             o.commands.clear();
             o.combat.attack = None;
+            if self.game == thedas_vfs::Game::DragonAge2 && o.combat.in_combat {
+                o.combat.target = None;
+            }
             o.combat.in_combat = false;
         }
         let mut ev = self.new_event("DEATH", Some(killer));
@@ -1414,6 +1506,20 @@ impl Sim {
         }
         let target = cmd.target.unwrap_or(OBJECT_INVALID);
         let ability = cmd.ints.first().copied().unwrap_or(0);
+        // The placeholder must first select an actual basic attack. Native preparation
+        // also rejects absent ability/target records before its target write. Our
+        // preparation/approach remains simplified (see da2-combat-target.md).
+        if self.game == thedas_vfs::Game::DragonAge2
+            && ability > 1
+            && self
+                .world
+                .tables()
+                .get(1, "")
+                .is_some_and(|t| t.has_row(i64::from(ability)))
+            && (target == OBJECT_INVALID || self.world.get(target).is_some())
+        {
+            self.remember_da2_combat_target(id, target);
+        }
         let item = self.ability_item(id, cmd);
         let mut ev = self.new_event("COMMAND_PENDING", Some(id));
         ev.objects = vec![id, target, item];
@@ -1600,6 +1706,16 @@ impl Sim {
     /// (provisional).
     pub(crate) fn start_attack(&mut self, id: ObjectId, target: ObjectId, ty: i32) {
         self.face_target(id, target);
+        // Legacy DA2 preparation 0x640a12..0x640a18 writes the same record.
+        if self.game == thedas_vfs::Game::DragonAge2
+            && self.world.get(target).is_some()
+            && let Some(o) = self
+                .world
+                .get_mut(id)
+                .filter(|o| o.kind == ObjectKind::Creature)
+        {
+            o.combat.target = Some(target);
+        }
         let mut ev = self.new_event("COMMAND_PENDING", Some(id));
         ev.objects = vec![id, target];
         ev.ints = vec![ty, 0];
@@ -2405,6 +2521,243 @@ mod tests {
     fn sim() -> Sim {
         let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
         Sim::new(Arc::new(Vfs::new()), table, 3)
+    }
+
+    fn target_sim(game: thedas_vfs::Game) -> Sim {
+        let table = EngineTable::parse(
+            b"object GetAttackTarget(object who) = 522;\n\
+              void SetCombatState(object who, int state) = 525;\n\
+              int ClearAllCommands(object who) = 353;\n\
+              int COMMAND_TYPE_USE_ABILITY = 25;\n\
+              int COMMAND_TYPE_ATTACK = 1;\n\
+              int FOLLOWER_STATE_AVAILABLE = 2;\n\
+              int FOLLOWER_STATE_UNAVAILABLE = 3;\n",
+        )
+        .unwrap();
+        let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(table), 3);
+        s.game = game;
+        let tables = crate::m2da::Tables::empty();
+        tables.insert("#1", &["range"], vec![(3110, vec![Cell::Int(0)])]);
+        s.world.tables = Arc::new(tables);
+        s
+    }
+
+    fn target_call(
+        s: &mut Sim,
+        who: ObjectId,
+        name: &str,
+        args: &[thedas_script::vm::Value],
+    ) -> Option<thedas_script::vm::Value> {
+        let f = s.table.function_by_name(name).cloned().unwrap();
+        let mut h = crate::sim::ScriptHost {
+            sim: s,
+            event: None,
+            script: "test".into(),
+        };
+        crate::engine::call(&mut h, who, &f, args).unwrap().unwrap()
+    }
+
+    fn stored_target(s: &mut Sim, who: ObjectId) -> ObjectId {
+        use thedas_script::vm::Value;
+        let Some(Value::Object(target)) =
+            target_call(s, who, "GetAttackTarget", &[Value::Object(who)])
+        else {
+            panic!("object result")
+        };
+        target
+    }
+
+    fn prepare_target(s: &mut Sim, who: ObjectId, target: ObjectId, ability: i32) {
+        s.world.get_mut(who).unwrap().commands.clear();
+        s.order_ability(who, ability, target, "");
+        s.world
+            .get_mut(who)
+            .unwrap()
+            .fields
+            .insert("CommandResult".into(), 1);
+        let cmd = s.world.get(who).unwrap().commands[0].clone();
+        s.start_ability(who, &cmd);
+    }
+
+    #[test]
+    fn da2_script_target_survives_completion_queue_clear_and_reload_until_combat_exit() {
+        use thedas_script::vm::Value;
+        let mut s = target_sim(thedas_vfs::Game::DragonAge2);
+        let who = s.world.spawn(ObjectKind::Creature, "caster");
+        let target = s.world.spawn(ObjectKind::Creature, "enemy");
+        s.set_combat_state(who, true);
+        prepare_target(&mut s, who, target, 3110);
+        assert_eq!(stored_target(&mut s, who), target);
+        // The normal/chained completion path removes the front command before the next
+        // authored AI round. The target remains available to that round in combat.
+        s.world.get_mut(who).unwrap().commands[0].cancellable = true;
+        s.finish_chained_ability(who);
+        assert!(s.world.get(who).unwrap().commands.is_empty());
+        assert_eq!(stored_target(&mut s, who), target);
+        s.order_wait(who, 1.);
+        target_call(&mut s, who, "ClearAllCommands", &[Value::Object(who)]);
+        assert_eq!(stored_target(&mut s, who), target);
+        // Getter validity belongs to the script: a dead or removed target is still an id.
+        s.world.get_mut(target).unwrap().dead = true;
+        assert_eq!(stored_target(&mut s, who), target);
+        s.world.objects.remove(&target);
+        let json = serde_json::to_string(&s.world).unwrap();
+        s.world = serde_json::from_str(&json).unwrap();
+        assert_eq!(stored_target(&mut s, who), target);
+        target_call(
+            &mut s,
+            who,
+            "SetCombatState",
+            &[Value::Object(who), Value::Int(0)],
+        );
+        assert_eq!(stored_target(&mut s, who), OBJECT_INVALID);
+    }
+
+    #[test]
+    fn da2_modern_target_preserves_self_and_party_casts_but_records_other_allies() {
+        let mut s = target_sim(thedas_vfs::Game::DragonAge2);
+        let who = s.world.spawn(ObjectKind::Creature, "hero");
+        let friend = s.world.spawn(ObjectKind::Creature, "follower");
+        let reserve = s.world.spawn(ObjectKind::Creature, "recruited_reserve");
+        let unavailable = s.world.spawn(ObjectKind::Creature, "unavailable_recruit");
+        let enemy = s.world.spawn(ObjectKind::Creature, "enemy");
+        let ally = s.world.spawn(ObjectKind::Creature, "non_party_ally");
+        s.world.hero = Some(who);
+        s.world.get_mut(who).unwrap().followers.push(friend);
+        s.world
+            .get_mut(reserve)
+            .unwrap()
+            .fields
+            .insert("FollowerState".into(), 2);
+        s.world
+            .get_mut(unavailable)
+            .unwrap()
+            .fields
+            .insert("FollowerState".into(), 3);
+        prepare_target(&mut s, who, enemy, 3110);
+        for target in [who, friend, reserve, unavailable] {
+            prepare_target(&mut s, who, target, 3110);
+            assert_eq!(stored_target(&mut s, who), enemy);
+        }
+        prepare_target(&mut s, friend, enemy, 3110);
+        prepare_target(&mut s, friend, who, 3110);
+        assert_eq!(stored_target(&mut s, friend), enemy);
+        prepare_target(&mut s, reserve, enemy, 3110);
+        prepare_target(&mut s, reserve, friend, 3110);
+        assert_eq!(stored_target(&mut s, reserve), enemy);
+        // Friendly non-party targets still replace the field. There is no native
+        // hostility/ability-category filter around the write.
+        prepare_target(&mut s, who, ally, 3110);
+        assert_eq!(stored_target(&mut s, who), ally);
+        prepare_target(&mut s, who, OBJECT_INVALID, 3110);
+        assert_eq!(stored_target(&mut s, who), OBJECT_INVALID);
+    }
+
+    #[test]
+    fn da2_completion_clears_exploring_active_party_and_escorts_only() {
+        use thedas_script::vm::Value;
+        let mut s = target_sim(thedas_vfs::Game::DragonAge2);
+        let hero = s.world.spawn(ObjectKind::Creature, "hero");
+        let active = s.world.spawn(ObjectKind::Creature, "active");
+        let reserve = s.world.spawn(ObjectKind::Creature, "reserve");
+        let escort = s.world.spawn(ObjectKind::Creature, "escort");
+        let npc = s.world.spawn(ObjectKind::Creature, "npc");
+        let enemy = s.world.spawn(ObjectKind::Creature, "enemy");
+        s.world.hero = Some(hero);
+        s.world.get_mut(hero).unwrap().followers.push(active);
+        s.world.get_mut(hero).unwrap().escorts.push(escort);
+        s.world
+            .get_mut(reserve)
+            .unwrap()
+            .fields
+            .insert("FollowerState".into(), 2);
+        for combat in [false, true] {
+            for who in [hero, active, reserve, escort, npc] {
+                for clear in [false, true] {
+                    s.set_combat_state(who, combat);
+                    prepare_target(&mut s, who, enemy, 3110);
+                    let cmd = &mut s.world.get_mut(who).unwrap().commands[0];
+                    cmd.cancellable = true;
+                    cmd.due = Some(10);
+                    if clear {
+                        target_call(&mut s, who, "ClearAllCommands", &[Value::Object(who)]);
+                    } else {
+                        s.finish_chained_ability(who);
+                    }
+                    let cleared = !combat && [hero, active, escort].contains(&who);
+                    assert_eq!(
+                        stored_target(&mut s, who),
+                        if cleared { OBJECT_INVALID } else { enemy }
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn da2_target_preparation_does_not_accept_placeholder_or_missing_records() {
+        let mut s = target_sim(thedas_vfs::Game::DragonAge2);
+        let who = s.world.spawn(ObjectKind::Creature, "caster");
+        let first = s.world.spawn(ObjectKind::Creature, "first");
+        let second = s.world.spawn(ObjectKind::Creature, "second");
+        prepare_target(&mut s, who, first, 3110);
+        for (target, ability) in [(second, 1), (second, 9999), (123456, 3110)] {
+            prepare_target(&mut s, who, target, ability);
+            assert_eq!(stored_target(&mut s, who), first);
+        }
+        // A later script-side pending failure does not undo native preparation.
+        s.world.get_mut(who).unwrap().commands.clear();
+        s.order_ability(who, 3110, second, "");
+        s.world
+            .get_mut(who)
+            .unwrap()
+            .fields
+            .insert("CommandResult".into(), -1);
+        let cmd = s.world.get(who).unwrap().commands[0].clone();
+        s.start_ability(who, &cmd);
+        assert!(s.world.get(who).unwrap().commands.is_empty());
+        assert_eq!(stored_target(&mut s, who), second);
+        // Repeating exploration does not run the combat-exit transition.
+        s.set_combat_state(who, false);
+        assert_eq!(stored_target(&mut s, who), second);
+        s.set_combat_state(who, true);
+        assert_eq!(stored_target(&mut s, who), second);
+        s.set_combat_state(who, false);
+        assert_eq!(stored_target(&mut s, who), OBJECT_INVALID);
+    }
+
+    #[test]
+    fn target_storage_is_absent_from_old_saves_and_does_not_change_origins_getter() {
+        let old = serde_json::to_string(&CombatData::default()).unwrap();
+        assert!(!old.contains("\"target\""));
+        assert_eq!(
+            serde_json::from_str::<CombatData>(&old).unwrap().target,
+            None
+        );
+        for game in [thedas_vfs::Game::Origins, thedas_vfs::Game::DragonAge2] {
+            let mut s = target_sim(game);
+            let who = s.world.spawn(ObjectKind::Creature, "attacker");
+            let target = s.world.spawn(ObjectKind::Creature, "target");
+            s.start_attack(who, target, 1);
+            assert_eq!(
+                s.world.get(who).unwrap().combat.target,
+                (game == thedas_vfs::Game::DragonAge2).then_some(target)
+            );
+            s.order_attack(who, target);
+            assert_eq!(stored_target(&mut s, who), target);
+            s.world.get_mut(who).unwrap().commands.clear();
+            assert_eq!(
+                stored_target(&mut s, who),
+                if game == thedas_vfs::Game::DragonAge2 {
+                    target
+                } else {
+                    OBJECT_INVALID
+                }
+            );
+            let prop = s.world.spawn(ObjectKind::Placeable, "prop");
+            s.world.get_mut(prop).unwrap().combat.target = Some(target);
+            assert_eq!(stored_target(&mut s, prop), OBJECT_INVALID);
+        }
     }
 
     #[test]
