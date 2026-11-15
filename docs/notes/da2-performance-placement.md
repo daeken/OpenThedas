@@ -43,30 +43,39 @@ false so Origins snapshots do not gain a field.
 Activation remains the separately landed behavior. Unresolved bindings create
 no objects. Relative stages, native owner-context fallback, processing suspension
 and full performance camera playback remain unfinished. Active-party follower
-aliases are a separate repair in PR #898. Walkmesh handling uses the existing simulator floor lookup at the
-prepared point; native 0x57d200's wider projection search is not reproduced.
+aliases are a separate repair in PR #898. Walkmesh handling uses the existing
+simulator floor lookup at the prepared point; native 0x57d200's wider projection
+search is not reproduced.
 No combat balance, stats, damage or cooldown changes are included.
 
 ## Validation
 
-On merged main d87f9ef2, fmt, workspace all-target clippy with warnings denied,
-workspace tests (1,209 passed, 17 ignored, zero failures) and release MCP/CLI/app
-builds pass. The DAO corpus passes with the existing 5,219 undeclared-action
-findings. The full s01-s13 A/B sweep has 26 successful runs, identical story logs
-and plot sequences, all 15 complete JSON checkpoints identical and no refused
-saves. Four DAO 600-tick repeat/reload checks are identical. The DA2 repeat is
-identical; its reload check reports only next_effect_id 2 versus 3, with the
-matched main check recorded separately before PR submission.
+On merged main d0bcc32c, fmt, workspace all-target clippy with warnings denied,
+workspace tests (1,214 passed, 17 ignored, zero failures) and forced
+simulation/MCP/CLI release rebuilds pass. The DAO corpus passes with the existing
+5,219 undeclared-action findings; its parsers are unchanged by the main merges.
+The refreshed full s01-s13 A/B sweep has 26 successful runs, identical story logs
+and plot sequences, 15 identical complete JSON checkpoints and no refused saves.
+Four DAO 600-tick repeat/reload checks are identical. The DA2 repeat is identical;
+reload differs only in `next_effect_id` (2 versus 3) on both main and candidate.
+Matched main/candidate repeat and reload checkpoints are identical. Later
+upstream changes are outside this frozen comparison.
 
 The matched Karl confrontation starts from the same natural Chantry arrival,
 takes the same replies and ends at t=1323927 on both binaries. All five templars
 now leave their original overlapping positions for the authored stage end poses.
-A repeat produces identical complete candidate JSON. The established natural
-route driver still wins Karl's fight and returns to Anders: baseline t=1504060,
-candidate t=1555860, zero script errors and zero developer healing/kill aids.
-These are conditional-driver outcomes, not equal-duration comparisons. The
-earlier pre-Ogre checkpoint still wipes at t=915150 on both, with identical
-complete saved JSON; this placement repair does not resolve that wipe.
+A repeat produces identical complete candidate JSON. The forced rebuild's
+performance endpoint is also byte-identical to the earlier candidate endpoint.
+On the earlier d87f9ef2 baseline the established natural driver wins Karl's fight
+and returns to Anders: main t=1504060, placement t=1555860. On frozen main
+d0bcc32c that driver instead wipes main at t=1488427 and placement at t=1483127.
+The changed main-baseline outcome's cause is unproven. All runs have zero script
+errors and zero developer healing/kill aids. These are conditional-driver
+outcomes, not equal-duration comparisons or fresh-run completion.
+
+The pre-Ogre checkpoint still wipes at t=915150 on refreshed main and candidate,
+with identical complete JSON, also identical to the earlier baseline's endpoint.
+This placement repair does not resolve that wipe.
 
 The same-renderer, same-camera matched capture has Before / After / Delta x4
 panels: 4.350% of pixels change at >2/255 in any RGB channel. Media remains staged
@@ -74,10 +83,10 @@ for coordinator review, never published by this job.
 
 Integration with the separate follower-binding repair places Bethany and Varric
 on their authored marks too. The same established Karl combat driver then wipes
-at t=1414027, including a run spending available level-up points and resting before
-the approach. Placement alone still wins as recorded above. The integration
-result is retained explicitly; processing suspension and actor AI remain open,
-and these checkpoint outcomes do not establish fresh-run completion.
+at t=1414027 on both the earlier and refreshed source, with identical complete end
+states. A prepared run using available level-ups/rest and a separate manual-input
+run also wipe on the earlier integration. Processing suspension, command
+admission and actor locomotion remain open. No combat-completion claim is made.
 
 Synthetic regressions cover
 runtime-tag parsing, the explicit release switch, duplicate/missing bindings,
