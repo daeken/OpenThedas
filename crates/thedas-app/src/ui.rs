@@ -3860,6 +3860,14 @@ mod tests {
         for n in 0..3 {
             ui.ask_text(1, "Name", "Rowan", "OK", "Cancel");
             pump(&mut ui);
+            // Script popup values belong to the binding until that popup closes.
+            ui.stage.bridge.bind(
+                ui.stage
+                    .bridge
+                    .values()
+                    .into_iter()
+                    .filter(|(key, _)| key.starts_with("GUIPopupLayer.")),
+            );
             ui.ask_free_text(2, "Report", "", "Save", "Keep here");
             pump(&mut ui);
             assert!(crate::box_shows(&mut ui, "Name"));
@@ -3878,6 +3886,7 @@ mod tests {
                 close(&mut ui);
                 pump(&mut ui);
                 assert!(ui.stage.dialog_prompt().is_none());
+                ui.stage.bridge.bind([]);
                 ui.ask_free_text(2, "Report", "", "Save", "Keep here");
             } else {
                 close(&mut ui);
@@ -3886,12 +3895,18 @@ mod tests {
                     ui.stage.bridge.value("GUIPopupLayer.InputText"),
                     Some(thedas_ui::UiValue::String("Rowan".into()))
                 );
+                // The app's next bind drops the finished script's popup values.
+                // That must not erase the queued report's input flag or callbacks.
+                ui.stage.bridge.bind([]);
             }
-            // Type as soon as the question opens, before the following focus frames.
-            for _ in 0..2 {
+            // Type on the first tick with an input field, without extra settling frames.
+            for _ in 0..20 {
                 ui.show_text_popup();
                 ui.stage.tick(1000.0 / 30.0);
                 ui.allow_free_text_popup();
+                if crate::box_shows(&mut ui, "Report") && ui.typing() {
+                    break;
+                }
             }
             assert!(crate::box_shows(&mut ui, "Report"));
             let note = format!("Sera's report {n}: \"wrong\", 123. #$% ").repeat(30);

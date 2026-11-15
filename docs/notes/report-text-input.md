@@ -26,6 +26,11 @@ from the report's retry logic. A later report sequence also left typing with
 no text field available. The displayed prompt is now read from the live popup's
 `ms_sInitString`, guarded by a live clip check. Pending questions retain their
 values until they can be shown, and never change another dialog's field policy.
+When a script popup closes, the following binding update removes its popup
+properties. Previously that could also erase a report question written during
+the script dialog, including its input flag and callbacks, creating a box with
+no working text input. Publishing the complete question immediately before
+showing it keeps it intact through that binding expiry.
 A tick between closing the previous dialog and publishing the next question lets
 the previous callback collect its typed answer before `InputText` is replaced.
 Timeouts and report completion cancel pending questions so they cannot appear
