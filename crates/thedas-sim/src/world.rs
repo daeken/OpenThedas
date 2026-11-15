@@ -409,8 +409,8 @@ pub struct Effect {
 
 impl Effect {
     /// Compares reconstructed parameters without identity or application context.
-    /// Used by item-property removal and saved environmental-visual replay only;
-    /// script RemoveEffect uses the assigned identity whenever it has one.
+    /// Used for item-property removal, environmental-visual replay and legacy
+    /// zero-ID queries; script RemoveEffect uses an assigned identity when present.
     pub(crate) fn same_payload(&self, other: &Self) -> bool {
         let mut candidate = self.clone();
         candidate.id = other.id;

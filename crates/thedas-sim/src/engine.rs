@@ -11494,53 +11494,54 @@ mod coverage_tests {
     #[test]
     fn da2_area_load_visual_replays_reconcile_saved_copies() {
         for identified in [false, true] {
-        let table = EngineTable::parse(
-            format!("{LDF}\nint EVENT_TYPE_AREALOADSAVE_POSTLOADEXIT = 43;\n").as_bytes(),
-        )
-        .unwrap();
-        let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(table), 7);
-        s.game = thedas_vfs::Game::DragonAge2;
-        let area = s.world.spawn(ObjectKind::Area, "area");
-        let wall = s.world.spawn(ObjectKind::Placeable, "wall");
-        s.world.get_mut(wall).unwrap().area = Some(area);
-        let mut fire = Effect {
-            ty: 4,
-            creator: Some(area),
-            duration_type: 3,
-            ints: vec![600001],
-            ..Default::default()
-        };
-        let mut other = Effect {
-            ints: vec![600002],
-            ..fire.clone()
-        };
-        if identified {
-            s.world.identify_effect(&mut fire);
-            s.world.identify_effect(&mut other);
-        }
-        // An older snapshot may already contain several copies. Only the exact
-        // environmental visual reissued by the load handler is reconciled.
-        s.world.get_mut(wall).unwrap().effects = vec![fire.clone(), other.clone(), fire.clone()];
-        for _ in 0..3 {
-            s.load_game(s.save_game()).unwrap();
-            let event = s.new_event("AREALOADSAVE_POSTLOADEXIT", None);
-            let event = Some(s.world.store(EngineData::Event(event)));
-            let mut replay = fire.clone();
-            if identified {
-                replay.id = 0;
-                s.world.identify_effect(&mut replay);
-            }
-            let mut h = ScriptHost {
-                sim: &mut s,
-                event,
-                script: "area".into(),
+            let table = EngineTable::parse(
+                format!("{LDF}\nint EVENT_TYPE_AREALOADSAVE_POSTLOADEXIT = 43;\n").as_bytes(),
+            )
+            .unwrap();
+            let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(table), 7);
+            s.game = thedas_vfs::Game::DragonAge2;
+            let area = s.world.spawn(ObjectKind::Area, "area");
+            let wall = s.world.spawn(ObjectKind::Placeable, "wall");
+            s.world.get_mut(wall).unwrap().area = Some(area);
+            let mut fire = Effect {
+                ty: 4,
+                creator: Some(area),
+                duration_type: 3,
+                ints: vec![600001],
+                ..Default::default()
             };
-            apply_visual_or_effect(&mut h, wall, replay);
-            assert_eq!(
-                s.world.get(wall).unwrap().effects,
-                [fire.clone(), other.clone()]
-            );
-        }
+            let mut other = Effect {
+                ints: vec![600002],
+                ..fire.clone()
+            };
+            if identified {
+                s.world.identify_effect(&mut fire);
+                s.world.identify_effect(&mut other);
+            }
+            // An older snapshot may already contain several copies. Only the exact
+            // environmental visual reissued by the load handler is reconciled.
+            s.world.get_mut(wall).unwrap().effects =
+                vec![fire.clone(), other.clone(), fire.clone()];
+            for _ in 0..3 {
+                s.load_game(s.save_game()).unwrap();
+                let event = s.new_event("AREALOADSAVE_POSTLOADEXIT", None);
+                let event = Some(s.world.store(EngineData::Event(event)));
+                let mut replay = fire.clone();
+                if identified {
+                    replay.id = 0;
+                    s.world.identify_effect(&mut replay);
+                }
+                let mut h = ScriptHost {
+                    sim: &mut s,
+                    event,
+                    script: "area".into(),
+                };
+                apply_visual_or_effect(&mut h, wall, replay);
+                assert_eq!(
+                    s.world.get(wall).unwrap().effects,
+                    [fire.clone(), other.clone()]
+                );
+            }
         }
     }
 
