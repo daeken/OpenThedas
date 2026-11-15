@@ -5954,6 +5954,19 @@ mod tests {
         let returned = s.enter_area("bdc210ar_players_home", None).unwrap();
         assert_eq!(returned, area);
         assert_eq!(s.world.get(door).unwrap().fields["State"], 1);
+        // An older save can hold an unloaded area's active door parked with
+        // active=false. Initialization must retain its actual collision state.
+        let o = s.world.get_mut(door).unwrap();
+        o.fields.insert("InitialState".into(), 1);
+        o.fields.remove("State");
+        o.parked = Some(true);
+        o.active = false;
+        let mut legacy = s.save_game();
+        legacy.revision = 9;
+        s.load_game(legacy).unwrap();
+        assert!(!s.world.get(door).unwrap().active);
+        s.enter_area("bdc210ar_players_home", None).unwrap();
+        assert!(s.closed_doors(area).iter().any(|(id, _)| *id == door));
     }
 
     #[test]

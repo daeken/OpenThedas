@@ -39,8 +39,9 @@ impl Sim {
         }
         // Model setup subsequently applies the loaded active flag through
         // vfunc +0x140 (0x752096 / 0x752aa3 -> 0x74f200).
-        if !self.world.get(id).unwrap().active {
-            let state = self.world.get(id).unwrap().fields["State"] as u16;
+        let o = self.world.get(id).unwrap();
+        if !o.parked.unwrap_or(o.active) {
+            let state = o.fields["State"] as u16;
             self.write_placeable_walkmesh(id, state, true);
         }
     }
@@ -136,7 +137,7 @@ impl Sim {
             && let Ok(physics) = thedas_formats::phy::Phy::parse(&data)
         {
             let o = self.world.get_mut(id).unwrap();
-            let blocking = o.active
+            let blocking = o.parked.unwrap_or(o.active)
                 && matches!(controller.cell_by_hash(0x86a2_7132, row), Some(Cell::Int(v)) if *v != 0);
             o.placeable_group = Some(if blocking {
                 physics

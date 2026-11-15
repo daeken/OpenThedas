@@ -76,3 +76,5 @@ delivery. Save revision 10 repairs only Origins placeables lacking State but
 carrying InitialState, in stable object-ID order for overlapping footprints.
 Explicit saved State and existing pathing patches survive; revisiting a known
 area does not initialize again. DA2 retains its existing behavior.
+Migration uses an unloaded object's remembered active flag, so parking an area
+does not turn its initially closed doors into group-1 objects on return.
