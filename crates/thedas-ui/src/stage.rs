@@ -210,11 +210,21 @@ fn add_book_backdrop(m: &mut UiMovie) {
     );
     let black = format!("{ROOT}.black");
     m.call(&format!("{black}.beginFill"), &[n(0.0), n(100.0)]);
-    m.call(&format!("{black}.moveTo"), &[n(-4096.0), n(-4096.0)]);
-    for (x, y) in [(5120.0, -4096.0), (5120.0, 5120.0), (-4096.0, 5120.0)] {
+    // A square scaled up, not a polygon with far corners: the renderer left a triangle of the
+    // game showing at the screen's corner with those.
+    m.call(&format!("{black}.moveTo"), &[n(0.0), n(0.0)]);
+    for (x, y) in [(100.0, 0.0), (100.0, 100.0), (0.0, 100.0), (0.0, 0.0)] {
         m.call(&format!("{black}.lineTo"), &[n(x), n(y)]);
     }
     m.call(&format!("{black}.endFill"), &[]);
+    for (prop, v) in [
+        ("_x", -4096.0),
+        ("_y", -4096.0),
+        ("_width", 9216.0),
+        ("_height", 9216.0),
+    ] {
+        m.set(&format!("{black}.{prop}"), n(v));
+    }
     m.call(
         &format!("{ROOT}.createEmptyMovieClip"),
         &[s("page"), n(1.0)],
@@ -710,6 +720,27 @@ impl Stage {
     pub fn mouse_wheel(&mut self, x: f64, y: f64, lines: f64) {
         for m in self.input_movies() {
             m.mouse_wheel(x, y, lines);
+        }
+    }
+
+    /// The button was released while an item or ability was being dragged from one movie to
+    /// another (`GUI.Dragging`): the movie with a drop target under the mouse (the front
+    /// one) ends the drag, and takes the drop; with none under it, the front movie ends it,
+    /// and the drag is refused. The movies call the drag's callbacks themselves
+    /// (`GUI.InvokeCallback`). Provisional: the exe's handling is not traced; the movies'
+    /// own `StopExternalDrag` is what it is taken to call.
+    pub fn drop_external(&mut self) {
+        let mut target = None;
+        for (i, m) in self.movies.iter_mut().enumerate().rev() {
+            let probe = m.call(crate::avm1::DROP_PROBE, &[]);
+            if matches!(&probe, UiValue::String(t) if t != "undefined") {
+                target = Some(i);
+                break;
+            }
+        }
+        let i = target.unwrap_or(self.movies.len().saturating_sub(1));
+        if let Some(m) = self.movies.get_mut(i) {
+            m.call(crate::avm1::DROP_EXTERNAL, &[]);
         }
     }
 
