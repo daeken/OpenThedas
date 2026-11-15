@@ -215,6 +215,12 @@ fn main() -> Result<()> {
                     });
                     names.push("found".into());
                 }
+                ["noshadow", i] => {
+                    let i: usize = i.parse()?;
+                    if let Some(l) = points.get_mut(i) {
+                        l.cast_shadows = false;
+                    }
+                }
                 ["light", i, k, ..] => {
                     let (i, k): (usize, f32) = (i.parse()?, k.parse()?);
                     if let Some(l) = points.get_mut(i) {
@@ -930,6 +936,30 @@ fn fit(
                 "found {} {} {} {} {} {} {}\n",
                 f.position.x, f.position.y, f.position.z, f.radius, f.color.x, f.color.y, f.color.z
             ));
+        }
+    }
+    // Which lights the shadow pass took: a light whose texels (those no other light reaches)
+    // are mostly dark in the shipped alpha did not cast into it.
+    let mut solo: BTreeMap<usize, (usize, usize)> = BTreeMap::new();
+    for r in &rows {
+        if let [(i, _)] = r.terms.as_slice() {
+            let e = solo.entry(*i as usize).or_default();
+            if r.shipped[3] >= 8 {
+                e.0 += 1;
+            } else {
+                e.1 += 1;
+            }
+        }
+    }
+    for (i, (lit, dark)) in &solo {
+        let verdict = *dark > 10 * *lit;
+        println!(
+            "  shadow pass membership {:28} alone-lit texels: {lit} lit / {dark} dark in alpha{}",
+            names.get(*i).map(String::as_str).unwrap_or("?"),
+            if verdict { "  → left out" } else { "" }
+        );
+        if verdict {
+            out.push_str(&format!("noshadow {i}\n"));
         }
     }
     std::fs::create_dir_all(&args.out)?;
