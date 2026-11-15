@@ -159,6 +159,10 @@ pub struct Sim {
     /// Walkers held up by another creature's body: since when, and whether that was
     /// reported (see `Sim::advance_movers`). Not saved.
     pub(crate) blocked_since: HashMap<ObjectId, (u64, bool)>,
+    /// Perception's sight-line answers between two creatures, kept while neither moves
+    /// and the area's collision is the same (see `Sim::update_perception`). Not saved: a
+    /// pure function of positions and geometry, worked out again when missing.
+    pub(crate) sight_memo: crate::combat::SightMemo,
     /// The add-ins' area-list scripts, read once (see [`crate::prcscr`]).
     pub(crate) prcscr: Option<Arc<Vec<(String, String)>>>,
     /// The area list whose add-in scripts have run since it was loaded. Not saved: a load
@@ -674,6 +678,7 @@ impl Sim {
             placeable_collisions: HashMap::new(),
             door_collisions: HashMap::new(),
             blocked_since: HashMap::new(),
+            sight_memo: Default::default(),
             prcscr: None,
             prcscr_ran: None,
             fire_lengths: HashMap::new(),
@@ -1099,9 +1104,10 @@ impl Sim {
         self.world
             .location_vfx
             .retain(|v| v.duration_ms.is_none_or(|d| v.started_ms + d > end));
+        self.world.instant_vfx.retain(|v| v.started_ms + v.ms > end);
         self.world
-            .instant_vfx
-            .retain(|v| v.started_ms + crate::world::INSTANT_VFX_MS > end);
+            .instant_location_vfx
+            .retain(|v| v.started_ms + v.ms > end);
         self.leave_conversation_mode();
         self.advance_ambient(ms);
         self.update_perception();
@@ -2524,9 +2530,11 @@ impl Sim {
         }
     }
 
-    /// Queues trigger ENTER/EXIT events. Origins' sender (0x698850) gives them the
-    /// creature as creator and event target, integer 0 = 0, and the receiving trigger in
-    /// object slot 0. DA2 keeps its provisional payload; membership timing is separate.
+    /// Queues ENTER for triggers a creature is now in and EXIT for ones it left. Origins'
+    /// outline test is on XY (0x799130), with authored offsets translated without facing
+    /// rotation (0x7997cf). Origins' sender (0x698850) gives the events the creature as
+    /// creator and event target, integer 0 = 0, and the receiving trigger in object slot 0.
+    /// DA2 keeps its provisional payload; membership timing is separate.
     pub fn update_triggers(&mut self, id: ObjectId) {
         let Some(o) = self.world.get(id) else { return };
         if o.kind != ObjectKind::Creature {
@@ -2538,7 +2546,7 @@ impl Sim {
             .trigger_ids()
             .iter()
             .filter_map(|&t| self.world.get(t))
-            .filter(|t| t.active && t.area == area && crate::engine::in_trigger(pos, t))
+            .filter(|t| t.active && t.area == area && crate::engine::in_trigger(pos, t, self.game))
             .map(|t| t.id)
             .collect();
         let before = self.world.in_triggers.get(&id).cloned().unwrap_or_default();
@@ -6694,6 +6702,42 @@ mod tests {
                 assert_eq!(locals.ints.get("type"), Some(&ty));
             }
         }
+    }
+
+    #[test]
+    fn origins_trigger_membership_uses_authored_axes_and_ignores_height() {
+        let mut s = sim();
+        let area = s.world.spawn(ObjectKind::Area, "a");
+        let tr = s.world.spawn(ObjectKind::Trigger, "t");
+        let c = s.world.spawn(ObjectKind::Creature, "c");
+        let t = s.world.get_mut(tr).unwrap();
+        t.area = Some(area);
+        t.position = [10.0, 20.0, 30.0];
+        t.facing = 90.0;
+        t.geometry = vec![
+            [1.0, -0.5, 0.0],
+            [3.0, -0.5, 0.0],
+            [3.0, 0.5, 0.0],
+            [1.0, 0.5, 0.0],
+        ];
+        s.world.get_mut(c).unwrap().area = Some(area);
+        // Facing must not move this eastward outline north of the trigger.
+        s.move_object(c, [10.0, 22.0, 30.0], None);
+        assert!(s.world.queue.is_empty());
+        s.move_object(c, [12.0, 20.0, 130.0], None);
+        assert_eq!(s.world.in_triggers.get(&c), Some(&vec![tr]));
+        let ev = &s.world.queue.values().next().unwrap().event;
+        assert_eq!(ev.ty, s.event_type("ENTER"));
+        s.world.queue.clear();
+        s.move_object(c, [12.0, 20.0, -130.0], None);
+        assert!(s.world.queue.is_empty(), "height alone does not leave");
+        s.move_object(c, [10.0, 22.0, -130.0], None);
+        assert_eq!(s.world.queue.len(), 1);
+        assert_eq!(
+            s.world.queue.values().next().unwrap().event.ty,
+            s.event_type("EXIT")
+        );
+        assert!(!s.world.in_triggers.contains_key(&c));
     }
 
     #[test]

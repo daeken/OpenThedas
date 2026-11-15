@@ -817,10 +817,14 @@ fn applied_effect(
 fn apply_visual_or_effect(h: &mut ScriptHost, target: ObjectId, e: Effect) {
     let instant = constant(&h.sim.table, "EFFECT_DURATION_TYPE_INSTANT");
     if e.ty == 4 && e.duration_type == instant && h.object(target).is_some() {
+        let vfx = e.ints.first().copied().unwrap_or(0);
+        let timing = h.sim.instant_vfx_timing(vfx);
         let note = crate::world::InstantVfx {
             target,
-            vfx: e.ints.first().copied().unwrap_or(0),
+            vfx,
             started_ms: h.sim.world.time_ms,
+            ms: timing.ms,
+            lasting: timing.lasting,
         };
         h.sim.world.instant_vfx.push(note);
     }
@@ -1597,7 +1601,7 @@ pub fn call(
         "IsInTrigger" => {
             let (o, tr) = (h.object(obj(a, 0)), h.object(obj(a, 1)));
             ok(b(match (o, tr) {
-                (Some(o), Some(tr)) => o.area == tr.area && in_trigger(o.position, tr),
+                (Some(o), Some(tr)) => o.area == tr.area && in_trigger(o.position, tr, h.sim.game),
                 _ => false,
             }))
         }
@@ -3547,6 +3551,23 @@ pub fn call(
                             effect: e,
                         };
                         h.sim.world.location_vfx.push(entry);
+                    } else {
+                        // Played and gone: a note for presentation (see
+                        // `InstantLocationVfx`).
+                        h.sim.world.next_instant_vfx += 1;
+                        let vfx = e.ints.first().copied().unwrap_or(0);
+                        let timing = h.sim.instant_vfx_timing(vfx);
+                        let note = crate::world::InstantLocationVfx {
+                            handle: h.sim.world.next_instant_vfx,
+                            vfx,
+                            ms: timing.ms,
+                            lasting: timing.lasting,
+                            area: l.area,
+                            position: l.position,
+                            facing: l.facing,
+                            started_ms: h.sim.world.time_ms,
+                        };
+                        h.sim.world.instant_location_vfx.push(note);
                     }
                 }
             }
@@ -5827,14 +5848,17 @@ pub fn dist(a: [f32; 3], b: [f32; 3]) -> f32 {
     ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt()
 }
 
-/// Point-in-polygon on the XY plane (even-odd rule).
-/// Whether a point is inside a trigger. The outline is relative to the trigger's position
-/// and rotated by its facing (degrees about Z).
-pub fn in_trigger(p: [f32; 3], trigger: &crate::world::Object) -> bool {
+/// Whether a point is inside a trigger's XY outline. Origins' loader adds the trigger's
+/// position to its authored vertices without rotating them (0x7997cf..0x7997e8), and
+/// its membership test reads only XY (0x799130). DA2 retains the provisional rotation.
+pub fn in_trigger(p: [f32; 3], trigger: &crate::world::Object, game: thedas_vfs::Game) -> bool {
     if trigger.geometry.len() < 3 {
         return false;
     }
     let (dx, dy) = (p[0] - trigger.position[0], p[1] - trigger.position[1]);
+    if game == thedas_vfs::Game::Origins {
+        return inside([dx, dy, p[2]], &trigger.geometry);
+    }
     let (s, c) = (-trigger.facing.to_radians()).dsin_cos();
     let local = [dx * c - dy * s, dx * s + dy * c, p[2]];
     inside(local, &trigger.geometry)
@@ -7990,6 +8014,50 @@ mod tests {
             script: "test".into(),
         };
         call(&mut h, caller, &f, a).unwrap().unwrap()
+    }
+
+    #[test]
+    fn origins_trigger_query_keeps_authored_axes_while_da2_keeps_rotation() {
+        let table = EngineTable::parse(
+            b"int IsInTrigger(object creature, object trigger) = 39;\n\
+            int EVENT_TYPE_ENTER = 8;\nint EVENT_TYPE_EXIT = 9;\n",
+        )
+        .unwrap();
+        let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(table), 1);
+        let area = s.world.spawn(crate::world::ObjectKind::Area, "a");
+        let c = s.world.spawn(crate::world::ObjectKind::Creature, "c");
+        let tr = s.world.spawn(crate::world::ObjectKind::Trigger, "t");
+        s.world.get_mut(c).unwrap().area = Some(area);
+        let t = s.world.get_mut(tr).unwrap();
+        t.area = Some(area);
+        t.position = [10.0, 20.0, 30.0];
+        t.geometry = vec![
+            [1.0, -0.5, 0.0],
+            [3.0, -0.5, 0.0],
+            [3.0, 0.5, 0.0],
+            [1.0, 0.5, 0.0],
+        ];
+        let args = [Value::Object(c), Value::Object(tr)];
+        s.world.get_mut(c).unwrap().position = [12.0, 20.0, 130.0];
+        for facing in [0.0, 90.0, 180.0, 270.0] {
+            s.world.get_mut(tr).unwrap().facing = facing;
+            s.update_triggers(c);
+            assert_eq!(run(&mut s, c, "IsInTrigger", &args), Some(Value::Int(1)));
+        }
+        s.world.get_mut(tr).unwrap().facing = 90.0;
+        s.game = thedas_vfs::Game::DragonAge2;
+        s.update_triggers(c);
+        assert_eq!(run(&mut s, c, "IsInTrigger", &args), Some(Value::Int(0)));
+        s.world.get_mut(c).unwrap().position = [10.0, 22.0, 130.0];
+        s.update_triggers(c);
+        assert_eq!(run(&mut s, c, "IsInTrigger", &args), Some(Value::Int(1)));
+        s.game = thedas_vfs::Game::Origins;
+        s.update_triggers(c);
+        assert_eq!(run(&mut s, c, "IsInTrigger", &args), Some(Value::Int(0)));
+        s.world.get_mut(c).unwrap().position = [12.0, 20.0, 130.0];
+        s.world.get_mut(c).unwrap().area = None;
+        s.update_triggers(c);
+        assert_eq!(run(&mut s, c, "IsInTrigger", &args), Some(Value::Int(0)));
     }
 
     fn effect_accessors_sim() -> Sim {
@@ -12654,6 +12722,25 @@ mod coverage_tests {
             &[Value::Object(area), found[0].clone()],
         );
         assert!(s.world.location_vfx.is_empty());
+        // An instant one (a spell's impact) is played and kept nowhere the scripts see; a
+        // note of it stays for presentation, for a while.
+        let impact = vfx(&mut s, 88);
+        let ground = place(&mut s, 2.0);
+        run(
+            &mut s,
+            hero,
+            "Engine_ApplyEffectAtLocation",
+            &[Value::Int(1), impact, ground, Value::Float(0.0)],
+        );
+        assert!(s.world.location_vfx.is_empty());
+        let notes = &s.world.instant_location_vfx;
+        assert_eq!(notes.len(), 1);
+        assert_eq!(
+            (notes[0].vfx, notes[0].area, notes[0].position),
+            (88, area, [2.0, 0.0, 0.0])
+        );
+        s.tick(crate::vfx::UNREAD_MS + 1);
+        assert!(s.world.instant_location_vfx.is_empty());
     }
 
     #[test]

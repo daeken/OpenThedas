@@ -232,6 +232,7 @@ impl Faces {
                 additive: true,
                 tracks,
                 scalars: Vec::new(),
+                colors: Vec::new(),
             })),
             ..Default::default()
         })
