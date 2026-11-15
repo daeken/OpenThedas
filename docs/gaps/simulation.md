@@ -28,6 +28,7 @@ Each entry gives what the original does, what we do, evidence, a rough size (S <
 6. **CommandJumpToLocation, CommandFly, SetFacingPosition, IsMoving, GetRoamLocation** are not implemented (static call counts 137, 353, 4, 2, 2). CommandFly is mostly in flyby/cutscene scripts. Size S each.
 7. **SetPhysicsController** (52 calls) is not implemented. It turns a creature's controller on or off, which matters once blocking lands. Size S. Deps: A1.
 8. **Personal space and overlap at spawn**: creatures placed overlapping are not pushed apart (the exe's capsule grows in 0.1 steps "while there is room"). Size S.
+9. **Arrival placement** now follows 0x6c73c0: the controlled leader takes the waypoint, followers take compact formation slots (0x7605b0, flag 1), and each point passes through the 20 m safe-location search. The standable test still approximates physics with the pathing grid; formation mirroring and the random fallback past slot 10 remain unmodelled. Save loading keeps saved positions.
 
 ### B. Combat rules and timing
 
