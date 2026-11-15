@@ -398,12 +398,12 @@ mod tests {
         let mut g = sample();
         assert_eq!(
             line_performance_ids(&g),
-            vec![Some(100), Some(101), Some(102), Some(103)]
+            vec![Some(100), None, None, Some(103)]
         );
-        g.structs[4].values[0] = Value::U16(9);
+        g.structs[5].values[0] = Value::U16(9);
         assert_eq!(
             line_performance_ids(&g),
-            vec![Some(100), Some(101), Some(102), None]
+            vec![Some(100), None, None, None]
         );
 
         let performance = Gff4 {
