@@ -145,12 +145,7 @@ fn main() {
                 Some((4, 4, vec![128; 64]))
             }
         }
-        let instance =
-            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
-        let adapter =
-            pollster::block_on(instance.request_adapter(&Default::default())).expect("adapter");
-        let (device, queue) =
-            pollster::block_on(adapter.request_device(&Default::default())).expect("device");
+        let (device, queue) = thedas_gfx::gpu::test_device();
         let mut r =
             thedas_gfx::render::Renderer::new(&device, &queue, wgpu::TextureFormat::Rgba8Unorm);
         let size = (1280, 720);
@@ -171,10 +166,12 @@ fn main() {
             render += b.elapsed();
         }
         println!(
-            "per tick: script {:?}, render {:?} ({drawn}/{n} ticks drew, {} draws)",
+            "per tick: script {:?}, render {:?} ({drawn}/{n} ticks drew, {} meshes in {} draw calls, bindless {})",
             script / n,
             render / n,
-            r.draws
+            r.draws,
+            r.calls,
+            r.bindless()
         );
     }
     for l in log

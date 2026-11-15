@@ -89,11 +89,24 @@ impl GpuContext {
         if crate::profile::enabled() {
             wanted |= wgpu::Features::TIMESTAMP_QUERY;
         }
+        // Texture arrays let the interface (thedas-gfx) sample every image through one
+        // binding and merge its draws; without them it draws once per texture.
+        wanted |= wgpu::Features::TEXTURE_BINDING_ARRAY
+            | wgpu::Features::SAMPLED_TEXTURE_AND_STORAGE_BUFFER_ARRAY_NON_UNIFORM_INDEXING
+            | wgpu::Features::PARTIALLY_BOUND_BINDING_ARRAY;
+        let mut limits = wgpu::Limits::default();
+        let offered = adapter.limits();
+        limits.max_binding_array_elements_per_shader_stage = offered
+            .max_binding_array_elements_per_shader_stage
+            .min(1 << 16);
+        limits.max_binding_array_sampler_elements_per_shader_stage = offered
+            .max_binding_array_sampler_elements_per_shader_stage
+            .min(1 << 16);
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("thedas"),
                 required_features: adapter.features() & wanted,
-                required_limits: wgpu::Limits::default(),
+                required_limits: limits,
                 ..Default::default()
             })
             .await
