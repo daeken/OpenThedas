@@ -141,25 +141,37 @@ Terrain chunks: ChunkExportLightmapTextureSize (default 64, clamped to 512 excep
 
 ## 6. What the shipped bake did, by fitting [F]
 
-Measured on Castle Cousland's hall (`hrt201d`, atlas `hrt201d_room1400`, 126k texels sampled).
+Measured on Castle Cousland's hall (`hrt201d`, atlas `hrt201d_room1400`, every second texel).
+`--fit` gathers per texel the surface (as the bake finds it), each static light's
+falloff × |cos| × visibility, and occlusion ray hit distances, then fits.
 
-- **RGB lights.** Fitting the linear RGB (texel^1.5) of fully lit, unoccluded texels (alpha ≥
-  250) as ambient + Σ k·colour·max(0, 1 − d/R)·|cos|·visibility over the room's static lights
-  gives k = 0.94–1.09 for the four lamps beside it: the RGB pass had lights with the static
-  lights' positions, colours and radii, at brightness 1, with the linear falloff and gamma 1.5.
-  (The editor puts Static lights only in the shadow job, so these are Baked twins of the
-  static lamps.) The fireplace fits k ≈ 0.6. The room's fitted RGB ambient is about
-  (0.15, 0.12, 0.16), not the runtime ambient (0.225, 0.225, 0.2475).
-- **Alpha is not binary.** Dividing shipped alpha by the occlusion estimate, it rises with
-  S = Σ max(0, 1 − d/R)·|cos|·visibility over the static lights (no colour) roughly as
-  √min(1, 3S) and saturates near S = 0.35. `thedas-bake --shadow-intensity 3,0.5` models this.
-  [I] Consistent with a shadow job without `monochrome` whose blue channel (the (0.001, 0, 1)
-  colour × brightness) became alpha; the exact curve is still open.
-- **Occlusion** is far weaker than five 5-unit rays from all geometry. Leaving out meshes with
-  6177 = 0 helps; an effective ray length near 2 fits best so far. Open.
-- **Shadow shape.** The radius test explains 95% of the alpha's lit/unlit split; a ×0.85–0.9
-  radius explains 97.4%. The shipped shadows show penumbrae, consistent with the editor's
-  Light Size / Num Samples (soft shadows), which the 1.01 driver ignores.
+- **RGB lights.** The linear RGB (texel^1.5) of unoccluded texels fits
+  ambient + Σ k·colour·max(0, 1 − d/R)·|cos|·visibility over the room's static lights with
+  k = 0.85–1.08 for the four lamps beside it: the RGB pass had lights at the static lights'
+  positions, colours and radii, brightness 1, linear falloff, gamma 1.5. (The editor puts
+  Static lights only in the shadow job, so these are Baked twins of the static lamps.) The
+  fireplace fits k ≈ 0.6. The room's baked ambient fits ≈ (0.149, 0.146, 0.199), not the
+  runtime ambient (0.225, 0.225, 0.2475). What is left is mostly a blue fill: Baked-only
+  lights the game files no longer contain.
+- **Alpha is not binary.** Over the static lights, with S = Σ max(0, 1 − d/R)·|cos|·
+  visibility (no colour), shipped alpha ÷ occlusion ≈ √min(1, 3S): 0.47 at S = 0.075, 0.73
+  at 0.175, 0.96 at 0.325, saturated beyond 0.35 (`--shadow-intensity 3,0.5`). Other falloff
+  shapes (quadratic, cos², smoothstep) fit no better. [I] A shadow job without `monochrome`
+  whose blue channel (colour (0.001, 0, 1) × brightness) became alpha would behave like this;
+  the curve itself is fitted, not traced.
+- **Occlusion** is distance-weighted and clamped like the editor's AO settings (MinColour
+  −1.5, Exponent 2, MaxRayLength 5, which the 1.01 driver ignores): the best fit so far is
+  64 cosine rays out to 1.5, a hit at t occluding (1 − t/1.5)², pass value
+  clamp(−1 + 2v, 0, 1) for unoccluded share v, stored as is (`--ao-model 1.5,2,-1,1`). So
+  crevices go to exactly 0 in RGB and alpha alike. Meshes with MMH 6177 = 0 (carpets) do not
+  occlude.
+- **Coverage.** Shipped parts are covered one texel beyond what the toolset's film reaches
+  on every side (`--dilate 1`: an uncovered texel next to covered ones takes their mean).
+- **Shadows are hard.** Sampling point lights as spheres (`--light-size`) makes the fit worse
+  at every size tried (0.25–1).
+- With all of the above and the fitted lights, room1400's 876k texels differ by a mean of
+  7.4–9.5 levels in RGB and 6.9 in alpha (RMSE 14–17 and 26.5); 47% are within 4 levels on
+  every channel. First light was ~14 and ~13.
 
 ## 7. `thedas-bake`
 
@@ -168,5 +180,6 @@ lightmapped part and writes per atlas a PNG (ours | shipped | |difference| × 4,
 alpha) and `report.txt` with per-channel MAE/RMSE/bias. `--fit` instead fits light
 brightnesses and room ambients and reports how the shadow and occlusion passes explain
 alpha; `--probe X,Y` explains one atlas texel (surface, each light's term, what blocks the
-occlusion rays). `--ao-converged N`, `--ao-length L` and `--shadow-intensity K,E` switch to the
-fitted variants.
+occlusion rays). The fitted variants: `--ao-model L,E,LO,P`, `--shadow-intensity K,E`,
+`--dilate N`, `--use-fit fit.txt` (a `--fit` run's light brightnesses and room ambients),
+`--light-size R,N`; `--ao-converged N` and `--ao-length L` vary the toolset's own occlusion.
