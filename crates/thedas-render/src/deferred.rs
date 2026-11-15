@@ -264,6 +264,9 @@ pub(crate) struct DeferredPass {
     /// Experimental: a fitted light set's baked-only fill lights (lightmaps-off mode only;
     /// see `crate::lightset`), lit with the bake's linear falloff and no specular.
     fill_lights: Vec<SceneLight>,
+    /// A light set's baked shadow reach per level light (by position in centimetres): the
+    /// share of its radius it lights where runtime visibility replaces the lightmap's mask.
+    reach: HashMap<[i32; 3], f32>,
     /// The GPU refused the pass: the level stays faithful.
     refused: bool,
     /// Experimental probe + runtime visibility mode. Fixed when this renderer is built.
@@ -468,11 +471,15 @@ impl DeferredPass {
     ) -> Option<DeferredPass> {
         let started = std::time::Instant::now();
         // Experimental: a fitted light set for the lightmaps-off mode (see `crate::lightset`).
-        let light_set = if crate::config::CONFIG.baked_lighting {
+        // The hybrid mode takes only the set's shadow reaches.
+        let light_set = if crate::config::CONFIG.baked_lighting
+            && !crate::config::CONFIG.realtime_direct
+        {
             None
         } else {
             crate::lightset::LightSet::for_level(&scene.level)
         };
+        let lightmaps_off = !crate::config::CONFIG.baked_lighting;
         let punch_enabled = crate::config::CONFIG.punch;
         let punch: HashMap<usize, _> = if punch_enabled {
             d3d.draws
@@ -1046,7 +1053,13 @@ impl DeferredPass {
             gpu: None,
             effect_lights: Vec::new(),
             own_lights: Vec::new(),
+            reach: light_set
+                .iter()
+                .flat_map(|set| set.lights.iter())
+                .map(|l| (centimetres(l.position), l.reach()))
+                .collect(),
             fill_lights: light_set
+                .filter(|_| lightmaps_off)
                 .map(|set| {
                     // A fill belongs to the room of the pieces its atlas lights, so it reaches
                     // what that room's lights reach (it casts no shadow of its own).
@@ -1060,20 +1073,48 @@ impl DeferredPass {
                                 .then_some(d.room_id)?
                         })
                     };
-                    set.fills
-                        .iter()
-                        .map(|f| SceneLight::Point {
-                            position: f.position,
-                            color: f.color,
-                            radius: f.radius,
-                            name: "baked fill".into(),
-                            domain: None,
-                            is_static: true,
-                            version: 0,
-                            intensity: 1.0,
-                            room: f.atlas.as_deref().and_then(atlas_room),
+                    let fills = set.fills.iter().map(|f| SceneLight::Point {
+                        position: f.position,
+                        color: f.color,
+                        radius: f.radius,
+                        name: "baked fill".into(),
+                        domain: None,
+                        is_static: true,
+                        version: 0,
+                        intensity: 1.0,
+                        room: f.atlas.as_deref().and_then(atlas_room),
+                    });
+                    // The level's static lights had baked twins in the RGB pass (same place,
+                    // colour and radius, the fitted brightness, linear falloff): they join as
+                    // fills of their own. Fits of a light few texels saw can run wild, so the
+                    // brightness is held to [0, 2].
+                    let twins = set.lights.iter().filter_map(|l| {
+                        let k = l.baked_brightness?.clamp(0.0, 2.0);
+                        scene.lights.iter().find_map(|s| match s {
+                            SceneLight::Point {
+                                position,
+                                color,
+                                radius,
+                                intensity,
+                                room,
+                                ..
+                            } if position.distance(l.position) < 0.05 && k > 0.01 => {
+                                Some(SceneLight::Point {
+                                    position: *position,
+                                    color: *color * *intensity * k,
+                                    radius: *radius,
+                                    name: "baked fill twin".into(),
+                                    domain: None,
+                                    is_static: true,
+                                    version: 0,
+                                    intensity: 1.0,
+                                    room: *room,
+                                })
+                            }
+                            _ => None,
                         })
-                        .collect()
+                    });
+                    fills.chain(twins).collect()
                 })
                 .unwrap_or_default(),
             refused: false,
@@ -2855,13 +2896,22 @@ impl DeferredPass {
                 colour: colour.extend(if *is_static { 1.0 } else { 0.0 }).to_array(),
                 shadow: [
                     -1.0,
+                    // The domain code; its fraction (below 0.5, so every domain test still
+                    // reads it) is how far short of its radius the light's baked shadow
+                    // stopped (`DeferredPass::reach`, decoded in the lighting pass).
                     if name.starts_with("emitter ") {
                         3.0
                     } else if character {
                         2.0
                     } else {
                         1.0
-                    },
+                    } + 0.4
+                        * (1.0
+                            - self
+                                .reach
+                                .get(&centimetres(*position))
+                                .copied()
+                                .unwrap_or(1.0)),
                     0.0,
                     0.0,
                 ],
@@ -3160,6 +3210,11 @@ pub fn emitter_light(e: &crate::particles::EmitterState) -> Option<SceneLight> {
         intensity: 1.0,
         room: None,
     })
+}
+
+/// A position rounded to whole centimetres, to match a light set's lights to the scene's.
+fn centimetres(p: Vec3) -> [i32; 3] {
+    (p * 100.0).round().as_ivec3().to_array()
 }
 
 /// The six planes (`n·p + w ≥ 0` inside) of a view-projection with depth 0..1.

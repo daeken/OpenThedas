@@ -1299,6 +1299,14 @@ fn light_surface(frag: vec4<f32>, p: vec3<f32>, ga: vec4<f32>, spec: vec4<f32>,
         if (fill && object) {
             continue;
         }
+        // A light set's baked shadow reach (the fraction of the domain code, see
+        // `DeferredPass::reach`): where runtime visibility replaces the lightmap's mask, a
+        // level light lights only as far as its baked shadow did.
+        let baked_reach = 1.0 - fract(light_shadow.y) * 2.5;
+        if (baked_reach < 0.999 && !point_uses_baked_mask(light_colour.w > 0.5, material)
+            && d >= position.w * baked_reach) {
+            continue;
+        }
         let c = cos(d / position.w * PI * 0.5);
         let att = select(c * c, max(1.0 - d / position.w, 0.0), fill);
         var shade = 1.0;
