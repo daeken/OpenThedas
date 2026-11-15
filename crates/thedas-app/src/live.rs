@@ -287,6 +287,8 @@ pub struct Live {
     pub detail: thedas_render::scene::Detail,
     /// The conversation camera's resources and current shot.
     talk_camera: crate::talkcam::TalkCamera,
+    /// The creature the conversation camera hides (see [`crate::talkcam::TalkCamera::hidden`]).
+    talk_hidden: Option<ObjectId>,
     /// The playing cutscene's camera tracks.
     cutscene_camera: crate::cutcam::CutsceneCamera,
     /// The creatures cutscenes and conversation lines pose (see [`crate::cutactors`]).
@@ -771,6 +773,7 @@ impl Live {
             render_path: Default::default(),
             detail: Default::default(),
             talk_camera: Default::default(),
+            talk_hidden: None,
             cutscene_camera: Default::default(),
             cut_actors: Default::default(),
             cut_light_model: None,
@@ -1293,7 +1296,8 @@ impl Live {
     /// Rebuilds [`Live::opacity`] from every fade that sets one, multiplied together (a
     /// missing entry is opaque). Each source keeps its own values; add another fade (a
     /// corpse's decay) here rather than writing `opacity` directly. Sources: the game
-    /// camera's fade ([`crate::camfade`]).
+    /// camera's fade ([`crate::camfade`]), corpses' decay and the conversation listener the
+    /// default framing hides ([`crate::talkcam::TalkCamera::hidden`]).
     fn combine_opacity(&mut self) {
         self.opacity.clear();
         for (id, alpha) in self.camera_fade.faded() {
@@ -1303,6 +1307,10 @@ impl Live {
         let corpses = self.sim().corpse_fades();
         for (id, alpha) in corpses {
             *self.opacity.entry(id).or_insert(1.0) *= alpha;
+        }
+        // The listener a conversation's default framing hides.
+        if let Some(id) = self.talk_hidden {
+            self.opacity.insert(id, 0.0);
         }
         self.opacity.retain(|_, a| *a < 1.0);
     }
@@ -1436,6 +1444,14 @@ impl Live {
         &mut self,
         base: &thedas_render::Camera,
     ) -> Option<thedas_render::Camera> {
+        let view = self.conversation_view(base);
+        // The default framing hides its listener (see `TalkCamera::hidden`).
+        self.combine_opacity();
+        view
+    }
+
+    fn conversation_view(&mut self, base: &thedas_render::Camera) -> Option<thedas_render::Camera> {
+        self.talk_hidden = None;
         let sim = self.sim.lock().unwrap_or_else(|p| p.into_inner());
         // A cutscene that played over this line (the opening `start_wake.cut` over City
         // Elf's first line) leaves its last view for the rest of the line: the original
@@ -1466,8 +1482,11 @@ impl Live {
         let faces = self.objects.as_ref().map(|o| &o.faces);
         let face = |id| faces.and_then(|f| f.get(&id).copied());
         let posed = &self.posed;
-        self.talk_camera
-            .camera(&sim, base, &face, &|id| drawn_root(posed, id))
+        let view = self
+            .talk_camera
+            .camera(&sim, base, &face, &|id| drawn_root(posed, id));
+        self.talk_hidden = self.talk_camera.hidden();
+        view
     }
 
     /// The playing cutscene's camera (see [`crate::cutcam`]); `base` gives the clip planes.
