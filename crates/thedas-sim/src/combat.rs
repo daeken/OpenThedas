@@ -195,8 +195,11 @@ pub struct SightMemo {
     /// The area and the geometry the lines were worked out against. The geometry is held,
     /// not just named, so a newer copy at a reused address can never pass for it.
     made_for: Option<SightGeometry>,
-    lines: std::collections::HashMap<(ObjectId, ObjectId), ([u32; 3], [u32; 3], bool)>,
+    lines: std::collections::HashMap<(ObjectId, ObjectId), SightLine>,
 }
+
+/// Where the two ends stood (as bits) and whether the line between them was blocked.
+type SightLine = ([u32; 3], [u32; 3], bool);
 
 type SightGeometry = (
     ObjectId,
