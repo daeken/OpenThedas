@@ -618,6 +618,10 @@ pub struct AreaRenderer {
     updated: bool,
     /// The scene's particle emitters, as [`AreaScene::emitters`] orders them.
     pub emitters: Vec<crate::particles::EmitterState>,
+    /// Each emitter's texture tint (its alpha-weighted mean colour, brightest channel 1),
+    /// which its light takes on top of its particles' colour (see
+    /// [`crate::deferred::emitter_light`]).
+    emitter_tints: Vec<glam::Vec3>,
     /// The clock when the props were first posed, which their effects' timelines run from
     /// ([`crate::scene::EffectTimeline`]).
     pub effects_epoch: Option<f64>,
@@ -1179,6 +1183,21 @@ impl AreaRenderer {
             light: StandInLight::default(),
             stats,
             cut_away: scene.cut_away.clone(),
+            emitter_tints: {
+                let mut tints: HashMap<usize, glam::Vec3> = HashMap::new();
+                scene
+                    .emitters
+                    .iter()
+                    .map(|e| {
+                        *tints.entry(e.material).or_insert_with(|| {
+                            scene
+                                .materials
+                                .get(e.material)
+                                .map_or(glam::Vec3::ONE, |m| crate::deferred::texture_tint(vfs, m))
+                        })
+                    })
+                    .collect()
+            },
             cut_away_emitters: scene
                 .emitters
                 .iter()
@@ -1232,8 +1251,10 @@ impl AreaRenderer {
         self.d3d
             .glowing_emitters()
             .into_iter()
-            .filter_map(|i| self.emitters.get(i))
-            .filter_map(crate::deferred::emitter_light)
+            .filter_map(|i| {
+                let tint = self.emitter_tints.get(i).copied().unwrap_or(glam::Vec3::ONE);
+                crate::deferred::emitter_light(self.emitters.get(i)?, tint)
+            })
             .collect()
     }
 

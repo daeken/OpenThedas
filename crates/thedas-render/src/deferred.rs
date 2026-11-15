@@ -3142,7 +3142,7 @@ const EMITTER_REACH_PER: f32 = 4.0;
 
 /// The light an emitter's living particles give, as a point light at their glow-weighted
 /// centre (ours: the original's particles light nothing). `None` when they show none.
-pub fn emitter_light(e: &crate::particles::EmitterState) -> Option<SceneLight> {
+pub fn emitter_light(e: &crate::particles::EmitterState, tint: Vec3) -> Option<SceneLight> {
     if e.opacity <= 0.0 || e.particles.is_empty() || light_shaft(&e.blueprint.material) {
         return None;
     }
@@ -3172,6 +3172,7 @@ pub fn emitter_light(e: &crate::particles::EmitterState) -> Option<SceneLight> {
         .map(|(p, w)| p.distance(centre) * w)
         .sum::<f32>()
         / weight;
+    let total = total * tint;
     let shown = total.x + total.y + total.z;
     let strength = EMITTER_PEAK * (1.0 - (-shown / EMITTER_SHOWN).exp()) * e.opacity.min(1.0);
     let color = total / total.max_element() * strength;
@@ -3192,6 +3193,33 @@ pub fn emitter_light(e: &crate::particles::EmitterState) -> Option<SceneLight> {
 /// A position rounded to whole centimetres, to match a light set's lights to the scene's.
 fn centimetres(p: Vec3) -> [i32; 3] {
     (p * 100.0).round().as_ivec3().to_array()
+}
+
+/// The tint a particle texture gives the light its emitter makes: the texture's mean colour
+/// weighted by alpha, over a small mip, scaled so its brightest channel is 1 (white when it
+/// can't be read). Lightning's blue, for one, is in its texture, not its particles' colour.
+pub fn texture_tint(vfs: &thedas_vfs::Vfs, m: &crate::scene::SceneMaterial) -> Vec3 {
+    let tint = m.object.textures.iter().find_map(|t| {
+        let name = t.resource().to_ascii_lowercase();
+        let (data, _) = vfs.read(&name).ok()?;
+        let dds = thedas_formats::dds::Dds::parse(&data).ok()?;
+        // The first mip at most 16 texels a side (or the smallest there is).
+        let mip = (0..dds.mip_count)
+            .find(|&k| {
+                let (w, h, _) = dds.mip_size(k);
+                w.max(h) <= 16
+            })
+            .unwrap_or(dds.mip_count.saturating_sub(1));
+        let rgba = dds.decode_rgba8(0, mip).ok()?;
+        let (mut sum, mut weight) = (Vec3::ZERO, 0.0);
+        for px in rgba.chunks_exact(4) {
+            let a = px[3] as f32 / 255.0;
+            sum += Vec3::new(px[0] as f32, px[1] as f32, px[2] as f32) / 255.0 * a;
+            weight += a;
+        }
+        (weight > 0.0 && sum.max_element() > 0.0).then(|| sum / sum.max_element())
+    });
+    tint.unwrap_or(Vec3::ONE)
 }
 
 /// Whether an additive emitter's material draws a light shaft, sunbeam or lit dust (the
@@ -3389,7 +3417,7 @@ mod tests {
             Mat4::from_translation(at),
             1,
         );
-        assert_eq!(emitter_light(&e), None, "no particles, no light");
+        assert_eq!(emitter_light(&e, Vec3::ONE), None, "no particles, no light");
         e.advance(0.5);
         let Some(SceneLight::Point {
             position,
@@ -3398,7 +3426,7 @@ mod tests {
             is_static,
             room,
             ..
-        }) = emitter_light(&e)
+        }) = emitter_light(&e, Vec3::ONE)
         else {
             panic!("a burning emitter gives a point light");
         };
@@ -3410,7 +3438,7 @@ mod tests {
         assert!(!is_static && room.is_none());
         // Hidden (a cut-away model's), it gives none.
         e.opacity = 0.0;
-        assert_eq!(emitter_light(&e), None);
+        assert_eq!(emitter_light(&e, Vec3::ONE), None);
     }
 
     #[test]
