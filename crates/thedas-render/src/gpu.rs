@@ -89,11 +89,24 @@ impl GpuContext {
         if crate::profile::enabled() {
             wanted |= wgpu::Features::TIMESTAMP_QUERY;
         }
+        // Texture arrays let the interface (thedas-gfx) sample every image through one
+        // binding and merge its draws; without them it draws once per texture.
+        wanted |= wgpu::Features::TEXTURE_BINDING_ARRAY
+            | wgpu::Features::SAMPLED_TEXTURE_AND_STORAGE_BUFFER_ARRAY_NON_UNIFORM_INDEXING
+            | wgpu::Features::PARTIALLY_BOUND_BINDING_ARRAY;
+        let mut limits = wgpu::Limits::default();
+        let offered = adapter.limits();
+        limits.max_binding_array_elements_per_shader_stage = offered
+            .max_binding_array_elements_per_shader_stage
+            .min(1 << 16);
+        limits.max_binding_array_sampler_elements_per_shader_stage = offered
+            .max_binding_array_sampler_elements_per_shader_stage
+            .min(1 << 16);
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("thedas"),
                 required_features: adapter.features() & wanted,
-                required_limits: wgpu::Limits::default(),
+                required_limits: limits,
                 ..Default::default()
             })
             .await
@@ -1760,6 +1773,13 @@ impl AreaRenderer {
         self.d3d
             .update(ctx, camera, width, height, self.time as f32);
         self.updated = true;
+    }
+
+    /// This frame's sun texture matrices/partition plane and map size, for capture
+    /// diagnostics. Reading these does not advance the fit or its smoothing history.
+    pub fn sun_shadow_data(&self) -> Option<([[f32; 4]; 9], u32)> {
+        let (data, _) = self.d3d.sun_shadows()?;
+        Some((data, self.d3d.shadows.as_ref()?.size()))
     }
 
     /// Records this renderer's shadow casters into the partitions: `clear` for the first
