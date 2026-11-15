@@ -690,15 +690,16 @@ fn equipment_tints(
     out
 }
 
-/// The creature's weapons: drawn into its hands while it is in combat, else sheathed (see
+/// The creature's weapons: drawn into its hands while it is in combat, or as an
+/// explicit Origins draw/sheath command left them (see
 /// [`weapon_node`]). In the hands they sit in the grip only once the combat stance closes
 /// the hands around them (the combat animation trees animate the fingers; nothing else
 /// poses them). Provisional: the original draws and sheathes them with animations
 /// (`COMMAND_UNSHEATHEWEAPONS`, `COMMAND_SHEATHEWEAPONS`) whose timing is not traced; here
-/// they are drawn for as long as the creature's combat state (`GetCombatState`) is set.
+/// explicit commands change the attachments at completion.
 fn weapons(sim: &Sim, o: &Object, gear: Gear) -> Vec<Attached> {
-    let drawn = o.combat.in_combat;
-    weapons_held(sim, o, gear, drawn, drawn)
+    let (main, off) = sim.weapon_drawn_hands(o);
+    weapons_held(sim, o, gear, main, off)
 }
 
 /// [`weapons`] with each hand's weapon drawn or sheathed as given.
@@ -724,7 +725,13 @@ fn weapons_held(sim: &Sim, o: &Object, gear: Gear, main: bool, off: bool) -> Vec
 /// sheathed as `main` says, the off hand's as `off` says, or as the creature's combat state
 /// has it when the cutscene has not touched it.
 pub fn weapons_in_cutscene(sim: &Sim, o: &Object, main: bool, off: Option<bool>) -> Vec<Attached> {
-    weapons_held(sim, o, Gear::World, main, off.unwrap_or(o.combat.in_combat))
+    weapons_held(
+        sim,
+        o,
+        Gear::World,
+        main,
+        off.unwrap_or(sim.weapon_drawn_hands(o).1),
+    )
 }
 
 /// The node an item hangs from: `BITM_base.gda`'s part for its slot (main or off hand) and
@@ -1131,6 +1138,7 @@ struct DrawnKey {
     in_chargen: bool,
     /// Weapons are drawn in combat and sheathed out of it (their attachment nodes).
     in_combat: bool,
+    weapon_hands: (bool, bool),
     equipment: Vec<(i32, ObjectId, Option<i32>, Option<i32>)>,
     /// A body bag's corpse, once handed off (see [`corpse_model`]).
     corpse: Option<i32>,
@@ -1148,6 +1156,7 @@ impl DrawnKey {
             && self.gender == o.fields.get("Gender").copied()
             && self.in_chargen == (sim.world.chargen == Some(o.id))
             && self.in_combat == o.combat.in_combat
+            && self.weapon_hands == sim.weapon_drawn_hands(o)
             && self.equipment.len() == o.equipment.len()
             && self
                 .equipment
@@ -1180,6 +1189,7 @@ impl DrawnKey {
             head_morph: sim.face_name(o.id).or_else(|| o.head_morph.clone()),
             in_chargen: sim.world.chargen == Some(o.id),
             in_combat: o.combat.in_combat,
+            weapon_hands: sim.weapon_drawn_hands(o),
             equipment: o
                 .equipment
                 .iter()
@@ -1390,6 +1400,29 @@ pub fn area_models_cached(sim: &Sim, area: ObjectId, cache: &mut ModelCache) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ring_weapon_queries_script_draw_invalidates_attachment_cache() {
+        use std::sync::Arc;
+        use thedas_script::EngineTable;
+        use thedas_vfs::Vfs;
+        let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(EngineTable::default()), 1);
+        let id = s.world.spawn(ObjectKind::Creature, "guard");
+        let key = DrawnKey::of(&s, s.world.get(id).unwrap());
+        s.world
+            .get_mut(id)
+            .unwrap()
+            .fields
+            .insert("WeaponMainDrawn".into(), 1);
+        assert!(!key.matches(&s, s.world.get(id).unwrap()));
+        let key = DrawnKey::of(&s, s.world.get(id).unwrap());
+        assert!(key.matches(&s, s.world.get(id).unwrap()));
+        s.game = thedas_vfs::Game::DragonAge2;
+        assert_eq!(
+            s.weapon_drawn_hands(s.world.get(id).unwrap()),
+            (false, false)
+        );
+    }
 
     #[test]
     fn a_drawn_key_matches_what_it_was_made_from_until_that_changes() {

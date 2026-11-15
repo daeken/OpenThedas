@@ -339,6 +339,10 @@ impl Sim {
     /// combat. Repeating the current state does not run the transition again.
     pub(crate) fn set_combat_state(&mut self, id: ObjectId, on: bool) {
         if let Some(o) = self.world.get_mut(id) {
+            if self.game == thedas_vfs::Game::Origins && o.combat.in_combat != on {
+                o.fields.remove("WeaponMainDrawn");
+                o.fields.remove("WeaponOffDrawn");
+            }
             if self.game == thedas_vfs::Game::DragonAge2 && o.combat.in_combat && !on {
                 o.combat.target = None;
             }

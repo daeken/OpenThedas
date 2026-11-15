@@ -4133,6 +4133,13 @@ impl Sim {
             // and reports itself done at once.
             let set = cmd.ints.first().copied().unwrap_or(-1);
             self.switch_weapon_set(id, set);
+        } else if self.game == thedas_vfs::Game::Origins
+            && matches!(
+                cmd.name.as_str(),
+                "CommandSheatheWeapons" | "CommandUnsheatheWeapons"
+            )
+        {
+            self.set_weapons_drawn(id, cmd.name == "CommandUnsheatheWeapons");
         } else if cmd.name == "CommandUseObject" {
             // Using a placeable (a door, a lever) sends it EVENT_TYPE_USE, as clicking it does.
             if let Some(t) = cmd.target.filter(|&t| self.world.get(t).is_some()) {
@@ -5818,6 +5825,24 @@ mod tests {
                     "{game:?}, Useable={useable:?}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn ring_weapon_queries_commands_retain_draw_state_after_completion() {
+        let mut s = sim();
+        let c = s.world.spawn(ObjectKind::Creature, "guard");
+        for (name, expected) in [
+            ("CommandUnsheatheWeapons", true),
+            ("CommandSheatheWeapons", false),
+        ] {
+            s.world.get_mut(c).unwrap().commands.push(Command {
+                name: name.into(),
+                ..Default::default()
+            });
+            s.finish_command(c);
+            assert_eq!(s.weapons_unsheathed(c), expected);
+            assert!(s.world.get(c).unwrap().commands.is_empty());
         }
     }
 
