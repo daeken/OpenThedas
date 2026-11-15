@@ -1284,24 +1284,36 @@ pub fn visual_effects(sim: &Sim, o: &Object) -> Vec<EffectModel> {
 /// Where the ids of [`location_vfx_models`] start: above any object id the world hands out.
 pub const LOCATION_VFX_IDS: ObjectId = 0xf000_0000;
 
+/// Where the ids of the instant ones among [`location_vfx_models`] start.
+pub const INSTANT_LOCATION_VFX_IDS: ObjectId = 0xf800_0000;
+
 /// The visual effects scripts applied at places in `area` (`World::location_vfx`, such as
-/// the Proving's crowd), each drawn as its `VFX_base.gda` row's model (`ModelName`:
+/// the Proving's crowd, and the instant ones just played there, `World::instant_location_vfx`:
+/// a spell's impact), each drawn as its `VFX_base.gda` row's model (`ModelName`:
 /// `fxe_sprite_arena_p` for 10011) where the effect was applied. They are not objects:
-/// their ids are [`LOCATION_VFX_IDS`] plus the effect's handle, and their kind is `Area`.
-/// Provisional: the row's other columns (its type, attachment, scale) are not mirrored.
+/// their ids are [`LOCATION_VFX_IDS`] (or [`INSTANT_LOCATION_VFX_IDS`]) plus the effect's
+/// handle, and their kind is `Area`. Provisional: the row's other columns (its type,
+/// attachment, scale) are not mirrored.
 pub fn location_vfx_models(sim: &Sim, area: ObjectId) -> Vec<ObjectModel> {
     let Some(t) = sim.world.tables().get(0, "vfx_base") else {
         return Vec::new();
     };
-    sim.world
-        .location_vfx
-        .iter()
-        .filter(|v| v.area == area)
-        .filter_map(|v| {
-            let model = text(t.cell("ModelName", v.vfx as i64))?.to_ascii_lowercase();
+    let lasting = sim.world.location_vfx.iter().map(|v| {
+        let id = LOCATION_VFX_IDS.wrapping_add(v.handle as ObjectId);
+        (id, v.vfx, v.area, v.position, v.facing)
+    });
+    let instant = sim.world.instant_location_vfx.iter().map(|v| {
+        let id = INSTANT_LOCATION_VFX_IDS.wrapping_add(v.handle as ObjectId);
+        (id, v.vfx, v.area, v.position, v.facing)
+    });
+    lasting
+        .chain(instant)
+        .filter(|v| v.2 == area)
+        .filter_map(|(id, vfx, _, position, facing)| {
+            let model = text(t.cell("ModelName", vfx as i64))?.to_ascii_lowercase();
             Some(ObjectModel {
-                id: LOCATION_VFX_IDS.wrapping_add(v.handle as ObjectId),
-                tag: format!("vfx_{}", v.vfx),
+                id,
+                tag: format!("vfx_{vfx}"),
                 kind: ObjectKind::Area,
                 models: vec![model],
                 attached: Vec::new(),
@@ -1310,8 +1322,8 @@ pub fn location_vfx_models(sim: &Sim, area: ObjectId) -> Vec<ObjectModel> {
                 hide_hair: false,
                 effects: Vec::new(),
                 motion: None,
-                position: v.position,
-                facing: v.facing,
+                position,
+                facing,
             })
         })
         .collect()
@@ -1402,6 +1414,42 @@ mod tests {
             *s.world.get_mut(id).unwrap() = was;
             assert!(key.matches(&s, s.world.get(id).unwrap()));
         }
+    }
+
+    #[test]
+    fn effects_played_at_places_are_drawn_while_kept() {
+        use std::sync::Arc;
+        use thedas_script::EngineTable;
+        use thedas_vfs::Vfs;
+        let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(EngineTable::default()), 1);
+        let area = s.world.spawn(ObjectKind::Area, "a");
+        s.world.tables().insert(
+            "vfx_base",
+            &["ModelName"],
+            vec![
+                (77, vec![Cell::String("FXC_Crowd".into())]),
+                (88, vec![Cell::String("fxm_impact".into())]),
+            ],
+        );
+        s.world
+            .instant_location_vfx
+            .push(thedas_sim::world::InstantLocationVfx {
+                handle: 3,
+                vfx: 88,
+                area,
+                position: [1.0, 2.0, 3.0],
+                facing: 45.0,
+                started_ms: 0,
+            });
+        let drawn = location_vfx_models(&s, area);
+        assert_eq!(drawn.len(), 1);
+        assert_eq!(drawn[0].id, INSTANT_LOCATION_VFX_IDS + 3);
+        assert_eq!(drawn[0].models, ["fxm_impact"]);
+        assert_eq!(
+            (drawn[0].position, drawn[0].facing),
+            ([1.0, 2.0, 3.0], 45.0)
+        );
+        assert!(location_vfx_models(&s, area + 1).is_empty());
     }
 
     #[test]
