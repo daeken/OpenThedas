@@ -866,8 +866,11 @@ fn sun_covered(p: vec3<f32>) -> bool {
 
 // The grey every bounce surface reflects with (its albedo is not in the cube maps).
 const BOUNCE_ALBEDO: f32 = 0.4;
-// Samples per cube face per light, in a 2 x 2 stratified grid jittered per pixel.
-const BOUNCE_SAMPLES: u32 = 4u;
+// Samples per cube face per light, jittered per pixel. Neighbouring bounce pixels take
+// alternate faces (three each), which the upsample's 2 x 2 average puts back together.
+const BOUNCE_SAMPLES: u32 = 2u;
+// The bounce target is this many times smaller than the frame on each side.
+const BOUNCE_SCALE: i32 = 4;
 
 // A cube face's forward, right and up, as `deferred_shadow::faces` looks along them
 // (`Mat4::look_to_rh(eye, forward, up)`: right = forward x up, up' = right x forward).
@@ -902,7 +905,10 @@ fn bounce_point(face: i32, origin: vec2<i32>, t: vec2<i32>, lp: vec3<f32>) -> ve
 @fragment
 fn fs_bounce(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     let flags = sun.enabled.w;
-    let px = vec2<i32>(frag.xy) * 2;
+    let cell_px = vec2<i32>(frag.xy);
+    let px = min(cell_px * BOUNCE_SCALE + vec2<i32>(BOUNCE_SCALE / 2),
+        vec2<i32>(lighting.size.xy) - vec2<i32>(1));
+    let parity = (cell_px.x + cell_px.y) % 2;
     let depth = textureLoad(g_depth, px, 0).x;
     if (flags == 0u || depth >= 1.0) {
         return vec4<f32>(0.0);
@@ -913,7 +919,8 @@ fn fs_bounce(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     let room = u32(gn.z + 0.5);
     let jitter = vec2<f32>(bounce_noise(frag.xy), bounce_noise(frag.yx + vec2<f32>(17.0, 5.0)));
     // Each sample stands for a sixth of a face's quarter: its solid angle.
-    let omega = 4.0 * PI / (6.0 * f32(BOUNCE_SAMPLES));
+    // Twice a sixth of a face's share: this pixel takes half the faces.
+    let omega = 2.0 * 4.0 * PI / (6.0 * f32(BOUNCE_SAMPLES));
     var sum = vec3<f32>(0.0);
     for (var i = 0u; i < lighting.counts.x; i = i + 1u) {
         let l = lights[i];
@@ -934,9 +941,9 @@ fn fs_bounce(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
             continue;
         }
         let origin = vec2<i32>(l.shadow.zw);
-        for (var face = 0; face < 6; face = face + 1) {
+        for (var face = parity; face < 6; face = face + 2) {
             for (var k = 0u; k < BOUNCE_SAMPLES; k = k + 1u) {
-                let cell = vec2<f32>(f32(k % 2u), f32(k / 2u));
+                let cell = vec2<f32>(f32(k), f32((k + u32(face)) % 2u));
                 let u = (cell + fract(jitter + vec2<f32>(f32(face) * 0.371, f32(i) * 0.713))) * 0.5;
                 let t = vec2<i32>(u * 510.0);
                 let y = bounce_point(face, origin, t, lp);
@@ -979,14 +986,14 @@ fn fs_bounce(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     return vec4<f32>(sum, 1.0);
 }
 
-// Sunlight bounced off what the screen shows near `x` (normal `nx`): sixteen points of a
+// Sunlight bounced off what the screen shows near `x` (normal `nx`): eight points of a
 // 3 m hemisphere, each the visible surface there, lit by the sun through its cascades and
 // reflecting its own G-buffer albedo. A cube-map gather can't do this for the sun: its
 // shadow maps see a roof, not the sunlit floor under a window. Off-screen surfaces are
 // missed, so the bounce fades at the frame's edges.
 fn sun_bounce(x: vec3<f32>, nx: vec3<f32>, frag: vec2<f32>) -> vec3<f32> {
     let radius = 3.0;
-    let count = 16u;
+    let count = 8u;
     let axis = select(vec3<f32>(0.0, 0.0, 1.0), vec3<f32>(0.0, 1.0, 0.0), abs(nx.z) > 0.95);
     let t = normalize(cross(axis, nx));
     let b = cross(nx, t);
@@ -1040,12 +1047,12 @@ fn sun_bounce(x: vec3<f32>, nx: vec3<f32>, frag: vec2<f32>) -> vec3<f32> {
 // resolution samples, weighted by how close their depth is (so edges don't bleed).
 fn bounce_at(px: vec2<i32>, depth: f32) -> vec3<f32> {
     let size = vec2<i32>(textureDimensions(bounce_tex));
-    let base = max((px - vec2<i32>(1)) / 2, vec2<i32>(0));
+    let base = max((px - vec2<i32>(BOUNCE_SCALE / 2)) / BOUNCE_SCALE, vec2<i32>(0));
     var sum = vec3<f32>(0.0);
     var weight = 0.0;
     for (var k = 0; k < 4; k = k + 1) {
         let q = clamp(base + vec2<i32>(k % 2, k / 2), vec2<i32>(0), size - vec2<i32>(1));
-        let dq = textureLoad(g_depth, q * 2, 0).x;
+        let dq = textureLoad(g_depth, q * BOUNCE_SCALE + vec2<i32>(BOUNCE_SCALE / 2), 0).x;
         let w = 1.0 / (1.0 + abs(dq - depth) * 2000.0);
         sum = sum + textureLoad(bounce_tex, q, 0).rgb * w;
         weight = weight + w;
