@@ -1293,8 +1293,14 @@ fn light_surface(frag: vec4<f32>, p: vec3<f32>, ga: vec4<f32>, spec: vec4<f32>,
         if (!strands && ndl < 0.0) {
             continue;
         }
+        // A light set's fill light (colour w 2): the bake's linear falloff, level surfaces
+        // only, no highlight.
+        let fill = light_colour.w > 1.5;
+        if (fill && object) {
+            continue;
+        }
         let c = cos(d / position.w * PI * 0.5);
-        let att = c * c;
+        let att = select(c * c, max(1.0 - d / position.w, 0.0), fill);
         var shade = 1.0;
         if (light_shadow.x >= 0.0) {
             shade = shadowed(i32(light_shadow.x + 0.5), vec2<i32>(light_shadow.zw), position.xyz, p, n);
@@ -1305,7 +1311,7 @@ fn light_surface(frag: vec4<f32>, p: vec3<f32>, ga: vec4<f32>, spec: vec4<f32>,
         let diffuse_response = select(ndl, max(ndl * 0.75 + 0.25, 0.0), strands);
         let dif = att * diffuse_response * light_colour.rgb * shade;
         var sp = vec3<f32>(0.0);
-        if (compute_specular) {
+        if (compute_specular && !fill) {
             let h = normalize(v + ln);
             sp = att * highlight(n, h, power, hair) * light_colour.rgb * shade;
         }

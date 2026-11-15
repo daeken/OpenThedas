@@ -849,7 +849,7 @@ impl Live {
             return;
         }
         // A tutorial that pauses the game holds it until its popup is dismissed.
-        if self.sim().world.tutorial_paused {
+        if self.sim().tutorial_paused() {
             return;
         }
         self.owed_ms += dt_ms.clamp(0.0, MAX_STEP_MS);
@@ -1885,6 +1885,23 @@ impl Live {
             models.push(m);
         }
         let kept = shown.kept;
+        // The next frame's locomotion leaves these creatures' standing pose to the cutscene:
+        // a playing cutscene's actors, and creatures a conversation line animates or that
+        // keep a cutscene's animations (a seated creature). A conversation line that only
+        // places and faces its speakers leaves them to locomotion, so they turn in place
+        // toward each other as #914 has them.
+        let cut_playing = sim.world.cutscene.is_some();
+        self.locomotion.hold(
+            posing
+                .iter()
+                .filter(|(_, show)| cut_playing || !show.animations.is_empty())
+                .map(|(id, _)| *id)
+                .chain(
+                    kept.iter()
+                        .filter(|(_, a)| !a.is_empty())
+                        .map(|(id, _)| *id),
+                ),
+        );
         // A cutscene's weapon draws and hidden actors.
         let mut hidden = std::collections::HashSet::new();
         // Party members the playing cutscene does not cast are not drawn while it plays

@@ -364,7 +364,14 @@ pub struct Locomotion {
     /// By appearance: its walk and run speeds and its clips' (see [`Pace`]).
     speeds: HashMap<i32, [f32; 4]>,
     last_ms: Option<u64>,
+    /// Creatures a cutscene or conversation line poses, or that keep a cutscene's
+    /// animations (a seated creature), as of the last frame (see [`Locomotion::hold`]).
+    held: std::collections::HashSet<ObjectId>,
 }
+
+/// A placement further than this in one frame (metres) is a jump (a teleport, a cutscene's
+/// placement), not a step: the facing it brings is not a turn in place.
+const JUMP_M: f32 = 1.0;
 
 /// An appearance's `apr_base.gda` speeds: walk, run, the walk clip's and the run clip's
 /// (0 where missing).
@@ -382,6 +389,15 @@ fn appearance_speeds(sim: &Sim, appearance: i32) -> [f32; 4] {
 }
 
 impl Locomotion {
+    /// The creatures cutscenes pose or that keep a cutscene's animations, which the next
+    /// [`Locomotion::apply`] leaves standing as they are: their posed layers are measured
+    /// against the standing pose, and a turn clip under them pulls a seated creature out of
+    /// its seat. Provisional: the exe's controller under a cutscene's layers is not traced.
+    pub fn hold(&mut self, held: impl IntoIterator<Item = ObjectId>) {
+        self.held.clear();
+        self.held.extend(held);
+    }
+
     /// Advances every creature's controller to the simulation's time and gives each running
     /// or standing creature's motion its blend.
     pub fn apply(&mut self, sim: &Sim, models: &mut [ObjectModel]) {
@@ -405,7 +421,7 @@ impl Locomotion {
             let first = motion.actions.first().map(String::as_str);
             let running = match first {
                 Some(action::RUN) => true,
-                Some(action::PAUSE) if motion.looping => false,
+                Some(action::PAUSE) if motion.looping && !self.held.contains(&m.id) => false,
                 // Anything else (an attack, a death, a played animation) takes the body
                 // whole; the controller starts again from standing.
                 _ => {
@@ -437,6 +453,15 @@ impl Locomotion {
                 let (dx, dy) = (m.position[0] - p[0], m.position[1] - p[1]);
                 (dx * dx + dy * dy > 1e-6).then(|| thedas_sim::world::facing_toward(dx, dy))
             });
+            // A jump (a teleport, a cutscene's placement) brings its facing with it: it is
+            // taken as the facing to turn from, not a turn to make.
+            let jumped = gait.last.is_some_and(|(p, _)| {
+                let d = [p[0] - m.position[0], p[1] - m.position[1]];
+                d[0] * d[0] + d[1] * d[1] > JUMP_M * JUMP_M
+            });
+            if jumped && !running {
+                gait.facing = Some(m.facing);
+            }
             let last_moved = match gait.last {
                 Some((_, at)) if !(running || moved) => at,
                 _ => now,
@@ -1092,6 +1117,56 @@ mod tests {
         );
         assert_eq!(g.phase, Phase::Starting);
         assert_eq!(g.clip.as_ref().unwrap().0, "pauseturnr180runf");
+    }
+
+    #[test]
+    fn a_creature_a_cutscene_holds_keeps_its_standing_motion() {
+        let mut sim = Sim::new(
+            Arc::new(thedas_vfs::Vfs::new()),
+            Arc::new(thedas_script::EngineTable::default()),
+            1,
+        );
+        let id = sim.world.spawn(ObjectKind::Creature, "sitter");
+        let pause = Motion {
+            trees: vec!["humanoid.anb".into()],
+            actions: vec![action::PAUSE.into()],
+            time: 0.0,
+            looping: true,
+            blend: Vec::new(),
+        };
+        let model = |facing: f32, position: [f32; 3]| ObjectModel {
+            id,
+            tag: "sitter".into(),
+            kind: ObjectKind::Creature,
+            models: Vec::new(),
+            attached: Vec::new(),
+            tints: Vec::new(),
+            morph: None,
+            hide_hair: false,
+            effects: Vec::new(),
+            motion: Some(pause.clone()),
+            position,
+            facing,
+        };
+        let mut l = Locomotion::default();
+        l.apply(&sim, &mut [model(0.0, [0.0; 3])]);
+        assert!(
+            l.gaits.contains_key(&id),
+            "an idle creature has a controller"
+        );
+        // A jump brings its facing: no turn is owed.
+        sim.world.time_ms += 33;
+        l.apply(&sim, &mut [model(90.0, [5.0, 0.0, 0.0])]);
+        assert_eq!(l.gaits[&id].phase, Phase::Idle);
+        assert_eq!(l.gaits[&id].facing, Some(90.0));
+        // Held by a cutscene: the controller lets go and the motion is left as it is.
+        l.hold([id]);
+        sim.world.time_ms += 33;
+        let mut models = [model(180.0, [5.0, 0.0, 0.0])];
+        l.apply(&sim, &mut models);
+        assert!(!l.gaits.contains_key(&id));
+        assert_eq!(models[0].motion, Some(pause.clone()));
+        assert_eq!(models[0].facing, 180.0);
     }
 
     #[test]

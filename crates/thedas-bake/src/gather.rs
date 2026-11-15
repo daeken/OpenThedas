@@ -74,6 +74,15 @@ impl BakeScene {
             let Some(mesh) = scene.meshes.get(d.mesh) else {
                 continue;
             };
+            // Water surfaces are not part of the bake (from the shipped atlases: terrain under
+            // lake water is lit by the sun).
+            if scene
+                .materials
+                .get(d.material)
+                .is_some_and(|m| m.material_name().contains("water"))
+            {
+                continue;
+            }
             // The toolset's script takes texture coordinates 1 when the chunk has them, else 0
             // (terrain) (LightMapper.py, MSHChunk).
             let use_uv1 = mesh.chunk.element(DeclUsage::TexCoord, 1).is_some();
