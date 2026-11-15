@@ -2104,10 +2104,11 @@ impl DeferredPass {
             );
             if self.realtime_direct() {
                 // A static light with a cube of its own takes that visibility in place of
-                // the lightmap's baked mask; the rest keep the mask.
+                // the lightmap's baked mask (it lights as a dynamic one does); the rest keep
+                // the mask. The shadow record's y is the light's domain: leave it alone.
                 for light in &mut lights {
                     if light.shadow[0] >= 0.0 {
-                        light.shadow[1] = 1.0;
+                        light.colour[3] = 0.0;
                     }
                 }
             }

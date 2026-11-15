@@ -1098,9 +1098,7 @@ fn light_surface(frag: vec4<f32>, p: vec3<f32>, ga: vec4<f32>, spec: vec4<f32>,
         }
         // Objects have no baked direct visibility. Their point lights use their own
         // cube visibility, never the sun's mask or Static1's grazing-angle floor.
-        // In the hybrid mode a static light with a cube of its own (shadow y = 1) takes
-        // that runtime visibility in place of the baked mask.
-        if (point_uses_baked_mask(light_colour.w > 0.5, material) && light_shadow.y < 0.5) {
+        if (point_uses_baked_mask(light_colour.w > 0.5, material)) {
             diff_s = diff_s + dif;
             spec_s = spec_s + sp;
         } else {
