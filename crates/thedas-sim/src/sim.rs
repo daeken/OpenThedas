@@ -3918,6 +3918,8 @@ impl Sim {
                 // BeginConversation, which otherwise bypasses its restart guard.
                 // The native ambient manager arbitrates a speaker's active line at
                 // 0x6ff190, before starting its voice (0x6ffaa0 -> 0x6fe4a0).
+                // Provisional: enforcing that lifetime before player dispatch is our
+                // boundary choice; the native command's earlier busy check is untraced.
                 .filter(|&t| {
                     self.game != thedas_vfs::Game::Origins
                         || !self.ambient.iter().any(|a| a.c.owner == t)

@@ -19,6 +19,10 @@ The Origins command path now leaves a target's active ambient conversation alone
 before dispatching DIALOGUE. A subsequent click after its line/conversation ends
 is accepted normally. This reproduces the reported native no-restart behavior;
 ClearAmbientDialogs' explicit script behavior and DA2's command path are unchanged.
+The command-boundary placement is provisional: the traced executor checks a live
+target and dispatches DIALOGUE, but an earlier native player busy check has not
+been identified. The native no-restart result and ambient arbitration are verified;
+this does not claim instruction-identical placement of the check.
 
 Reproduction must exercise the click path. Six direct BeginConversation calls
 produce one line already; six creature_core DIALOGUE events produced six lines
