@@ -572,6 +572,11 @@ mod tests {
             }],
         });
         let pool = PosePool::new();
+        let (closed, receiver) = mpsc::channel();
+        drop(receiver);
+        let unavailable = PosePool {
+            workers: vec![closed],
+        };
         for (count, time) in [(17, 0.2), (1, 0.4), (80, 0.7), (0, 0.8), (9, 1.0)] {
             let jobs = || {
                 (0..count)
@@ -596,9 +601,12 @@ mod tests {
             };
             let mut expected = pose_jobs(jobs());
             let mut actual = pool.pose(jobs());
+            let mut fallback = unavailable.pose(jobs());
             expected.sort_by_key(|p| (p.0, p.1));
             actual.sort_by_key(|p| (p.0, p.1));
+            fallback.sort_by_key(|p| (p.0, p.1));
             assert_eq!(actual, expected);
+            assert_eq!(fallback, expected);
         }
     }
 }
