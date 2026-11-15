@@ -399,15 +399,34 @@ pub const FORMATION: [[f32; 2]; 11] = [
     [3.5, -1.0],
 ];
 
+/// Arrival calls 0x7605b0 with flag 1 (0x6c75a2), selecting the compact table
+/// at 0xc0d2f0 rather than the ordinary follow formation.
+const ARRIVAL_FORMATION: [[f32; 2]; 11] = [
+    [-1.0, -0.5],
+    [1.0, -0.5],
+    [0.0, -1.0],
+    [-2.0, -1.0],
+    [2.0, -1.0],
+    [-3.0, -1.0],
+    [3.0, -1.0],
+    [-1.0, -2.0],
+    [1.0, -2.0],
+    [-3.0, -2.0],
+    [3.0, -2.0],
+];
+
 /// Where follower slot `k` (from 0) stands with a leader at `p` heading `facing` (DAOrigins.exe
 /// 0x760810 -> 0x7605b0 -> 0xa38a40): the [`FORMATION`] entry turned by the leader's heading.
 /// Provisional: slots past the table (the exe picks a random point within 4 m) take its last.
 pub fn behind(p: [f32; 3], facing: f32, k: usize) -> [f32; 3] {
+    formation_position(p, facing, FORMATION[k.min(FORMATION.len() - 1)])
+}
+
+fn formation_position(p: [f32; 3], facing: f32, [x, y]: [f32; 2]) -> [f32; 3] {
     let heading = crate::world::heading_of(facing).to_radians();
     let (fx, fy) = (heading.dcos(), heading.dsin());
     // The leader's right: forward turned a quarter turn clockwise.
     let (rx, ry) = (fy, -fx);
-    let [x, y] = FORMATION[k.min(FORMATION.len() - 1)];
     [p[0] + x * rx + y * fx, p[1] + x * ry + y * fy, p[2]]
 }
 
@@ -1884,19 +1903,7 @@ impl Sim {
         self.world.store = None;
         self.world.chanter_board = None;
         let old = self.world.area;
-        let party: Vec<ObjectId> = self
-            .world
-            .hero
-            .into_iter()
-            .chain(
-                self.world
-                    .hero
-                    .and_then(|h| self.world.get(h))
-                    .map(|h| h.followers.clone())
-                    .unwrap_or_default(),
-            )
-            .chain(self.party_pool())
-            .collect();
+        let party = self.arriving_party();
         // The party leaves the old area: its script hears each member go
         // (EVENT_TYPE_EXIT, creator and object 0 the member), before the area unloads.
         if let Some(old) = old {
@@ -1929,20 +1936,10 @@ impl Sim {
             Ok(new) => {
                 self.place_party_on_map(area);
                 self.travel_arrived();
-                let at = self
-                    .world
-                    .hero
-                    .and_then(|h| self.world.get(h))
-                    .map(|h| (h.position, h.facing));
-                for (k, id) in party.iter().skip(1).enumerate() {
+                // `arrive` has already placed every member at a searched formation slot.
+                for id in party.iter().skip(1) {
                     self.following.remove(id);
-                    let before_area = self.world.get(*id).and_then(|o| o.area);
                     if let Some(o) = self.world.get_mut(*id) {
-                        o.area = Some(new);
-                        if let Some((p, facing)) = at {
-                            o.position = behind(p, facing, k);
-                            o.facing = facing;
-                        }
                         // What a member was doing in the old area ends with it: a move under
                         // way would otherwise carry on from where it began there, putting
                         // the member back at its old coordinates in the new area (Daveth
@@ -1955,7 +1952,6 @@ impl Sim {
                         ev.objects = vec![*id];
                         self.world.queue_event(0, new, ev, None);
                     }
-                    self.da2_encounter_area_changed(*id, before_area);
                 }
             }
             Err(e) => {
@@ -4301,11 +4297,26 @@ impl Sim {
         Ok(area)
     }
 
-    /// The party arrives in an area: the hero stands at the waypoint (or the first one),
-    /// new objects get `SPAWN`, the area its load events and the hero's `ENTER`.
+    /// The travelling members, in party order, followed by inactive recruits. A recruit
+    /// already in the active party occurs only once, including for EXIT/ENTER delivery.
+    fn arriving_party(&self) -> Vec<ObjectId> {
+        let mut members = crate::engine::party_of(self);
+        for id in self.party_pool() {
+            if !members.contains(&id) {
+                members.push(id);
+            }
+        }
+        members
+    }
+
+    /// DAOrigins.exe 0x6c73c0: the controlled leader takes the transition target,
+    /// followers its compact formation slots (0x7605b0, flag 1). Each creature's point
+    /// passes through 0x73e370 with radius 20, check and ground snap on; a failed search
+    /// keeps the requested point. Save loading restores the world without calling this.
+    /// Provisional: the standable test is the grid approximation in `nav.rs`, formation
+    /// mirroring is not modelled, and slots past the table use its last entry.
     fn arrive(&mut self, area: ObjectId, waypoint: Option<&str>, spawned: Vec<ObjectId>) {
-        // Place the hero.
-        if let Some(hero) = self.world.hero {
+        if let Some(leader) = self.world.controlled() {
             let wp = self
                 .world
                 .objects
@@ -4313,14 +4324,41 @@ impl Sim {
                 .filter(|o| o.kind == ObjectKind::Waypoint && o.area == Some(area))
                 .find(|o| waypoint.is_none_or(|w| o.tag.eq_ignore_ascii_case(w)))
                 .map(|o| (o.position, o.facing));
-            let h = self.world.get_mut(hero).expect("hero exists");
-            let before_area = h.area;
-            h.area = Some(area);
-            if let Some((p, f)) = wp {
-                h.position = p;
-                h.facing = f;
+            let target = wp.or_else(|| self.world.get(leader).map(|o| (o.position, o.facing)));
+            let members = self.arriving_party();
+            let leader_index = members.iter().position(|&id| id == leader).unwrap_or(0);
+            for (i, id) in members.into_iter().enumerate() {
+                let before_area = self.world.get(id).and_then(|o| o.area);
+                if let Some((p, facing)) = target {
+                    // 0x631d90: member zero takes the controlled member's slot when
+                    // another party member leads; every other member keeps index - 1.
+                    let slot = if i == 0 { leader_index } else { i }.saturating_sub(1);
+                    let p = if id == leader {
+                        p
+                    } else {
+                        formation_position(
+                            p,
+                            facing,
+                            ARRIVAL_FORMATION[slot.min(ARRIVAL_FORMATION.len() - 1)],
+                        )
+                    };
+                    let how = crate::nav::SafeSearch {
+                        radius: 20.0,
+                        body_radius: self.capsule_radius(id),
+                        mover: Some(id),
+                        standable_keeps: true,
+                    };
+                    let position = self.safe_search(area, p, how).unwrap_or(p);
+                    if let Some(o) = self.world.get_mut(id) {
+                        o.position = position;
+                        o.facing = facing;
+                    }
+                }
+                if let Some(o) = self.world.get_mut(id) {
+                    o.area = Some(area);
+                }
+                self.da2_encounter_area_changed(id, before_area);
             }
-            self.da2_encounter_area_changed(hero, before_area);
         }
 
         // Load events (order provisional, see the module docs).
@@ -5832,6 +5870,117 @@ mod tests {
         assert!(s.world.get(awake).unwrap().active);
         assert!(!s.world.get(asleep).unwrap().active);
         assert_eq!(s.world.get(hero).unwrap().area, Some(a));
+    }
+
+    #[test]
+    fn arrival_searches_the_waypoint_and_compact_slots_before_enter_events() {
+        for leader_index in [0, 2] {
+            let mut s = sim();
+            let old = s.world.spawn(ObjectKind::Area, "old");
+            let area = s.world.spawn(ObjectKind::Area, "next");
+            s.world.get_mut(area).unwrap().template = "next".into();
+            s.world.area = Some(old);
+            s.area_layouts.insert(area, "open".into());
+            s.nav_grids.insert(
+                "open".into(),
+                Some(Arc::new(thedas_formats::level::NavGrid {
+                    columns: 40,
+                    rows: 40,
+                    cell_size: 0.5,
+                    clearance: 2.0,
+                    base: [0.0; 3],
+                    normal: [0.0, 0.0, 1.0],
+                    data: vec![1; 1600],
+                    heights: vec![16.0; 1600],
+                    surfaces: Vec::new(),
+                })),
+            );
+            let members: Vec<_> = (0..4)
+                .map(|i| {
+                    let id = s.world.spawn(ObjectKind::Creature, &format!("member{i}"));
+                    let o = s.world.get_mut(id).unwrap();
+                    o.area = Some(old);
+                    o.position = [-10.0, -10.0, 3.0];
+                    id
+                })
+                .collect();
+            s.world.hero = Some(members[0]);
+            s.world.controlled = Some(members[leader_index]);
+            s.world.get_mut(members[0]).unwrap().followers = members[1..].to_vec();
+            let waypoint = s.world.spawn(ObjectKind::Waypoint, "entry");
+            let w = s.world.get_mut(waypoint).unwrap();
+            w.area = Some(area);
+            w.position = [10.0, 10.0, 3.0];
+            w.facing = 270.0;
+            s.area_transition("next", "entry");
+            let offsets = [[-1.0, -0.5], [1.0, -0.5], [0.0, -1.0]];
+            for (i, &id) in members.iter().enumerate() {
+                let slot = if i == 0 { leader_index } else { i }.saturating_sub(1);
+                // Facing 270: forward +X, right -Y.
+                let [x, y] = if i == leader_index {
+                    [0.0; 2]
+                } else {
+                    offsets[slot]
+                };
+                let want = [10.0 + y, 10.0 - x];
+                let o = s.world.get(id).unwrap();
+                assert!((o.position[0] - want[0]).abs() < 1e-5);
+                assert!((o.position[1] - want[1]).abs() < 1e-5);
+                assert_eq!(o.position[2], 1.0, "member {i}: {:?}", o.position);
+                assert_eq!((o.area, o.facing), (Some(area), 270.0));
+            }
+            let entering: Vec<_> = s
+                .world
+                .queue
+                .values()
+                .filter(|q| q.target == area && q.event.objects.len() == 1)
+                .map(|q| q.event.objects[0])
+                .collect();
+            assert_eq!(entering, members);
+            // Loading a save must retain its exact positions, including an unsafe one.
+            s.world.get_mut(members[0]).unwrap().position = [40.0, 50.0, 6.0];
+            let saved = s.save_game();
+            s.load_game(saved).unwrap();
+            assert_eq!(s.world.get(members[0]).unwrap().position, [40.0, 50.0, 6.0]);
+        }
+    }
+
+    #[test]
+    fn arrival_keeps_blocked_points_and_searches_off_grid() {
+        let mut s = sim();
+        let area = s.world.spawn(ObjectKind::Area, "a");
+        let hero = s.world.spawn(ObjectKind::Creature, "hero");
+        s.world.hero = Some(hero);
+        let wp = s.world.spawn(ObjectKind::Waypoint, "entry");
+        s.world.get_mut(wp).unwrap().area = Some(area);
+        s.area_layouts.insert(area, "open".into());
+        let mut data = vec![1; 64];
+        data[18] = 9;
+        s.nav_grids.insert(
+            "open".into(),
+            Some(Arc::new(thedas_formats::level::NavGrid {
+                columns: 8,
+                rows: 8,
+                cell_size: 0.5,
+                clearance: 2.0,
+                base: [10.0, 10.0, 0.0],
+                normal: [0.0, 0.0, 1.0],
+                data,
+                heights: vec![16.0; 64],
+                surfaces: Vec::new(),
+            })),
+        );
+        for requested in [[11.25, 11.25, 3.0], [9.4, 12.0, 3.0], [-11.0, 12.0, 3.0]] {
+            s.world.get_mut(wp).unwrap().position = requested;
+            s.arrive(area, Some("entry"), Vec::new());
+            let p = s.world.get(hero).unwrap().position;
+            if requested[0] == 9.4 {
+                assert_eq!(p[2], 1.0);
+                assert!(p[0] >= 10.0);
+            } else {
+                assert_eq!(p, requested, "a non-success keeps the requested point");
+            }
+        }
     }
 
     #[test]
