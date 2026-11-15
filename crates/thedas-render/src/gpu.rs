@@ -1218,6 +1218,9 @@ impl AreaRenderer {
     /// The lights its glowing particle emitters give the deferred path this frame (see
     /// [`crate::deferred::emitter_light`]); the faithful path has none of these.
     pub fn emitter_lights(&self) -> Vec<crate::scene::SceneLight> {
+        if !crate::config::CONFIG.emitter_lights {
+            return Vec::new();
+        }
         self.d3d
             .glowing_emitters()
             .into_iter()
