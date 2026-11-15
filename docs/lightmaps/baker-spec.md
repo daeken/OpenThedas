@@ -153,7 +153,20 @@ falloff × |cos| × visibility, and occlusion ray hit distances, then fits.
   fireplace fits k ≈ 0.6. The room's baked ambient fits ≈ (0.149, 0.146, 0.199), not the
   runtime ambient (0.225, 0.225, 0.2475). What is left is mostly a blue fill: Baked-only
   lights the game files no longer contain.
-- **Alpha is not binary.** Over the static lights, with S = Σ max(0, 1 − d/R)·|cos|·
+- **Alpha *is* binary after all; the curve below is occlusion in disguise.** RGB and alpha
+  carry the same occlusion factor, so alpha / green = sm / lm_g, and lm_g follows from the
+  fitted RGB model: an occlusion-free estimate of the shadow pass. Over texels one static
+  light alone reaches (Cousland room1100/1400/400), that estimate is ≈ 1 (0.9–1.1) at every
+  light strength for most lights (lamp_007, lamp_011, fireplaces, bounce_005): the shipped
+  shadow pass is the toolset's monochrome one. Some lights (lamp_009, lamp_010, bounce_008)
+  step from 0 to 1 well inside their runtime radius: their bake radius was smaller (about
+  two thirds) than the exported one. So the √min(1, 3S) curve below only stands in for an
+  occlusion model we have not matched yet (the shipped occlusion is darker under ceilings,
+  plateauing near 220/255 on open floors); with the current occlusion model it still scores
+  better (alpha MAE 19.5 / 6.5 on room1100 / room1400 against 19.8 / 9.0 monochrome).
+  Next: fit occlusion on the occlusion-free texels' alpha, then return to `Monochrome`
+  with per-light bake radii.
+- **Former reading (kept for the record): alpha rises with light strength.** Over the static lights, with S = Σ max(0, 1 − d/R)·|cos|·
   visibility (no colour), shipped alpha ÷ occlusion ≈ √min(1, 3S): 0.47 at S = 0.075, 0.73
   at 0.175, 0.96 at 0.325, saturated beyond 0.35 (`--shadow-intensity 3,0.5`). Other falloff
   shapes (quadratic, cos², smoothstep) fit no better. [I] A shadow job without `monochrome`
@@ -179,13 +192,39 @@ falloff × |cos| × visibility, and occlusion ray hit distances, then fits.
 - **Shadows are hard.** Sampling point lights as spheres (`--light-size`) makes the fit worse
   at every size tried (0.25–1).
 - Whole level, each atlas fitted then baked (Cousland, 88 atlases, 19.2M texels): mean error
-  RGB 9.4 / 8.2 / 8.8, alpha 15.2 levels (RMSE 17 / 15 / 16 and 42); 35% of texels within 4
+  RGB 9.4 / 8.2 / 8.8, alpha 15.0 levels (RMSE 17 / 15 / 16 and 42); 35% of texels within 4
   levels on every channel. Alpha is the weakest part (window and fake-sun fills).
+- **Exteriors** (Lake Calenhad `lak100d`, 71 terrain/LOD atlases, 26.3M texels): mean error RGB
+  4.0 / 4.1 / 3.8, alpha 8.3 levels; 70% of texels within 4 levels on every channel. The sun
+  is in the shadow pass only (its fitted RGB brightness is ≈ 0, as the editor routing says);
+  the baked ambient is a dim green, about (0.06, 0.09, 0.06); water surfaces are not part of
+  the bake scene (terrain under the lake is sunlit in the shipped alpha).
 - With all of the above and the fitted lights, room1400's 876k texels differ by a mean of
   7.4–9.5 levels in RGB and 6.9 in alpha (RMSE 14–17 and 26.5); 47% are within 4 levels on
   every channel. First light was ~14 and ~13.
 
-## 7. `thedas-bake`
+## 7. Light sets (for the deferred renderer)
+
+`thedas-bake <install> <level> --lightset DIR` merges the per-atlas fits in `DIR/fit-*/fit.txt`
+(from `--fit --discover N --out DIR/fit-<atlas>`) into `DIR/<level>.lightset.json`. Because
+it is derived from game data, it lives outside the repository, in OpenThedas-testdata
+`lightmap/lightsets/`. Fields (linear colours):
+
+- `rooms.<room>.baked_ambient`: the RGB pass's flat ambient for that room's pieces (mean over
+  atlases); `runtime_ambient`: the room light model's ambient, when it has one.
+- `lights[]`: every level light (the bake's order: non-character points, then the sun) with
+  `name`, `kind`, `position` (for the sun, the direction toward it), `radius`, runtime
+  `color`; `baked_brightness`: mean fitted RGB-pass brightness where it was seen
+  (`null` = not seen); `in_alpha`: whether the shadow pass took it.
+- `found[]`: baked-only lights recovered from the RGB residual: `position`, `radius`,
+  `color` (colour × brightness), and the `atlas` whose fit found them. Fits of neighbouring
+  atlases can find the same light twice.
+
+A light's baked contribution is colour × brightness × max(0, 1 − d/radius) × |N·L| (no inverse
+square), shadowed, on top of the room's baked ambient; the lightmap stores it with gamma 1.5
+and multiplied by occlusion.
+
+## 8. `thedas-bake`
 
 `cargo run -p thedas-bake --release -- <install> <level> [--atlas NAME] [--out DIR]` bakes every
 lightmapped part and writes per atlas a PNG (ours | shipped | |difference| × 4, RGB above

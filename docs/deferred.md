@@ -414,6 +414,26 @@ ambient discontinuities. The original baked image remains the default while thos
 addressed. Moving the remaining material families into the G-buffer is still
 the next coverage step.
 
+### Fitted light sets (experimental)
+
+`THEDAS_DEFERRED_LIGHTSET=<file or directory>` gives the lightmaps-off mode a level's light set:
+what the shipped lightmaps say the original bake's lights were, fitted by `thedas-bake` (see
+`docs/lightmaps/baker-spec.md` §7; the sets are derived from game data and live outside the
+repository, in OpenThedas-testdata `lightmap/lightsets/<level>.lightset.json`). It does nothing
+in the `baked` and `hybrid` modes or when unset.
+
+- Level surfaces (not objects or characters) take their room's baked ambient in place of the
+  probe, encoded as the lightmaps store light (linear^(1/1.5)), uniform over the hemisphere.
+- The set's baked-only fill lights join the light list after the shadow slots are chosen
+  (never shadowed), nearest first into what room it has left. Each belongs to the room its
+  fitted atlas lights. The lighting pass marks them by colour w = 2: the bake's linear
+  falloff max(0, 1 − d/R), no highlight, level surfaces only.
+
+On the Cousland hall camera, against the `baked` frame, `realtime` differs by a mean of 20.4
+levels per channel (−18 bias) and `realtime` with the light set by 10.6 (+8.6); on two Lake
+Calenhad terrain views 6.1–6.5 and 0.5. Not yet: the static lights' baked twins, the
+occlusion the lightmaps carry, fill visibility.
+
 ## Real-time bounce
 
 `fs_bounce` gathers one bounce of light at quarter resolution before the lighting pass, which

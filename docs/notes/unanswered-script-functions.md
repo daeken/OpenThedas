@@ -45,6 +45,10 @@ Later traced slice: Origins `IsDestroyable` and `SetDestroyable` now answer
 for the established CCObject kinds ([trace](script-destroyability-flag.md)).
 Their rows below remain part of this dated baseline snapshot.
 
+Origins `GetPCSpeaker` now answers with the controlled party member
+([trace](origins-placeable-conversations.md#the-signet-ring-reply)); its row
+also remains part of this dated baseline snapshot.
+
 | function | id | calls | scripts |
 | --- | --- | --- | --- |
 | DEBUG_ConsoleCommand | 704 | 649 | 57 |
