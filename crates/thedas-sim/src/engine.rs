@@ -1599,6 +1599,19 @@ pub fn call(
             })
         }
         "IsInTrigger" => {
+            if h.sim.game == thedas_vfs::Game::Origins {
+                // 0x66da90 resolves a creature, then searches its cached trigger IDs
+                // (+0xba8). A script query does not refresh geometry or send events.
+                let inside = h.object(obj(a, 0)).is_some_and(|o| {
+                    o.kind == ObjectKind::Creature
+                        && h.sim
+                            .world
+                            .in_triggers
+                            .get(&o.id)
+                            .is_some_and(|ids| ids.contains(&obj(a, 1)))
+                });
+                return ok(b(inside));
+            }
             let (o, tr) = (h.object(obj(a, 0)), h.object(obj(a, 1)));
             ok(b(match (o, tr) {
                 (Some(o), Some(tr)) => o.area == tr.area && in_trigger(o.position, tr, h.sim.game),
@@ -4712,6 +4725,10 @@ pub fn call(
         }
         "BeginTrainingStep" => {
             h.sim.begin_training_step(int(a, 0), int(a, 1), int(a, 2));
+            void()
+        }
+        "HighlightGuiElement" => {
+            h.sim.highlight_gui_element(int(a, 0), int(a, 1));
             void()
         }
         "ShowPopup" => {
@@ -8028,6 +8045,83 @@ mod tests {
             script: "test".into(),
         };
         call(&mut h, caller, &f, a).unwrap().unwrap()
+    }
+
+    #[test]
+    fn origins_trigger_query_reads_cached_membership_without_refreshing_it() {
+        let table = EngineTable::parse(
+            b"int IsInTrigger(object creature, object trigger) = 39;\n\
+              int EVENT_TYPE_ENTER = 8;\nint EVENT_TYPE_EXIT = 9;\n",
+        )
+        .unwrap();
+        for game in [thedas_vfs::Game::Origins, thedas_vfs::Game::DragonAge2] {
+            let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(table.clone()), 1);
+            s.game = game;
+            let area = s.world.spawn(crate::world::ObjectKind::Area, "a");
+            let c = s.world.spawn(crate::world::ObjectKind::Creature, "c");
+            let tr = s.world.spawn(crate::world::ObjectKind::Trigger, "t");
+            s.world.get_mut(c).unwrap().area = Some(area);
+            s.world.get_mut(c).unwrap().position = [10.0, 10.0, 0.0];
+            let t = s.world.get_mut(tr).unwrap();
+            t.area = Some(area);
+            t.position = [10.0, 10.0, 0.0];
+            t.geometry = vec![
+                [-1.0, -1.0, 0.0],
+                [1.0, -1.0, 0.0],
+                [1.0, 1.0, 0.0],
+                [-1.0, 1.0, 0.0],
+            ];
+            let args = [Value::Object(c), Value::Object(tr)];
+            assert_eq!(
+                run(&mut s, c, "IsInTrigger", &args),
+                Some(Value::Int(i32::from(game == thedas_vfs::Game::DragonAge2)))
+            );
+            assert!(s.world.in_triggers.is_empty());
+            assert!(
+                s.world.queue.is_empty(),
+                "query must not refresh membership or send ENTER"
+            );
+            s.update_triggers(c);
+            assert_eq!(run(&mut s, c, "IsInTrigger", &args), Some(Value::Int(1)));
+            s.world.get_mut(c).unwrap().position = [20.0, 10.0, 0.0];
+            let queued: Vec<_> = s.world.queue.keys().copied().collect();
+            assert_eq!(
+                run(&mut s, c, "IsInTrigger", &args),
+                Some(Value::Int(i32::from(game == thedas_vfs::Game::Origins)))
+            );
+            assert_eq!(
+                s.world.queue.keys().copied().collect::<Vec<_>>(),
+                queued,
+                "query must not send EXIT"
+            );
+            s.update_triggers(c);
+            assert_eq!(run(&mut s, c, "IsInTrigger", &args), Some(Value::Int(0)));
+            // The native first lookup accepts creatures only, even when another object's
+            // ID has been placed into the cache and its geometry would match.
+            let p = s.world.spawn(crate::world::ObjectKind::Placeable, "p");
+            let o = s.world.get_mut(p).unwrap();
+            o.area = Some(area);
+            o.position = [10.0, 10.0, 0.0];
+            s.world.in_triggers.insert(p, vec![tr]);
+            assert_eq!(
+                run(
+                    &mut s,
+                    c,
+                    "IsInTrigger",
+                    &[Value::Object(p), Value::Object(tr)]
+                ),
+                Some(Value::Int(i32::from(game == thedas_vfs::Game::DragonAge2)))
+            );
+            assert_eq!(
+                run(
+                    &mut s,
+                    c,
+                    "IsInTrigger",
+                    &[Value::Object(OBJECT_INVALID), Value::Object(tr)]
+                ),
+                Some(Value::Int(0))
+            );
+        }
     }
 
     #[test]
