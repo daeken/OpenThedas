@@ -628,15 +628,22 @@ pub enum SoundRequest {
     Music { name: String },
 }
 
-/// The ids of the world's creatures, and of its creatures and placeables, in id order: the
+/// The ids of the world's creatures, of its creatures and placeables, and of its triggers, in
+/// id order: the
 /// per-tick updates that only look at creatures read these instead of walking every object
 /// (thousands of items and waypoints). Keyed by the object count and the next id, which
 /// every addition (`World::spawn`) and removal changes; an object's kind never changes.
 #[derive(Default)]
 struct KindIndex(std::sync::Mutex<Option<KindLists>>);
 
-/// (object count, next id, creatures, creatures and placeables)
-type KindLists = (usize, ObjectId, Arc<Vec<ObjectId>>, Arc<Vec<ObjectId>>);
+/// (object count, next id, creatures, creatures and placeables, triggers)
+type KindLists = (
+    usize,
+    ObjectId,
+    Arc<Vec<ObjectId>>,
+    Arc<Vec<ObjectId>>,
+    Arc<Vec<ObjectId>>,
+);
 
 impl Clone for KindIndex {
     fn clone(&self) -> Self {
@@ -1070,7 +1077,19 @@ impl World {
             .filter(|o| matches!(o.kind, ObjectKind::Creature | ObjectKind::Placeable))
             .map(|o| o.id)
             .collect();
-        let l = (key.0, key.1, Arc::new(creatures), Arc::new(actors));
+        let triggers: Vec<ObjectId> = self
+            .objects
+            .values()
+            .filter(|o| o.kind == ObjectKind::Trigger)
+            .map(|o| o.id)
+            .collect();
+        let l = (
+            key.0,
+            key.1,
+            Arc::new(creatures),
+            Arc::new(actors),
+            Arc::new(triggers),
+        );
         *cache = Some(l.clone());
         l
     }
@@ -1083,6 +1102,11 @@ impl World {
     /// The world's creatures and placeables, in id order.
     pub fn actor_ids(&self) -> Arc<Vec<ObjectId>> {
         self.kind_lists().3
+    }
+
+    /// The world's triggers, in id order.
+    pub fn trigger_ids(&self) -> Arc<Vec<ObjectId>> {
+        self.kind_lists().4
     }
 
     pub fn spawn(&mut self, kind: ObjectKind, tag: &str) -> ObjectId {
@@ -1299,6 +1323,8 @@ mod tests {
         let b = w.spawn(ObjectKind::Creature, "b");
         assert_eq!(*w.creature_ids(), vec![a, b]);
         assert_eq!(*w.actor_ids(), vec![a, p, b]);
+        let t = w.spawn(ObjectKind::Trigger, "t");
+        assert_eq!(*w.trigger_ids(), vec![t]);
         // A removal, then an addition that brings the count back to what it was.
         w.objects.remove(&a);
         assert_eq!(*w.creature_ids(), vec![b]);

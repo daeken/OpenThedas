@@ -2521,14 +2521,10 @@ impl Sim {
         let (pos, area) = (o.position, o.area);
         let now: Vec<ObjectId> = self
             .world
-            .objects
-            .values()
-            .filter(|t| {
-                t.kind == ObjectKind::Trigger
-                    && t.active
-                    && t.area == area
-                    && crate::engine::in_trigger(pos, t)
-            })
+            .trigger_ids()
+            .iter()
+            .filter_map(|&t| self.world.get(t))
+            .filter(|t| t.active && t.area == area && crate::engine::in_trigger(pos, t))
             .map(|t| t.id)
             .collect();
         let before = self.world.in_triggers.get(&id).cloned().unwrap_or_default();
