@@ -272,7 +272,10 @@ debug views now include the ground. Terrain also joins the point-shadow caster l
   flames, embers, spell effects), in the level's, its objects' and the visual effects'
   renderers, gives the deferred pass a point light each frame at its particles' glow-
   weighted centre, its colour their hue and its strength rising with the light they show
-  (`deferred::emitter_light`, constants tuned by eye). Two kinds give none: light-shaft and
+  (`deferred::emitter_light`, constants tuned by eye). Its colour also takes the
+  particle texture's tint (its alpha-weighted mean colour over a small mip, brightest channel
+  one; `deferred::texture_tint`), since some effects, lightning for one, carry their colour
+  in the texture rather than the particles. Two kinds give none: light-shaft and
   lit-dust effects (`fxe_day_beam`, `fxe_day_sunshine`, `fxe_day_dust_shine`, matched by
   name), which show light rather than give it, and any emitter within 1.5 m of a level static
   light, a torch or brazier the level already lights with its own lamp. Before this, the
