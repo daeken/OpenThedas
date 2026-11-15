@@ -62,8 +62,78 @@ or spawn callbacks during load, or invent bonuses outside the authored tables.
 
 ## Validation
 
-Synthetic regressions cover passive/base-item filtering, selected integer versus
-float parameter behavior, creator and lifetime, add/remove/unequip, and replacement
-with and without discarding the backpack. Installed-game stat queries, probe
-measurements, the DAO gate and determinism results will be recorded after the
-compiled verification run.
+Compared merged source `86da3d7a` with main `f4a5463a`. fmt and clippy
+(`--workspace --all-targets -- -D warnings`) pass. Workspace tests:
+1270 passed, 18 ignored, zero failed. The three synthetic
+regressions cover effect construction, property edits and unequipping, and
+replacement with either backpack policy, including an equipped item absent from
+an old snapshot's inventory. Documented DAO gate (s04, s07, s11, s14, s15 plus s13): all 12 executions succeed, zero log/plot
+differences, 7 identical checkpoint JSONs. Four 600-tick DAO scenarios per
+binary are identical on repeat and through save/reload.
+
+The independent effects patch retains the main baseline's weapon. A separate
+source archive combines this patch with the staged-preset fix (`0d8a0601`),
+with 1271 workspace tests passing and 18 ignored.
+All workspace release packages are cleaned between source roots. Frozen binary
+hashes and actual installed-game equipment/stat queries are retained with the
+external evidence.
+
+| Fresh Hawke total | Main | Effects only | Both fixes |
+| --- | ---: | ---: | ---: |
+| Max health (7) | 210.000 | 210.000 | 245.000 |
+| Attack (13) | 132.200 | 132.200 | 220.200 |
+| Physical damage bonus (17) | 0.000 | 0.000 | 3.000 |
+| Armor (26) | 0.000 | 86.000 | 155.000 |
+
+The shipped APPLY_EFFECT scripts produce these totals; the patch does not bake
+bonuses into base properties. Every full honest run reaches the real Blightlands
+without cheat healing or forced kills, with zero script errors, ordinary starter gear,
+and no worn effects whose creator is absent from current equipment. This checks
+that fake Champion modifiers end during the authored gear reset. At real arrival,
+the effects-only and combined runs both have maximum HP 160, attack 65.6,
+physical-damage bonus zero and armor 86. Their raw modifier map is exactly
+`{26: 86}`; the fake armor's +35 HP, +88 attack and +3 physical bonus are gone.
+
+| Fresh probe | Main | Effects only | Both fixes |
+| --- | ---: | ---: | ---: |
+| Initial six enemies observed defeated (seconds) | 214.5 | 214.5 | 164.2 |
+| Mean 3110/3210 damage to those six | 5.0972 (81 events) | 5.0972 (81 events) | 14.6815 (28 events) |
+
+The preset-only fix in [PR #939](https://github.com/daeken/OpenThedas/pull/939)
+measured 132.2 seconds and mean damage 12.6058 to the same initial six enemies.
+Thus adding the worn effects improves the recorded damage mean but does not
+monotonically improve this driver's clear time. Full honest real-area arrival is
+1390.066 game seconds on main, 831.966 with the preset alone, 1390.066 with effects
+alone and 838.866 with both. These are measurements of this scripted route;
+original-game combat-time parity is not established.
+
+All probe comparisons use the same frozen supplied `drive_da2.py` (SHA-256
+`5a2a52bf1d94051d50b4fc6eec5f9f2d5415845277b2151baa2a0d6bd1eba7ae`)
+as `wave1b.py`'s drive module. Aggregate probe damage can include later-wave
+targets while initial ranged enemies live, so the table filters the initial six
+IDs. Blocked positive-damage events count. The old 189-second passive-driver
+sample ended with enemies alive and is not the matched baseline above.
+
+The Tower story replay wipes on the first floor for all five seeds on both
+binaries; its script still exits zero and saves under the misleading
+`13_flemeth_hut` name. This is baseline parity, not a successful Tower story clear.
+
+Extra DA2 600-tick repeat and save/reload results, including fresh snapshots
+containing the new item effects:
+
+- effects base-da2-detcheck.log: `DET pro_real_start.json twice: identical | save+reload: [('/next_effect_id', '2', '3')]`
+- effects base-fresh-detcheck.log: `DET base_01_pro000ar_blightlands_fake.json twice: identical | save+reload: identical`
+- effects fix-da2-detcheck.log: `DET pro_real_start.json twice: identical | save+reload: [('/next_effect_id', '2', '3')]`
+- effects fix-fresh-detcheck.log: `DET fix_01_pro000ar_blightlands_fake.json twice: identical | save+reload: identical`
+- combined fix-fresh-detcheck.log: `DET fix_01_pro000ar_blightlands_fake.json twice: identical | save+reload: identical`
+
+Any baseline reload difference is retained explicitly in the external snapshots;
+it is not silently ignored or called an identical reload. The comparison note
+records the observed field differences alongside the DAO checks.
+
+Own-renderer media has Before, After and Delta ×4 panels. At a threshold greater
+than 3/255 in any RGB channel, the effects-only pair changes
+0.0000% of frame pixels; the combined pair changes
+1.9965%. The effects-only same-pose frames are pixel-identical; the corrected armor
+stat does not change the equipment appearance in this capture. All traces, snapshots, hashes and
+media statistics remain outside the repository in the damage job evidence.
