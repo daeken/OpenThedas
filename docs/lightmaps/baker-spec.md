@@ -215,7 +215,8 @@ it is derived from game data, it lives outside the repository, in OpenThedas-tes
 - `lights[]`: every level light (the bake's order: non-character points, then the sun) with
   `name`, `kind`, `position` (for the sun, the direction toward it), `radius`, runtime
   `color`; `baked_brightness`: mean fitted RGB-pass brightness where it was seen
-  (`null` = not seen); `in_alpha`: whether the shadow pass took it.
+  (`null` = not seen); `in_alpha`: whether the shadow pass took it; `shadow_reach`: the share
+  of its radius the shadow pass reached (the bake radius; 1 when not fitted).
 - `found[]`: baked-only lights recovered from the RGB residual: `position`, `radius`,
   `color` (colour × brightness), and the `atlas` whose fit found them. Fits of neighbouring
   atlases can find the same light twice.
