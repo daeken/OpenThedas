@@ -6,8 +6,10 @@ only explore and combat (0 and 1) reach the pause at `0x6940ec`.
 `SetTrainingMode` has the corresponding check at `0x692f81`.
 
 Our cutscene clock is separate from `world.game_mode`: the Dwarf Commoner
-opening plays `bdccs_intro.cut` while the latter is still explore. A pending
-lesson could therefore stop playback and appear over the cut. Origins now
+opening plays `bdccs_intro.cut` while the latter is still explore. Starting
+training mode 1 through the hidden client's MCP control during that opening
+reproduces a frozen camera clock: an additional seven seconds of frame input
+leaves the cut on the same pose. Origins now
 holds both tutorial presentations and their effective pause while a cut is
 playing or queued. The pending queue, lesson step and requested pause remain
 intact, and become effective after the cinematic handoff. Saving restrictions
