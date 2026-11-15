@@ -245,21 +245,33 @@ impl Sim {
         cmd: &Command,
         settings: Settings,
     ) -> Option<u64> {
-        let target = self.world.get(cmd.target?)?;
+        let (target_id, target_kind, target_area) = self
+            .world
+            .get(cmd.target?)
+            .map(|o| (o.id, o.kind, o.area))?;
         let actor = self.world.get(who)?;
         let (from, area) = (actor.position, actor.area);
-        if area.is_none() || area != target.area {
+        if area.is_none() || area != target_area {
             self.fail_front_command(who, "COMMAND_FAILED_INVALID_PATH");
             return None;
         }
-        let (to, facing, tolerance) = if target.kind == ObjectKind::Placeable
-            && let Some((point, facing)) = self.interaction_point(target.id, settings.id)
+        let (to, facing, tolerance) = if target_kind == ObjectKind::Placeable
+            && let Some((point, facing)) = self.interaction_point(target_id, settings.id)
         {
             (point, Some(facing), self.body_radius(who))
         } else {
             // 0x743872 supplies max range 0.1 and minimum 0 to the ordinary
             // move-to-object subcommand; capsule contact can end that walk.
-            (target.position, None, 0.15)
+            let movement = Command {
+                target: cmd.target,
+                max_range: Some(0.1),
+                ..Default::default()
+            };
+            let Some(goal) = self.move_to_object_goal(who, &movement) else {
+                self.fail_front_command(who, "COMMAND_FAILED_INVALID_PATH");
+                return None;
+            };
+            (goal.position, None, 0.15)
         };
         let path = if crate::engine::dist(from, to) > tolerance {
             match self.route_to(who, to) {

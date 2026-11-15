@@ -3018,7 +3018,7 @@ impl Sim {
     /// target. Keep the goal in the command's saved location. Provisional: the alternate
     /// LOS-goal search (nonzero native float 4), failed-search fallback 0x73e7f0 and
     /// replanning a moving target (0x7a50f0) are not modelled.
-    fn move_to_object_goal(&mut self, id: ObjectId, cmd: &Command) -> Option<Location> {
+    pub(crate) fn move_to_object_goal(&mut self, id: ObjectId, cmd: &Command) -> Option<Location> {
         let mover = self.world.get(id)?;
         let target = self.world.get(cmd.target?)?;
         let area = mover.area?;

@@ -43,10 +43,11 @@ length. The exit flag controls the final phase.
 
 The headless implementation retains requests and phase progress in saves,
 uses the existing navigation/mover and command-completion paths, and reads
-animation lengths through the existing cached animation reader. Its movement
-fallback uses the simulation's existing interaction reach; native tolerance,
-turn rate, animation-tree arbitration, linked animation sequences and root
-blending remain approximations. This change does not add presentation of
+animation lengths through the existing cached animation reader. The placeable
+tolerance is the actor's personal space (`0x6a21a0`). The fallback supplies
+maximum 0.1 and minimum zero, as the factory does, to the existing ground-goal
+search and capsule-contact completion. Turn rate, animation-tree arbitration,
+linked animation sequences and root blending remain approximations. This change does not add presentation of
 the interaction animation or cancellation exit blending. It does not change
 CommandPlayAnimation or CommandFly, and DA2 keeps its previous unanswered
 dispatch path. Synthetic tests exercise engine dispatch, reciprocal roles,
