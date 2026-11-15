@@ -284,7 +284,12 @@ pub struct Renderer {
     scale9: HashMap<(DisplayId, [u32; 8]), Vec<Arc<GpuMesh>>>,
     glyphs: HashMap<(usize, usize), Arc<GlyphMesh>>,
     texts: HashMap<DisplayId, (u64, Vec<Arc<GpuMesh>>)>,
-    drawings: HashMap<DisplayId, Vec<Arc<GpuMesh>>>,
+    /// Drawing-API meshes by clip, with a hash of the drawing they were made from.
+    drawings: HashMap<DisplayId, (u64, Vec<Arc<GpuMesh>>)>,
+    /// Quads of images loaded into clips, by URL and size.
+    bitmap_quads: HashMap<(String, u32, u32), Arc<GpuMesh>>,
+    /// What the last render did (see [`RenderStats`]).
+    pub stats: RenderStats,
     bitmaps: HashMap<(String, bool, bool), Option<Bitmap>>,
     engine_images: HashMap<String, Option<EngineImage>>,
     targets: Option<Targets>,
@@ -388,6 +393,8 @@ impl Renderer {
             glyphs: HashMap::new(),
             texts: HashMap::new(),
             drawings: HashMap::new(),
+            bitmap_quads: HashMap::new(),
+            stats: RenderStats::default(),
             bitmaps: HashMap::new(),
             engine_images: HashMap::new(),
             targets: None,
@@ -601,6 +608,8 @@ impl Renderer {
             ops: Vec::new(),
             uniforms: Vec::new(),
         };
+        self.stats = RenderStats::default();
+        let started = std::time::Instant::now();
         let root = player.vm.root;
         self.walk(
             player,
@@ -614,10 +623,14 @@ impl Renderer {
             &mut b,
         );
         self.draws = b.ops.len();
+        self.stats.draws = b.ops.len();
+        self.stats.build_us = started.elapsed().as_micros() as u64;
+        let started = std::time::Instant::now();
         if let Some(targets) = self.targets.take() {
             self.draw_build(&b, &targets);
             self.targets = Some(targets);
         }
+        self.stats.submit_us = started.elapsed().as_micros() as u64;
         // Drop text meshes of fields that are gone.
         self.texts
             .retain(|d, _| player.vm.display.get(*d).is_some());
@@ -857,6 +870,7 @@ impl Renderer {
         if let Some(m) = self.shapes.get(&key) {
             return m.clone();
         }
+        self.stats.shapes_tessellated += 1;
         let movie = player.vm.movie.clone();
         if let Some(Character::Shape(shape)) = movie.characters.get(&id)
             && let Some(name) = engine_shape(shape, &movie)
@@ -1038,6 +1052,7 @@ impl Renderer {
                 return m.clone();
             }
         }
+        self.stats.texts_rebuilt += 1;
         let (bx, by, bw, bh) = t.bounds;
         let mut m = Mesh {
             paint: Paint::Solid,
@@ -1451,40 +1466,51 @@ impl Renderer {
             Kind::Text(_) => self.text_meshes(player, images, d),
             Kind::Bitmap { url, width, height } => {
                 let (url, w, h) = (url.clone(), *width, *height);
-                match self.bitmap(images, &url, false, true) {
-                    Some((bg, _, _)) => {
-                        let mut m = Mesh {
-                            paint: Paint::Solid,
-                            vertices: Vec::new(),
-                            indices: vec![0, 1, 2, 0, 2, 3],
-                        };
-                        for (x, y) in [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)] {
-                            m.vertices.push(Vertex {
-                                pos: [x * w * 20.0, y * h * 20.0],
-                                uv: [x, y],
-                                color: [255; 4],
-                            });
+                let key = (url.clone(), w.to_bits(), h.to_bits());
+                if let Some(q) = self.bitmap_quads.get(&key) {
+                    vec![q.clone()]
+                } else {
+                    match self.bitmap(images, &url, false, true) {
+                        Some((bg, _, _)) => {
+                            let mut m = Mesh {
+                                paint: Paint::Solid,
+                                vertices: Vec::new(),
+                                indices: vec![0, 1, 2, 0, 2, 3],
+                            };
+                            for (x, y) in [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)] {
+                                m.vertices.push(Vertex {
+                                    pos: [x * w * 20.0, y * h * 20.0],
+                                    uv: [x, y],
+                                    color: [255; 4],
+                                });
+                            }
+                            self.stats.uploads += 1;
+                            let q = self.upload(&m, Some(bg), 1.0, Matrix::IDENTITY);
+                            if let Some(q) = &q {
+                                self.bitmap_quads.insert(key, q.clone());
+                            }
+                            q.into_iter().collect()
                         }
-                        self.upload(&m, Some(bg), 1.0, Matrix::IDENTITY)
-                            .into_iter()
-                            .collect()
+                        None => Vec::new(),
                     }
-                    None => Vec::new(),
                 }
             }
             Kind::Clip(c) => match &c.drawing {
                 Some(dr) => {
-                    if let Some(m) = self.drawings.get(&d) {
-                        m.clone()
-                    } else {
-                        let mut out = Vec::new();
-                        for (color, pts) in dr.fills.iter().chain(dr.current.iter()) {
-                            if let Some(m) = tess::tessellate_polygon(pts, *color) {
-                                out.extend(self.upload(&m, None, 0.0, Matrix::IDENTITY));
+                    let hash = drawing_hash(dr);
+                    match self.drawings.get(&d) {
+                        Some((h, m)) if *h == hash => m.clone(),
+                        _ => {
+                            let mut out = Vec::new();
+                            for (color, pts) in dr.fills.iter().chain(dr.current.iter()) {
+                                if let Some(m) = tess::tessellate_polygon(pts, *color) {
+                                    self.stats.uploads += 1;
+                                    out.extend(self.upload(&m, None, 0.0, Matrix::IDENTITY));
+                                }
                             }
+                            self.drawings.insert(d, (hash, out.clone()));
+                            out
                         }
-                        // Drawings change rarely; drop the cache when the clip is dirty.
-                        out
                     }
                 }
                 None => Vec::new(),
@@ -1775,6 +1801,37 @@ fn text_shadow_style(style: &str) -> TextShadowStyle {
         rest = &rest[i + j + 1..];
     }
     out
+}
+
+/// What one render did, for profiling (`THEDAS_UI_PROFILE`).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RenderStats {
+    /// Draw calls.
+    pub draws: usize,
+    /// Meshes uploaded to the GPU (each a pair of new buffers).
+    pub uploads: usize,
+    /// Text fields whose mesh was rebuilt.
+    pub texts_rebuilt: usize,
+    /// Shapes tessellated.
+    pub shapes_tessellated: usize,
+    /// Time spent walking the display list and building meshes, and recording/submitting.
+    pub build_us: u64,
+    pub submit_us: u64,
+}
+
+/// A hash of a drawing's fills, to know when its meshes must be made again.
+fn drawing_hash(d: &crate::display::Drawing) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for (c, pts) in d.fills.iter().chain(d.current.iter()) {
+        c.hash(&mut h);
+        pts.len().hash(&mut h);
+        for (x, y) in pts {
+            x.to_bits().hash(&mut h);
+            y.to_bits().hash(&mut h);
+        }
+    }
+    h.finish()
 }
 
 struct Viewport {
