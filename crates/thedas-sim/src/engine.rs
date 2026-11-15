@@ -7740,8 +7740,11 @@ mod tests {
 
     #[test]
     fn origins_trigger_query_keeps_authored_axes_while_da2_keeps_rotation() {
-        let table = EngineTable::parse(b"int IsInTrigger(object creature, object trigger) = 39;\n")
-            .unwrap();
+        let table = EngineTable::parse(
+            b"int IsInTrigger(object creature, object trigger) = 39;\n\
+            int EVENT_TYPE_ENTER = 8;\nint EVENT_TYPE_EXIT = 9;\n",
+        )
+        .unwrap();
         let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(table), 1);
         let area = s.world.spawn(crate::world::ObjectKind::Area, "a");
         let c = s.world.spawn(crate::world::ObjectKind::Creature, "c");
@@ -7760,17 +7763,22 @@ mod tests {
         s.world.get_mut(c).unwrap().position = [12.0, 20.0, 130.0];
         for facing in [0.0, 90.0, 180.0, 270.0] {
             s.world.get_mut(tr).unwrap().facing = facing;
+            s.update_triggers(c);
             assert_eq!(run(&mut s, c, "IsInTrigger", &args), Some(Value::Int(1)));
         }
         s.world.get_mut(tr).unwrap().facing = 90.0;
         s.game = thedas_vfs::Game::DragonAge2;
+        s.update_triggers(c);
         assert_eq!(run(&mut s, c, "IsInTrigger", &args), Some(Value::Int(0)));
         s.world.get_mut(c).unwrap().position = [10.0, 22.0, 130.0];
+        s.update_triggers(c);
         assert_eq!(run(&mut s, c, "IsInTrigger", &args), Some(Value::Int(1)));
         s.game = thedas_vfs::Game::Origins;
+        s.update_triggers(c);
         assert_eq!(run(&mut s, c, "IsInTrigger", &args), Some(Value::Int(0)));
         s.world.get_mut(c).unwrap().position = [12.0, 20.0, 130.0];
         s.world.get_mut(c).unwrap().area = None;
+        s.update_triggers(c);
         assert_eq!(run(&mut s, c, "IsInTrigger", &args), Some(Value::Int(0)));
     }
 
