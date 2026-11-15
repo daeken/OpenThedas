@@ -618,7 +618,7 @@ fn fit(
     {
         let sat: Vec<&fit::Row> = rows
             .iter()
-            .filter(|r| r.terms.iter().map(|t| t.1).sum::<f32>() >= 0.45 && r.shipped[3] >= 24)
+            .filter(|r| r.reach.iter().any(|&(_, q)| q < 0.5))
             .collect();
         println!(
             "  occlusion models over {} saturated, lit texels",
@@ -654,9 +654,9 @@ fn fit(
                 ("(1-t/L)^2", 2),
                 ("(1-t/L)^0.5", 3),
             ] {
-                for li in [0.5f32, 1.0, 1.5, 2.0, 3.0, 5.0] {
+                for li in [1.0f32, 1.5, 2.0, 3.0, 4.0, 5.0] {
                     for lo in [0.0f32, -0.5, -1.0, -1.5, -2.0] {
-                        for pw in [1.0f32, 1.0 / 1.5, 0.5] {
+                        for pw in [1.0f32, 1.0 / 1.5, 0.5, 1.5, 2.0] {
                             let (mut se, mut n) = (0.0f64, 0);
                             for r in &sat {
                                 let hits = match cosine {
@@ -952,6 +952,123 @@ fn fit(
                 "found {} {} {} {} {} {} {}\n",
                 f.position.x, f.position.y, f.position.z, f.radius, f.color.x, f.color.y, f.color.z
             ));
+        }
+    }
+    // The shadow pass without occlusion: alpha / green = sm / lm_g (both carry the same
+    // occlusion), and lm_g comes from the fitted lightmap model. By light-strength quintile,
+    // on texels one light alone reaches.
+    if let Some(lf) = &last {
+        let mut per: BTreeMap<usize, Vec<(f64, f64)>> = BTreeMap::new();
+        for r in &rows {
+            let ([(i, t)], Some(room)) = (r.terms.as_slice(), r.room) else {
+                continue;
+            };
+            let (i, t) = (*i as usize, *t as f64);
+            if r.shipped[1] < 12 || r.shipped[3] == 0 {
+                continue;
+            }
+            let lin = lf.ambient[room as usize].y as f64
+                + lf.light_scale[i] * lights[i].color.y as f64 * t;
+            let lm_g = lin.max(0.0).powf(1.0 / settings.gamma as f64);
+            let sm = r.shipped[3] as f64 / r.shipped[1] as f64 * lm_g;
+            per.entry(i).or_default().push((t, sm));
+        }
+        for (i, mut pts) in per {
+            if pts.len() < 100 {
+                continue;
+            }
+            pts.sort_by(|a, b| a.0.total_cmp(&b.0));
+            let q: Vec<String> = pts
+                .chunks(pts.len().div_ceil(6))
+                .map(|c| {
+                    let mut v: Vec<f64> = c.iter().map(|p| p.1).collect();
+                    v.sort_by(f64::total_cmp);
+                    format!("S≈{:.3}: sm {:.2}", c[c.len() / 2].0, v[v.len() / 2])
+                })
+                .collect();
+            println!(
+                "  occlusion-free shadow pass {:24} {} texels: {}",
+                names.get(i).map(String::as_str).unwrap_or("?"),
+                pts.len(),
+                q.join(" | ")
+            );
+        }
+    }
+    // The alpha curve, light by light: on open texels that one light alone reaches, with
+    // alpha below saturation, regress ln(alpha) on ln(S): the slope is the curve's exponent
+    // and the intercept gives that light's scale (alpha = (k·S)^e).
+    {
+        let mut per: BTreeMap<usize, Vec<(f64, f64)>> = BTreeMap::new();
+        for r in &rows {
+            if let ([(i, t)], [(_, q)]) = (r.terms.as_slice(), r.reach.as_slice())
+                && open_model(r) >= 0.98
+                && r.shipped[3] > 10
+                && r.shipped[3] < 245
+                && *t > 0.0
+            {
+                let q = *q as f64;
+                let cos = *t as f64 / (1.0 - q).max(1e-6);
+                let feature = match std::env::var("THEDAS_BAKE_ALPHA_FEATURE").as_deref() {
+                    Ok("falloff") => 1.0 - q,
+                    Ok("cos") => cos,
+                    Ok("cos2") => (std::f64::consts::FRAC_PI_2 * q).cos().powi(2) * cos,
+                    Ok("invsq") => cos / (q * q).max(1e-4),
+                    _ => *t as f64,
+                };
+                per.entry(*i as usize)
+                    .or_default()
+                    .push((feature.max(1e-9).ln(), (r.shipped[3] as f64 / 255.0).ln()));
+            }
+        }
+        for (i, pts) in per.iter() {
+            if pts.len() < 100 {
+                continue;
+            }
+            // Median alpha by feature quintile.
+            let mut sorted = pts.clone();
+            sorted.sort_by(|a, b| a.0.total_cmp(&b.0));
+            let q: Vec<String> = sorted
+                .chunks(sorted.len().div_ceil(5))
+                .map(|c| {
+                    let mut a: Vec<f64> = c.iter().map(|p| p.1.exp() * 255.0).collect();
+                    a.sort_by(f64::total_cmp);
+                    format!(
+                        "S≈{:.3}: α̃ {:.0} [{:.0}..{:.0}]",
+                        c[c.len() / 2].0.exp(),
+                        a[a.len() / 2],
+                        a[a.len() / 10],
+                        a[a.len() * 9 / 10]
+                    )
+                })
+                .collect();
+            println!(
+                "  alpha by S quintile {}: {}",
+                names.get(*i).map(String::as_str).unwrap_or("?"),
+                q.join(" | ")
+            );
+            let i = *i;
+            let n = pts.len() as f64;
+            let (mx, my) = (
+                pts.iter().map(|p| p.0).sum::<f64>() / n,
+                pts.iter().map(|p| p.1).sum::<f64>() / n,
+            );
+            let sxy: f64 = pts.iter().map(|p| (p.0 - mx) * (p.1 - my)).sum();
+            let sxx: f64 = pts.iter().map(|p| (p.0 - mx).powi(2)).sum();
+            let e = sxy / sxx;
+            let b = my - e * mx;
+            let k = (b / e).exp();
+            let resid = (pts
+                .iter()
+                .map(|p| (p.1 - (b + e * p.0)).powi(2))
+                .sum::<f64>()
+                / n)
+                .sqrt();
+            println!(
+                "  alpha curve {:28} {} texels: exponent {e:.3}, scale k {k:.3}, ln-residual {resid:.3}, runtime colour {:?}",
+                names.get(i).map(String::as_str).unwrap_or("?"),
+                pts.len(),
+                lights[i].color
+            );
         }
     }
     // Which lights the shadow pass took: a light whose texels (those no other light reaches)
