@@ -190,8 +190,7 @@ The player lives in `crates/thedas-gfx`:
   Dragging extends the selection, including outside the field until release; Shift-click
   retains its anchor. Picking uses the field's inverse world transform and the layout's
   aligned, wrapped and scrolled character advances, including spaces and missing glyphs.
-- Remaining work includes complete text `shadowStyle`, inline-image host-helper equivalence,
-  cached bitmap alpha masks, and broader interaction parity.
+- Remaining work includes cached bitmap alpha masks and broader interaction parity.
 - Tools: `cargo run -p thedas-ui --example capture -- INSTALL OUT.png MOVIES [FRAMES]
   [WxH]` captures the player once and reports timings. `SF_CAPTURE_SETUP` supplies optional
   `call`/`set` steps. This replaces the former `sidebyside` comparison example.
