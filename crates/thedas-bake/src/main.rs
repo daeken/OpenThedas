@@ -70,6 +70,13 @@ struct Args {
     /// With --fit: look for this many missing (baked-only) lights in the residual.
     #[arg(long, default_value_t = 0)]
     discover: usize,
+    /// Merge the per-atlas fits under this directory (`fit-*/fit.txt`) into
+    /// `<dir>/<level>.lightset.json` and exit.
+    #[arg(long)]
+    lightset: Option<PathBuf>,
+    /// List the level's lightmap atlases and exit.
+    #[arg(long)]
+    list: bool,
     /// Fit every n-th texel.
     #[arg(long, default_value_t = 2)]
     stride: u32,
@@ -87,6 +94,12 @@ fn main() -> Result<()> {
     let started = Instant::now();
     let scene = AreaScene::load(&vfs, &level)?;
     let bake = BakeScene::new(&scene, &vfs);
+    if args.list {
+        for (a, regions) in &bake.atlases {
+            println!("{a} {}", regions.len());
+        }
+        return Ok(());
+    }
     if let Ok(model) = std::env::var("THEDAS_BAKE_FIND") {
         for (ri, r) in bake.regions.iter().enumerate() {
             let d = &scene.draws[r.draw];
@@ -192,6 +205,9 @@ fn main() -> Result<()> {
         });
     }
 
+    if let Some(dir) = &args.lightset {
+        return lightset(dir, &level, &points, &names, &ambient);
+    }
     // A fit's results replace the RGB pass's light brightness and the room ambients.
     if let Some(path) = &args.use_fit {
         let text = std::fs::read_to_string(path)?;
@@ -964,6 +980,114 @@ fn fit(
     }
     std::fs::create_dir_all(&args.out)?;
     std::fs::write(args.out.join("fit.txt"), out)?;
+    Ok(())
+}
+
+/// The fitted light set: what the shipped lightmaps say the bake's lights were, merged over
+/// every atlas's fit (see docs/lightmaps/baker-spec.md, "Light sets").
+fn lightset(
+    dir: &Path,
+    level: &str,
+    points: &[BakeLight],
+    names: &[String],
+    ambient: &BTreeMap<String, Vec3>,
+) -> Result<()> {
+    use serde_json::json;
+    let mut rooms: BTreeMap<String, (Vec3, u32)> = BTreeMap::new();
+    let mut scale: Vec<(f64, u32)> = vec![(0.0, 0); points.len()];
+    let mut noshadow: Vec<u32> = vec![0; points.len()];
+    let mut atlases = 0u32;
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let Some(atlas) = name.strip_prefix("fit-") else {
+            continue;
+        };
+        let Ok(text) = std::fs::read_to_string(path.join("fit.txt")) else {
+            continue;
+        };
+        atlases += 1;
+        for line in text.lines() {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            match f.as_slice() {
+                ["ambient", room, r, g, b, ..] => {
+                    let e = rooms.entry(room.to_string()).or_insert((Vec3::ZERO, 0));
+                    e.0 += Vec3::new(r.parse()?, g.parse()?, b.parse()?);
+                    e.1 += 1;
+                }
+                ["light", i, k, ..] => {
+                    let (i, k): (usize, f64) = (i.parse()?, k.parse()?);
+                    if k > 0.0
+                        && let Some(e) = scale.get_mut(i)
+                    {
+                        e.0 += k;
+                        e.1 += 1;
+                    }
+                }
+                ["noshadow", i] => {
+                    if let Some(e) = noshadow.get_mut(i.parse::<usize>()?) {
+                        *e += 1;
+                    }
+                }
+                ["found", x, y, z, r, cr, cg, cb] => found.push(json!({
+                    "position": [x.parse::<f32>()?, y.parse::<f32>()?, z.parse::<f32>()?],
+                    "radius": r.parse::<f32>()?,
+                    "color": [cr.parse::<f32>()?, cg.parse::<f32>()?, cb.parse::<f32>()?],
+                    "atlas": atlas,
+                })),
+                _ => {}
+            }
+        }
+    }
+    let lights: Vec<_> = points
+        .iter()
+        .enumerate()
+        .map(|(i, l)| {
+            let (kind, position, radius) = match l.kind {
+                LightKind::Point { position, radius } => ("point", position.to_array(), radius),
+                LightKind::Directional { toward } => ("sun", toward.to_array(), 0.0),
+                LightKind::Ambient => ("ambient", [0.0; 3], 0.0),
+            };
+            let (sum, n) = scale[i];
+            json!({
+                "name": names.get(i),
+                "kind": kind,
+                "position": position,
+                "radius": radius,
+                "color": l.color.to_array(),
+                "baked_brightness": if n > 0 { Some(sum / n as f64) } else { None },
+                "fitted_atlases": n,
+                "in_alpha": noshadow[i] == 0,
+            })
+        })
+        .collect();
+    let rooms: serde_json::Map<String, serde_json::Value> = rooms
+        .into_iter()
+        .map(|(room, (sum, n))| {
+            let c = sum / n as f32;
+            (
+                room.clone(),
+                json!({
+                    "baked_ambient": c.to_array(),
+                    "runtime_ambient": ambient.get(&room).map(|a| a.to_array()),
+                }),
+            )
+        })
+        .collect();
+    let doc = json!({
+        "level": level,
+        "atlases_fitted": atlases,
+        "note": "Fitted from the shipped lightmaps by thedas-bake --fit; see docs/lightmaps/baker-spec.md. Linear colours; baked light = colour × baked_brightness × max(0, 1 − d/radius) × |N·L|, gamma 1.5 in the lightmap.",
+        "rooms": rooms,
+        "lights": lights,
+        "found": found,
+    });
+    let out = dir.join(format!("{level}.lightset.json"));
+    std::fs::write(&out, serde_json::to_string_pretty(&doc)?)?;
+    eprintln!("wrote {} ({atlases} atlases)", out.display());
     Ok(())
 }
 
