@@ -111,8 +111,8 @@ as #739.
 ## Known gaps
 
 From `docs/deferred.md` and `docs/notes/deferred-*.md`:
-- Tangent frames still come from screen derivatives, not the meshes' tangents. Static1's
-  material tint is missing.
+- G-buffer surfaces use authored mesh tangent/binormal frames, with derivatives for
+  missing or degenerate frames. Static1's material tint is missing.
 - Not yet in the G-buffer: hair (lit forward), unsupported alpha/blended families,
   Char2 (low detail), and far tree billboards. Character rim light, skin scattering,
   gore/heraldry and remote materials are not represented.

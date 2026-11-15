@@ -48,7 +48,7 @@ fn obj(a: &[Value], i: usize) -> ObjectId {
 }
 
 /// The independent placeable current, retaining explicit currents from older saves.
-fn origins_placeable_health(o: &Object) -> i32 {
+pub(crate) fn origins_placeable_health(o: &Object) -> i32 {
     o.properties.get(&7).map_or_else(
         || i32::from(o.fields.get("Health").copied().unwrap_or(0) as i16),
         |p| p.1.round() as i32,
@@ -3297,19 +3297,7 @@ pub fn call(
         "SetPlaceableHealth" => {
             // 0x65a250 -> 0x74e8e0: signed-short current, independent of
             // maximum and object flags. The scripts send their own DEATH event.
-            let current = i32::from(int(a, 1) as i16);
-            if h.sim.game == thedas_vfs::Game::Origins
-                && let Some(o) = h.sim.world.get_mut(obj(a, 0))
-                && o.kind == ObjectKind::Placeable
-            {
-                o.fields.insert("Health".into(), current);
-                if let Some(p) = o.properties.get_mut(&7) {
-                    p.1 = current as f32;
-                }
-                if current <= 0 && o.inventory.is_empty() {
-                    o.interactive = false;
-                }
-            }
+            h.sim.set_placeable_health(obj(a, 0), int(a, 1));
             void()
         }
         "GetHealth" => {
@@ -3642,13 +3630,23 @@ pub fn call(
             }
             void()
         }
-        // Heartbeats: EVENT_TYPE_HEARTBEAT2 every interval until EndHeartbeat.
+        // Origins keeps a per-creature clock; neither setter queues an event.
         "InitHeartbeat" | "EndHeartbeat"
             if h.sim.game == thedas_vfs::Game::Origins
                 && h.object(obj(a, 0))
                     .is_none_or(|o| o.kind != ObjectKind::Creature) =>
         {
             // 0x666380 / 0x666400 both require the creature lookup 0x5d58c0.
+            void()
+        }
+        "InitHeartbeat" | "EndHeartbeat" if h.sim.game == thedas_vfs::Game::Origins => {
+            if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
+                o.fields.remove("HeartbeatMs");
+                o.heartbeat = (name == "InitHeartbeat").then(|| crate::world::Heartbeat {
+                    interval_bits: float(a, 1).to_bits(),
+                    elapsed: 0.0,
+                });
+            }
             void()
         }
         "InitHeartbeat" => {
@@ -7981,11 +7979,26 @@ mod tests {
                     &[Value::Object(id), Value::Float(2.0)],
                 );
                 let accepted = game == thedas_vfs::Game::DragonAge2 || kind == ObjectKind::Creature;
+                let native = game == thedas_vfs::Game::Origins && accepted;
+                let o = s.world.get(id).unwrap();
                 assert_eq!(
-                    s.world.get(id).unwrap().fields["HeartbeatMs"],
-                    if accepted { 2000 } else { 600 }
+                    o.fields.get("HeartbeatMs").copied(),
+                    if native {
+                        None
+                    } else if accepted {
+                        Some(2000)
+                    } else {
+                        Some(600)
+                    }
                 );
-                assert_eq!(s.world.queue.len(), queue_len + usize::from(accepted));
+                assert_eq!(
+                    o.heartbeat.map(|c| (c.interval(), c.elapsed)),
+                    native.then_some((2.0, 0.0))
+                );
+                assert_eq!(
+                    s.world.queue.len(),
+                    queue_len + usize::from(accepted && !native)
+                );
                 if !accepted {
                     assert_eq!(s.save_json().unwrap(), before);
                 }
@@ -7998,6 +8011,7 @@ mod tests {
                     if accepted { None } else { Some(600) }
                 );
                 assert_eq!(s.world.queue.len(), queued);
+                assert!(s.world.get(id).unwrap().heartbeat.is_none());
                 if !accepted {
                     assert_eq!(s.save_json().unwrap(), before);
                 }
