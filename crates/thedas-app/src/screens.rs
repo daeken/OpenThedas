@@ -81,7 +81,13 @@ impl Screen {
             Screen::Store => &["store.gfx", "tooltips.gfx"],
             Screen::Chanters => &["chanters.gfx", "tooltips.gfx"],
             Screen::LevelUp => &["levelup.gfx", "tooltips.gfx"],
-            Screen::Inventory => &["inventory.gfx", "navbar.gfx", "tooltips.gfx"],
+            // The quickbar stays up over the screens items and abilities are dragged from.
+            Screen::Inventory => &[
+                "inventory.gfx",
+                "quickbar.gfx",
+                "navbar.gfx",
+                "tooltips.gfx",
+            ],
             Screen::CharacterRecord => &["characterrecord.gfx", "navbar.gfx", "tooltips.gfx"],
             Screen::Tactics => &["tactics.gfx", "navbar.gfx", "tooltips.gfx"],
             Screen::AreaMap => &["map.gfx", "navbar.gfx", "tooltips.gfx"],
@@ -92,9 +98,12 @@ impl Screen {
             // Quick Play and finishing ask for confirmation on the popup layer.
             Screen::CharGen => &["chargen.gfx", "popuplayer.gfx"],
             Screen::Journal => &["journal.gfx", "navbar.gfx", "tooltips.gfx"],
-            Screen::Skills | Screen::SpellsTalents => {
-                &["abilities.gfx", "navbar.gfx", "tooltips.gfx"]
-            }
+            Screen::Skills | Screen::SpellsTalents => &[
+                "abilities.gfx",
+                "quickbar.gfx",
+                "navbar.gfx",
+                "tooltips.gfx",
+            ],
             // Settings that need confirming (a new resolution) ask on the popup layer.
             Screen::Options => &["optionsmenu.gfx", "popuplayer.gfx"],
             // Over the screen it was opened from (see `with_examine`).
