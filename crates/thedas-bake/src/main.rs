@@ -45,6 +45,11 @@ struct Args {
     /// Experimental soft shadows for point lights: "radius,samples".
     #[arg(long, value_parser = parse_ke)]
     light_size: Option<(f32, f32)>,
+    /// The settings that best reproduce the shipped atlases (docs/lightmaps/baker-spec.md §6):
+    /// the fitted occlusion model and a one-texel dilation, over the toolset's monochrome
+    /// shadow pass. Use with `--use-fit` for the lights, bake radii and ambients.
+    #[arg(long)]
+    shipped: bool,
     /// Grow each part's covered area by this many texels.
     #[arg(long, default_value_t = 0)]
     dilate: u32,
@@ -142,18 +147,26 @@ fn main() -> Result<()> {
         ao_rays: args.ao_rays,
         ao_length: args.ao_length,
         ao_converged: args.ao_converged,
-        dilate: args.dilate,
+        dilate: if args.shipped && args.dilate == 0 {
+            1
+        } else {
+            args.dilate
+        },
         light_size: args.light_size.map(|(r, n)| (r, n as u32)),
-        ao_model: args.ao_model.as_deref().map(|s| {
-            let v: Vec<f32> = s.split(',').filter_map(|x| x.trim().parse().ok()).collect();
-            thedas_bake::bake::AoModel {
-                length: v.first().copied().unwrap_or(1.5),
-                exponent: v.get(1).copied().unwrap_or(2.0),
-                lo: v.get(2).copied().unwrap_or(-1.0),
-                power: v.get(3).copied().unwrap_or(1.0),
-                hi: v.get(4).copied().unwrap_or(1.0),
-            }
-        }),
+        ao_model: args
+            .ao_model
+            .as_deref()
+            .or(args.shipped.then_some("1.5,2,-1,1,1"))
+            .map(|s| {
+                let v: Vec<f32> = s.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+                thedas_bake::bake::AoModel {
+                    length: v.first().copied().unwrap_or(1.5),
+                    exponent: v.get(1).copied().unwrap_or(2.0),
+                    lo: v.get(2).copied().unwrap_or(-1.0),
+                    power: v.get(3).copied().unwrap_or(1.0),
+                    hi: v.get(4).copied().unwrap_or(1.0),
+                }
+            }),
         shadow_model: match args.shadow_intensity {
             Some((k, e)) => thedas_bake::bake::ShadowModel::Intensity { k, e },
             None => thedas_bake::bake::ShadowModel::Monochrome,
