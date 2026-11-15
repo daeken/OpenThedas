@@ -461,9 +461,26 @@ pub fn display_set(vm: &mut Vm, d: DisplayId, name: &str, v: &Value) -> bool {
 /// Resizes an auto-sized field's box to its text.
 pub fn apply_autosize(vm: &mut Vm, d: DisplayId) {
     let fonts = vm.fonts.clone();
+    let movie = vm.movie.clone();
+    let host = &mut vm.host;
     let Some(t) = vm.display.get_mut(d).and_then(|o| o.text_mut()) else {
         return;
     };
+    t.resolve_images(|src| {
+        if let Some(image) = movie.image(src) {
+            return Some(crate::text::ImageResource {
+                url: image.file.clone(),
+                width: image.width as f32,
+                height: image.height as f32,
+            });
+        }
+        host.image_size(src)
+            .map(|(w, h)| crate::text::ImageResource {
+                url: src.to_string(),
+                width: w as f32,
+                height: h as f32,
+            })
+    });
     if t.auto_size == AutoSize::None {
         return;
     }
@@ -749,10 +766,7 @@ fn mc_unload_movie(vm: &mut Vm, this: Value, _: &[Value]) -> Value {
 
 fn bitmap_load(vm: &mut Vm, this: Value, args: &[Value]) -> Value {
     let name = vm.to_str(&arg(args, 0));
-    let image = vm.movie.exports.get(&name.to_ascii_lowercase())
-        .and_then(|id| vm.movie.characters.get(id))
-        .or_else(|| vm.movie.characters.values().find(|c| matches!(c, crate::swf::Character::Image(i) if i.export_name.eq_ignore_ascii_case(&name))));
-    let Some(crate::swf::Character::Image(image)) = image else {
+    let Some(image) = vm.movie.image(&name) else {
         return Value::Null;
     };
     let (url, width, height) = (image.file.clone(), image.width, image.height);
