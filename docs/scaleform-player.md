@@ -149,6 +149,11 @@ The player lives in `crates/thedas-gfx`:
   chargen click-through as well as the simulation gates.
 - Historical comparisons under `OpenThedas-testdata/sf-compare` remain unchanged.
 - A movie that did not change is not drawn again.
+- Window leave clears rollover and drag-over state immediately and keeps picking
+  disabled through later frame/layout changes. Re-entering at the same coordinates
+  restores hover. Captured releases outside still reach the pressed control without
+  activating it, and leaving does not move a text selection or discard text focus.
+  The `leave` automation step follows the same movie path as native window leave.
 - Display objects stringify to their paths and unnamed timeline clips/text fields receive
   unique `instanceN` names. Host tree walks can now configure notification multiply passes
   (removing the black bands behind popups) and find menu buttons. Popup vertical placement
