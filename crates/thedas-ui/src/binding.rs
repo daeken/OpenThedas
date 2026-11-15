@@ -887,7 +887,7 @@ fn sim_values_with(
     // sets both; a tutorial that pauses the game sets only `Client.Paused`, as
     // DAOrigins.exe's TutorialControl does (0x6940ec: the client pause, 0x5d6740, with
     // its user flag off), so the border shows then too.
-    let paused = shown.paused || sim.world.tutorial_paused || sim.training_paused();
+    let paused = shown.paused || sim.tutorial_paused() || sim.training_paused();
     v.insert("Client.Paused".into(), num(u8::from(paused)));
     v.insert("Client.UserPaused".into(), num(u8::from(shown.paused)));
     if let Some(p) = shown.book_page {
@@ -957,7 +957,8 @@ fn sim_values_with(
     // Provisional: the original's rule for a tutorial waiting while a menu is up is not
     // traced; QA saw the panel over the options, save and game menus, where it does not
     // belong.
-    let tutorials: &[thedas_sim::journal::Tutorial] = if shown.menu_up {
+    let tutorials_held = shown.menu_up || sim.tutorials_held();
+    let tutorials: &[thedas_sim::journal::Tutorial] = if tutorials_held {
         &[]
     } else {
         &sim.world.tutorials
@@ -968,7 +969,7 @@ fn sim_values_with(
             tutorials
                 .iter()
                 .map(|t| t.resref.as_str())
-                .chain(shown.pad_active.then_some("pad"))
+                .chain((shown.pad_active && !sim.tutorials_held()).then_some("pad"))
                 .collect::<Vec<_>>()
                 .join(","),
         ),
@@ -1004,7 +1005,11 @@ fn sim_values_with(
     // The training step shown (`trainingsteps.gda`'s row; 0 none), see `thedas_sim::training`.
     v.insert(
         "Tutorials.TrainingStep".into(),
-        num(sim.world.training.step),
+        num(if sim.tutorials_held() {
+            0
+        } else {
+            sim.world.training.step
+        }),
     );
     // The tutorials' screen highlights (DAConstants `GUI_HIGHLIGHT_*`: 0 follower, 1
     // tactics, 2 inventory, 3 health poultice, 4 empty quickbar, 5 tactic preset, 6
@@ -2205,6 +2210,41 @@ fn inventory(sim: &Sim, who: Option<u32>, filter: i32, v: &mut BTreeMap<String, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cinematic_tutorials_wait_and_reappear_with_their_pause() {
+        let mut sim = Sim::new(
+            std::sync::Arc::new(thedas_vfs::Vfs::new()),
+            std::sync::Arc::new(thedas_script::EngineTable::default()),
+            1,
+        );
+        sim.world.tutorials.push(thedas_sim::journal::Tutorial {
+            resref: "lesson".into(),
+            title: None,
+            text: None,
+            pauses: true,
+        });
+        sim.world.tutorial_paused = true;
+        sim.world.training.step = 7;
+        sim.world.cutscenes.push("intro.cut".into());
+        let shown = Presentation {
+            pad_active: true,
+            ..Default::default()
+        };
+        let v = sim_values_for(&sim, &shown);
+        assert_eq!(v["Tutorials.TutorialList"], UiValue::String(String::new()));
+        assert_eq!(v["Tutorials.TrainingStep"], num(0));
+        assert_eq!(v["Client.Paused"], num(0));
+        assert_eq!(sim.world.tutorials.len(), 1);
+        sim.world.cutscenes.clear();
+        let v = sim_values_for(&sim, &shown);
+        assert_eq!(
+            v["Tutorials.TutorialList"],
+            UiValue::String("lesson,pad".into())
+        );
+        assert_eq!(v["Tutorials.TrainingStep"], num(7));
+        assert_eq!(v["Client.Paused"], num(1));
+    }
 
     #[test]
     fn empty_party_slots_read_as_no_creature() {
