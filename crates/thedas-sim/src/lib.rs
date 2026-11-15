@@ -57,6 +57,7 @@ pub mod tactics;
 pub mod threat;
 pub mod trace;
 pub mod training;
+pub mod vfx;
 pub mod voice;
 pub mod world;
 pub mod worldmap;

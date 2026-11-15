@@ -1291,7 +1291,7 @@ pub fn visual_effects(sim: &Sim, o: &Object) -> Vec<EffectModel> {
             model,
             key: format!("{base}_{n}"),
             started_ms: Some(v.started_ms),
-            lasting: false,
+            lasting: v.lasting,
         });
     }
     out
@@ -1355,7 +1355,7 @@ pub fn location_vfx_models(sim: &Sim, area: ObjectId) -> Vec<ObjectModel> {
                     model: model(v.vfx)?,
                     key: format!("i{}_{}", v.vfx, v.started_ms),
                     started_ms: Some(v.started_ms),
-                    lasting: false,
+                    lasting: v.lasting,
                 }],
                 ..at(id, v.vfx, v.position, v.facing)
             })
@@ -1540,6 +1540,8 @@ mod tests {
                 position: [1.0, 2.0, 3.0],
                 facing: 45.0,
                 started_ms: 0,
+                ms: 2000,
+                lasting: false,
             });
         let drawn = location_vfx_models(&s, area);
         assert_eq!(drawn.len(), 1);
