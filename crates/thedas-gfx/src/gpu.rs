@@ -9,12 +9,13 @@ use std::sync::{Arc, Mutex};
 
 use crate::tess::Vertex;
 
-/// A vertex as the shaders read it from storage (24 bytes, std430 alignment).
+/// A vertex as the shaders read it from storage (32 bytes, std430 alignment).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct GpuVertex {
     pub pos: [f32; 2],
     pub uv: [f32; 2],
+    pub extrude: [f32; 2],
     pub color: u32,
     pub _pad: u32,
 }
@@ -24,6 +25,7 @@ impl From<&Vertex> for GpuVertex {
         Self {
             pos: v.pos,
             uv: v.uv,
+            extrude: v.extrude,
             color: u32::from_le_bytes(v.color),
             _pad: 0,
         }
