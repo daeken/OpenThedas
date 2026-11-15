@@ -30,9 +30,14 @@
 //!   barely turn the body (their root turns under 20°): the exe turns the creature while
 //!   they play, so the facing drawn turns from the old to the new over the clip.
 //!
-//! Provisional (not mirrored): walking and the run/walk weights by speed, leaning into
-//! turns, the playback rate following speed, authored transition curves (`.tbi`), and the
-//! agent's time scale. The facing drawn during a turn clip turns evenly over the clip (the
+//! - **The cycle** (0xa6b7a0): `Run` against `Walk` by speed (the speed over the run
+//!   speed once past the walk speed), the run leaning into turns (`runleanl` /
+//!   `runleanr` by the turn rate, full at a quarter turn a second, eased in steps,
+//!   0xa6dee0, 0xa6e0ef), every cycle clip started together and played at one rate that
+//!   follows the speed (0xa6aa70), so walking, running and leaning show one gait.
+//!
+//! Provisional (not mirrored): walking backwards and the combat directional walks, authored
+//! transition curves (`.tbi`), and the agent's time scale. The facing drawn during a turn clip turns evenly over the clip (the
 //! exe's turning of the creature, a separate mechanism, is not traced). Weights blend the
 //! poses in order rather than by the exe's tree evaluation (0x814c22).
 
@@ -146,6 +151,79 @@ enum Phase {
     Turning,
 }
 
+/// A creature's speeds for its running cycle (`apr_base.gda`): how fast it moves now, the
+/// speeds above which it walks and runs (0x958f23c8, 0xa0dcd78c: 1.54 and 6 for humans),
+/// and the speeds its walk and run clips are made for (0xcd9cc343, 0xbd6d4446: 1.54 and
+/// 3.62), read at 0xa6b52e–0xa6b592.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Pace {
+    pub speed: f32,
+    pub walk: f32,
+    pub run: f32,
+    pub walk_clip: f32,
+    pub run_clip: f32,
+    pub combat: bool,
+}
+
+impl Pace {
+    /// `Run`'s share against `Walk` (0xa69b50): all of it in combat, else the speed over the
+    /// run speed once past the walk speed (not clamped in the exe; clamped here to blend).
+    fn run_share(&self) -> f32 {
+        if self.combat {
+            1.0
+        } else if self.speed > self.walk && self.run > 0.0 {
+            (self.speed / self.run).clamp(0.0, 1.0)
+        } else {
+            0.0
+        }
+    }
+
+    /// The running cycle's playback rate (0xa6aa70): speed over the walk clip's speed below
+    /// the walk speed, over the run clip's above the run speed, and between them the two
+    /// rates at those speeds mixed by how far between it is. Provisional in combat (the
+    /// exe's combat threshold and clip speed are other columns): the run's rule.
+    fn rate(&self) -> f32 {
+        const EPS: f32 = 1e-6;
+        let (s, w, r) = (self.speed, self.walk, self.run);
+        let over = |v: f32, clip: f32| if clip > EPS { v / clip } else { 1.0 };
+        if self.combat || (r - w).abs() <= EPS || s > r - EPS {
+            over(s, self.run_clip)
+        } else if s < w + EPS {
+            over(s, self.walk_clip)
+        } else {
+            let f = (s - w) / (r - w);
+            let (a, b) = (over(w, self.walk_clip), over(r, self.run_clip));
+            a + (b - a) * f
+        }
+    }
+}
+
+/// One step of the lean toward `target` (0xa6e0ef): a new step starts at 0.001·ms, grows by
+/// half each tick up to 0.002·ms, or at least 0.05·ms when the lean reverses; equal to the
+/// target, the step is forgotten. Back to straight (no turn), 0xa6ddc0 grows it up to
+/// 0.05·ms.
+fn lean_toward(lean: &mut (f32, Option<f32>), target: f32, ms: f32, straightening: bool) {
+    let (value, step) = lean;
+    if *value == target {
+        *step = None;
+        return;
+    }
+    let reverses = *value * target < 0.0;
+    let s = match *step {
+        None => 0.001 * ms,
+        Some(old) if straightening => (1.5 * old).min(0.05 * ms),
+        Some(old) if reverses => (1.5 * old).max(0.05 * ms),
+        Some(old) => (1.5 * old).min(0.002 * ms),
+    };
+    *step = Some(s);
+    let d = target - *value;
+    *value = if d.abs() <= s {
+        target
+    } else {
+        *value + s * d.signum()
+    };
+}
+
 /// The drawn facing turning from one facing to another over a clip: the exe turns the
 /// creature while its turn clip plays (the clips themselves barely turn the root).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -177,8 +255,15 @@ struct Gait {
     clip: Option<(String, u64)>,
     /// The one-shot it replaced, fading out.
     previous: Option<(String, u64, Fader)>,
-    /// When the running cycle started (ms) and its offset (seconds).
-    cycle: (u64, f32),
+    /// How far the running cycle has played (seconds of clip time): its clips start
+    /// together and advance at one playback rate (0xa69ad0, 0xa6b5d0).
+    cycle: f32,
+    /// `Run`'s weight against `Walk` (0xa69b50), fading at 4/s.
+    run: Fader,
+    /// The lean into a turn, -1 (right) to 1 (left), and the step it moves by (0xa6e0ef).
+    lean: (f32, Option<f32>),
+    /// The lean's node weights fading at 4/s.
+    lean_weight: Fader,
     /// The stop clip the start clip's markers named, for a stop before the cycle's first.
     start_next: Option<String>,
     /// The movement trees the run came from.
@@ -191,6 +276,8 @@ struct Gait {
     facing: Option<f32>,
     /// The drawn facing's turn, while a turn clip plays.
     turn: Option<Turn>,
+    /// The creature's speed when last moving (m/s).
+    pace: f32,
 }
 
 impl Gait {
@@ -202,24 +289,27 @@ impl Gait {
             motion: Fader::at(0.0),
             clip: None,
             previous: None,
-            cycle: (0, 0.0),
+            cycle: 0.0,
+            run: Fader::at(1.0),
+            lean: (0.0, None),
+            lean_weight: Fader::at(0.0),
             start_next: None,
             trees: Vec::new(),
             last: None,
             speed: (1.0, 1.0),
             facing: None,
             turn: None,
+            pace: 0.0,
         }
     }
 
     /// Already running (first seen moving): the cycle at full weight.
-    fn running(now: u64, trees: Vec<String>) -> Self {
+    fn running(trees: Vec<String>) -> Self {
         Gait {
             phase: Phase::Running,
             standing: Fader::at(0.0),
             layer: Fader::at(1.0),
             motion: Fader::at(1.0),
-            cycle: (now, 0.0),
             trees,
             ..Gait::idle()
         }
@@ -257,8 +347,8 @@ impl Gait {
         (f < 1.0).then(|| (t.from + t.by * f).rem_euclid(360.0))
     }
 
-    fn cycle_time(&self, now: u64) -> f32 {
-        now.saturating_sub(self.cycle.0) as f32 / 1000.0 + self.cycle.1
+    fn cycle_time(&self, _now: u64) -> f32 {
+        self.cycle
     }
 }
 
@@ -268,7 +358,24 @@ pub struct Locomotion {
     gaits: HashMap<ObjectId, Gait>,
     /// By (tree, action): the clip's files, read once.
     clips: HashMap<(String, String), Option<Arc<ClipInfo>>>,
+    /// By appearance: its walk and run speeds and its clips' (see [`Pace`]).
+    speeds: HashMap<i32, [f32; 4]>,
     last_ms: Option<u64>,
+}
+
+/// An appearance's `apr_base.gda` speeds: walk, run, the walk clip's and the run clip's
+/// (0 where missing).
+fn appearance_speeds(sim: &Sim, appearance: i32) -> [f32; 4] {
+    let Some(t) = sim.world.tables().get(0, "apr_base") else {
+        return [0.0; 4];
+    };
+    [0x958f_23c8u32, 0xa0dc_d78c, 0xcd9c_c343, 0xbd6d_4446].map(|h| {
+        match t.cell_by_hash(h, appearance as i64) {
+            Some(thedas_formats::gda::Cell::Float(v)) => *v as f32,
+            Some(thedas_formats::gda::Cell::Int(v)) => *v as f32,
+            _ => 0.0,
+        }
+    })
 }
 
 impl Locomotion {
@@ -309,7 +416,7 @@ impl Locomotion {
             };
             let gait = self.gaits.entry(m.id).or_insert_with(|| {
                 if running {
-                    Gait::running(now, motion.trees.clone())
+                    Gait::running(motion.trees.clone())
                 } else {
                     Gait::idle()
                 }
@@ -340,6 +447,21 @@ impl Locomotion {
                 Some(motion.clone())
             };
             let trees = gait.trees.clone();
+            if running && let Some(c) = o.commands.first() {
+                gait.pace = sim.command_speed(m.id, c);
+            }
+            let speeds = *self
+                .speeds
+                .entry(o.appearance)
+                .or_insert_with(|| appearance_speeds(sim, o.appearance));
+            let pace = Pace {
+                speed: gait.pace,
+                walk: speeds[0],
+                run: speeds[1],
+                walk_clip: speeds[2],
+                run_clip: speeds[3],
+                combat: o.combat.in_combat,
+            };
             step(
                 gait,
                 &mut self.clips,
@@ -347,6 +469,7 @@ impl Locomotion {
                 &trees,
                 moving,
                 m.facing,
+                pace,
                 now,
                 dt,
             );
@@ -477,9 +600,11 @@ fn step(
     trees: &[String],
     moving: bool,
     facing: f32,
+    pace: Pace,
     now: u64,
     dt: f32,
 ) {
+    let facing_change = gait.facing.map_or(0.0, |f| turned(f, facing));
     // How far the simulation turned the creature since last frame, from the facing drawn
     // (a turn under way turns on from where it is).
     let drawn = gait.drawn_facing(now).or(gait.facing).unwrap_or(facing);
@@ -522,7 +647,7 @@ fn step(
             } else {
                 // No start clip: straight into the cycle.
                 gait.phase = Phase::Running;
-                gait.cycle = (now, 0.0);
+                gait.cycle = 0.0;
                 gait.layer.to(1.0, MOVE_RATE);
                 gait.motion.to(1.0, MOVE_RATE);
                 gait.standing.to(0.0, CLEAR_RATE);
@@ -536,7 +661,7 @@ fn step(
             }
             if info.as_ref().is_none_or(|i| t >= i.length) {
                 gait.phase = Phase::Running;
-                gait.cycle = (now, info.and_then(|i| i.offset).unwrap_or(0.0));
+                gait.cycle = info.and_then(|i| i.offset).unwrap_or(0.0);
                 gait.motion.to(1.0, MOVE_RATE);
             }
         }
@@ -585,6 +710,26 @@ fn step(
         }
         (Phase::Running, true) | (Phase::Idle, false) => {}
     }
+    // The running cycle: run against walk by speed, the lean into turns, all its clips
+    // advancing together at the speed's playback rate.
+    gait.run.to(pace.run_share(), MOVE_RATE);
+    let ms = dt * 1000.0;
+    let leaning = gait.phase == Phase::Running && !pace.combat && pace.speed > pace.run - 1e-6;
+    if leaning && facing_change.abs() > 1e-4 && dt > 0.0 {
+        // 0xa6dee0: the turn this tick over a quarter turn a second, clamped; anticlockwise
+        // (left) positive.
+        let target =
+            (facing_change.to_radians() / (dt * std::f32::consts::FRAC_PI_2)).clamp(-1.0, 1.0);
+        lean_toward(&mut gait.lean, target, ms, false);
+    } else {
+        lean_toward(&mut gait.lean, 0.0, ms, true);
+    }
+    gait.lean_weight.to(gait.lean.0, MOVE_RATE);
+    if gait.layer.value > 0.0 || gait.phase == Phase::Running {
+        gait.cycle += dt * pace.rate();
+    }
+    gait.run.step(dt);
+    gait.lean_weight.step(dt);
     gait.standing.step(dt);
     gait.layer.step(dt);
     gait.motion.step(dt);
@@ -645,16 +790,27 @@ fn compose(
         ))
         .is_none_or(|c| c.is_some());
     if cycle_known {
-        parts.push((
-            Motion {
-                trees: gait.trees.clone(),
-                actions: vec![action::RUN.into()],
-                time: gait.cycle_time(now),
-                looping: true,
-                blend: Vec::new(),
-            },
-            layer * motion,
-        ));
+        // `Walk` and `Run` by speed; within them the straight clips and the leans
+        // (0xa69bd0): walkf and runf 1 − |lean|, runleanl the lean left, runleanr right.
+        let q = gait.run.value;
+        let l = gait.lean_weight.value;
+        for (a, w) in [
+            (action::WALK, (1.0 - q) * (1.0 - l.abs())),
+            (action::RUN, q * (1.0 - l.abs())),
+            (action::LEAN_LEFT, q * l.max(0.0)),
+            (action::LEAN_RIGHT, q * (-l).max(0.0)),
+        ] {
+            parts.push((
+                Motion {
+                    trees: gait.trees.clone(),
+                    actions: vec![a.into()],
+                    time: gait.cycle_time(now),
+                    looping: true,
+                    blend: Vec::new(),
+                },
+                layer * motion * w,
+            ));
+        }
     }
     blend(parts)
 }
@@ -675,6 +831,68 @@ fn blend(parts: Vec<(Motion, f32)>) -> Option<Motion> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Running at the run speed, its clip made for it: the cycle plays at 1×.
+    const PACE: Pace = Pace {
+        speed: 6.0,
+        walk: 1.54,
+        run: 6.0,
+        walk_clip: 1.54,
+        run_clip: 6.0,
+        combat: false,
+    };
+
+    #[test]
+    fn the_cycle_walks_runs_and_plays_at_the_speed_s_rate() {
+        let human = Pace {
+            speed: 6.0,
+            walk: 1.54,
+            run: 6.0,
+            walk_clip: 1.54,
+            run_clip: 3.62,
+            combat: false,
+        };
+        assert_eq!(human.run_share(), 1.0);
+        assert!((human.rate() - 6.0 / 3.62).abs() < 1e-5);
+        let walking = Pace {
+            speed: 1.54,
+            ..human
+        };
+        assert_eq!(walking.run_share(), 0.0);
+        assert!((walking.rate() - 1.0).abs() < 1e-5);
+        let between = Pace {
+            speed: 3.77,
+            ..human
+        };
+        assert!((between.run_share() - 3.77 / 6.0).abs() < 1e-5);
+        let mid = 1.0 + (6.0 / 3.62 - 1.0) * 0.5;
+        assert!((between.rate() - mid).abs() < 1e-4);
+        assert_eq!(
+            Pace {
+                combat: true,
+                ..walking
+            }
+            .run_share(),
+            1.0
+        );
+    }
+
+    #[test]
+    fn the_lean_eases_toward_its_target() {
+        let mut lean = (0.0, None);
+        lean_toward(&mut lean, 1.0, 16.0, false);
+        assert!((lean.0 - 0.016).abs() < 1e-6);
+        lean_toward(&mut lean, 1.0, 16.0, false);
+        assert!((lean.0 - 0.016 - 0.024).abs() < 1e-6);
+        lean_toward(&mut lean, 1.0, 16.0, false);
+        assert!(
+            (lean.0 - 0.016 - 0.024 - 0.032).abs() < 1e-6,
+            "capped at 0.002·ms"
+        );
+        // Reversing jumps to at least 0.05·ms a tick.
+        lean_toward(&mut lean, -1.0, 16.0, false);
+        assert!((lean.0 - (0.072 - 0.8)).abs() < 1e-5);
+    }
 
     fn m(a: &str) -> Motion {
         Motion {
@@ -770,6 +988,7 @@ mod tests {
                     &trees,
                     moving,
                     0.0,
+                    PACE,
                     *t,
                     d as f32 / 1000.0,
                 );
@@ -795,7 +1014,7 @@ mod tests {
         assert_eq!(g.phase, Phase::Running);
         assert!((g.layer.value - 1.0).abs() < 1e-6);
         // Half a second into the cycle: the left foot's marker was the last.
-        let since = t - g.cycle.0;
+        let since = (g.cycle * 1000.0).round() as u64;
         run(&mut g, true, 500 - since, &mut t);
         run(&mut g, false, 10, &mut t);
         assert_eq!(g.phase, Phase::Stopping);
@@ -834,9 +1053,13 @@ mod tests {
         }
         let mut g = Gait::idle();
         g.trees = trees.clone();
-        step(&mut g, &mut clips, &sim, &trees, false, 90.0, 1000, 0.0);
+        step(
+            &mut g, &mut clips, &sim, &trees, false, 90.0, PACE, 1000, 0.0,
+        );
         // Turned 60° anticlockwise in place: the left turn, at 120·0.8/60 → capped 1.3×.
-        step(&mut g, &mut clips, &sim, &trees, false, 150.0, 1010, 0.01);
+        step(
+            &mut g, &mut clips, &sim, &trees, false, 150.0, PACE, 1010, 0.01,
+        );
         assert_eq!(g.phase, Phase::Turning);
         assert_eq!(g.clip.as_ref().unwrap().0, "turnl90");
         assert_eq!(g.speed.0, TURN_SPEED_MAX);
@@ -844,8 +1067,12 @@ mod tests {
         assert!(mid > 90.0 && mid < 150.0, "{mid}");
         assert_eq!(g.drawn_facing(1010 + 700), None);
         // Run off the other way: a half turn to the right as it starts.
-        step(&mut g, &mut clips, &sim, &trees, false, 150.0, 2000, 0.99);
-        step(&mut g, &mut clips, &sim, &trees, true, 340.0, 2010, 0.01);
+        step(
+            &mut g, &mut clips, &sim, &trees, false, 150.0, PACE, 2000, 0.99,
+        );
+        step(
+            &mut g, &mut clips, &sim, &trees, true, 340.0, PACE, 2010, 0.01,
+        );
         assert_eq!(g.phase, Phase::Starting);
         assert_eq!(g.clip.as_ref().unwrap().0, "pauseturnr180runf");
     }
