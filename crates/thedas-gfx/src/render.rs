@@ -20,6 +20,8 @@ pub trait Images {
     fn image(&mut self, name: &str) -> Option<(u32, u32, Vec<u8>)>;
 }
 
+/// The draw shader. `{TEXTURES}` and `{SAMPLE}` are filled in for adapters with and without
+/// texture arrays (see [`shader_source`]).
 const SHADER: &str = r#"
 struct Draw {
     m0: vec4<f32>,
@@ -28,11 +30,22 @@ struct Draw {
     g1: vec4<f32>,
     mul: vec4<f32>,
     add: vec4<f32>,
+    // x: paint (0 solid, 1 bitmap, 2-4 gradients); y: destination blend; z: texture slot;
+    // w: sampler.
     mode: vec4<f32>,
+    // A rectangular mask in target pixels (x0, y0, x1, y1); all zeros for none.
+    clip: vec4<f32>,
 };
-@group(0) @binding(0) var<uniform> d: Draw;
-@group(1) @binding(0) var tex: texture_2d<f32>;
-@group(1) @binding(1) var smp: sampler;
+struct Vert {
+    pos: vec2<f32>,
+    uv: vec2<f32>,
+    color: u32,
+    pad: u32,
+};
+@group(0) @binding(0) var<storage, read> draws: array<Draw>;
+@group(0) @binding(1) var<storage, read> verts: array<Vert>;
+@group(0) @binding(2) var<storage, read> stream: array<vec2<u32>>;
+{TEXTURES}
 @group(2) @binding(0) var backdrop: texture_2d<f32>;
 
 struct V {
@@ -40,25 +53,42 @@ struct V {
     @location(0) uv: vec2<f32>,
     @location(1) color: vec4<f32>,
     @location(2) local: vec2<f32>,
+    @location(3) @interpolate(flat) rec: u32,
 };
 
 @vertex
-fn vs(@location(0) pos: vec2<f32>, @location(1) uv: vec2<f32>, @location(2) color: vec4<f32>) -> V {
+fn vs(@builtin(vertex_index) vi: u32) -> V {
+    let e = stream[vi];
+    let v = verts[e.x];
+    let d = draws[e.y];
     var o: V;
-    let x = d.m0.x * pos.x + d.m0.y * pos.y + d.m0.z;
-    let y = d.m1.x * pos.x + d.m1.y * pos.y + d.m1.z;
+    let x = d.m0.x * v.pos.x + d.m0.y * v.pos.y + d.m0.z;
+    let y = d.m1.x * v.pos.x + d.m1.y * v.pos.y + d.m1.z;
     o.pos = vec4<f32>(x, y, 0.0, 1.0);
-    o.uv = uv;
-    o.color = color;
-    o.local = pos;
+    o.uv = v.uv;
+    o.color = unpack4x8unorm(v.color);
+    o.local = v.pos;
+    o.rec = e.y;
     return o;
 }
 
+{SAMPLE}
+
 fn shade(i: V) -> vec4<f32> {
+    let d = draws[i.rec];
+    if (any(d.clip != vec4<f32>(0.0))
+        && (i.pos.x < d.clip.x || i.pos.y < d.clip.y || i.pos.x >= d.clip.z || i.pos.y >= d.clip.w)) {
+        discard;
+    }
     var c = i.color;
     let mode = i32(d.mode.x + 0.5);
+    let slot = u32(d.mode.z + 0.5);
+    let smp_index = u32(d.mode.w + 0.5);
+    // Derivatives come before any branch on the draw's paint.
+    let gx = dpdx(i.uv);
+    let gy = dpdy(i.uv);
     if (mode == 1) {
-        let t = textureSample(tex, smp, i.uv);
+        let t = sample_tex(slot, smp_index, i.uv, gx, gy);
         c = vec4<f32>(t.rgb / max(t.a, 0.00001), t.a);
     } else if (mode >= 2) {
         let g = vec2<f32>(
@@ -70,11 +100,8 @@ fn shade(i: V) -> vec4<f32> {
         } else {
             t = length(g) / 16384.0;
         }
-        let r = textureSample(tex, smp, vec2<f32>(clamp(t, 0.0, 1.0) * (255.0 / 256.0) + 0.5 / 256.0, 0.5));
+        let r = sample_tex(slot, 0u, vec2<f32>(clamp(t, 0.0, 1.0) * (255.0 / 256.0) + 0.5 / 256.0, 0.5), vec2<f32>(0.0), vec2<f32>(0.0));
         c = vec4<f32>(r.rgb / max(r.a, 0.00001), r.a);
-    } else {
-        let t = textureSample(tex, smp, vec2<f32>(0.5, 0.5));
-        c = c * t.a;
     }
     c = clamp(c * d.mul + d.add, vec4<f32>(0.0), vec4<f32>(1.0));
     return vec4<f32>(c.rgb * c.a, c.a);
@@ -93,7 +120,7 @@ fn fs_blend(i: V) -> @location(0) vec4<f32> {
     let s = src.rgb / max(src.a, 0.00001);
     let dc = dst.rgb / max(dst.a, 0.00001);
     var mixed = abs(dc - s);
-    let mode = i32(d.mode.y + 0.5);
+    let mode = i32(draws[i.rec].mode.y + 0.5);
     if (mode == 2) { mixed = 1.0 - dc; }
     if (mode == 3 || mode == 4) {
         let threshold = select(dc, s, mode == 4);
@@ -105,6 +132,47 @@ fn fs_blend(i: V) -> @location(0) vec4<f32> {
 }
 "#;
 
+/// The shader for an adapter with (`bindless`) or without texture arrays. With them every
+/// texture is one binding indexed by the draw's slot; without, each draw binds its own.
+fn shader_source(bindless: bool) -> String {
+    let (textures, sample) = if bindless {
+        (
+            "@group(1) @binding(0) var textures: binding_array<texture_2d<f32>>;
+@group(1) @binding(1) var s0: sampler;
+@group(1) @binding(2) var s1: sampler;
+@group(1) @binding(3) var s2: sampler;
+@group(1) @binding(4) var s3: sampler;",
+            "fn sample_tex(slot: u32, s: u32, uv: vec2<f32>, gx: vec2<f32>, gy: vec2<f32>) -> vec4<f32> {
+    switch s {
+        case 1u: { return textureSampleGrad(textures[slot], s1, uv, gx, gy); }
+        case 2u: { return textureSampleGrad(textures[slot], s2, uv, gx, gy); }
+        case 3u: { return textureSampleGrad(textures[slot], s3, uv, gx, gy); }
+        default: { return textureSampleGrad(textures[slot], s0, uv, gx, gy); }
+    }
+}",
+        )
+    } else {
+        (
+            "@group(1) @binding(0) var tex: texture_2d<f32>;
+@group(1) @binding(1) var smp: sampler;",
+            "fn sample_tex(slot: u32, s: u32, uv: vec2<f32>, gx: vec2<f32>, gy: vec2<f32>) -> vec4<f32> {
+    return textureSampleGrad(tex, smp, uv, gx, gy);
+}",
+        )
+    };
+    let source = SHADER
+        .replace("{TEXTURES}", textures)
+        .replace("{SAMPLE}", sample);
+    if bindless {
+        format!("enable wgpu_binding_array;\n{source}")
+    } else {
+        source
+    }
+}
+
+/// The most texture slots a bindless table holds.
+const MAX_SLOTS: u32 = 4096;
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
 struct DrawU {
@@ -115,21 +183,62 @@ struct DrawU {
     mul: [f32; 4],
     add: [f32; 4],
     mode: [f32; 4],
+    /// A rectangle (x0, y0, x1, y1, target pixels) outside which nothing draws: a mask that
+    /// is an axis-aligned rectangle, without the stencil. All zeros: none.
+    clip: [f32; 4],
 }
 
-const UNIFORM_STRIDE: u64 = 256;
 const SAMPLES: u32 = 4;
 
 struct GpuMesh {
-    vb: wgpu::Buffer,
-    ib: wgpu::Buffer,
-    count: u32,
+    /// Where the vertices are in the arena, and the triangles (relative to that start).
+    verts: crate::gpu::VRange,
+    indices: Arc<[u32]>,
     mode: f32,
     to_gradient: Matrix,
-    /// The texture binding (ramp or bitmap); `None` for solid colours.
-    binding: Option<Arc<wgpu::BindGroup>>,
+    /// The texture (ramp or bitmap); `None` for solid colours.
+    binding: Option<crate::gpu::Tex>,
     /// Scaleform text shadows keep shadowColor when the text's parent is tinted.
     fixed_rgb: bool,
+    /// The mesh is exactly this axis-aligned rectangle (local twips: x0, y0, x1, y1), so as
+    /// a mask it can clip by rectangle instead of the stencil.
+    rect: Option<[f32; 4]>,
+}
+
+/// Whether `m` covers exactly its bounding rectangle (every vertex on a corner, the
+/// triangles' area that of the rectangle).
+fn mesh_rect(m: &Mesh) -> Option<[f32; 4]> {
+    let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+    for v in &m.vertices {
+        x0 = x0.min(v.pos[0]);
+        y0 = y0.min(v.pos[1]);
+        x1 = x1.max(v.pos[0]);
+        y1 = y1.max(v.pos[1]);
+    }
+    let eps = 0.5;
+    let on = |a: f32, lo: f32, hi: f32| (a - lo).abs() < eps || (a - hi).abs() < eps;
+    if x1 - x0 < eps
+        || y1 - y0 < eps
+        || !m
+            .vertices
+            .iter()
+            .all(|v| on(v.pos[0], x0, x1) && on(v.pos[1], y0, y1))
+    {
+        return None;
+    }
+    let mut area = 0.0f32;
+    for t in m.indices.chunks_exact(3) {
+        let p = |i: u32| {
+            m.vertices
+                .get(i as usize)
+                .map(|v| v.pos)
+                .unwrap_or_default()
+        };
+        let (a, b, c) = (p(t[0]), p(t[1]), p(t[2]));
+        area += ((b[0] - a[0]) * (c[1] - a[1]) - (c[0] - a[0]) * (b[1] - a[1])).abs() / 2.0;
+    }
+    let want = (x1 - x0) * (y1 - y0);
+    ((area - want).abs() <= want * 1e-3).then_some([x0, y0, x1, y1])
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -257,11 +366,11 @@ type CpuShape = (Arc<Mesh>, Arc<GpuMesh>);
 /// A glyph's triangles in EM units.
 type GlyphMesh = (Vec<[f32; 2]>, Vec<u32>);
 /// An uploaded image: its binding and size.
-type Bitmap = (Arc<wgpu::BindGroup>, f32, f32);
+type Bitmap = (crate::gpu::Tex, f32, f32);
 
 struct EngineImage {
     texture: wgpu::Texture,
-    binding: Arc<wgpu::BindGroup>,
+    binding: crate::gpu::Tex,
 }
 
 pub struct Renderer {
@@ -269,12 +378,25 @@ pub struct Renderer {
     queue: wgpu::Queue,
     format: wgpu::TextureFormat,
     pipelines: HashMap<(Blend, Stencil), wgpu::RenderPipeline>,
-    uniform_layout: wgpu::BindGroupLayout,
+    /// Group 0: draw records, the vertex arena and the per-render vertex stream.
+    draw_layout: wgpu::BindGroupLayout,
+    /// One texture and its sampler (each draw's own without texture arrays; the backdrop).
     texture_layout: wgpu::BindGroupLayout,
+    /// Every texture slot and the four samplers (with texture arrays).
+    table_layout: Option<wgpu::BindGroupLayout>,
+    table_group: Option<(u64, wgpu::BindGroup)>,
+    bindless: bool,
+    arena: crate::gpu::Arena,
+    textures: crate::gpu::Textures,
+    /// The draw records and the vertex stream (buffer and its size in bytes).
+    records: Option<(wgpu::Buffer, u64)>,
+    stream: Option<(wgpu::Buffer, u64)>,
+    white_view: wgpu::TextureView,
+    /// Draw calls in the last render, after merging.
+    pub calls: usize,
     shader: wgpu::ShaderModule,
     pipeline_layout: wgpu::PipelineLayout,
-    uniforms: Option<(wgpu::Buffer, wgpu::BindGroup, u64)>,
-    white: Arc<wgpu::BindGroup>,
+    white: wgpu::BindGroup,
     clamp: wgpu::Sampler,
     repeat: wgpu::Sampler,
     clamp_nearest: wgpu::Sampler,
@@ -309,22 +431,29 @@ struct Targets {
 
 impl Renderer {
     pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, format: wgpu::TextureFormat) -> Self {
+        let wanted = wgpu::Features::TEXTURE_BINDING_ARRAY
+            | wgpu::Features::SAMPLED_TEXTURE_AND_STORAGE_BUFFER_ARRAY_NON_UNIFORM_INDEXING
+            | wgpu::Features::PARTIALLY_BOUND_BINDING_ARRAY;
+        let bindless = device.features().contains(wanted)
+            && device.limits().max_binding_array_elements_per_shader_stage >= MAX_SLOTS
+            && std::env::var_os("THEDAS_UI_NO_BINDLESS").is_none();
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("gfx"),
-            source: wgpu::ShaderSource::Wgsl(SHADER.into()),
+            source: wgpu::ShaderSource::Wgsl(shader_source(bindless).into()),
         });
-        let uniform_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        let storage = |binding| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        };
+        let draw_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("gfx draw"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: true,
-                    min_binding_size: wgpu::BufferSize::new(std::mem::size_of::<DrawU>() as u64),
-                },
-                count: None,
-            }],
+            entries: &[storage(0), storage(1), storage(2)],
         });
         let texture_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("gfx texture"),
@@ -347,11 +476,38 @@ impl Renderer {
                 },
             ],
         });
+        let table_layout = bindless.then(|| {
+            let sampler = |binding| wgpu::BindGroupLayoutEntry {
+                binding,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            };
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("gfx texture table"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: std::num::NonZeroU32::new(MAX_SLOTS),
+                    },
+                    sampler(1),
+                    sampler(2),
+                    sampler(3),
+                    sampler(4),
+                ],
+            })
+        });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("gfx"),
             bind_group_layouts: &[
-                Some(&uniform_layout),
-                Some(&texture_layout),
+                Some(&draw_layout),
+                Some(table_layout.as_ref().unwrap_or(&texture_layout)),
                 Some(&texture_layout),
             ],
             immediate_size: 0,
@@ -371,17 +527,26 @@ impl Renderer {
         let clamp_nearest = sampler(wgpu::AddressMode::ClampToEdge, wgpu::FilterMode::Nearest);
         let repeat_nearest = sampler(wgpu::AddressMode::Repeat, wgpu::FilterMode::Nearest);
         let white_tex = upload_texture(device, queue, 1, 1, &[255, 255, 255, 255]);
-        let white = Arc::new(texture_binding(device, &texture_layout, &white_tex, &clamp));
+        let white = texture_binding(device, &texture_layout, &white_tex, &clamp);
+        let white_view = white_tex.create_view(&Default::default());
         Self {
             device: device.clone(),
             queue: queue.clone(),
             format,
             pipelines: HashMap::new(),
-            uniform_layout,
+            draw_layout,
             texture_layout,
+            table_layout,
+            table_group: None,
+            bindless,
+            arena: crate::gpu::Arena::new(device),
+            textures: crate::gpu::Textures::new(),
+            records: None,
+            stream: None,
+            white_view,
+            calls: 0,
             shader,
             pipeline_layout,
-            uniforms: None,
             white,
             clamp,
             repeat,
@@ -428,13 +593,7 @@ impl Renderer {
                         module: &self.shader,
                         entry_point: Some("vs"),
                         compilation_options: Default::default(),
-                        buffers: &[Some(wgpu::VertexBufferLayout {
-                            array_stride: std::mem::size_of::<Vertex>() as u64,
-                            step_mode: wgpu::VertexStepMode::Vertex,
-                            attributes: &wgpu::vertex_attr_array![
-                                0 => Float32x2, 1 => Float32x2, 2 => Unorm8x4
-                            ],
-                        })],
+                        buffers: &[],
                     },
                     primitive: wgpu::PrimitiveState::default(),
                     depth_stencil: Some(wgpu::DepthStencilState {
@@ -526,6 +685,12 @@ impl Renderer {
         }
     }
 
+    /// Whether every texture is sampled from one bound table (merging draws across
+    /// textures); without texture arrays each texture breaks a batch.
+    pub fn bindless(&self) -> bool {
+        self.bindless
+    }
+
     /// The texture [`Renderer::render`] draws into.
     pub fn output(&self) -> Option<&wgpu::Texture> {
         self.targets.as_ref().map(|t| &t.output)
@@ -536,7 +701,7 @@ impl Renderer {
     /// Same-size refreshes keep the texture and all cached shape bindings alive.
     pub fn set_engine_image(&mut self, name: &str, image: Option<(u32, u32, &[u8])>) {
         let key = engine_image_name(name);
-        let old = self.engine_images.entry(key).or_default();
+        let old = self.engine_images.entry(key.clone()).or_default();
         if let Some((w, h, rgba)) = image {
             if w == 0 || h == 0 || rgba.len() != w as usize * h as usize * 4 {
                 return;
@@ -551,13 +716,10 @@ impl Renderer {
                 return;
             }
             let texture = upload_texture(&self.device, &self.queue, w, h, &pixels);
-            let binding = Arc::new(texture_binding(
-                &self.device,
-                &self.texture_layout,
-                &texture,
-                &self.clamp,
-            ));
-            *old = Some(EngineImage { texture, binding });
+            let binding = self.make_tex(&texture, crate::gpu::SAMPLER_CLAMP);
+            if let Some(slot) = self.engine_images.get_mut(&key) {
+                *slot = Some(EngineImage { texture, binding });
+            }
         } else if let Some(old) = old {
             // Keep existing meshes valid while clearing the target, and reuse its storage
             // if the engine supplies another frame of the same size later.
@@ -607,6 +769,7 @@ impl Renderer {
         let mut b = Build {
             ops: Vec::new(),
             uniforms: Vec::new(),
+            clip: [0.0; 4],
         };
         self.stats = RenderStats::default();
         let started = std::time::Instant::now();
@@ -638,41 +801,151 @@ impl Renderer {
             .retain(|d, _| player.vm.display.get(*d).is_some());
     }
 
+    /// Makes sure `slot` is a storage buffer of at least `need` bytes.
+    fn storage(
+        device: &wgpu::Device,
+        slot: &mut Option<(wgpu::Buffer, u64)>,
+        need: u64,
+        label: &str,
+    ) {
+        if slot.as_ref().is_none_or(|(_, cap)| *cap < need) {
+            let cap = need.next_power_of_two().max(1 << 16);
+            *slot = Some((
+                device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some(label),
+                    size: cap,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                }),
+                cap,
+            ));
+        }
+    }
+
+    /// The bindless texture table's bind group, made again when slots changed.
+    fn table_group(&mut self) -> Option<wgpu::BindGroup> {
+        let layout = self.table_layout.as_ref()?;
+        let generation = self.textures.generation();
+        if self
+            .table_group
+            .as_ref()
+            .is_none_or(|(g, _)| *g != generation)
+        {
+            let slots = self.textures.slots.lock().ok()?;
+            let mut views: Vec<&wgpu::TextureView> = slots
+                .views()
+                .iter()
+                .map(|v| v.as_ref().unwrap_or(&self.white_view))
+                .take(MAX_SLOTS as usize)
+                .collect();
+            if views.is_empty() {
+                views.push(&self.white_view);
+            }
+            let group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("gfx texture table"),
+                layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureViewArray(&views),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&self.clamp),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::Sampler(&self.repeat),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::Sampler(&self.clamp_nearest),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: wgpu::BindingResource::Sampler(&self.repeat_nearest),
+                    },
+                ],
+            });
+            drop(slots);
+            self.table_group = Some((generation, group));
+        }
+        self.table_group.as_ref().map(|(_, g)| g.clone())
+    }
+
     fn draw_build(&mut self, b: &Build, t: &Targets) {
-        // Upload the uniforms.
-        let need = (b.uniforms.len().max(1) as u64) * UNIFORM_STRIDE;
-        if self.uniforms.as_ref().is_none_or(|u| u.2 < need) {
-            let cap = need.next_power_of_two().max(UNIFORM_STRIDE * 64);
-            let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("gfx uniforms"),
-                size: cap,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("gfx uniforms"),
-                layout: &self.uniform_layout,
-                entries: &[wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                        buffer: &buf,
-                        offset: 0,
-                        size: wgpu::BufferSize::new(std::mem::size_of::<DrawU>() as u64),
-                    }),
-                }],
-            });
-            self.uniforms = Some((buf, bg, cap));
-        }
-        let mut bytes = vec![0u8; b.uniforms.len() * UNIFORM_STRIDE as usize];
-        for (i, u) in b.uniforms.iter().enumerate() {
-            let at = i * UNIFORM_STRIDE as usize;
-            bytes[at..at + std::mem::size_of::<DrawU>()].copy_from_slice(bytemuck::bytes_of(u));
-        }
-        if let Some((buf, _, _)) = &self.uniforms {
-            if !bytes.is_empty() {
-                self.queue.write_buffer(buf, 0, &bytes);
+        // Records: one per op (`Build::push` gives each its own), read by index.
+        let mut records = b.uniforms.clone();
+        for op in &b.ops {
+            if let (Some(tex), Some(r)) = (&op.mesh.binding, records.get_mut(op.uniform as usize)) {
+                r.mode[2] = tex.slot() as f32;
+                r.mode[3] = f32::from(tex.sampler());
             }
         }
+        if records.is_empty() {
+            records.push(DrawU::default());
+        }
+        // The stream: each op's triangles as (arena vertex, record) pairs, in draw order.
+        let mut stream: Vec<[u32; 2]> = Vec::new();
+        let mut ranges: Vec<(u32, u32)> = Vec::with_capacity(b.ops.len());
+        for op in &b.ops {
+            let start = stream.len() as u32;
+            let base = op.mesh.verts.start;
+            stream.extend(op.mesh.indices.iter().map(|&i| [base + i, op.uniform]));
+            ranges.push((start, stream.len() as u32 - start));
+        }
+        if stream.is_empty() {
+            stream.push([0, 0]);
+        }
+        let record_bytes: &[u8] = bytemuck::cast_slice(&records);
+        let stream_bytes: &[u8] = bytemuck::cast_slice(&stream);
+        Self::storage(
+            &self.device,
+            &mut self.records,
+            record_bytes.len() as u64,
+            "gfx records",
+        );
+        Self::storage(
+            &self.device,
+            &mut self.stream,
+            stream_bytes.len() as u64,
+            "gfx stream",
+        );
+        let table = self.table_group();
+        if std::env::var_os("GFX_BATCH_DEBUG").is_some() {
+            let mut runs: Vec<(String, usize)> = Vec::new();
+            for op in &b.ops {
+                let k = format!("{:?}/{:?}/{}", op.blend, op.stencil, op.reference);
+                match runs.last_mut() {
+                    Some((last, n)) if *last == k => *n += 1,
+                    _ => runs.push((k, 1)),
+                }
+            }
+            eprintln!("gfx batches: {runs:?}");
+        }
+        let (Some((record_buf, _)), Some((stream_buf, _))) = (&self.records, &self.stream) else {
+            return;
+        };
+        self.queue.write_buffer(record_buf, 0, record_bytes);
+        self.queue.write_buffer(stream_buf, 0, stream_bytes);
+        let draw_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("gfx draw"),
+            layout: &self.draw_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: record_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: self.arena.buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: stream_buf.as_entire_binding(),
+                },
+            ],
+        });
         for op in &b.ops {
             self.pipeline(op.blend, op.stencil);
         }
@@ -697,6 +970,7 @@ impl Renderer {
             (tex, binding)
         });
         // Even a first draw that needs a backdrop must see a cleared target.
+        let mut calls = 0usize;
         let mut start = 0;
         let mut first = true;
         loop {
@@ -752,26 +1026,53 @@ impl Renderer {
                 }),
                 ..Default::default()
             });
-            let Some((_, ubg, _)) = &self.uniforms else {
-                return;
-            };
             // All pipelines share this layout; ordinary draws do not read group 2.
             pass.set_bind_group(
                 2,
                 snapshot.as_ref().map(|(_, bg)| bg).unwrap_or(&self.white),
                 &[],
             );
-            for op in &b.ops[start..end] {
+            pass.set_bind_group(0, &draw_group, &[]);
+            if let Some(table) = &table {
+                pass.set_bind_group(1, table, &[]);
+            }
+            // Consecutive ops that share a pipeline, a stencil reference and (without
+            // texture arrays) a texture are one draw: their stream ranges are adjacent.
+            let key = |o: &Op| {
+                (
+                    o.blend,
+                    o.stencil,
+                    o.reference,
+                    if table.is_some() {
+                        None
+                    } else {
+                        o.mesh.binding.as_ref().map(|t| (t.slot(), t.sampler()))
+                    },
+                )
+            };
+            let mut i = start;
+            while i < end {
+                let op = &b.ops[i];
+                let k = key(op);
+                let mut j = i + 1;
+                while j < end && key(&b.ops[j]) == k {
+                    j += 1;
+                }
                 let Some(p) = self.pipelines.get(&(op.blend, op.stencil)) else {
+                    i = j;
                     continue;
                 };
                 pass.set_pipeline(p);
                 pass.set_stencil_reference(op.reference);
-                pass.set_bind_group(0, ubg, &[op.uniform * UNIFORM_STRIDE as u32]);
-                pass.set_bind_group(1, &**op.mesh.binding.as_ref().unwrap_or(&self.white), &[]);
-                pass.set_vertex_buffer(0, op.mesh.vb.slice(..));
-                pass.set_index_buffer(op.mesh.ib.slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(0..op.mesh.count, 0, 0..1);
+                if table.is_none() {
+                    let single = op.mesh.binding.as_ref().map(|t| t.single());
+                    pass.set_bind_group(1, single.unwrap_or(&self.white), &[]);
+                }
+                let first = ranges[i].0;
+                let last = ranges[j - 1].0 + ranges[j - 1].1;
+                pass.draw(first..last, 0..1);
+                calls += 1;
+                i = j;
             }
             drop(pass);
             if end == b.ops.len() {
@@ -781,12 +1082,13 @@ impl Renderer {
             first = false;
         }
         self.queue.submit(Some(encoder.finish()));
+        self.calls = calls;
     }
 
     fn upload(
-        &self,
+        &mut self,
         m: &Mesh,
-        binding: Option<Arc<wgpu::BindGroup>>,
+        binding: Option<crate::gpu::Tex>,
         mode: f32,
         to_gradient: Matrix,
     ) -> Option<Arc<GpuMesh>> {
@@ -794,39 +1096,40 @@ impl Renderer {
     }
 
     fn upload_colored(
-        &self,
+        &mut self,
         m: &Mesh,
-        binding: Option<Arc<wgpu::BindGroup>>,
+        binding: Option<crate::gpu::Tex>,
         mode: f32,
         to_gradient: Matrix,
         fixed_rgb: bool,
     ) -> Option<Arc<GpuMesh>> {
-        if m.indices.is_empty() {
+        if m.indices.is_empty() || m.vertices.is_empty() {
             return None;
         }
-        let vb = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("gfx vertices"),
-                contents: bytemuck::cast_slice(&m.vertices),
-                usage: wgpu::BufferUsages::VERTEX,
-            });
-        let ib = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("gfx indices"),
-                contents: bytemuck::cast_slice(&m.indices),
-                usage: wgpu::BufferUsages::INDEX,
-            });
+        let verts = self.arena.alloc(&self.device, &self.queue, &m.vertices);
+        let rect = mesh_rect(m);
         Some(Arc::new(GpuMesh {
-            vb,
-            ib,
-            count: m.indices.len() as u32,
+            rect,
+            verts,
+            indices: Arc::from(m.indices.as_slice()),
             mode,
             to_gradient,
             binding,
             fixed_rgb,
         }))
+    }
+
+    /// Registers a texture for drawing with sampler `sampler` (see `gpu::SAMPLER_*`).
+    fn make_tex(&self, texture: &wgpu::Texture, sampler: u8) -> crate::gpu::Tex {
+        let s = match sampler {
+            crate::gpu::SAMPLER_REPEAT => &self.repeat,
+            crate::gpu::SAMPLER_CLAMP_NEAREST => &self.clamp_nearest,
+            crate::gpu::SAMPLER_REPEAT_NEAREST => &self.repeat_nearest,
+            _ => &self.clamp,
+        };
+        let single = texture_binding(&self.device, &self.texture_layout, texture, s);
+        self.textures
+            .add(texture.create_view(&Default::default()), sampler, single)
     }
 
     fn bitmap(
@@ -844,16 +1147,12 @@ impl Renderer {
             premultiply(&mut px);
             let t = upload_texture(&self.device, &self.queue, w, h, &px);
             let s = match (repeat, smooth) {
-                (false, false) => &self.clamp_nearest,
-                (true, false) => &self.repeat_nearest,
-                (false, true) => &self.clamp,
-                (true, true) => &self.repeat,
+                (false, false) => crate::gpu::SAMPLER_CLAMP_NEAREST,
+                (true, false) => crate::gpu::SAMPLER_REPEAT_NEAREST,
+                (false, true) => crate::gpu::SAMPLER_CLAMP,
+                (true, true) => crate::gpu::SAMPLER_REPEAT,
             };
-            (
-                Arc::new(texture_binding(&self.device, &self.texture_layout, &t, s)),
-                w as f32,
-                h as f32,
-            )
+            (self.make_tex(&t, s), w as f32, h as f32)
         });
         self.bitmaps.insert(key, r.clone());
         r
@@ -876,12 +1175,12 @@ impl Renderer {
             && let Some(name) = engine_shape(shape, &movie)
             && let Some(image) = self.engine_images.get(&name)
         {
-            let out: Vec<_> = image
-                .as_ref()
-                .and_then(|image| {
+            let binding = image.as_ref().map(|image| image.binding.clone());
+            let out: Vec<_> = binding
+                .and_then(|binding| {
                     self.upload(
                         &image_quad(shape.bounds),
-                        Some(image.binding.clone()),
+                        Some(binding),
                         1.0,
                         Matrix::IDENTITY,
                     )
@@ -966,12 +1265,7 @@ impl Renderer {
                         })
                         .collect();
                     let t = upload_texture(&self.device, &self.queue, 256, 1, &px);
-                    let bg = Arc::new(texture_binding(
-                        &self.device,
-                        &self.texture_layout,
-                        &t,
-                        &self.clamp,
-                    ));
+                    let bg = self.make_tex(&t, crate::gpu::SAMPLER_CLAMP);
                     self.upload(&m, Some(bg), *kind as f32, *to_gradient)
                 }
             };
@@ -1281,7 +1575,7 @@ impl Renderer {
                 .and_then(|o| o.parent)
                 .map(|p| player.vm.display.world_matrix(p))
                 .unwrap_or(Matrix::IDENTITY);
-            self.mask_ops(
+            let rect = self.mask_ops(
                 player,
                 images,
                 mask,
@@ -1291,6 +1585,23 @@ impl Renderer {
                 Stencil::Push,
                 b,
             );
+            if let Some(rect) = rect {
+                let saved = b.clip;
+                b.clip = clip_intersect(saved, rect);
+                self.walk_content(
+                    player,
+                    images,
+                    d,
+                    parent,
+                    parent_cx,
+                    parent_blend,
+                    view,
+                    stencil,
+                    b,
+                );
+                b.clip = saved;
+                return;
+            }
             self.walk_content(
                 player,
                 images,
@@ -1386,6 +1697,7 @@ impl Renderer {
             let mut source = Build {
                 ops: Vec::new(),
                 uniforms: Vec::new(),
+                clip: [0.0; 4],
             };
             self.walk(
                 player,
@@ -1408,12 +1720,7 @@ impl Renderer {
                 &filters,
                 view.k * 20.0,
             );
-            let binding = Arc::new(texture_binding(
-                &self.device,
-                &self.texture_layout,
-                &output,
-                &self.clamp,
-            ));
+            let binding = self.make_tex(&output, crate::gpu::SAMPLER_CLAMP);
             let mesh = Mesh {
                 paint: Paint::Solid,
                 vertices: [
@@ -1436,6 +1743,7 @@ impl Renderer {
                     m0: [1.0, 0.0, 0.0, 0.0],
                     m1: [0.0, 1.0, 0.0, 0.0],
                     mul: [1.0; 4],
+                    clip: b.clip,
                     ..Default::default()
                 });
                 b.push(&mesh, u, blend, stencil);
@@ -1534,24 +1842,36 @@ impl Renderer {
             .iter()
             .map(|(k, c)| (*k, *c, player.vm.display.get(*c).and_then(|x| x.clip_depth)))
             .collect();
-        // Open masks: (until depth, mask object, its matrix, stencil level inside).
-        let mut masks: Vec<(i32, DisplayId)> = Vec::new();
+        // Open masks: (until depth, mask object, the clip before a rectangular mask).
+        let mut masks: Vec<(i32, DisplayId, Option<[f32; 4]>)> = Vec::new();
         let mut level = stencil;
         let grid = self.grid_for(player, d, parent);
         for (depth, c, clip) in kids {
-            while let Some((until, m)) = masks.last().copied() {
+            while let Some((until, m, saved)) = masks.last().copied() {
                 if depth > until {
-                    self.mask_ops(player, images, m, world, view, level, Stencil::Pop, b);
-                    level -= 1;
+                    match saved {
+                        Some(saved) => b.clip = saved,
+                        None => {
+                            self.mask_ops(player, images, m, world, view, level, Stencil::Pop, b);
+                            level -= 1;
+                        }
+                    }
                     masks.pop();
                 } else {
                     break;
                 }
             }
             if let Some(until) = clip {
-                self.mask_ops(player, images, c, world, view, level, Stencil::Push, b);
-                level += 1;
-                masks.push((until, c));
+                match self.mask_ops(player, images, c, world, view, level, Stencil::Push, b) {
+                    Some(rect) => {
+                        masks.push((until, c, Some(b.clip)));
+                        b.clip = clip_intersect(b.clip, rect);
+                    }
+                    None => {
+                        level += 1;
+                        masks.push((until, c, None));
+                    }
+                }
                 continue;
             }
             if let Some((noscale, remap)) = &grid {
@@ -1601,9 +1921,14 @@ impl Renderer {
             }
             self.walk(player, images, c, world, cx, blend, view, level, b);
         }
-        while let Some((_, m)) = masks.pop() {
-            self.mask_ops(player, images, m, world, view, level, Stencil::Pop, b);
-            level -= 1;
+        while let Some((_, m, saved)) = masks.pop() {
+            match saved {
+                Some(saved) => b.clip = saved,
+                None => {
+                    self.mask_ops(player, images, m, world, view, level, Stencil::Pop, b);
+                    level -= 1;
+                }
+            }
         }
     }
 
@@ -1619,10 +1944,11 @@ impl Renderer {
         level: u32,
         mode: Stencil,
         b: &mut Build,
-    ) {
+    ) -> Option<[f32; 4]> {
         let mut tmp = Build {
             ops: Vec::new(),
             uniforms: std::mem::take(&mut b.uniforms),
+            clip: b.clip,
         };
         // A mask counts however its clip is set to show.
         let vis = player.vm.display.get(m).map(|o| o.visible);
@@ -1647,6 +1973,23 @@ impl Renderer {
             o.visible = v;
         }
         b.uniforms = tmp.uniforms;
+        // A mask that is one axis-aligned rectangle clips by rectangle: no stencil writes,
+        // and the masked content keeps batching with its neighbours.
+        if mode == Stencil::Push && tmp.ops.len() == 1 {
+            let op = &tmp.ops[0];
+            if let (Some(r), Some(u)) = (op.mesh.rect, b.uniforms.get(op.uniform as usize)) {
+                if u.m0[1].abs() < 1e-7 && u.m1[0].abs() < 1e-7 {
+                    let to_px = |x: f32, y: f32| {
+                        let nx = u.m0[0] * x + u.m0[2];
+                        let ny = u.m1[1] * y + u.m1[2];
+                        ((nx + 1.0) * 0.5 * view.w, (1.0 - ny) * 0.5 * view.h)
+                    };
+                    let (ax, ay) = to_px(r[0], r[1]);
+                    let (bx, by) = to_px(r[2], r[3]);
+                    return Some([ax.min(bx), ay.min(by), ax.max(bx), ay.max(by)]);
+                }
+            }
+        }
         let reference = level;
         for mut op in tmp.ops {
             op.stencil = mode;
@@ -1654,6 +1997,7 @@ impl Renderer {
             op.blend = Blend::Normal;
             b.ops.push(op);
         }
+        None
     }
 
     /// For a clip with a scaling grid that is scaled: its matrix with the scale taken out
@@ -1845,6 +2189,30 @@ struct Viewport {
 struct Build {
     ops: Vec<Op>,
     uniforms: Vec<DrawU>,
+    /// The rectangular mask records made now get (see `DrawU::clip`).
+    clip: [f32; 4],
+}
+
+/// The intersection of two clip rectangles (zeros meaning none); an empty result clips
+/// everything.
+fn clip_intersect(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
+    if a == [0.0; 4] {
+        return b;
+    }
+    if b == [0.0; 4] {
+        return a;
+    }
+    let r = [
+        a[0].max(b[0]),
+        a[1].max(b[1]),
+        a[2].min(b[2]),
+        a[3].min(b[3]),
+    ];
+    if r[2] <= r[0] || r[3] <= r[1] {
+        [1.0, 1.0, 0.0, 0.0]
+    } else {
+        r
+    }
 }
 
 /// Cuts `mesh` (moved by `place`) along the grid's lines so each piece lies in one cell, then
@@ -2048,6 +2416,7 @@ impl Build {
                 cx.add[3] / 255.0,
             ],
             mode: [0.0; 4],
+            clip: self.clip,
         };
         self.uniforms.push(u);
         self.uniforms.len() as u32 - 1
@@ -2379,11 +2748,7 @@ mod shadow_tests {
                 Some((2, 2, color.repeat(4)))
             }
         }
-        let instance =
-            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
-        let adapter = pollster::block_on(instance.request_adapter(&Default::default())).unwrap();
-        let (device, queue) =
-            pollster::block_on(adapter.request_device(&Default::default())).unwrap();
+        let (device, queue) = crate::gpu::test_device();
         let mut player = blend_player();
         let root = player.vm.root;
         let field =
@@ -2449,11 +2814,7 @@ mod shadow_tests {
                 Some((2, 1, vec![255, 0, 0, 255, 0, 0, 255, 255]))
             }
         }
-        let instance =
-            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
-        let adapter = pollster::block_on(instance.request_adapter(&Default::default())).unwrap();
-        let (device, queue) =
-            pollster::block_on(adapter.request_device(&Default::default())).unwrap();
+        let (device, queue) = crate::gpu::test_device();
         let mut player = blend_player();
         let root = player.vm.root;
         let bounds = Rect {
@@ -2547,11 +2908,7 @@ mod shadow_tests {
 
     #[test]
     fn destination_blends_handle_transparent_pictures_and_flatten_the_source() {
-        let instance =
-            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
-        let adapter = pollster::block_on(instance.request_adapter(&Default::default())).unwrap();
-        let (device, queue) =
-            pollster::block_on(adapter.request_device(&Default::default())).unwrap();
+        let (device, queue) = crate::gpu::test_device();
         let mut renderer = Renderer::new(&device, &queue, wgpu::TextureFormat::Rgba8Unorm);
         for mode in [
             BlendMode::Difference,
@@ -2629,11 +2986,7 @@ mod shadow_tests {
 
     #[test]
     fn destination_snapshots_preserve_open_masks_and_later_draws() {
-        let instance =
-            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
-        let adapter = pollster::block_on(instance.request_adapter(&Default::default())).unwrap();
-        let (device, queue) =
-            pollster::block_on(adapter.request_device(&Default::default())).unwrap();
+        let (device, queue) = crate::gpu::test_device();
         let mut p = blend_player();
         let root = p.vm.root;
         quad(&mut p, root, 0, [64, 128, 192, 255], 640.0);
@@ -2664,11 +3017,7 @@ mod shadow_tests {
 
     #[test]
     fn moving_script_mask_clips_filtered_content_in_stage_space() {
-        let instance =
-            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
-        let adapter = pollster::block_on(instance.request_adapter(&Default::default())).unwrap();
-        let (device, queue) =
-            pollster::block_on(adapter.request_device(&Default::default())).unwrap();
+        let (device, queue) = crate::gpu::test_device();
         let bytes = b"FWS\x08\x12\0\0\0\x08\0\0\x1e\x01\0\x40\0\0\0";
         let mut p =
             Player::new(bytes, "mask-test", Box::new(Empty), Arc::new(Empty), None).unwrap();
@@ -2788,11 +3137,7 @@ mod shadow_tests {
 
     #[test]
     fn alpha_and_erase_affect_only_the_enclosing_layer() {
-        let instance =
-            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
-        let adapter = pollster::block_on(instance.request_adapter(&Default::default())).unwrap();
-        let (device, queue) =
-            pollster::block_on(adapter.request_device(&Default::default())).unwrap();
+        let (device, queue) = crate::gpu::test_device();
         let bytes = b"FWS\x08\x12\0\0\0\x08\0\0\x1e\x01\0\x40\0\0\0";
         let mut p =
             Player::new(bytes, "blend-test", Box::new(Empty), Arc::new(Empty), None).unwrap();
@@ -2851,11 +3196,7 @@ mod shadow_tests {
 
     #[test]
     fn selection_and_caret_refresh_cached_text_on_blink_and_focus_changes() {
-        let instance =
-            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
-        let adapter = pollster::block_on(instance.request_adapter(&Default::default())).unwrap();
-        let (device, queue) =
-            pollster::block_on(adapter.request_device(&Default::default())).unwrap();
+        let (device, queue) = crate::gpu::test_device();
         let mut p = blend_player();
         let font = Arc::new(Font {
             em: 100.0,
@@ -2965,11 +3306,7 @@ mod shadow_tests {
 
     #[test]
     fn tinted_text_keeps_black_shadows_and_inherits_alpha() {
-        let instance =
-            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
-        let adapter = pollster::block_on(instance.request_adapter(&Default::default())).unwrap();
-        let (device, queue) =
-            pollster::block_on(adapter.request_device(&Default::default())).unwrap();
+        let (device, queue) = crate::gpu::test_device();
         let bytes = b"FWS\x08\x12\0\0\0\x08\0\0\x1e\x01\0\x40\0\0\0";
         let mut player =
             Player::new(bytes, "shadow-test", Box::new(Empty), Arc::new(Empty), None).unwrap();
