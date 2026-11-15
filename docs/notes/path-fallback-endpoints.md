@@ -118,9 +118,9 @@ context (**0x73efae–0x73efb9**); the ordinary executor maps path failures 5/8 
 
 ## Implementation boundary
 
-OpenThedas still has a provisional grid A* and an unrestricted failed-search fallback.
-The separate height-guard PR [#915](https://github.com/daeken/OpenThedas/pull/915)
-addresses only tall failed routes. It does not implement these endpoint repairs or the
+OpenThedas still has a provisional grid A*. The merged height-guard PR
+[#915](https://github.com/daeken/OpenThedas/pull/915) rejects tall failed Origins
+routes; flatter failures and missing-grid movement retain a provisional direct fallback. It does not implement these endpoint repairs or the
 flat ground-segment query.
 
 The flat segment mask 0x24 matches the simulator's sight mask. However, its ground-height
