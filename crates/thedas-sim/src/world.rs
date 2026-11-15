@@ -407,6 +407,19 @@ pub struct Effect {
     pub flags: i32,
 }
 
+impl Effect {
+    /// Compares reconstructed parameters without identity or application context.
+    /// Used by item-property removal and saved environmental-visual replay only;
+    /// script RemoveEffect uses the assigned identity whenever it has one.
+    pub(crate) fn same_payload(&self, other: &Self) -> bool {
+        let mut candidate = self.clone();
+        candidate.id = other.id;
+        candidate.visual_target = other.visual_target;
+        candidate.visual_location = other.visual_location;
+        candidate == *other
+    }
+}
+
 /// A visual effect applied at a place (`Engine_ApplyEffectAtLocation` with an
 /// `EffectVisualEffect`, type 4): what rendering draws, such as the Proving's crowd. The
 /// simulation only keeps it: it adds the entry when a script applies the effect and drops it

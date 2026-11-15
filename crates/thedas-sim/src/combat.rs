@@ -859,11 +859,7 @@ impl Sim {
                     x.id == effect.id
                 } else {
                     // Direct API callers and older saves have no assigned identity.
-                    let mut legacy = x.clone();
-                    legacy.id = 0;
-                    legacy.visual_target = effect.visual_target;
-                    legacy.visual_location = effect.visual_location;
-                    &legacy == effect
+                    x.same_payload(effect)
                 }
             }) {
                 Some(i) => Some(o.effects.remove(i)),

@@ -848,7 +848,7 @@ fn apply_visual_or_effect(h: &mut ScriptHost, target: ObjectId, e: Effect) {
     if let (Some(replay), Some(o)) = (replay, h.sim.world.get_mut(target)) {
         let mut kept = false;
         o.effects.retain(|e| {
-            if *e != replay {
+            if !e.same_payload(&replay) {
                 return true;
             }
             let first = !kept;
@@ -11493,6 +11493,7 @@ mod coverage_tests {
 
     #[test]
     fn da2_area_load_visual_replays_reconcile_saved_copies() {
+        for identified in [false, true] {
         let table = EngineTable::parse(
             format!("{LDF}\nint EVENT_TYPE_AREALOADSAVE_POSTLOADEXIT = 43;\n").as_bytes(),
         )
@@ -11502,17 +11503,21 @@ mod coverage_tests {
         let area = s.world.spawn(ObjectKind::Area, "area");
         let wall = s.world.spawn(ObjectKind::Placeable, "wall");
         s.world.get_mut(wall).unwrap().area = Some(area);
-        let fire = Effect {
+        let mut fire = Effect {
             ty: 4,
             creator: Some(area),
             duration_type: 3,
             ints: vec![600001],
             ..Default::default()
         };
-        let other = Effect {
+        let mut other = Effect {
             ints: vec![600002],
             ..fire.clone()
         };
+        if identified {
+            s.world.identify_effect(&mut fire);
+            s.world.identify_effect(&mut other);
+        }
         // An older snapshot may already contain several copies. Only the exact
         // environmental visual reissued by the load handler is reconciled.
         s.world.get_mut(wall).unwrap().effects = vec![fire.clone(), other.clone(), fire.clone()];
@@ -11520,16 +11525,22 @@ mod coverage_tests {
             s.load_game(s.save_game()).unwrap();
             let event = s.new_event("AREALOADSAVE_POSTLOADEXIT", None);
             let event = Some(s.world.store(EngineData::Event(event)));
+            let mut replay = fire.clone();
+            if identified {
+                replay.id = 0;
+                s.world.identify_effect(&mut replay);
+            }
             let mut h = ScriptHost {
                 sim: &mut s,
                 event,
                 script: "area".into(),
             };
-            apply_visual_or_effect(&mut h, wall, fire.clone());
+            apply_visual_or_effect(&mut h, wall, replay);
             assert_eq!(
                 s.world.get(wall).unwrap().effects,
                 [fire.clone(), other.clone()]
             );
+        }
         }
     }
 
