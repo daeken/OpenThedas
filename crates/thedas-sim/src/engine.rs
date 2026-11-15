@@ -226,6 +226,36 @@ fn da2_ability_list(sim: &Sim, who: ObjectId, ty: i32, cooling: bool) -> Vec<i32
     }
 }
 
+/// Origins native 859: concatenate owned skill/talent/spell lists (types 1..3),
+/// optionally retaining only entries with a positive remaining cooldown.
+fn origins_ability_list(sim: &Sim, who: ObjectId, ty: i32, cooling: bool) -> Vec<i32> {
+    let Some(o) = sim
+        .world
+        .get(who)
+        .filter(|o| o.kind == ObjectKind::Creature)
+    else {
+        return Vec::new();
+    };
+    if !(0..=3).contains(&ty) {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for kind in 1..=3 {
+        if ty != 0 && ty != kind {
+            continue;
+        }
+        out.extend(o.abilities.iter().copied().filter(|&id| {
+            sim.abi_int(id, "AbilityType") == kind
+                && (!cooling
+                    || o.combat
+                        .cooldowns
+                        .get(&cooldown_key(id, ""))
+                        .is_some_and(|&until| until > sim.world.time_ms))
+        }));
+    }
+    out
+}
+
 /// The party's inventory slots before any backpack (provisional).
 pub const DEFAULT_INVENTORY_SIZE: i32 = 70;
 
@@ -4265,6 +4295,18 @@ pub fn call(
             }
             void()
         }
+        "GetAbilityList" if f.id == 859 => {
+            if h.sim.game != thedas_vfs::Game::Origins {
+                return None;
+            }
+            ok(Value::Array {
+                elem: Type::Int,
+                items: origins_ability_list(h.sim, obj(a, 0), int(a, 1), int(a, 2) != 0)
+                    .into_iter()
+                    .map(Value::Int)
+                    .collect(),
+            })
+        }
         "GetAbilityList" => ok(Value::Array {
             elem: Type::Int,
             items: da2_ability_list(h.sim, obj(a, 0), int(a, 1), int(a, 2) != 0)
@@ -6531,6 +6573,105 @@ mod tests {
             script: "test".into(),
         };
         assert!(call(&mut h, owner, &f, &[]).is_none());
+    }
+
+    #[test]
+    fn native_859_returns_owned_abilities_in_type_groups_and_filters_their_cooldowns() {
+        let table = EngineTable::default().with_inferred();
+        let f = table.function_for_call(859, 3).unwrap();
+        assert_eq!(f.name, "GetAbilityList");
+        assert_eq!(f.ret, Type::Array(Box::new(Type::Int)));
+        let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(table), 1);
+        s.world.tables().insert(
+            "ABI_base",
+            &["AbilityType"],
+            vec![
+                (10, vec![Cell::Int(3)]),
+                (20, vec![Cell::Int(2)]),
+                (30, vec![Cell::Int(1)]),
+                (40, vec![Cell::Int(4)]),
+                (50, vec![Cell::Int(1)]),
+                (60, vec![Cell::Int(0)]),
+            ],
+        );
+        let who = s.world.spawn(ObjectKind::Creature, "creature");
+        s.world.time_ms = 1000;
+        let o = s.world.get_mut(who).unwrap();
+        o.abilities = [10, 20, 30, 40, 60, 999].into_iter().collect();
+        o.combat.cooldowns = [
+            ("10:".into(), 3000),
+            ("20:".into(), 1000),
+            ("30:item".into(), 4000),
+            ("50:".into(), 4000),
+        ]
+        .into_iter()
+        .collect();
+        let query = |s: &mut Sim, ty, cooling, expected: &[i32]| {
+            assert_eq!(
+                run(
+                    s,
+                    who,
+                    "GetAbilityList",
+                    &[Value::Object(who), Value::Int(ty), Value::Int(cooling)]
+                ),
+                Some(Value::Array {
+                    elem: Type::Int,
+                    items: expected.iter().copied().map(Value::Int).collect(),
+                })
+            );
+        };
+        query(&mut s, 0, 0, &[30, 20, 10]);
+        query(&mut s, 1, 0, &[30]);
+        query(&mut s, 2, 0, &[20]);
+        query(&mut s, 3, 0, &[10]);
+        query(&mut s, 0, 1, &[10]);
+        query(&mut s, 0, -1, &[10]);
+        for ty in [-1, 4, 5] {
+            query(&mut s, ty, 0, &[]);
+        }
+        s.world.time_ms = 3000;
+        query(&mut s, 0, 1, &[]);
+        assert_eq!(s.world.get(who).unwrap().combat.cooldowns.len(), 4);
+    }
+
+    #[test]
+    fn native_859_invalid_creatures_return_an_empty_integer_array_and_da2_is_unchanged() {
+        let mut s = Sim::new(
+            Arc::new(Vfs::new()),
+            Arc::new(EngineTable::default().with_inferred()),
+            1,
+        );
+        let item = s.world.spawn(ObjectKind::Item, "item");
+        for who in [item, OBJECT_INVALID] {
+            assert_eq!(
+                run(
+                    &mut s,
+                    who,
+                    "GetAbilityList",
+                    &[Value::Object(who), Value::Int(0), Value::Int(0)]
+                ),
+                Some(Value::Array {
+                    elem: Type::Int,
+                    items: Vec::new()
+                })
+            );
+        }
+        s.game = thedas_vfs::Game::DragonAge2;
+        let f = s.table.function(859).unwrap().clone();
+        let mut h = ScriptHost {
+            sim: &mut s,
+            event: None,
+            script: "test".into(),
+        };
+        assert!(
+            call(
+                &mut h,
+                item,
+                &f,
+                &[Value::Object(item), Value::Int(0), Value::Int(0)]
+            )
+            .is_none()
+        );
     }
 
     #[test]
