@@ -401,10 +401,7 @@ mod tests {
             vec![Some(100), None, None, Some(103)]
         );
         g.structs[5].values[0] = Value::U16(9);
-        assert_eq!(
-            line_performance_ids(&g),
-            vec![Some(100), None, None, None]
-        );
+        assert_eq!(line_performance_ids(&g), vec![Some(100), None, None, None]);
 
         let performance = Gff4 {
             file_type: FourCC::new(b"LINE"),
