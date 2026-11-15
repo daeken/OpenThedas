@@ -201,3 +201,10 @@ round-trip, and a bent route whose arrival bearing differs from the original
 order. This implements the scalar body-yaw step during translation. Persistent
 locomotion modes, stationary turn completion, performance processing ownership,
 the direction filter and complete command admission remain separate work.
+
+The shared scalar helper also retains its existing half-turn convention.
+Native `0x8c8780` obtains signed headings from direction vectors, and `0x8c8ff0`
+retains both endpoints of the closed interval [-180, 180]. At exactly opposite
+directions, the native turn sign can depend on the vector's signed zero. The
+scalar facing representation discards that distinction. Exact antiparallel
+turn-sign parity therefore belongs to the remaining vector-heading work.
