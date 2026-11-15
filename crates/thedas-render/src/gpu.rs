@@ -576,6 +576,8 @@ pub struct AreaRenderer {
     lightmap_groups: Vec<wgpu::BindGroup>,
     stand_in: Vec<Draw>,
     d3d: crate::d3d_gpu::D3dPass,
+    /// Which props have been posed at least once (see [`Self::prop_seen`]).
+    posed_props: Vec<bool>,
     /// (scene draw index, draw) in drawing order.
     opaque: Vec<(usize, DrawRef)>,
     blended: Vec<(usize, DrawRef)>,
@@ -1104,6 +1106,7 @@ impl AreaRenderer {
             lightmap_groups,
             stand_in,
             d3d,
+            posed_props: Vec::new(),
             opaque,
             blended,
             only_draws: None,
@@ -1437,6 +1440,25 @@ impl AreaRenderer {
         }
     }
 
+    /// Whether the last frame showed prop `prop` or cast a shadow from it (any of its
+    /// draws in the view or a sun partition), or it was never posed: posing a prop no
+    /// one sees can wait. `seen` is [`D3dPass::seen_draws`]'s, taken once a frame.
+    pub fn prop_seen(&self, scene: &AreaScene, prop: usize, seen: &[bool]) -> bool {
+        if seen.is_empty() || !self.posed_props.get(prop).copied().unwrap_or(false) {
+            return true;
+        }
+        scene.props.get(prop).is_none_or(|p| {
+            p.draws
+                .clone()
+                .any(|d| seen.get(d).copied().unwrap_or(true))
+        })
+    }
+
+    /// The draws the last frame showed or cast a shadow from (see [`Self::prop_seen`]).
+    pub fn seen_draws(&self) -> Vec<bool> {
+        self.d3d.seen_draws()
+    }
+
     pub fn pose_prop(
         &mut self,
         ctx: &GpuContext,
@@ -1448,6 +1470,10 @@ impl AreaRenderer {
         let Some(p) = scene.props.get(prop) else {
             return;
         };
+        if self.posed_props.len() <= prop {
+            self.posed_props.resize(prop + 1, false);
+        }
+        self.posed_props[prop] = true;
         let to_model = p.transform.inverse();
         let attached: std::collections::HashSet<usize> =
             p.attachments.iter().flat_map(|a| a.draws.clone()).collect();
