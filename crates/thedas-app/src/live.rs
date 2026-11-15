@@ -1885,6 +1885,9 @@ impl Live {
             models.push(m);
         }
         let kept = shown.kept;
+        // The next frame's locomotion leaves these creatures' standing pose to the cutscene.
+        self.locomotion
+            .hold(posing.keys().chain(kept.keys()).copied());
         // A cutscene's weapon draws and hidden actors.
         let mut hidden = std::collections::HashSet::new();
         // Party members the playing cutscene does not cast are not drawn while it plays

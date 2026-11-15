@@ -85,8 +85,9 @@ pub struct Animator {
     /// Each animation's track nodes on each skeleton (by the skeleton's index, then the
     /// animation's resource): see [`crate::skeleton::Skeleton::track_nodes`].
     track_nodes: HashMap<usize, HashMap<String, TrackNodes>>,
-    /// Each prop's poses as last computed (see [`Animator::pose_props`]).
-    last_poses: Vec<crate::skeleton::Poses>,
+    /// Each prop's poses as last computed, and what they were posed with (see
+    /// [`Animator::pose_props`]; none: not posed since the props changed).
+    last_poses: Vec<Option<(u64, crate::skeleton::Poses)>>,
 }
 
 fn load<T>(
@@ -444,9 +445,29 @@ impl Animator {
         // A prop the last frame neither showed nor cast a shadow from keeps its pose
         // (and place) until it is seen again: the pose is not drawn. Not traced against
         // the original's animation updates (provisional; a modern saving).
+        // A prop is posed again, seen or not, when its clip changes (it sits down, say) or
+        // it has no pose kept: a culled prop is otherwise left in a pose it no longer has.
         let seen = renderer.seen_draws();
+        if self.last_poses.len() != props.len() {
+            self.last_poses = vec![None; props.len()];
+        }
+        let shapes: Vec<u64> = props
+            .iter()
+            .map(|(_, c)| {
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                if let Some(c) = c {
+                    clip_shape(c, &mut h);
+                }
+                std::hash::Hasher::finish(&h)
+            })
+            .collect();
         let posing: Vec<bool> = (0..props.len())
-            .map(|i| renderer.prop_seen(scene, i, &seen))
+            .map(|i| {
+                self.last_poses[i]
+                    .as_ref()
+                    .is_none_or(|(shape, _)| *shape != shapes[i])
+                    || renderer.prop_seen(scene, i, &seen)
+            })
             .collect();
         let mut jobs: Vec<(usize, usize, Prepared)> = Vec::new();
         for (i, (_, clip)) in props.iter().enumerate() {
@@ -477,17 +498,29 @@ impl Animator {
         }
         // An unseen prop is placed again with the pose it was last given, so that it moves
         // (and its attachments and effects with it) and is seen when it comes into view.
-        if self.last_poses.len() != props.len() {
-            self.last_poses = vec![Default::default(); props.len()];
-        }
         for (i, ((transform, _), poses)) in props.iter().zip(by_prop).enumerate() {
             if posing[i] {
                 renderer.pose_prop(ctx, scene, i, *transform, &poses);
-                self.last_poses[i] = poses;
-            } else {
-                renderer.pose_prop(ctx, scene, i, *transform, &self.last_poses[i]);
+                self.last_poses[i] = Some((shapes[i], poses));
+            } else if let Some((_, kept)) = &self.last_poses[i] {
+                renderer.pose_prop(ctx, scene, i, *transform, kept);
             }
         }
+    }
+}
+
+/// What a clip plays, without where in it: its trees, actions and layers (a change to
+/// them is a new pose; a change of time alone is not).
+fn clip_shape(c: &Clip, h: &mut impl std::hash::Hasher) {
+    use std::hash::Hash;
+    c.trees.hash(h);
+    c.actions.hash(h);
+    c.looping.hash(h);
+    c.absolute.hash(h);
+    c.inline.as_ref().map(Arc::as_ptr).hash(h);
+    c.layers.len().hash(h);
+    for l in &c.layers {
+        clip_shape(l, h);
     }
 }
 
