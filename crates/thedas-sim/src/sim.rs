@@ -2869,6 +2869,17 @@ impl Sim {
     /// Puts a `CommandMoveToObject` walker that stepped inside its minimum range back out
     /// to it, on the line from the target.
     fn stop_at_range(&mut self, id: ObjectId) {
+        if self.game == thedas_vfs::Game::Origins
+            && self
+                .world
+                .get(id)
+                .and_then(|o| o.commands.first())
+                .is_some_and(|c| {
+                    c.name == "CommandMoveToObject" && c.max_range.is_some() && c.location.is_some()
+                })
+        {
+            return;
+        }
         let Some((pos, min, tpos)) = self.world.get(id).and_then(|o| {
             let c = o.commands.first()?;
             let t = self.world.get(c.target?)?;
@@ -2887,11 +2898,48 @@ impl Sim {
         }
     }
 
-    /// DAOrigins.exe 0x7aa200 uses the horizontal range test at 0x7a3090:
-    /// fMaxRange (raised to fMinRange at 0x66f312) plus 0.05 m slack. Older saves
-    /// without a maximum keep their former minimum-only behavior. Provisional: a
-    /// walker already inside its minimum is not sent away, and capsule contact also
-    /// ends the walk (the native locomotion status at 0x7a9130 is not fully traced).
+    /// Origins' initial range check (0x7aa440) can complete without walking. Otherwise
+    /// 0x7a6ca0 -> 0x7a31c0 chooses a goal fMinRange from the target toward the mover,
+    /// searching within max(0.5, fMaxRange-fMinRange), check off. The locomotion check
+    /// (0x7a9622) uses fMaxRange-fMinRange around that goal, not fMaxRange around the
+    /// target. Keep the goal in the command's saved location. Provisional: the alternate
+    /// LOS-goal search (nonzero native float 4), failed-search fallback 0x73e7f0 and
+    /// replanning a moving target (0x7a50f0) are not modelled.
+    fn move_to_object_goal(&mut self, id: ObjectId, cmd: &Command) -> Option<Location> {
+        let mover = self.world.get(id)?;
+        let target = self.world.get(cmd.target?)?;
+        let area = mover.area?;
+        if target.area != Some(area) || target.id == id {
+            return None;
+        }
+        let (here, there, facing) = (mover.position, target.position, mover.facing);
+        let min = cmd.seconds.max(0.0);
+        let max = cmd.max_range?.max(min);
+        let (dx, dy) = (here[0] - there[0], here[1] - there[1]);
+        let distance = (dx * dx + dy * dy).sqrt();
+        let position = if distance >= (min - 0.05).max(0.0) && distance <= max + 0.05 {
+            here
+        } else {
+            let k = if distance > 1e-4 { min / distance } else { 0.0 };
+            let point = [there[0] + dx * k, there[1] + dy * k, there[2]];
+            let how = crate::nav::SafeSearch {
+                radius: (max - min).max(0.5),
+                body_radius: self.capsule_radius(id),
+                mover: Some(id),
+                standable_keeps: false,
+            };
+            self.safe_search(area, point, how).unwrap_or(point)
+        };
+        Some(Location {
+            area,
+            position,
+            facing,
+        })
+    }
+
+    /// Active Origins walks test the stored locomotion goal with the range width
+    /// (0x7a9622..0x7a9776). Legacy saves and DA2 keep their previous target-centred
+    /// approximation. Capsule-contact completion remains provisional.
     fn move_to_object_arrived(&self, id: ObjectId) -> bool {
         const RANGE_SLACK: f32 = 0.05;
         let Some(o) = self.world.get(id) else {
@@ -2912,11 +2960,19 @@ impl Sim {
         let d = ((t.position[0] - o.position[0]).powi(2) + (t.position[1] - o.position[1]).powi(2))
             .sqrt();
         let min = c.seconds.max(0.0);
-        // A step that went past the lower bound is put back at the range by
-        // [`Sim::stop_at_range`]; a walker that starts inside it is not sent away
-        // (provisional).
+        // Legacy/DA2 moves retain their target-centred range approximation and the
+        // lower-bound correction in `stop_at_range`.
         let max = c.max_range.unwrap_or(min).max(min);
-        let in_range = d <= max + RANGE_SLACK;
+        let in_range = if self.game == thedas_vfs::Game::Origins && c.max_range.is_some() {
+            c.location.map_or(d <= max + RANGE_SLACK, |l| {
+                let goal_distance = ((l.position[0] - o.position[0]).powi(2)
+                    + (l.position[1] - o.position[1]).powi(2))
+                .sqrt();
+                goal_distance <= max - min + RANGE_SLACK
+            })
+        } else {
+            d <= max + RANGE_SLACK
+        };
         let touching = t.kind == ObjectKind::Creature
             && self.alive(t.id)
             && d <= self.capsule_radius(id) + self.capsule_radius(t.id) + RANGE_SLACK;
@@ -3538,6 +3594,16 @@ impl Sim {
                     let pos = self.world.get(id).map(|o| o.position);
                     let mut path = Vec::new();
                     let mut cmd = cmd;
+                    if self.game == thedas_vfs::Game::Origins
+                        && cmd.name == "CommandMoveToObject"
+                        && cmd.max_range.is_some()
+                    {
+                        cmd.location = self.move_to_object_goal(id, &cmd);
+                        if let Some(c) = self.world.get_mut(id).and_then(|o| o.commands.first_mut())
+                        {
+                            c.location = cmd.location;
+                        }
+                    }
                     // Moving away from an object: to the point at the asked distance from it,
                     // on the line from it through the mover (closer in when the mover is
                     // farther off), as script.ldf describes the command. Provisional: the
@@ -3589,7 +3655,11 @@ impl Sim {
                                 .map(|o| o.position)
                         });
                         if let (Some(to), Some(p)) = (to, pos) {
-                            path = match self.route_to(id, to) {
+                            path = match if to == p {
+                                crate::nav::Routed::Path(vec![p])
+                            } else {
+                                self.route_to(id, to)
+                            } {
                                 crate::nav::Routed::Path(p) => p,
                                 crate::nav::Routed::Straight => Vec::new(),
                                 crate::nav::Routed::Door(door) => {
@@ -3781,6 +3851,11 @@ impl Sim {
         let location = cmd
             .location
             .filter(|_| cmd.name != "CommandUseAbility")
+            .filter(|_| {
+                !(self.game == thedas_vfs::Game::Origins
+                    && cmd.name == "CommandMoveToObject"
+                    && cmd.max_range.is_some())
+            })
             .filter(|l| !at_door(self, l.position, Some(l.area)));
         if let Some(l) = location {
             // Cross the triggers between where the move began and its end on the way (along
@@ -6137,6 +6212,61 @@ mod tests {
         assert!(o.commands.is_empty());
         assert_eq!(o.position, [80.0, 120.0, 29.5]);
         assert_eq!(o.area, Some(area));
+    }
+
+    #[test]
+    fn an_origins_move_already_in_range_keeps_its_exact_pose() {
+        let mut s = sim();
+        let area = s.world.spawn(ObjectKind::Area, "a");
+        let walker = s.world.spawn(ObjectKind::Creature, "walker");
+        let target = s.world.spawn(ObjectKind::Waypoint, "target");
+        let here = [7.0, 0.0, 4.0];
+        let o = s.world.get_mut(walker).unwrap();
+        o.area = Some(area);
+        o.position = here;
+        o.commands.push(Command {
+            name: "CommandMoveToObject".into(),
+            target: Some(target),
+            seconds: 1.0,
+            max_range: Some(4.0),
+            ..Default::default()
+        });
+        let t = s.world.get_mut(target).unwrap();
+        t.area = Some(area);
+        t.position = [10.0, 0.0, 9.0];
+        s.tick(100);
+        let o = s.world.get(walker).unwrap();
+        assert!(o.commands.is_empty());
+        assert_eq!(o.position, here);
+    }
+
+    #[test]
+    fn origins_move_completion_uses_the_offset_goal_and_survives_reload() {
+        let mut s = sim();
+        let area = s.world.spawn(ObjectKind::Area, "a");
+        let walker = s.world.spawn(ObjectKind::Creature, "walker");
+        let target = s.world.spawn(ObjectKind::Waypoint, "target");
+        s.world.get_mut(walker).unwrap().area = Some(area);
+        let t = s.world.get_mut(target).unwrap();
+        t.area = Some(area);
+        t.position = [10.0, 0.0, 0.0];
+        let mut cmd = Command {
+            name: "CommandMoveToObject".into(),
+            target: Some(target),
+            seconds: 1.0,
+            max_range: Some(4.0),
+            ..Default::default()
+        };
+        cmd.location = s.move_to_object_goal(walker, &cmd);
+        assert_eq!(cmd.location.unwrap().position, [9.0, 0.0, 0.0]);
+        let restored = serde_json::from_str(&serde_json::to_string(&cmd).unwrap()).unwrap();
+        s.world.get_mut(walker).unwrap().commands.push(restored);
+        // A detour enters the target's 4 m disc before it enters the native goal's
+        // 3 m disc. Testing only the target would complete too soon here.
+        s.world.get_mut(walker).unwrap().position = [8.0, 3.0, 0.0];
+        assert!(!s.move_to_object_arrived(walker));
+        s.world.get_mut(walker).unwrap().position = [9.0, 3.0, 0.0];
+        assert!(s.move_to_object_arrived(walker));
     }
 
     #[test]
