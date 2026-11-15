@@ -50,12 +50,22 @@ Both have zero script errors. Tranquility completion is not claimed. No plot
 forcing, direct activation, developer healing or kill aids are used.
 
 The inherited checkpoint has an inconsistent arrival: the current area is the
-Chantry, but the hero still belongs to Hightown Night. The driver's ordinary
-`move_hero` request consequently takes the existing cross-area walk fallback,
-which moves the hero into Karl's area without elapsed time. This is a matched
-activation test, not proof of a faithful Chantry arrival. The later wipe also
-predates the separate stored-combat-target repair. Neither cinematic placement
-nor this activation omission alone is established as the cause of that wipe.
+Chantry, but the hero still belongs to Hightown Night. The old driver kept its
+Hightown-door destination after Anders's conversation naturally transitioned
+inside. Its next walk took the existing cross-area fallback back to Hightown;
+the later walk to Karl moved the hero inside again without elapsed time.
+This remains a matched activation test, not faithful-arrival evidence.
+
+Correcting the private driver to stop on the area change reaches the Chantry
+at t=1312315 with hero and current area both 6375. From this checkpoint,
+activation alone starts the fight but wipes at t=1414127. Combining this repair
+with the separately reviewed stored-combat-target change wins the fight, follows
+Karl's final conversation, returns to Darktown and completes Anders's dialogue
+at t=1504060. A second run starting back in Hightown reproduces that endpoint.
+The party is alive, Anders joins the active followers, and both runs have zero
+script errors without developer healing, kill aids, plot forcing or manual
+activation. Full cinematic placement/processing parity remains unfinished;
+neither omission alone is established as the cause of every earlier wipe.
 
 Synthetic regressions cover the spoken-line/performance mapping, no-performance
 flag, bindings without world objects, current-area resolution, persistence on
