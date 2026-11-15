@@ -5,7 +5,8 @@
 //! of 287 stand on 1s; 9s form the walls between rooms, with gaps where doors stand), its
 //! height is the stored value in sixteenths of a metre, and a creature can step between
 //! neighbouring cells whose heights differ by at most [`MAX_STEP`]. Routes are 8-connected
-//! A* without cutting blocked corners.
+//! A* without cutting blocked corners, straightened as DAOrigins.exe's planner straightens
+//! them (see [`straighten`]).
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
@@ -18,6 +19,14 @@ use crate::sim::Sim;
 
 /// The largest height change between neighbouring cells a walker can take, in metres.
 pub const MAX_STEP: f32 = 0.6;
+
+/// The largest height change between cells a straight leg crosses (DAOrigins.exe's
+/// traversability query, 0xa4bde3-0xa4be01: float 0.5 at 0xb59324).
+const STRAIGHT_STEP: f32 = 0.5;
+
+/// The spacing of the points the planner keeps along a long straight leg, in metres
+/// (DAOrigins.exe 0xa4e3dc-0xa4e3e2: 2.0 at 0xb59318).
+const LEG_SPACING: f32 = 2.0;
 
 /// The radius of the body the safe-location search places (DAOrigins.exe 0xae7104).
 const SAFE_BODY_RADIUS: f32 = 0.5;
@@ -184,6 +193,11 @@ pub fn route_avoiding(
     // The cells a route may use: the search and the straightening of its route
     // ([`straighten`]) both go by this, and step between cells by [`passable`].
     let free = |c: (u32, u32)| walkable(g, c) && !blocked.contains(&idx(c));
+    // A straight line that is clear needs no search (DAOrigins.exe 0xa4e1b0 tries
+    // 0xa4bb80 from start to goal first, 0xa4e20a-0xa4e26a).
+    if straight_clear(g, from, to, &free) {
+        return Some(resample(g, from, &[to]));
+    }
     let h = |c: (u32, u32)| {
         let (dx, dy) = (
             (c.0 as f32 - goal.0 as f32).abs(),
@@ -238,7 +252,7 @@ pub fn route_avoiding(
                 continue;
             }
             let n = (x as u32, y as u32);
-            if !passable(g, c, n, &free) {
+            if !passable(g, c, n, MAX_STEP, &free) {
                 continue;
             }
             let step = if dx != 0 && dy != 0 {
@@ -257,44 +271,68 @@ pub fn route_avoiding(
     None
 }
 
-/// The longest stretch of a route [`straighten`] takes in one straight line, in cells.
-const STRAIGHT_REACH: usize = 24;
-
-/// A route of cell centres (`pts`, walked from `from`) as straight legs: from each point the
-/// walker goes straight on to the furthest of the next [`STRAIGHT_REACH`] points the line to
-/// which crosses only free cells (see [`straight_clear`]), with points put back along each
-/// leg a cell apart at the ground's height there, so the walk still follows the floor.
+/// The search's route (`pts`, cell centres walked from `from`, ending at the goal) as
+/// DAOrigins.exe's planner leaves it: the shortcut helper (0xa4c2a0) tests a stretch's two
+/// ends with the traversability query ([`straight_clear`]) and, when the line between them
+/// is clear, drops the points in between; when it is not, it splits the stretch at its
+/// middle point and does the same with each half (0xa4c45f-0xa4c485). Long legs then get
+/// points back at about [`LEG_SPACING`] ([`resample`]).
 ///
 /// The 8-connected search's own route turns in 45° steps from cell centre to cell centre,
 /// and its first leg runs from wherever the walker stands to the next cell's centre, which
-/// can be beside or behind it. The walker faces each leg as it walks it, so a route made
-/// again every frame (the pad's stick and the movement keys order a walk a little ahead
-/// each frame) swung the hero's facing by 45° or more from frame to frame, and it walked a
-/// zigzag. Provisional: DAOrigins.exe's path follower and its smoothing are not traced.
+/// can be beside or behind it; walked as it is, with a route made again every frame (the
+/// pad's stick and the movement keys order a walk a little ahead each frame), the hero's
+/// heading swung from frame to frame. Not ported: the planner's partition of a fresh
+/// stretch by path length against octile distance before shortcutting (0xa4c790, tolerance
+/// 0.25), its relaxation of corners over point triples (0xa4d110 -> 0xa4c930), and the
+/// query's 3x3 clearance test round each cell for the walker's radius (0xa4bd28-0xa4bdd5):
+/// a line here needs only the cells it crosses to be free.
 fn straighten(
     g: &NavGrid,
     from: [f32; 3],
     pts: &[[f32; 3]],
     free: &impl Fn((u32, u32)) -> bool,
 ) -> Vec<[f32; 3]> {
+    let all: Vec<[f32; 3]> = std::iter::once(from).chain(pts.iter().copied()).collect();
+    let mut keep = vec![true; all.len()];
+    let mut stretches = vec![(0, all.len() - 1)];
+    while let Some((lo, hi)) = stretches.pop() {
+        if hi - lo < 2 {
+            continue;
+        }
+        if straight_clear(g, all[lo], all[hi], free) {
+            keep[lo + 1..hi].iter_mut().for_each(|k| *k = false);
+        } else {
+            let mid = (lo + hi) / 2;
+            stretches.push((mid, hi));
+            stretches.push((lo, mid));
+        }
+    }
+    let kept: Vec<[f32; 3]> = all
+        .iter()
+        .zip(&keep)
+        .skip(1)
+        .filter(|(_, k)| **k)
+        .map(|(p, _)| *p)
+        .collect();
+    resample(g, from, &kept)
+}
+
+/// Points put back along each leg longer than twice [`LEG_SPACING`]: `floor(length /
+/// spacing)` of them, evenly along it (DAOrigins.exe 0xa4c335-0xa4c448), each at the
+/// floor's height there. The exe does this to the legs its shortcuts make; here every leg
+/// gets it, the direct line too, because a mover's height is interpolated between points
+/// where the exe's physics controller keeps it on the floor.
+fn resample(g: &NavGrid, from: [f32; 3], pts: &[[f32; 3]]) -> Vec<[f32; 3]> {
     let mut out = Vec::with_capacity(pts.len());
     let mut at = from;
-    let mut i = 0;
-    while i < pts.len() {
-        let mut j = i;
-        while j + 1 < pts.len()
-            && j + 1 - i < STRAIGHT_REACH
-            && straight_clear(g, at, pts[j + 1], free)
-        {
-            j += 1;
-        }
-        // The cells passed over on the way, a cell apart, at the floor's height.
-        let to = pts[j];
+    for &to in pts {
         let (dx, dy) = (to[0] - at[0], to[1] - at[1]);
-        let steps = ((dx * dx + dy * dy).sqrt() / g.cell_size).floor() as usize;
-        if j > i {
-            for k in 1..steps {
-                let f = k as f32 / steps as f32;
+        let length = (dx * dx + dy * dy).sqrt();
+        if length > 2.0 * LEG_SPACING {
+            let n = (length / LEG_SPACING).floor() as usize;
+            for k in 1..=n {
+                let f = k as f32 / (n + 1) as f32;
                 let p = [at[0] + dx * f, at[1] + dy * f, 0.0];
                 let z = g
                     .cell(p)
@@ -304,26 +342,34 @@ fn straighten(
         }
         out.push(to);
         at = to;
-        i = j + 1;
     }
     out
 }
 
 /// Whether a walker can step from cell `c` to the neighbouring cell `n` (8-connected): `n`
-/// is `free`, their heights differ by at most [`MAX_STEP`], and a diagonal step cuts no
-/// corner of a cell that is not free. The route search and [`straight_clear`] both step by
-/// this, so a straightened route goes only where the search could have.
-fn passable(g: &NavGrid, c: (u32, u32), n: (u32, u32), free: &impl Fn((u32, u32)) -> bool) -> bool {
-    if !free(n) || (height(g, n) - height(g, c)).abs() > MAX_STEP {
+/// is `free`, their heights differ by at most `step`, and a diagonal step cuts no corner of
+/// a cell that is not free. The route search (with [`MAX_STEP`]) and [`straight_clear`]
+/// (with the stricter [`STRAIGHT_STEP`]) both step by this, over the same free cells, so a
+/// straightened route goes only where the search could have.
+fn passable(
+    g: &NavGrid,
+    c: (u32, u32),
+    n: (u32, u32),
+    step: f32,
+    free: &impl Fn((u32, u32)) -> bool,
+) -> bool {
+    if !free(n) || (height(g, n) - height(g, c)).abs() > step {
         return false;
     }
     c.0 == n.0 || c.1 == n.1 || (free((n.0, c.1)) && free((c.0, n.1)))
 }
 
-/// Whether a walker can go in a straight line from `a` to `b`: it starts on a `free` cell,
-/// and each cell the line passes into is one the route search could step to from the last
-/// ([`passable`]). A line starting off the grid or on a cell that is not free is not
-/// straight-clear.
+/// Whether a walker can go in a straight line from `a` to `b`, as DAOrigins.exe's
+/// traversability query (0xa4bb80) walks a line over the grid in half-cell steps
+/// (0xa4bc49-0xa4bc76): it starts on a `free` cell, and each cell the line passes into is
+/// one the route search could step to from the last ([`passable`]), with no height change
+/// over [`STRAIGHT_STEP`]. A line starting off the grid or on a cell that is not free is
+/// not straight-clear.
 fn straight_clear(
     g: &NavGrid,
     a: [f32; 3],
@@ -337,7 +383,7 @@ fn straight_clear(
         return false;
     }
     let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
-    let n = (((dx * dx + dy * dy).sqrt() / (g.cell_size * 0.25)).ceil() as usize).max(1);
+    let n = (((dx * dx + dy * dy).sqrt() / (g.cell_size * 0.5)).ceil() as usize).max(1);
     for k in 1..=n {
         let f = k as f32 / n as f32;
         let Some(c) = g.cell([a[0] + dx * f, a[1] + dy * f, 0.0]) else {
@@ -346,7 +392,7 @@ fn straight_clear(
         if c == prev {
             continue;
         }
-        if !passable(g, prev, c, free) {
+        if !passable(g, prev, c, STRAIGHT_STEP, free) {
             return false;
         }
         prev = c;
@@ -1139,8 +1185,14 @@ mod tests {
             );
             at = *q;
         }
-        // Points a cell apart, so the walk still follows the floor's height.
-        assert!(p.len() >= 8, "{p:?}");
+        // A clear line is taken at once (no search), with points kept along it about
+        // LEG_SPACING apart (none further apart than twice that).
+        let mut at = from;
+        for q in &p {
+            let d = ((q[0] - at[0]).powi(2) + (q[1] - at[1]).powi(2)).sqrt();
+            assert!(d <= 2.0 * LEG_SPACING && d >= LEG_SPACING * 0.5, "{p:?}");
+            at = *q;
+        }
     }
 
     #[test]
@@ -1463,6 +1515,7 @@ mod tests {
             arrived: false,
             da2_target_prepared: false,
             path: Vec::new(),
+            turned_at: None,
         });
         let r = 2.0 * s.capsule_radius(leader);
         for _ in 0..400 {
@@ -1552,6 +1605,7 @@ mod tests {
             arrived: false,
             da2_target_prepared: false,
             path: Vec::new(),
+            turned_at: None,
         });
         let r = 2.0 * s.capsule_radius(hero);
         for _ in 0..150 {
@@ -1668,6 +1722,7 @@ mod tests {
             arrived: false,
             da2_target_prepared: false,
             path: Vec::new(),
+            turned_at: None,
         });
         // Four metres in a straight line, but the wall sends it up through the gap: the
         // route is longer, and halfway along it the walker is in the top row, not inside
