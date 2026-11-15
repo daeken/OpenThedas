@@ -261,6 +261,8 @@ pub(crate) struct D3dPass {
     /// The scene's lights, then the lights added since ([`D3dPass::set_extra_lights`]), for
     /// re-picking the lights of objects that move.
     scene_lights: Vec<SceneLight>,
+    /// The flicker of `scene_lights` (see [`crate::flicker`]), stepped by each frame's clock.
+    flicker: std::sync::Mutex<crate::flicker::Flickers>,
     /// How many of `scene_lights` are the scene's own.
     own_lights: usize,
     /// Per scene draw, what its lights were picked by when the pass was made: its bounding
@@ -2119,6 +2121,7 @@ impl D3dPass {
             particle_buffer,
             quad_indices,
             scene_lights: scene.lights.clone(),
+            flicker: std::sync::Mutex::new(crate::flicker::Flickers::new(&scene.lights)),
             own_lights: scene.lights.len(),
             placed: scene
                 .draws
@@ -2197,6 +2200,7 @@ impl D3dPass {
                 partition: None,
                 tree: None,
                 winds: &[],
+                flicker: &[],
             };
             let mut data = vec![0u8; slot_size];
             for (table, base) in [(program.vs.ctab.as_ref(), 0), (program.ps.ctab.as_ref(), 3)] {
@@ -2293,6 +2297,10 @@ impl D3dPass {
         }
         self.scene_lights.truncate(self.own_lights);
         self.scene_lights.extend_from_slice(extra);
+        self.flicker
+            .get_mut()
+            .unwrap_or_else(|e| e.into_inner())
+            .set_lights(&self.scene_lights);
         let relit = self.relit.get_mut().unwrap_or_else(|e| e.into_inner());
         relit.resize(self.draws.len(), None);
         self.extra_lit.resize(self.draws.len(), None);
@@ -2501,6 +2509,7 @@ impl D3dPass {
             partition: None,
             tree: Some(tree),
             winds,
+            flicker: &[],
         };
         let program = self.program(d);
         let mut constants = context.fill(program.vs.ctab.as_ref());
@@ -2797,6 +2806,10 @@ impl D3dPass {
         written.resize(self.draws.len(), None);
         let mut relit = self.relit.lock().unwrap_or_else(|e| e.into_inner());
         self.repick_lights(&in_view, &mut statics, &mut relit);
+        let mut flicker = self.flicker.lock().unwrap_or_else(|e| e.into_inner());
+        if !warm {
+            flicker.advance(time);
+        }
         // The per-frame registers of slots that are otherwise current: (offset, bytes).
         let mut partial: Vec<u8> = Vec::new();
         let mut partial_spans: Vec<(u64, std::ops::Range<usize>)> = Vec::new();
@@ -2852,6 +2865,12 @@ impl D3dPass {
                 partition: None,
                 tree: self.trees.get(d.draw).and_then(|t| t.as_ref()),
                 winds: &winds,
+                // A rig's lights are not the scene's: they hold steady.
+                flicker: if rigged.is_some() {
+                    &[]
+                } else {
+                    flicker.values()
+                },
             };
             // The constants that stay as the draw was made are filled once (see
             // [`ConstantContext::per_frame`]); each frame refills the rest over them.
@@ -3120,6 +3139,7 @@ impl D3dPass {
                     partition: Some(partitions[k].view_proj),
                     tree: None,
                     winds: &[],
+                    flicker: &[],
                 };
                 for (table, base) in [(program.vs.ctab.as_ref(), 0), (program.ps.ctab.as_ref(), 3)]
                 {
@@ -3471,6 +3491,7 @@ mod tests {
     #[test]
     fn added_lights_join_a_draws_pick_by_its_class() {
         let light = |x: f32, domain: i64, intensity: f32| SceneLight::Point {
+            flicker: None,
             position: Vec3::new(x, 0.0, 0.0),
             color: Vec3::ONE,
             radius: 10.0,
@@ -3523,6 +3544,7 @@ mod tests {
             is_static: true,
             version: 0,
             intensity: 1.0,
+            flicker: None,
             room: None,
         };
         let lights = vec![light(0.0, "a"), light(20.0, "b")];

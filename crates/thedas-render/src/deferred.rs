@@ -1073,6 +1073,7 @@ impl DeferredPass {
                                 .then_some(d.room_id)?
                         })
                     };
+<<<<<<< HEAD
                     set.fills.iter().map(|f| SceneLight::Point {
                         position: f.position,
                         color: f.color,
@@ -1085,6 +1086,23 @@ impl DeferredPass {
                         room: f.atlas.as_deref().and_then(atlas_room),
                     })
                     .collect()
+=======
+                    set.fills
+                        .iter()
+                        .map(|f| SceneLight::Point {
+                            position: f.position,
+                            color: f.color,
+                            radius: f.radius,
+                            name: "baked fill".into(),
+                            domain: None,
+                            is_static: true,
+                            version: 0,
+                            intensity: 1.0,
+                            flicker: None,
+                            room: f.atlas.as_deref().and_then(atlas_room),
+                        })
+                        .collect()
+>>>>>>> origin/main
                 })
                 .unwrap_or_default(),
             refused: false,
@@ -3178,6 +3196,7 @@ pub fn emitter_light(e: &crate::particles::EmitterState) -> Option<SceneLight> {
         is_static: false,
         version: 1,
         intensity: 1.0,
+        flicker: None,
         room: None,
     })
 }
