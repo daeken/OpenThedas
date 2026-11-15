@@ -2714,6 +2714,14 @@ impl UiLayer {
         self.shown.lock().map(|s| s.paperdoll_preset).unwrap_or(0)
     }
 
+    /// The stage creature's turn, face-camera tilt and drag counter.
+    pub fn paperdoll_pose(&self) -> (f32, f32, u64) {
+        self.shown
+            .lock()
+            .map(|s| (s.paperdoll_yaw, s.paperdoll_pitch, s.paperdoll_drags))
+            .unwrap_or_default()
+    }
+
     /// The party member to draw into the paperdoll and how far it is turned (radians), when
     /// it is due (see [`PaperdollClock`]): the one the inventory or character record shows
     /// (the member the player controls). `dt_ms` is the time since the last call.

@@ -123,6 +123,10 @@ pub struct Presentation {
     /// How far the player has turned the paperdoll from facing them (radians; the
     /// inventory's and character record's rotate buttons, see `crate::input::PAPERDOLL_TURN`).
     pub paperdoll_yaw: f32,
+    /// Face-preset tilt relative to its initial -10 degrees (exe 0x7b2512).
+    pub paperdoll_pitch: f32,
+    /// Drag messages received; a drag finishes an active preset blend (0x7b2442).
+    pub paperdoll_drags: u64,
     /// The paperdoll's camera preset (`Paperdoll.SetCameraPreset`, DAOrigins.exe's
     /// `SetCameraPresetMessage`, handled at 0x7b49b0): 0 the whole body, 1 the face (character
     /// creation's appearance page). Character creation starts at 0 (0x7bbc4d).
@@ -477,6 +481,7 @@ pub fn sim_values_for(sim: &Sim, shown: &Presentation) -> BTreeMap<String, UiVal
             );
         }
     }
+    v.insert("Paperdoll.CameraMode".into(), num(shown.paperdoll_preset));
     // The creature in character creation as its paperdoll shows it (chargen.gfx's
     // `Paperdoll.PaperCreature`), with the portrait drawn of it, which the appearance page's
     // portrait loads (`.Portrait`; it reads `CharGenCreature.Portrait` too).

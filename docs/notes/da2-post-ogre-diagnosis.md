@@ -80,9 +80,10 @@ That does not match the native getter:
 - Modern ability preparation has a corresponding write at
   0x641010..0x641016. The surrounding checks preserve some self/party-targeted
   uses; a blanket assignment for every spell would require further care.
-- Combat-mode processing includes an explicit clear at
-  0x67629c..0x6762a2. This is state with a lifecycle, not just a view of the
-  currently executing command.
+- Modern ability completion includes a conditional clear at
+  0x67629c..0x6762a2 (the callback's role and guards were subsequently traced in
+  `da2-combat-target.md`). This is state with a lifecycle, not just a view of
+  the currently executing command.
 
 The authored `rules_core` reads this getter in its target selection, tactic and
 movement logic. For example, its follower-target helper at bytecode 0x2f4d5

@@ -393,6 +393,10 @@ pub struct Command {
     /// so the attack's start step tests the range with its slack (see `Sim::approach_point`).
     #[serde(default)]
     pub arrived: bool,
+    /// DA2's combat-target preparation has run for this command, before approach.
+    /// Keep it across save/reload so a later combat exit is not undone on arrival.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub da2_target_prepared: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -406,6 +410,12 @@ pub struct Effect {
     pub strings: Vec<String>,
     pub duration_type: i32,
     pub id: i32,
+    /// A visual effect's application context (0x6646b0 reads its target or point).
+    /// Kept on the applied copy, so one constructor can be applied to several objects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visual_target: Option<ObjectId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visual_location: Option<Location>,
     /// When a temporary effect runs out (simulation milliseconds).
     #[serde(default)]
     pub expires: Option<u64>,
@@ -426,6 +436,19 @@ pub struct Effect {
     /// The flags `SetEffectFlags` gave it (effect +0x3c). Kept; not read yet.
     #[serde(default)]
     pub flags: i32,
+}
+
+impl Effect {
+    /// Compares reconstructed parameters without identity or application context.
+    /// Used for item-property removal, environmental-visual replay and legacy
+    /// zero-ID queries; script RemoveEffect uses an assigned identity when present.
+    pub(crate) fn same_payload(&self, other: &Self) -> bool {
+        let mut candidate = self.clone();
+        candidate.id = other.id;
+        candidate.visual_target = other.visual_target;
+        candidate.visual_location = other.visual_location;
+        candidate == *other
+    }
 }
 
 /// A visual effect applied at a place (`Engine_ApplyEffectAtLocation` with an
@@ -629,6 +652,10 @@ pub struct World {
     #[serde(with = "sorted")]
     pub handles: HashMap<u64, EngineData>,
     next_handle: u64,
+    /// Effect identities (DAOrigins.exe 0xa652a0). Kept across saves; zero on
+    /// older saves initializes the allocator above their existing nonzero IDs.
+    #[serde(default)]
+    next_effect_id: u32,
     #[serde(with = "pairs")]
     pub queue: BTreeMap<(u64, u64), QueuedEvent>,
     next_seq: u64,
@@ -931,6 +958,7 @@ impl World {
             next_id: 1,
             handles: HashMap::new(),
             next_handle: 1,
+            next_effect_id: 0,
             queue: BTreeMap::new(),
             next_seq: 0,
             projectile_impact_events: BTreeMap::new(),
@@ -1043,6 +1071,36 @@ impl World {
         self.next_handle += 1;
         self.handles.insert(h, d);
         h
+    }
+
+    /// A newly constructed, valid effect gets an identity; copies and setters keep it.
+    /// Native 0xa652a0 assigns +0x20 from a counter and skips the -1 sentinel.
+    pub(crate) fn identify_effect(&mut self, effect: &mut Effect) {
+        if effect.ty == 0 || effect.id != 0 {
+            return;
+        }
+        if self.next_effect_id == 0 {
+            let ids = self
+                .objects
+                .values()
+                .flat_map(|o| o.effects.iter().map(|e| e.id))
+                .chain(self.location_vfx.iter().map(|v| v.effect.id))
+                .chain(self.handles.values().filter_map(|v| match v {
+                    EngineData::Effect(e) => Some(e.id),
+                    _ => None,
+                }));
+            self.next_effect_id = ids.filter(|&id| id > 0).max().unwrap_or(0) as u32 + 1;
+        }
+        effect.id = self.next_effect_id as i32;
+        self.next_effect_id = self.next_effect_id.wrapping_add(1);
+        if self.next_effect_id == u32::MAX || self.next_effect_id == 0 {
+            self.next_effect_id = 1;
+        }
+    }
+
+    pub(crate) fn store_new_effect(&mut self, mut effect: Effect) -> u64 {
+        self.identify_effect(&mut effect);
+        self.store(EngineData::Effect(effect))
     }
 
     pub fn handle(&self, h: Option<u64>) -> Option<&EngineData> {
