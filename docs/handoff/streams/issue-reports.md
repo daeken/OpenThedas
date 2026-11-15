@@ -173,6 +173,50 @@ exact commit in a detached worktree (`OpenThedas-wt/report-mac`, target `report-
 
 Use a scratch HOME and a control port of your own; this stream used 7900-7909.
 
+### Replay an F8 report
+
+`thedas replay <report-folder-or-zip>` reads `journal_checkpoint.json` and every input in
+`journal.jsonl`, checks the intermediate world hashes, then compares the complete saved state
+with `save_now.json`. A mismatch prints the first differing JSON pointer (including object ID,
+field and tag when available). It stops at the first intermediate hash divergence and retains
+that actual state for inspection. It never modifies or extracts the report.
+
+```sh
+thedas replay captures/report --install "$GAME" --save captures/replayed.json
+thedas replay captures/report.zip --install "$GAME"
+thedas replay captures/report --install "$GAME" --until 120000 --save captures/early.json
+thedas-app --install "$GAME" --save captures/replayed.json
+```
+
+- The install defaults to `THEDAS_INSTALL`, then the path recorded in `report.json` (uploaded
+  reports redact that path, so normally pass `--install`). Use the same game assets, add-ins,
+  keys and mod layers as the reporter. Reports do not contain those resources. Use a scratch
+  HOME for automated runs, and `THEDAS_HIDDEN_WINDOW=1` for any engine window.
+- The running CLI's commit must equal the journal header's build; refusal prints both.
+  There is no bypass. To investigate an older report, check out its commit and transplant only
+  the replay CLI files/registration/build script and zip dependency, leaving its simulation,
+  script, resource and save code intact. Build there; do not relabel a current binary as old.
+- `--until` is **absolute world time in milliseconds**, not elapsed time since the checkpoint.
+  It stops before the first input that would exceed the limit, including within a repeat;
+  it never shortens a tick. Commands at the same time still run (cutscenes can hold world time).
+  A limit earlier than the checkpoint is refused.
+- Exit **0** means the complete F8 saved state matched; **1** means a differing state,
+  intermediate hash divergence, or an early stop before F8; **2** means replay was impossible
+  (build/revision/checkpoint mismatch, missing files/resources, malformed/truncated log, bad zip
+  or failed output write). An uploaded report whose journal was left out cannot replay.
+- `--save` writes the reached state even on divergence or an early stop, so the app can open
+  it with `--save`. Rendering remains the app's job; replay itself needs no GPU or control port.
+- Zips can have flat contents or one enclosing report folder. Paths are validated and each
+  selected file is limited to 128 MiB after decompression; ambiguous or duplicate files fail.
+- Synthetic unit fixtures only: `cargo test -p thedas-cli replay::`. They exercise checkpoint
+  serialization, repeated inputs, strict log validation, build refusal, first hash divergence,
+  early stopping, field differences outside the world hash, folder/zip parity and unsafe zips.
+  For an end-to-end synthetic report, run the app in a scratch HOME with `--journal` plus
+  `--control`, play a few ticks, request `report` with a test note, then replay the resulting
+  folder and zip using a CLI built at that same commit.
+
+### Report and updater checks
+
 - `report/drive_report.py APP SAVE [PORT] [RUN_MS]`: report files; `POPUP=1` for the typed note;
   `THEDAS_REPORT_UPLOAD=1` plus a copied `discord-webhook` or `update-url` to really send.
 - `report/drive_mark.py APP SAVE`: marking two spots. "Mark spots" sits at physical 1054,832 in
