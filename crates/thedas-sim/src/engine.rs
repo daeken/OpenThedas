@@ -1611,6 +1611,19 @@ pub fn call(
             })
         }
         "IsInTrigger" => {
+            if h.sim.game == thedas_vfs::Game::Origins {
+                // 0x66da90 resolves a creature, then searches its cached trigger IDs
+                // (+0xba8). A script query does not refresh geometry or send events.
+                let inside = h.object(obj(a, 0)).is_some_and(|o| {
+                    o.kind == ObjectKind::Creature
+                        && h.sim
+                            .world
+                            .in_triggers
+                            .get(&o.id)
+                            .is_some_and(|ids| ids.contains(&obj(a, 1)))
+                });
+                return ok(b(inside));
+            }
             let (o, tr) = (h.object(obj(a, 0)), h.object(obj(a, 1)));
             ok(b(match (o, tr) {
                 (Some(o), Some(tr)) => o.area == tr.area && in_trigger(o.position, tr, h.sim.game),
@@ -4663,6 +4676,20 @@ pub fn call(
                 return ok(Value::Int(action));
             }
             let o = h.object(id);
+            // A body bag opens for looting: `placeable_core` calls `OpenInventory` only for
+            // PLACEABLE_ACTION_OPEN_INVENTORY, and the bag's type (placeable_types row 16,
+            // "Body Bag") has no state controller to give it an action, as a chest's has.
+            // Provisional: DAOrigins.exe's GetPlaceableAction is not traced; the exe reads
+            // the template's IsBodyBag into the placeable (0x750683, setter 0x74bd70).
+            if o.is_some_and(|o| {
+                o.template
+                    .eq_ignore_ascii_case(crate::inventory::BODY_BAG_TEMPLATE)
+            }) {
+                return ok(Value::Int(constant(
+                    &h.sim.table,
+                    "PLACEABLE_ACTION_OPEN_INVENTORY",
+                )));
+            }
             let dest = o.is_some_and(|o| {
                 o.locals
                     .strings
@@ -8026,6 +8053,83 @@ mod tests {
             script: "test".into(),
         };
         call(&mut h, caller, &f, a).unwrap().unwrap()
+    }
+
+    #[test]
+    fn origins_trigger_query_reads_cached_membership_without_refreshing_it() {
+        let table = EngineTable::parse(
+            b"int IsInTrigger(object creature, object trigger) = 39;\n\
+              int EVENT_TYPE_ENTER = 8;\nint EVENT_TYPE_EXIT = 9;\n",
+        )
+        .unwrap();
+        for game in [thedas_vfs::Game::Origins, thedas_vfs::Game::DragonAge2] {
+            let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(table.clone()), 1);
+            s.game = game;
+            let area = s.world.spawn(crate::world::ObjectKind::Area, "a");
+            let c = s.world.spawn(crate::world::ObjectKind::Creature, "c");
+            let tr = s.world.spawn(crate::world::ObjectKind::Trigger, "t");
+            s.world.get_mut(c).unwrap().area = Some(area);
+            s.world.get_mut(c).unwrap().position = [10.0, 10.0, 0.0];
+            let t = s.world.get_mut(tr).unwrap();
+            t.area = Some(area);
+            t.position = [10.0, 10.0, 0.0];
+            t.geometry = vec![
+                [-1.0, -1.0, 0.0],
+                [1.0, -1.0, 0.0],
+                [1.0, 1.0, 0.0],
+                [-1.0, 1.0, 0.0],
+            ];
+            let args = [Value::Object(c), Value::Object(tr)];
+            assert_eq!(
+                run(&mut s, c, "IsInTrigger", &args),
+                Some(Value::Int(i32::from(game == thedas_vfs::Game::DragonAge2)))
+            );
+            assert!(s.world.in_triggers.is_empty());
+            assert!(
+                s.world.queue.is_empty(),
+                "query must not refresh membership or send ENTER"
+            );
+            s.update_triggers(c);
+            assert_eq!(run(&mut s, c, "IsInTrigger", &args), Some(Value::Int(1)));
+            s.world.get_mut(c).unwrap().position = [20.0, 10.0, 0.0];
+            let queued: Vec<_> = s.world.queue.keys().copied().collect();
+            assert_eq!(
+                run(&mut s, c, "IsInTrigger", &args),
+                Some(Value::Int(i32::from(game == thedas_vfs::Game::Origins)))
+            );
+            assert_eq!(
+                s.world.queue.keys().copied().collect::<Vec<_>>(),
+                queued,
+                "query must not send EXIT"
+            );
+            s.update_triggers(c);
+            assert_eq!(run(&mut s, c, "IsInTrigger", &args), Some(Value::Int(0)));
+            // The native first lookup accepts creatures only, even when another object's
+            // ID has been placed into the cache and its geometry would match.
+            let p = s.world.spawn(crate::world::ObjectKind::Placeable, "p");
+            let o = s.world.get_mut(p).unwrap();
+            o.area = Some(area);
+            o.position = [10.0, 10.0, 0.0];
+            s.world.in_triggers.insert(p, vec![tr]);
+            assert_eq!(
+                run(
+                    &mut s,
+                    c,
+                    "IsInTrigger",
+                    &[Value::Object(p), Value::Object(tr)]
+                ),
+                Some(Value::Int(i32::from(game == thedas_vfs::Game::DragonAge2)))
+            );
+            assert_eq!(
+                run(
+                    &mut s,
+                    c,
+                    "IsInTrigger",
+                    &[Value::Object(OBJECT_INVALID), Value::Object(tr)]
+                ),
+                Some(Value::Int(0))
+            );
+        }
     }
 
     #[test]
@@ -12602,6 +12706,32 @@ mod coverage_tests {
     fn sim() -> Sim {
         let table = Arc::new(EngineTable::parse(LDF.as_bytes()).unwrap());
         Sim::new(Arc::new(Vfs::new()), table, 1)
+    }
+
+    #[test]
+    fn a_body_bag_opens_for_looting_and_other_placeables_are_used() {
+        let table = Arc::new(
+            EngineTable::parse(
+                b"int PLACEABLE_ACTION_USE = 5;\n\
+                  int PLACEABLE_ACTION_OPEN_INVENTORY = 11;\n\
+                  int GetPlaceableAction(object oPlaceable) = 1;\n",
+            )
+            .unwrap(),
+        );
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        let foe = s.world.spawn(ObjectKind::Creature, "foe");
+        s.world.get_mut(foe).unwrap().money = 5;
+        let bag = s.spawn_body_bag(foe, false).unwrap();
+        // placeable_core opens a container only for PLACEABLE_ACTION_OPEN_INVENTORY.
+        assert_eq!(
+            run(&mut s, bag, "GetPlaceableAction", &[Value::Object(bag)]),
+            Some(Value::Int(11))
+        );
+        let lever = s.world.spawn(ObjectKind::Placeable, "lever");
+        assert_eq!(
+            run(&mut s, lever, "GetPlaceableAction", &[Value::Object(lever)]),
+            Some(Value::Int(5))
+        );
     }
 
     /// Calls engine function `name` as `caller`.
