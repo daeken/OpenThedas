@@ -2767,7 +2767,9 @@ impl<'a> Loader<'a> {
         let mut out = Vec::new();
         for (k, (e, name, hook, below)) in found.into_iter().enumerate() {
             let (in_model, follows) = match hook {
-                Some(hook) => {
+                // An effect played at a place has no body to hang from: its emitters stand
+                // where it was played, from the model's root.
+                Some(hook) if !prop.models.is_empty() => {
                     let body = prop.models.iter().find_map(|m| {
                         let mmh = self.model(m)?;
                         let chain = mmh.node_chain(hook)?;
@@ -2783,7 +2785,7 @@ impl<'a> Loader<'a> {
                     let node = self.scene.skeletons[skeleton].node(hook);
                     (at * below, node.map(|n| (skeleton, n)))
                 }
-                None => (below, None),
+                _ => (below, None),
             };
             // The emitter's tracks in an animation; an animation that plays without them
             // gives it nothing.
