@@ -3143,6 +3143,11 @@ const EMITTER_REACH_PER: f32 = 4.0;
 /// The light an emitter's living particles give, as a point light at their glow-weighted
 /// centre (ours: the original's particles light nothing). `None` when they show none.
 pub fn emitter_light(e: &crate::particles::EmitterState) -> Option<SceneLight> {
+    emitter_light_tinted(e, Vec3::ONE)
+}
+
+/// [`emitter_light`] for particles whose texture tints them `tint` ([`texture_tint`]).
+pub fn emitter_light_tinted(e: &crate::particles::EmitterState, tint: Vec3) -> Option<SceneLight> {
     if e.opacity <= 0.0 || e.particles.is_empty() || light_shaft(&e.blueprint.material) {
         return None;
     }
@@ -3172,6 +3177,7 @@ pub fn emitter_light(e: &crate::particles::EmitterState) -> Option<SceneLight> {
         .map(|(p, w)| p.distance(centre) * w)
         .sum::<f32>()
         / weight;
+    let total = total * tint;
     let shown = total.x + total.y + total.z;
     let strength = EMITTER_PEAK * (1.0 - (-shown / EMITTER_SHOWN).exp()) * e.opacity.min(1.0);
     let color = total / total.max_element() * strength;
@@ -3194,6 +3200,33 @@ fn centimetres(p: Vec3) -> [i32; 3] {
     (p * 100.0).round().as_ivec3().to_array()
 }
 
+/// The tint a particle texture gives the light its emitter makes: the texture's mean colour
+/// weighted by alpha, over a small mip, scaled so its brightest channel is 1 (white when it
+/// can't be read). Lightning's blue, for one, is in its texture, not its particles' colour.
+pub fn texture_tint(vfs: &thedas_vfs::Vfs, m: &crate::scene::SceneMaterial) -> Vec3 {
+    let tint = m.object.textures.iter().find_map(|t| {
+        let name = t.resource().to_ascii_lowercase();
+        let (data, _) = vfs.read(&name).ok()?;
+        let dds = thedas_formats::dds::Dds::parse(&data).ok()?;
+        // The first mip at most 16 texels a side (or the smallest there is).
+        let mip = (0..dds.mip_count)
+            .find(|&k| {
+                let (w, h, _) = dds.mip_size(k);
+                w.max(h) <= 16
+            })
+            .unwrap_or(dds.mip_count.saturating_sub(1));
+        let rgba = dds.decode_rgba8(0, mip).ok()?;
+        let (mut sum, mut weight) = (Vec3::ZERO, 0.0);
+        for px in rgba.chunks_exact(4) {
+            let a = px[3] as f32 / 255.0;
+            sum += Vec3::new(px[0] as f32, px[1] as f32, px[2] as f32) / 255.0 * a;
+            weight += a;
+        }
+        (weight > 0.0 && sum.max_element() > 0.0).then(|| sum / sum.max_element())
+    });
+    tint.unwrap_or(Vec3::ONE)
+}
+
 /// Whether an additive emitter's material draws a light shaft, sunbeam or lit dust (the
 /// level's `fxe_day_beam`, `fxe_day_sunshine`, `fxe_day_dust_shine`): it shows light that
 /// is already there, it doesn't give any (provisional: by name).
@@ -3204,17 +3237,26 @@ fn light_shaft(material: &str) -> bool {
         .any(|k| m.contains(k))
 }
 
-/// Whether emitter light `l` sits within 1.5 m of one of the level's static lights: a torch
-/// or brazier the level already lights (its lamp is authored beside the flame), which an
-/// emitter light would light twice.
+/// Whether emitter light `l` sits beside an authored light that already lights what it
+/// would: within 1.5 m of one of the level's static lights (a torch or brazier's lamp), or
+/// within 3 m of any other light that isn't an emitter's (a visual effect's own light, which
+/// its animations colour and size). An emitter light there would light it twice.
 fn beside_level_light(l: &SceneLight, scene: &[SceneLight]) -> bool {
     let SceneLight::Point { position, name, .. } = l else {
         return false;
     };
     name.starts_with("emitter ")
-        && scene.iter().any(|s| {
-            matches!(s, SceneLight::Point { position: p, is_static: true, .. }
-                if p.distance(*position) < 1.5)
+        && scene.iter().any(|s| match s {
+            SceneLight::Point {
+                position: p,
+                is_static,
+                name,
+                ..
+            } => {
+                let reach = if *is_static { 1.5 } else { 3.0 };
+                !name.starts_with("emitter ") && p.distance(*position) < reach
+            }
+            _ => false,
         })
 }
 
@@ -3358,12 +3400,15 @@ mod tests {
         let spell = point("emitter Sum_Conj_04", Vec3::new(6.0, 0.0, 0.5), false);
         assert!(beside_level_light(&flame, &level));
         assert!(!beside_level_light(&spell, &level));
-        // Only emitter lights are dropped, and only beside static lights.
+        // Only emitter lights are dropped.
         assert!(!beside_level_light(&level[0], &level));
-        assert!(!beside_level_light(
-            &flame,
-            &[point("x", Vec3::new(0.3, 0.0, 2.0), false)]
-        ));
+        // A visual effect's own (dynamic) light within 3 m takes over from its particles'.
+        let fx = |x| [point("flame_c", Vec3::new(x, 0.0, 2.0), false)];
+        assert!(beside_level_light(&flame, &fx(2.0)));
+        assert!(!beside_level_light(&flame, &fx(5.0)));
+        // Other emitter lights don't count.
+        let other = [point("emitter x", Vec3::new(0.3, 0.0, 2.0), false)];
+        assert!(!beside_level_light(&flame, &other));
     }
 
     #[test]

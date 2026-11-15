@@ -2404,6 +2404,23 @@ impl D3dPass {
         if self.scene_lights[self.own_lights..] == *extra {
             return;
         }
+        // When the same lights stand but some changed (an effect's light brightening, its
+        // reach growing), only the draws within those lights' reach, before or after, can
+        // pick differently: a light out of reach weighs nothing.
+        let old = &self.scene_lights[self.own_lights..];
+        let near: Option<Vec<(Vec3, f32)>> = (old.len() == extra.len()).then(|| {
+            old.iter()
+                .zip(extra)
+                .filter(|(a, b)| a != b)
+                .flat_map(|(a, b)| [a, b])
+                .filter_map(|l| match l {
+                    SceneLight::Point {
+                        position, radius, ..
+                    } => Some((*position, *radius)),
+                    SceneLight::Ambient { .. } => None,
+                })
+                .collect()
+        });
         self.scene_lights.truncate(self.own_lights);
         self.scene_lights.extend_from_slice(extra);
         self.flicker
@@ -2421,6 +2438,13 @@ impl D3dPass {
             let Some(&(sphere, room, level_own)) = self.placed.get(d.draw) else {
                 continue;
             };
+            if let Some(near) = &near
+                && !near
+                    .iter()
+                    .any(|(p, r)| p.distance_squared(sphere.0) <= (r + sphere.1).powi(2))
+            {
+                continue;
+            }
             let class = self
                 .classes
                 .get(d.draw)
