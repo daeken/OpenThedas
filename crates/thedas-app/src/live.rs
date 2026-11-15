@@ -448,7 +448,7 @@ pub static ANTIALIASING_FORCED: std::sync::atomic::AtomicBool =
 
 /// The most samples a pixel at or under `wanted` that the adapter supports for `format`.
 fn supported_samples(ctx: &GpuContext, format: wgpu::TextureFormat, wanted: u32) -> u32 {
-    thedas_render::msaa::supported_samples(&ctx.adapter, format)
+    thedas_render::msaa::supported_samples(&ctx.adapter, &ctx.device, format)
         .into_iter()
         .filter(|&n| n <= wanted.max(1))
         .max()

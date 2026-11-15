@@ -1515,7 +1515,7 @@ impl App {
         // The anti-aliasing slider offers what the device draws the world with; the choice
         // (4x unless the player chose) is the world's samples (see `sync_antialiasing`).
         ui.set_antialias_samples(
-            thedas_render::msaa::supported_samples(&ctx.adapter, config.format),
+            thedas_render::msaa::supported_samples(&ctx.adapter, &ctx.device, config.format),
             !upload::automated(),
         );
         if let (Some(live), Some(_)) = (&self.live, &self.screens) {
