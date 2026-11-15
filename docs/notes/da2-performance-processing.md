@@ -167,12 +167,21 @@ ownership; it narrows the processing-freeze hypothesis without changing combat
 inputs. The old trace predates per-blow attack entries, so it cannot supply
 current attack tallies.
 
-These caller counts identify executing script owners. The getter can receive a
-different actor as its argument. The guarded branch at `0x11c5` reaches effect
-type 9 with engine float 1 set to 0.4 and a 1.5-second duration. The installed
-effects schema identifies type 9 as movement speed. Its exact actor arguments
-and native effect executor remain to be audited. The animation-selection branch
-and the effect branch provide separate inputs for a future locomotion replay.
+These caller counts identify executing script owners. Watched engine-call logs
+show all 74 queries occurring during COMMAND_PENDING (35) and querying another
+actor. Argument counts are 53 for object 406, five for 448, seven for 449, five
+for 450 and four for 540.
+
+The COMMAND_PENDING stack audit identifies that argument as the target variable
+initialized from event object 1. At `0x11c5`, the caster must be a follower and
+the valid target must be a moving non-follower. Additional ability flags and
+range-band checks guard the body. The branch constructs effect type 9 with
+engine float 1 set to 0.4. It passes the target, temporary duration type 2,
+duration 1.5, creator SELF and ability 0 through `0x2e78` to
+Engine_ApplyEffectOnObject at `0x30d7`. The installed effects schema identifies
+type 9 as movement speed. The native effect executor remains to be audited.
+The animation-selection branch and the target-effect branch provide separate
+inputs for a future persistent-locomotion replay.
 
 Damage, health, chargen inputs and Karl combat are owned by the separate
 damage investigation. No balance adjustment or processing heuristic is

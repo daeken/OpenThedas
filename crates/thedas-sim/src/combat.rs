@@ -1450,7 +1450,7 @@ impl Sim {
         let mut ev = self.new_event("CHOOSE_BASIC_ATTACK", Some(id));
         ev.objects = vec![id, target, OBJECT_INVALID];
         // Native 0x640dff forwards command boolean 2. Ordinary player input sets
-        // it at 0x47fc51; the script CommandAttack constructor leaves it false.
+        // it at 0x47fc51. The script CommandAttack constructor leaves it false.
         ev.ints = vec![0, 0, i32::from(cmd.da2_basic_attack_fallback)];
         ev.vectors = vec![point];
         let script = self.world.get_mut(id).and_then(|o| {

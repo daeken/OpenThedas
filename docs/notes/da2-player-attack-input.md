@@ -28,7 +28,7 @@ sets this boolean according to its own third argument.
 Native modern-command preparation `0x640c40` handles placeholder ability 1 by
 sending event 111. At `0x640dff..0x640e10`, it reads command boolean 2 through
 `0x8a83b0` and copies its value into event integer 2. The selection result replaces
-command integer 0 at `0x640e34`; result 1 takes the no-action completion path.
+command integer 0 at `0x640e34`. Result 1 takes the no-action completion path.
 
 The script `CommandAttack` constructor at `0x4dda50` also builds command 25 from
 the positive default ability. It writes its ability and object parameters while
