@@ -324,12 +324,18 @@ impl OwnMovie {
         self.player.run_queue();
     }
 
+    /// Brings the picture up to date when the movie changed: its own texture, or, drawing
+    /// straight into the frame ([`crate::direct`]), its draw list.
     pub fn render(&mut self) {
         let mut images = self.images.clone();
         let started = std::time::Instant::now();
-        let drew = self
-            .renderer
-            .render_if_dirty(&mut self.player, &mut images, self.size);
+        let drew = if crate::direct() {
+            self.renderer
+                .prepare_into(&mut self.player, &mut images, self.size)
+        } else {
+            self.renderer
+                .render_if_dirty(&mut self.player, &mut images, self.size)
+        };
         if drew {
             let r = &self.renderer.stats;
             let p = &mut self.profile;
@@ -359,13 +365,24 @@ impl OwnMovie {
         self.renderer.output().cloned()
     }
 
+    /// Draws the movie over `target` (the frame, of the movie's size) into `encoder`,
+    /// re-walking it only when it changed.
+    pub fn draw_into(&mut self, encoder: &mut wgpu::CommandEncoder, target: &wgpu::Texture) {
+        self.render();
+        self.renderer.draw_into(encoder, target);
+    }
+
     pub fn device(&self) -> (wgpu::Device, wgpu::Queue) {
         (self.gpu.device.clone(), self.gpu.queue.clone())
     }
 
     /// The last frame (RGBA8, premultiplied).
     pub fn capture(&mut self) -> Option<Rgba> {
-        let (width, height, mut pixels) = self.renderer.capture()?;
+        let (width, height, mut pixels) = if crate::direct() {
+            self.renderer.capture_prepared()?
+        } else {
+            self.renderer.capture()?
+        };
         crate::premultiply(&mut pixels);
         Some(Rgba {
             width,
