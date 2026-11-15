@@ -1073,7 +1073,7 @@ impl DeferredPass {
                                 .then_some(d.room_id)?
                         })
                     };
-                    let fills = set.fills.iter().map(|f| SceneLight::Point {
+                    set.fills.iter().map(|f| SceneLight::Point {
                         position: f.position,
                         color: f.color,
                         radius: f.radius,
@@ -1083,38 +1083,8 @@ impl DeferredPass {
                         version: 0,
                         intensity: 1.0,
                         room: f.atlas.as_deref().and_then(atlas_room),
-                    });
-                    // The level's static lights had baked twins in the RGB pass (same place,
-                    // colour and radius, the fitted brightness, linear falloff): they join as
-                    // fills of their own. Fits of a light few texels saw can run wild, so the
-                    // brightness is held to [0, 2].
-                    let twins = set.lights.iter().filter_map(|l| {
-                        let k = l.baked_brightness?.clamp(0.0, 2.0);
-                        scene.lights.iter().find_map(|s| match s {
-                            SceneLight::Point {
-                                position,
-                                color,
-                                radius,
-                                intensity,
-                                room,
-                                ..
-                            } if position.distance(l.position) < 0.05 && k > 0.01 => {
-                                Some(SceneLight::Point {
-                                    position: *position,
-                                    color: *color * *intensity * k,
-                                    radius: *radius,
-                                    name: "baked fill twin".into(),
-                                    domain: None,
-                                    is_static: true,
-                                    version: 0,
-                                    intensity: 1.0,
-                                    room: *room,
-                                })
-                            }
-                            _ => None,
-                        })
-                    });
-                    fills.chain(twins).collect()
+                    })
+                    .collect()
                 })
                 .unwrap_or_default(),
             refused: false,

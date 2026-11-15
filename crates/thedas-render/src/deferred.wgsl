@@ -1224,6 +1224,7 @@ fn light_surface(frag: vec4<f32>, p: vec3<f32>, ga: vec4<f32>, spec: vec4<f32>,
     var diff_s = vec3<f32>(0.0);
     var spec_s = vec3<f32>(0.0);
     var diff_d = vec3<f32>(0.0);
+    var diff_fill = vec3<f32>(0.0);
     var spec_d = vec3<f32>(0.0);
     let tile_x = min(u32(frag.x * 16.0 / lighting.size.x), 15u);
     let tile_y = min(u32(frag.y * 9.0 / lighting.size.y), 8u);
@@ -1317,11 +1318,21 @@ fn light_surface(frag: vec4<f32>, p: vec3<f32>, ga: vec4<f32>, spec: vec4<f32>,
             }
         }
         let diffuse_response = select(ndl, max(ndl * 0.75 + 0.25, 0.0), strands);
-        let dif = att * diffuse_response * light_colour.rgb * shade;
+        // With lightmaps off, the level's lights take the ambient occlusion the lightmap
+        // alpha (static lights) and RGB (baked fills) would have carried: the bake
+        // multiplied both by its occlusion pass (docs/lightmaps/baker-spec.md §3).
+        let occlusion = select(1.0, ao, mode > 0u && light_shadow.y < 1.5 && !object);
+        let dif = att * diffuse_response * light_colour.rgb * shade * occlusion;
         var sp = vec3<f32>(0.0);
         if (compute_specular && !fill) {
             let h = normalize(v + ln);
-            sp = att * highlight(n, h, power, hair) * light_colour.rgb * shade;
+            sp = att * highlight(n, h, power, hair) * light_colour.rgb * shade * max(occlusion, 0.2);
+        }
+        // A light set's fills rebuild the lightmap's RGB: summed linear here,
+        // then encoded with the room's ambient as the bake encoded its texels (below).
+        if (fill) {
+            diff_fill = diff_fill + att * max(ndl, 0.0) * light_colour.rgb;
+            continue;
         }
         // Objects have no baked direct visibility. Their point lights use their own
         // cube visibility, never the sun's mask or Static1's grazing-angle floor.
@@ -1364,12 +1375,18 @@ fn light_surface(frag: vec4<f32>, p: vec3<f32>, ga: vec4<f32>, spec: vec4<f32>,
     let ambient_shade = select(select(mix(1.0, sun_shade, 0.15), 1.0, object), ao, mode > 0u);
     // Terrain1 masks static diffuse twice; Static1 and Low's Terrain3 only once.
     let static_diffuse = diff_s * sun_shade * select(lm.a, lm.a * lm.a, terrain && !terrain_low);
-    let diffuse = static_diffuse + lm.rgb * ambient_shade + diff_d;
+    // The live lightmap: the room's baked ambient (stored gamma-1.5 encoded) plus the fills,
+    // encoded together as the bake wrote its texels (baker-spec.md §2-3).
+    var baked_rgb = lm.rgb;
+    if (any(diff_fill > vec3<f32>(0.0))) {
+        baked_rgb = pow(pow(max(lm.rgb, vec3<f32>(0.0)), vec3<f32>(1.5)) + diff_fill, vec3<f32>(1.0 / 1.5));
+    }
+    let diffuse = static_diffuse + baked_rgb * ambient_shade + diff_d;
     let specular = select((spec_s * sun_shade * max(lm.a, 0.2) + spec_d) * 3.0,
         (spec_s * (0.75 * sun_shade * lm.a + 0.25) + spec_d) * 3.0, terrain);
     var colour = albedo * diffuse + spec.rgb * specular * falloff;
     if (fused) {
-        colour = albedo * (static_diffuse + diff_d) + spec.rgb * specular * falloff + lm.rgb;
+        colour = albedo * (static_diffuse + diff_d) + spec.rgb * specular * falloff + baked_rgb;
     }
     switch view {
         case 1u: { return vec4<f32>(albedo, 1.0); }
