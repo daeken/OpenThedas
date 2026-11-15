@@ -1004,7 +1004,9 @@ impl Sim {
         }
         let mut going = Vec::new();
         for mut a in std::mem::take(&mut self.ambient) {
-            if !self.ambient_owner_present(a.c.owner, a.area) {
+            if !self.world.get(a.c.owner).is_some_and(|o| !o.dead)
+                || !self.ambient_owner_present(a.c.owner, a.area)
+            {
                 continue;
             }
             a.left_ms -= ms as i64;
@@ -1035,11 +1037,10 @@ impl Sim {
     }
 
     fn ambient_owner_present(&self, owner: ObjectId, area: Option<ObjectId>) -> bool {
-        self.world.get(owner).is_some_and(|o| {
-            !o.dead
-                && (self.game != thedas_vfs::Game::Origins
-                    || (o.active && o.area == self.world.area && area == self.world.area))
-        })
+        self.game != thedas_vfs::Game::Origins
+            || self.world.get(owner).is_some_and(|o| {
+                !o.dead && o.active && o.area == self.world.area && area == self.world.area
+            })
     }
 
     /// The line of an ambient conversation is over: its next line is said, or `None` when
