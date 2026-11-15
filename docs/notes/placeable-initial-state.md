@@ -4,6 +4,11 @@ Static trace of the GOG 1.05a executable, SHA-256
 `2346caee611002d4dff6ecef68eb315b63a37004dd98b39c11a9c26c0b45bfb3`.
 Addresses are virtual addresses; the original game was not run.
 
+A read-only census of the base campaign's designerareas.erf confirms 862 of
+5,581 instances have nonzero InitialState: 713 locked, 106 open, 27 Open_2,
+eight Dead and eight Dead_2. Redcliffe's Dwyn and Owen door instances both
+start at row 1; the Dwarf Commoner home door starts at row 2.
+
 The area instance uses the GFF3 label `InitialState`. The property-name helper's
 PE string lookup identifies its ASCII name at `0xb1be60`; it is not a GFF4
 numeric field. The ASCII placeable reader `0x750370` reads it at

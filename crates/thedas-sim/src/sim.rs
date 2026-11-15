@@ -5987,6 +5987,23 @@ mod tests {
         assert!(!s.world.get(door).unwrap().active);
         s.enter_area("bdc210ar_players_home", None).unwrap();
         assert!(s.closed_doors(area).iter().any(|(id, _)| *id == door));
+        let redcliffe = s.enter_area("arl100ar_redcliffe_village", None).unwrap();
+        for tag in ["arl100ip_door_dwyn", "arl100ip_door_owen"] {
+            let id = s
+                .world
+                .objects
+                .values()
+                .find(|o| o.area == Some(redcliffe) && o.tag == tag)
+                .unwrap()
+                .id;
+            assert_eq!(s.world.get(id).unwrap().fields["InitialState"], 1);
+            assert_eq!(s.world.get(id).unwrap().fields["State"], 1);
+            assert_eq!(
+                crate::engine::placeable_default_action(&s, id),
+                Some(3),
+                "{tag} must offer Unlock"
+            );
+        }
     }
 
     #[test]
