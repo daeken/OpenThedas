@@ -701,13 +701,17 @@ pub const NOTE_PROMPT_SEND: &str = "What went wrong? Say what you expected and w
 /// The id of the question whether to mark spots, and of the note for one spot.
 pub const MARK_ID: u32 = NOTE_ID + 1;
 pub const REGION_ID: u32 = NOTE_ID + 2;
+pub const MORE_MARKS_ID: u32 = NOTE_ID + 3;
 
 /// What the question whether to mark spots says.
 pub const MARK_PROMPT: &str = "Want to point at something? Choose Mark spots, then drag a box \
-     around each thing on screen and say what is wrong there. Press F8 or Enter when done.";
+     around each thing on screen and say what is wrong there. Press F8, Enter or Escape when done.";
 
 /// What the note for one marked spot asks.
 pub const REGION_PROMPT: &str = "What about this spot?";
+
+/// The choice after a spot's note, including a removed box.
+pub const MORE_MARKS_PROMPT: &str = "Would you like to mark another spot?";
 
 /// A note given with the request (a client's), or `THEDAS_REPORT_NOTE` (tests): the
 /// player is not asked then.

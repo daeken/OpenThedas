@@ -31,9 +31,13 @@ and an nginx site on the test server. Paths below are relative to the folder hol
      session exactly;
    - `note.txt`.
 2. **Mark spots** (mouse and pad). After F8 the player is offered "Mark spots", drags a box
-   around each problem and types a note for it, then presses F8, Enter or Escape (B or Start on
-   the pad) to reach the overall note. The pad half (pointer, A at each corner) is UI's #642.
-3. **Note.** Asked in the game's own message box (`UiLayer::ask_text`/`ask_choice`, UI's).
+   around each problem and types a note for it. Each spot's note is followed by "Mark another
+   spot" / "Done marking"; Done goes straight to the overall note. F8, Enter or Escape (B or
+   Start on the pad) also finishes while drawing, dropping an unfinished box. The pad half
+   (pointer, A at each corner) is UI's #642.
+3. **Note.** Asked in the game's own message box (`UiLayer::ask_free_text`/`ask_choice`).
+   Report and spot notes opt out of the movie's 20-character name-field limit and restriction;
+   ordinary `ask_text` and the game's name prompts keep their original settings.
    - Either button keeps the report; the second, "Keep here", keeps it unsent.
    - Every box we ask is asked again when a script's box displaces it, and given up after about
      5 s, so the game never waits on it.

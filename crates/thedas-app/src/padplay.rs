@@ -257,8 +257,8 @@ impl PadPlay {
 
     /// Marking spots for an issue report with the pad (ours, as reports are): the left stick
     /// moves the pointer (the D-pad nudges it), A starts a box where it is and a second A
-    /// ends it there (the box's note is then asked, as after a mouse drag); B drops a box
-    /// being drawn, or with none ends marking, as Start does; the report's note follows.
+    /// ends it there (the box's note is then asked, as after a mouse drag). B or Start
+    /// ends marking, dropping an unfinished box; the report's note follows.
     fn mark(
         &mut self,
         state: &PadState,
@@ -311,15 +311,7 @@ impl PadPlay {
                 }
                 .into(),
             );
-        } else if pressed(now.1, was.1) {
-            if drawing {
-                host.drop_mark();
-                log.push("mark: box dropped".into());
-            } else {
-                host.end_marking();
-                log.push("mark: done".into());
-            }
-        } else if pressed(now.2, was.2) {
+        } else if pressed(now.1, was.1) || pressed(now.2, was.2) {
             // A box half drawn is dropped, not kept without its note.
             if drawing {
                 host.drop_mark();
