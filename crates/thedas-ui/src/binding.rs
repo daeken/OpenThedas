@@ -803,7 +803,7 @@ pub fn sim_values_for(sim: &Sim, shown: &Presentation) -> BTreeMap<String, UiVal
             tutorials
                 .iter()
                 .map(|t| t.resref.as_str())
-                .chain((shown.pad_active && !tutorials_held).then_some("pad"))
+                .chain((shown.pad_active && !sim.tutorials_held()).then_some("pad"))
                 .collect::<Vec<_>>()
                 .join(","),
         ),
