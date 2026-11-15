@@ -57,3 +57,16 @@ fn fs_shadow(in: Out) -> @location(0) vec4<f32> {
     }
     return vec4<f32>(length(in.world - d.light.xyz), 0.0, 0.0, 1.0);
 }
+
+// Clearing one dirty tile must leave every reused cube in the sheet intact. Depth is
+// cleared for the whole sheet by the render pass, so only its distance colour is reset.
+@vertex
+fn vs_clear(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
+    let xy = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u));
+    return vec4<f32>(xy * 2.0 - 1.0, 0.0, 1.0);
+}
+
+@fragment
+fn fs_clear() -> @location(0) vec4<f32> {
+    return vec4<f32>(1.0e9, 0.0, 0.0, 1.0);
+}
