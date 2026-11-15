@@ -41,6 +41,8 @@ and an nginx site on the test server. Paths below are relative to the folder hol
      open movies, contexts/screens, and the bridge's current observed/HUD values, capped
      at 1024 values / 8192 nodes / 512 characters per string (lists/objects cap at 64,
      nesting at 8). Counts/limits make truncation visible;
+     observer discovery caps at 4096 tokens and value selection at 3072 candidates,
+     using sorted-map prefix ranges so capture work is bounded too;
    - `frames.json`: the last 600 raw frame times, oldest first, each with sim time, area,
      loading/cutscene/conversation flags, screens and cheap renderer draw statistics.
      These counts describe loaded scene draws, skipped draws and particle draws, not
@@ -62,7 +64,8 @@ and an nginx site on the test server. Paths below are relative to the folder hol
    on a dedicated worker. Completion (including the control reply/upload) waits for that
    worker without blocking the frame loop. Journal file handles plus the length at the
    press pin the checkpoint/log even if a checkpoint is rotated or inputs are appended.
-   `report.json.capture_ms` and the `report: captured state` log measure snapshot overhead;
+   `report.json.capture_ms`, `capture_timings_ms` (presentation, metadata, save clone, trace),
+   and the `report: captured state` log measure snapshot overhead;
    screenshot readback remains the existing frame-capture path.
 2. **Mark spots** (mouse and pad). After F8 the player is offered "Mark spots", drags a box
    around each problem and types a note for it. Each spot's note is followed by "Mark another
