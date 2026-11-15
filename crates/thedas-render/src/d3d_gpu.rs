@@ -220,6 +220,9 @@ pub(crate) struct D3dPass {
     winds: std::sync::Mutex<Vec<thedas_formats::speedtree_gen::wind::Wind>>,
     /// The time the winds were last stepped to.
     wind_time: std::sync::Mutex<f32>,
+    /// Where the camera stood for the last frame's constants: transparent draws are sorted
+    /// by their distance from it.
+    camera_at: std::sync::Mutex<Vec3>,
     /// The level's sun (direction, colour), if it has one.
     sun: Option<(Vec3, Vec3)>,
     fog: [[f32; 4]; 2],
@@ -314,6 +317,61 @@ pub(crate) struct ParticleDraw {
     /// Drawn into the distortion mask, not the frame (a `DistortionMask.sta` program; see
     /// [`crate::distortion`]).
     distortion: bool,
+}
+
+/// The submission queue's groups for blended draws, in the order `dadefaultsub.sub.xml`
+/// draws them (DAOrigins.exe's default queue): `StaticBlendFlat`; the transparent character
+/// groups (`TransparentCharacterBodies`, `TransparentCharacterShader`) and the hair
+/// (`CharacterHairMultipass`); `WaterPlanes`; `FadingSpeedTrees`; `DistortionDiffuse_Water`;
+/// and `TransparentGeometry`, every other transparent draw with the particle emitters. The
+/// sorted groups (`sort by distance farthest`) draw back to front.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum TransparencyGroup {
+    StaticBlendFlat,
+    CharacterBodies,
+    Characters,
+    Hair,
+    Water,
+    Trees,
+    DistortionWater,
+    Geometry,
+}
+
+impl TransparencyGroup {
+    /// Whether the group draws back to front (`sort by distance farthest`); the others keep
+    /// the scene's order.
+    pub fn sorted(self) -> bool {
+        matches!(
+            self,
+            Self::CharacterBodies | Self::Characters | Self::Hair | Self::Geometry
+        )
+    }
+}
+
+/// The group a blended draw of render class `class` (a material's comma-separated
+/// `RenderClass`) is drawn in. Provisional: the queue's attribute tests (hidden, faded,
+/// LOD fades) are not mirrored, and the engine's own render classes (`multipassHair`) are
+/// read from the material's.
+pub fn transparency_group(class: Option<&str>) -> TransparencyGroup {
+    let has =
+        |k: &str| class.is_some_and(|c| c.split(',').any(|x| x.trim().eq_ignore_ascii_case(k)));
+    if has("staticblendflat") {
+        TransparencyGroup::StaticBlendFlat
+    } else if has("transparent_body") {
+        TransparencyGroup::CharacterBodies
+    } else if has("hair") || has("multipasshair") {
+        TransparencyGroup::Hair
+    } else if has("character") {
+        TransparencyGroup::Characters
+    } else if has("water") && !has("distortion_diffuse") {
+        TransparencyGroup::Water
+    } else if has("speedtree") {
+        TransparencyGroup::Trees
+    } else if has("water") {
+        TransparencyGroup::DistortionWater
+    } else {
+        TransparencyGroup::Geometry
+    }
 }
 
 /// The format of the shadow partitions: `PSSMStatic.psh` writes depth and its square into
@@ -2061,6 +2119,7 @@ impl D3dPass {
             instance_buffer,
             instancing: std::sync::Mutex::new(Instancing::default()),
             wind_time: std::sync::Mutex::new(0.0),
+            camera_at: std::sync::Mutex::new(Vec3::ZERO),
             winds: std::sync::Mutex::new(match scene.wind {
                 Some((strength, direction)) if !scene.tree_constants.is_empty() => (0..5)
                     .map(|_| thedas_formats::speedtree_gen::wind::Wind::dao(strength, direction))
@@ -2226,6 +2285,56 @@ impl D3dPass {
 
     /// Draws the particle draws filled by [`D3dPass::update_particles`]: the frame's, or
     /// with `distortion` those of the distortion mask (see [`crate::distortion`]).
+    /// Where the camera stood for this frame (see [`D3dPass::update`]).
+    pub fn camera_at(&self) -> Vec3 {
+        *self.camera_at.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Draw `i`'s distance from this frame's camera (to its bounding sphere's centre), by
+    /// which transparent draws are sorted; 0 for one without bounds.
+    pub fn distance(&self, i: usize, camera: Vec3) -> f32 {
+        self.draws
+            .get(i)
+            .and_then(|d| self.world_sphere(d))
+            .map_or(0.0, |(c, _)| c.distance(camera))
+    }
+
+    /// The submission queue group (`dadefaultsub.sub.xml`) a blended draw is drawn in, by
+    /// its material's render class (see [`transparency_group`]).
+    pub fn transparency_group(&self, i: usize) -> TransparencyGroup {
+        let class = self
+            .draws
+            .get(i)
+            .and_then(|d| self.worlds.get(d.draw))
+            .and_then(|(_, _, m)| self.materials.get(*m))
+            .and_then(|m| m.render_class.as_deref());
+        transparency_group(class)
+    }
+
+    /// Particle draw `k`'s quads, if it has any this frame and is not a distortion one.
+    pub fn draw_particle(&self, pass: &mut wgpu::RenderPass<'_>, k: usize) {
+        let (Some(indices), Some(d)) = (&self.quad_indices, self.particles.get(k)) else {
+            return;
+        };
+        let count = d.count.load(std::sync::atomic::Ordering::Relaxed);
+        if count == 0 || d.distortion {
+            return;
+        }
+        pass.set_pipeline(&self.pipelines[d.pipeline].pipeline);
+        pass.set_bind_group(0, &d.consts, &[]);
+        pass.set_bind_group(1, &d.textures, &[]);
+        pass.set_vertex_buffer(0, d.vertices.slice(..));
+        pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
+        pass.draw_indexed(0..count, 0, 0..1);
+    }
+
+    /// Whether particle draw `k` has quads for the frame (not the distortion mask's).
+    pub fn particle_drawn(&self, k: usize) -> bool {
+        self.particles.get(k).is_some_and(|d| {
+            !d.distortion && d.count.load(std::sync::atomic::Ordering::Relaxed) > 0
+        })
+    }
+
     pub fn draw_particles(&self, pass: &mut wgpu::RenderPass<'_>, distortion: bool) {
         let Some(indices) = &self.quad_indices else {
             return;
@@ -2633,6 +2742,9 @@ impl D3dPass {
         warm: bool,
     ) {
         let aspect = width as f32 / height.max(1) as f32;
+        if !warm {
+            *self.camera_at.lock().unwrap_or_else(|e| e.into_inner()) = camera.position;
+        }
         // The level's pass places this frame's partitions; the objects' pass reads them.
         let partitions = match (&self.shadows, self.sun) {
             _ if warm => None,
@@ -3380,6 +3492,26 @@ impl D3dPass {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn blended_draws_fall_in_the_submission_queues_groups() {
+        use super::{TransparencyGroup as G, transparency_group as g};
+        assert_eq!(g(Some("Transparent")), G::Geometry);
+        assert_eq!(g(Some("Transparent,Additive,Emitter")), G::Geometry);
+        assert_eq!(g(None), G::Geometry);
+        assert_eq!(g(Some("Transparent, Water")), G::Water);
+        assert_eq!(g(Some("Distortion_Diffuse, Water")), G::DistortionWater);
+        assert_eq!(g(Some("Transparent,Hair,Character")), G::Hair);
+        assert_eq!(
+            g(Some("Transparent,Transparent_Body,Character,Closeup")),
+            G::CharacterBodies
+        );
+        assert_eq!(g(Some("Character,Transparent")), G::Characters);
+        assert_eq!(g(Some("StaticBlendFlat, Transparent")), G::StaticBlendFlat);
+        // The queue's order: characters, hair, water, then the rest with the particles.
+        assert!(G::Characters < G::Hair && G::Hair < G::Water && G::Water < G::Geometry);
+        assert!(G::Geometry.sorted() && !G::Water.sorted());
+    }
+
     use super::*;
 
     #[test]

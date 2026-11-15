@@ -534,6 +534,14 @@ impl RenderCache {
     }
 }
 
+/// A transparent item of a frame (see [`AreaRenderer::transparent_order`]): a blended draw
+/// (by index into `blended`) or a particle draw.
+#[derive(Clone, Copy, Debug)]
+enum Transparent {
+    Draw(usize),
+    Particles(usize),
+}
+
 #[derive(Clone, Copy)]
 enum DrawRef {
     StandIn(usize),
@@ -2174,54 +2182,113 @@ impl AreaRenderer {
             |r: &DrawRef| matches!(*r, DrawRef::D3d(i) if self.d3d.is_faded(&self.d3d.draws[i]));
         let solid = self.opaque.iter().filter(|(_, r)| opaque && !faded(r));
         let faded_opaque = self.opaque.iter().filter(|(_, r)| transparent && faded(r));
-        let blended = self.blended.iter().filter(|_| transparent);
-        for (di, r) in solid.chain(faded_opaque).chain(blended) {
-            if self
-                .only_draws
-                .as_ref()
-                .is_some_and(|only| !only.contains(di))
-            {
+        for (di, r) in solid.chain(faded_opaque) {
+            self.draw_one(pass, *di, r, deferred);
+        }
+        if !transparent {
+            return;
+        }
+        // The blended draws and the particles (the emitters' render classes are
+        // transparent), in the submission queue's order.
+        for t in self.transparent_order() {
+            match t {
+                Transparent::Draw(k) => {
+                    let (di, r) = &self.blended[k];
+                    self.draw_one(pass, *di, r, deferred);
+                }
+                Transparent::Particles(k) if self.only_draws.is_none() => {
+                    self.d3d.draw_particle(pass, k);
+                }
+                Transparent::Particles(_) => {}
+            }
+        }
+    }
+
+    /// This frame's blended draws (by index into `blended`) and particle draws in the order
+    /// DAOrigins.exe's submission queue draws them: by [`TransparencyGroup`], and within a
+    /// sorted group farthest first from the camera (a particle draw by its emitter's
+    /// position). Ties keep the scene's order, which keeps a multi-pass draw's passes in
+    /// turn. Provisional: the queue sorts each renderer's draws apart from the others'
+    /// (the level's, the objects', the effects') only as far as this renderer goes.
+    fn transparent_order(&self) -> Vec<Transparent> {
+        use crate::d3d_gpu::TransparencyGroup;
+        let camera = self.d3d.camera_at();
+        let mut items: Vec<(TransparencyGroup, f32, Transparent)> = Vec::new();
+        for (k, (_, r)) in self.blended.iter().enumerate() {
+            let (group, distance) = match *r {
+                DrawRef::D3d(i) => {
+                    let g = self.d3d.transparency_group(i);
+                    let d = if g.sorted() {
+                        self.d3d.distance(i, camera)
+                    } else {
+                        0.0
+                    };
+                    (g, d)
+                }
+                DrawRef::StandIn(_) => (TransparencyGroup::Geometry, f32::MAX),
+            };
+            items.push((group, distance, Transparent::Draw(k)));
+        }
+        for (k, p) in self.d3d.particles.iter().enumerate() {
+            if !self.d3d.particle_drawn(k) {
                 continue;
             }
-            let d = match *r {
-                DrawRef::StandIn(i) => &self.stand_in[i],
-                DrawRef::D3d(i) => {
-                    if !self.d3d.in_view(i)
-                        || (deferred
-                            && !self.d3d.is_faded(&self.d3d.draws[i])
-                            && self.deferred.as_ref().is_some_and(|p| p.takes(i)))
-                    {
-                        continue;
-                    }
-                    let d = &self.d3d.draws[i];
-                    let mesh = &self.meshes[d.mesh];
-                    if (deferred || self.deferred_frame)
-                        && self
-                            .deferred
-                            .as_ref()
-                            .is_some_and(|p| p.draw_forward(pass, i, &self.d3d, mesh))
-                    {
-                        continue;
-                    }
-                    self.d3d.draw(pass, d, &mesh.indices, mesh.count);
-                    continue;
+            let at = self
+                .emitters
+                .get(p.emitter)
+                .map_or(camera, |e| e.world.w_axis.truncate());
+            items.push((
+                TransparencyGroup::Geometry,
+                at.distance(camera),
+                Transparent::Particles(k),
+            ));
+        }
+        items.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.total_cmp(&a.1)));
+        items.into_iter().map(|(_, _, t)| t).collect()
+    }
+
+    /// Draws one opaque or blended draw (see [`Self::draw_forward`]).
+    fn draw_one(&self, pass: &mut wgpu::RenderPass<'_>, di: usize, r: &DrawRef, deferred: bool) {
+        if self
+            .only_draws
+            .as_ref()
+            .is_some_and(|only| !only.contains(&di))
+        {
+            return;
+        }
+        let d = match *r {
+            DrawRef::StandIn(i) => &self.stand_in[i],
+            DrawRef::D3d(i) => {
+                if !self.d3d.in_view(i)
+                    || (deferred
+                        && !self.d3d.is_faded(&self.d3d.draws[i])
+                        && self.deferred.as_ref().is_some_and(|p| p.takes(i)))
+                {
+                    return;
                 }
-            };
-            let mesh = &self.meshes[d.mesh];
-            pass.set_bind_group(0, &self.frame_group, &[]);
-            pass.set_pipeline(&self.pipelines[d.pipeline].0);
-            pass.set_bind_group(1, &self.material_groups[d.material_group], &[]);
-            pass.set_bind_group(2, &self.lightmap_groups[d.lightmap_group], &[]);
-            pass.set_bind_group(3, &self.draw_group, &[d.uniform_offset]);
-            pass.set_vertex_buffer(0, mesh.vertices.slice(..));
-            pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
-            pass.draw_indexed(0..mesh.count, 0, 0..1);
-        }
-        // Particles last, over everything else (the emitters' render classes are
-        // transparent).
-        if transparent && self.only_draws.is_none() {
-            self.d3d.draw_particles(pass, false);
-        }
+                let d = &self.d3d.draws[i];
+                let mesh = &self.meshes[d.mesh];
+                if (deferred || self.deferred_frame)
+                    && self
+                        .deferred
+                        .as_ref()
+                        .is_some_and(|p| p.draw_forward(pass, i, &self.d3d, mesh))
+                {
+                    return;
+                }
+                self.d3d.draw(pass, d, &mesh.indices, mesh.count);
+                return;
+            }
+        };
+        let mesh = &self.meshes[d.mesh];
+        pass.set_bind_group(0, &self.frame_group, &[]);
+        pass.set_pipeline(&self.pipelines[d.pipeline].0);
+        pass.set_bind_group(1, &self.material_groups[d.material_group], &[]);
+        pass.set_bind_group(2, &self.lightmap_groups[d.lightmap_group], &[]);
+        pass.set_bind_group(3, &self.draw_group, &[d.uniform_offset]);
+        pass.set_vertex_buffer(0, mesh.vertices.slice(..));
+        pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
+        pass.draw_indexed(0..mesh.count, 0, 0..1);
     }
 
     /// Records the level's frame buffer effects over `target`, a frame this renderer (and
