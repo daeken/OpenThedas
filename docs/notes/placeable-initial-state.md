@@ -57,7 +57,11 @@ object's footprint, and SetObjectActive updates PWK along with the flag.
 For appearance type 1, `0x74e850` asks `0x74bcc0` for the active controller
 state's blocking predicate (column hash `0x86a27132`). `0x74d350` restores the
 original PHY group for a blocking state and sets group 1 otherwise. This keeps
-an initially open door out of creature and sight collision. The locked state
+an initially open door out of creature and sight collision.
+The doorway approximation checks the restored group's NonWalkable bit, rather
+than Creatures: the home door's PHY belongs to Placeables | NonWalkable and has
+no Creatures bit. Group 1 still disables both doorway and sight blocking.
+The locked state
 is the controller row itself: Closed_Locked offers Unlock rather than Open;
 there is no additional lock boolean to seed. PickLock and key requirements
 remain their separately loaded instance/template fields.

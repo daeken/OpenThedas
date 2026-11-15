@@ -5942,7 +5942,7 @@ mod tests {
                 .get(door)
                 .unwrap()
                 .placeable_group
-                .is_some_and(|group| group & thedas_formats::phy::mask::CREATURES != 0)
+                .is_some_and(|group| group & thedas_formats::phy::mask::NON_WALKABLE != 0)
         );
         assert_ne!(
             s.world.nav_patches, before,

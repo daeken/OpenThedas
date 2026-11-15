@@ -591,7 +591,7 @@ impl Sim {
                     o.active
                         && (state == 0 || state == 1)
                         && o.placeable_group
-                            .is_none_or(|g| g & thedas_formats::phy::mask::CREATURES != 0)
+                            .is_none_or(|g| g & thedas_formats::phy::mask::NON_WALKABLE != 0)
                 })
             })
             .cloned()
