@@ -5,7 +5,7 @@
 //! - Applying an area-of-effect effect (type 5) at a location or to an object (0x7a0230)
 //!   makes the object: its `VFX Persistent` row (M2DA 96, the effect's integer 0) gives the
 //!   shape (0x7e4da0): `C` a circle of `Radius`, `R` a rectangle `Width` across by `Length`
-//!   along its facing. The effect's string 0 is its script; its creator (if a creature) and
+//!   along its facing. The effect's string 0 is its script; its creator and
 //!   ability are the object's. Applied at a location it stays there; applied to an object
 //!   it goes with that object (0x7e5d80).
 //! - Its first update sends it one `EVENT_TYPE_AOE_HEARTBEAT` (0x7e4b63), with the creator,
@@ -55,13 +55,16 @@ pub enum AoeShape {
     Rect { width: f32, length: f32 },
 }
 
+/// A creature an area of effect may hold: its id, position and area.
+type Inhabitant = (ObjectId, [f32; 3], Option<ObjectId>);
+
 /// What an area-of-effect object keeps (see the module docs).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct AoeState {
     /// The `VFX Persistent` row.
     pub row: i32,
     pub shape: AoeShape,
-    /// The effect's creator, if a creature (`OBJECT_INVALID` otherwise).
+    /// The effect's creator (`OBJECT_INVALID` when absent).
     pub creator: ObjectId,
     pub ability: i32,
     /// The object it goes with, when applied to one rather than at a location.
@@ -142,9 +145,16 @@ impl Sim {
         let creator = effect
             .creator
             .filter(|&c| {
-                self.world
-                    .get(c)
-                    .is_some_and(|o| o.kind == ObjectKind::Creature)
+                // DAOrigins.exe 0x7a03bf passes effect+0x40 unchanged to 0x7e4720,
+                // which stores it at AoE+0x4ac. ENTER/EXIT forward that id at
+                // 0x7e5c02/0x7e5c7c; it need not be a creature. Dwarf Noble's
+                // pressure-plate scripts use GetEventCreator as the placeable.
+                // Keep DA2's existing policy until its path is traced.
+                self.game == thedas_vfs::Game::Origins
+                    || self
+                        .world
+                        .get(c)
+                        .is_some_and(|o| o.kind == ObjectKind::Creature)
             })
             .unwrap_or(OBJECT_INVALID);
         let id = self.world.spawn(ObjectKind::AreaOfEffect, &label);
@@ -183,15 +193,26 @@ impl Sim {
             .filter(|o| o.kind == ObjectKind::AreaOfEffect)
             .map(|o| o.id)
             .collect();
+        // The creatures an area of effect can hold, gathered once for all of them (scanning
+        // every object of the world once per area of effect cost a lot in busy areas). Only
+        // removing one runs scripts at once (its members' EXIT), so the list is gathered
+        // again after that; the scans themselves only queue events.
+        let mut creatures: Option<Vec<Inhabitant>> = None;
         for id in ids {
-            let Some(state) = self.world.get(id).and_then(|o| o.aoe.clone()) else {
+            let Some((expires, follows)) = self
+                .world
+                .get(id)
+                .and_then(|o| o.aoe.as_ref())
+                .map(|s| (s.expires, s.follows))
+            else {
                 continue;
             };
-            if state.expires.is_some_and(|t| t <= now) {
+            if expires.is_some_and(|t| t <= now) {
                 self.destroy_aoe(id);
+                creatures = None;
                 continue;
             }
-            if let Some(owner) = state.follows {
+            if let Some(owner) = follows {
                 let at = self.world.get(owner).map(|o| (o.position, o.area));
                 if let (Some((p, Some(area))), Some(o)) = (at, self.world.get_mut(id)) {
                     if o.area == Some(area) {
@@ -199,35 +220,59 @@ impl Sim {
                     }
                 }
             }
-            self.scan_aoe(id);
+            let list = creatures.get_or_insert_with(|| self.aoe_inhabitants());
+            let list = std::mem::take(list);
+            self.scan_aoe_among(id, &list);
+            creatures = Some(list);
         }
+    }
+
+    /// The living, active creatures, in the world's order, with where they stand.
+    fn aoe_inhabitants(&self) -> Vec<Inhabitant> {
+        self.world
+            .creature_ids()
+            .iter()
+            .filter_map(|&id| self.world.get(id))
+            .filter(|c| c.active && !c.dead)
+            .map(|c| (c.id, c.position, c.area))
+            .collect()
     }
 
     /// Sends ENTER for living, active creatures newly inside an area of effect and EXIT for
     /// members now outside (queued, as the engine queues them).
     fn scan_aoe(&mut self, id: ObjectId) {
+        let list = self.aoe_inhabitants();
+        self.scan_aoe_among(id, &list);
+    }
+
+    /// [`Sim::scan_aoe`] over `creatures` (from [`Sim::aoe_inhabitants`]).
+    fn scan_aoe_among(&mut self, id: ObjectId, creatures: &[Inhabitant]) {
         let Some(o) = self.world.get(id) else { return };
-        let Some(state) = o.aoe.clone() else { return };
+        let Some(state) = o.aoe.as_ref() else { return };
         let (area, center, facing) = (o.area, o.position, o.facing);
-        let script = o.script.clone();
         let mut members = state.members.clone();
         let mut changes: Vec<(ObjectId, bool)> = Vec::new();
-        for c in self.world.objects.values() {
-            if c.kind != ObjectKind::Creature || c.area != area || !c.active || c.dead {
+        for &(c, at, c_area) in creatures {
+            if c_area != area {
                 continue;
             }
-            let inside = state.shape.contains(center, facing, c.position);
-            let member = members.contains(&c.id);
+            let inside = state.shape.contains(center, facing, at);
+            let member = members.contains(&c);
             if inside && !member {
-                members.push(c.id);
-                changes.push((c.id, true));
+                members.push(c);
+                changes.push((c, true));
             } else if !inside && member {
-                members.retain(|&m| m != c.id);
-                changes.push((c.id, false));
+                members.retain(|&m| m != c);
+                changes.push((c, false));
             }
         }
+        if changes.is_empty() {
+            return;
+        }
+        let script = o.script.clone();
+        let state = state.clone();
         if let Some(s) = self.world.get_mut(id).and_then(|o| o.aoe.as_mut()) {
-            s.members = members;
+            s.members = members.clone();
         }
         for (c, enter) in changes {
             let ev = self.aoe_event(id, &state, c, enter);
@@ -415,6 +460,46 @@ mod tests {
             .filter(|o| o.kind == ObjectKind::AreaOfEffect)
             .map(|o| o.id)
             .collect()
+    }
+
+    #[test]
+    fn origins_aoe_events_preserve_placeable_creators_through_save_and_reload() {
+        for game in [thedas_vfs::Game::Origins, thedas_vfs::Game::DragonAge2] {
+            let mut s = sim();
+            s.game = game;
+            let area = s.world.spawn(ObjectKind::Area, "chamber");
+            let plate = s.world.spawn(ObjectKind::Placeable, "pressure_plate");
+            let member = creature(&mut s, area, [1.0, 0.0, 0.0]);
+            let effect = Effect {
+                ty: EFFECT_TYPE_AOE,
+                creator: Some(plate),
+                ability: 123,
+                ints: vec![203],
+                ..Default::default()
+            };
+            let aoe = s.create_aoe(&effect, area, [0.0; 3], 0.0, None, None);
+            let creator = if game == thedas_vfs::Game::Origins {
+                plate
+            } else {
+                OBJECT_INVALID
+            };
+            assert_eq!(
+                queued(&s, aoe),
+                vec![
+                    (74, None, Some(creator), 123, aoe),
+                    (8, Some(member), Some(creator), 123, aoe),
+                ]
+            );
+            let saved = s.save_json().unwrap();
+            s.load_json(&saved).unwrap();
+            s.world.queue.clear();
+            s.world.get_mut(member).unwrap().position = [5.0, 0.0, 0.0];
+            s.update_aoes();
+            assert_eq!(
+                queued(&s, aoe),
+                vec![(9, Some(member), Some(creator), 123, aoe)]
+            );
+        }
     }
 
     #[test]

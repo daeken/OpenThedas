@@ -5227,6 +5227,7 @@ dependencies = [
  "ureq",
  "wgpu",
  "winit",
+ "zip 2.6.1",
 ]
 
 [[package]]
@@ -5240,6 +5241,22 @@ dependencies = [
  "thedas-formats",
  "thedas-vfs",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "thedas-bake"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "env_logger",
+ "glam",
+ "log",
+ "png",
+ "serde_json",
+ "thedas-formats",
+ "thedas-render",
+ "thedas-vfs",
 ]
 
 [[package]]
@@ -5324,6 +5341,7 @@ dependencies = [
  "log",
  "naga",
  "pollster 0.4.0",
+ "serde_json",
  "thedas-formats",
  "thedas-shader",
  "thedas-vfs",

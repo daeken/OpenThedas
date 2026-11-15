@@ -261,6 +261,9 @@ pub(crate) struct DeferredPass {
     effect_lights: Vec<SceneLight>,
     /// The lights its own renderer's glowing emitters give, set each frame.
     own_lights: Vec<SceneLight>,
+    /// Experimental: a fitted light set's baked-only fill lights (lightmaps-off mode only;
+    /// see `crate::lightset`), lit with the bake's linear falloff and no specular.
+    fill_lights: Vec<SceneLight>,
     /// The GPU refused the pass: the level stays faithful.
     refused: bool,
     /// Experimental probe + runtime visibility mode. Fixed when this renderer is built.
@@ -301,6 +304,10 @@ struct Gpu {
     env: [wgpu::RenderPipeline; 3],
     lighting: wgpu::RenderPipeline,
     lighting_baked: wgpu::RenderPipeline,
+    /// The real-time bounce gather (half resolution, see `fs_bounce`), and the layout of
+    /// its result for the lighting pass (group 3).
+    bounce: wgpu::RenderPipeline,
+    bounce_layout: wgpu::BindGroupLayout,
     frame_buffer: wgpu::Buffer,
     /// Every draw's [`DrawUniforms`], [`DRAW_STRIDE`] apart, rewritten each frame.
     draw_buffer: wgpu::Buffer,
@@ -337,6 +344,9 @@ struct Gpu {
 struct Targets {
     size: (u32, u32),
     views: [wgpu::TextureView; 4],
+    /// The real-time bounce at half resolution, and its group for the lighting pass.
+    bounce: wgpu::TextureView,
+    bounce_group: wgpu::BindGroup,
     /// The G-buffer and the depth it was drawn with, for the lighting pass.
     group: wgpu::BindGroup,
     /// The depth buffer `group` reads.
@@ -457,6 +467,12 @@ impl DeferredPass {
         cache: &mut TextureCache,
     ) -> Option<DeferredPass> {
         let started = std::time::Instant::now();
+        // Experimental: a fitted light set for the lightmaps-off mode (see `crate::lightset`).
+        let light_set = if crate::config::CONFIG.baked_lighting {
+            None
+        } else {
+            crate::lightset::LightSet::for_level(&scene.level)
+        };
         let punch_enabled = crate::config::CONFIG.punch;
         let punch: HashMap<usize, _> = if punch_enabled {
             d3d.draws
@@ -797,16 +813,28 @@ impl DeferredPass {
                     },
                 ],
                 terrain: crate::deferred_terrain::TerrainData::new(m),
-                probe: item
-                    .probe
-                    .and_then(|i| scene.probes.get(i))
-                    .map(|p| p.probe.rows())
-                    .unwrap_or_else(|| {
-                        thedas_formats::probe::IrradianceProbe::uniform(
-                            crate::d3d::NO_PROBE_IRRADIANCE,
-                        )
-                        .rows()
-                    }),
+                probe: match light_set
+                    .as_ref()
+                    .filter(|_| !is_object)
+                    .and_then(|set| set.ambient.get(&item.room.to_ascii_lowercase()))
+                {
+                    // The room's baked ambient in place of the probe, encoded as the
+                    // lightmaps store light (gamma 1.5), which the shaders use raw.
+                    Some(a) => thedas_formats::probe::IrradianceProbe::uniform(
+                        a.max(Vec3::ZERO).powf(1.0 / 1.5).to_array(),
+                    )
+                    .rows(),
+                    None => item
+                        .probe
+                        .and_then(|i| scene.probes.get(i))
+                        .map(|p| p.probe.rows())
+                        .unwrap_or_else(|| {
+                            thedas_formats::probe::IrradianceProbe::uniform(
+                                crate::d3d::NO_PROBE_IRRADIANCE,
+                            )
+                            .rows()
+                        }),
+                },
                 tint: {
                     let values = m
                         .object
@@ -1018,6 +1046,36 @@ impl DeferredPass {
             gpu: None,
             effect_lights: Vec::new(),
             own_lights: Vec::new(),
+            fill_lights: light_set
+                .map(|set| {
+                    // A fill belongs to the room of the pieces its atlas lights, so it reaches
+                    // what that room's lights reach (it casts no shadow of its own).
+                    let atlas_room = |atlas: &str| {
+                        let suffix = format!("{atlas}.dds");
+                        scene.draws.iter().find_map(|d| {
+                            let lm = d.lightmap.as_ref()?;
+                            lm.texture
+                                .to_ascii_lowercase()
+                                .ends_with(&suffix)
+                                .then_some(d.room_id)?
+                        })
+                    };
+                    set.fills
+                        .iter()
+                        .map(|f| SceneLight::Point {
+                            position: f.position,
+                            color: f.color,
+                            radius: f.radius,
+                            name: "baked fill".into(),
+                            domain: None,
+                            is_static: true,
+                            version: 0,
+                            intensity: 1.0,
+                            room: f.atlas.as_deref().and_then(atlas_room),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
             refused: false,
             baked_lighting: crate::config::CONFIG.baked_lighting,
             ssao: crate::config::CONFIG.ssao,
@@ -1182,6 +1240,12 @@ impl DeferredPass {
 
     pub(crate) fn set_culling(&mut self, culling: Option<[bool; 2]>) {
         self.culling = culling;
+    }
+
+    /// The hybrid mode: baked lighting with real-time direct visibility
+    /// (`THEDAS_DEFERRED_BAKED_LIGHTING=bounce`).
+    fn realtime_direct(&self) -> bool {
+        self.baked_lighting && crate::config::CONFIG.realtime_direct
     }
 
     /// Whether the GPU refused the pass.
@@ -1488,6 +1552,10 @@ impl DeferredPass {
                 cache: None,
             })
         });
+        let bounce_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("deferred bounce"),
+            entries: &[tex(0, false)],
+        });
         let lighting_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("deferred lighting"),
@@ -1495,9 +1563,45 @@ impl DeferredPass {
                     Some(&lighting_layout),
                     Some(&targets_layout),
                     Some(&sun_layout),
+                    Some(&bounce_layout),
                 ],
                 immediate_size: 0,
             });
+        let bounce_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("deferred bounce"),
+                bind_group_layouts: &[
+                    Some(&lighting_layout),
+                    Some(&targets_layout),
+                    Some(&sun_layout),
+                ],
+                immediate_size: 0,
+            });
+        let bounce = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("deferred bounce"),
+            layout: Some(&bounce_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &module,
+                entry_point: Some("vs_fullscreen"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &module,
+                entry_point: Some("fs_bounce"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: BOUNCE_FORMAT,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
         let make_lighting = |entry_point| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some("deferred lighting"),
@@ -1766,6 +1870,8 @@ impl DeferredPass {
             env,
             lighting,
             lighting_baked,
+            bounce,
+            bounce_layout,
             mask_buffer,
             light_masks: None,
             frame_buffer,
@@ -2090,12 +2196,42 @@ impl DeferredPass {
         let shadowed = if !crate::config::CONFIG.point_shadows {
             Vec::new()
         } else {
-            shadow_slots(
+            let slots = shadow_slots(
                 &mut lights,
                 camera.position,
                 crate::config::CONFIG.shadow_slots,
-            )
+                self.realtime_direct(),
+            );
+            if self.realtime_direct() {
+                // A static light with a cube of its own takes that visibility in place of
+                // the lightmap's baked mask (it lights as a dynamic one does); the rest keep
+                // the mask. The shadow record's y is the light's domain: leave it alone.
+                for light in &mut lights {
+                    if light.shadow[0] >= 0.0 {
+                        light.colour[3] = 0.0;
+                    }
+                }
+            }
+            slots
         };
+        if !self.fill_lights.is_empty() {
+            // A light set's fill lights: after the shadow slots are chosen (they never take
+            // one), nearest first into what room the light list has left. Colour w = 2 marks
+            // them for the lighting pass (linear falloff, no specular, level surfaces only).
+            let planes = frustum(camera.view_proj(width as f32 / height.max(1) as f32));
+            let mut fills: Vec<(f32, GpuLight)> = self
+                .fill_lights
+                .iter()
+                .filter_map(|l| self.light(l, &planes, camera.position, characters))
+                .collect();
+            fills.sort_by(|a, b| a.0.total_cmp(&b.0));
+            fills.truncate(MAX_LIGHTS.saturating_sub(lights.len()));
+            for (_, mut l) in fills {
+                l.colour[3] = 2.0;
+                l.shadow[0] = -1.0;
+                lights.push(l);
+            }
+        }
         if crate::config::CONFIG.log_lights {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| {
@@ -2184,9 +2320,36 @@ impl DeferredPass {
                 layout: &gpu.targets_layout,
                 entries: &entries,
             });
+            let bounce = device
+                .create_texture(&wgpu::TextureDescriptor {
+                    label: Some("deferred bounce"),
+                    size: wgpu::Extent3d {
+                        width: width.div_ceil(4).max(1),
+                        height: height.div_ceil(4).max(1),
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: BOUNCE_FORMAT,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                        | wgpu::TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
+                })
+                .create_view(&wgpu::TextureViewDescriptor::default());
+            let bounce_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("deferred bounce"),
+                layout: &gpu.bounce_layout,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&bounce),
+                }],
+            });
             gpu.targets = Some(Targets {
                 size: (width, height),
                 views,
+                bounce,
+                bounce_group,
                 group,
                 depth: depth.clone(),
             });
@@ -2293,6 +2456,7 @@ impl DeferredPass {
             ],
             static_tints: tints.factors,
         };
+        let bounce_flags = bounce_flags(self.baked_lighting);
         let sun = SunUniforms {
             data: d3d
                 .sun_shadows()
@@ -2304,8 +2468,8 @@ impl DeferredPass {
                     self.sun_early_exit
                         .unwrap_or(crate::config::CONFIG.sun_early_exit),
                 ),
-                0,
-                0,
+                u32::from(self.baked_lighting && crate::config::CONFIG.realtime_direct),
+                bounce_flags,
             ],
         };
         ctx.queue
@@ -2492,6 +2656,37 @@ impl DeferredPass {
             p.stage(ctx, encoder, "gbuffer");
         }
         {
+            // The real-time bounce, gathered before the lighting pass reads it. With bounce
+            // off the pass only clears it (the lighting pass then skips reading it).
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("deferred bounce"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &targets.bounce,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: if bounce_flags != 0 {
+                    profile.as_deref_mut().and_then(|p| p.pass("bounce"))
+                } else {
+                    None
+                },
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            if bounce_flags != 0 {
+                pass.set_pipeline(&gpu.bounce);
+                pass.set_bind_group(0, &gpu.lighting_group, &[]);
+                pass.set_bind_group(1, &targets.group, &[]);
+                pass.set_bind_group(2, gpu.sun_group.as_ref().expect("sun targets"), &[]);
+                pass.draw(0..3, 0..1);
+            }
+        }
+        {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("deferred lighting"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -2521,6 +2716,7 @@ impl DeferredPass {
             pass.set_bind_group(0, &gpu.lighting_group, &[]);
             pass.set_bind_group(1, &targets.group, &[]);
             pass.set_bind_group(2, gpu.sun_group.as_ref().expect("sun targets"), &[]);
+            pass.set_bind_group(3, &targets.bounce_group, &[]);
             pass.draw(0..3, 0..1);
         }
         if let Some(p) = profile.as_deref_mut() {
@@ -2829,10 +3025,15 @@ fn draw_all(
 }
 
 /// Gives the shadow slots to lights without baked visibility (emitters, moving lights,
-/// and all point lights in probe mode) that matter most from `eye`: their
-/// brightness times reach over their distance. Returns each slot's light (position,
-/// radius).
-fn shadow_slots(lights: &mut [GpuLight], eye: Vec3, slots: usize) -> Vec<(Vec3, f32)> {
+/// and all point lights in probe mode), and with `statics` the static ones too, that
+/// matter most from `eye`: their brightness times reach over their distance. Returns each
+/// slot's light (position, radius).
+fn shadow_slots(
+    lights: &mut [GpuLight],
+    eye: Vec3,
+    slots: usize,
+    statics: bool,
+) -> Vec<(Vec3, f32)> {
     let columns = crate::deferred_shadow::atlas_columns(slots) as usize;
     let score = |l: &GpuLight| {
         let p = Vec3::from_slice(&l.position[..3]);
@@ -2840,7 +3041,7 @@ fn shadow_slots(lights: &mut [GpuLight], eye: Vec3, slots: usize) -> Vec<(Vec3, 
         bright * l.position[3] / (1.0 + p.distance(eye))
     };
     let mut order: Vec<usize> = (0..lights.len())
-        .filter(|&i| lights[i].colour[3] < 0.5 && lights[i].position[3] > 0.0)
+        .filter(|&i| (statics || lights[i].colour[3] < 0.5) && lights[i].position[3] > 0.0)
         .collect();
     order.sort_by(|&a, &b| score(&lights[b]).total_cmp(&score(&lights[a])));
     order.truncate(slots.min(crate::deferred_shadow::SLOTS));
@@ -2881,10 +3082,25 @@ fn debug_view() -> u32 {
             "shadows" => 10,
             "sun-shadows" => 11,
             "ao" => 12,
+            "bounce" => 13,
             _ => 0,
         }
     })
 }
+
+/// What bounces (`fs_bounce`): bit 0 the shadowed dynamic lights (emitters, moving
+/// lights), which the lightmaps' baked bounce never held; with no lightmap bounce standing
+/// in, bit 1 the shadowed static lights too and bit 2 the sun (screen-space).
+/// `THEDAS_DEFERRED_BOUNCE=0` turns it off.
+fn bounce_flags(baked_lighting: bool) -> u32 {
+    if !crate::config::CONFIG.bounce {
+        return 0;
+    }
+    1 | if baked_lighting { 0 } else { 2 | 4 }
+}
+
+/// The real-time bounce target's format.
+const BOUNCE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 
 /// The brightest a glowing emitter's light gets (its strongest channel), approached as its
 /// particles show more light: `1 − e^(−shown / EMITTER_SHOWN)`, with `shown` their summed
@@ -3126,7 +3342,7 @@ mod tests {
             light(4.0, 1.0, false),
             light(100.0, 1.0, false),
         ];
-        let slots = shadow_slots(&mut lights, Vec3::ZERO, 4);
+        let slots = shadow_slots(&mut lights, Vec3::ZERO, 4, false);
         assert_eq!(slots.len(), 4);
         assert_eq!(
             lights[0].shadow[0], -1.0,
@@ -3141,7 +3357,7 @@ mod tests {
         let mut lights: Vec<_> = (1..=crate::deferred_shadow::SLOTS + 1)
             .map(|i| light(i as f32, 1.0, false))
             .collect();
-        let slots = shadow_slots(&mut lights, Vec3::ZERO, usize::MAX);
+        let slots = shadow_slots(&mut lights, Vec3::ZERO, usize::MAX, false);
         assert_eq!(slots.len(), crate::deferred_shadow::SLOTS);
         for (i, light) in lights.iter().enumerate() {
             assert_eq!(

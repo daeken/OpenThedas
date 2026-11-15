@@ -358,6 +358,26 @@ debug views now include the ground. Terrain also joins the point-shadow caster l
 - With baked lighting on, static lights and static geometry still depend on `lm.a`.
   The experimental lightmaps-off mode below lets static lights use the point-shadow pool.
 
+## Lightmap modes
+
+The deferred path's treatment of the baked lightmaps is chosen once per process:
+`thedas-app --lighting baked|hybrid|realtime`, the launcher's "Deferred lighting" choice,
+`thedas_render::set_baked_lighting` before the first renderer is made, or
+`THEDAS_DEFERRED_BAKED_LIGHTING` (`0` realtime, `bounce`/`hybrid` hybrid). The faithful
+path ignores it.
+
+- `baked` (default): lightmap RGB is the baked bounce, alpha the baked direct visibility,
+  as Static1 uses them.
+- `hybrid`: the lightmaps keep only their bounce. Static point lights compete with the
+  dynamic ones for the sixteen cube shadow slots; a static light holding one takes its
+  cube's visibility in place of the baked mask (and, like a dynamic light, not the sun's
+  mask). Where a sun cascade covers a point, the sun takes the cascade's visibility alone.
+  Lights without a cube and the sun outside the cascades keep the baked mask, so nothing
+  leaks where runtime visibility is unknown. Characters and placeables now shadow the
+  level's own torches and the sun's light the same way the lightmaps shadowed static
+  geometry. The bounce stays baked: it does not move with doors, characters or spells.
+- `realtime`: below.
+
 ## Real-time lighting in place of lightmaps (experimental)
 
 Lightmap rgb is the baked bounce and the baked-only lights; `lm.a` the baked visibility.
@@ -393,6 +413,55 @@ budget, missing occluders, screen edges and coarse room probes can cause light l
 ambient discontinuities. The original baked image remains the default while those are
 addressed. Moving the remaining material families into the G-buffer is still
 the next coverage step.
+
+### Fitted light sets (experimental)
+
+`THEDAS_DEFERRED_LIGHTSET=<file or directory>` gives the lightmaps-off mode a level's light set:
+what the shipped lightmaps say the original bake's lights were, fitted by `thedas-bake` (see
+`docs/lightmaps/baker-spec.md` §7; the sets are derived from game data and live outside the
+repository, in OpenThedas-testdata `lightmap/lightsets/<level>.lightset.json`). It does nothing
+in the `baked` and `hybrid` modes or when unset.
+
+- Level surfaces (not objects or characters) take their room's baked ambient in place of the
+  probe, encoded as the lightmaps store light (linear^(1/1.5)), uniform over the hemisphere.
+- The set's baked-only fill lights join the light list after the shadow slots are chosen
+  (never shadowed), nearest first into what room it has left. Each belongs to the room its
+  fitted atlas lights. The lighting pass marks them by colour w = 2: the bake's linear
+  falloff max(0, 1 − d/R), no highlight, level surfaces only.
+
+On the Cousland hall camera, against the `baked` frame, `realtime` differs by a mean of 20.4
+levels per channel (−18 bias) and `realtime` with the light set by 10.6 (+8.6); on two Lake
+Calenhad terrain views 6.1–6.5 and 0.5. Not yet: the static lights' baked twins, the
+occlusion the lightmaps carry, fill visibility.
+
+## Real-time bounce
+
+`fs_bounce` gathers one bounce of light at quarter resolution before the lighting pass, which
+adds it to the ambient term (times the albedo in fused frames). `THEDAS_DEFERRED_BOUNCE=0`
+turns it off; `THEDAS_DEFERRED_VIEW=bounce` shows it alone.
+
+- **Shadowed point lights:** each cube texel is the first surface the light reaches, so it
+  is lit; twelve texels per light (two per face, jittered per pixel; neighbouring bounce
+  pixels take alternate faces, which the upsample's 2 × 2 average combines) become small
+  emitters at that point, with a normal from neighbouring texels and the light's colour and
+  falloff. Each stands for its solid angle times its distance squared, and relights a
+  receiver by both cosines over `π r²` (`r²` clamped near the patch). Bounce surfaces reflect
+  a fixed grey (0.4): the cubes hold no albedo. Lights reach receivers within twice their
+  radius and only in rooms they reach.
+- **Sun (screen-space):** eight points of a 3 m hemisphere around the receiver, each the
+  surface the screen shows there, lit by the sun through its cascades and reflecting its own
+  G-buffer albedo (so a green carpet tints nearby stone). The sun's maps can't be used the
+  way the cubes are: they see a roof, not the sunlit floor under a window. Off-screen
+  surfaces are missed, so the bounce fades at the frame's edges.
+
+Which lights bounce depends on the lightmap mode: with lightmaps (`baked`, `hybrid`) only
+the dynamic lights (emitters, spells), whose bounce the lightmaps never held; with none
+(`realtime`) the static lights and the sun too. No receiver-to-sender visibility test yet,
+no temporal accumulation (the per-pixel jitter is averaged by the depth-aware 2 × 2
+upsample only), and one bounce. Cost: on an M4 with the Cousland hall in `realtime` mode,
+the first half-resolution version (24 texels a light, 16 sun points) added about 74 ms of
+GPU time; this quarter-resolution, interleaved version adds about 3.6 ms there (lighting stage
+4.6 → 8.2 ms with `THEDAS_RENDER_PROFILE=1`) and looks the same in captures.
 
 ## Measuring frame cost
 

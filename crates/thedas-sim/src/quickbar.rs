@@ -335,6 +335,15 @@ impl Sim {
     /// an ability its owner lost leave the bar, and what a member can use that has never been
     /// on it takes a free slot, to stay there.
     pub fn settle_quickbars(&mut self) {
+        // The party's pack, gathered once: nothing below changes what it holds.
+        let pack = self.party_backpack();
+        let count = |sim: &Sim, tag: &str| -> i32 {
+            pack.iter()
+                .filter_map(|&i| sim.world.get(i))
+                .filter(|o| o.tag.eq_ignore_ascii_case(tag))
+                .map(|o| o.fields.get("StackSize").copied().unwrap_or(1).max(1))
+                .sum()
+        };
         for who in crate::engine::party_of(self) {
             let Some(o) = self.world.get(who) else {
                 continue;
@@ -346,7 +355,7 @@ impl Sim {
                     if q.item.is_empty() {
                         !o.abilities.contains(&q.ability)
                     } else {
-                        self.item_count(&q.item) == 0
+                        count(self, &q.item) == 0
                     }
                 })
                 .map(|(s, _)| *s)

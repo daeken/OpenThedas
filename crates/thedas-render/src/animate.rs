@@ -3,7 +3,7 @@
 //! time into a pose. Trees, animations and rest poses are read once and kept.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock, mpsc};
 
 use glam::Mat4;
 use thedas_formats::anim::{AnimTree, Animation};
@@ -85,6 +85,9 @@ pub struct Animator {
     /// Each animation's track nodes on each skeleton (by the skeleton's index, then the
     /// animation's resource): see [`crate::skeleton::Skeleton::track_nodes`].
     track_nodes: HashMap<usize, HashMap<String, TrackNodes>>,
+    /// Each prop's poses as last computed, and what they were posed with (see
+    /// [`Animator::pose_props`]; none: not posed since the props changed).
+    last_poses: Vec<Option<(u64, crate::skeleton::Poses)>>,
 }
 
 fn load<T>(
@@ -355,6 +358,74 @@ impl Prepared {
     }
 }
 
+type PoseJobs = Vec<(usize, usize, Prepared)>;
+type PosedJobs = Vec<(usize, usize, Posed)>;
+
+struct PoseBatch {
+    jobs: PoseJobs,
+    reply: mpsc::Sender<PosedJobs>,
+}
+
+/// Posing owns all of its inputs, so workers can persist between frames. The caller
+/// poses one chunk too; at most POSE_THREADS threads work on a frame, as before.
+struct PosePool {
+    workers: Vec<mpsc::Sender<PoseBatch>>,
+}
+
+fn pose_jobs(jobs: PoseJobs) -> PosedJobs {
+    jobs.into_iter().map(|(i, s, p)| (i, s, p.pose())).collect()
+}
+
+impl PosePool {
+    fn new() -> Self {
+        let threads = std::thread::available_parallelism()
+            .map_or(1, |n| n.get())
+            .clamp(1, POSE_THREADS);
+        let workers = (1..threads)
+            .filter_map(|i| {
+                let (tx, rx) = mpsc::channel::<PoseBatch>();
+                std::thread::Builder::new()
+                    .name(format!("pose-{i}"))
+                    .spawn(move || {
+                        while let Ok(batch) = rx.recv() {
+                            let _ = batch.reply.send(pose_jobs(batch.jobs));
+                        }
+                    })
+                    .ok()
+                    .map(|_| tx)
+            })
+            .collect();
+        Self { workers }
+    }
+
+    fn pose(&self, jobs: PoseJobs) -> PosedJobs {
+        let count = jobs.len();
+        let chunk = jobs.len().div_ceil(self.workers.len() + 1);
+        let mut jobs = jobs.into_iter();
+        let own = jobs.by_ref().take(chunk).collect();
+        let (reply, results) = mpsc::channel();
+        let mut posed = Vec::with_capacity(count);
+        for worker in &self.workers {
+            let batch = PoseBatch {
+                jobs: jobs.by_ref().take(chunk).collect(),
+                reply: reply.clone(),
+            };
+            if batch.jobs.is_empty() {
+                break;
+            }
+            if let Err(e) = worker.send(batch) {
+                posed.extend(pose_jobs(e.0.jobs));
+            }
+        }
+        drop(reply);
+        posed.extend(pose_jobs(own));
+        for done in results {
+            posed.extend(done);
+        }
+        posed
+    }
+}
+
 impl Animator {
     /// Places and poses every prop of `scene` in `renderer`: `props[i]` is prop `i`'s
     /// transform and clip (none: rest pose), with `advance` seconds added to looping clips'
@@ -371,8 +442,38 @@ impl Animator {
         // The lookups first, in order (they fill the caches); then the posing, which reads
         // only what was looked up, spread over threads (a camp holds a hundred creatures,
         // each with several skeletons).
+        // A prop the last frame neither showed nor cast a shadow from keeps its pose
+        // (and place) until it is seen again: the pose is not drawn. Not traced against
+        // the original's animation updates (provisional; a modern saving).
+        // A prop is posed again, seen or not, when its clip changes (it sits down, say) or
+        // it has no pose kept: a culled prop is otherwise left in a pose it no longer has.
+        let seen = renderer.seen_draws();
+        if self.last_poses.len() != props.len() {
+            self.last_poses = vec![None; props.len()];
+        }
+        let shapes: Vec<u64> = props
+            .iter()
+            .map(|(_, c)| {
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                if let Some(c) = c {
+                    clip_shape(c, &mut h);
+                }
+                std::hash::Hasher::finish(&h)
+            })
+            .collect();
+        let posing: Vec<bool> = (0..props.len())
+            .map(|i| {
+                self.last_poses[i]
+                    .as_ref()
+                    .is_none_or(|(shape, _)| *shape != shapes[i])
+                    || renderer.prop_seen(scene, i, &seen)
+            })
+            .collect();
         let mut jobs: Vec<(usize, usize, Prepared)> = Vec::new();
         for (i, (_, clip)) in props.iter().enumerate() {
+            if !posing[i] {
+                continue;
+            }
             if let Some(clip) = clip {
                 let mut clip = clip.clone();
                 if clip.looping {
@@ -385,44 +486,41 @@ impl Animator {
                 }
             }
         }
-        let threads = std::thread::available_parallelism()
-            .map_or(1, |n| n.get())
-            .clamp(1, POSE_THREADS);
-        let mut posed: Vec<(usize, usize, Posed)> = Vec::with_capacity(jobs.len());
-        if threads <= 1 || jobs.len() < 8 {
-            posed.extend(jobs.into_iter().map(|(i, s, p)| (i, s, p.pose())));
+        let posed = if jobs.len() < 8 {
+            pose_jobs(jobs)
         } else {
-            let chunk = jobs.len().div_ceil(threads);
-            let mut chunks: Vec<Vec<(usize, usize, Prepared)>> = Vec::new();
-            let mut jobs = jobs.into_iter().peekable();
-            while jobs.peek().is_some() {
-                chunks.push(jobs.by_ref().take(chunk).collect());
-            }
-            std::thread::scope(|scope| {
-                let handles: Vec<_> = chunks
-                    .into_iter()
-                    .map(|c| {
-                        scope.spawn(move || {
-                            c.into_iter()
-                                .map(|(i, s, p)| (i, s, p.pose()))
-                                .collect::<Vec<_>>()
-                        })
-                    })
-                    .collect();
-                for h in handles {
-                    if let Ok(done) = h.join() {
-                        posed.extend(done);
-                    }
-                }
-            });
-        }
+            static POOL: OnceLock<PosePool> = OnceLock::new();
+            POOL.get_or_init(PosePool::new).pose(jobs)
+        };
         let mut by_prop: Vec<crate::skeleton::Poses> = vec![Default::default(); props.len()];
         for (i, s, p) in posed {
             by_prop[i].insert(s, p);
         }
-        for (i, ((transform, _), poses)) in props.iter().zip(&by_prop).enumerate() {
-            renderer.pose_prop(ctx, scene, i, *transform, poses);
+        // An unseen prop is placed again with the pose it was last given, so that it moves
+        // (and its attachments and effects with it) and is seen when it comes into view.
+        for (i, ((transform, _), poses)) in props.iter().zip(by_prop).enumerate() {
+            if posing[i] {
+                renderer.pose_prop(ctx, scene, i, *transform, &poses);
+                self.last_poses[i] = Some((shapes[i], poses));
+            } else if let Some((_, kept)) = &self.last_poses[i] {
+                renderer.pose_prop(ctx, scene, i, *transform, kept);
+            }
         }
+    }
+}
+
+/// What a clip plays, without where in it: its trees, actions and layers (a change to
+/// them is a new pose; a change of time alone is not).
+fn clip_shape(c: &Clip, h: &mut impl std::hash::Hasher) {
+    use std::hash::Hash;
+    c.trees.hash(h);
+    c.actions.hash(h);
+    c.looping.hash(h);
+    c.absolute.hash(h);
+    c.inline.as_ref().map(Arc::as_ptr).hash(h);
+    c.layers.len().hash(h);
+    for l in &c.layers {
+        clip_shape(l, h);
     }
 }
 
@@ -499,5 +597,71 @@ mod tests {
             &a.named_for("plain.ani", plain.clone(), 0, &skeleton),
             &plain
         ));
+    }
+
+    #[test]
+    fn reused_workers_match_sequential_poses_across_frames_and_job_counts() {
+        let skeleton = Arc::new(crate::skeleton::Skeleton::from_mmh(&Mmh {
+            name: None,
+            mesh_file: None,
+            nodes: vec![node("Root", 0, vec![node("Elbow", 1, vec![])])],
+        }));
+        let animation = Arc::new(Animation {
+            name: "motion".into(),
+            length: 1.0,
+            additive: false,
+            scalars: Vec::new(),
+            tracks: vec![Track {
+                bone: "elbow".into(),
+                channel: Channel::Translation,
+                keys: vec![
+                    Key {
+                        time: 0.0,
+                        value: [0.0, 0.0, 0.0, 0.0],
+                    },
+                    Key {
+                        time: 1.0,
+                        value: [1.0, 2.0, 3.0, 0.0],
+                    },
+                ],
+            }],
+        });
+        let pool = PosePool::new();
+        let (closed, receiver) = mpsc::channel();
+        drop(receiver);
+        let unavailable = PosePool {
+            workers: vec![closed],
+        };
+        for (count, time) in [(17, 0.2), (1, 0.4), (80, 0.7), (0, 0.8), (9, 1.0)] {
+            let jobs = || {
+                (0..count)
+                    .map(|i| {
+                        (
+                            i,
+                            i % 3,
+                            Prepared {
+                                skeleton: skeleton.clone(),
+                                rest: Arc::new(skeleton.rest()),
+                                layers: vec![(
+                                    animation.clone(),
+                                    time,
+                                    false,
+                                    1.0,
+                                    skeleton.track_nodes(&animation).into(),
+                                )],
+                            },
+                        )
+                    })
+                    .collect()
+            };
+            let mut expected = pose_jobs(jobs());
+            let mut actual = pool.pose(jobs());
+            let mut fallback = unavailable.pose(jobs());
+            expected.sort_by_key(|p| (p.0, p.1));
+            actual.sort_by_key(|p| (p.0, p.1));
+            fallback.sort_by_key(|p| (p.0, p.1));
+            assert_eq!(actual, expected);
+            assert_eq!(fallback, expected);
+        }
     }
 }
