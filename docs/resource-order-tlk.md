@@ -40,6 +40,13 @@ that substring (0x4c2fc0), advancing by the replacement's length. Both paths rea
 the same module member and preserve its case. This is caller-specific normalization,
 not a rule for every named table or for other whitespace characters.
 
+RTTI identifies that object as `ModuleResourceManager` (vtable 0xb00958).
+Its synchronous load path, 0x5fce80, copies the requested module string into
+member +0x60 at 0x5fcf92..0x5fcf9d. The queued path carries the same string in
+its request object before forwarding it at 0x5fe03a; save loading forwards its
+stored module string at 0x6c7a46. This establishes the source as the load request,
+without proving that an arbitrary UI display name or CIF filename is equivalent.
+
 ## Gender reprioritization
 
 **0x4e5cf0 is not unload.** It walks the vector from front to back, copies an entry whose
@@ -71,8 +78,8 @@ The merge implementation remains unchanged. The follow-up is a shared named TLK 
 for the simulation and UI, with differing-duplicate-string fixtures, first-hit and gender
 reordering checks, locale/female membership, case-sensitive unload-all and RIM message
 lifetimes. Exact startup ordering of all registration/event paths and the unresolved RIM
-flag still need tracing; VFS priority alone does not establish them. All-resource and all-string winner
-dumps, table row-position audits and the character-creation click-through are required
+flag still need tracing; VFS priority alone does not establish them. All-resource and
+all-string winner dumps, table row-position audits and the character-creation click-through are required
 before changing that behavior. Origins does not establish DA2 `_p` precedence.
 
 Binary identity: DAOrigins.exe SHA-256
