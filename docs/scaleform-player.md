@@ -85,6 +85,11 @@ The player lives in `crates/thedas-gfx`:
 4. **`text`**: HTML-subset parser (p, br, font face/size/color, b, i, u, img), layout with
    word wrap, autosize, `textAutoSize` shrink, shadows; glyphs from the font library's
    DefineFont3 outlines, rasterised into a glyph atlas at the drawn size.
+   Native inline images resolve exported bitmap names and host image URLs before
+   measurement. Intrinsic or explicit dimensions, horizontal spacing, baseline `vspace`,
+   paragraph alignment and word wrapping share the text layout. Positive `vspace` raises
+   the image and negative values lower it. Images render with scrolling and field clipping,
+   inherit display transforms/alpha and reuse the field's revision-keyed mesh cache.
    Focused fields track a selection anchor and caret. Ctrl+A and `Selection.setSelection`
    replace/delete the selected range; Shift navigation extends it. Selection getters and
    setters translate script UTF-16 indices to the text storage's character boundaries.
@@ -187,7 +192,8 @@ The player lives in `crates/thedas-gfx`:
 - Export-backed `BitmapData.loadBitmap` and `MovieClip.attachBitmap` let the shared host
   inline-image helper place copper/silver/gold icons in inventory and store prices. Timeline
   jumps distinguish text characters, so the unaffordable-price state can replace gold text
-  with its authored red definition. Native text-layout `<img>` rendering remains separate.
+  with its authored red definition. This helper remains in place while its approximate
+  centred-image placement is compared with native baseline image layout.
 - `MovieClip.duplicateMovieClip` constructs a fresh instance of the registered class with
   the source's transform, colour, drawing and clip events. The host can now add its Mod Mode
   button alongside Report Issue using the same menu setup on the player.
