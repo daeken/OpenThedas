@@ -186,6 +186,44 @@ const FIELD_ACTORS: u32 = 5200;
 const FIELD_TRACKS: u32 = 5206;
 const FIELD_ACTOR_OBJECT: u32 = 5216;
 
+/// The spoken line a DA2 performance belongs to (not its archive's hashed name).
+pub(crate) fn performance_line(g: &Gff4) -> Option<u32> {
+    match g.field(g.root, FIELD_PERFORMANCE_LINE)? {
+        Value::Tlk(t) => Some(t.id),
+        other => other.as_i64().map(|id| id as u32),
+    }
+}
+
+/// Performances are indexed by the actual line list, not virtual wheel replies.
+/// Bit 3 suppresses the performance even if an archive contains that line.
+pub(crate) fn line_performance_ids(g: &Gff4) -> Vec<Option<u32>> {
+    structs(g, g.root, 30002)
+        .into_iter()
+        .map(|line| {
+            (int(g, line, 30200)? & 8 == 0)
+                .then(|| strref(g, line, 30201))
+                .flatten()
+        })
+        .collect()
+}
+
+/// World-object bindings in this performance. Taking an object activates it in
+/// DA2 (0x59c030 -> 0x53d020; the same +0x144 virtual as SetObjectActive).
+/// Models without a binding do not create simulation objects here.
+pub(crate) fn performance_actor_tags(g: &Gff4) -> Vec<String> {
+    let Some(cut) = crate::cutscene::cut_root(g) else {
+        return Vec::new();
+    };
+    structs(g, cut, FIELD_ACTORS)
+        .into_iter()
+        .filter_map(|actor| {
+            let tag = g.field(actor, FIELD_ACTOR_OBJECT)?.as_str()?;
+            let tag = tag.trim_end_matches('\0').trim();
+            (!tag.is_empty()).then(|| tag.to_string())
+        })
+        .collect()
+}
+
 /// Who says the line a performance (`.cl`) performs: the talk-table id of the line, and the
 /// object of the one actor with a speak-line track (template `ASLN`), as its cutscene binds
 /// actors (`PLAYER`, `OWNER` or a tag). `None` for a performance nobody speaks in.
@@ -196,10 +234,7 @@ const FIELD_ACTOR_OBJECT: u32 = 5216;
 /// Bethany's "Here they come", the player's "Allow me" and "All yours, Sister"), not traced
 /// in DragonAge2.exe.
 pub fn performance_speaker(g: &Gff4) -> Option<(u32, String)> {
-    let line = match g.field(g.root, FIELD_PERFORMANCE_LINE)? {
-        Value::Tlk(t) => t.id,
-        other => other.as_i64()? as u32,
-    };
+    let line = performance_line(g)?;
     let cut = crate::cutscene::cut_root(g)?;
     structs(g, cut, FIELD_ACTORS).into_iter().find_map(|actor| {
         let speaks = structs(g, actor, FIELD_TRACKS)
@@ -356,6 +391,62 @@ mod tests {
             root: StructId(0),
             shared_strings: None,
         }
+    }
+
+    #[test]
+    fn performances_follow_spoken_lines_and_skip_unperformed_lines() {
+        let mut g = sample();
+        assert_eq!(
+            line_performance_ids(&g),
+            vec![Some(100), Some(101), Some(102), Some(103)]
+        );
+        g.structs[4].values[0] = Value::U16(9);
+        assert_eq!(
+            line_performance_ids(&g),
+            vec![Some(100), Some(101), Some(102), None]
+        );
+
+        let performance = Gff4 {
+            file_type: FourCC::new(b"LINE"),
+            templates: vec![
+                template(b"LINE", &[31100, 31102]),
+                template(b"CUT ", &[5200]),
+                template(b"ACTR", &[5216]),
+            ],
+            structs: vec![
+                StructData {
+                    template: 0,
+                    values: vec![Value::Struct(Some(StructId(1))), Value::U32(103)],
+                },
+                StructData {
+                    template: 1,
+                    values: vec![Value::List(Some(List::Struct(vec![
+                        Some(StructId(2)),
+                        Some(StructId(3)),
+                        Some(StructId(4)),
+                    ])))],
+                },
+                StructData {
+                    template: 2,
+                    values: vec![Value::String(Some("templar\0".into()))],
+                },
+                StructData {
+                    template: 2,
+                    values: vec![Value::String(None)],
+                },
+                StructData {
+                    template: 2,
+                    values: vec![Value::String(Some("PLAYER\0".into()))],
+                },
+            ],
+            root: StructId(0),
+            ..g
+        };
+        assert_eq!(performance_line(&performance), Some(103));
+        assert_eq!(
+            performance_actor_tags(&performance),
+            vec!["templar", "PLAYER"]
+        );
     }
 
     #[test]

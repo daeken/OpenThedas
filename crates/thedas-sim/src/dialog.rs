@@ -531,7 +531,19 @@ impl Sim {
     /// Line `line`'s own cutscene starts: the creatures it stages are taken.
     fn begin_line_staging(&mut self, c: &mut Conversation, line: usize) {
         let cuts = self.conversation_line_cuts(&c.dlg.name);
-        let Some(tracks) = cuts.get(line).and_then(|l| l.tracks.clone()) else {
+        let Some(cut) = cuts.get(line) else {
+            return;
+        };
+        if self.game == thedas_vfs::Game::DragonAge2 {
+            for tag in &cut.activate {
+                if let Some(id) = self.cutscene_actor_object(tag, Some(c.owner), Some(c.player))
+                    && let Some(o) = self.world.get_mut(id)
+                {
+                    o.active = true;
+                }
+            }
+        }
+        let Some(tracks) = cut.tracks.clone() else {
             return;
         };
         let Some(ctx) = self.line_context(c, line, &tracks) else {
@@ -673,6 +685,16 @@ impl Sim {
     /// speakers its line performances name (`cln_<name>.crf`, see
     /// [`crate::cnv::performance_speaker`]). Empty when no archive of that name is mounted.
     fn performance_speakers(&self, name: &str) -> std::collections::HashMap<u32, String> {
+        self.conversation_performances(name)
+            .values()
+            .filter_map(crate::cnv::performance_speaker)
+            .collect()
+    }
+
+    pub(crate) fn conversation_performances(
+        &self,
+        name: &str,
+    ) -> std::collections::HashMap<u32, Gff4> {
         let file = format!("cln_{}.crf", name.to_ascii_lowercase());
         let mut out = std::collections::HashMap::new();
         for layer in self.vfs.layers() {
@@ -690,8 +712,8 @@ impl Sim {
                 let Ok(g) = Gff4::parse(&data) else {
                     continue;
                 };
-                if let Some((line, who)) = crate::cnv::performance_speaker(&g) {
-                    out.entry(line).or_insert(who);
+                if let Some(line) = crate::cnv::performance_line(&g) {
+                    out.entry(line).or_insert(g);
                 }
             }
         }
@@ -1255,6 +1277,75 @@ mod tests {
             ],
             root: StructId(0),
             shared_strings: None,
+        }
+    }
+
+    #[test]
+    fn da2_performance_bindings_activate_only_named_world_actors_and_stay_active() {
+        use crate::cutactors::LineCut;
+        use crate::world::ObjectKind;
+        use std::sync::Arc;
+
+        for game in [thedas_vfs::Game::Origins, thedas_vfs::Game::DragonAge2] {
+            let mut sim = Sim::new(
+                Arc::new(thedas_vfs::Vfs::new()),
+                Arc::new(thedas_script::EngineTable::default()),
+                1,
+            );
+            sim.game = game;
+            let area = sim.world.spawn(ObjectKind::Area, "here");
+            let away = sim.world.spawn(ObjectKind::Area, "away");
+            sim.world.area = Some(area);
+            let hero = sim.world.spawn(ObjectKind::Creature, "player");
+            let owner = sim.world.spawn(ObjectKind::Creature, "owner");
+            let templar = sim.world.spawn(ObjectKind::Creature, "templar");
+            let prop = sim.world.spawn(ObjectKind::Placeable, "prop");
+            let elsewhere = sim.world.spawn(ObjectKind::Creature, "elsewhere");
+            let untouched = sim.world.spawn(ObjectKind::Creature, "untouched");
+            sim.world.hero = Some(hero);
+            for id in [hero, owner, templar, prop, elsewhere, untouched] {
+                let o = sim.world.get_mut(id).unwrap();
+                o.area = Some(if id == elsewhere { away } else { area });
+                o.active = id == hero || id == owner;
+            }
+            sim.line_cuts.insert(
+                "binding".into(),
+                Arc::new(vec![LineCut {
+                    activate: ["templar", "templar", "prop", "elsewhere", "missing"]
+                        .map(String::from)
+                        .to_vec(),
+                    ..Default::default()
+                }]),
+            );
+            let dlg = Dlg {
+                name: "binding".into(),
+                starts: vec![0],
+                nodes: vec![Node {
+                    text: Some("The actors enter.".into()),
+                    speaker: "OWNER".into(),
+                    reply: false,
+                    strref: None,
+                    listener: String::new(),
+                    condition: PlotRef::default(),
+                    action: PlotRef::default(),
+                    children: Vec::new(),
+                    show_once: 0,
+                    cnv_flags: Some(1),
+                    ambient: false,
+                    cutscene: None,
+                }],
+            };
+            assert!(sim.open_conversation(hero, owner, dlg, None));
+            let activated = game == thedas_vfs::Game::DragonAge2;
+            assert_eq!(sim.world.get(templar).unwrap().active, activated);
+            assert_eq!(sim.world.get(prop).unwrap().active, activated);
+            assert!(!sim.world.get(elsewhere).unwrap().active);
+            assert!(!sim.world.get(untouched).unwrap().active);
+            sim.end_conversation();
+            assert_eq!(sim.world.get(templar).unwrap().active, activated);
+            let restored: crate::world::World =
+                serde_json::from_str(&serde_json::to_string(&sim.world).unwrap()).unwrap();
+            assert_eq!(restored.get(templar).unwrap().active, activated);
         }
     }
 
