@@ -49,7 +49,7 @@ pub const FADE_RATE: f32 = 5.0;
 /// creatures bit, 6066).
 pub const MASK_CREATURES: u32 = mask::CREATURES;
 
-/// A creature collision shape in its model's space.
+/// A primitive physics shape in its model's space.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Shape {
     Sphere {
@@ -177,9 +177,15 @@ fn matrix(t: &Transform) -> Mat4 {
 /// capsule runs along its local +Z from (0, 0, r) to (0, 0, r + height) (see
 /// [`thedas_formats::phy`]).
 pub fn model_shapes(phy: &Phy, mmh: Option<&Mmh>) -> Vec<Shape> {
+    model_shapes_in_mask(phy, mmh, MASK_CREATURES)
+}
+
+/// Primitive physics shapes in `mask`, including placeable interaction volumes whose
+/// models have no rendered mesh. Their node and shape transforms are kept intact.
+pub fn model_shapes_in_mask(phy: &Phy, mmh: Option<&Mmh>, mask: u32) -> Vec<Shape> {
     let mut out = Vec::new();
     for s in &phy.shapes {
-        if s.mask & MASK_CREATURES == 0 {
+        if s.mask & mask == 0 {
             continue;
         }
         let node = match (mmh, s.parent.as_deref()) {
@@ -254,6 +260,38 @@ impl CameraFade {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn placeable_pick_volumes_are_filtered_and_transformed() {
+        let phy = Phy {
+            shapes: vec![thedas_formats::phy::Shape {
+                parent: None,
+                mask: thedas_formats::phy::mask::PLACEABLES,
+                pose: Transform {
+                    position: [0.0, 0.0, 1.0],
+                    ..Default::default()
+                },
+                geometry: Geometry::Box {
+                    half: [2.0, 0.1, 1.0],
+                },
+            }],
+            ..Default::default()
+        };
+        assert!(model_shapes(&phy, None).is_empty());
+        let shapes = model_shapes_in_mask(&phy, None, thedas_formats::phy::mask::PLACEABLES);
+        assert_eq!(shapes.len(), 1);
+        let placement = Mat4::from_rotation_translation(
+            glam::Quat::from_rotation_z(std::f32::consts::FRAC_PI_2),
+            Vec3::new(10.0, 20.0, 3.0),
+        );
+        let hit = shapes[0].ray(&placement, Vec3::new(5.0, 21.5, 4.0), Vec3::X);
+        assert!((hit.unwrap() - 4.9).abs() < 1e-4);
+        assert!(
+            shapes[0]
+                .ray(&placement, Vec3::new(5.0, 23.0, 4.0), Vec3::X)
+                .is_none()
+        );
+    }
 
     #[test]
     fn rays_meet_spheres_capsules_and_boxes_where_they_are_placed() {

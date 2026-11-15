@@ -84,10 +84,13 @@ Letterbox absent at 16:9; `<emp>` shown plain; the Fade's radial blur; 3 m camer
 Measured 2026-11-12 at main `1eb844a`, from the sweep chain and gate logs:
 
 - **The Human Noble chain needs a survival aid.** It passes all 16 steps to the first party camp
-  only because the developer heal script runs whenever a member drops under 35% health, 63 times
-  in all (32 in the Tower). Without it the party wipes in the Wilds. Part of that is the harness
-  (it does not kite or focus fire) and part is combat balance not yet matching the original;
-  nobody has separated the two.
+  only because the developer heal script runs whenever a member drops under 35% health. At main
+  `6786ce9` (2026-11-15) that is 36 heals, down from 63 at `1eb844a`: 11 in steps s01 to s12 (3 in
+  the siege, 6 at the cache, 2 at the start of the Tower) and 25 in s13, from the Tower to Flemeth.
+  The Tower attack log shows no outlier enemies, so the remaining heals look like harness play (it
+  does not kite or focus fire) rather than combat balance. A trace of the hit and damage formulas
+  against the original is under way to confirm. (At `1eb844a` the party wiped in the Wilds without
+  the aid; not re-measured since.)
 - **Past the first camp nothing plays end to end.** The Redcliffe night and Orzammar ambush
   scenarios are lost with and without preparation.
 - **The regression gate covers the Human Noble chain only.** The other five origins have saves
