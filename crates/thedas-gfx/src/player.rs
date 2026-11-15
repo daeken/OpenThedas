@@ -3059,6 +3059,37 @@ mod queue_tests {
     }
 
     #[test]
+    fn fractional_child_transforms_keep_the_authored_map_viewport_size() {
+        let (mut p, field) = input_player();
+        remove_clip(&mut p.vm, field);
+        let root = p.vm.root;
+        let parent = create_empty(&mut p.vm, root, "viewport", 1).unwrap();
+        let child = create_empty(&mut p.vm, parent, "border", 1).unwrap();
+        draw_pick_rect(&mut p.vm, child, 837.0, 604.0);
+        p.vm.display.get_mut(child).unwrap().matrix = crate::swf::Matrix::translate(0.5, -0.5);
+        let value = p.vm.display_object(parent);
+        assert_eq!(p.vm.get(&value, "_width"), Value::Number(837.0));
+        assert_eq!(p.vm.get(&value, "_height"), Value::Number(604.0));
+        let size = display_api::local_bounds(&p.vm, parent).unwrap();
+        assert_eq!((size.width(), size.height()), (837 * 20, 604 * 20));
+        p.vm.display.get_mut(parent).unwrap().matrix = crate::swf::Matrix::translate(0.5, 0.5);
+        let size = display_api::local_bounds(&p.vm, root).unwrap();
+        assert_eq!((size.width(), size.height()), (837 * 20, 604 * 20));
+        // Inverse shears cancel before the leaf's box is transformed. An
+        // intermediate axis-aligned box would retain the shear's extra height.
+        p.vm.display.get_mut(parent).unwrap().matrix = crate::swf::Matrix {
+            b: 1.0,
+            ..crate::swf::Matrix::IDENTITY
+        };
+        p.vm.display.get_mut(child).unwrap().matrix = crate::swf::Matrix {
+            b: -1.0,
+            ..crate::swf::Matrix::IDENTITY
+        };
+        assert_eq!(p.vm.get(&value, "_width"), Value::Number(837.0));
+        assert_eq!(p.vm.get(&value, "_height"), Value::Number(604.0));
+    }
+
+    #[test]
     fn selection_ranges_shift_navigation_and_utf16_indices() {
         let (mut p, field) = input_player();
         set_focus(&mut p.vm, Some(field));
@@ -3335,6 +3366,52 @@ mod queue_tests {
             },
         );
         assert!(p.vm.display.child_named(root, "instance3").is_some());
+    }
+
+    #[test]
+    fn native_inline_images_resolve_before_script_measurements_and_autosize() {
+        let (mut p, field) = input_player();
+        let mut movie = Movie::default();
+        movie.characters.insert(
+            500,
+            Character::Image(crate::swf::ExternalImage {
+                format: 0,
+                width: 24,
+                height: 16,
+                export_name: "coin".into(),
+                file: "coin.dds".into(),
+            }),
+        );
+        p.vm.movie = Arc::new(movie);
+        let value = p.vm.display_object(field);
+        p.vm.set(&value, "html", Value::Bool(true));
+        p.vm.set(&value, "autoSize", Value::from("left"));
+        p.vm.set(
+            &value,
+            "htmlText",
+            Value::from("<img src='COIN' vspace='-10'>"),
+        );
+        assert_eq!(p.vm.get(&value, "textWidth"), Value::Number(24.0));
+        assert_eq!(p.vm.get(&value, "_width"), Value::Number(28.0));
+        let t = p.vm.display.get(field).unwrap().text().unwrap();
+        assert!(t.layout.as_ref().is_some_and(|l| l.height >= 16.0));
+        assert_eq!(
+            t.layout.as_ref().unwrap().lines[0].images[0].0.size(),
+            (24.0, 16.0)
+        );
+        p.vm.set(&value, "htmlText", Value::from("plain text"));
+        let fonts = p.vm.fonts.clone();
+        assert!(
+            p.vm.display
+                .get_mut(field)
+                .unwrap()
+                .text_mut()
+                .unwrap()
+                .layout(&*fonts)
+                .lines[0]
+                .images
+                .is_empty()
+        );
     }
 
     #[test]
