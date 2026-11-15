@@ -269,6 +269,8 @@ pub struct Live {
     swings: thedas_ui::models::PlaceableSwings,
     /// Creatures' starts and stops (see [`thedas_ui::locomotion`]).
     locomotion: thedas_ui::locomotion::Locomotion,
+    /// Crossfades between creatures' animations outside movement.
+    crossfade: thedas_ui::crossfade::Crossfade,
     /// Objects drawn faded, by id: their opacity (0..1; missing is 1). The camera fades a
     /// creature it is inside (DAOrigins.exe 0x6c4130 eases it to 0.05).
     pub opacity: std::collections::HashMap<ObjectId, f32>,
@@ -748,6 +750,7 @@ impl Live {
             models: ModelCache::default(),
             swings: Default::default(),
             locomotion: Default::default(),
+            crossfade: Default::default(),
             opacity: Default::default(),
             cache: RenderCache::default(),
             async_loads: false,
@@ -1864,6 +1867,7 @@ impl Live {
         };
         self.swings.apply(&sim, &mut models);
         self.locomotion.apply(&sim, &mut models);
+        self.crossfade.apply(&sim, &mut models);
         let was = self.staged;
         self.staged = staged.map(|(id, s)| (id, s.mark, s.facing));
         if self.staged.map(|s| s.0) != was.map(|s| s.0) {
