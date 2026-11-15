@@ -301,6 +301,10 @@ struct Gpu {
     env: [wgpu::RenderPipeline; 3],
     lighting: wgpu::RenderPipeline,
     lighting_baked: wgpu::RenderPipeline,
+    /// The real-time bounce gather (half resolution, see `fs_bounce`), and the layout of
+    /// its result for the lighting pass (group 3).
+    bounce: wgpu::RenderPipeline,
+    bounce_layout: wgpu::BindGroupLayout,
     frame_buffer: wgpu::Buffer,
     /// Every draw's [`DrawUniforms`], [`DRAW_STRIDE`] apart, rewritten each frame.
     draw_buffer: wgpu::Buffer,
@@ -337,6 +341,9 @@ struct Gpu {
 struct Targets {
     size: (u32, u32),
     views: [wgpu::TextureView; 4],
+    /// The real-time bounce at half resolution, and its group for the lighting pass.
+    bounce: wgpu::TextureView,
+    bounce_group: wgpu::BindGroup,
     /// The G-buffer and the depth it was drawn with, for the lighting pass.
     group: wgpu::BindGroup,
     /// The depth buffer `group` reads.
@@ -1494,6 +1501,10 @@ impl DeferredPass {
                 cache: None,
             })
         });
+        let bounce_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("deferred bounce"),
+            entries: &[tex(0, false)],
+        });
         let lighting_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("deferred lighting"),
@@ -1501,9 +1512,45 @@ impl DeferredPass {
                     Some(&lighting_layout),
                     Some(&targets_layout),
                     Some(&sun_layout),
+                    Some(&bounce_layout),
                 ],
                 immediate_size: 0,
             });
+        let bounce_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("deferred bounce"),
+                bind_group_layouts: &[
+                    Some(&lighting_layout),
+                    Some(&targets_layout),
+                    Some(&sun_layout),
+                ],
+                immediate_size: 0,
+            });
+        let bounce = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("deferred bounce"),
+            layout: Some(&bounce_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &module,
+                entry_point: Some("vs_fullscreen"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &module,
+                entry_point: Some("fs_bounce"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: BOUNCE_FORMAT,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
         let make_lighting = |entry_point| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some("deferred lighting"),
@@ -1772,6 +1819,8 @@ impl DeferredPass {
             env,
             lighting,
             lighting_baked,
+            bounce,
+            bounce_layout,
             mask_buffer,
             light_masks: None,
             frame_buffer,
@@ -2202,9 +2251,36 @@ impl DeferredPass {
                 layout: &gpu.targets_layout,
                 entries: &entries,
             });
+            let bounce = device
+                .create_texture(&wgpu::TextureDescriptor {
+                    label: Some("deferred bounce"),
+                    size: wgpu::Extent3d {
+                        width: width.div_ceil(2).max(1),
+                        height: height.div_ceil(2).max(1),
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: BOUNCE_FORMAT,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                        | wgpu::TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
+                })
+                .create_view(&wgpu::TextureViewDescriptor::default());
+            let bounce_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("deferred bounce"),
+                layout: &gpu.bounce_layout,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&bounce),
+                }],
+            });
             gpu.targets = Some(Targets {
                 size: (width, height),
                 views,
+                bounce,
+                bounce_group,
                 group,
                 depth: depth.clone(),
             });
@@ -2311,6 +2387,7 @@ impl DeferredPass {
             ],
             static_tints: tints.factors,
         };
+        let bounce_flags = bounce_flags(self.baked_lighting);
         let sun = SunUniforms {
             data: d3d
                 .sun_shadows()
@@ -2323,7 +2400,7 @@ impl DeferredPass {
                         .unwrap_or(crate::config::CONFIG.sun_early_exit),
                 ),
                 u32::from(self.baked_lighting && crate::config::CONFIG.realtime_direct),
-                0,
+                bounce_flags,
             ],
         };
         ctx.queue
@@ -2510,6 +2587,33 @@ impl DeferredPass {
             p.stage(ctx, encoder, "gbuffer");
         }
         {
+            // The real-time bounce, gathered before the lighting pass reads it. With bounce
+            // off the pass only clears it (the lighting pass then skips reading it).
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("deferred bounce"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &targets.bounce,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            if bounce_flags != 0 {
+                pass.set_pipeline(&gpu.bounce);
+                pass.set_bind_group(0, &gpu.lighting_group, &[]);
+                pass.set_bind_group(1, &targets.group, &[]);
+                pass.set_bind_group(2, gpu.sun_group.as_ref().expect("sun targets"), &[]);
+                pass.draw(0..3, 0..1);
+            }
+        }
+        {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("deferred lighting"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -2539,6 +2643,7 @@ impl DeferredPass {
             pass.set_bind_group(0, &gpu.lighting_group, &[]);
             pass.set_bind_group(1, &targets.group, &[]);
             pass.set_bind_group(2, gpu.sun_group.as_ref().expect("sun targets"), &[]);
+            pass.set_bind_group(3, &targets.bounce_group, &[]);
             pass.draw(0..3, 0..1);
         }
         if let Some(p) = profile.as_deref_mut() {
@@ -2904,10 +3009,25 @@ fn debug_view() -> u32 {
             "shadows" => 10,
             "sun-shadows" => 11,
             "ao" => 12,
+            "bounce" => 13,
             _ => 0,
         }
     })
 }
+
+/// What bounces (`fs_bounce`): bit 0 the shadowed dynamic lights (emitters, moving
+/// lights), which the lightmaps' baked bounce never held; with no lightmap bounce standing
+/// in, bit 1 the shadowed static lights too and bit 2 the sun (screen-space).
+/// `THEDAS_DEFERRED_BOUNCE=0` turns it off.
+fn bounce_flags(baked_lighting: bool) -> u32 {
+    if !crate::config::CONFIG.bounce {
+        return 0;
+    }
+    1 | if baked_lighting { 0 } else { 2 | 4 }
+}
+
+/// The real-time bounce target's format.
+const BOUNCE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 
 /// The brightest a glowing emitter's light gets (its strongest channel), approached as its
 /// particles show more light: `1 − e^(−shown / EMITTER_SHOWN)`, with `shown` their summed

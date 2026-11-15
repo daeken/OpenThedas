@@ -17,8 +17,8 @@ pub struct GlyphBitmap {
     pub alpha: Vec<u8>,
 }
 
-/// Flattens an outline (font units) into line segments in pixels (`scale` pixels per unit).
-fn segments(records: &[Record], scale: f32) -> Vec<[(f32, f32); 2]> {
+/// Flattens an outline (font units) into line segments in pixels (`sx`/`sy` pixels per unit).
+fn segments(records: &[Record], sx: f32, sy: f32) -> Vec<[(f32, f32); 2]> {
     let mut out = Vec::new();
     let (mut px, mut py) = (0.0f32, 0.0f32);
     let mut start = (0.0f32, 0.0f32);
@@ -35,21 +35,21 @@ fn segments(records: &[Record], scale: f32) -> Vec<[(f32, f32); 2]> {
                     if open {
                         close(&mut out, (px, py), start);
                     }
-                    px = *x as f32 * scale;
-                    py = *y as f32 * scale;
+                    px = *x as f32 * sx;
+                    py = *y as f32 * sy;
                     start = (px, py);
                     open = true;
                 }
             }
             Record::Line { to } => {
-                let p = (to.0 as f32 * scale, to.1 as f32 * scale);
+                let p = (to.0 as f32 * sx, to.1 as f32 * sy);
                 out.push([(px, py), p]);
                 (px, py) = p;
                 open = true;
             }
             Record::Curve { control, to } => {
-                let c = (control.0 as f32 * scale, control.1 as f32 * scale);
-                let e = (to.0 as f32 * scale, to.1 as f32 * scale);
+                let c = (control.0 as f32 * sx, control.1 as f32 * sy);
+                let e = (to.0 as f32 * sx, to.1 as f32 * sy);
                 // Enough steps that the chord stays within a tenth of a pixel.
                 let dd = ((px - 2.0 * c.0 + e.0).powi(2) + (py - 2.0 * c.1 + e.1).powi(2)).sqrt();
                 let n = ((dd / 0.4).sqrt().ceil() as usize).clamp(1, 64);
@@ -152,10 +152,16 @@ impl Raster {
 /// Rasterises a glyph outline (font units) at `scale` pixels per unit. `None` for an
 /// empty glyph (a space) or one too large to cache.
 pub fn rasterize(records: &[Record], scale: f32) -> Option<GlyphBitmap> {
-    if !scale.is_finite() || scale <= 0.0 {
+    rasterize_xy(records, scale, scale)
+}
+
+/// As [`rasterize`], with separate horizontal and vertical scales (fields stretched by the
+/// stage's aspect).
+pub fn rasterize_xy(records: &[Record], sx: f32, sy: f32) -> Option<GlyphBitmap> {
+    if !sx.is_finite() || sx <= 0.0 || !sy.is_finite() || sy <= 0.0 {
         return None;
     }
-    let segs = segments(records, scale);
+    let segs = segments(records, sx, sy);
     if segs.is_empty() {
         return None;
     }
@@ -213,6 +219,10 @@ pub struct Placed {
     pub h: f32,
 }
 
+/// A cached glyph: font (by address), glyph index, and its horizontal and vertical sizes in
+/// quarter pixels.
+pub type GlyphKey = (usize, usize, u32, u32);
+
 /// Packs glyph bitmaps into square pages with shelves (rows of glyphs of similar height).
 pub struct Packer {
     pub size: u32,
@@ -220,7 +230,7 @@ pub struct Packer {
     x: u32,
     y: u32,
     row: u32,
-    entries: HashMap<(usize, usize, u32), Option<Placed>>,
+    entries: HashMap<GlyphKey, Option<Placed>>,
 }
 
 impl Packer {
@@ -241,7 +251,7 @@ impl Packer {
 
     /// The glyph already placed for (font, glyph, size key), if any (`Some(None)`: it has no
     /// pixels or did not fit).
-    pub fn get(&self, key: (usize, usize, u32)) -> Option<Option<Placed>> {
+    pub fn get(&self, key: GlyphKey) -> Option<Option<Placed>> {
         self.entries.get(&key).copied()
     }
 
@@ -271,7 +281,7 @@ impl Packer {
         Some(at)
     }
 
-    pub fn insert(&mut self, key: (usize, usize, u32), placed: Option<Placed>) {
+    pub fn insert(&mut self, key: GlyphKey, placed: Option<Placed>) {
         self.entries.insert(key, placed);
     }
 }
@@ -333,6 +343,15 @@ mod tests {
         assert_eq!(at(&b, 15, 15), 0);
         assert_eq!(at(&b, 5, 15), 255);
         assert!(rasterize(&[], 1.0).is_none());
+    }
+
+    #[test]
+    fn stretched_glyphs_scale_each_axis() {
+        let b = rasterize_xy(&square(0, 0, 10, 10, true), 2.0, 1.0).unwrap();
+        assert_eq!(at(&b, 19, 5), 255);
+        assert_eq!(at(&b, 20, 5), 0);
+        assert_eq!(at(&b, 5, 9), 255);
+        assert_eq!(at(&b, 5, 10), 0);
     }
 
     #[test]
