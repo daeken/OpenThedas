@@ -3692,6 +3692,8 @@ impl App {
         state: ElementState,
         repeat: bool,
     ) -> bool {
+        // A key skips a cutscene, as a click does. Provisional: the game's own
+        // skip key is not traced.
         if state == ElementState::Pressed
             && !repeat
             && self
