@@ -6675,7 +6675,13 @@ mod tests {
             "GetTlkTableString",
             "GetDebugHelpersEnabled",
         ] {
-            assert_eq!(run(&mut s, 1, name, &[]), None, "{name}");
+            let function = s.table.function_by_name(name).cloned().unwrap();
+            let mut host = ScriptHost {
+                sim: &mut s,
+                event: None,
+                script: "test".into(),
+            };
+            assert!(call(&mut host, 1, &function, &[]).is_none(), "{name}");
         }
     }
 
