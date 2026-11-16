@@ -67,6 +67,9 @@ and an nginx site on the test server. Paths below are relative to the folder hol
    `report.json.capture_ms`, `capture_timings_ms` (presentation, metadata, save clone, trace),
    and the `report: captured state` log measure snapshot overhead;
    screenshot readback remains the existing frame-capture path.
+   Presentation collection is warmed once behind the loading screen when a scene is ready,
+   so its first-use code/serialization cost does not land on the first F8 press. This only
+   reads cached state and discards the warm-up snapshot.
 2. **Mark spots** (mouse and pad). After F8 the player is offered "Mark spots", drags a box
    around each problem and types a note for it. Each spot's note is followed by "Mark another
    spot" / "Done marking"; Done goes straight to the overall note. F8, Enter or Escape (B or

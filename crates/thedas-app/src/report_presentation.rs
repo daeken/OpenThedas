@@ -8,6 +8,20 @@ use thedas_ui::UiValue;
 use super::FrameContext;
 
 pub fn frame_context(app: &crate::App) -> FrameContext {
+    let context = raw_frame_context(app);
+    // Fault in the diagnostic/serialization paths while the loading screen still
+    // covers a ready scene. The first F8 must not pay their one-time cold cost.
+    static WARM: std::sync::Once = std::sync::Once::new();
+    if context.loading
+        && app.gfx.is_some()
+        && app.live.as_ref().is_some_and(|l| l.objects.is_some())
+    {
+        WARM.call_once(|| drop(snapshot(app)));
+    }
+    context
+}
+
+fn raw_frame_context(app: &crate::App) -> FrameContext {
     let mut context = FrameContext {
         loading: app.load_screen_up || app.gfx.as_ref().is_some_and(|g| g.ui.loading()),
         screens: app
@@ -34,7 +48,7 @@ pub fn frame_context(app: &crate::App) -> FrameContext {
 }
 
 pub fn snapshot(app: &crate::App) -> J {
-    let context = frame_context(app);
+    let context = raw_frame_context(app);
     let staged = app
         .live
         .as_ref()
