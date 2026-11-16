@@ -57,7 +57,28 @@ group, death, area removal, signed-byte reads, invalid requests, manual locks,
 non-creature unlock and snapshot reload. A helper control distinguishes the
 model branches and verifies death bypasses both living bonuses.
 
-Matched story measurements and Origins regression results follow after the
-merged candidate completes its checks.
+## Matched no-aid story measurements
+
+Main `e401ccbc` and candidate code `226f0d04` use the same story-check driver,
+seed 1 and `--aid none`. Both reach fake prologue at 33 ms and real prologue
+at 210,166 ms. Both wipe in encounter 10008. First game over moves from
+309,698 to 310,798 ms, with zero script errors, developer heals or forced kills.
+
+| Fight interval | Main | Candidate |
+| --- | ---: | ---: |
+| Fake prologue | 208.4 s | 208.4 s |
+| Real-arrival transient combat | 1.1 s | 1.1 s |
+| First real fight | 23.2 s | 23.2 s |
+| Encounter 10008, ending in a wipe | 50.0 s | 51.1 s |
+
+In encounter 10008, Hawke's damage/impacts change from 596.194/75 to
+496.613/78, Carver's from 190.774/41 to 310.367/52, and Bethany's from
+494.435/39 to 183.498/22. These are outcomes of changed script decisions;
+the damage calculations are unchanged. GetAILevel's unimplemented count
+drops from 113 to zero.
+
+Formatting, strict workspace/all-target clippy, 1,405 workspace tests
+(25 ignored, zero failures), and the release MCP/CLI/app build pass.
+The matched Origins and corpus checks are still running at this checkpoint.
 
 No HP, damage, difficulty or AI frequency values are retuned.
