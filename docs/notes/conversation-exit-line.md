@@ -1,7 +1,8 @@
 # Conversation exit replays the answered line (#1033, #1036)
 
-Static investigation, 2026-11-15. Runtime reproduction and validation are pending:
-the required build launcher refused to run with less than 15 GB free disk.
+Static investigation, 2026-11-15; runtime validation resumed 2026-11-16 after
+the disk-space blocker was removed. Engine comparison: main `6d66c10e` and
+candidate `67a379dd` (the fix merged with that main).
 
 The reports distinguish an exhausted reply from a new final NPC line. In #1033,
 `bdc100_kasch` remains on NPC node 6 (strref 41009) after selecting reply node 33
@@ -58,10 +59,59 @@ pre-exit fixtures from each report's `save_now.json` and final journal reply.
 It restores the answered node's reply and dialog mode, then takes that reply
 through the app. This isolates the bug without replaying unrelated travel,
 inventory input, or build-specific journal hashes. It is not a full replay from
-`save_before.json`; that requested runtime investigation remains pending.
+`save_before.json`. The strict CLI replay refuses the reports' `8bf06c21` build
+identity on this build. A separate attempt from the unmodified earlier saves,
+retaining only conversation orders, reply choices and reply intervals, takes a
+different branch or fails to open the conversation when other journal inputs
+are omitted. It is inconclusive; no full-journal equivalence is claimed and the
+strict replay guard was not bypassed.
 
 The script requires HUD restoration within its first 250 ms sample and a
-nonzero leader move order through the app's controller path by 500 ms. It logs
+nonzero leader move input through the app's controller path and more than 0.1
+units of actual leader displacement by 500 ms. Play inputs are read from a fresh
+app journal (`--journal` in the scratch HOME), rather than the save's edit-only
+command journal. It logs
 48 subsequent 250 ms samples so a failing binary's delayed HUD return is visible.
 It uses a hidden capture, scratch HOME, no mods/audio, and the shared resource
 launcher. Outputs stay under testdata `codex-captures/convhang`.
+
+The focused repro fails both cases on main and passes both on the candidate.
+Main's first HUD samples are at 4000 ms for #1033 and 5000 ms for #1036; neither
+has a nonzero movement input or leader displacement by the 500 ms save. The
+candidate shows the HUD at the first 250 ms sample and records fresh movement
+inputs and leader displacement by 500 ms in both cases. Both saved simulations
+are in mode 0, with no pending talk or cutscene at that point. These times are
+elapsed headless input time, not wall-clock timings of asset loading.
+
+## Regression gate
+
+The serial, isolated `gate_round2.sh` recipe passes all 12 s01–s12 steps on
+both binaries: zero gameplay-log differences, 503 ordered plot entries identical,
+matching endpoint areas and no refused saves. S13 reaches Flemeth's hut on both
+at time 1918259 ms, with the same last diagnostic counters (550 step requests,
+11919 MCP calls). Its logs match after excluding wall-time `SLOW` diagnostics
+and normalizing the output-directory path. The source tower fixture's MD5 is
+`4668c45a9f092333fab9f124a3d45c55`.
+
+The complete decoded save comparison finds exactly these eight differences:
+
+| Snapshot | Main `talk.line` | Candidate `talk.line` |
+| --- | ---: | --- |
+| `01_cousland_start.json` | 109 | `null` |
+| `03_after_fergus.json` | 10 | `null` |
+| `04_siege_start.json` | 44 | `null` |
+| `08_wilds_start.json` | 3 | `null` |
+| `08a_ostagar_duncan.json` | 106 | `null` |
+| `10_wilds_cache.json` | 1210 | `null` |
+| `11_after_joining.json` | 45 | `null` |
+| S13 `13_flemeth_hut.json` | 1177 | `null` |
+
+Each is an ended conversation with an empty reply list in both versions: the
+candidate drops the answered line as intended. Every other saved field matches.
+
+Detcheck runs 600 ticks from `04_siege_start`, `07_ostagar_arrival`,
+`09_wilds_vials` and `sc_tower_midfight_named` on both binaries. All eight runs
+match on repetition and on save/reload halfway; the four main-versus-candidate
+normalized worlds also match. Normalization is the standard detcheck harness's
+bookkeeping-counter and event-sequence exclusion; the complete difference lists
+are empty.

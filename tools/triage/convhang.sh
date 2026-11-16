@@ -59,7 +59,7 @@ for number in (1033, 1036):
     world = state["world"]
     world["game_mode"] = 4
     world["mode_before_talk"] = 0
-    # Discard historical commands so the output proves a new move was accepted.
+    # Discard historical edits; play inputs are checked in the app's input journal.
     world["command_journal"] = []
     leader = world.get("controlled") or world["hero"]
     initial_position = world["objects"][str(leader)]["position"]
@@ -75,17 +75,17 @@ for number in (1033, 1036):
     env.pop("THEDAS_USER_DIR", None)
     env.pop("THEDAS_MOD_LIST", None)
     command = [binary, "--install", install, "--save", str(fixture),
-               "--capture", str(case / "settled.png"), "--size", "960x540",
+               "--capture", str(case / "settled.png"), "--journal", "--size", "960x540",
                "--steps", steps]
     with (case / "run.log").open("w") as log:
         result = subprocess.run(command, env=env, stdout=log, stderr=subprocess.STDOUT, timeout=480)
     log = (case / "run.log").read_text()
     samples = re.findall(r"run 250: screens (\{[^}]*\})", log)
     for index, screens in enumerate(samples):
-        elapsed = 250 if index == 0 else (index + 2) * 250
+        elapsed = (index + 1) * 250
         print(f"#{number} +{elapsed:05}ms screens={screens}")
     saves = [p for p in (home / ".openthedas/saves").glob("*.json") if not p.name.endswith(".meta.json")]
-    moves = []
+    moved = False
     for path in saves:
         saved = json.loads(path.read_text())
         current = saved["world"]
@@ -93,17 +93,19 @@ for number in (1033, 1036):
               f"talk={None if saved['talk'] is None else {k: v for k, v in saved['talk'].items() if k in ('line', 'ended', 'replies')}} "
               f"pending_talks={len(current.get('pending_talks', []))} "
               f"cutscene={current.get('cutscene')} dialog_cutscenes={current.get('dialog_cutscenes', [])}")
-        moves.extend(entry for entry in saved["world"].get("command_journal", [])
-                     if entry["command"]["command"] == "order_move"
-                     and entry["command"]["who"] == leader
-                     and entry["t"] > initial_time
-                     and entry["outcome"] == {"outcome": "done", "ok": True})
+        moved |= math.dist(current["objects"][str(leader)]["position"], initial_position) > 0.1
+    input_path = home / ".openthedas/journal/checkpoint.journal"
+    inputs = [json.loads(line) for line in input_path.read_text().splitlines()] if input_path.exists() else []
+    moves = [entry for entry in inputs
+             if entry.get("command", {}).get("command") == "order_move"
+             and entry["command"]["who"] == leader and entry["t"] > initial_time]
     # A nonzero stick order targets a point ahead, rather than a stop at the feet.
     nonzero = any(all(math.isfinite(x) for x in entry["command"]["to"])
                   and math.dist(entry["command"]["to"], initial_position) > 0.1
                   for entry in moves)
-    ok = result.returncode == 0 and bool(samples) and samples[0] == "{Hud}" and nonzero
-    print(f"{'PASS' if ok else 'FAIL'}: #{number}, HUD by 250ms, leader move by 500ms: {len(moves)} accepted move orders")
+    ok = result.returncode == 0 and bool(samples) and samples[0] == "{Hud}" and nonzero and moved
+    print(f"{'PASS' if ok else 'FAIL'}: #{number}, HUD by 250ms, leader move by 500ms: "
+          f"{len(moves)} move inputs, nonzero={nonzero}, displaced={moved}")
     passed &= ok
 
 print(f"{'PASS' if passed else 'FAIL'}: convhang; evidence: {out}")
