@@ -443,6 +443,9 @@ fn formation_position(p: [f32; 3], facing: f32, [x, y]: [f32; 2]) -> [f32; 3] {
 /// snaps once a step would pass the way. Differences under 1e-6° are left (0xb596b8). Not
 /// ported: the follower's filter on the asked-for way before this (0xa63fd7-0xa64026, a
 /// blend toward the route's way of `1 - 0.9^ceil(d / 0.075)` for a step of `d` metres).
+/// DA2 uses the same scalar law at 0x8a6110 (moving caller 0x8b11e4): its constants are
+/// 0.4 at 0xc23498, 0.28 at 0xc237f0, 1/180 at 0xbf3d54 and epsilon at 0xc2442c.
+/// See da2-performance-processing.md for the separate locomotion/controller lifecycle.
 pub(crate) fn turn_toward(facing: f32, want: f32, dt: f32) -> f32 {
     let e = (want - facing + 180.0).rem_euclid(360.0) - 180.0;
     if e.abs() <= 1e-6 || dt <= 0.0 {
@@ -2510,6 +2513,7 @@ impl Sim {
                 impacted: false,
                 arrived: false,
                 da2_target_prepared: false,
+                da2_basic_attack_fallback: false,
                 path: Vec::new(),
                 turned_at: None,
                 is_static: false,
@@ -3030,13 +3034,12 @@ impl Sim {
                 }
                 self.update_triggers(id);
             }
-            let da2 = self.game == thedas_vfs::Game::DragonAge2;
             if let Some(o) = self.world.get_mut(id) {
                 o.position = p;
                 if let Some((dx, dy)) = dir {
                     let want = crate::world::facing_toward(dx, dy);
-                    // Dragon Age II's follower is not traced: it faces the way at once.
-                    if da2 {
+                    if self.game == thedas_vfs::Game::DragonAge2 && o.kind != ObjectKind::Creature {
+                        // DA2's traced locomotion component belongs to creatures.
                         o.facing = want;
                     } else {
                         let since = o.commands.first().and_then(|c| c.turned_at).unwrap_or(t0);
@@ -4156,10 +4159,16 @@ impl Sim {
             // A walk that was under way ends facing as the walker's body faces: DAOrigins.exe's
             // ordinary arrival stops and resets the route (0x6a9430 -> 0xa63ac0) and sets no
             // facing, so the bearing the order was given with (the player's click, a held
-            // stick's aim) does not snap onto the body at the end. Jumps, placements and
-            // Dragon Age II's moves (its follower not traced) take the location's facing.
-            let keeps_facing =
-                walked && cmd.from.is_some() && self.game != thedas_vfs::Game::DragonAge2;
+            // stick's aim) does not snap onto the body at the end. DA2 completion likewise
+            // stops the follower (0x675fae -> 0x8a60e0) without assigning that bearing.
+            // Jumps and placements still take the location's facing.
+            let keeps_facing = walked
+                && cmd.from.is_some()
+                && (self.game != thedas_vfs::Game::DragonAge2
+                    || self
+                        .world
+                        .get(id)
+                        .is_some_and(|o| o.kind == ObjectKind::Creature));
             if let Some(obj) = self.world.get_mut(id) {
                 obj.position = l.position;
                 obj.area = Some(l.area);
@@ -5870,6 +5879,66 @@ mod tests {
     }
 
     #[test]
+    fn da2_walking_turns_over_elapsed_time_and_keeps_it_across_reload() {
+        let mut s = sim();
+        s.game = thedas_vfs::Game::DragonAge2;
+        let area = s.world.spawn(ObjectKind::Area, "a");
+        let walker = s.world.spawn(ObjectKind::Creature, "walker");
+        s.world.get_mut(walker).unwrap().area = Some(area);
+        // Initially facing +Y, asked to walk +X: native 0x8a6110 turns about
+        // -22.85 degrees on the first 33 ms step, rather than snapping to 270.
+        s.order_move(walker, [30.0, 0.0, 0.0]);
+        s.tick(33);
+        let first = s.world.get(walker).unwrap().facing;
+        assert!((first - 337.15384).abs() < 0.01, "{first}");
+        assert!(s.world.get(walker).unwrap().position[0] > 0.0);
+        // Other work at the same timestamp spends no second turning budget.
+        s.tick(0);
+        assert_eq!(s.world.get(walker).unwrap().facing, first);
+        let mut loaded = sim();
+        loaded.game = s.game;
+        loaded.world = serde_json::from_str(&serde_json::to_string(&s.world).unwrap()).unwrap();
+        s.tick(33);
+        loaded.tick(33);
+        let expected = s.world.get(walker).unwrap();
+        let actual = loaded.world.get(walker).unwrap();
+        assert!(expected.facing < first && expected.facing > 270.0);
+        assert_eq!(actual.facing, expected.facing);
+        assert_eq!(actual.position, expected.position);
+        assert_eq!(actual.commands, expected.commands);
+    }
+
+    #[test]
+    fn da2_path_arrival_preserves_body_heading_instead_of_the_orders_bearing() {
+        let mut s = sim();
+        s.game = thedas_vfs::Game::DragonAge2;
+        let area = s.world.spawn(ObjectKind::Area, "a");
+        let walker = s.world.spawn(ObjectKind::Creature, "walker");
+        s.world.get_mut(walker).unwrap().area = Some(area);
+        s.order_move(walker, [1.0, 1.0, 0.0]);
+        s.tick(0);
+        let c = s
+            .world
+            .get_mut(walker)
+            .unwrap()
+            .commands
+            .first_mut()
+            .unwrap();
+        c.path = vec![[1.0, 0.0, 0.0], [1.0, 1.0, 0.0]];
+        c.due = Some(100);
+        c.location.as_mut().unwrap().facing = 123.0;
+        s.world.time_ms = 100;
+        s.advance_movers();
+        let before = s.world.get(walker).unwrap().facing;
+        assert_eq!(before, 0.0); // The last leg faces +Y.
+        s.finish_command(walker);
+        let o = s.world.get(walker).unwrap();
+        assert_eq!(o.position, [1.0, 1.0, 0.0]);
+        assert_eq!(o.facing, before);
+        assert!(o.commands.is_empty());
+    }
+
+    #[test]
     fn dragon_age_2_reference_functions_run_as_their_twins() {
         let ldf = "#define ENGINE_STRUCTURE_0 event\n\
             event Event(int nType) = 0;\n\
@@ -6171,6 +6240,7 @@ mod tests {
             impacted: false,
             arrived: false,
             da2_target_prepared: false,
+            da2_basic_attack_fallback: false,
             path: Vec::new(),
             turned_at: None,
             is_static: false,
@@ -7003,6 +7073,7 @@ mod tests {
             impacted: false,
             arrived: false,
             da2_target_prepared: false,
+            da2_basic_attack_fallback: false,
             path: Vec::new(),
             turned_at: None,
             is_static: false,
@@ -7099,6 +7170,7 @@ mod tests {
             impacted: false,
             arrived: false,
             da2_target_prepared: false,
+            da2_basic_attack_fallback: false,
             path: Vec::new(),
             turned_at: None,
             is_static: false,
@@ -7145,6 +7217,7 @@ mod tests {
             impacted: false,
             arrived: false,
             da2_target_prepared: false,
+            da2_basic_attack_fallback: false,
             path: Vec::new(),
             turned_at: None,
             is_static: false,
@@ -7265,6 +7338,7 @@ mod tests {
             impacted: false,
             arrived: false,
             da2_target_prepared: false,
+            da2_basic_attack_fallback: false,
             path: Vec::new(),
             turned_at: None,
             is_static: false,
@@ -7471,6 +7545,7 @@ mod tests {
                 impacted: false,
                 arrived: false,
                 da2_target_prepared: false,
+                da2_basic_attack_fallback: false,
                 path: Vec::new(),
                 turned_at: None,
                 is_static: false,
@@ -7525,6 +7600,7 @@ mod tests {
             impacted: false,
             arrived: false,
             da2_target_prepared: false,
+            da2_basic_attack_fallback: false,
             path: Vec::new(),
             turned_at: None,
             is_static: false,
@@ -7673,6 +7749,7 @@ mod tests {
             impacted: false,
             arrived: false,
             da2_target_prepared: false,
+            da2_basic_attack_fallback: false,
             path: Vec::new(),
             turned_at: None,
             is_static: false,
@@ -7743,6 +7820,7 @@ mod tests {
             impacted: false,
             arrived: false,
             da2_target_prepared: false,
+            da2_basic_attack_fallback: false,
             path: Vec::new(),
             turned_at: None,
             is_static: false,
@@ -7797,6 +7875,7 @@ mod tests {
             impacted: false,
             arrived: false,
             da2_target_prepared: false,
+            da2_basic_attack_fallback: false,
             path: Vec::new(),
             turned_at: None,
             is_static: false,
@@ -8027,6 +8106,7 @@ mod tests {
                 impacted: false,
                 arrived: false,
                 da2_target_prepared: false,
+                da2_basic_attack_fallback: false,
                 path: Vec::new(),
                 turned_at: None,
                 is_static: false,
@@ -8057,6 +8137,7 @@ mod tests {
             impacted: false,
             arrived: false,
             da2_target_prepared: false,
+            da2_basic_attack_fallback: false,
             path: Vec::new(),
             turned_at: None,
             is_static: false,
@@ -8141,6 +8222,7 @@ mod tests {
             impacted: false,
             arrived: false,
             da2_target_prepared: false,
+            da2_basic_attack_fallback: false,
             path: Vec::new(),
             turned_at: None,
             is_static: false,
@@ -8209,6 +8291,7 @@ mod tests {
             impacted: false,
             arrived: false,
             da2_target_prepared: false,
+            da2_basic_attack_fallback: false,
             path: Vec::new(),
             turned_at: None,
             is_static: false,
@@ -8438,6 +8521,7 @@ mod tests {
             impacted: false,
             arrived: false,
             da2_target_prepared: false,
+            da2_basic_attack_fallback: false,
             path: Vec::new(),
             turned_at: None,
             is_static: false,
