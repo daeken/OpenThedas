@@ -1,10 +1,10 @@
 //! Engine functions the shipped `script.ldf` does not declare, with signatures inferred from
 //! how compiled scripts call them. The GOG 1.05 engine has functions newer than the table it
 //! ships: even core `creature_core.ncs` calls #862. Everything here is provisional; names are
-//! descriptive guesses, not BioWare's.
+//! descriptive guesses except where an executable trace establishes the registration.
 //!
 //! - #859 `(object, int, int) -> int[]`: the result is stored in an `int[]` local
-//!   (`gxa_module_chargen`).
+//!   (`gxa_module_chargen`); Origins registers GetAbilityList at 0x6764c6.
 //! - #860 `(int, float, float, int, object, string) -> void` (`vgk400ar_siege_ext_a`).
 //! - #862 `(string) -> int`: called with `"core_ep1"` and tested directly; reads like "is this
 //!   package loaded" (`creature_core`, `placeable_core`).
@@ -26,12 +26,12 @@ pub fn inferred() -> Vec<Function> {
     vec![
         Function {
             id: 859,
-            name: "Inferred859_GetIntArray".into(),
+            name: "GetAbilityList".into(),
             ret: Type::Array(Box::new(Type::Int)),
             params: vec![
                 p(Type::Object, "oObject", None),
-                p(Type::Int, "n1", None),
-                p(Type::Int, "n2", None),
+                p(Type::Int, "nAbilityType", None),
+                p(Type::Int, "bCoolingDown", None),
             ],
         },
         Function {

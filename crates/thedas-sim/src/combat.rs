@@ -105,6 +105,9 @@ pub struct CombatData {
     /// DA2's `SetAbilityResult`: the command and result captured for the later impact.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ability_cast: Option<AbilityCast>,
+    /// DA2 animation-driven locomotion, independent of the pending impact deadline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) animation_motion: Option<crate::da2_animation::AnimationMotion>,
     /// Milliseconds gathered towards the next regeneration pass (see `Sim::regenerate`).
     #[serde(default)]
     pub regen_ms: u64,
@@ -324,6 +327,9 @@ impl Sim {
         if self.game != thedas_vfs::Game::DragonAge2 {
             return;
         }
+        if let Some(o) = self.world.get_mut(id) {
+            o.combat.animation_motion = None;
+        }
         let member = crate::engine::party_of(self).contains(&id)
             || self
                 .world
@@ -339,6 +345,10 @@ impl Sim {
     /// combat. Repeating the current state does not run the transition again.
     pub(crate) fn set_combat_state(&mut self, id: ObjectId, on: bool) {
         if let Some(o) = self.world.get_mut(id) {
+            if self.game == thedas_vfs::Game::Origins && o.combat.in_combat != on {
+                o.fields.remove("WeaponMainDrawn");
+                o.fields.remove("WeaponOffDrawn");
+            }
             if self.game == thedas_vfs::Game::DragonAge2 && o.combat.in_combat && !on {
                 o.combat.target = None;
             }
@@ -1324,6 +1334,7 @@ impl Sim {
 
     /// Marks a creature dead, clears what it was doing and sends it `EVENT_TYPE_DEATH`.
     pub fn kill(&mut self, id: ObjectId, killer: ObjectId) {
+        self.da2_reset_locomotion(id);
         let health = constant_of(self, "PROPERTY_DEPLETABLE_HEALTH");
         let now = self.world.time_ms;
         if let Some(o) = self.world.get_mut(id) {
@@ -1496,6 +1507,7 @@ impl Sim {
             impacted: false,
             arrived: false,
             da2_target_prepared: false,
+            da2_basic_attack_fallback: self.game == thedas_vfs::Game::DragonAge2,
             path: Vec::new(),
             turned_at: None,
             is_static: false,
@@ -1546,9 +1558,9 @@ impl Sim {
             .unwrap_or([0.0; 3]);
         let mut ev = self.new_event("CHOOSE_BASIC_ATTACK", Some(id));
         ev.objects = vec![id, target, OBJECT_INVALID];
-        // Integer 2 is native command boolean 2. The attack constructor leaves it
-        // false. The sim has no separate alternate/manual combo input yet.
-        ev.ints = vec![0, 0, 0];
+        // Native 0x640dff forwards command boolean 2. Ordinary player input sets
+        // it at 0x47fc51. The script CommandAttack constructor leaves it false.
+        ev.ints = vec![0, 0, i32::from(cmd.da2_basic_attack_fallback)];
         ev.vectors = vec![point];
         let script = self.world.get_mut(id).and_then(|o| {
             o.fields.insert("CommandResult".into(), 0);
@@ -1613,6 +1625,7 @@ impl Sim {
             impacted: false,
             arrived: false,
             da2_target_prepared: false,
+            da2_basic_attack_fallback: false,
             path: Vec::new(),
             turned_at: None,
             is_static: false,
@@ -1667,6 +1680,7 @@ impl Sim {
             && let Some(o) = self.world.get_mut(id)
         {
             o.combat.ability_cast = None;
+            o.combat.animation_motion = None;
         }
         let target = cmd.target.unwrap_or(OBJECT_INVALID);
         let ability = cmd.ints.first().copied().unwrap_or(0);
@@ -2662,6 +2676,7 @@ mod tests {
     use thedas_formats::gda::Cell;
 
     use thedas_script::EngineTable;
+    use thedas_script::vm::Value;
     use thedas_vfs::Vfs;
 
     use super::*;
@@ -2997,6 +3012,116 @@ mod tests {
         assert_eq!(hit.event.ints, [123, 3]);
         assert_eq!(hit.event.vectors, [[20., 0., 0.]]);
         assert!(s.world.pop_due(u64::MAX).is_none());
+    }
+
+    #[test]
+    fn da2_player_attack_forwards_and_saves_the_native_range_fallback() {
+        let table = EngineTable::parse(
+            b"#define ENGINE_STRUCTURE_0 event\n\
+              event GetCurrentEvent() = 1;\n\
+              int GetEventInteger(event ev, int index) = 2;\n\
+              void SetCommandResult(object who, int result) = 3;\n\
+              int EVENT_TYPE_CHOOSE_BASIC_ATTACK = 111;\n\
+              int COMMAND_TYPE_ATTACK = 1;\n\
+              int COMMAND_TYPE_USE_ABILITY = 25;\n",
+        )
+        .unwrap();
+        let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(table), 3);
+        s.game = thedas_vfs::Game::DragonAge2;
+        let area = s.world.spawn(ObjectKind::Area, "arena");
+        let who = s.world.spawn(ObjectKind::Creature, "attacker");
+        let target = s.world.spawn(ObjectKind::Creature, "target");
+        s.world.get_mut(who).unwrap().area = Some(area);
+        s.world.get_mut(target).unwrap().area = Some(area);
+        s.world.get_mut(target).unwrap().position = [30., 0., 0.];
+        s.world.get_mut(who).unwrap().script = Some("choose.ncs".into());
+        // Our selector copies event integer 2 into CommandResult, exposing the
+        // actual event delivered through the ordinary player-order entry point.
+        let mut code = vec![0x04, 0x03];
+        code.extend(2_i32.to_be_bytes());
+        code.extend([0x05, 0, 0, 1, 0, 0x05, 0, 0, 2, 2, 0x04, 0x06]);
+        code.extend(who.to_be_bytes());
+        code.extend([0x05, 0, 0, 3, 2, 0x20, 0]);
+        let mut bytes = b"NCS V1.0B".to_vec();
+        bytes.extend(((13 + code.len()) as u32).to_be_bytes());
+        bytes.extend(code);
+        s.add_script("choose.ncs", thedas_script::Ncs::parse(&bytes).unwrap());
+
+        s.order_attack(who, target);
+        let original = s.world.get(who).unwrap().commands[0].clone();
+        assert!(original.da2_basic_attack_fallback);
+        let saved = serde_json::to_string(&original).unwrap();
+        let restored: crate::world::Command = serde_json::from_str(&saved).unwrap();
+        assert_eq!(restored, original);
+        for enabled in [true, false] {
+            let mut cmd = restored.clone();
+            cmd.da2_basic_attack_fallback = enabled;
+            assert!(!s.choose_da2_basic_attack(who, &mut cmd));
+            assert_eq!(
+                s.world.get(who).unwrap().fields["CommandResult"],
+                i32::from(enabled)
+            );
+        }
+        assert!(s.world.trace.script_errors.is_empty());
+        let mut older = serde_json::to_value(&original).unwrap();
+        older
+            .as_object_mut()
+            .unwrap()
+            .remove("da2_basic_attack_fallback");
+        let older: crate::world::Command = serde_json::from_value(older).unwrap();
+        assert!(!older.da2_basic_attack_fallback);
+
+        s.game = thedas_vfs::Game::Origins;
+        s.order_attack(who, target);
+        let origins = &s.world.get(who).unwrap().commands[0];
+        assert_eq!(origins.name, "CommandAttack");
+        assert!(!origins.da2_basic_attack_fallback);
+        assert!(
+            !serde_json::to_value(origins)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .contains_key("da2_basic_attack_fallback")
+        );
+    }
+
+    #[test]
+    fn da2_script_attack_constructor_keeps_its_native_false_fallback() {
+        let table = EngineTable::parse(
+            b"#define ENGINE_STRUCTURE_2 command\n\
+              command CommandAttack(object target, int result) = 1;\n\
+              int COMMAND_TYPE_ATTACK = 1;\n\
+              int COMMAND_TYPE_USE_ABILITY = 25;\n",
+        )
+        .unwrap();
+        let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(table), 3);
+        s.game = thedas_vfs::Game::DragonAge2;
+        let who = s.world.spawn(ObjectKind::Creature, "attacker");
+        let target = s.world.spawn(ObjectKind::Creature, "target");
+        let function = s.table.function_by_name("CommandAttack").unwrap().clone();
+        let mut host = crate::sim::ScriptHost {
+            sim: &mut s,
+            event: None,
+            script: "test".into(),
+        };
+        let value = crate::engine::call(
+            &mut host,
+            who,
+            &function,
+            &[Value::Object(target), Value::Int(0)],
+        )
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        let Value::Engine { handle, .. } = value else {
+            panic!("command handle expected")
+        };
+        let Some(crate::world::EngineData::Command(cmd)) = s.world.handle(handle) else {
+            panic!("command payload expected")
+        };
+        assert_eq!(cmd.name, "CommandUseAbility");
+        assert_eq!(cmd.ints, [1]);
+        assert!(!cmd.da2_basic_attack_fallback);
     }
 
     #[test]
@@ -3848,6 +3973,7 @@ mod tests {
                 impacted: false,
                 arrived: false,
                 da2_target_prepared: false,
+                da2_basic_attack_fallback: false,
                 path: Vec::new(),
                 turned_at: None,
                 is_static: false,
