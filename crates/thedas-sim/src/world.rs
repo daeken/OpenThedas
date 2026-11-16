@@ -194,6 +194,9 @@ pub struct Object {
     pub geometry: Vec<[f32; 3]>,
     /// Pending commands (front first).
     pub commands: Vec<Command>,
+    /// Origins' animation left playing after COMMAND_LOOPING releases its command.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub looping_animation: Option<Command>,
     pub followers: Vec<ObjectId>,
     /// Non-party followers (`AddNonPartyFollower`): they follow but are not in the party.
     #[serde(default)]
@@ -282,6 +285,7 @@ impl Object {
             interactive: true,
             geometry: Vec::new(),
             commands: Vec::new(),
+            looping_animation: None,
             followers: Vec::new(),
             escorts: Vec::new(),
             stored: BTreeMap::new(),
@@ -344,7 +348,9 @@ pub struct Command {
     pub is_static: bool,
     pub target: Option<ObjectId>,
     pub location: Option<Location>,
-    /// Command-specific float. Player Initiate Dialog uses it for stalled-approach milliseconds.
+    /// The constructor's first float (wait time, move range, etc.); for Origins'
+    /// PlayAnimation, the optional speed override stored in native float 3.
+    /// Player Initiate Dialog uses it for stalled-approach milliseconds.
     pub seconds: f32,
     /// `CommandMoveToObject`'s fMaxRange, raised to fMinRange by its builder
     /// (DAOrigins.exe 0x66f260). Older saves used only `seconds` (fMinRange).
@@ -356,7 +362,8 @@ pub struct Command {
     #[serde(default)]
     pub due: Option<u64>,
     /// For a move: where the mover was and the time when it set off. Its position in
-    /// between is interpolated (see `Sim::advance_movers`).
+    /// between is interpolated (see `Sim::advance_movers`). For Origins' PlayAnimation,
+    /// records its start so presentation does not infer it from a fixed duration.
     #[serde(default)]
     pub from: Option<([f32; 3], u64)>,
     /// For a move: when its mover's body last turned toward the way it goes (see

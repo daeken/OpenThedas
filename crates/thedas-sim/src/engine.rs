@@ -3269,6 +3269,7 @@ pub fn call(
         "SetCommandFloat" => {
             // 0x66ee60 writes the indexed native float directly. MoveToObject's
             // builder stores maximum in slot 0 and minimum in slot 1 (0x66f39a).
+            // PlayAnimation reads its speed override from float 3 (0x7a4480).
             // Other command layouts remain provisional.
             let mut c = match h.sim.world.handle(handle(a, 0)) {
                 Some(EngineData::Command(c)) => c.clone(),
@@ -3285,6 +3286,10 @@ pub fn call(
                     0 => c.max_range = Some(float(a, 1)),
                     1 => c.seconds = float(a, 1),
                     _ => {}
+                }
+            } else if c.name == "CommandPlayAnimation" && h.sim.game == thedas_vfs::Game::Origins {
+                if index == 3 {
+                    c.seconds = float(a, 1);
                 }
             } else if index == 0 {
                 c.seconds = float(a, 1);
@@ -3324,6 +3329,10 @@ pub fn call(
                             1 => c.seconds,
                             _ => 0.0,
                         }
+                    } else if c.name == "CommandPlayAnimation"
+                        && h.sim.game == thedas_vfs::Game::Origins
+                    {
+                        if i == 3 { c.seconds } else { 0.0 }
                     } else if i == 0 {
                         c.seconds
                     } else {
