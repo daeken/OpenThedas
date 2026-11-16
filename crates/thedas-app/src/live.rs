@@ -856,7 +856,7 @@ impl Live {
             );
             return;
         }
-        // A tutorial that pauses the game holds it until its popup is dismissed.
+        // A tutorial's general pause lasts until unpause or popup dismissal.
         if self.sim().tutorial_paused() {
             return;
         }
@@ -3717,9 +3717,6 @@ impl Live {
         Some(out)
     }
 
-    /// The player's pause key (Space). During a training tutorial the game may not be
-    /// unpaused: the key is the training action `EVENT_TYPE_TRAINING_UNPAUSE` instead (see
-    /// `thedas_sim::training`), and the player's own pause is left as it was.
     /// The controlled party member switches to its other weapon set, as the quickbar's
     /// weapon set button does (the / key, the pad's RT+A).
     pub fn switch_weapon_set(&self) {
@@ -3745,20 +3742,23 @@ impl Live {
         self.aiming.take().map(|a| a.ability)
     }
 
+    /// Space toggles the effective pause. The simulation decides whether guided
+    /// training accepts unpause and releases an ordinary tutorial's general pause.
     pub fn toggle_pause(&mut self) {
         let mut sim = self.sim();
-        if sim.training_paused() {
-            sim.input(
+        if self.paused || sim.training_paused() || sim.tutorial_paused() {
+            let accepted = sim.input(
                 thedas_sim::commands::CommandSource::Player,
-                thedas_sim::commands::SimCommand::TrainingEvent {
-                    name: "UNPAUSE".to_string(),
-                    arg: 0,
-                },
+                thedas_sim::commands::SimCommand::Unpause,
             );
+            drop(sim);
+            if accepted {
+                self.paused = false;
+            }
             return;
         }
         drop(sim);
-        self.paused = !self.paused;
+        self.paused = true;
     }
 
     /// Makes party member `n` (0 is the hero) the leader the player controls.
