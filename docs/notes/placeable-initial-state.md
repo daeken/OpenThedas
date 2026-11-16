@@ -58,6 +58,10 @@ The active setter is CCPlaceable vtable `0xb1c084` slot `+0x140`,
 inactive. Model setup applies the loaded active flag through that same slot
 at `0x752096` / `0x752aa3`. Initialization therefore clears an inactive
 object's footprint, and SetObjectActive updates PWK along with the flag.
+The script handler returns for an already matching active flag at `0x66198c`
+or `0x661a8b`; it must not replay clearing over a later footprint owner's write.
+The model-load path calls the virtual setter directly, so initialization still
+applies its loaded flag even though that value is already stored.
 
 For appearance type 1, `0x74e850` asks `0x74bcc0` for the active controller
 state's blocking predicate (column hash `0x86a27132`). `0x74d350` restores the

@@ -5968,6 +5968,28 @@ mod tests {
             "unlocking must refresh cached doorway cells"
         );
         s.set_placeable_state(door, 1);
+        let locked_grid = s.nav_grid(area).unwrap();
+        s.set_object_active(door, false);
+        let cleared_grid = s.nav_grid(area).unwrap();
+        let index = locked_grid
+            .data
+            .iter()
+            .zip(&cleared_grid.data)
+            .position(|(&old, &new)| old == 8 && new == 1)
+            .unwrap();
+        // A different footprint owner writes after deactivation. Repeating the
+        // same script request must not remove that owner's cells again.
+        let mut overwritten = (*cleared_grid).clone();
+        overwritten.data[index] = 8;
+        s.changed_nav_grids.insert(area, Arc::new(overwritten));
+        s.world
+            .nav_patches
+            .get_mut(&area)
+            .unwrap()
+            .insert(index as u32, 8);
+        s.set_object_active(door, false);
+        assert_eq!(s.nav_grid(area).unwrap().data[index], 8);
+        s.set_object_active(door, true);
         let saved = s.save_json().unwrap();
         s.load_json(&saved).unwrap();
         assert_eq!(s.world.get(door).unwrap().fields["State"], 1);

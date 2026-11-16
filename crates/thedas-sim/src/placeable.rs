@@ -51,6 +51,15 @@ impl Sim {
         let Some(o) = self.world.get_mut(id) else {
             return;
         };
+        // The script handler returns before vfunc +0x140 when activity already
+        // matches (0x66198c / 0x661a8b). Replaying a removal could clear a later
+        // footprint owner's cells. Model-load initialization calls PWK directly.
+        if self.game == thedas_vfs::Game::Origins
+            && o.kind == ObjectKind::Placeable
+            && o.active == active
+        {
+            return;
+        }
         o.active = active;
         if self.game == thedas_vfs::Game::Origins && o.kind == ObjectKind::Placeable {
             let state = o
