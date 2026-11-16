@@ -3785,8 +3785,16 @@ impl Sim {
         });
         let mut ev = self.new_event("COMMAND_COMPLETE", Some(id));
         ev.ints = vec![c.ty, result];
+        if self.game == thedas_vfs::Game::Origins {
+            // 0x743dd0 retains owner/target for failures as well as success.
+            ev.objects = vec![id, c.target.unwrap_or(OBJECT_INVALID)];
+        }
         if let Some(b) = blocker {
-            ev.objects = vec![OBJECT_INVALID, OBJECT_INVALID, b];
+            if self.game == thedas_vfs::Game::Origins {
+                ev.objects.push(b);
+            } else {
+                ev.objects = vec![OBJECT_INVALID, OBJECT_INVALID, b];
+            }
         }
         if let Some(o) = self.world.get_mut(id) {
             o.combat.previous_command = Some(c);
@@ -4514,6 +4522,9 @@ impl Sim {
         });
         let mut ev = self.new_event("COMMAND_COMPLETE", Some(id));
         ev.ints = vec![cmd.ty, result];
+        if self.game == thedas_vfs::Game::Origins {
+            ev.objects = vec![id, cmd.target.unwrap_or(OBJECT_INVALID)];
+        }
         self.world.queue_event(0, id, ev, None);
     }
 
@@ -7175,6 +7186,78 @@ mod tests {
             assert_eq!(s.world.get(who).unwrap().locals.ints.get("n"), Some(&1));
             assert!(s.world.trace.entries.iter().any(|entry| matches!(entry,
                 TraceEntry::EventDelivered { script, .. } if script == "explicit")));
+        }
+    }
+
+    #[test]
+    fn origins_completion_events_retain_owner_target_and_blocker() {
+        for game in [thedas_vfs::Game::Origins, thedas_vfs::Game::DragonAge2] {
+            for failure in [
+                None,
+                Some(("COMMAND_FAILED_INVALID_PATH", -4, None)),
+                Some(("COMMAND_FAILED_PATH_ACTION_REQUIRED", -9, Some(99))),
+            ] {
+                let table = EngineTable::parse(
+                    b"int EVENT_TYPE_COMMAND_COMPLETE = 1004;\n\
+                    int COMMAND_TYPE_ATTACK = 1;\n\
+                    int COMMAND_FAILED_INVALID_PATH = -4;\n\
+                    int COMMAND_FAILED_PATH_ACTION_REQUIRED = -9;\n",
+                )
+                .unwrap();
+                let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(table), 1);
+                s.game = game;
+                let who = s.world.spawn(ObjectKind::Creature, "actor");
+                let target = s.world.spawn(ObjectKind::Creature, "target");
+                s.world.get_mut(who).unwrap().commands.push(Command {
+                    ty: 1,
+                    name: "CommandAttack".into(),
+                    target: Some(target),
+                    due: Some(100),
+                    ..Default::default()
+                });
+                let (result, blocker) = match failure {
+                    Some((name, result, blocker)) => {
+                        s.fail_front_command_with(who, name, blocker);
+                        (result, blocker)
+                    }
+                    None => {
+                        s.finish_command(who);
+                        (1, None)
+                    }
+                };
+                let events: Vec<_> = s
+                    .world
+                    .queue
+                    .values()
+                    .filter(|q| q.event.ty == 1004)
+                    .collect();
+                assert_eq!(events.len(), 1);
+                let event = events[0];
+                assert_eq!(event.target, who);
+                assert_eq!(event.event.creator, Some(who));
+                assert_eq!(event.event.ints, [1, result]);
+                let mut objects = if game == thedas_vfs::Game::Origins {
+                    vec![who, target]
+                } else if blocker.is_some() {
+                    vec![OBJECT_INVALID, OBJECT_INVALID]
+                } else {
+                    Vec::new()
+                };
+                objects.extend(blocker);
+                assert_eq!(event.event.objects, objects);
+                assert!(s.world.get(who).unwrap().commands.is_empty());
+                assert_eq!(
+                    s.world
+                        .get(who)
+                        .unwrap()
+                        .combat
+                        .previous_command
+                        .as_ref()
+                        .unwrap()
+                        .target,
+                    Some(target)
+                );
+            }
         }
     }
 

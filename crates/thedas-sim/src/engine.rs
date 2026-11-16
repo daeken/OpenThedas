@@ -5501,8 +5501,14 @@ pub fn call(
                 o.fields.insert("CommandResult".into(), result);
                 if failed && !o.commands.is_empty() {
                     let c = o.commands.remove(0);
+                    if h.sim.game == thedas_vfs::Game::Origins {
+                        o.combat.previous_command = Some(c.clone());
+                    }
                     let mut ev = h.sim.new_event("COMMAND_COMPLETE", Some(who));
                     ev.ints = vec![c.ty, result];
+                    if h.sim.game == thedas_vfs::Game::Origins {
+                        ev.objects = vec![who, c.target.unwrap_or(OBJECT_INVALID)];
+                    }
                     h.sim.world.queue_event(0, who, ev, None);
                 }
             }
@@ -8966,6 +8972,54 @@ mod tests {
                 .unwrap()
                 .contains("da2_locomotion")
         );
+    }
+
+    #[test]
+    fn origins_rejected_commands_keep_completion_arguments_and_previous_command() {
+        for game in [thedas_vfs::Game::Origins, thedas_vfs::Game::DragonAge2] {
+            let table = EngineTable::parse(
+                b"void SetCommandResult(object who, int result) = 716;\n\
+                int COMMAND_RESULT_FAILED = 0;\n\
+                int EVENT_TYPE_COMMAND_COMPLETE = 1004;\n",
+            )
+            .unwrap();
+            let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(table), 1);
+            s.game = game;
+            let who = s.world.spawn(ObjectKind::Creature, "actor");
+            let target = s.world.spawn(ObjectKind::Creature, "target");
+            let command = Command {
+                ty: 1,
+                name: "CommandAttack".into(),
+                target: Some(target),
+                due: Some(100),
+                ..Default::default()
+            };
+            s.world.get_mut(who).unwrap().commands.push(command.clone());
+            run(
+                &mut s,
+                who,
+                "SetCommandResult",
+                &[Value::Object(who), Value::Int(0)],
+            );
+            let event = s.world.queue.values().next().unwrap();
+            assert_eq!(event.target, who);
+            assert_eq!(event.event.creator, Some(who));
+            assert_eq!(event.event.ints, [1, 0]);
+            assert_eq!(
+                event.event.objects,
+                if game == thedas_vfs::Game::Origins {
+                    vec![who, target]
+                } else {
+                    Vec::new()
+                }
+            );
+            let actor = s.world.get(who).unwrap();
+            assert!(actor.commands.is_empty());
+            assert_eq!(
+                actor.combat.previous_command.as_ref(),
+                (game == thedas_vfs::Game::Origins).then_some(&command)
+            );
+        }
     }
 
     #[test]
