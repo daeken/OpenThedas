@@ -11,9 +11,22 @@ regression tests described below.
 The first animation report called a ten-entry queue and
 `COMMAND_COMPLETE [13,-2]` a queue-full failure. That interpretation was wrong.
 Installed `script.ldf` names -2 `COMMAND_FAILED_COMMAND_CLEARED`; there is no
-queue-full command result. Other failures are generic -1, invalid data -3,
-invalid path -4, no melee-ring space -5, no line of sight -6, destroyed target
--7, disabled -8, required path action -9, and timeout -10.
+queue-full command result. The installed result constants are:
+
+| Result | Constant |
+| --- | --- |
+| -1 | `COMMAND_FAILED` |
+| -2 | `COMMAND_FAILED_COMMAND_CLEARED` |
+| -3 | `COMMAND_FAILED_INVALID_DATA` |
+| -4 | `COMMAND_FAILED_INVALID_PATH` |
+| -5 | `COMMAND_FAILED_NO_SPACE_IN_MELEE_RING` |
+| -6 | `COMMAND_FAILED_NO_LINE_OF_SIGHT` |
+| -7 | `COMMAND_FAILED_TARGET_DESTROYED` |
+| -8 | `COMMAND_FAILED_DISABLED` |
+| -9 | `COMMAND_FAILED_PATH_ACTION_REQUIRED` |
+| -10 | `COMMAND_FAILED_TIMEOUT` |
+| 1 | `COMMAND_SUCCESSFUL` |
+| 2 | `COMMAND_LOOPING` |
 
 `AddCommand` 533 is registered to `0x66e0e0`. Valid object/command arguments
 reach `0x73cd10` at `0x66e1af`. A null object/command returns false; successful
