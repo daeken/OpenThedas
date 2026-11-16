@@ -96,5 +96,23 @@ passed, 22 ignored and zero failures. The connected fifteen-stage Origins
 comparison has identical logs, plot sequences and all seventeen produced JSON
 checkpoints. Its inherited progression stalls in Korcari Wilds and both board
 steps fail on the missing board. Four 600-tick Origins determinism controls
-pass repeat and save/reload comparisons. Independent fixture checks and the
-same-save DA2 control are recorded with the PR and investigation report.
+pass repeat and save/reload comparisons.
+
+Five additional independent Origins fixture scenarios have identical logs,
+plot sequences and six produced checkpoints. Joining and Lothering's board
+complete. Tower's five seeds wipe on level one on both builds. An extra father
+fixture attempt was stopped after fifteen minutes in its first seed. The
+connected father scenario had already completed identically on both builds.
+
+A separate same-save DA2 comparison starts at `t=634722`, issues the same
+ordinary Hawke attack, then advances exactly ten seconds with party AI enabled.
+Carver deals 65.11910 damage in five events on main and 112.50782 in ten events
+with the repair. His median cast interval is 1,484 versus 672 ms. Both complete
+controls wipe. Labelled before/after/delta captures use this ten-second state.
+
+The extra 100-tick DA2 determinism comparison repeats identically on both
+builds. Save/reload on each build changes one Bethany effect ID and the next
+effect-ID counter by one. All other world fields under the standard
+bookkeeping normalization match. This pre-existing difference is retained in
+the investigation evidence and reported separately from the passing Origins
+determinism gate.
