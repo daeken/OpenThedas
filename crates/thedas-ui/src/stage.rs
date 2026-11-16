@@ -768,6 +768,66 @@ impl Stage {
         }
     }
 
+    /// Draws the engine-owned image of an external drag above the movies. It lives in
+    /// the front movie's root, outside its layout and input behaviours, so both direct
+    /// rendering and captures use the same atlas image, alpha and stage transform.
+    /// The movies' SharedLibrary.DragImage fits its image into 58 by 58 stage pixels.
+    pub fn set_external_drag_image(&mut self, image: Option<&str>) {
+        const CLIP: &str = "_root.thedas_external_drag";
+        let image = image.filter(|_| self.mouse != OFF_STAGE);
+        let last = self.movies.len().saturating_sub(1);
+        for (i, movie) in self.movies.iter_mut().enumerate() {
+            let current = movie.get(&format!("{CLIP}.image"));
+            let wanted = image.filter(|s| i == last && !s.is_empty());
+            let Some(image) = wanted else {
+                if matches!(current, UiValue::String(_)) {
+                    movie.call(&format!("{CLIP}.removeMovieClip"), &[]);
+                }
+                continue;
+            };
+            let value = UiValue::String(image.to_string());
+            if current != value {
+                movie.call(&format!("{CLIP}.removeMovieClip"), &[]);
+                movie.call(
+                    "_root.createEmptyMovieClip",
+                    &[
+                        UiValue::String("thedas_external_drag".into()),
+                        UiValue::Number(1_000_000.0),
+                    ],
+                );
+                movie.call(
+                    &format!("{CLIP}.loadMovie"),
+                    &[UiValue::String(format!("img://{image}"))],
+                );
+                movie.set(&format!("{CLIP}.image"), value);
+                movie.set(&format!("{CLIP}.hitTestDisable"), UiValue::Bool(true));
+                movie.set(&format!("{CLIP}.topmostLevel"), UiValue::Bool(true));
+                if let (UiValue::Number(w), UiValue::Number(h)) = (
+                    movie.get(&format!("{CLIP}._width")),
+                    movie.get(&format!("{CLIP}._height")),
+                ) && w > 0.0
+                    && h > 0.0
+                {
+                    let scale = 58.0 / w.max(h);
+                    movie.set(&format!("{CLIP}._xscale"), UiValue::Number(scale * 100.0));
+                    movie.set(&format!("{CLIP}._yscale"), UiValue::Number(scale * 100.0));
+                }
+            }
+            // These are already in this movie's coordinates, including letterboxing.
+            for (axis, size) in [("x", "width"), ("y", "height")] {
+                if let (UiValue::Number(mouse), UiValue::Number(size)) = (
+                    movie.get(&format!("_root._{axis}mouse")),
+                    movie.get(&format!("{CLIP}._{size}")),
+                ) {
+                    movie.set(
+                        &format!("{CLIP}._{axis}"),
+                        UiValue::Number(mouse - size / 2.0),
+                    );
+                }
+            }
+        }
+    }
+
     pub fn mouse_button(&mut self, x: f64, y: f64, down: bool) {
         let mut released = None;
         for m in self.input_movies() {
