@@ -364,7 +364,12 @@ impl Recorder {
         if let Err(e) = std::thread::Builder::new()
             .name("report writer".into())
             .spawn(move || {
-                let result = files.write().and_then(|()| write_pending(&files.dir, rx));
+                let dir = files.dir.clone();
+                let written = files.write();
+                // The frozen world and presentation can be large. Release them after
+                // writing, rather than retaining them while the player types a note.
+                drop(files);
+                let result = written.and_then(|()| write_pending(&dir, rx));
                 let _ = done_tx.send(result);
             })
         {
