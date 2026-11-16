@@ -703,16 +703,19 @@ struct Line {
     /// cutscene has ended.
     cut_seen: bool,
     cut_done: bool,
+    /// Its own referenced cutscene has started. Automatic continuation waits for it.
+    owns_cut: bool,
 }
 
 impl Line {
-    /// Whether it has played: its voice-over's (or reading) time has passed, or the
-    /// cutscene that spoke it has ended. The executable gives a line that plays its own
-    /// cutscene the cutscene's length (`GameModeDialog` 0x68e5be-0x68e5ff: the line's
-    /// timer +0x2c4 is the cutscene's 5000, +0x8). Provisional: a line whose cutscene is
-    /// played by the cutscene mode (a `CUTR` reference) is taken to end with it the same
-    /// way.
+    /// Whether it has played. An automatic continuation waits for the line's own
+    /// referenced cut to complete (GameModeDialog 0x68de74–0x68df57), keeping its camera
+    /// and actors with the line. The presentation clock can run ahead of the cutscene's
+    /// capped simulation clock on slow frames.
     fn played(&self) -> bool {
+        if self.waits && self.owns_cut && !self.cut_done && self.t.is_finite() {
+            return false;
+        }
         self.cut_done || self.t >= self.voice_ms.unwrap_or_else(|| line_ms(&self.key.1))
     }
 }
@@ -2301,6 +2304,9 @@ impl UiLayer {
     /// ends (the screens start over with it).
     pub fn close_all(&mut self) {
         self.stage.movies.clear();
+        if let Ok(mut shown) = self.shown.lock() {
+            shown.dragging = false;
+        }
         self.line = None;
         self.floaties.clear();
         self.tooltip_text = None;
@@ -2323,6 +2329,10 @@ impl UiLayer {
             self.saves_listed = true;
             self.refresh_saves();
         }
+        // A movie's X can have closed it in the last tick. Reconcile that before
+        // binding the presentation and computing wanted screens; otherwise the old
+        // menu reopens its movie once while sync clears the player's toggle.
+        screens.note_open(&|m| self.stage.movies.iter().any(|x| x.name == m));
         self.screens_opened(screens, sim);
         // The journal, while its screen is up (built from the plots: it needs the simulation
         // mutably, which the bindings do not have).
@@ -2363,9 +2373,11 @@ impl UiLayer {
             self.stage.bridge.bind(values);
             let waits = thedas_ui::binding::awaits_continue(&sim);
             let cutscene = sim.world.cutscene.is_some();
+            let owns_cut =
+                sim.game == thedas_vfs::Game::Origins && sim.conversation_line_cutscene().is_some();
             let line = thedas_ui::binding::conversation(&sim).map(|d| {
                 let key: LineKey = (d.dialog, d.line, d.replies.iter().map(|r| r.0).collect());
-                (key, waits, cutscene)
+                (key, waits, cutscene, owns_cut)
             });
             // Before a game, the start menu, or the screen it opened (options, the load
             // screen).
@@ -2431,13 +2443,15 @@ impl UiLayer {
             );
         }
         self.line = match (line, self.line.take()) {
-            (Some((key, _, cutscene)), Some(mut l)) if l.key == key => {
+            (Some((key, _, cutscene, owns_cut)), Some(mut l)) if l.key == key => {
                 l.t += dt_ms;
                 l.cut_done |= l.cut_seen && !cutscene;
+                l.cut_done |= l.owns_cut && !owns_cut;
                 l.cut_seen |= cutscene;
+                l.owns_cut |= owns_cut;
                 Some(l)
             }
-            (Some((key, waits, cutscene)), _) => Some(Line {
+            (Some((key, waits, cutscene, owns_cut)), _) => Some(Line {
                 key,
                 t: 0.0,
                 voice_ms: None,
@@ -2446,6 +2460,7 @@ impl UiLayer {
                 continued: false,
                 cut_seen: cutscene,
                 cut_done: false,
+                owns_cut,
             }),
             (None, _) => None,
         };
@@ -2697,6 +2712,7 @@ impl UiLayer {
                 log::warn!("ui: the simulation does not handle {name} yet");
             }
         }
+        self.update_drag_image();
         aims
     }
 
@@ -3602,11 +3618,13 @@ impl UiLayer {
 
     pub fn mouse_move(&mut self, x: f64, y: f64) {
         self.stage.mouse_move(x, y);
+        self.update_drag_image();
     }
 
     /// The mouse left the window.
     pub fn mouse_leave(&mut self) {
         self.stage.mouse_leave();
+        self.stage.set_external_drag_image(None);
     }
 
     /// The mouse wheel turned `lines` (up positive) at (`x`, `y`): lists and text under the
@@ -3627,6 +3645,7 @@ impl UiLayer {
                 .unwrap_or(false);
             if dragging {
                 self.stage.drop_external();
+                self.stage.set_external_drag_image(None);
             }
         }
         // A click on a party portrait: portraits.gfx only says which member the mouse is
@@ -3639,6 +3658,18 @@ impl UiLayer {
         {
             self.portrait_clicked = Some(id as u32);
         }
+    }
+
+    fn update_drag_image(&mut self) {
+        let dragging = self.shown.lock().is_ok_and(|s| s.dragging);
+        let image = dragging
+            .then(|| self.stage.bridge.value("GUI.DragData.DragImage"))
+            .flatten();
+        let image = match &image {
+            Some(thedas_ui::UiValue::String(s)) => Some(s.as_str()),
+            _ => None,
+        };
+        self.stage.set_external_drag_image(image);
     }
 
     /// The party member whose portrait was clicked becomes the one the player controls, as
@@ -3936,6 +3967,151 @@ mod tests {
             ui.stage.tick(1000.0 / 30.0);
         }
         ui
+    }
+
+    #[test]
+    #[ignore = "requires THEDAS_INSTALL and an offscreen GPU"]
+    fn journal_close_message_does_not_reopen_its_movie() {
+        let mut ui = installed_popup_ui();
+        let sim = Arc::new(Mutex::new(Sim::new(
+            ui.vfs.clone(),
+            Arc::new(thedas_script::EngineTable::default()),
+            1,
+        )));
+        ui.attach(&sim);
+        let mut screens = Screens::new(false);
+        ui.stage.movies[0].set("_root.thedas_retained", thedas_ui::UiValue::Bool(true));
+        screens.toggle(Screen::Journal);
+        for _ in 0..20 {
+            ui.play(&mut screens, &sim, 1000.0 / 30.0);
+        }
+        assert!(ui.stage.movies.iter().any(|m| m.name == "journal.gfx"));
+        // The X button's message, as read from journal.gfx's CloseButton_init.
+        ui.stage.call_in(
+            "journal.gfx",
+            "ExternalCommands.SendMessage",
+            &[thedas_ui::UiValue::String("GUI.HideFullScreenGUI".into())],
+        );
+        ui.play(&mut screens, &sim, 1000.0 / 30.0);
+        for _ in 0..5 {
+            ui.play(&mut screens, &sim, 1000.0 / 30.0);
+            assert_eq!(screens.menu, None);
+            assert_eq!(
+                screens.shown(),
+                &std::collections::BTreeSet::from([Screen::Hud])
+            );
+            assert!(!ui.stage.movies.iter().any(|m| m.name == "journal.gfx"));
+            assert_eq!(ui.shown.lock().unwrap().book_page, None);
+            for name in ["popuplayer.gfx", "navbar.gfx", "tooltips.gfx"] {
+                assert_eq!(ui.stage.movies.iter().filter(|m| m.name == name).count(), 1);
+            }
+            assert_eq!(
+                popup_property(&mut ui, "_root.thedas_retained"),
+                thedas_ui::UiValue::Bool(true)
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires THEDAS_INSTALL and an offscreen GPU"]
+    fn external_drag_image_tracks_mouse_and_clears_on_release() {
+        use thedas_ui::UiValue;
+        let mut ui = installed_popup_ui();
+        ui.stage.set_image(
+            "thedas_drag_test.png",
+            Some(&Rgba {
+                width: 1,
+                height: 2,
+                pixels: vec![255; 8],
+            }),
+        );
+        ui.stage.bridge.set_value(
+            "GUI.DragData.DragImage",
+            UiValue::String("thedas_drag_test.png".into()),
+        );
+        assert!(ui.front_end_message(&mut Screens::new(false), "GUI.StartDragging", &[]));
+        ui.mouse_move(640.0, 360.0);
+        let clip = "_root.thedas_external_drag";
+        assert_eq!(
+            popup_property(&mut ui, &format!("{clip}._width")),
+            UiValue::Number(29.0)
+        );
+        assert_eq!(
+            popup_property(&mut ui, &format!("{clip}._height")),
+            UiValue::Number(58.0)
+        );
+        assert_eq!(
+            popup_property(&mut ui, &format!("{clip}.hitTestDisable")),
+            UiValue::Bool(true)
+        );
+        let before = popup_property(&mut ui, &format!("{clip}._x"));
+        ui.mouse_move(740.0, 360.0);
+        let after = popup_property(&mut ui, &format!("{clip}._x"));
+        assert!(matches!((before, after), (UiValue::Number(a), UiValue::Number(b)) if b > a));
+        ui.mouse_button(740.0, 360.0, false);
+        assert!(!ui.shown.lock().unwrap().dragging);
+        assert_eq!(
+            popup_property(&mut ui, &format!("{clip}.image")),
+            UiValue::Undefined
+        );
+    }
+
+    #[test]
+    #[ignore = "requires THEDAS_INSTALL and an offscreen GPU"]
+    fn pending_tutorial_survives_journal_and_skills_toggles() {
+        use thedas_ui::UiValue;
+        let mut ui = installed_popup_ui();
+        let mut sim = Sim::new(
+            ui.vfs.clone(),
+            Arc::new(thedas_script::EngineTable::default()),
+            1,
+        );
+        sim.world.tutorials.push(thedas_sim::journal::Tutorial {
+            resref: "lesson".into(),
+            title: None,
+            text: None,
+            pauses: false,
+        });
+        let sim = Arc::new(Mutex::new(sim));
+        ui.attach(&sim);
+        let mut screens = Screens::new(false);
+        for _ in 0..20 {
+            ui.play(&mut screens, &sim, 1000.0 / 30.0);
+        }
+        ui.stage
+            .movies
+            .iter_mut()
+            .find(|m| m.name == "popuplayer.gfx")
+            .unwrap()
+            .set("_root.thedas_retained", UiValue::Bool(true));
+        for screen in [Screen::Journal, Screen::Skills] {
+            screens.toggle(screen);
+            ui.play(&mut screens, &sim, 100.0);
+            assert_eq!(
+                ui.stage.bridge.value("Tutorials.TutorialList"),
+                Some(UiValue::String(String::new()))
+            );
+            screens.toggle(screen);
+            for _ in 0..30 {
+                ui.play(&mut screens, &sim, 1000.0 / 30.0);
+                assert_eq!(
+                    ui.stage.bridge.value("Tutorials.TutorialList"),
+                    Some(UiValue::String("lesson".into()))
+                );
+                assert_eq!(sim.lock().unwrap().world.tutorials.len(), 1);
+                assert_eq!(
+                    popup_property(&mut ui, "_root.thedas_retained"),
+                    UiValue::Bool(true)
+                );
+            }
+            assert_eq!(
+                popup_property(
+                    &mut ui,
+                    "_root.TutorialContainer_mc.Fade_mc.Tutorial_mc.MovieHidden"
+                ),
+                UiValue::Bool(false)
+            );
+        }
     }
 
     fn delay_report_input_init(ui: &mut UiLayer) {
@@ -4316,6 +4492,41 @@ mod tests {
         assert_eq!(line_ms("  "), 100.0);
         assert!(line_ms("Short.") < line_ms("A much longer line that takes a while to read."));
         assert_eq!(line_ms(&"x".repeat(1000)), 12_000.0);
+    }
+
+    #[test]
+    fn a_referenced_cut_finishes_before_its_line_automatically_continues() {
+        let mut line = Line {
+            key: ("dialog".into(), "A cinematic line.".into(), vec![1]),
+            t: 3000.0,
+            voice_ms: Some(2976.0),
+            voiced: true,
+            waits: true,
+            continued: false,
+            cut_seen: true,
+            cut_done: false,
+            owns_cut: true,
+        };
+        // Oskias node 17 has a 2.976 s voice and a 3.217 s cut. Presentation time
+        // can also run ahead of the cut's capped simulation clock on slow frames.
+        assert!(!line.played());
+        line.t = 15_000.0;
+        line.voice_ms = None;
+        assert!(!line.played());
+        line.cut_done = true;
+        assert!(line.played());
+
+        // A later line spoken during another line's cut keeps its own timing.
+        line.cut_done = false;
+        line.owns_cut = false;
+        assert!(line.played());
+        // Reply choices and an explicit skip retain their existing behavior.
+        line.owns_cut = true;
+        line.waits = false;
+        assert!(line.played());
+        line.waits = true;
+        line.t = f64::INFINITY;
+        assert!(line.played());
     }
 
     #[test]

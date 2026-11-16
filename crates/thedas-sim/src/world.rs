@@ -117,6 +117,9 @@ pub struct Object {
     /// see [`heading_of`] and [`facing_toward`].
     pub facing: f32,
     pub active: bool,
+    /// DA2 locomotion mode and residual facing, independent of its command queue.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub da2_locomotion: Option<crate::da2_locomotion::Locomotion>,
     /// A placeable's runtime physics group (Origins open doors/destruction use 1;
     /// blocking door states restore the model's original group).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -252,6 +255,7 @@ impl Object {
             facing: 0.0,
             placeable_group: None,
             active: true,
+            da2_locomotion: None,
             locals: Locals::default(),
             script: None,
             dialog: None,
