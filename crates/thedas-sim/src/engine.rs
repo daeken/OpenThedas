@@ -883,7 +883,7 @@ fn applied_effect(
     Some(e)
 }
 
-/// Applies a visual effect (type 4) to an object as any effect is applied; an instant one,
+/// Applies a visual effect (type 4) through the game's effect dispatcher; an instant one,
 /// which leaves nothing on the object, is noted for presentation ([`crate::world::InstantVfx`]).
 fn apply_visual_or_effect(h: &mut ScriptHost, target: ObjectId, e: Effect) {
     let instant = constant(&h.sim.table, "EFFECT_DURATION_TYPE_INSTANT");
@@ -13516,6 +13516,135 @@ mod coverage_tests {
             };
             apply_visual_or_effect(&mut h, target, effect);
             assert_eq!(s.world.get(target).unwrap().effects.len(), 2, "case {case}");
+        }
+    }
+
+    #[test]
+    fn origins_visual_effects_bypass_validation_without_disturbing_current_effect() {
+        for game in [thedas_vfs::Game::Origins, thedas_vfs::Game::DragonAge2] {
+            let table = EngineTable::parse(
+                format!(
+                    "{LDF}\nvoid SetIsCurrentEffectValid(int valid) = 201;\n\
+                     void Engine_ApplyEffectOnObject(int d, effect e, object o, float f, object c, int a) = 202;\n"
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+            let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(table), 7);
+            s.game = game;
+            s.world.trace.keep = true;
+            let target = s.world.spawn(ObjectKind::Creature, "visual_target");
+            s.world.hero = Some(target);
+            s.world.get_mut(target).unwrap().script = Some("reject".into());
+            // Synthetic hook: SetIsCurrentEffectValid(0); return.
+            let code = [4, 3, 0, 0, 0, 0, 5, 0, 0, 201, 1, 0x20, 0];
+            let mut bytes = b"NCS V1.0B".to_vec();
+            bytes.extend(((13 + code.len()) as u32).to_be_bytes());
+            bytes.extend(code);
+            s.add_script("reject", thedas_script::Ncs::parse(&bytes).unwrap());
+            let outer = Effect {
+                ty: 1012,
+                ints: vec![42],
+                ..Default::default()
+            };
+            s.current_effect = Some((outer.clone(), false));
+            s.current_effect_target = Some(target);
+            for entry in 0..4 {
+                let effect = Effect {
+                    ty: 4,
+                    ints: vec![3006],
+                    creator: Some(target),
+                    duration_type: 5,
+                    ..Default::default()
+                };
+                let handle = s.world.store_new_effect(effect.clone());
+                let effect_value = Value::Engine {
+                    ty: 3,
+                    handle: Some(handle),
+                };
+                match entry {
+                    0 => {
+                        run(
+                            &mut s,
+                            target,
+                            "ApplyEffectVisualEffect",
+                            &[
+                                Value::Object(target),
+                                Value::Object(target),
+                                Value::Int(3006),
+                                Value::Int(5),
+                                Value::Float(0.0),
+                                Value::Int(0),
+                            ],
+                        );
+                    }
+                    1 => {
+                        run(
+                            &mut s,
+                            target,
+                            "Engine_ApplyEffectOnObject",
+                            &[
+                                Value::Int(5),
+                                effect_value,
+                                Value::Object(target),
+                                Value::Float(0.0),
+                                Value::Object(target),
+                                Value::Int(0),
+                            ],
+                        );
+                    }
+                    2 => {
+                        run(
+                            &mut s,
+                            target,
+                            "Engine_ApplyEffectOnParty",
+                            &[
+                                Value::Int(5),
+                                effect_value,
+                                Value::Float(0.0),
+                                Value::Object(target),
+                                Value::Int(0),
+                                Value::Int(0),
+                            ],
+                        );
+                    }
+                    _ => s.apply_effect(target, effect),
+                }
+                assert_eq!(s.current_effect, Some((outer.clone(), false)));
+                assert_eq!(s.current_effect_target, Some(target));
+            }
+            let native = game == thedas_vfs::Game::Origins;
+            let effects = s.world.get(target).unwrap().effects.clone();
+            assert_eq!(effects.len(), if native { 4 } else { 0 });
+            for effect in &effects {
+                assert!(effect.id > 0);
+                assert_eq!(effect.visual_target, Some(target));
+                assert_eq!(effect.creator, Some(target));
+                assert_eq!(effect.expires, None);
+                assert!(s.remove_effect(target, effect));
+            }
+            assert_eq!(
+                s.world
+                    .trace
+                    .entries
+                    .iter()
+                    .filter(|e| matches!(e,
+                        crate::trace::TraceEntry::ScriptStart { script, .. } if script == "reject"
+                    ))
+                    .count(),
+                if native { 0 } else { 4 },
+            );
+            // Script-defined effects still execute and obey the rejecting hook.
+            s.apply_effect(
+                target,
+                Effect {
+                    ty: 1001,
+                    duration_type: 3,
+                    ..Default::default()
+                },
+            );
+            assert!(s.world.get(target).unwrap().effects.is_empty());
+            assert_eq!(s.current_effect, Some((outer, false)));
         }
     }
 
