@@ -13,6 +13,7 @@ pub mod atlas;
 pub mod avm1;
 pub mod binding;
 pub mod chains;
+pub mod crossfade;
 pub mod input;
 pub mod keys;
 pub mod locomotion;
@@ -882,6 +883,12 @@ impl UiMovie {
 
     pub fn mouse_button(&mut self, x: f64, y: f64, down: bool) {
         self.button_as(avm1::MOUSE_LEFT, x, y, down);
+    }
+
+    /// Whether a clip of the movie is under window pixel (`x`, `y`): a button's hit area
+    /// counts though nothing is drawn there.
+    pub fn has_clip_at(&self, x: f64, y: f64) -> bool {
+        self.player.has_clip_at(x, y)
     }
 
     /// Whether a click would stay in the focused text field, in window pixels.
