@@ -48,6 +48,7 @@ pub mod nav;
 pub mod orders;
 mod placeable;
 pub mod plot;
+pub mod plot_cooldown;
 pub mod prcscr;
 pub mod quickbar;
 pub mod replay;

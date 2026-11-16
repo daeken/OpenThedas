@@ -53,6 +53,18 @@ pub fn inferred() -> Vec<Function> {
             ret: Type::Int,
             params: vec![p(Type::String, "sPackage", None)],
         },
+        Function {
+            id: 861,
+            name: "SetPlotActionCooldown".into(),
+            ret: Type::Void,
+            params: vec![
+                p(Type::Int, "nPlotActionId", None),
+                p(Type::Float, "fSeconds", None),
+                p(Type::Int, "nEventType", None),
+                p(Type::Object, "oRecipient", None),
+                p(Type::String, "sScript", None),
+            ],
+        },
     ]
 }
 

@@ -549,6 +549,8 @@ pub struct PlotActions {
     pub disabled: bool,
     pub states: std::collections::BTreeMap<i32, i32>,
     pub counts: std::collections::BTreeMap<i32, i32>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub cooldowns: BTreeMap<i32, crate::plot_cooldown::PlotCooldown>,
 }
 
 /// A message box shown by `ShowPopup`: its text, kind (`nPopupType`), owner and whether it
