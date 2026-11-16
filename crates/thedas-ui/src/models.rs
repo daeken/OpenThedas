@@ -1002,7 +1002,7 @@ fn creature_motion(sim: &Sim, o: &Object, standing: bool) -> Option<Motion> {
 pub const COL_PLACEABLE_TREE: u32 = 0x70f4_63fa;
 pub const COL_STATE_CONTROLLER: u32 = 0x9a32_0a51;
 
-/// A placeable's state: `State` (set by `SetPlaceableState` or an action's result), else
+/// A placeable's state: `State` (initialized from the instance, then changed by scripts), else
 /// its template's `AnimContState`.
 pub fn placeable_state(o: &Object) -> i32 {
     o.fields

@@ -7,6 +7,27 @@ clears those two field settings after initialization, on that dialog instance.
 Ordinary `ask_text`, script name prompts, save names and character creation retain
 their field settings. Enter remains confirmation rather than a newline.
 
+Host ticks do not correspond to movie frames: under uneven scheduling the old
+`2..FOCUS_FRAMES` window could expire before `TextInput_mc_init` ran. Its late
+writes then restored the name limits or replaced early typing with the default
+input. The free-text policy now runs after every tick and before text input for
+the lifetime of the claimed popup clip. A marker on that clip identifies the
+engine question; a replacement script popup cannot inherit the policy even if
+its prompt text is identical.
+
+The initializer assigns the default text, limits and focus before installing
+`TextField.onKeyDown` as its final write. Until that handler exists, free-text
+dialogs capture characters, editing keys and Enter into an ordered queue rather
+than letting the movie accept them. Once initialization finishes, the policy is
+applied and the queued keys reach the field through normal input handling.
+Focus is established at that transition, independently of the ordinary prompts'
+focus-retry window. It is re-established through the installed focus handlers so
+an early mouse click cannot leave the field without its key listener.
+Closing or cancelling the dialog discards its remaining queue. The host also
+avoids focusing this field before initialization: doing that would cause the
+initializer's later focus assignment to skip `onSetFocus` and its key-listener
+registration. The normal name/script focus paths keep their existing behavior.
+
 Separately, the host text helper used a character's uppercase ASCII value as its
 virtual key code. Apostrophe therefore acted as Right, period as Delete, and
 `#`, `$`, `%` as End, Home, Left. Character input now carries character data
@@ -43,3 +64,29 @@ assets. It cycles name, report and choice boxes three times, checks the original
 20-character name limit while a report waits, cancels a blocked report, and types
 long punctuated notes. Run it explicitly with `--ignored`; the ordinary workspace
 suite also runs the asset-free text-input regression.
+
+The ignored `report_late_input_init_*` app tests deterministically advance thirty
+host ticks with zero movie time before letting initialization run. One types a
+long punctuated note after that late initialization and checks the following
+name prompt still has its 20-character limit. The other queues typing, selection,
+replacement, backspace and Enter before initialization, then verifies the exact
+submitted note. These use the installed movie and an offscreen GPU, without
+embedding assets. Run them with `THEDAS_INSTALL`, an isolated `HOME`, and
+`cargo test -j 2 -p thedas-app report_late_input_init -- --ignored --test-threads=1`
+through the shared cargo-slot wrapper.
+
+The 2026-11-15 loaded reproduction captured ten empty notes in forty reopens
+with the legacy build and native movie. A separate 160-reopen native sweep at a
+smaller viewport did not reproduce the character cap. To make that late-init
+case reliable, a private test overlay changed only the popup movie's frame-rate
+header from 60 to 5 fps; the fifth legacy reopen restored the 20-character limit.
+The overlay and all captured game data stay outside the repository. The original
+installed movie and its bytecode are unchanged.
+
+With the fix, twenty consecutive reopens in one loaded run saved every character
+of each 127-character punctuated note. The run alternated typing before and after
+initialization, used the same 5 fps overlay, and used a 640×360 hidden viewport to
+keep rendering costs within the replay's resource cap. Separate 1280×720 captures
+show both legacy failure modes and successful fixed notes. The runtime proof used
+an optimized debug build with assertions and overflow checks enabled; the ignored
+late-init tests and workspace checks use the normal debug/test settings.
