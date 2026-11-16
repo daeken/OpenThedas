@@ -4,6 +4,27 @@ use crate::Sim;
 use crate::world::{Heartbeat, ObjectKind};
 
 impl Sim {
+    /// Older snapshots have no float clock, only the interval in whole milliseconds (the
+    /// field Origins' setters no longer write). Their pending events are kept: those cannot be
+    /// distinguished from script-created HEARTBEAT2 events. Done once when a save loads, so
+    /// that ticks need not look the field up on every creature.
+    pub(crate) fn restore_script_heartbeats(&mut self) {
+        if self.game != thedas_vfs::Game::Origins {
+            return;
+        }
+        for o in self.world.objects.values_mut() {
+            if o.kind != ObjectKind::Creature {
+                continue;
+            }
+            if let Some(ms) = o.fields.remove("HeartbeatMs") {
+                o.heartbeat.get_or_insert(Heartbeat {
+                    interval_bits: (ms as f32 * 0.001).to_bits(),
+                    elapsed: 0.0,
+                });
+            }
+        }
+    }
+
     pub(crate) fn advance_script_heartbeats(&mut self, ms: u64) {
         if self.game != thedas_vfs::Game::Origins {
             return;
@@ -13,14 +34,6 @@ impl Sim {
         for o in self.world.objects.values_mut() {
             if o.kind != ObjectKind::Creature {
                 continue;
-            }
-            // Older snapshots have no float clock. Preserve their pending events:
-            // those cannot be distinguished from script-created HEARTBEAT2 events.
-            if let Some(ms) = o.fields.remove("HeartbeatMs") {
-                o.heartbeat.get_or_insert(Heartbeat {
-                    interval_bits: (ms as f32 * 0.001).to_bits(),
-                    elapsed: 0.0,
-                });
             }
             if !o.active || o.parked.is_some() {
                 continue;

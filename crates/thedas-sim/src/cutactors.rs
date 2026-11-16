@@ -262,6 +262,7 @@ impl Sim {
             }),
         );
         for b in &mut bound {
+            self.da2_reset_locomotion(b.object);
             // DA2 5028 controls all taken objects, including the player and props.
             b.restore = !stage.leave_at_end;
             b.da2_stage = true;
@@ -436,6 +437,7 @@ impl Sim {
     /// the module docs).
     pub fn release_cutscene_actors(&mut self, bound: Vec<Bound>) {
         for b in bound {
+            self.da2_reset_locomotion(b.object);
             let Some(o) = self.world.get(b.object) else {
                 continue;
             };
