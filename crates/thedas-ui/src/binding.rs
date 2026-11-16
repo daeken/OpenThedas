@@ -1045,7 +1045,9 @@ fn sim_values_with(
     // The training step shown (`trainingsteps.gda`'s row; 0 none), see `thedas_sim::training`.
     v.insert(
         "Tutorials.TrainingStep".into(),
-        num(if sim.tutorials_held() {
+        // Held back behind a screen, as the tutorial list is: the popup layer is over every
+        // screen now, and a step's panel over the journal or map is not the game's.
+        num(if tutorials_held {
             0
         } else {
             sim.world.training.step
