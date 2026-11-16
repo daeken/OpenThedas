@@ -82,3 +82,20 @@ Extra 100-tick DA2 runs repeat identically on both builds. Reload increments the
 next-effect counter by one and changes one effect ID on main or two on the
 candidate. All other world fields under the standard bookkeeping normalization
 match. This effect-allocation difference is retained in the external evidence.
+
+## Integration control
+
+A local control combines this repair with the separately reviewed waiting-queue
+repair. Its source is `3832b54a`. Both cluster regressions and the queue
+regression pass on that combination. The release MCP build passes. From the
+same real-arrival input, the first fight clears in 17.7 seconds. The second
+fight wipes after 43.1 seconds. Carver deals 240.92151 damage in 29 events and
+Bethany's Fireball deals 254.87286 in seven events. The frozen fake wave clears
+its initial six in 49.519 seconds, with mean Hawke basic health loss 5.963279
+over 86 events.
+
+An additional harness control corrects the health-potion tag to the DA2 item
+already carried by Hawke. He consumes one owned health potion through the
+ordinary item-use API. That second encounter still wipes, after 51.5 seconds,
+with zero developer heals and forced kills. These controls leave the remaining
+wipe reproducible with ordinary basic-attack input.
