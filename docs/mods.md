@@ -209,3 +209,7 @@ that this paragraph go with any program that includes its source:
 > full text of this paragraph, starting from "UnRAR source code" words, is included in
 > license, or in documentation if license is not available, and in source code comments of
 > resulting package.
+
+Windows cross-builds from a non-Windows host also compile
+`crates/thedas-vfs/src/unrar_windows.cpp`, adapted from UnRAR's Windows version checks under
+the same licence. The required paragraph is included in that source file's comments.
