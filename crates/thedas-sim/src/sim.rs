@@ -46,6 +46,9 @@ pub struct AreaEntry {
 #[derive(Clone, Debug, Default, serde::Serialize)]
 pub struct ModuleInfo {
     pub name: String,
+    /// The campaign's additional package names (Origins CIF field 17124).
+    /// The module manager's IsPackageLoaded lookup searches this list.
+    pub packages: Vec<String>,
     pub script: Option<String>,
     pub start_area: Option<String>,
     pub start_position: [f32; 3],
@@ -1386,6 +1389,7 @@ impl Sim {
         self.world.time_ms = until;
         self.advance_movers();
         self.advance_da2_projectiles();
+        self.advance_plot_action_cooldowns();
         self.regenerate(elapsed);
         self.decay_corpses(elapsed);
         self.kick_ambient_creatures(elapsed);
@@ -2414,7 +2418,7 @@ impl Sim {
                 }
             }
             self.move_object(id, p, None);
-            if Some(id) == self.world.hero {
+            if Some(id) == self.world.controlled() {
                 self.follow_leader(id);
             }
             self.tick(((d / speed) * 1000.0).round().max(1.0) as u64);
@@ -2432,21 +2436,50 @@ impl Sim {
         door.is_none()
     }
 
-    /// Keeps the hero's followers with it as [`Sim::walk`] steps it along: each living
+    /// Followers and their slots before movement eligibility is tested. Both Origins
+    /// (0x631d90, called at 0x760f68) and DA2 (0x5c6f90, called at 0x5e181c)
+    /// use party index - 1; member zero takes the controlled member's vacated slot.
+    /// Non-party followers follow the party, never preceding its active members.
+    pub(crate) fn follower_formation(&self, leader: ObjectId) -> Vec<(ObjectId, usize)> {
+        let members = crate::engine::party_of(self);
+        let Some(leader_index) = members.iter().position(|&id| id == leader) else {
+            return Vec::new();
+        };
+        let mut formation: Vec<_> = members
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|&(_, id)| id != leader)
+            .map(|(i, id)| {
+                let index = if i == 0 { leader_index } else { i };
+                (id, index - 1)
+            })
+            .collect();
+        if let Some(hero) = self.world.hero.and_then(|h| self.world.get(h)) {
+            for (i, &id) in hero.escorts.iter().enumerate() {
+                if !members.contains(&id) {
+                    formation.push((id, members.len() + i - 1));
+                }
+            }
+        }
+        formation
+    }
+
+    /// Keeps the party with its leader as [`Sim::walk`] steps it along: each living
     /// follower in the same area that follows the leader (`SetFollowPartyLeader`, on unless
     /// turned off) and is not fighting or busy with anything but waiting or its own follow
     /// move is put on its formation slot behind the leader ([`behind`], the exe's table at
     /// 0xc0d240). Provisional: followers are placed rather than walked (this serves the
     /// stepped walk of the tools; in play `Sim::keep_party_together` runs them there).
     pub fn follow_leader(&mut self, leader: ObjectId) {
-        let Some((pos, area, facing, followers)) = self.world.get(leader).map(|o| {
-            let mut all = o.followers.clone();
-            all.extend(o.escorts.iter().copied());
-            (o.position, o.area, o.facing, all)
-        }) else {
+        let Some((pos, area, facing)) = self
+            .world
+            .get(leader)
+            .map(|o| (o.position, o.area, o.facing))
+        else {
             return;
         };
-        for (i, f) in followers.into_iter().enumerate() {
+        for (f, i) in self.follower_formation(leader) {
             // A move of its own (a script's order, such as Alistair's walk to the tent after
             // Ostagar's war council) is left to finish: carried along meanwhile, it was
             // resumed when the walk stopped, and the follower walked back across the camp.
@@ -2471,10 +2504,10 @@ impl Sim {
     /// follows the leader (`SetFollowPartyLeader`, on unless turned off), is not fighting
     /// and has nothing to do but wait or its own follow move runs to its place behind the
     /// leader once it is more than [`FOLLOW_START`] from it, and is sent on again when that
-    /// place moves more than [`FOLLOW_RETARGET`] from where it is heading. Places are where
-    /// followers arrive with the leader (`behind`). Provisional: the original's party follow
-    /// (its distances, formation and pathing) is not traced; this keeps followers with the
-    /// leader the way [`Sim::follow_leader`] does for [`Sim::walk`].
+    /// place moves more than [`FOLLOW_RETARGET`] from where it is heading. Places use the
+    /// ordinary follow table (`behind`), with the same membership order as
+    /// [`Sim::follow_leader`]. Provisional: movement-vector heading, formation mirroring,
+    /// perception-based warping and the full native re-target rule are not modelled.
     pub fn keep_party_together(&mut self) {
         let combat = constant(&self.table, "GM_COMBAT");
         let Some(leader) = self.world.controlled().or(self.world.hero) else {
@@ -2516,11 +2549,7 @@ impl Sim {
                 .first()
                 .is_some_and(|c| c.name.starts_with("CommandMoveTo") && c.from.is_some())
         });
-        let followers: Vec<ObjectId> = crate::engine::party_of(self)
-            .into_iter()
-            .filter(|&f| f != leader)
-            .collect();
-        for (i, f) in followers.into_iter().enumerate() {
+        for (f, i) in self.follower_formation(leader) {
             let ours = self.following.contains(&f);
             let Some(o) = self.world.get(f) else { continue };
             let free = !o.dead
@@ -4421,6 +4450,13 @@ impl Sim {
             // and reports itself done at once.
             let set = cmd.ints.first().copied().unwrap_or(-1);
             self.switch_weapon_set(id, set);
+        } else if self.game == thedas_vfs::Game::Origins
+            && matches!(
+                cmd.name.as_str(),
+                "CommandSheatheWeapons" | "CommandUnsheatheWeapons"
+            )
+        {
+            self.set_weapons_drawn(id, cmd.name == "CommandUnsheatheWeapons");
         } else if cmd.name == "CommandUseObject" {
             // Using a placeable (a door, a lever) sends it EVENT_TYPE_USE, as clicking it does.
             if let Some(t) = cmd.target.filter(|&t| self.world.get(t).is_some()) {
@@ -5496,7 +5532,8 @@ fn cif_vars(g: &Gff4) -> Vec<(String, thedas_formats::gff4::Value)> {
 }
 
 /// The campaign file: script (17104), start area (17101), start position (17102) and the area
-/// tree (3290). Field meanings provisional, read from `singleplayer.cif`.
+/// tree (3290). Origins' additional package list is field 17124 (0x5fd7f3).
+/// Other field meanings remain provisional, read from `singleplayer.cif`.
 fn parse_cif(g: &Gff4) -> ModuleInfo {
     let s = |l: u32| {
         g.field(g.root, l)
@@ -5509,6 +5546,15 @@ fn parse_cif(g: &Gff4) -> ModuleInfo {
         start_area: s(17101).or_else(|| s(17100)),
         ..Default::default()
     };
+    if let Some(thedas_formats::gff4::Value::List(Some(thedas_formats::List::String(packages)))) =
+        g.field(g.root, 17124)
+    {
+        info.packages = packages
+            .iter()
+            .flatten()
+            .map(|name| name.trim_end_matches('\0').to_string())
+            .collect();
+    }
     if let Some(thedas_formats::gff4::Value::Vec3(p)) = g.field(g.root, 17102) {
         info.start_position = *p;
     }
@@ -5734,6 +5780,47 @@ impl ScriptHost<'_> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn package_loaded_campaign_cif_reads_its_explicit_dependency_list() {
+        use thedas_formats::gff4::{
+            FieldDef, FourCC, List, StructData, StructTemplate, Value as G, Version,
+        };
+        let mut g = Gff4 {
+            version: Version::V40,
+            platform: FourCC::new(b"PC  "),
+            file_type: FourCC::new(b"CIF "),
+            file_version: FourCC::new(b"V0.1"),
+            templates: vec![StructTemplate {
+                label: FourCC::new(b"CIF "),
+                fields: vec![FieldDef {
+                    label: 17124,
+                    type_code: 14,
+                    flags: 0x8000,
+                    offset: 0,
+                }],
+                size: 4,
+            }],
+            structs: vec![StructData {
+                template: 0,
+                values: vec![G::List(Some(List::String(vec![
+                    Some("core_ep1\0".into()),
+                    None,
+                    Some("another".into()),
+                ])))],
+            }],
+            root: StructId(0),
+            shared_strings: None,
+        };
+        let parsed = Gff4::parse(&g.write().unwrap()).unwrap();
+        assert_eq!(parse_cif(&parsed).packages, vec!["core_ep1", "another"]);
+        g.structs[0].values[0] = G::List(None);
+        let parsed = Gff4::parse(&g.write().unwrap()).unwrap();
+        assert!(parse_cif(&parsed).packages.is_empty());
+        g.templates[0].fields.clear();
+        g.structs[0].values.clear();
+        assert!(parse_cif(&g).packages.is_empty());
+    }
+
     fn add_command_sim() -> Sim {
         let ldf = "#define ENGINE_STRUCTURE_2 command\n\
             command CommandWait(float seconds) = 1;\n\
@@ -6494,6 +6581,24 @@ mod tests {
                     "{game:?}, Useable={useable:?}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn ring_weapon_queries_commands_retain_draw_state_after_completion() {
+        let mut s = sim();
+        let c = s.world.spawn(ObjectKind::Creature, "guard");
+        for (name, expected) in [
+            ("CommandUnsheatheWeapons", true),
+            ("CommandSheatheWeapons", false),
+        ] {
+            s.world.get_mut(c).unwrap().commands.push(Command {
+                name: name.into(),
+                ..Default::default()
+            });
+            s.finish_command(c);
+            assert_eq!(s.weapons_unsheathed(c), expected);
+            assert!(s.world.get(c).unwrap().commands.is_empty());
         }
     }
 
@@ -7321,6 +7426,56 @@ mod tests {
     }
 
     #[test]
+    fn arrival_does_not_place_active_recruits_twice() {
+        for game in [thedas_vfs::Game::Origins, thedas_vfs::Game::DragonAge2] {
+            let table =
+                EngineTable::parse(format!("{LDF}\nint FOLLOWER_STATE_ACTIVE = 1;\n").as_bytes())
+                    .unwrap();
+            let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(table), 7);
+            s.game = game;
+            let old = s.world.spawn(ObjectKind::Area, "old");
+            let area = s.world.spawn(ObjectKind::Area, "next");
+            s.world.get_mut(area).unwrap().template = "next".into();
+            s.world.area = Some(old);
+            let hero = s.world.spawn(ObjectKind::Creature, "hero");
+            let a = s.world.spawn(ObjectKind::Creature, "a");
+            let b = s.world.spawn(ObjectKind::Creature, "b");
+            s.world.hero = Some(hero);
+            s.world.get_mut(hero).unwrap().followers = vec![a, b];
+            let active = constant(&s.table, "FOLLOWER_STATE_ACTIVE");
+            assert_ne!(active, 0);
+            for id in [hero, a, b] {
+                let o = s.world.get_mut(id).unwrap();
+                o.area = Some(old);
+                if id != hero {
+                    o.fields.insert("FollowerState".into(), active);
+                }
+            }
+            assert_eq!(s.party_pool(), [a, b]);
+            let wp = s.world.spawn(ObjectKind::Waypoint, "entry");
+            let o = s.world.get_mut(wp).unwrap();
+            o.area = Some(area);
+            o.position = [20.0, 30.0, 0.0];
+            s.area_transition("next", "entry");
+            for (id, want) in [(a, [19.0, 29.5, 0.0]), (b, [21.0, 29.5, 0.0])] {
+                assert_eq!(s.world.get(id).unwrap().position, want, "{game:?}");
+                let enters = s
+                    .world
+                    .queue
+                    .values()
+                    .filter(|q| q.target == area && q.event.objects == [id])
+                    .count();
+                assert_eq!(enters, 1, "each recruit hears ENTER once");
+            }
+            // Loading a historical bad position must not silently rearrange the save.
+            s.world.get_mut(a).unwrap().position = [20.0, 27.5, 0.0];
+            let saved = s.save_game();
+            s.load_game(saved).unwrap();
+            assert_eq!(s.world.get(a).unwrap().position, [20.0, 27.5, 0.0]);
+        }
+    }
+
+    #[test]
     fn arrival_keeps_blocked_points_and_searches_off_grid() {
         let mut s = sim();
         let area = s.world.spawn(ObjectKind::Area, "a");
@@ -7754,6 +7909,110 @@ mod tests {
             p[1] > 5.0 && p[0].abs() < 1.0,
             "on his way to the tent: {p:?}"
         );
+    }
+
+    #[test]
+    fn following_preserves_party_slots_when_any_member_leads() {
+        for game in [thedas_vfs::Game::Origins, thedas_vfs::Game::DragonAge2] {
+            for timed in [false, true] {
+                for leader_index in 0..4 {
+                    let mut s = sim();
+                    s.game = game;
+                    let area = s.world.spawn(ObjectKind::Area, "a");
+                    let members: Vec<_> = (0..4)
+                        .map(|i| s.world.spawn(ObjectKind::Creature, &format!("member{i}")))
+                        .collect();
+                    let escort = s.world.spawn(ObjectKind::Creature, "escort");
+                    let leader = members[leader_index];
+                    s.world.hero = Some(members[0]);
+                    s.world.controlled = Some(leader);
+                    s.world.get_mut(members[0]).unwrap().followers = members[1..].to_vec();
+                    s.world.get_mut(members[0]).unwrap().escorts = vec![escort];
+                    for id in members.iter().copied().chain([escort]) {
+                        let o = s.world.get_mut(id).unwrap();
+                        o.area = Some(area);
+                        o.position = [-20.0; 3];
+                    }
+                    let pos = [20.0, 30.0, 0.0];
+                    let o = s.world.get_mut(leader).unwrap();
+                    o.position = pos;
+                    o.facing = 270.0;
+                    if timed {
+                        s.keep_party_together();
+                    } else {
+                        s.follow_leader(leader);
+                    }
+                    // Native 0x631d90: member zero takes the leader's vacated slot;
+                    // all other members retain index - 1. Escorts follow the party.
+                    for (i, id) in members.iter().copied().chain([escort]).enumerate() {
+                        let o = s.world.get(id).unwrap();
+                        if id == leader {
+                            assert!(o.commands.is_empty());
+                            assert_eq!(o.position, pos);
+                            continue;
+                        }
+                        let slot = if i == 0 { leader_index - 1 } else { i - 1 };
+                        let want = behind(pos, 270.0, slot);
+                        let got = if timed {
+                            o.commands
+                                .first()
+                                .and_then(|c| c.location)
+                                .unwrap()
+                                .position
+                        } else {
+                            o.position
+                        };
+                        assert_eq!(
+                            got, want,
+                            "{game:?}, timed={timed}, leader={leader_index}, member={i}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ineligible_followers_keep_their_slots_reserved() {
+        for timed in [false, true] {
+            let mut s = sim();
+            let area = s.world.spawn(ObjectKind::Area, "a");
+            let members: Vec<_> = (0..5)
+                .map(|i| s.world.spawn(ObjectKind::Creature, &format!("member{i}")))
+                .collect();
+            s.world.hero = Some(members[0]);
+            s.world.get_mut(members[0]).unwrap().followers = members[1..].to_vec();
+            for &id in &members {
+                let o = s.world.get_mut(id).unwrap();
+                o.area = Some(area);
+                o.position = [20.0, 30.0, 0.0];
+            }
+            s.world.get_mut(members[0]).unwrap().position = [0.0; 3];
+            s.world.get_mut(members[1]).unwrap().dead = true;
+            s.world.get_mut(members[2]).unwrap().area = None;
+            s.world
+                .get_mut(members[3])
+                .unwrap()
+                .fields
+                .insert("FollowPartyLeader".into(), 0);
+            if timed {
+                s.keep_party_together();
+            } else {
+                s.follow_leader(members[0]);
+            }
+            for &id in &members[1..4] {
+                let o = s.world.get(id).unwrap();
+                assert_eq!(o.position, [20.0, 30.0, 0.0]);
+                assert!(o.commands.is_empty());
+            }
+            let o = s.world.get(members[4]).unwrap();
+            let got = if timed {
+                o.commands[0].location.unwrap().position
+            } else {
+                o.position
+            };
+            assert_eq!(got, behind([0.0; 3], 0.0, 3));
+        }
     }
 
     #[test]

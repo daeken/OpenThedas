@@ -1045,7 +1045,9 @@ fn sim_values_with(
     // The training step shown (`trainingsteps.gda`'s row; 0 none), see `thedas_sim::training`.
     v.insert(
         "Tutorials.TrainingStep".into(),
-        num(if sim.tutorials_held() {
+        // Held back behind a screen, as the tutorial list is: the popup layer is over every
+        // screen now, and a step's panel over the journal or map is not the game's.
+        num(if tutorials_held {
             0
         } else {
             sim.world.training.step
@@ -1549,7 +1551,12 @@ fn item(sim: &Sim, prefix: &str, id: u32, v: &mut BTreeMap<String, UiValue>) {
     set("AbilityID", num(ability.unwrap_or(ITEM_ABILITY_INVALID)));
     set("RecipeID", field("CraftingRecipeID", 0));
     set("Unique", field("Unique", 0));
-    set("Irremovable", num(o.plot as u8));
+    let irremovable = if sim.game == thedas_vfs::Game::Origins {
+        sim.item_irremovable(id)
+    } else {
+        o.plot
+    };
+    set("Irremovable", num(irremovable as u8));
     for k in [
         "Damaged",
         "Indestructible",
@@ -2230,7 +2237,10 @@ fn inventory(sim: &Sim, who: Option<u32>, filter: i32, v: &mut BTreeMap<String, 
     let Some(o) = who.and_then(|w| sim.world.get(w)) else {
         return;
     };
-    v.insert("GUI.SelectedChar.CanChangeEquipment".into(), num(1));
+    v.insert(
+        "GUI.SelectedChar.CanChangeEquipment".into(),
+        num(sim.can_change_equipment(o.id) as u8),
+    );
     let (layout, can_switch) = equipment_layout(sim, &o.tag);
     v.insert("GUI.SelectedChar.EquipmentLayout".into(), num(layout));
     v.insert(
@@ -2503,6 +2513,42 @@ mod tests {
             },
         );
         assert!(other.contains_key(&format!("{k}.0")));
+    }
+
+    #[test]
+    fn equipment_flags_use_native_state_instead_of_plot_or_unconditional_access() {
+        let mut sim = Sim::new(
+            std::sync::Arc::new(thedas_vfs::Vfs::new()),
+            std::sync::Arc::new(thedas_script::EngineTable::default()),
+            1,
+        );
+        let hero = sim.world.spawn(ObjectKind::Creature, "hero");
+        sim.world.hero = Some(hero);
+        let gear = sim.world.spawn(ObjectKind::Item, "gear");
+        sim.world.get_mut(hero).unwrap().inventory.push(gear);
+        sim.world
+            .get_mut(hero)
+            .unwrap()
+            .fields
+            .insert("CanChangeEquipment".into(), 0);
+        sim.world
+            .get_mut(gear)
+            .unwrap()
+            .fields
+            .insert("Irremovable".into(), 1);
+        let values = sim_values(&sim);
+        assert_eq!(values["GUI.SelectedChar.CanChangeEquipment"], num(0));
+        assert_eq!(
+            values["GUIInventory.PartyBackpackView.0.Item.Irremovable"],
+            num(1)
+        );
+        sim.game = thedas_vfs::Game::DragonAge2;
+        let values = sim_values(&sim);
+        assert_eq!(values["GUI.SelectedChar.CanChangeEquipment"], num(1));
+        assert_eq!(
+            values["GUIInventory.PartyBackpackView.0.Item.Irremovable"],
+            num(0)
+        );
     }
 
     #[test]
