@@ -77,8 +77,13 @@ In encounter 10008, Hawke's damage/impacts change from 596.194/75 to
 the damage calculations are unchanged. GetAILevel's unimplemented count
 drops from 113 to zero.
 
-Formatting, strict workspace/all-target clippy, 1,405 workspace tests
-(25 ignored, zero failures), and the release MCP/CLI/app build pass.
-The matched Origins and corpus checks are still running at this checkpoint.
+Formatting, strict workspace/all-target clippy and the release MCP/CLI/app
+build pass. Workspace tests: 1,405 passed, 25 ignored, zero failures.
+Seven paired Origins scenarios have zero log or plot-sequence differences;
+all eight produced checkpoint JSONs are identical, with game_over false.
+Tower reaches Flemeth's hut on both builds. Four 600-tick Origins fixtures
+pass repeat and save/reload determinism. Both corpus runs pass 32,864 files
+with identical report JSON and the same 5,219 existing undeclared-action
+diagnostics.
 
 No HP, damage, difficulty or AI frequency values are retuned.
