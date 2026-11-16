@@ -90,7 +90,7 @@ Each entry gives what the original does, what we do, evidence, a rough size (S <
 4. **Placeable popup text** (GetPlaceablePopupText, 53 calls) is not implemented. Size S.
 5. **Music volume states by tag** (SetMusicVolumeStateByTag, 52 calls) are not implemented. Audio dep. Size S.
 6. **BeginSlideshow** (6 calls, ending slides) and **PlayMovie** (3) are not implemented. Size S–M. Deps: UI.
-7. **Training mode and tutorial steps** (BeginTrainingStep, HighlightGuiElement) are not implemented; single-script use. Size S.
+7. **Training mode and tutorial steps**: BeginTrainingStep and HighlightGuiElement are implemented (the highlight ends when the step's event fires; the exe's handler for it is not traced).
 8. **Cheat flag, play time and completion %** (SetCheatUsedFlag 48, GetPlayTime, SetGameCompletionPercentage): trivial, but GetPlayTime matters for achievements. Size S.
 9. **Time of day, weather and atmosphere**: ResetAtmosphere is not implemented, and nothing in the sim tracks time of day. Size S (as far as the sim goes).
 10. **World map**: travel is instant. Random encounters exist in worldmap.rs, but the encounter chance and table rules are not verified. Size M.
