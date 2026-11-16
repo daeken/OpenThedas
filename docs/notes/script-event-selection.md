@@ -28,6 +28,12 @@ corresponding interface at `0x750d61` (vtable `0xb1bf5c`). Both tables select
 and forwards the event to `0x698960`. These two concrete paths establish
 the scope of the replacement correction.
 
+Queued delivery reaches the same selector. The generic message dispatcher
+`0x64a8c0` resolves the target's CCObject and calls primary virtual `+0xc8`.
+The creature implementation `0x6a25c0` and placeable implementation
+`0x74d030` forward message kind 10 to `0x698a50`. Its branch at `0x698afd`
+calls `0x698960` at `0x698b11`.
+
 `Sim::deliver` now follows this precedence for Origins creatures and
 placeables: a nonempty table-114 `Script` cell, then an explicit override
 when present, then the object's own script. A table script can therefore
@@ -40,16 +46,16 @@ at delivery rather than when the event is queued.
 Synthetic regressions execute scripts and verify the selected script,
 scriptless objects, empty and missing table values, explicit-empty
 suppression, queued delivery, and preservation of DA2 and module/area
-routes. No saved state or table content changes. Disabled-event sets,
-other object routes, module/area senders, script-side `HandleEvent`, and
+routes. Disabled-event sets, other object routes, module/area senders,
+script-side `HandleEvent`, and
 all direct-dispatch callers remain outside this bounded fix.
 
 ## Complete-world comparison
 
-The full s01–s16 comparison of main `68797d17` and runtime head `44eccbdd`
+The full s01–s16 comparison of main `d87590e5` and runtime head `636e792f`
 has 32 successful exits, matching ending areas, sixteen matching story logs,
 sixteen matching ordered plot-write traces and sixteen matching command
-traces. All 9,042 health inspections and 45 before/after heal pairs agree.
+traces. All 8,895 health inspections and 44 before/after heal pairs agree.
 Four 600-tick Origins determinism checks agree on repeat and save/reload,
 and all six origins load and advance 60 ticks.
 
@@ -66,11 +72,12 @@ script, which delegates through `creature_core` to `rules_core`. Direct table
 dispatch removes two transient allocations and one read-only plot diagnostic
 for that single event. Every other saved field agrees in both probes.
 
-Eleven engine-log files differ. A strict comparison accounts for 358 entries
+Eleven engine-log files differ. A strict comparison accounts for 360 entries
 whose only difference is a transient engine-handle number. It also accounts
-for 15 fewer read-only Doomsayer plot diagnostics in s15 and 46 fewer in s16.
-Every removed diagnostic coincides with that creature's matching completed
-animation command. All remaining engine-log text and metadata agree.
+for 12 fewer read-only Doomsayer plot diagnostics in s15 and 49 fewer in s16.
+The timestamp multiset of removed diagnostics exactly matches that creature's
+completed animation commands, including multiplicity. All remaining engine-log
+text and metadata agree.
 
 The complete inherited final plot maps agree at every step.
 
@@ -90,27 +97,28 @@ The complete inherited final plot maps agree at every step.
 | s12 | 232 | Equal |
 | s13 | 262 | Equal |
 | s14 | 297 | Equal |
-| s15 | 304 | Equal |
-| s16 | 331 | Equal |
+| s15 | 303 | Equal |
+| s16 | 329 | Equal |
 
 Sixteen installed-table event probes exercise scriptless creatures and
 placeables, explicit overrides and ITEM_ONHIT/COMMAND_COMPLETE delivery.
-The corpus passes with 563,678 entries, 10,652 archives, 155,719 GFF round
-trips and all 774 typed placeable walkmeshes. The existing 5,219 undeclared
-action diagnostics remain nonfatal. Human Noble and Dwarf Commoner hidden
+The corpus passes in 619 seconds with 563,678 entries, 10,652 archives,
+155,719 GFF round trips and all 774 typed placeable walkmeshes. The existing
+5,219 undeclared-action diagnostics remain nonfatal. Human Noble and Dwarf Commoner hidden
 character-creation click-throughs reach their verified names and openings.
 Their staged comparisons include absolute RGB Delta ×4 panels with a
-maximum-channel threshold greater than 2/255. Human Noble changes four
-pixels, or 0.000434%, and Dwarf Commoner is pixel-identical.
+maximum-channel threshold greater than 2/255. Human Noble changes thirteen
+pixels, or 0.001411%, and Dwarf Commoner is pixel-identical. Both deltas are
+essentially zero.
 
 Separate DA2 repeats and four paired complete saves agree. Both binaries'
 DA2 save/reload checks differ at `next_effect_id`, from 2 to 3. The standalone
-Tower control on exact main exits 3 after 1,080 seconds when its server hits
-the 4 GiB memory watchdog, with the last checkpoint at 350 steps and 7,923
-calls. Candidate standalone execution is deferred after that baseline
+Tower control on exact main exits 3 after 2,403 seconds when its server hits
+the 4 GiB physical-footprint watchdog, with the last checkpoint at 300 steps
+and 6,886 calls. Candidate standalone execution is deferred after that baseline
 failure. The full-chain Tower scenarios complete on both binaries.
 
 Private evidence is retained under
-`codex-mods-target/gaps/scr065-event-table-final/`, including the strict
+`codex-mods-target/gaps/scr065-event-table-review/`, including the strict
 complete-save/log classification, identical-input delegation probes,
 final plot maps, binary and harness hashes, captures and control outcomes.
