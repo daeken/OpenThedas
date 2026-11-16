@@ -24,12 +24,52 @@ and an nginx site on the test server. Paths below are relative to the folder hol
      case-sensitivity, mod layers (`player_layers`), status, coverage counters, frame stats,
      snapshot ages and marked `regions`;
    - `log.txt`: the last 400 log lines, from a tee around env_logger;
+   - `log.full.txt`: the session log up to the press, bounded to 20,000 physical lines and
+     8 MiB (individual messages truncate at 16 KiB). `report.json.log` gives retained and
+     dropped line counts. Both logs use the same tee/filter;
+   - `presentation.json`: the camera's mode, position, direction/target, field of view and
+     explore zoom; each drawn creature/placeable candidate's id/tag, last placement vs.
+     sim position, cached skeleton roots vs. rest/sim, facing, animation resources and
+     layers (seconds, 30 fps frame coordinate, length, weight, additive/absolute/phase),
+     head/eye tracking target, actual renderer opacity and attached VFX. Scene candidates
+     include offscreen/shadow-only objects, labelled by `seen_in_view_or_shadow`; fully
+     hidden objects are omitted. Cinematic/free cameras store a point 1 m down the actual
+     view direction rather than inventing a focus distance (`target_kind` says which).
+     Near-camera emitters (within 50 m, at most 512) include position, material, particle
+     count, opacity and animation overrides. Sound starts cover the last 10 s, at most
+     512 successful event requests, or `null` with audio disabled. The interface lists
+     open movies, contexts/screens, and the bridge's current observed/HUD values, capped
+     at 1024 values / 8192 nodes / 512 characters per string (lists/objects cap at 64,
+     nesting at 8). Counts/limits make truncation visible;
+     observer discovery caps at 4096 tokens and value selection at 3072 candidates,
+     using sorted-map prefix ranges so capture work is bounded too;
+   - `frames.json`: the last 600 raw frame times, oldest first, each with sim time, area,
+     loading/cutscene/conversation flags, screens and cheap renderer draw statistics.
+     These counts describe loaded scene draws, skipped draws and particle draws, not
+     per-pass GPU visibility. The existing summary stays in `report.json.frames`;
+   - `options.ini` (the active `--settings` file, else the data-folder default) and
+     `launcher.json` from the data folder, when present. The worker parses and sanitizes
+     them: key/token/password/secret/credential/authorization/webhook fields are dropped,
+     recursively in JSON and by field/section in INI; INI comments are discarded.
+     Invalid/unreadable or over-1-MiB configs are omitted with a warning. Home paths in all
+     new files become `~` locally as well as in uploads;
    - `input.txt`: the last 120 s of input;
    - `trace.json`: `Trace::recent` (the sim's last 4000 command, log, dialog, plot, failed-script
      and missing entries);
    - `journal_checkpoint.json` and `journal.jsonl`: the sim stream's journal, which replays the
      session exactly;
    - `note.txt`.
+   The press clones the save and reads already cached presentation data. Save serialization,
+   journal copying, JSON/config/log writes, screenshot writes, and marked PNG encoding run
+   on a dedicated worker. Completion (including the control reply/upload) waits for that
+   worker without blocking the frame loop. Journal file handles plus the length at the
+   press pin the checkpoint/log even if a checkpoint is rotated or inputs are appended.
+   `report.json.capture_ms`, `capture_timings_ms` (presentation, metadata, save clone, trace),
+   and the `report: captured state` log measure snapshot overhead;
+   screenshot readback remains the existing frame-capture path.
+   Presentation collection is warmed once behind the loading screen when a scene is ready,
+   so its first-use code/serialization cost does not land on the first F8 press. This only
+   reads cached state and discards the warm-up snapshot.
 2. **Mark spots** (mouse and pad). After F8 the player is offered "Mark spots", drags a box
    around each problem and types a note for it. Each spot's note is followed by "Mark another
    spot" / "Done marking"; Done goes straight to the overall note. F8, Enter or Escape (B or
@@ -47,7 +87,10 @@ and an nginx site on the test server. Paths below are relative to the folder hol
    - Home-folder paths become `~` and the install path is dropped.
    - The total is kept under Discord's 10 MB. Order of giving way: the screenshot first goes to
      half size, then the journal is left out (`journal_left_out` in the uploaded report.json),
-     then the screenshot is dropped.
+     then the supplemental files give way in order: `log.full.txt`, `frames.json`,
+     `options.ini`, `launcher.json` (`files_left_out` records why), then the screenshot is
+     dropped. `presentation.json` always stays. Local files remain available even when
+     left out of an upload.
    - `sent.json` in the folder records the Discord message id.
 5. **Track.** `report_sync.py` runs every 3 minutes on the Mac.
    - It opens a GitHub issue labelled `player-report` for each new game report in
@@ -171,7 +214,84 @@ exact commit in a detached worktree (`OpenThedas-wt/report-mac`, target `report-
 
 ## How to test this area
 
-Use a scratch HOME and a control port of your own; this stream used 7900-7909.
+Use a scratch HOME and the control port assigned by the current job brief (report-capture:
+8049 only). Run builds and hidden-window probes through `cargo-slot.sh`, with `-j 2`.
+
+### Replay an F8 report
+
+`thedas replay <report-folder-or-zip>` reads `journal_checkpoint.json` and every input in
+`journal.jsonl`, checks the intermediate world hashes, then compares the complete saved state
+with `save_now.json`. A mismatch prints the first differing JSON pointer (including object ID,
+field and tag when available). It stops at the first intermediate hash divergence and retains
+that actual state for inspection. It never modifies or extracts the report.
+
+```sh
+thedas replay captures/report --install "$GAME" --save captures/replayed.json
+thedas replay captures/report.zip --install "$GAME"
+thedas replay captures/report --install "$GAME" --until 120000 --save captures/early.json
+thedas-app --install "$GAME" --save captures/replayed.json
+thedas-app --install "$GAME" --save captures/replayed.json --capture captures/replayed.png
+```
+
+- The install defaults to `THEDAS_INSTALL`, then the path recorded in `report.json` (uploaded
+  reports redact that path, so normally pass `--install`). Use the same game assets, add-ins,
+  keys and mod layers as the reporter. Reports do not contain those resources. Use a scratch
+  HOME for automated runs, and `THEDAS_HIDDEN_WINDOW=1` for any engine window.
+- The running CLI's commit must equal the journal header's build; refusal prints both.
+  There is no bypass. To investigate an older report, check out its commit and transplant only
+  the replay CLI files/registration/build script, zip dependency and the additive
+  `thedas_sim::replay::load_checkpoint` helper, leaving its existing simulation, script,
+  resource and save logic intact. Build there; do not relabel a current binary as old.
+- `--until` is **absolute world time in milliseconds**, not elapsed time since the checkpoint.
+  It stops before the first input that would exceed the limit, including within a repeat;
+  it never shortens a tick. Commands at the same time still run (cutscenes can hold world time).
+  A limit earlier than the checkpoint is refused.
+- Exit **0** means the complete F8 saved state matched; **1** means a differing state,
+  intermediate hash divergence, or an early stop before F8; **2** means replay was impossible
+  (build/revision/checkpoint mismatch, missing files/resources, malformed/truncated log, bad zip
+  or failed output write). An uploaded report whose journal was left out cannot replay.
+- `--save` writes the reached state even on divergence or an early stop, so the app can open
+  it with `--save`. Rendering remains the app's job; replay itself needs no GPU or control port.
+- Zips can have flat contents or one enclosing report folder. Paths are validated and each
+  selected file is limited to 128 MiB after decompression; ambiguous or duplicate files fail.
+- Synthetic unit fixtures only: `cargo test -p thedas-cli replay::`. They exercise checkpoint
+  serialization, repeated inputs, strict log validation, build refusal, first hash divergence,
+  early stopping, field differences outside the world hash, folder/zip parity and unsafe zips.
+  For an end-to-end synthetic report, run the app in a scratch HOME with `--journal` plus
+  `--control`, play a few ticks, request `report` with a test note, then replay the resulting
+  folder and zip using a CLI built at that same commit.
+
+#### Verified reports and recording gaps
+
+The serial validation at `9469b3e0` passed 10 replay tests and the workspace suite (1,332
+passed, 19 ignored), plus clippy with warnings denied. The 100-input synthetic simulation
+report matched as both a folder and zip (exit 0); an altered target returned 1, and build
+mismatch, truncated input and an output inside the report returned 2. A real `--until 1000`
+run stopped at 989 ms and exported a loadable save. The app rendered an exported replay save
+to PNG in a scratch HOME with its hidden-window setting.
+
+The following game-derived originals were tested on release builds at their header commits,
+with only the replay tool and additive checkpoint helper backported. Every logged input and
+intermediate hash passed; all original input files stayed unchanged. None of these originals
+matched the **complete** F8 saved state:
+
+| Report | Build | Inputs applied | Exit / first difference |
+| --- | --- | ---: | --- |
+| `2026-11-15-04-25-bdc210ar_players_home` | `d87f9ef2` | 13,343 | 1: 16 ms short; object 118's `combat.regen_ms` |
+| `2026-11-15-21-29-bdc130ar_tapsters_tavern` | `c006baa4` | 701 | 1: journal-entry `seq`, despite equal world clocks |
+| `2026-11-15-21-46-bdc200ar_slums` | `c006baa4` | 2,420 | 1: journal-entry `seq`; clock also 27 ms short |
+| Uploaded zip from issue #986 | `c006baa4` | 3,516 | 1: journal-entry `seq`; clock also 17 ms short |
+
+In a **separate diagnostic copy**, adding one 16 ms tick to the first log produced an exact
+complete-state match. Replay never invents that input itself. `GameJournal::files` flushes its
+writer without draining the sim's pending input log, so a report can omit its current frame.
+An independently driven F8 test reproduced this with a 100 ms gap and zero logged inputs.
+Journal-entry sequence differences are outside `world_hash` and are caught by the final
+structural comparison. These are recording/reconstruction gaps to investigate, not reasons
+to ignore differing fields. Keep real fixtures and proof logs outside git, under
+`OpenThedas-testdata/codex-captures/report-replay/`.
+
+### Report and updater checks
 
 - `report/drive_report.py APP SAVE [PORT] [RUN_MS]`: report files; `POPUP=1` for the typed note;
   `THEDAS_REPORT_UPLOAD=1` plus a copied `discord-webhook` or `update-url` to really send.
@@ -186,6 +306,10 @@ Use a scratch HOME and a control port of your own; this stream used 7900-7909.
 - Unit tests: `cargo test -p thedas-app report:: upload:: update::`. They cover the ring,
   regions, the zip writer and reader, redaction, offers, sent-report scanning and the message
   format.
+  Capture tests additionally cover animation time/weights, 2 cm root offsets, bounded HUD
+  values, raw-frame context/eviction, full-log limits, worker completion/cancellation,
+  config sanitization, pinned journal prefixes, archive membership/redaction and upload
+  omission order. `thedas-audio` tests cover the sound-start ring.
 - Steps: `key f8` drives a report from `--steps` and `--control`; the `report` control command
   takes `"note"`.
 
@@ -204,8 +328,9 @@ Use a scratch HOME and a control port of your own; this stream used 7900-7909.
 
 ## Known gaps and ideas
 
-- The screenshot readback and `save_json` run on the frame thread (about 20 ms per snapshot on a
-  big save). Serializing on a worker would remove the hitch.
+- Screenshot readback and the periodic before-save ring still run on the frame thread.
+  F8's save serialization and file writes run on its worker; the save's in-memory clone
+  and the presentation snapshot stay at the press.
 - The update offer needs the HUD's popup layer; before a game it waits.
 - The Windows exes are console-subsystem, so a log window opens beside the game.
 - Mac packages are unsigned and Apple silicon only; there is no app bundle (the icon is set at

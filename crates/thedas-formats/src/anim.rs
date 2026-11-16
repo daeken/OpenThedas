@@ -175,6 +175,7 @@ mod ani {
     pub const NAME: u32 = 4006;
     pub const LENGTH: u32 = 4009;
     pub const ADDITIVE: u32 = 4011;
+    pub const UNSCALED: u32 = 4040;
     pub const TARGET: u32 = 4000;
     pub const KIND: u32 = 4001;
     pub const KEYS: u32 = 4004;
@@ -366,6 +367,10 @@ pub struct Animation {
     /// (0x544090 → 0x8110f0). Their first keys are the identity (`mh.po_2arm_06.ani`,
     /// `mh_o.eyejitter.ani`).
     pub additive: bool,
+    /// Field 4040: its translations are not scaled by the creature's appearance (the loader
+    /// 0x815fb0 keeps it at +0x2f; the blend setup 0x814ab1 then takes (1, 1, 1) for the
+    /// appearance's translation multipliers; notes/nonhuman-clip-retarget-trace.md).
+    pub unscaled: bool,
     pub tracks: Vec<Track>,
     /// Its float tracks ([`track_kind::FLOAT`]).
     pub scalars: Vec<ScalarTrack>,
@@ -556,6 +561,7 @@ impl Animation {
             name: d.opt_str(root, ani::NAME)?.unwrap_or_default(),
             length,
             additive: d.opt_i64(root, ani::ADDITIVE)?.is_some_and(|v| v != 0),
+            unscaled: d.opt_i64(root, ani::UNSCALED)?.is_some_and(|v| v != 0),
             tracks,
             scalars,
             colors,

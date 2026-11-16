@@ -440,6 +440,15 @@ impl GameBridge {
             .unwrap_or_default()
     }
 
+    /// Inspects the current values without cloning the whole interface state. The
+    /// callback must only read values, and must not call back into the bridge.
+    pub fn inspect_values<T>(
+        &self,
+        inspect: impl FnOnce(&BTreeMap<String, UiValue>) -> T,
+    ) -> Option<T> {
+        self.state.lock().ok().map(|s| inspect(&s.values))
+    }
+
     pub fn value(&self, name: &str) -> Option<UiValue> {
         self.state.lock().ok()?.values.get(name).cloned()
     }
