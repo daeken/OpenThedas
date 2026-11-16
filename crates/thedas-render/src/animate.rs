@@ -34,6 +34,11 @@ pub struct Clip {
     /// An animation made in memory (a speaker's lip sync, see `thedas_formats::facefx`),
     /// played in place of one looked up by `trees` and `actions`.
     pub inline: Option<Arc<Animation>>,
+    /// The creature's appearance's translation multipliers (`apr_base`, 0x6a13c0): the
+    /// clip's translation keys are scaled by them and added to the skeleton's own
+    /// translations (see [`crate::skeleton::Layer::scale`]). `None` keeps the older
+    /// first-key convention (a cutscene's poses).
+    pub translation_scale: Option<[f32; 3]>,
 }
 
 impl Default for Clip {
@@ -48,6 +53,7 @@ impl Default for Clip {
             weight: 1.0,
             phase: None,
             inline: None,
+            translation_scale: None,
         }
     }
 }
@@ -120,6 +126,40 @@ fn load<T>(
 }
 
 impl Animator {
+    /// The pose last sent to the renderer, without sampling or loading any resources.
+    pub fn last_pose(&self, prop: usize) -> Option<&crate::skeleton::Poses> {
+        self.last_poses.get(prop)?.as_ref().map(|(_, poses)| poses)
+    }
+
+    /// A clip's already loaded animation, for diagnostics on the frame thread. Never
+    /// reads the VFS (including when a resource was missing).
+    pub fn cached_animation_resource(&self, clip: &Clip) -> Option<(String, Arc<Animation>)> {
+        if let Some(animation) = &clip.inline {
+            return Some((animation.name.clone(), animation.clone()));
+        }
+        for tree in &clip.trees {
+            let Some(tree) = self
+                .trees
+                .get(&tree_resource(tree).to_ascii_lowercase())
+                .and_then(Option::as_ref)
+            else {
+                continue;
+            };
+            if let Some(name) = clip
+                .actions
+                .iter()
+                .find_map(|a| tree.action(a)?.animation.as_ref())
+            {
+                return self
+                    .animations
+                    .get(&name.to_ascii_lowercase())?
+                    .as_ref()
+                    .map(|animation| (name.clone(), animation.clone()));
+            }
+        }
+        None
+    }
+
     /// Forgets the skeletons posed so far (they are kept by their index in a scene), for
     /// posing another scene's; the animations read stay.
     pub fn forget_skeletons(&mut self) {
@@ -324,6 +364,7 @@ impl Animator {
             skeleton: s,
             rest,
             layers,
+            scale: clip.translation_scale.map(glam::Vec3::from_array),
         })
     }
 }
@@ -337,6 +378,8 @@ struct Prepared {
     skeleton: Arc<crate::skeleton::Skeleton>,
     rest: Arc<Vec<Mat4>>,
     layers: Vec<PreparedLayer>,
+    /// The clip's [`Clip::translation_scale`].
+    scale: Option<glam::Vec3>,
 }
 
 impl Prepared {
@@ -351,6 +394,7 @@ impl Prepared {
                 against_base: *b,
                 weight: *w,
                 nodes: n,
+                scale: self.scale,
             })
             .collect();
         let pose = self.skeleton.pose_mapped(&mapped);
@@ -531,6 +575,47 @@ mod tests {
     use thedas_formats::level::Transform;
     use thedas_formats::model::{Mmh, Node};
 
+    #[test]
+    fn diagnostics_resolve_only_cached_resources_and_try_fallback_trees() {
+        let mut animator = Animator::default();
+        animator.trees.insert("missing.anb".into(), None);
+        animator.trees.insert(
+            "loaded.anb".into(),
+            Some(Arc::new(AnimTree {
+                name: "loaded".into(),
+                nodes: vec![thedas_formats::anim::AnimNode {
+                    action: "idle".into(),
+                    animation: Some("fixture.ani".into()),
+                    speed: 1.0,
+                    once: false,
+                }],
+            })),
+        );
+        let animation = Arc::new(Animation {
+            name: "fixture".into(),
+            length: 2.0,
+            additive: false,
+            unscaled: false,
+            tracks: vec![],
+            scalars: vec![],
+            colors: vec![],
+        });
+        animator
+            .animations
+            .insert("fixture.ani".into(), Some(animation.clone()));
+        let mut clip = Clip {
+            trees: vec!["missing".into(), "LOADED".into()],
+            actions: vec!["idle".into()],
+            ..Default::default()
+        };
+        let (name, resolved) = animator.cached_animation_resource(&clip).unwrap();
+        assert_eq!(name, "fixture.ani");
+        assert!(Arc::ptr_eq(&resolved, &animation));
+        clip.actions = vec!["unloaded".into()];
+        assert!(animator.cached_animation_resource(&clip).is_none());
+        assert_eq!(animator.animations.len(), 1);
+    }
+
     fn node(name: &str, bone: u32, children: Vec<Node>) -> Node {
         Node {
             kind: thedas_formats::FourCC::new(b"node"),
@@ -569,7 +654,9 @@ mod tests {
             name: "wave".into(),
             length: 1.0,
             additive: false,
+            unscaled: false,
             scalars: Default::default(),
+            colors: Vec::new(),
             tracks: vec![
                 track(hashed("elbow_rotation"), Channel::Rotation),
                 // A bone this skeleton does not have stays hashed.
@@ -610,7 +697,9 @@ mod tests {
             name: "motion".into(),
             length: 1.0,
             additive: false,
+            unscaled: false,
             scalars: Vec::new(),
+            colors: Vec::new(),
             tracks: vec![Track {
                 bone: "elbow".into(),
                 channel: Channel::Translation,
@@ -642,6 +731,7 @@ mod tests {
                             Prepared {
                                 skeleton: skeleton.clone(),
                                 rest: Arc::new(skeleton.rest()),
+                                scale: None,
                                 layers: vec![(
                                     animation.clone(),
                                     time,

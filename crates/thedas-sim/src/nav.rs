@@ -533,6 +533,33 @@ pub enum Routed {
     Straight,
 }
 
+/// The grid's stand-in for DAOrigins.exe's flat failed-search fallback test (0x685920:
+/// three ground segments queried against the area's physics with mask 0x24, the query
+/// lifted by 0.5 m): no wall cell on the line ([`wall_between`]), and no walkable cell
+/// along it, sampled every half cell, whose floor stands more than 0.5 m above the line.
+/// Provisional: the sim has no physics scene; the segments' width and the exe's height
+/// queries are not modelled. See docs/notes/path-fallback-endpoints.md.
+pub fn flat_fallback_clear(g: &NavGrid, from: [f32; 3], to: [f32; 3]) -> bool {
+    if wall_between(g, from, to) {
+        return false;
+    }
+    let (dx, dy) = (to[0] - from[0], to[1] - from[1]);
+    let len = (dx * dx + dy * dy).sqrt();
+    let step = (g.cell_size * 0.5).max(0.05);
+    let n = (len / step).ceil() as usize;
+    (1..n).all(|i| {
+        let t = i as f32 * step / len;
+        let p = [
+            from[0] + dx * t,
+            from[1] + dy * t,
+            from[2] + (to[2] - from[2]) * t,
+        ];
+        g.cell(p)
+            .filter(|&c| walkable(g, c))
+            .is_none_or(|c| height(g, c) <= p[2] + 0.5)
+    })
+}
+
 /// Whether a wall of the pathing grid lies on the straight line between two points: a
 /// cell valued 9 (bits 0 and 3: the walls between rooms indoors, buildings outdoors) sampled
 /// every half cell, leaving out the first and last 0.75 m (a creature against a wall still
@@ -563,7 +590,7 @@ impl Sim {
     /// The closed doors of an area with the pathing-grid cells of their doorways: doors are
     /// the placeables whose appearance's state controller (`placeable_types.gda`) is
     /// `StateCnt_Door`; a door is closed in states 0 and 1 (`statecnt_door.gda`:
-    /// Closed_Unlocked, Closed_Locked), its state being field `State` (`SetPlaceableState`)
+    /// Closed_Unlocked, Closed_Locked), its state being field `State` (initially `InitialState`)
     /// or else the template's `AnimContState`. The doorway is the walkable cells within
     /// [`DOORWAY_RADIUS`] of the door.
     pub fn closed_doors(
@@ -591,7 +618,7 @@ impl Sim {
                     o.active
                         && (state == 0 || state == 1)
                         && o.placeable_group
-                            .is_none_or(|g| g & thedas_formats::phy::mask::CREATURES != 0)
+                            .is_none_or(|g| g & thedas_formats::phy::mask::NON_WALKABLE != 0)
                 })
             })
             .cloned()
@@ -982,7 +1009,8 @@ impl Sim {
             return Vec::new();
         };
         let mut out = Vec::new();
-        for o in self.world.objects.values() {
+        let actors = self.world.actor_ids();
+        for o in actors.iter().filter_map(|&id| self.world.get(id)) {
             if o.kind != crate::world::ObjectKind::Placeable || o.area != Some(area) || !o.active {
                 continue;
             }
@@ -1067,7 +1095,8 @@ impl Sim {
         let tables = self.world.tables();
         let types = tables.get(0, "placeable_types")?;
         let mut placed: Vec<(thedas_script::vm::ObjectId, String, [f32; 3], f32)> = Vec::new();
-        for o in self.world.objects.values() {
+        let actors = self.world.actor_ids();
+        for o in actors.iter().filter_map(|&id| self.world.get(id)) {
             if o.kind != crate::world::ObjectKind::Placeable || o.area != Some(area) || !o.active {
                 continue;
             }
@@ -1295,6 +1324,80 @@ mod tests {
         (s, hero)
     }
 
+    /// A sim whose area has a 7x3 grid of 1 m cells, walkable at height 0 except where
+    /// `cell` says otherwise (value, height), with the hero at (0.5, 1.5).
+    fn walled(cell: impl Fn(u32, u32) -> Option<(u8, f32)>) -> (Sim, thedas_script::vm::ObjectId) {
+        let (mut s, hero) = disconnected_levels(0.0);
+        let (w, h) = (7u32, 3u32);
+        let mut data = vec![1u8; (w * h) as usize];
+        let mut heights = vec![0.0; (w * h) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                if let Some((v, z)) = cell(x, y) {
+                    data[(y * w + x) as usize] = v;
+                    heights[(y * w + x) as usize] = z * 16.0;
+                }
+            }
+        }
+        let g = NavGrid {
+            columns: w,
+            rows: h,
+            cell_size: 1.0,
+            clearance: 2.0,
+            base: [0.0, 0.0, 0.0],
+            normal: [0.0, 0.0, 1.0],
+            data,
+            heights,
+            surfaces: Vec::new(),
+        };
+        s.nav_grids.insert("levels".into(), Some(Arc::new(g)));
+        (s, hero)
+    }
+
+    #[test]
+    fn a_failed_flat_walk_does_not_cross_a_wall_or_rising_floor() {
+        // Two rooms split by a wall column: no route, and the fallback would cross it.
+        let (mut s, hero) = walled(|x, _| (x == 3).then_some((9, 0.0)));
+        assert_eq!(s.route_to(hero, [5.5, 1.5, 0.0]), Routed::InvalidPath);
+        // Split by void instead, nothing in the way: the straight fallback stays.
+        let (mut s, hero) = walled(|x, _| (x == 3).then_some((10, 0.0)));
+        assert_eq!(s.route_to(hero, [5.5, 1.5, 0.0]), Routed::Straight);
+        // A raised walkable floor between them, too steep to path over, is in the way.
+        let (mut s, hero) = walled(|x, _| match x {
+            2 => Some((10, 0.0)),
+            3 => Some((1, 2.0)),
+            4 => Some((10, 0.0)),
+            _ => None,
+        });
+        assert_eq!(s.route_to(hero, [5.5, 1.5, 0.0]), Routed::InvalidPath);
+        s.game = thedas_vfs::Game::DragonAge2;
+        assert_eq!(s.route_to(hero, [5.5, 1.5, 0.0]), Routed::Straight);
+    }
+
+    #[test]
+    fn a_goal_in_a_wall_moves_back_toward_the_walker() {
+        // The goal is in the wall at column 4, at the height of the floor beyond it
+        // (column 5, 5 m up and out of reach), so the search goes for that floor and fails;
+        // the goal then moves back toward the walker onto column 3: the first row that
+        // reaches it, at its first sideways point (k = -n, 0x73e7f0).
+        let (mut s, hero) = walled(|x, _| match x {
+            4 => Some((9, 0.0)),
+            5 | 6 => Some((1, 5.0)),
+            _ => None,
+        });
+        match s.route_to(hero, [4.5, 1.5, 5.0]) {
+            Routed::Path(p) => {
+                let end = *p.last().unwrap();
+                assert!(
+                    (end[0] - 3.5).abs() < 1e-4 && (end[1] - 0.5).abs() < 1e-4,
+                    "{p:?}"
+                );
+                assert_eq!(end[2], 0.0);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
     #[test]
     fn failed_path_height_guard_is_strict_and_origins_only() {
         let goal = [4.5, 1.5, 0.0];
@@ -1364,6 +1467,44 @@ mod tests {
         let complete = s.world.queue.values().find(|q| q.event.ty == 500).unwrap();
         assert_eq!(complete.target, hero);
         assert_eq!(complete.event.ints, [20, -4]);
+    }
+
+    #[test]
+    fn an_unreachable_talk_approach_cancels_without_dialogue() {
+        use crate::world::ObjectKind;
+        // Flat and vertically separated disconnected floors both fail a required
+        // approach. Being within the authored radius needs no route across them.
+        for height in [0.0, 1.0] {
+            let (mut s, hero) = disconnected_levels(height);
+            s.world.trace.keep = true;
+            let npc = s.world.spawn(ObjectKind::Creature, "bartender");
+            let area = s.world.area;
+            let n = s.world.get_mut(npc).unwrap();
+            n.area = area;
+            n.position = [4.5, 1.5, 0.0];
+            n.facing = 90.0;
+            n.interact_radius = Some(0.1);
+            let from = s.world.get(hero).unwrap().position;
+            s.order_talk(hero, npc);
+            s.tick(1000);
+            let h = s.world.get(hero).unwrap();
+            assert!(h.commands.is_empty());
+            assert_eq!(h.position, from);
+            assert!(s.world.trace.entries.iter().any(|e| matches!(e,
+                crate::trace::TraceEntry::Command { command, status, .. }
+                    if command == "CommandInitiateDialog" && status == "failed -4")));
+            assert!(!s.world.trace.entries.iter().any(|e| matches!(e,
+                crate::trace::TraceEntry::Command { command, status, .. }
+                    if command == "CommandInitiateDialog" && status == "complete")));
+
+            s.world.get_mut(npc).unwrap().interact_radius = Some(5.0);
+            s.order_talk(hero, npc);
+            s.tick(1000);
+            assert_eq!(s.world.get(hero).unwrap().position, from);
+            assert!(s.world.trace.entries.iter().any(|e| matches!(e,
+                crate::trace::TraceEntry::Command { command, status, .. }
+                    if command == "CommandInitiateDialog" && status == "complete")));
+        }
     }
 
     #[test]
@@ -1635,6 +1776,7 @@ mod tests {
             impacted: false,
             arrived: false,
             da2_target_prepared: false,
+            da2_basic_attack_fallback: false,
             path: Vec::new(),
             turned_at: None,
             is_static: false,
@@ -1726,6 +1868,7 @@ mod tests {
             impacted: false,
             arrived: false,
             da2_target_prepared: false,
+            da2_basic_attack_fallback: false,
             path: Vec::new(),
             turned_at: None,
             is_static: false,
@@ -1844,6 +1987,7 @@ mod tests {
             impacted: false,
             arrived: false,
             da2_target_prepared: false,
+            da2_basic_attack_fallback: false,
             path: Vec::new(),
             turned_at: None,
             is_static: false,

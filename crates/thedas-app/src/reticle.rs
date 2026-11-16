@@ -131,8 +131,14 @@ fn fs() -> @location(0) vec4<f32> { return colour; }
 /// pad's marks over the world.
 #[derive(Clone)]
 pub struct ReticlePass {
-    pipeline: wgpu::RenderPipeline,
     group: wgpu::BindGroup,
+    shader: wgpu::ShaderModule,
+    layout: wgpu::PipelineLayout,
+    format: wgpu::TextureFormat,
+    /// Its pipelines by the samples a pixel of the target they draw into: the one it was
+    /// made for, and any other a frame's target turned out to have (a frame resolved or
+    /// drawn single-sampled while the world multisamples), made when first needed.
+    pipelines: std::sync::Arc<std::sync::Mutex<Vec<(u32, wgpu::RenderPipeline)>>>,
 }
 
 impl ReticlePass {
@@ -173,11 +179,29 @@ impl ReticlePass {
             bind_group_layouts: &[Some(&layout)],
             immediate_size: 0,
         });
+        let pass = Self {
+            group,
+            shader,
+            layout: pl,
+            format,
+            pipelines: Default::default(),
+        };
+        pass.pipeline(device, samples.max(1));
+        pass
+    }
+
+    /// The pipeline for a target of `samples` a pixel, made the first time it is needed.
+    fn pipeline(&self, device: &wgpu::Device, samples: u32) -> wgpu::RenderPipeline {
+        let mut made = self.pipelines.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((_, p)) = made.iter().find(|(n, _)| *n == samples) {
+            return p.clone();
+        }
+        let (shader, format) = (&self.shader, self.format);
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("reticle"),
-            layout: Some(&pl),
+            layout: Some(&self.layout),
             vertex: wgpu::VertexState {
-                module: &shader,
+                module: shader,
                 entry_point: Some("vs"),
                 compilation_options: Default::default(),
                 buffers: &[Some(wgpu::VertexBufferLayout {
@@ -187,7 +211,7 @@ impl ReticlePass {
                 })],
             },
             fragment: Some(wgpu::FragmentState {
-                module: &shader,
+                module: shader,
                 entry_point: Some("fs"),
                 compilation_options: Default::default(),
                 targets: &[Some(wgpu::ColorTargetState {
@@ -199,13 +223,14 @@ impl ReticlePass {
             primitive: Default::default(),
             depth_stencil: None,
             multisample: wgpu::MultisampleState {
-                count: samples.max(1),
+                count: samples,
                 ..Default::default()
             },
             multiview_mask: None,
             cache: None,
         });
-        Self { pipeline, group }
+        made.push((samples, pipeline.clone()));
+        pipeline
     }
 
     /// Draws `lines` (pixels of a `size` view) over `target`.
@@ -244,7 +269,10 @@ impl ReticlePass {
             })],
             ..Default::default()
         });
-        pass.set_pipeline(&self.pipeline);
+        // The pipeline must match the target: a pass whose target is single-sampled while
+        // the pass was made for the multisampled world would not validate.
+        let pipeline = self.pipeline(device, target.texture().sample_count());
+        pass.set_pipeline(&pipeline);
         pass.set_bind_group(0, &self.group, &[]);
         pass.set_vertex_buffer(0, buffer.slice(..));
         pass.draw(0..vertices.len() as u32, 0..1);

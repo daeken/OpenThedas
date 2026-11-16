@@ -16,7 +16,7 @@ use std::collections::BTreeSet;
 use thedas_sim::Sim;
 use thedas_ui::stage::Stage;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
 pub enum Screen {
     Hud,
     Cutscene,
@@ -75,26 +75,52 @@ impl Screen {
                 "popuplayer.gfx",
                 "tooltips.gfx",
             ],
-            Screen::Cutscene => &["cutscene.gfx"],
-            Screen::Conversation => &["conversation.gfx"],
-            Screen::WorldMap => &["worldmap.gfx"],
-            Screen::Store => &["store.gfx", "tooltips.gfx"],
-            Screen::Chanters => &["chanters.gfx", "tooltips.gfx"],
-            Screen::LevelUp => &["levelup.gfx", "tooltips.gfx"],
-            Screen::Inventory => &["inventory.gfx", "navbar.gfx", "tooltips.gfx"],
-            Screen::CharacterRecord => &["characterrecord.gfx", "navbar.gfx", "tooltips.gfx"],
-            Screen::Tactics => &["tactics.gfx", "navbar.gfx", "tooltips.gfx"],
-            Screen::AreaMap => &["map.gfx", "navbar.gfx", "tooltips.gfx"],
-            Screen::PartyPicker => &["partypicker.gfx"],
+            Screen::Cutscene => &["cutscene.gfx", "popuplayer.gfx"],
+            Screen::Conversation => &["conversation.gfx", "popuplayer.gfx"],
+            Screen::WorldMap => &["worldmap.gfx", "popuplayer.gfx"],
+            Screen::Store => &["store.gfx", "popuplayer.gfx", "tooltips.gfx"],
+            Screen::Chanters => &["chanters.gfx", "popuplayer.gfx", "tooltips.gfx"],
+            Screen::LevelUp => &["levelup.gfx", "popuplayer.gfx", "tooltips.gfx"],
+            // The quickbar stays up over the screens items and abilities are dragged from.
+            Screen::Inventory => &[
+                "inventory.gfx",
+                "quickbar.gfx",
+                "navbar.gfx",
+                "popuplayer.gfx",
+                "tooltips.gfx",
+            ],
+            Screen::CharacterRecord => &[
+                "characterrecord.gfx",
+                "navbar.gfx",
+                "popuplayer.gfx",
+                "tooltips.gfx",
+            ],
+            Screen::Tactics => &[
+                "tactics.gfx",
+                "navbar.gfx",
+                "popuplayer.gfx",
+                "tooltips.gfx",
+            ],
+            Screen::AreaMap => &["map.gfx", "navbar.gfx", "popuplayer.gfx", "tooltips.gfx"],
+            Screen::PartyPicker => &["partypicker.gfx", "popuplayer.gfx"],
             Screen::Death => &["deathscreen.gfx"],
             // Its save names and confirmations are dialog boxes on the popup layer.
             Screen::SaveLoad => &["saveload.gfx", "popuplayer.gfx"],
             // Quick Play and finishing ask for confirmation on the popup layer.
             Screen::CharGen => &["chargen.gfx", "popuplayer.gfx"],
-            Screen::Journal => &["journal.gfx", "navbar.gfx", "tooltips.gfx"],
-            Screen::Skills | Screen::SpellsTalents => {
-                &["abilities.gfx", "navbar.gfx", "tooltips.gfx"]
-            }
+            Screen::Journal => &[
+                "journal.gfx",
+                "navbar.gfx",
+                "popuplayer.gfx",
+                "tooltips.gfx",
+            ],
+            Screen::Skills | Screen::SpellsTalents => &[
+                "abilities.gfx",
+                "quickbar.gfx",
+                "navbar.gfx",
+                "popuplayer.gfx",
+                "tooltips.gfx",
+            ],
             // Settings that need confirming (a new resolution) ask on the popup layer.
             Screen::Options => &["optionsmenu.gfx", "popuplayer.gfx"],
             // Over the screen it was opened from (see `with_examine`).
@@ -295,26 +321,40 @@ impl Screens {
         changes
     }
 
-    /// [`Screens::update`] (to [`wanted`]) applied to `stage`: movies of closed screens are dropped, those of
-    /// opened screens loaded (failures logged).
+    /// [`Screens::update`] (to [`wanted`]) applied to `stage`. Shared movies keep their
+    /// live state across screens; in particular the popup layer must not restart its
+    /// tutorial initializers every time a book page closes. Call [`Self::note_open`]
+    /// before calculating `want`, so a movie's close clears the menu first.
     pub fn sync(&mut self, want: BTreeSet<Screen>, stage: &mut Stage) -> Changes {
-        self.note_open(&|m| stage.movies.iter().any(|x| x.name == m));
         let mut changes = self.update(want);
         changes.dismissed = std::mem::take(&mut self.closed_by_player);
-        for s in &changes.closed {
-            for m in s.movies() {
-                stage.close(m);
+        let mut movies = Vec::new();
+        for screen in &self.shown {
+            for movie in screen.movies() {
+                if !movies.contains(movie) {
+                    movies.push(*movie);
+                }
             }
         }
+        // Also removes the auxiliary movies of a screen whose primary movie closed
+        // itself: note_open already removed that screen from `shown`.
+        stage.movies.retain(|m| movies.contains(&m.name.as_str()));
         for s in &changes.opened {
             let started = std::time::Instant::now();
             for m in s.movies() {
-                if let Err(e) = stage.open(m) {
+                if !stage.movies.iter().any(|movie| movie.name == *m)
+                    && let Err(e) = stage.open(m)
+                {
                     log::warn!("ui: {m}: {e}");
                 }
             }
             log::info!("ui: {s:?} up in {:.2}s", started.elapsed().as_secs_f64());
         }
+        // Retained movies still belong at their new screen's layer (the popup under
+        // tooltips, above the HUD), rather than before newly opened movies.
+        stage
+            .movies
+            .sort_by_key(|m| movies.iter().position(|name| *name == m.name));
         changes
     }
 }

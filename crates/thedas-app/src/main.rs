@@ -207,6 +207,8 @@ struct Args {
     /// reticle), `pad a` (a game controller's button pressed and let go; `pad press rt`
     /// and `pad release rt` hold and let go), `pad stick-left X,Y MS` and
     /// `pad stick-right X,Y MS` (a stick held there while the game runs MS, then let go).
+    /// `windowkey down|repeat|up KeyCode [JSON text]` replays the window keyboard route,
+    /// e.g. `windowkey down Quote "'"; windowkey up Quote; windowkey down Enter`.
     #[arg(long, default_value = "")]
     steps: String,
     /// Module for `--save` and `--objects`; the install's base campaign when not given
@@ -232,6 +234,13 @@ struct Args {
     /// `THEDAS_DEFERRED_BAKED_LIGHTING`, else `baked`.
     #[arg(long, value_parser = ["baked", "hybrid", "realtime"])]
     lighting: Option<String>,
+    /// Viewer (`--area`): place visual effects in the level, `MODEL@X,Y,Z` separated by `;`
+    /// (`fxa_fireball_impact_p@10,4,0;fxa_storm_area_p@14,2,0`), each a model of the
+    /// game's VFX (`.mmh` without the extension) standing there, its emitters running from
+    /// the start (`--time` seconds into them at a capture). For looking at effects and their
+    /// light; ours, nothing the original offers.
+    #[arg(long, default_value = "")]
+    vfx: String,
     /// The original's "Graphics Detail" video option, which picks the materials' techniques
     /// and the bloom's blur: `low`, `medium` or `high` (High's materials draw as Medium's; its
     /// sun shadows are 1024 texels a side and reach further).
@@ -327,6 +336,41 @@ fn hero_camera(pos: [f32; 3], facing: f32) -> Camera {
         yaw,
         -0.3,
     )
+}
+
+/// `--vfx`: `MODEL@X,Y,Z` separated by `;`, each as a prop showing that model.
+fn parse_vfx(spec: &str) -> Result<Vec<thedas_render::Prop>> {
+    spec.split(';')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .enumerate()
+        .map(|(i, item)| {
+            let (model, at) = item.split_once('@').context("--vfx takes MODEL@X,Y,Z")?;
+            let xyz: Vec<f32> = at
+                .split(',')
+                .map(|v| v.trim().parse::<f32>())
+                .collect::<std::result::Result<_, _>>()
+                .context("--vfx position must be X,Y,Z")?;
+            let [x, y, z] = xyz[..] else {
+                bail!("--vfx position must be X,Y,Z");
+            };
+            Ok(thedas_render::Prop {
+                label: format!("vfx{i}"),
+                models: Vec::new(),
+                attached: Vec::new(),
+                morph: None,
+                hide_hair: false,
+                tints: Vec::new(),
+                effects: vec![thedas_render::PropEffect {
+                    model: model.trim().trim_end_matches(".mmh").to_ascii_lowercase(),
+                    key: format!("vfx{i}"),
+                    age: 0.0,
+                    lasting: true,
+                }],
+                transform: thedas_render::Prop::placement([x, y, z], 0.0),
+            })
+        })
+        .collect()
 }
 
 fn parse_size(s: &str) -> Result<(u32, u32)> {
@@ -742,6 +786,9 @@ fn capture(
                     loaded.render_path,
                 );
                 renderer.frame_effects = loaded.frame_effects;
+                // `--vfx` effects play through their timelines up to the capture's time (no
+                // animator poses viewer props).
+                renderer.play_prop_effects(scene, shader_time);
                 renderer.set_time(shader_time);
                 log_stats(&renderer);
                 renderer.capture(ctx, &camera, w, h)?
@@ -1025,6 +1072,9 @@ enum ResumeOffer {
 
 /// The ids of the offer to resume and of the box saying it failed.
 const RESUME_ID: u32 = 0x5245_5355;
+/// The question shown when the way back to the start menu fails (no answer is acted on).
+const RETURN_FAILED_ID: u32 = 0x5245_5446;
+
 const RESUME_FAILED_ID: u32 = RESUME_ID + 1;
 
 /// When `written` was, said as how long ago from `now`.
@@ -1448,6 +1498,7 @@ impl App {
                     self.loaded.render_path,
                 );
                 r.frame_effects = self.loaded.frame_effects;
+                r.start_prop_effects(scene, 0.25);
                 log_stats(&r);
                 println!("camera {}", self.camera.spec());
                 Some(r)
@@ -1466,7 +1517,7 @@ impl App {
         // The anti-aliasing slider offers what the device draws the world with; the choice
         // (4x unless the player chose) is the world's samples (see `sync_antialiasing`).
         ui.set_antialias_samples(
-            thedas_render::msaa::supported_samples(&ctx.adapter, config.format),
+            thedas_render::msaa::supported_samples(&ctx.adapter, &ctx.device, config.format),
             !upload::automated(),
         );
         if let (Some(live), Some(_)) = (&self.live, &self.screens) {
@@ -2797,6 +2848,13 @@ impl App {
             }
             return;
         }
+        let capture_started = Instant::now();
+        let capture = report::Capture {
+            presentation: report::presentation_snapshot(self),
+            settings: self.settings.clone(),
+            data_dir: saves::data_dir(),
+        };
+        let presentation_ms = capture_started.elapsed().as_secs_f64() * 1000.0;
         let mut info = json!({
             "build": report::build_info(),
             "settings": self.started_with,
@@ -2831,6 +2889,9 @@ impl App {
         let mut trace = None;
         let mut journal = None;
         let mut pause = false;
+        let metadata_ms = capture_started.elapsed().as_secs_f64() * 1000.0 - presentation_ms;
+        let mut save_clone_ms = 0.0;
+        let mut trace_ms = 0.0;
         if let Some(live) = self.live.as_mut() {
             if !live.front_end {
                 journal = live.journal.as_mut().and_then(|j| j.files());
@@ -2839,17 +2900,25 @@ impl App {
                 info["game"]["hero"] = json!(sim.world.hero.map(|h| sim.display_name(h)));
                 info["game"]["area_name"] = json!(sim.world.area.map(|a| sim.display_name(a)));
                 info["game"]["coverage"] = sim.world.trace.coverage();
-                match sim.save_json() {
-                    Ok(b) => now_save = Some(b),
-                    Err(e) => log::warn!("report: the game's state: {e}"),
-                }
+                let stage = Instant::now();
+                now_save = Some(report::ReportSave::Game(Box::new(sim.save_game())));
+                save_clone_ms = stage.elapsed().as_secs_f64() * 1000.0;
+                let stage = Instant::now();
                 trace = serde_json::to_value(&sim.world.trace.recent).ok();
+                trace_ms = stage.elapsed().as_secs_f64() * 1000.0;
                 drop(sim);
                 pause = !live.paused;
             }
         }
-        let dir = self.recorder.start(now_save, trace, journal, info);
-        log::info!("report: started in {}", dir.display());
+        info["capture_ms"] = json!(capture_started.elapsed().as_secs_f64() * 1000.0);
+        info["capture_timings_ms"] = json!({ "presentation": presentation_ms, "metadata": metadata_ms,
+            "save_clone": save_clone_ms, "trace": trace_ms });
+        let dir = self.recorder.start(now_save, trace, journal, info, capture);
+        log::info!(
+            "report: captured state in {:.2} ms; started in {}",
+            capture_started.elapsed().as_secs_f64() * 1000.0,
+            dir.display()
+        );
         // The frame as presented, read back as the next one is drawn; drawn again
         // offscreen where the surface cannot be read back.
         let readable = self
@@ -3062,7 +3131,13 @@ impl App {
     /// One frame of reports: a snapshot of the game when one is due, and a report under
     /// way finished once its screenshot and note are in.
     fn report_frame(&mut self, dt_ms: f64) {
-        self.recorder.frame(dt_ms);
+        let context = report::frame_context(self);
+        let dt_ms = self
+            .gfx
+            .as_ref()
+            .and_then(|g| g.frames.last_frame_ms())
+            .unwrap_or(dt_ms);
+        self.recorder.frame(dt_ms, context);
         for a in std::mem::take(&mut self.mark_answers) {
             self.mark_answer(a);
         }
@@ -3608,6 +3683,49 @@ impl App {
         true
     }
 
+    /// The window keyboard route, also used by control's `windowkey` replay.
+    /// Returns true when the key requests that the application close.
+    fn window_key(
+        &mut self,
+        code: KeyCode,
+        text: Option<&str>,
+        state: ElementState,
+        repeat: bool,
+    ) -> bool {
+        // A key skips a cutscene, as a click does. Provisional: the game's own
+        // skip key is not traced.
+        if state == ElementState::Pressed
+            && !repeat
+            && self
+                .screens
+                .as_ref()
+                .is_some_and(screens::Screens::in_cutscene)
+        {
+            if let Some(live) = self.live.as_ref() {
+                live.sim().input(
+                    thedas_sim::commands::CommandSource::Player,
+                    thedas_sim::commands::SimCommand::SkipCutscene,
+                );
+            }
+            return false;
+        }
+        if state == ElementState::Pressed && self.text_key(code, text) {
+            return false;
+        }
+        match state {
+            ElementState::Pressed => {
+                if !repeat && self.key_down(code) {
+                    return true;
+                }
+                self.keys.insert(code);
+            }
+            ElementState::Released => {
+                self.keys.remove(&code);
+            }
+        }
+        false
+    }
+
     /// Draws the level the way `path` says, or the other way than now for `None` (F11),
     /// from the next frame; returns the way it is drawn now.
     fn set_render_path(
@@ -3708,6 +3826,23 @@ impl App {
                 if let Some(live) = self.live.as_ref() {
                     live.switch_weapon_set();
                     log::info!("weapon set switched");
+                }
+            }
+            // In a conversation the number keys pick the replies (1 is the first), not the
+            // quickbar: the conversation screen lists them numbered.
+            c if self.live.is_some()
+                && quickslot_key(c).is_some()
+                && self
+                    .screens
+                    .as_ref()
+                    .is_some_and(|s| s.shown().contains(&screens::Screen::Conversation)) =>
+            {
+                let n = quickslot_key(c).unwrap_or(0) as usize;
+                if let Some(live) = self.live.as_mut() {
+                    let have = live.sim().dialog_state().map_or(0, |d| d.replies.len());
+                    if n < have {
+                        log::info!("{}", reply(live, n));
+                    }
                 }
             }
             // The quickbar's first ten slots: 1 to 9, then 0.
@@ -4016,6 +4151,12 @@ impl App {
                     if typed { "typed" } else { "no text field" }
                 ));
             }
+            Step::WindowKey(code, text, state, repeat) => {
+                self.quit |= self.window_key(*code, text.as_deref(), *state, *repeat);
+                log.push(format!(
+                    "windowkey {state:?} {code:?} {text:?} repeat={repeat}"
+                ));
+            }
             Step::Wipe => {
                 if let Some(l) = self.live.as_ref() {
                     wipe(&mut l.sim());
@@ -4186,6 +4327,10 @@ impl App {
                     _ => KeyCode::KeyI,
                 });
                 log.push(format!("{m:?}"));
+            }
+            &Step::RawKey(code) => {
+                self.key_down(code);
+                log.push(format!("rawkey {code:?}"));
             }
             &Step::Leader(n) => {
                 let tag = self.live.as_mut().and_then(|l| l.choose_leader(n));
@@ -4711,7 +4856,18 @@ impl App {
             if matches!(r, ui::FrontEnd::StartMenu) {
                 match live::Live::open(&self.install, &self.module, start, &self.shaders) {
                     Ok(l) => self.install_live(l),
-                    Err(e) => log::warn!("front end: {r:?} failed: {e:#}"),
+                    Err(e) => {
+                        log::warn!("front end: {r:?} failed: {e:#}");
+                        // Say so: the game just carries on, which looks like a dead button.
+                        if let Some(g) = self.gfx.as_mut() {
+                            g.ui.ask_choice(
+                                RETURN_FAILED_ID,
+                                &format!("The start menu could not be opened: {e:#}"),
+                                "OK",
+                                "OK",
+                            );
+                        }
+                    }
                 }
                 continue;
             }
@@ -5061,39 +5217,8 @@ impl ApplicationHandler for App {
                 let PhysicalKey::Code(code) = event.physical_key else {
                     return;
                 };
-                // A key skips a cutscene (and the movie it plays), as a click does.
-                // Provisional: the game's own skip key is not traced.
-                if event.state == ElementState::Pressed
-                    && !event.repeat
-                    && self
-                        .screens
-                        .as_ref()
-                        .is_some_and(screens::Screens::in_cutscene)
-                {
-                    if let Some(live) = self.live.as_ref() {
-                        live.sim().input(
-                            thedas_sim::commands::CommandSource::Player,
-                            thedas_sim::commands::SimCommand::SkipCutscene,
-                        );
-                    }
-                    return;
-                }
-                // While a movie's text field has focus, keys type into it (repeats too).
-                if event.state == ElementState::Pressed
-                    && self.text_key(code, event.text.as_deref())
-                {
-                    return;
-                }
-                match event.state {
-                    ElementState::Pressed => {
-                        if !event.repeat && self.key_down(code) {
-                            event_loop.exit();
-                        }
-                        self.keys.insert(code);
-                    }
-                    ElementState::Released => {
-                        self.keys.remove(&code);
-                    }
+                if self.window_key(code, event.text.as_deref(), event.state, event.repeat) {
+                    event_loop.exit();
                 }
             }
             WindowEvent::CursorMoved { position, .. } => self.cursor_to(position.x, position.y),
@@ -5920,6 +6045,9 @@ enum Step {
     /// A key for the focused text field (`key backspace`, `enter`, `delete`, `left`, `right`,
     /// `home`, `end`, `tab`, `escape`, `ctrl+a`).
     TextKey(thedas_ui::UiKey),
+    /// A window key event through App::text_key and the normal game key routing:
+    /// `windowkey down|repeat|up KeyCode [JSON text]` (winit's physical key names).
+    WindowKey(KeyCode, Option<String>, ElementState, bool),
     /// The whole party falls, as the game sees it after a wipe (for trying the death screen
     /// headless).
     Wipe,
@@ -6043,6 +6171,9 @@ enum Step {
     /// A movement key held or let go (`keydown w`, `keyup w`; w, a, s, d, q or e), as the
     /// keyboard holds it.
     HoldKey(KeyCode, bool),
+    /// `rawkey NAME`: a key pressed as the window delivers it (1 to 0, space, enter, escape,
+    /// tab), so what the game does with the key itself is tested.
+    RawKey(KeyCode),
     /// The highlight key held or let go (`allnames on`, `allnames off`): every creature near
     /// shows its name, as while Tab is down.
     AllNames(bool),
@@ -6390,6 +6521,23 @@ fn parse_step(s: &str) -> Result<Step> {
         "key" if arg.eq_ignore_ascii_case("space") => Step::Pause,
         "key" if arg == "/" => Step::SwapWeapons,
         "key" if arg.eq_ignore_ascii_case("f10") => Step::ModMode,
+        "rawkey" => Step::RawKey(match arg.trim().to_ascii_lowercase().as_str() {
+            "1" => KeyCode::Digit1,
+            "2" => KeyCode::Digit2,
+            "3" => KeyCode::Digit3,
+            "4" => KeyCode::Digit4,
+            "5" => KeyCode::Digit5,
+            "6" => KeyCode::Digit6,
+            "7" => KeyCode::Digit7,
+            "8" => KeyCode::Digit8,
+            "9" => KeyCode::Digit9,
+            "0" => KeyCode::Digit0,
+            "space" => KeyCode::Space,
+            "enter" => KeyCode::Enter,
+            "escape" => KeyCode::Escape,
+            "tab" => KeyCode::Tab,
+            other => bail!("rawkey takes 1 to 0, space, enter, escape or tab, not {other:?}"),
+        }),
         "modmode" => Step::ModMode,
         "modselect" if !arg.is_empty() => Step::ModSelect(arg.to_string()),
         "modframe" => Step::ModFrame(arg.parse().context("modframe takes a frame number")?),
@@ -6506,6 +6654,27 @@ fn parse_step(s: &str) -> Result<Step> {
         "key" if arg.eq_ignore_ascii_case("f11") => Step::Renderer(None),
         "wipe" => Step::Wipe,
         "type" => Step::Type(arg.to_string()),
+        "windowkey" => {
+            let mut words = arg.splitn(3, ' ');
+            let state = words.next().unwrap_or_default();
+            let name = words
+                .next()
+                .context("windowkey takes down|repeat|up KeyCode [JSON text]")?;
+            let code = serde_json::from_value(J::String(name.into()))
+                .with_context(|| format!("unknown windowkey physical key {name:?}"))?;
+            let (state, repeat) = match state {
+                "down" => (ElementState::Pressed, false),
+                "repeat" => (ElementState::Pressed, true),
+                "up" => (ElementState::Released, false),
+                _ => bail!("windowkey takes down|repeat|up KeyCode [JSON text]"),
+            };
+            let text = words
+                .next()
+                .map(serde_json::from_str::<String>)
+                .transpose()
+                .context("windowkey text must be a JSON string")?;
+            Step::WindowKey(code, text, state, repeat)
+        }
         "key" if text_key(arg).is_some() => {
             Step::TextKey(text_key(arg).unwrap_or(thedas_ui::UiKey::Enter))
         }
@@ -6706,7 +6875,8 @@ fn main() -> Result<()> {
         args.area.as_deref().unwrap_or(DEFAULT_AREA)
     };
     let detail = thedas_render::scene::Detail::parse(&args.detail).unwrap_or_default();
-    let mut loaded = load(&install, area, &args.shaders, &[], detail)?;
+    let vfx = parse_vfx(&args.vfx)?;
+    let mut loaded = load(&install, area, &args.shaders, &vfx, detail)?;
     loaded.frame_effects = args.frame_effects == "on";
     loaded.render_path = thedas_render::RenderPath::parse(&args.renderer).unwrap_or_default();
     if let Some(l) = live.as_mut() {
@@ -7104,6 +7274,9 @@ fn main() -> Result<()> {
                             if typed { "typed" } else { "no text field" }
                         );
                     }
+                    Step::WindowKey(..) => {
+                        bail!("windowkey requires a window with --control");
+                    }
                     &Step::TextKey(k) => {
                         let typed = played.as_mut().is_some_and(|(layer, _)| layer.key(k));
                         println!(
@@ -7187,7 +7360,9 @@ fn main() -> Result<()> {
                         println!("allnames {on}");
                     }
                     // The movement keys are the window's (see `App::key_walk`).
-                    Step::HoldKey(..) => println!("keydown and keyup need a window"),
+                    Step::HoldKey(..) | Step::RawKey(..) => {
+                        println!("keydown, keyup and rawkey need a window")
+                    }
                     Step::AskChoice(prompt) => {
                         if let Some((layer, _)) = played.as_mut() {
                             layer.ask_choice(0, prompt, "Yes", "No");
@@ -7648,6 +7823,22 @@ fn pack_note(name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn vfx_specs_parse_into_effect_props() {
+        let props = super::parse_vfx("fxa_fire_aoe_p@1,2,3; FXA_Ice_Cld_P.mmh @ -4.5,0,7").unwrap();
+        assert_eq!(props.len(), 2);
+        assert_eq!(props[0].effects[0].model, "fxa_fire_aoe_p");
+        assert_eq!(props[1].effects[0].model, "fxa_ice_cld_p");
+        assert!(props[0].effects[0].lasting && props[0].models.is_empty());
+        assert_eq!(
+            props[1].transform.w_axis.truncate(),
+            glam::Vec3::new(-4.5, 0.0, 7.0)
+        );
+        assert!(super::parse_vfx("").unwrap().is_empty());
+        assert!(super::parse_vfx("fxa_fire_aoe_p").is_err());
+        assert!(super::parse_vfx("fxa_fire_aoe_p@1,2").is_err());
+    }
+
     /// Against a real install (`THEDAS_INSTALL`), offscreen: the EA logo's frame
     /// two seconds in is drawn letterboxed in a taller window (written to `$INTRO_PNG` when
     /// set, to look at).
@@ -7760,6 +7951,26 @@ mod tests {
             Some(UiKey::SelectAll)
         );
         assert_eq!(text_edit_key(KeyCode::KeyA, false, false), None);
+    }
+
+    #[test]
+    fn window_keys_keep_physical_codes_text_and_repeats_separate() {
+        use ElementState::{Pressed, Released};
+        assert_eq!(
+            parse_steps(r#"windowkey down F8; windowkey up F8; windowkey down Quote "'"; windowkey repeat KeyA "A"; windowkey down Space " "; windowkey down Enter"#).unwrap(),
+            vec![
+                Step::WindowKey(KeyCode::F8, None, Pressed, false),
+                Step::WindowKey(KeyCode::F8, None, Released, false),
+                Step::WindowKey(KeyCode::Quote, Some("'".into()), Pressed, false),
+                Step::WindowKey(KeyCode::KeyA, Some("A".into()), Pressed, true),
+                Step::WindowKey(KeyCode::Space, Some(" ".into()), Pressed, false),
+                Step::WindowKey(KeyCode::Enter, None, Pressed, false),
+            ]
+        );
+        assert!(parse_steps("windowkey down NotAKey x").is_err());
+        assert!(parse_steps("windowkey sideways Enter").is_err());
+        assert!(parse_steps("windowkey down").is_err());
+        assert!(parse_steps("windowkey down KeyA unquoted").is_err());
     }
 
     #[test]

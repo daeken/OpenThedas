@@ -21,6 +21,8 @@ const NEW_SAVE: u32 = 336_242;
 /// The mage class (`CLASS_WIZARD`, `cla_base.gda` row 2; the scripts' constant, not the
 /// engine's).
 const CLASS_WIZARD: i32 = 2;
+/// `ItemUtils.ITEM_ABILITY_INVALID`: the ability id the movies take as none.
+const ITEM_ABILITY_INVALID: i32 = 200_000;
 
 fn num(v: impl Into<f64>) -> UiValue {
     UiValue::Number(v.into())
@@ -81,6 +83,12 @@ pub fn sim_values(sim: &Sim) -> BTreeMap<String, UiValue> {
 /// keeps for it.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Presentation {
+    /// Which screens are up (the app's screen numbers): a screen opening or closing makes the
+    /// values it reads be built again at once (see [`ValueCache`]).
+    pub screens: Vec<u32>,
+    /// An item or ability is being dragged between movies (`GUI.StartDragging` until the
+    /// button is released): `GUI.Dragging` reads 1, which the movies' drop targets look for.
+    pub dragging: bool,
     /// The inventory screen's item category tab (`GUIInventory.SetItemListFilter`, see
     /// [`ItemCategory`]); 0 shows every item.
     pub item_filter: i32,
@@ -300,6 +308,9 @@ pub struct ValueCache {
     pub updates: Vec<(String, Vec<(String, UiValue)>)>,
     /// Groups no longer shown.
     pub drops: Vec<String>,
+    /// What the interface showed when the groups were built: a screen opening or a tab
+    /// picked changes what its values are, so every group is built again at once.
+    shown: Option<Presentation>,
     /// The interface's own time (the frames' durations added up), which the groups age by:
     /// real time in play, the steps' time when driven by a script.
     now_ms: f64,
@@ -316,6 +327,16 @@ impl ValueCache {
     /// Moves the interface's time on by a frame.
     pub fn advance(&mut self, dt_ms: f64) {
         self.now_ms += dt_ms;
+    }
+
+    /// Notes what the interface shows now; a change makes every group stale.
+    fn see(&mut self, shown: &Presentation) {
+        if self.shown.as_ref() != Some(shown) {
+            self.shown = Some(shown.clone());
+            for b in self.groups.values_mut() {
+                b.at_ms = f64::NEG_INFINITY;
+            }
+        }
     }
 
     /// Whether `group` must be built again (not built yet, built for another `token`, or
@@ -401,6 +422,7 @@ pub fn sim_values_cached(
     shown: &Presentation,
     cache: &mut ValueCache,
 ) -> BTreeMap<String, UiValue> {
+    cache.see(shown);
     sim_values_with(sim, shown, Some(cache))
 }
 
@@ -636,6 +658,7 @@ fn sim_values_with(
             );
         }
     }
+    v.insert("GUI.Dragging".into(), num(shown.dragging as u8));
     v.insert("Paperdoll.CameraMode".into(), num(shown.paperdoll_preset));
     // The creature in character creation as its paperdoll shows it (chargen.gfx's
     // `Paperdoll.PaperCreature`), with the portrait drawn of it, which the appearance page's
@@ -1022,7 +1045,9 @@ fn sim_values_with(
     // The training step shown (`trainingsteps.gda`'s row; 0 none), see `thedas_sim::training`.
     v.insert(
         "Tutorials.TrainingStep".into(),
-        num(if sim.tutorials_held() {
+        // Held back behind a screen, as the tutorial list is: the popup layer is over every
+        // screen now, and a step's panel over the journal or map is not the game's.
+        num(if tutorials_held {
             0
         } else {
             sim.world.training.step
@@ -1030,11 +1055,20 @@ fn sim_values_with(
     );
     // The tutorials' screen highlights (DAConstants `GUI_HIGHLIGHT_*`: 0 follower, 1
     // tactics, 2 inventory, 3 health poultice, 4 empty quickbar, 5 tactic preset, 6
-    // equipment slot, 7 unequipped item) are all off: no tutorial asks for one. A movie
-    // hearing nothing leaves its glow on (the portraits' halo, the quickbar's).
-    for i in 0..8 {
-        v.insert(format!("GUI.GuiHighlights.{i}"), num(i));
-        v.insert(format!("GUI.GuiHighlights.{i}.Highlight"), num(0));
+    // equipment slot, 7 unequipped item): on for what the training step under way points at
+    // (`HighlightGuiElement`), with its argument, off for the rest. A movie hearing nothing
+    // leaves its glow on (the portraits' halo, the quickbar's).
+    let training = sim.world.training;
+    for i in 0..8usize {
+        let on = training.highlighted & (1 << i) != 0;
+        v.insert(format!("GUI.GuiHighlights.{i}"), num(i as f64));
+        v.insert(format!("GUI.GuiHighlights.{i}.Highlight"), num(on as u8));
+        if on {
+            v.insert(
+                format!("GUI.GuiHighlights.{i}.HighlightArg"),
+                num(training.highlight_args[i]),
+            );
+        }
     }
     if let Some(who) = controlled.or(hero) {
         section(&mut cache, "Tactics", u64::from(who), &mut v, |v| {
@@ -1510,10 +1544,19 @@ fn item(sim: &Sim, prefix: &str, id: u32, v: &mut BTreeMap<String, UiValue>) {
     set("EquippableSlots", num(mask));
     set("StackSize", field("StackSize", 1));
     set("Cost", num(sim.item_value(id)));
-    set("AbilityID", field("AbilityID", -1));
+    // An item that gives no ability reads as `ItemUtils.ITEM_ABILITY_INVALID` (200000, in the
+    // movies' code): the inventory drags such items inside itself (to equip them), and the
+    // others out to the quickbar too.
+    let ability = o.fields.get("AbilityID").copied().filter(|a| *a > 0);
+    set("AbilityID", num(ability.unwrap_or(ITEM_ABILITY_INVALID)));
     set("RecipeID", field("CraftingRecipeID", 0));
     set("Unique", field("Unique", 0));
-    set("Irremovable", num(o.plot as u8));
+    let irremovable = if sim.game == thedas_vfs::Game::Origins {
+        sim.item_irremovable(id)
+    } else {
+        o.plot
+    };
+    set("Irremovable", num(irremovable as u8));
     for k in [
         "Damaged",
         "Indestructible",
@@ -2194,7 +2237,10 @@ fn inventory(sim: &Sim, who: Option<u32>, filter: i32, v: &mut BTreeMap<String, 
     let Some(o) = who.and_then(|w| sim.world.get(w)) else {
         return;
     };
-    v.insert("GUI.SelectedChar.CanChangeEquipment".into(), num(1));
+    v.insert(
+        "GUI.SelectedChar.CanChangeEquipment".into(),
+        num(sim.can_change_equipment(o.id) as u8),
+    );
     let (layout, can_switch) = equipment_layout(sim, &o.tag);
     v.insert("GUI.SelectedChar.EquipmentLayout".into(), num(layout));
     v.insert(
@@ -2467,6 +2513,42 @@ mod tests {
             },
         );
         assert!(other.contains_key(&format!("{k}.0")));
+    }
+
+    #[test]
+    fn equipment_flags_use_native_state_instead_of_plot_or_unconditional_access() {
+        let mut sim = Sim::new(
+            std::sync::Arc::new(thedas_vfs::Vfs::new()),
+            std::sync::Arc::new(thedas_script::EngineTable::default()),
+            1,
+        );
+        let hero = sim.world.spawn(ObjectKind::Creature, "hero");
+        sim.world.hero = Some(hero);
+        let gear = sim.world.spawn(ObjectKind::Item, "gear");
+        sim.world.get_mut(hero).unwrap().inventory.push(gear);
+        sim.world
+            .get_mut(hero)
+            .unwrap()
+            .fields
+            .insert("CanChangeEquipment".into(), 0);
+        sim.world
+            .get_mut(gear)
+            .unwrap()
+            .fields
+            .insert("Irremovable".into(), 1);
+        let values = sim_values(&sim);
+        assert_eq!(values["GUI.SelectedChar.CanChangeEquipment"], num(0));
+        assert_eq!(
+            values["GUIInventory.PartyBackpackView.0.Item.Irremovable"],
+            num(1)
+        );
+        sim.game = thedas_vfs::Game::DragonAge2;
+        let values = sim_values(&sim);
+        assert_eq!(values["GUI.SelectedChar.CanChangeEquipment"], num(1));
+        assert_eq!(
+            values["GUIInventory.PartyBackpackView.0.Item.Irremovable"],
+            num(0)
+        );
     }
 
     #[test]
