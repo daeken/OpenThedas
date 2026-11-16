@@ -1245,10 +1245,9 @@ impl World {
     }
 
     pub fn by_tag(&self, tag: &str) -> impl Iterator<Item = &Object> {
-        let tag = tag.to_ascii_lowercase();
         self.objects
             .values()
-            .filter(move |o| o.tag.to_ascii_lowercase() == tag)
+            .filter(move |o| o.tag.eq_ignore_ascii_case(tag))
     }
 
     /// Removes an object `delay_ms` from now.
