@@ -89,6 +89,13 @@ pub struct CombatData {
     /// DA2's `GetAttackTarget`: prepared combat target, independent of the command queue.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<ObjectId>,
+    /// Origins attack-side paired death animation, independent of the victim's death event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub death_blow: Option<crate::deathblow::DeathBlow>,
+    /// Origins victim reaction. Presentation plays this from its recorded start,
+    /// including while scripts already see a dead creature.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub death_blow_reaction: Option<crate::deathblow::DeathBlowReaction>,
     /// Creatures this one currently perceives.
     pub perceived: Vec<ObjectId>,
     /// Those of them it perceived as hostile (an appearance is announced again when a
@@ -999,6 +1006,7 @@ impl Sim {
         // A lethal hit arrives as EFFECT_TYPE_DEATH (7 in effects.gda) rather than as damage
         // that empties the health bar: the engine does the killing.
         if valid && effect.ty == EFFECT_TYPE_RESURRECTION {
+            self.cancel_death_blow_reaction(target);
             if let Some(o) = self.world.get_mut(target) {
                 o.dead = false;
                 o.died_at = None;
@@ -1334,6 +1342,12 @@ impl Sim {
 
     /// Marks a creature dead, clears what it was doing and sends it `EVENT_TYPE_DEATH`.
     pub fn kill(&mut self, id: ObjectId, killer: ObjectId) {
+        self.kill_with_event_delay(id, killer, 0);
+    }
+
+    /// Native death-animation tasks zero health at start and notify scripts at end
+    /// (0x7ab31d and 0x7ab401). Ordinary effect-driven deaths notify immediately.
+    pub(crate) fn kill_with_event_delay(&mut self, id: ObjectId, killer: ObjectId, delay: u64) {
         self.da2_reset_locomotion(id);
         let health = constant_of(self, "PROPERTY_DEPLETABLE_HEALTH");
         let now = self.world.time_ms;
@@ -1350,6 +1364,7 @@ impl Sim {
             }
             o.commands.clear();
             o.combat.attack = None;
+            o.combat.death_blow = None;
             if self.game == thedas_vfs::Game::DragonAge2 && o.combat.in_combat {
                 o.combat.target = None;
             }
@@ -1357,7 +1372,7 @@ impl Sim {
         }
         let mut ev = self.new_event("DEATH", Some(killer));
         ev.objects = vec![killer];
-        self.world.queue_event(0, id, ev, None);
+        self.world.queue_event(delay, id, ev, None);
     }
 
     /// Fills a creature's tactics slots from a preset: the preset's row in
@@ -2026,13 +2041,20 @@ impl Sim {
     }
 
     pub(crate) fn finish_attack(&mut self, id: ObjectId, target: ObjectId) {
+        self.attack_impact_slots(id, target, &[0, 1]);
+        if let Some(o) = self.world.get_mut(id) {
+            o.combat.attack = None;
+        }
+    }
+
+    pub(crate) fn attack_impact_slots(&mut self, id: ObjectId, target: ObjectId, hands: &[usize]) {
         // An attack restored from a save made before DA2 resolution was implemented can
         // still have result zero. Resolve it once before delivering its impact.
         self.resolve_da2_attack(id, target);
         let Some(result) = self.world.get(id).and_then(|o| o.combat.attack.clone()) else {
             return;
         };
-        for hand in 0..2 {
+        for &hand in hands {
             let hit = result.results[hand];
             // Keep the previous fallback when the module or default attack's script
             // metadata is unavailable. Normal attacks already hold their script's roll.
@@ -2099,9 +2121,6 @@ impl Sim {
                     }
                 }
             }
-        }
-        if let Some(o) = self.world.get_mut(id) {
-            o.combat.attack = None;
         }
     }
 }
