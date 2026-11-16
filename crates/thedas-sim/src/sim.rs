@@ -156,6 +156,9 @@ pub struct Sim {
     /// Each door's collision for sight lines (`None`: its model has none) and the key of the
     /// model and placement it was built from (see `Sim::door_sight`).
     pub(crate) door_collisions: HashMap<ObjectId, (u64, Option<Arc<crate::collision::Collision>>)>,
+    /// Each area transition's interaction volume (see [`crate::contact`]) and the key of the
+    /// model and placement it was built from. Not saved.
+    pub(crate) contact_shapes: HashMap<ObjectId, (u64, Option<Arc<crate::collision::Collision>>)>,
     /// Walkers held up by another creature's body: since when, and whether that was
     /// reported (see `Sim::advance_movers`). Not saved.
     pub(crate) blocked_since: HashMap<ObjectId, (u64, bool)>,
@@ -182,6 +185,11 @@ pub struct Sim {
     /// The conversations being said in passing (see [`crate::dialog::AmbientTalk`]). Not
     /// saved.
     pub(crate) ambient: Vec<crate::dialog::AmbientTalk>,
+    /// When each creature's last line said in passing is over (world time, ms), kept when
+    /// its conversation is cleared: DAOrigins.exe's ambient manager tracks the speaker's
+    /// line apart from the conversation record, and does not start another line for a
+    /// speaker still saying one (0x6ffaa0 -> 0x6ff190). Not saved, like `ambient`.
+    pub(crate) ambient_speaking: std::collections::BTreeMap<ObjectId, u64>,
     /// The install's voice banks, for the lengths of voiced lines.
     pub voices: crate::voice::Voices,
     /// Every command given through [`Sim::apply`] since it was turned on (`Some`), for
@@ -673,6 +681,7 @@ impl Sim {
             current_effect_target: None,
             dialog_ambient: false,
             ambient: Vec::new(),
+            ambient_speaking: Default::default(),
             voices: crate::voice::Voices::new(),
             input_log: None,
             loads: 0,
@@ -684,6 +693,7 @@ impl Sim {
             collisions: HashMap::new(),
             placeable_collisions: HashMap::new(),
             door_collisions: HashMap::new(),
+            contact_shapes: HashMap::new(),
             blocked_since: HashMap::new(),
             sight_memo: Default::default(),
             prcscr: None,
@@ -752,6 +762,7 @@ impl Sim {
         self.door_cells.clear();
         self.placeable_collisions.clear();
         self.door_collisions.clear();
+        self.contact_shapes.clear();
         self.blocked_since.clear();
     }
 
@@ -859,7 +870,8 @@ impl Sim {
         value
     }
 
-    /// Delivers an event to an object's event script (or `script`, when given).
+    /// Delivers an event, with Origins creature/placeable table scripts taking priority
+    /// over an explicit `script` and the object's own script.
     pub fn deliver(&mut self, target: ObjectId, mut event: Event, script: Option<String>) {
         if event.target.is_none() {
             event.target = Some(target);
@@ -880,9 +892,29 @@ impl Sim {
             });
             return;
         };
-        let Some(script) = script.or_else(|| obj.script.clone()) else {
+        // Both verified +0x70 dispatch interfaces call CCObject::DispatchEvent
+        // (0x69a130 -> 0x698960). It first reads engineevents.Script by event type.
+        // Other object routes and DA2 have not been established by this trace.
+        let native_selection = self.game != thedas_vfs::Game::DragonAge2
+            && matches!(obj.kind, ObjectKind::Creature | ObjectKind::Placeable);
+        let table_script = native_selection
+            .then(|| self.world.tables().get(114, ""))
+            .flatten()
+            .and_then(|t| match t.cell("Script", i64::from(event.ty)) {
+                Some(thedas_formats::gda::Cell::String(s)) => {
+                    let s = s.trim_end_matches('\0');
+                    (!s.is_empty()).then(|| s.to_string())
+                }
+                _ => None,
+            });
+        let Some(script) = table_script.or(script).or_else(|| obj.script.clone()) else {
             return;
         };
+        // An explicitly selected empty script suppresses the object's fallback too.
+        // Native 0x6985f0 silently consumes the event after selection in this case.
+        if native_selection && script.trim_end_matches('\0').is_empty() {
+            return;
+        }
         self.world.trace.push(TraceEntry::EventDelivered {
             t: self.world.time_ms,
             target,
@@ -2604,6 +2636,7 @@ impl Sim {
         } else {
             self.world.in_triggers.insert(id, now);
         }
+        self.update_placeable_contacts(id);
     }
 
     /// Re-arms a heartbeat after it fires, while the object still has one.
@@ -2879,13 +2912,12 @@ impl Sim {
         let reach = crate::engine::dist(a, b) + mine + 2.0;
         // The creature the walker is making for is not walked round: it stops against it.
         let goal = me.commands.first().and_then(|c| c.target);
-        let bodies: Vec<([f32; 2], f32, bool)> = self
-            .world
-            .objects
-            .values()
+        let creatures = self.world.creature_ids();
+        let bodies: Vec<([f32; 2], f32, bool)> = creatures
+            .iter()
+            .filter_map(|&c| self.world.get(c))
             .filter(|o| {
                 o.id != id
-                    && o.kind == crate::world::ObjectKind::Creature
                     && o.area == Some(area)
                     && o.active
                     && !o.dead
@@ -2931,16 +2963,19 @@ impl Sim {
             return false;
         };
         let mine = self.capsule_radius(id);
-        self.world.objects.values().any(|o| {
-            o.id != id
-                && o.kind == crate::world::ObjectKind::Creature
-                && o.area == Some(area)
-                && o.active
-                && !o.dead
-                && o.parked.is_none()
-                && ((o.position[0] - p[0]).powi(2) + (o.position[1] - p[1]).powi(2)).sqrt()
-                    < mine + self.capsule_radius(o.id)
-        })
+        let creatures = self.world.creature_ids();
+        creatures
+            .iter()
+            .filter_map(|&c| self.world.get(c))
+            .any(|o| {
+                o.id != id
+                    && o.area == Some(area)
+                    && o.active
+                    && !o.dead
+                    && o.parked.is_none()
+                    && ((o.position[0] - p[0]).powi(2) + (o.position[1] - p[1]).powi(2)).sqrt()
+                        < mine + self.capsule_radius(o.id)
+            })
     }
 
     /// Keeps track of a walker held up by bodies, logging once when it has made no progress
@@ -3432,14 +3467,13 @@ impl Sim {
         // The other melee attackers of the same target hold their places on its ring.
         let mine = self.body_radius(id);
         let target_r = self.body_radius(target);
-        let held: Vec<(i32, i32)> = self
-            .world
-            .objects
-            .values()
+        let creatures = self.world.creature_ids();
+        let held: Vec<(i32, i32)> = creatures
+            .iter()
+            .filter_map(|&c| self.world.get(c))
             .filter(|o| {
                 o.id != id
                     && o.id != target
-                    && o.kind == crate::world::ObjectKind::Creature
                     && o.area == me.area
                     && o.active
                     && !o.dead
@@ -4324,18 +4358,13 @@ impl Sim {
             // is dead; rules_core answers it with UT_Talk, which begins the conversation.
             let target = cmd
                 .target
-                .filter(|&t| self.world.get(t).is_some_and(|o| !o.dead))
-                // A click must respect the ambient speaker's current line before
-                // dispatching DIALOGUE: UT_Talk clears ambient dialogs before calling
-                // BeginConversation, which otherwise bypasses its restart guard.
-                // The native ambient manager arbitrates a speaker's active line at
-                // 0x6ff190, before starting its voice (0x6ffaa0 -> 0x6fe4a0).
-                // Provisional: enforcing that lifetime before player dispatch is our
-                // boundary choice; the native command's earlier busy check is untraced.
-                .filter(|&t| {
-                    self.game != thedas_vfs::Game::Origins
-                        || !self.ambient.iter().any(|a| a.c.owner == t)
-                });
+                .filter(|&t| self.world.get(t).is_some_and(|o| !o.dead));
+            // Sent even while the target says something in passing: the executor has no
+            // such test, and UT_Talk clears the target's ambient dialogs before it begins
+            // the conversation, so a real conversation starts at once. A creature whose
+            // conversation is itself said in passing (the Dust Town beggar) does not begin
+            // its line again over the one it is saying: the ambient manager keeps the
+            // speaker's line apart from the cleared record ([`Sim::ambient_speaking`]).
             if let Some(t) = target {
                 if cmd.name == "CommandInitiateDialog"
                     && cmd.arrived
@@ -6642,6 +6671,163 @@ mod tests {
         let m = s.world.spawn(ObjectKind::Module, "module");
         s.world.module = Some(m);
         m
+    }
+
+    #[test]
+    fn origins_creature_and_placeable_event_scripts_use_table_then_explicit_then_object() {
+        use thedas_formats::gda::Cell;
+
+        for kind in [ObjectKind::Creature, ObjectKind::Placeable] {
+            let mut s = sim();
+            for script in ["table", "explicit", "object", " "] {
+                s.add_script(script, counter_script());
+            }
+            let who = s.world.spawn(kind, "actor");
+            // Queueing retains the event; the table is consulted when it is delivered.
+            s.world.queue_event(
+                0,
+                who,
+                Event {
+                    ty: 42,
+                    ..Event::default()
+                },
+                Some("explicit".into()),
+            );
+            s.world.tables().insert(
+                "#114",
+                &["Script"],
+                vec![(42, vec![Cell::String("table\0".into())])],
+            );
+            s.tick(0);
+            assert_eq!(s.world.get(who).unwrap().locals.ints.get("n"), Some(&1));
+            assert!(s.world.trace.entries.iter().any(|entry| matches!(entry,
+                TraceEntry::EventDelivered { script, target, ty: 42, .. }
+                    if script == "table" && *target == who)));
+
+            for (cell, explicit, object, expected) in [
+                (
+                    Cell::String("table".into()),
+                    Some("explicit"),
+                    Some("object"),
+                    Some("table"),
+                ),
+                (
+                    Cell::Empty,
+                    Some("explicit"),
+                    Some("object"),
+                    Some("explicit"),
+                ),
+                (
+                    Cell::String(String::new()),
+                    None,
+                    Some("object"),
+                    Some("object"),
+                ),
+                (
+                    Cell::String("\0".into()),
+                    None,
+                    Some("object"),
+                    Some("object"),
+                ),
+                // Nonempty means nonempty: whitespace is not trimmed into a fallback.
+                (
+                    Cell::String(" ".into()),
+                    Some("explicit"),
+                    Some("object"),
+                    Some(" "),
+                ),
+                (Cell::Empty, Some(""), Some("object"), None),
+                (Cell::Empty, None, Some(""), None),
+                (Cell::Empty, None, None, None),
+            ] {
+                s.world
+                    .tables()
+                    .insert("#114", &["Script"], vec![(42, vec![cell])]);
+                s.world.get_mut(who).unwrap().script = object.map(str::to_string);
+                s.world
+                    .get_mut(who)
+                    .unwrap()
+                    .locals
+                    .ints
+                    .insert("n".into(), 0);
+                s.world.trace.entries.clear();
+                s.deliver(
+                    who,
+                    Event {
+                        ty: 42,
+                        ..Event::default()
+                    },
+                    explicit.map(str::to_string),
+                );
+                assert_eq!(
+                    s.world.get(who).unwrap().locals.ints["n"],
+                    i32::from(expected.is_some())
+                );
+                let delivered: Vec<_> = s
+                    .world
+                    .trace
+                    .entries
+                    .iter()
+                    .filter_map(|entry| match entry {
+                        TraceEntry::EventDelivered { script, .. } => Some(script.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(delivered, expected.into_iter().collect::<Vec<_>>());
+                assert!(
+                    !s.world
+                        .trace
+                        .entries
+                        .iter()
+                        .any(|entry| matches!(entry, TraceEntry::Missing { .. }))
+                );
+            }
+            // An existing table without this event's row also takes the ordinary fallback.
+            s.world.get_mut(who).unwrap().script = Some("object".into());
+            s.world.trace.entries.clear();
+            s.deliver(
+                who,
+                Event {
+                    ty: 43,
+                    ..Event::default()
+                },
+                None,
+            );
+            assert!(s.world.trace.entries.iter().any(|entry| matches!(entry,
+                TraceEntry::EventDelivered { script, ty: 43, .. } if script == "object")));
+        }
+    }
+
+    #[test]
+    fn event_table_selection_preserves_da2_and_untraced_object_routes() {
+        for (game, kind) in [
+            (thedas_vfs::Game::DragonAge2, ObjectKind::Creature),
+            (thedas_vfs::Game::DragonAge2, ObjectKind::Placeable),
+            (thedas_vfs::Game::Origins, ObjectKind::Module),
+            (thedas_vfs::Game::Origins, ObjectKind::Area),
+        ] {
+            let mut s = sim();
+            s.game = game;
+            s.add_script("explicit", counter_script());
+            s.world.tables().insert(
+                "#114",
+                &["Script"],
+                vec![(42, vec![thedas_formats::gda::Cell::String("table".into())])],
+            );
+            let who = s.world.spawn(kind, "actor");
+            s.world.get_mut(who).unwrap().script = Some("object".into());
+            s.deliver(
+                who,
+                Event {
+                    ty: 42,
+                    ..Event::default()
+                },
+                Some("explicit".into()),
+            );
+            assert_eq!(s.world.get(who).unwrap().locals.ints.get("n"), Some(&1));
+            assert!(s.world.trace.entries.iter().any(|entry| matches!(entry,
+                TraceEntry::EventDelivered { script, .. } if script == "explicit")));
+        }
     }
 
     #[test]
