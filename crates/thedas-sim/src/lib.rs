@@ -56,6 +56,7 @@ pub mod session;
 pub mod sim;
 pub mod store;
 pub mod tactics;
+pub mod target_request;
 pub mod threat;
 pub mod trace;
 pub mod training;
