@@ -106,6 +106,52 @@ Facing update `0x8a3e70` can request mode 4. Stop helper `0x8a60e0` changes
 controller and heading checks. Thus queued movement and a displacement in
 the last tick are each insufficient representations of this getter.
 
+### Persistent stop and turn completion
+
+The complete update at `0x8c5b60` first requires component byte `+0x75`
+and update-record integer `+0x34` to be nonzero. It copies the current
+direction from update-record `+0x10` into component `+0xa0`. A nonzero mode
+is recorded in the function's activity return before processing; that return
+can therefore remain true on the update that clears the mode. `IsMoving`
+reads the mode itself, not this return value.
+
+Modes 3 and 4 both run the body-heading step, then clear desired speed
+`+0xe0`. The controller update follows before completion is tested. The
+observed transitions are:
+
+| State before completion | Condition | Transition |
+| --- | --- | --- |
+| Mode 3 | Controller is enabled and its `+0x54 & 0x1c` is nonzero | Keep mode 3 |
+| Mode 3 | That controller condition is absent | Set mode 0, then pass the retained desired direction through `0x8a3e70` |
+| Mode 4 | Desired direction is nonzero and its angle from the current direction is at least `1 - epsilon` degrees | Keep mode 4 |
+| Mode 4 | Direction test permits completion, but the enabled controller's linked record exists with nonzero `+0xd0` | Keep mode 4 |
+| Mode 4 | Direction and controller tests permit completion | Set mode 0 |
+
+Here epsilon is the float at `0xc2442c`, approximately `1e-6`. The direction
+comparison is an **angle in degrees**, not a dot-product tolerance.
+`0x8ca5d0` normalizes horizontal vectors, takes the arccosine of their
+clamped dot product, and `0x8ca780` multiplies the result by the float
+`57.29582595825195` at `0xbe0800`. The ordinary completion tolerance is
+therefore about one degree. The meanings of the controller's `+0x54` states
+and linked `+0xd0` field are not fully classified by this trace.
+
+The mode-3 call back through `0x8a3e70` matters: a stop can transition
+`3 -> 0 -> 4` in the same update when residual facing exceeds the tolerance
+and the controller permits it. A zero desired vector is cleared by that
+setter; a nonzero desired vector is flattened and normalized. From idle,
+the setter enters mode 4 only when a turn is needed and the linked-controller
+guard permits it. Stopping a stationary turn through `0x8a60e0`, in contrast,
+sets mode 0 directly. A fixed one-tick stop flag or an immediate
+clear-on-arrival would each omit these observed states.
+
+The raw mode-switch table at `0x8a3e5c` confirms that mode 3 clears `+0xe4`
+without immediately clearing `+0xe0`; mode 0 clears both. The next ordinary
+mode-3 update clears `+0xe0` after stepping heading. The speed table at
+`0x8a3c40` returns zero for modes 0, 3 and 4; only modes 1/2 perform the
+appearance-speed lookup. These are distinct stored speed, requested speed
+and controller-completion boundaries, not evidence for another combat-speed
+constant.
+
 The full take calls `0x8c3da0` at `0x53d184`, and release calls the same helper
 at `0x58601b`. It sets a nonzero locomotion mode to zero, then resets the
 linked controller when present. This connects performance ownership to the
@@ -147,7 +193,8 @@ activation nor pose placement implements the processing lifecycle above.
 DA2 `AddCommand` appends/prepends directly and does not yet apply all the native
 admission/static rules. `IsMoving` still falls back to the unimplemented
 return value. A complete fix needs explicit persistent locomotion state and
-tests of take, held admission, release, cancellation and save/reload.
+tests of take, held admission, release, cancellation and save/reload, including
+the residual turn after a stop and the controller-dependent completion above.
 
 Retained matched diagnostics contain 38 IsMoving fallbacks in the larger
 patrol ambush and 74 in the pre-Ogre replay, all from `ability_core.ncs`.
