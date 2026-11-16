@@ -5280,6 +5280,7 @@ dependencies = [
  "thedas-sim",
  "thedas-vfs",
  "thedas-video",
+ "zip 2.6.1",
 ]
 
 [[package]]

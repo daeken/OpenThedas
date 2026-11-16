@@ -91,6 +91,9 @@ fn cut_scene_lights(
 /// What the objects' scene was built for: each object's models. A change rebuilds it.
 type ObjectsKey = Vec<(u32, Vec<String>)>;
 
+#[path = "live_report.rs"]
+mod report_snapshot;
+
 /// The level of the current area, drawn first; built when the area's layout changes.
 pub struct LiveLevel {
     pub layout: String,
@@ -3430,6 +3433,19 @@ impl Live {
                             },
                         );
                         Some(format!("use {tag}"))
+                    }
+                    // A click on a corpse opens what it left, as the pad's A on it does: the
+                    // body bag has no model of its own to click.
+                    thedas_sim::world::ObjectKind::Creature if dead => {
+                        let bag = sim.corpse_body_bag(id)?;
+                        sim.input(
+                            thedas_sim::commands::CommandSource::Player,
+                            thedas_sim::commands::SimCommand::OrderUse {
+                                who: leader,
+                                target: bag,
+                            },
+                        );
+                        Some(format!("loot {tag}"))
                     }
                     _ => None,
                 }

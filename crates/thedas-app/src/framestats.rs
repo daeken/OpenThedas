@@ -16,6 +16,7 @@ pub const LOG_EVERY: u32 = 10;
 #[derive(Default)]
 pub struct FrameStats {
     last: Option<Instant>,
+    last_ms: Option<f64>,
     since: Option<Instant>,
     /// Frame times in milliseconds.
     times: Vec<f32>,
@@ -27,8 +28,9 @@ impl FrameStats {
     /// Notes a frame drawn at `now`; once a second gives the text for the title.
     pub fn frame(&mut self, now: Instant) -> Option<String> {
         if let Some(last) = self.last.replace(now) {
-            self.times
-                .push(now.saturating_duration_since(last).as_secs_f32() * 1000.0);
+            let ms = now.saturating_duration_since(last).as_secs_f64() * 1000.0;
+            self.last_ms = Some(ms);
+            self.times.push(ms as f32);
         }
         let since = *self.since.get_or_insert(now);
         if now.saturating_duration_since(since) < WINDOW || self.times.is_empty() {
@@ -39,6 +41,11 @@ impl FrameStats {
         self.times.clear();
         self.given = self.given.wrapping_add(1);
         text
+    }
+
+    /// Raw start-to-start redraw interval, before simulation/camera time is clamped.
+    pub fn last_frame_ms(&self) -> Option<f64> {
+        self.last_ms
     }
 
     /// Whether the figure just given is one for the log too (the first, then every
@@ -101,8 +108,10 @@ mod tests {
         let mut f = FrameStats::default();
         let t0 = Instant::now();
         assert!(f.frame(t0).is_none());
+        assert!(f.last_frame_ms().is_none());
         for i in 1..60 {
             assert!(f.frame(t0 + Duration::from_millis(i * 16)).is_none());
+            assert_eq!(f.last_frame_ms(), Some(16.0));
         }
         let s = f.frame(t0 + Duration::from_millis(1001)).unwrap();
         assert!(s.contains("fps"), "{s}");

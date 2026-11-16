@@ -2848,6 +2848,13 @@ impl App {
             }
             return;
         }
+        let capture_started = Instant::now();
+        let capture = report::Capture {
+            presentation: report::presentation_snapshot(self),
+            settings: self.settings.clone(),
+            data_dir: saves::data_dir(),
+        };
+        let presentation_ms = capture_started.elapsed().as_secs_f64() * 1000.0;
         let mut info = json!({
             "build": report::build_info(),
             "settings": self.started_with,
@@ -2882,6 +2889,9 @@ impl App {
         let mut trace = None;
         let mut journal = None;
         let mut pause = false;
+        let metadata_ms = capture_started.elapsed().as_secs_f64() * 1000.0 - presentation_ms;
+        let mut save_clone_ms = 0.0;
+        let mut trace_ms = 0.0;
         if let Some(live) = self.live.as_mut() {
             if !live.front_end {
                 journal = live.journal.as_mut().and_then(|j| j.files());
@@ -2890,17 +2900,25 @@ impl App {
                 info["game"]["hero"] = json!(sim.world.hero.map(|h| sim.display_name(h)));
                 info["game"]["area_name"] = json!(sim.world.area.map(|a| sim.display_name(a)));
                 info["game"]["coverage"] = sim.world.trace.coverage();
-                match sim.save_json() {
-                    Ok(b) => now_save = Some(b),
-                    Err(e) => log::warn!("report: the game's state: {e}"),
-                }
+                let stage = Instant::now();
+                now_save = Some(report::ReportSave::Game(Box::new(sim.save_game())));
+                save_clone_ms = stage.elapsed().as_secs_f64() * 1000.0;
+                let stage = Instant::now();
                 trace = serde_json::to_value(&sim.world.trace.recent).ok();
+                trace_ms = stage.elapsed().as_secs_f64() * 1000.0;
                 drop(sim);
                 pause = !live.paused;
             }
         }
-        let dir = self.recorder.start(now_save, trace, journal, info);
-        log::info!("report: started in {}", dir.display());
+        info["capture_ms"] = json!(capture_started.elapsed().as_secs_f64() * 1000.0);
+        info["capture_timings_ms"] = json!({ "presentation": presentation_ms, "metadata": metadata_ms,
+            "save_clone": save_clone_ms, "trace": trace_ms });
+        let dir = self.recorder.start(now_save, trace, journal, info, capture);
+        log::info!(
+            "report: captured state in {:.2} ms; started in {}",
+            capture_started.elapsed().as_secs_f64() * 1000.0,
+            dir.display()
+        );
         // The frame as presented, read back as the next one is drawn; drawn again
         // offscreen where the surface cannot be read back.
         let readable = self
@@ -3113,7 +3131,13 @@ impl App {
     /// One frame of reports: a snapshot of the game when one is due, and a report under
     /// way finished once its screenshot and note are in.
     fn report_frame(&mut self, dt_ms: f64) {
-        self.recorder.frame(dt_ms);
+        let context = report::frame_context(self);
+        let dt_ms = self
+            .gfx
+            .as_ref()
+            .and_then(|g| g.frames.last_frame_ms())
+            .unwrap_or(dt_ms);
+        self.recorder.frame(dt_ms, context);
         for a in std::mem::take(&mut self.mark_answers) {
             self.mark_answer(a);
         }
@@ -3802,6 +3826,23 @@ impl App {
                     log::info!("weapon set switched");
                 }
             }
+            // In a conversation the number keys pick the replies (1 is the first), not the
+            // quickbar: the conversation screen lists them numbered.
+            c if self.live.is_some()
+                && quickslot_key(c).is_some()
+                && self
+                    .screens
+                    .as_ref()
+                    .is_some_and(|s| s.shown().contains(&screens::Screen::Conversation)) =>
+            {
+                let n = quickslot_key(c).unwrap_or(0) as usize;
+                if let Some(live) = self.live.as_mut() {
+                    let have = live.sim().dialog_state().map_or(0, |d| d.replies.len());
+                    if n < have {
+                        log::info!("{}", reply(live, n));
+                    }
+                }
+            }
             // The quickbar's first ten slots: 1 to 9, then 0.
             c if self.live.is_some() && quickslot_key(c).is_some() => {
                 let slot = quickslot_key(c).unwrap_or(0);
@@ -4284,6 +4325,10 @@ impl App {
                     _ => KeyCode::KeyI,
                 });
                 log.push(format!("{m:?}"));
+            }
+            &Step::RawKey(code) => {
+                self.key_down(code);
+                log.push(format!("rawkey {code:?}"));
             }
             &Step::Leader(n) => {
                 let tag = self.live.as_mut().and_then(|l| l.choose_leader(n));
@@ -6124,6 +6169,9 @@ enum Step {
     /// A movement key held or let go (`keydown w`, `keyup w`; w, a, s, d, q or e), as the
     /// keyboard holds it.
     HoldKey(KeyCode, bool),
+    /// `rawkey NAME`: a key pressed as the window delivers it (1 to 0, space, enter, escape,
+    /// tab), so what the game does with the key itself is tested.
+    RawKey(KeyCode),
     /// The highlight key held or let go (`allnames on`, `allnames off`): every creature near
     /// shows its name, as while Tab is down.
     AllNames(bool),
@@ -6471,6 +6519,23 @@ fn parse_step(s: &str) -> Result<Step> {
         "key" if arg.eq_ignore_ascii_case("space") => Step::Pause,
         "key" if arg == "/" => Step::SwapWeapons,
         "key" if arg.eq_ignore_ascii_case("f10") => Step::ModMode,
+        "rawkey" => Step::RawKey(match arg.trim().to_ascii_lowercase().as_str() {
+            "1" => KeyCode::Digit1,
+            "2" => KeyCode::Digit2,
+            "3" => KeyCode::Digit3,
+            "4" => KeyCode::Digit4,
+            "5" => KeyCode::Digit5,
+            "6" => KeyCode::Digit6,
+            "7" => KeyCode::Digit7,
+            "8" => KeyCode::Digit8,
+            "9" => KeyCode::Digit9,
+            "0" => KeyCode::Digit0,
+            "space" => KeyCode::Space,
+            "enter" => KeyCode::Enter,
+            "escape" => KeyCode::Escape,
+            "tab" => KeyCode::Tab,
+            other => bail!("rawkey takes 1 to 0, space, enter, escape or tab, not {other:?}"),
+        }),
         "modmode" => Step::ModMode,
         "modselect" if !arg.is_empty() => Step::ModSelect(arg.to_string()),
         "modframe" => Step::ModFrame(arg.parse().context("modframe takes a frame number")?),
@@ -7293,7 +7358,9 @@ fn main() -> Result<()> {
                         println!("allnames {on}");
                     }
                     // The movement keys are the window's (see `App::key_walk`).
-                    Step::HoldKey(..) => println!("keydown and keyup need a window"),
+                    Step::HoldKey(..) | Step::RawKey(..) => {
+                        println!("keydown, keyup and rawkey need a window")
+                    }
                     Step::AskChoice(prompt) => {
                         if let Some((layer, _)) = played.as_mut() {
                             layer.ask_choice(0, prompt, "Yes", "No");
