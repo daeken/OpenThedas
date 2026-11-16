@@ -16,6 +16,120 @@ pub struct TargetRequest {
     pub script: Option<String>,
 }
 
+impl Sim {
+    /// Replaces the previous request without issuing its callback. The native's
+    /// second float is unused; radius selects circular targeting when nonzero.
+    pub(crate) fn request_target(&mut self, request: TargetRequest) {
+        self.world.target_request = Some(request);
+    }
+
+    pub fn cancel_target_request(&mut self) {
+        self.world.target_request = None;
+    }
+
+    fn requested_target_valid(&self, selected: ObjectId, mask: i32) -> bool {
+        if selected == OBJECT_INVALID {
+            return mask & 0x20 != 0;
+        }
+        let Some(o) = self.world.get(selected) else {
+            return false;
+        };
+        match o.kind {
+            ObjectKind::Creature => {
+                if self.world.controlled() == Some(selected) {
+                    return mask & 1 != 0;
+                }
+                let no_health = !o
+                    .properties
+                    .get(&7)
+                    .is_some_and(|&(_, h)| (1.0..2147483648.0).contains(&h));
+                if no_health {
+                    return mask & 0x40 != 0;
+                }
+                // The executable reads its cached IsHostile attribute. Reuse
+                // our relationship calculation when no explicit attribute exists.
+                let hostile = o.fields.get("IsHostile").map_or_else(
+                    || {
+                        self.world
+                            .controlled()
+                            .is_some_and(|who| self.hostile(who, selected))
+                    },
+                    |&h| h != 0,
+                );
+                if !hostile {
+                    mask & 2 != 0
+                } else if crate::engine::party_of(self).contains(&selected) {
+                    mask & 0x80 != 0
+                } else {
+                    mask & 4 != 0
+                }
+            }
+            ObjectKind::Placeable => mask & 8 != 0,
+            ObjectKind::Item => mask & 0x10 != 0,
+            ObjectKind::Area
+            | ObjectKind::Module
+            | ObjectKind::Party
+            | ObjectKind::Stage
+            | ObjectKind::Map
+            | ObjectKind::MapPin => false,
+            _ => true,
+        }
+    }
+
+    fn requested_target_event(
+        &self,
+        selected: ObjectId,
+        position: [f32; 3],
+    ) -> Option<(TargetRequest, Event)> {
+        let request = self.world.target_request.as_ref()?;
+        if !self.requested_target_valid(selected, request.mask) {
+            return None;
+        }
+        let position = self.world.get(selected).map_or(position, |o| o.position);
+        Some((
+            request.clone(),
+            Event {
+                ty: request.event_type,
+                creator: self.world.controlled(),
+                target: Some(request.recipient),
+                objects: vec![selected],
+                vectors: vec![position],
+                ..Default::default()
+            },
+        ))
+    }
+
+    /// Completes script targeting with an object, or OBJECT_INVALID and a ground
+    /// point. Invalid choices leave the request active. Delivery is synchronous;
+    /// the native clears targeting after the callback, including a replacement
+    /// request made inside that callback.
+    pub fn respond_to_target_request(&mut self, selected: ObjectId, position: [f32; 3]) -> bool {
+        let Some((request, event)) = self.requested_target_event(selected, position) else {
+            return false;
+        };
+        self.deliver(request.recipient, event, request.script);
+        self.world.target_request = None;
+        true
+    }
+
+    /// A click while targeting selects a target instead of issuing an order.
+    pub(crate) fn target_request_click(
+        &mut self,
+        who: ObjectId,
+        selected: ObjectId,
+        position: [f32; 3],
+    ) -> bool {
+        if self.game != thedas_vfs::Game::Origins
+            || self.world.target_request.is_none()
+            || self.world.controlled() != Some(who)
+        {
+            return false;
+        }
+        self.respond_to_target_request(selected, position);
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -218,119 +332,5 @@ mod tests {
         };
         assert!(crate::engine::call(&mut h, hero, &f, &[]).is_none());
         assert!(s.world.target_request.is_none());
-    }
-}
-
-impl Sim {
-    /// Replaces the previous request without issuing its callback. The native's
-    /// second float is unused; radius selects circular targeting when nonzero.
-    pub(crate) fn request_target(&mut self, request: TargetRequest) {
-        self.world.target_request = Some(request);
-    }
-
-    pub fn cancel_target_request(&mut self) {
-        self.world.target_request = None;
-    }
-
-    fn requested_target_valid(&self, selected: ObjectId, mask: i32) -> bool {
-        if selected == OBJECT_INVALID {
-            return mask & 0x20 != 0;
-        }
-        let Some(o) = self.world.get(selected) else {
-            return false;
-        };
-        match o.kind {
-            ObjectKind::Creature => {
-                if self.world.controlled() == Some(selected) {
-                    return mask & 1 != 0;
-                }
-                let no_health = !o
-                    .properties
-                    .get(&7)
-                    .is_some_and(|&(_, h)| (1.0..2147483648.0).contains(&h));
-                if no_health {
-                    return mask & 0x40 != 0;
-                }
-                // The executable reads its cached IsHostile attribute. Reuse
-                // our relationship calculation when no explicit attribute exists.
-                let hostile = o.fields.get("IsHostile").map_or_else(
-                    || {
-                        self.world
-                            .controlled()
-                            .is_some_and(|who| self.hostile(who, selected))
-                    },
-                    |&h| h != 0,
-                );
-                if !hostile {
-                    mask & 2 != 0
-                } else if crate::engine::party_of(self).contains(&selected) {
-                    mask & 0x80 != 0
-                } else {
-                    mask & 4 != 0
-                }
-            }
-            ObjectKind::Placeable => mask & 8 != 0,
-            ObjectKind::Item => mask & 0x10 != 0,
-            ObjectKind::Area
-            | ObjectKind::Module
-            | ObjectKind::Party
-            | ObjectKind::Stage
-            | ObjectKind::Map
-            | ObjectKind::MapPin => false,
-            _ => true,
-        }
-    }
-
-    fn requested_target_event(
-        &self,
-        selected: ObjectId,
-        position: [f32; 3],
-    ) -> Option<(TargetRequest, Event)> {
-        let request = self.world.target_request.as_ref()?;
-        if !self.requested_target_valid(selected, request.mask) {
-            return None;
-        }
-        let position = self.world.get(selected).map_or(position, |o| o.position);
-        Some((
-            request.clone(),
-            Event {
-                ty: request.event_type,
-                creator: self.world.controlled(),
-                target: Some(request.recipient),
-                objects: vec![selected],
-                vectors: vec![position],
-                ..Default::default()
-            },
-        ))
-    }
-
-    /// Completes script targeting with an object, or OBJECT_INVALID and a ground
-    /// point. Invalid choices leave the request active. Delivery is synchronous;
-    /// the native clears targeting after the callback, including a replacement
-    /// request made inside that callback.
-    pub fn respond_to_target_request(&mut self, selected: ObjectId, position: [f32; 3]) -> bool {
-        let Some((request, event)) = self.requested_target_event(selected, position) else {
-            return false;
-        };
-        self.deliver(request.recipient, event, request.script);
-        self.world.target_request = None;
-        true
-    }
-
-    /// A click while targeting selects a target instead of issuing an order.
-    pub(crate) fn target_request_click(
-        &mut self,
-        who: ObjectId,
-        selected: ObjectId,
-        position: [f32; 3],
-    ) -> bool {
-        if self.game != thedas_vfs::Game::Origins
-            || self.world.target_request.is_none()
-            || self.world.controlled() != Some(who)
-        {
-            return false;
-        }
-        self.respond_to_target_request(selected, position);
-        true
     }
 }
