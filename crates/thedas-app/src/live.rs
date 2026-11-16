@@ -91,6 +91,9 @@ fn cut_scene_lights(
 /// What the objects' scene was built for: each object's models. A change rebuilds it.
 type ObjectsKey = Vec<(u32, Vec<String>)>;
 
+#[path = "live_report.rs"]
+mod report_snapshot;
+
 /// The level of the current area, drawn first; built when the area's layout changes.
 pub struct LiveLevel {
     pub layout: String,
