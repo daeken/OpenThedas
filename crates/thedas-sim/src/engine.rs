@@ -47,6 +47,17 @@ fn obj(a: &[Value], i: usize) -> ObjectId {
     }
 }
 
+/// DA2's waiting queue is separate from its active executor (0x4fd460,
+/// 0x5a8d40). Our started front carries that executor's deadline.
+fn script_command_queue(sim: &Sim, who: ObjectId) -> &[Command] {
+    let Some(o) = sim.world.get(who) else {
+        return &[];
+    };
+    let active = sim.game == thedas_vfs::Game::DragonAge2
+        && o.commands.first().is_some_and(|c| c.due.is_some());
+    &o.commands[usize::from(active)..]
+}
+
 /// The independent placeable current, retaining explicit currents from older saves.
 pub(crate) fn origins_placeable_health(o: &Object) -> i32 {
     o.properties.get(&7).map_or_else(
@@ -626,10 +637,13 @@ const ABI_PERSISTENT_AREA: u32 = 0x5d3e_0787;
 /// The M2DA id of `VFX Persistent`.
 const VFX_PERSISTENT_TABLE: i32 = 96;
 
-/// `GetClusterCenter`, as DAOrigins.exe works it out (0x671980):
-/// - The cluster's span is the ability's `aoe_param1` in `ABI_base` (or, for an ability with
-///   a lasting area, its `VFX Persistent` row's `Radius`), doubled for a sphere
-///   (`aoe_type` 1).
+/// `GetClusterCenter` (DAOrigins.exe 0x671980, DragonAge2.exe 0x51a4b0):
+/// - In Origins, the cluster's span is the ability's `aoe_param1` in `ABI_base`
+///   (or, for an ability with a lasting area, its `VFX Persistent` row's `Radius`),
+///   doubled for a sphere (`aoe_type` 1).
+/// - DA2 reads the persistent row through the upgradable ability column 0x53a8a258,
+///   then its radius and shape from table 96. A sphere doubles the radius. Ability
+///   302030 instead doubles its upgradable 0x15bdf19c parameter (0x51a588-0x51a5ff).
 /// - The candidates are the creatures the creator perceives. Each hostile one in turn is a
 ///   cluster's center; the others join it, in candidate order, when within the span of the
 ///   center and of every member already in (a quirk kept: distances are read from a table
@@ -674,24 +688,45 @@ fn cluster_center(
         })
         .collect();
     let tables = sim.world.tables.clone();
-    let abi = tables.get(0, "ABI_base");
-    let abi_cell = |col: &str| {
-        abi.as_ref()
-            .and_then(|t| t.cell(col, ability as i64).cloned())
-    };
-    let persistent = abi.as_ref().map_or(0, |t| {
-        cell_int(t.cell_by_hash(ABI_PERSISTENT_AREA, ability as i64))
-    });
-    let mut span = if persistent == 0 {
-        cell_float(abi_cell("aoe_param1").as_ref())
+    let span = if sim.game == thedas_vfs::Game::DragonAge2 {
+        if ability == 302030 {
+            2.0 * upgradable_ability_float(sim, creator, 0x15bd_f19c, ability)
+        } else {
+            let persistent = upgradable_ability_int(sim, creator, 0x53a8_a258, ability);
+            let area = tables.get(VFX_PERSISTENT_TABLE, "");
+            let cell = |column| {
+                area.as_ref()
+                    .filter(|_| persistent != 0)
+                    .and_then(|t| t.cell_by_hash(column, i64::from(persistent)))
+            };
+            let radius = cell_float(cell(0xad5f_b9f8));
+            if cell_int(cell(0x4de7_0e62)) == 1 {
+                2.0 * radius
+            } else {
+                radius
+            }
+        }
     } else {
-        tables
-            .get(VFX_PERSISTENT_TABLE, "")
-            .map_or(0.0, |t| cell_float(t.cell("Radius", persistent as i64)))
+        let abi = tables.get(0, "ABI_base");
+        let abi_cell = |col: &str| {
+            abi.as_ref()
+                .and_then(|t| t.cell(col, ability as i64).cloned())
+        };
+        let persistent = abi.as_ref().map_or(0, |t| {
+            cell_int(t.cell_by_hash(ABI_PERSISTENT_AREA, ability as i64))
+        });
+        let mut span = if persistent == 0 {
+            cell_float(abi_cell("aoe_param1").as_ref())
+        } else {
+            tables
+                .get(VFX_PERSISTENT_TABLE, "")
+                .map_or(0.0, |t| cell_float(t.cell("Radius", persistent as i64)))
+        };
+        if cell_int(abi_cell("aoe_type").as_ref()) == 1 {
+            span *= 2.0;
+        }
+        span
     };
-    if cell_int(abi_cell("aoe_type").as_ref()) == 1 {
-        span *= 2.0;
-    }
     let n = candidates.len();
     let hostile: Vec<bool> = candidates
         .iter()
@@ -3600,9 +3635,13 @@ pub fn call(
             void()
         }
         "GetCommandByIndex" => {
-            let c = h
-                .object(obj(a, 0))
-                .and_then(|o| o.commands.get(int(a, 1).max(0) as usize).cloned());
+            let index = if h.sim.game == thedas_vfs::Game::DragonAge2 {
+                // 0x5c2400 consumes the index as an unsigned 16-bit value.
+                int(a, 1) as u16 as usize
+            } else {
+                int(a, 1).max(0) as usize
+            };
+            let c = script_command_queue(h.sim, obj(a, 0)).get(index).cloned();
             let hd = c.map(|c| h.sim.world.store(EngineData::Command(c)));
             ok(Value::Engine {
                 ty: ty.command,
@@ -3649,7 +3688,7 @@ pub fn call(
             ok(Value::Int(exists as i32))
         }
         "GetCommandQueueSize" => ok(Value::Int(
-            h.object(obj(a, 0)).map_or(0, |o| o.commands.len() as i32),
+            script_command_queue(h.sim, obj(a, 0)).len() as i32
         )),
         // Cancelling a command in progress completes it (COMMAND_RESULT_INVALID), which is
         // how the AI notices it has nothing to do. Provisional.
@@ -8053,6 +8092,81 @@ mod tests {
             script: "test".into(),
         };
         call(&mut h, caller, &f, a).unwrap().unwrap()
+    }
+
+    #[test]
+    fn da2_command_queue_omits_the_active_executor_and_keeps_waiting_indexes() {
+        fn command_at(s: &mut Sim, who: ObjectId, index: i32) -> Option<Command> {
+            let Some(Value::Engine { handle, .. }) = run(
+                s,
+                who,
+                "GetCommandByIndex",
+                &[Value::Object(who), Value::Int(index)],
+            ) else {
+                panic!("expected command handle");
+            };
+            match s.world.handle(handle) {
+                Some(EngineData::Command(command)) => Some(command.clone()),
+                _ => None,
+            }
+        }
+
+        for game in [thedas_vfs::Game::DragonAge2, thedas_vfs::Game::Origins] {
+            let table = EngineTable::parse(
+                b"#define ENGINE_STRUCTURE_2 command\n\
+                int GetCommandQueueSize(object o) = 724;\n\
+                command GetCommandByIndex(object o, int i) = 536;\n\
+                int COMMAND_TYPE_WAIT = 13;\n",
+            )
+            .unwrap();
+            let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(table), 1);
+            s.game = game;
+            let who = s.world.spawn(ObjectKind::Creature, "actor");
+            let size = |s: &mut Sim, id| run(s, who, "GetCommandQueueSize", &[Value::Object(id)]);
+            assert_eq!(size(&mut s, who), Some(Value::Int(0)));
+            assert_eq!(size(&mut s, OBJECT_INVALID), Some(Value::Int(0)));
+            assert_eq!(command_at(&mut s, OBJECT_INVALID, 0), None);
+            s.order_wait(who, 1.);
+            // Before the scheduler starts it, the front is still waiting.
+            assert_eq!(size(&mut s, who), Some(Value::Int(1)));
+            assert_eq!(command_at(&mut s, who, 0).unwrap().seconds, 1.);
+            s.tick(100);
+            let da2 = game == thedas_vfs::Game::DragonAge2;
+            assert_eq!(size(&mut s, who), Some(Value::Int(i32::from(!da2))));
+            assert_eq!(command_at(&mut s, who, 0).is_none(), da2);
+            let mut next = s.world.get(who).unwrap().commands[0].clone();
+            next.due = None;
+            next.seconds = 2.;
+            s.world.get_mut(who).unwrap().commands.push(next.clone());
+            next.seconds = 3.;
+            s.world.get_mut(who).unwrap().commands.push(next);
+            assert_eq!(size(&mut s, who), Some(Value::Int(if da2 { 2 } else { 3 })));
+            assert_eq!(
+                command_at(&mut s, who, 0).unwrap().seconds,
+                if da2 { 2. } else { 1. }
+            );
+            assert_eq!(command_at(&mut s, who, -1).is_none(), da2);
+            assert_eq!(command_at(&mut s, who, i32::MAX), None);
+            assert_eq!(command_at(&mut s, who, 65536).is_some(), da2);
+            if da2 {
+                assert_eq!(command_at(&mut s, who, -65536).unwrap().seconds, 2.);
+            }
+            // A ready animation still belongs to the executor. Reload keeps
+            // the same queue boundary, including older records without readiness.
+            s.world.get_mut(who).unwrap().commands[0].cancellable = true;
+            s.world = serde_json::from_str(&serde_json::to_string(&s.world).unwrap()).unwrap();
+            assert_eq!(size(&mut s, who), Some(Value::Int(if da2 { 2 } else { 3 })));
+            s.world.get_mut(who).unwrap().commands[0].cancellable = false;
+            s.world = serde_json::from_str(&serde_json::to_string(&s.world).unwrap()).unwrap();
+            s.tick(900);
+            assert_eq!(
+                command_at(&mut s, who, 0).unwrap().seconds,
+                if da2 { 3. } else { 2. }
+            );
+            assert_eq!(size(&mut s, who), Some(Value::Int(if da2 { 1 } else { 2 })));
+            s.world.get_mut(who).unwrap().commands.clear();
+            assert_eq!(size(&mut s, who), Some(Value::Int(0)));
+        }
     }
 
     #[test]
@@ -13414,9 +13528,18 @@ mod coverage_tests {
         );
         t.insert(
             "#96",
-            &["ID", "Radius"],
-            vec![(7, vec![Cell::Int(7), Cell::Float(3.0)])],
+            &["ID", "Radius", "#ad5fb9f8", "#4de70e62"],
+            vec![(
+                7,
+                vec![
+                    Cell::Int(7),
+                    Cell::Float(3.0),
+                    Cell::Float(3.0),
+                    Cell::Int(0),
+                ],
+            )],
         );
+        t.insert("#1", &["#53a8a258"], vec![(2, vec![Cell::Int(7)])]);
         s.world.tables = Arc::new(t);
         let area = s.world.spawn(ObjectKind::Area, "area");
         s.world.hostility.insert((1, 2), true);
@@ -13524,6 +13647,113 @@ mod coverage_tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn da2_clusters_use_persistent_shapes_and_upgradable_ability_parameters() {
+        let mut s = sim();
+        s.game = thedas_vfs::Game::DragonAge2;
+        let tables = crate::m2da::Tables::empty();
+        tables.insert(
+            "ABI_base",
+            &["aoe_type", "aoe_param1"],
+            vec![(301030, vec![Cell::Int(1), Cell::Float(100.0)])],
+        );
+        tables.insert(
+            "#1",
+            &["#53a8a258", "#15bdf19c", "#d300f4d9"],
+            vec![
+                (0, vec![Cell::Int(1), Cell::Float(1.0)]),
+                (
+                    301030,
+                    vec![Cell::Int(301030), Cell::Float(0.0), Cell::Int(301031)],
+                ),
+                (301031, vec![Cell::Int(1)]),
+                (301040, vec![Cell::Int(301040)]),
+                (301050, vec![Cell::Int(0)]),
+                (301060, vec![Cell::Int(999999)]),
+                (
+                    302030,
+                    vec![Cell::Int(301040), Cell::Float(2.5), Cell::Int(302031)],
+                ),
+                (302031, vec![Cell::Int(0), Cell::Float(1.0)]),
+            ],
+        );
+        tables.insert(
+            "#96",
+            &["#ad5fb9f8", "#4de70e62"],
+            vec![
+                (0, vec![Cell::Float(100.0), Cell::Int(1)]),
+                (301030, vec![Cell::Float(2.5), Cell::Int(1)]),
+                (301031, vec![Cell::Float(3.5), Cell::Int(1)]),
+                (301040, vec![Cell::Float(2.5), Cell::Int(2)]),
+            ],
+        );
+        let tables = Arc::new(tables);
+        s.world.tables = tables.clone();
+        let area = s.world.spawn(ObjectKind::Area, "area");
+        s.world.hostility.insert((1, 2), true);
+        let put = |s: &mut Sim, group, x| {
+            let id = s.world.spawn(ObjectKind::Creature, "creature");
+            let o = s.world.get_mut(id).unwrap();
+            (o.area, o.group, o.position) = (Some(area), group, [x, 0.0, 0.0]);
+            o.properties.insert(7, (100.0, 100.0));
+            id
+        };
+        let mage = put(&mut s, 1, 0.0);
+        let lone = put(&mut s, 2, 100.0);
+        let a = put(&mut s, 2, 10.0);
+        let b = put(&mut s, 2, 14.0);
+        let far = put(&mut s, 2, 30.0);
+        s.world.get_mut(mage).unwrap().combat.perceived = vec![lone, a, b, far];
+        let center = |s: &mut Sim, ability| {
+            let result = run(
+                s,
+                mage,
+                "GetClusterCenter",
+                &[
+                    Value::Object(mage),
+                    Value::Int(ability),
+                    Value::Int(2),
+                    Value::Int(0),
+                    Value::Int(0),
+                ],
+            );
+            match result {
+                Some(Value::Engine { handle, .. }) => match s.world.handle(handle) {
+                    Some(EngineData::Location(l)) => (l.area, l.position),
+                    _ => panic!("no location"),
+                },
+                _ => panic!("no location"),
+            }
+        };
+        // Fireball's sphere spans 5 m, with Origins metadata giving a different answer.
+        assert_eq!(center(&mut s, 301030), (area, [12.0, 0.0, 0.0]));
+        s.game = thedas_vfs::Game::Origins;
+        assert_eq!(center(&mut s, 301030), (area, [38.5, 0.0, 0.0]));
+        s.game = thedas_vfs::Game::DragonAge2;
+        // Other shapes keep their radius. Zero, missing and unknown persistent rows
+        // have zero span, including a zero row containing otherwise valid metadata.
+        for ability in [301040, 301050, 301060, 301070] {
+            assert_eq!(center(&mut s, ability).0, OBJECT_INVALID, "{ability}");
+        }
+        s.world.get_mut(b).unwrap().position[0] = 16.0;
+        assert_eq!(center(&mut s, 301030).0, OBJECT_INVALID);
+        assert_eq!(center(&mut s, 302030).0, OBJECT_INVALID);
+        // A learned direct upgrade can change the persistent row itself.
+        s.world.get_mut(mage).unwrap().abilities.insert(301031);
+        assert_eq!(center(&mut s, 301030), (area, [13.0, 0.0, 0.0]));
+        // 302030 doubles its upgradable float even with a different persistent shape.
+        s.world.get_mut(mage).unwrap().abilities.insert(302031);
+        assert_eq!(center(&mut s, 302030), (area, [13.0, 0.0, 0.0]));
+        let saved = s.save_json().unwrap();
+        s.load_json(&saved).unwrap();
+        s.world.tables = tables;
+        assert_eq!(center(&mut s, 301030), (area, [13.0, 0.0, 0.0]));
+        assert_eq!(center(&mut s, 302030), (area, [13.0, 0.0, 0.0]));
+        s.world.tables = Arc::new(crate::m2da::Tables::empty());
+        assert_eq!(center(&mut s, 301030).0, OBJECT_INVALID);
+        assert_eq!(center(&mut s, 302030).0, OBJECT_INVALID);
     }
 
     #[test]
