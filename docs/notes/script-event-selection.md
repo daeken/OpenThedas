@@ -43,3 +43,74 @@ suppression, queued delivery, and preservation of DA2 and module/area
 routes. No saved state or table content changes. Disabled-event sets,
 other object routes, module/area senders, script-side `HandleEvent`, and
 all direct-dispatch callers remain outside this bounded fix.
+
+## Complete-world comparison
+
+The full s01–s16 comparison of main `68797d17` and runtime head `44eccbdd`
+has 32 successful exits, matching ending areas, sixteen matching story logs,
+sixteen matching ordered plot-write traces and sixteen matching command
+traces. All 9,042 health inspections and 45 before/after heal pairs agree.
+Four 600-tick Origins determinism checks agree on repeat and save/reload,
+and all six origins load and advance 60 ticks.
+
+Of 35 complete saves, sixteen agree byte for byte. The other nineteen differ
+only in `world.next_handle`, which advances less often with table dispatch.
+Every compared save has an empty live-handle map. Complete recursive
+comparison establishes equality of every other saved field.
+
+An identical-input event probe isolates the allocation difference. Main
+delivers COMMAND_COMPLETE through `player_core` and then `rules_core`,
+allocating one extra transient event handle. The corrected dispatcher selects
+`rules_core` directly. A second probe uses the Lothering Doomsayer's object
+script, which delegates through `creature_core` to `rules_core`. Direct table
+dispatch removes two transient allocations and one read-only plot diagnostic
+for that single event. Every other saved field agrees in both probes.
+
+Eleven engine-log files differ. A strict comparison accounts for 358 entries
+whose only difference is a transient engine-handle number. It also accounts
+for 15 fewer read-only Doomsayer plot diagnostics in s15 and 46 fewer in s16.
+Every removed diagnostic coincides with that creature's matching completed
+animation command. All remaining engine-log text and metadata agree.
+
+The complete inherited final plot maps agree at every step.
+
+| Step | Stored entries on each side | Final values |
+| --- | ---: | --- |
+| s01 | 41 | Equal |
+| s02 | 66 | Equal |
+| s03 | 75 | Equal |
+| s04 | 84 | Equal |
+| s05 | 108 | Equal |
+| s06 | 109 | Equal |
+| s07 | 130 | Equal |
+| s08 | 149 | Equal |
+| s09 | 157 | Equal |
+| s10 | 175 | Equal |
+| s11 | 189 | Equal |
+| s12 | 232 | Equal |
+| s13 | 262 | Equal |
+| s14 | 297 | Equal |
+| s15 | 304 | Equal |
+| s16 | 331 | Equal |
+
+Sixteen installed-table event probes exercise scriptless creatures and
+placeables, explicit overrides and ITEM_ONHIT/COMMAND_COMPLETE delivery.
+The corpus passes with 563,678 entries, 10,652 archives, 155,719 GFF round
+trips and all 774 typed placeable walkmeshes. The existing 5,219 undeclared
+action diagnostics remain nonfatal. Human Noble and Dwarf Commoner hidden
+character-creation click-throughs reach their verified names and openings.
+Their staged comparisons include absolute RGB Delta ×4 panels with a
+maximum-channel threshold greater than 2/255. Human Noble changes four
+pixels, or 0.000434%, and Dwarf Commoner is pixel-identical.
+
+Separate DA2 repeats and four paired complete saves agree. Both binaries'
+DA2 save/reload checks differ at `next_effect_id`, from 2 to 3. The standalone
+Tower control on exact main exits 3 after 1,080 seconds when its server hits
+the 4 GiB memory watchdog, with the last checkpoint at 350 steps and 7,923
+calls. Candidate standalone execution is deferred after that baseline
+failure. The full-chain Tower scenarios complete on both binaries.
+
+Private evidence is retained under
+`codex-mods-target/gaps/scr065-event-table-final/`, including the strict
+complete-save/log classification, identical-input delegation probes,
+final plot maps, binary and harness hashes, captures and control outcomes.
