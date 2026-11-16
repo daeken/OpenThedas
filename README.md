@@ -268,6 +268,8 @@ labelled `player-report`; your user name and home folder are left out. "Keep her
 report on your computer only. Development builds and runs driven by `--control` never send
 anything.
 
+Developers: `thedas replay <report-folder-or-zip> [--save out.json]` checks the journal against the F8 state; see [replay testing](docs/handoff/streams/issue-reports.md#how-to-test-this-area).
+
 When a fix lands (a pull request that closes the report's issue) and a build with it is
 published, a test build offers it at start: it saves your game, downloads the new build into a
 folder of its own, restarts where you are or where you reported the problem, and asks whether it

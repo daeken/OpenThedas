@@ -46,7 +46,11 @@ pub const SAVE_FORMAT: u32 = 1;
 /// - 9: Origins placeables load their `Useable` interaction flag. Earlier saves left
 ///   non-useable scenery interactive; loading disables those objects. An earlier script
 ///   explicitly enabling such scenery cannot be distinguished from the old default.
-pub const SAVE_REVISION: u32 = 9;
+/// - 10: Origins placed objects initialize their current State from InitialState.
+///   Earlier saves without State receive that initial value and its PWK footprint;
+///   explicit saved states and their existing pathing writes are preserved.
+///   An older no-op setter that left no State field cannot be distinguished.
+pub const SAVE_REVISION: u32 = 10;
 
 /// The trace channel loading reports save damage on.
 pub const SAVE_CHANNEL: i32 = -7;
@@ -260,6 +264,7 @@ impl Sim {
         world.uber_alerts.clear();
         self.world = world;
         self.restore_da2_encounters();
+        self.restore_script_heartbeats();
         self.repair_body_bags();
         // A conversation whose last line was already shown does not come back: the game
         // cannot be saved during a conversation, so a loaded game never resumes one at its
@@ -390,6 +395,14 @@ impl Sim {
                 o.kind == crate::world::ObjectKind::Placeable && o.fields.get("Useable") == Some(&0)
             }) {
                 object.interactive = false;
+            }
+        }
+        if save_revision < 10 && self.game == thedas_vfs::Game::Origins {
+            // Stable order matters where placed footprints overlap.
+            let mut ids: Vec<_> = self.world.objects.keys().copied().collect();
+            ids.sort_unstable();
+            for id in ids {
+                self.init_placeable_state(id);
             }
         }
         // DA2 snapshots can contain PC followers initialized through the monster path

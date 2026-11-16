@@ -590,7 +590,7 @@ impl Sim {
     /// The closed doors of an area with the pathing-grid cells of their doorways: doors are
     /// the placeables whose appearance's state controller (`placeable_types.gda`) is
     /// `StateCnt_Door`; a door is closed in states 0 and 1 (`statecnt_door.gda`:
-    /// Closed_Unlocked, Closed_Locked), its state being field `State` (`SetPlaceableState`)
+    /// Closed_Unlocked, Closed_Locked), its state being field `State` (initially `InitialState`)
     /// or else the template's `AnimContState`. The doorway is the walkable cells within
     /// [`DOORWAY_RADIUS`] of the door.
     pub fn closed_doors(
@@ -618,7 +618,7 @@ impl Sim {
                     o.active
                         && (state == 0 || state == 1)
                         && o.placeable_group
-                            .is_none_or(|g| g & thedas_formats::phy::mask::CREATURES != 0)
+                            .is_none_or(|g| g & thedas_formats::phy::mask::NON_WALKABLE != 0)
                 })
             })
             .cloned()
@@ -1470,6 +1470,44 @@ mod tests {
     }
 
     #[test]
+    fn an_unreachable_talk_approach_cancels_without_dialogue() {
+        use crate::world::ObjectKind;
+        // Flat and vertically separated disconnected floors both fail a required
+        // approach. Being within the authored radius needs no route across them.
+        for height in [0.0, 1.0] {
+            let (mut s, hero) = disconnected_levels(height);
+            s.world.trace.keep = true;
+            let npc = s.world.spawn(ObjectKind::Creature, "bartender");
+            let area = s.world.area;
+            let n = s.world.get_mut(npc).unwrap();
+            n.area = area;
+            n.position = [4.5, 1.5, 0.0];
+            n.facing = 90.0;
+            n.interact_radius = Some(0.1);
+            let from = s.world.get(hero).unwrap().position;
+            s.order_talk(hero, npc);
+            s.tick(1000);
+            let h = s.world.get(hero).unwrap();
+            assert!(h.commands.is_empty());
+            assert_eq!(h.position, from);
+            assert!(s.world.trace.entries.iter().any(|e| matches!(e,
+                crate::trace::TraceEntry::Command { command, status, .. }
+                    if command == "CommandInitiateDialog" && status == "failed -4")));
+            assert!(!s.world.trace.entries.iter().any(|e| matches!(e,
+                crate::trace::TraceEntry::Command { command, status, .. }
+                    if command == "CommandInitiateDialog" && status == "complete")));
+
+            s.world.get_mut(npc).unwrap().interact_radius = Some(5.0);
+            s.order_talk(hero, npc);
+            s.tick(1000);
+            assert_eq!(s.world.get(hero).unwrap().position, from);
+            assert!(s.world.trace.entries.iter().any(|e| matches!(e,
+                crate::trace::TraceEntry::Command { command, status, .. }
+                    if command == "CommandInitiateDialog" && status == "complete")));
+        }
+    }
+
+    #[test]
     fn a_valid_sloping_route_can_change_height_by_more_than_half_a_metre() {
         let (mut s, hero) = disconnected_levels(1.0);
         let mut g = grid();
@@ -1738,6 +1776,7 @@ mod tests {
             impacted: false,
             arrived: false,
             da2_target_prepared: false,
+            da2_basic_attack_fallback: false,
             path: Vec::new(),
             turned_at: None,
             is_static: false,
@@ -1829,6 +1868,7 @@ mod tests {
             impacted: false,
             arrived: false,
             da2_target_prepared: false,
+            da2_basic_attack_fallback: false,
             path: Vec::new(),
             turned_at: None,
             is_static: false,
@@ -1947,6 +1987,7 @@ mod tests {
             impacted: false,
             arrived: false,
             da2_target_prepared: false,
+            da2_basic_attack_fallback: false,
             path: Vec::new(),
             turned_at: None,
             is_static: false,
