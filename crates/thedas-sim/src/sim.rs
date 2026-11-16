@@ -443,6 +443,9 @@ fn formation_position(p: [f32; 3], facing: f32, [x, y]: [f32; 2]) -> [f32; 3] {
 /// snaps once a step would pass the way. Differences under 1e-6° are left (0xb596b8). Not
 /// ported: the follower's filter on the asked-for way before this (0xa63fd7-0xa64026, a
 /// blend toward the route's way of `1 - 0.9^ceil(d / 0.075)` for a step of `d` metres).
+/// DA2 uses the same scalar law at 0x8a6110 (moving caller 0x8b11e4): its constants are
+/// 0.4 at 0xc23498, 0.28 at 0xc237f0, 1/180 at 0xbf3d54 and epsilon at 0xc2442c.
+/// See da2-performance-processing.md for the separate locomotion/controller lifecycle.
 pub(crate) fn turn_toward(facing: f32, want: f32, dt: f32) -> f32 {
     let e = (want - facing + 180.0).rem_euclid(360.0) - 180.0;
     if e.abs() <= 1e-6 || dt <= 0.0 {
@@ -2531,6 +2534,7 @@ impl Sim {
                 impacted: false,
                 arrived: false,
                 da2_target_prepared: false,
+                da2_basic_attack_fallback: false,
                 path: Vec::new(),
                 turned_at: None,
                 is_static: false,
@@ -2643,6 +2647,60 @@ impl Sim {
         (routed, std::mem::take(&mut self.route_approach))
     }
 
+    /// DAOrigins.exe's goal adjustment for a path request (0x73e7f0): with `u` the
+    /// direction from `to` toward `from` in XY and `h` half a pathing cell, the point
+    /// `to + h*u`, then rows `r = h, 2h, ...` out to 2 m, each from `-n` to `+n` sideways
+    /// (`n = (r + 0.01)/h`, points `to + r*u + k*h*(u.y, -u.x)`), the first walkable one
+    /// winning, at the floor's height; failing those, the safe-location search round `to`
+    /// out to the same 2 m. Provisional: walkable cells stand in for the exe's point test
+    /// (0x73de70) and its height queries.
+    fn repair_goal(
+        &mut self,
+        area: ObjectId,
+        g: &thedas_formats::level::NavGrid,
+        id: ObjectId,
+        from: [f32; 3],
+        to: [f32; 3],
+    ) -> Option<[f32; 3]> {
+        const REACH: f32 = 2.0;
+        let floor = |q: [f32; 2]| {
+            g.cell([q[0], q[1], to[2]])
+                .filter(|&c| crate::nav::walkable(g, c))
+                .map(|c| [q[0], q[1], crate::nav::height(g, c)])
+        };
+        let (dx, dy) = (from[0] - to[0], from[1] - to[1]);
+        let len = (dx * dx + dy * dy).sqrt();
+        let h = g.cell_size * 0.5;
+        if len > 1e-6 && h > 0.0 {
+            let u = [dx / len, dy / len];
+            if let Some(q) = floor([to[0] + h * u[0], to[1] + h * u[1]]) {
+                return Some(q);
+            }
+            let mut r = h;
+            while r <= REACH {
+                let n = ((r + 0.01) / h) as i32;
+                for k in -n..=n {
+                    let s = k as f32 * h;
+                    let q = [to[0] + r * u[0] + s * u[1], to[1] + r * u[1] - s * u[0]];
+                    if let Some(q) = floor(q) {
+                        return Some(q);
+                    }
+                }
+                r += h;
+            }
+        }
+        self.safe_search(
+            area,
+            to,
+            crate::nav::SafeSearch {
+                radius: REACH,
+                body_radius: 0.0,
+                mover: Some(id),
+                standable_keeps: false,
+            },
+        )
+    }
+
     fn route_inner(&mut self, id: ObjectId, to: [f32; 3]) -> crate::nav::Routed {
         use crate::nav::Routed;
         self.route_approach.clear();
@@ -2735,13 +2793,35 @@ impl Sim {
         } else {
             crate::nav::route_avoiding(&g, from, to, &locked)
         };
-        let Some(p) = unlocked_route.or_else(|| crate::nav::route(&g, from, to)) else {
+        let origins = self.game == thedas_vfs::Game::Origins;
+        let mut found = unlocked_route.or_else(|| crate::nav::route(&g, from, to));
+        // Origins 0x73ea80 moves a goal that is not on walkable ground (0xa62a90) before
+        // it searches: back toward the walker, up to 2 m (0x73e7f0; see
+        // docs/notes/path-fallback-endpoints.md). Ambient walkers' random destinations
+        // often land in walls or on another floor; without this they took the straight
+        // fallback below, through fountains and floors. Provisional: done here only when
+        // the search to the goal as given fails (the exe does it first), and walkable
+        // cells stand in for the exe's point test (0x73de70).
+        let mut to = to;
+        if found.is_none() && origins && !crate::nav::on_walkable(&g, to) {
+            if let Some(q) = self.repair_goal(area, &g, id, from, to) {
+                to = q;
+                found = crate::nav::route(&g, from, to);
+            }
+        }
+        let Some(p) = found else {
             // Origins 0x73ea80 tries a collision-tested direct path after a failed search
             // only when |start.z - goal.z| <= 0.5 (0x73ee88, constant 0xb1b7b4).
             // Status 5/8 then stops locomotion and returns INVALID_PATH (-4) in
             // 0x7a9130. Do not turn a failed tall route into a walk through the level.
-            // The flat fallback's collision test and DA2's path failures remain untraced.
-            if self.game == thedas_vfs::Game::Origins && (from[2] - to[2]).abs() > 0.5 {
+            if origins && (from[2] - to[2]).abs() > 0.5 {
+                return Routed::InvalidPath;
+            }
+            // The flat fallback (0x685920) tests three ground segments against the area's
+            // physics (mask 0x24), failing on any hit. Provisional stand-in on the grid
+            // ([`crate::nav::flat_fallback_clear`]): no wall cell across the line, and no
+            // walkable floor rising more than 0.5 m over it.
+            if origins && !crate::nav::flat_fallback_clear(&g, from, to) {
                 return Routed::InvalidPath;
             }
             return Routed::Straight;
@@ -2975,13 +3055,12 @@ impl Sim {
                 }
                 self.update_triggers(id);
             }
-            let da2 = self.game == thedas_vfs::Game::DragonAge2;
             if let Some(o) = self.world.get_mut(id) {
                 o.position = p;
                 if let Some((dx, dy)) = dir {
                     let want = crate::world::facing_toward(dx, dy);
-                    // Dragon Age II's follower is not traced: it faces the way at once.
-                    if da2 {
+                    if self.game == thedas_vfs::Game::DragonAge2 && o.kind != ObjectKind::Creature {
+                        // DA2's traced locomotion component belongs to creatures.
                         o.facing = want;
                     } else {
                         let since = o.commands.first().and_then(|c| c.turned_at).unwrap_or(t0);
@@ -3010,6 +3089,38 @@ impl Sim {
                         c.path = vec![here];
                     }
                 }
+            }
+        }
+        // DA2's task-37 motion is sampled on its own animation clock. Changing
+        // an impact deadline to the tail must not rewind its position.
+        for (id, wanted) in self.da2_animation_positions() {
+            let Some((was, area)) = self.world.get(id).map(|o| (o.position, o.area)) else {
+                continue;
+            };
+            if was == wanted {
+                continue;
+            }
+            let at = self.slide_past_bodies(id, was, wanted).unwrap_or(wanted);
+            if was == at {
+                continue;
+            }
+            if let Some(area) = area
+                && self.door_sight(area).blocks(was, at)
+            {
+                continue;
+            }
+            // Task 37 drives the actor controller, not a pathfinding route. In
+            // particular, Origins' grid walkability mask is not a DA2 motion
+            // constraint: authored DA2 placements can be outside that mask.
+            // Use the same trigger-crossing samples as ordinary locomotion.
+            let steps = (crate::engine::dist(was, at) / TRIGGER_STEP).ceil().max(1.) as usize;
+            for i in 1..=steps {
+                let f = i as f32 / steps as f32;
+                self.move_object(
+                    id,
+                    std::array::from_fn(|j| was[j] + (at[j] - was[j]) * f),
+                    None,
+                );
             }
         }
     }
@@ -4101,10 +4212,16 @@ impl Sim {
             // A walk that was under way ends facing as the walker's body faces: DAOrigins.exe's
             // ordinary arrival stops and resets the route (0x6a9430 -> 0xa63ac0) and sets no
             // facing, so the bearing the order was given with (the player's click, a held
-            // stick's aim) does not snap onto the body at the end. Jumps, placements and
-            // Dragon Age II's moves (its follower not traced) take the location's facing.
-            let keeps_facing =
-                walked && cmd.from.is_some() && self.game != thedas_vfs::Game::DragonAge2;
+            // stick's aim) does not snap onto the body at the end. DA2 completion likewise
+            // stops the follower (0x675fae -> 0x8a60e0) without assigning that bearing.
+            // Jumps and placements still take the location's facing.
+            let keeps_facing = walked
+                && cmd.from.is_some()
+                && (self.game != thedas_vfs::Game::DragonAge2
+                    || self
+                        .world
+                        .get(id)
+                        .is_some_and(|o| o.kind == ObjectKind::Creature));
             if let Some(obj) = self.world.get_mut(id) {
                 obj.position = l.position;
                 obj.area = Some(l.area);
@@ -5815,6 +5932,66 @@ mod tests {
     }
 
     #[test]
+    fn da2_walking_turns_over_elapsed_time_and_keeps_it_across_reload() {
+        let mut s = sim();
+        s.game = thedas_vfs::Game::DragonAge2;
+        let area = s.world.spawn(ObjectKind::Area, "a");
+        let walker = s.world.spawn(ObjectKind::Creature, "walker");
+        s.world.get_mut(walker).unwrap().area = Some(area);
+        // Initially facing +Y, asked to walk +X: native 0x8a6110 turns about
+        // -22.85 degrees on the first 33 ms step, rather than snapping to 270.
+        s.order_move(walker, [30.0, 0.0, 0.0]);
+        s.tick(33);
+        let first = s.world.get(walker).unwrap().facing;
+        assert!((first - 337.15384).abs() < 0.01, "{first}");
+        assert!(s.world.get(walker).unwrap().position[0] > 0.0);
+        // Other work at the same timestamp spends no second turning budget.
+        s.tick(0);
+        assert_eq!(s.world.get(walker).unwrap().facing, first);
+        let mut loaded = sim();
+        loaded.game = s.game;
+        loaded.world = serde_json::from_str(&serde_json::to_string(&s.world).unwrap()).unwrap();
+        s.tick(33);
+        loaded.tick(33);
+        let expected = s.world.get(walker).unwrap();
+        let actual = loaded.world.get(walker).unwrap();
+        assert!(expected.facing < first && expected.facing > 270.0);
+        assert_eq!(actual.facing, expected.facing);
+        assert_eq!(actual.position, expected.position);
+        assert_eq!(actual.commands, expected.commands);
+    }
+
+    #[test]
+    fn da2_path_arrival_preserves_body_heading_instead_of_the_orders_bearing() {
+        let mut s = sim();
+        s.game = thedas_vfs::Game::DragonAge2;
+        let area = s.world.spawn(ObjectKind::Area, "a");
+        let walker = s.world.spawn(ObjectKind::Creature, "walker");
+        s.world.get_mut(walker).unwrap().area = Some(area);
+        s.order_move(walker, [1.0, 1.0, 0.0]);
+        s.tick(0);
+        let c = s
+            .world
+            .get_mut(walker)
+            .unwrap()
+            .commands
+            .first_mut()
+            .unwrap();
+        c.path = vec![[1.0, 0.0, 0.0], [1.0, 1.0, 0.0]];
+        c.due = Some(100);
+        c.location.as_mut().unwrap().facing = 123.0;
+        s.world.time_ms = 100;
+        s.advance_movers();
+        let before = s.world.get(walker).unwrap().facing;
+        assert_eq!(before, 0.0); // The last leg faces +Y.
+        s.finish_command(walker);
+        let o = s.world.get(walker).unwrap();
+        assert_eq!(o.position, [1.0, 1.0, 0.0]);
+        assert_eq!(o.facing, before);
+        assert!(o.commands.is_empty());
+    }
+
+    #[test]
     fn dragon_age_2_reference_functions_run_as_their_twins() {
         let ldf = "#define ENGINE_STRUCTURE_0 event\n\
             event Event(int nType) = 0;\n\
@@ -6273,6 +6450,7 @@ mod tests {
             impacted: false,
             arrived: false,
             da2_target_prepared: false,
+            da2_basic_attack_fallback: false,
             path: Vec::new(),
             turned_at: None,
             is_static: false,
@@ -7105,6 +7283,7 @@ mod tests {
             impacted: false,
             arrived: false,
             da2_target_prepared: false,
+            da2_basic_attack_fallback: false,
             path: Vec::new(),
             turned_at: None,
             is_static: false,
@@ -7201,6 +7380,7 @@ mod tests {
             impacted: false,
             arrived: false,
             da2_target_prepared: false,
+            da2_basic_attack_fallback: false,
             path: Vec::new(),
             turned_at: None,
             is_static: false,
@@ -7247,6 +7427,7 @@ mod tests {
             impacted: false,
             arrived: false,
             da2_target_prepared: false,
+            da2_basic_attack_fallback: false,
             path: Vec::new(),
             turned_at: None,
             is_static: false,
@@ -7367,6 +7548,7 @@ mod tests {
             impacted: false,
             arrived: false,
             da2_target_prepared: false,
+            da2_basic_attack_fallback: false,
             path: Vec::new(),
             turned_at: None,
             is_static: false,
@@ -7573,6 +7755,7 @@ mod tests {
                 impacted: false,
                 arrived: false,
                 da2_target_prepared: false,
+                da2_basic_attack_fallback: false,
                 path: Vec::new(),
                 turned_at: None,
                 is_static: false,
@@ -7627,6 +7810,7 @@ mod tests {
             impacted: false,
             arrived: false,
             da2_target_prepared: false,
+            da2_basic_attack_fallback: false,
             path: Vec::new(),
             turned_at: None,
             is_static: false,
@@ -7775,6 +7959,7 @@ mod tests {
             impacted: false,
             arrived: false,
             da2_target_prepared: false,
+            da2_basic_attack_fallback: false,
             path: Vec::new(),
             turned_at: None,
             is_static: false,
@@ -7845,6 +8030,7 @@ mod tests {
             impacted: false,
             arrived: false,
             da2_target_prepared: false,
+            da2_basic_attack_fallback: false,
             path: Vec::new(),
             turned_at: None,
             is_static: false,
@@ -7899,6 +8085,7 @@ mod tests {
             impacted: false,
             arrived: false,
             da2_target_prepared: false,
+            da2_basic_attack_fallback: false,
             path: Vec::new(),
             turned_at: None,
             is_static: false,
@@ -8129,6 +8316,7 @@ mod tests {
                 impacted: false,
                 arrived: false,
                 da2_target_prepared: false,
+                da2_basic_attack_fallback: false,
                 path: Vec::new(),
                 turned_at: None,
                 is_static: false,
@@ -8159,6 +8347,7 @@ mod tests {
             impacted: false,
             arrived: false,
             da2_target_prepared: false,
+            da2_basic_attack_fallback: false,
             path: Vec::new(),
             turned_at: None,
             is_static: false,
@@ -8243,6 +8432,7 @@ mod tests {
             impacted: false,
             arrived: false,
             da2_target_prepared: false,
+            da2_basic_attack_fallback: false,
             path: Vec::new(),
             turned_at: None,
             is_static: false,
@@ -8311,6 +8501,7 @@ mod tests {
             impacted: false,
             arrived: false,
             da2_target_prepared: false,
+            da2_basic_attack_fallback: false,
             path: Vec::new(),
             turned_at: None,
             is_static: false,
@@ -8540,6 +8731,7 @@ mod tests {
             impacted: false,
             arrived: false,
             da2_target_prepared: false,
+            da2_basic_attack_fallback: false,
             path: Vec::new(),
             turned_at: None,
             is_static: false,

@@ -32,15 +32,17 @@ and player orders now use this modern path.
 Ability 1 is a placeholder, not a concrete damaging swing. Native preparation at
 0x640d6d sends CHOOSE_BASIC_ATTACK (111) synchronously to the creature's script:
 creator/caster, objects caster/target/invalid, vector 0 the target point, and
-integer 2 command boolean 2. The ordinary constructor leaves that boolean false.
+integer 2 command boolean 2. The script constructor leaves that boolean false.
+Ordinary player attack input enables it through `0x47fc51..0x47fc5e`, allowing
+the shipped selector's range fallback. See `da2-player-attack-input.md`.
 CommandResult is cleared first. The shipped ability_core script chooses the
 actual attack from the combat range, arc and combo tables and writes its ID to
 CommandResult. Native 0x640e34 writes that ID back into command integer 0; a
 result of 1 takes the no-action branch. The player-input path at 0x47fb83 uses
 the same event. No custom combo cycle or replacement damage formula is needed.
 
-The simulation retains its existing approach planner, asks for selection once
-in reach, stores the chosen ability and target point on the command, then uses
+The simulation retains its existing approach planner, asks for selection before
+approach, stores the chosen ability and target point on the command, then uses
 the modern START/IMPACT pipeline above. A script can prepend an animation during
 selection; its command must survive removal of the placeholder. A saved concrete
 attack is not selected again on reload. Origins' constructor remains unchanged.
