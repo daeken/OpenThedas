@@ -4727,6 +4727,10 @@ pub fn call(
             h.sim.begin_training_step(int(a, 0), int(a, 1), int(a, 2));
             void()
         }
+        "HighlightGuiElement" => {
+            h.sim.highlight_gui_element(int(a, 0), int(a, 1));
+            void()
+        }
         "ShowPopup" => {
             h.sim.world.popup = Some(crate::world::Popup {
                 strref: int(a, 0),

@@ -75,26 +75,52 @@ impl Screen {
                 "popuplayer.gfx",
                 "tooltips.gfx",
             ],
-            Screen::Cutscene => &["cutscene.gfx"],
-            Screen::Conversation => &["conversation.gfx"],
-            Screen::WorldMap => &["worldmap.gfx"],
-            Screen::Store => &["store.gfx", "tooltips.gfx"],
-            Screen::Chanters => &["chanters.gfx", "tooltips.gfx"],
-            Screen::LevelUp => &["levelup.gfx", "tooltips.gfx"],
-            Screen::Inventory => &["inventory.gfx", "navbar.gfx", "tooltips.gfx"],
-            Screen::CharacterRecord => &["characterrecord.gfx", "navbar.gfx", "tooltips.gfx"],
-            Screen::Tactics => &["tactics.gfx", "navbar.gfx", "tooltips.gfx"],
-            Screen::AreaMap => &["map.gfx", "navbar.gfx", "tooltips.gfx"],
-            Screen::PartyPicker => &["partypicker.gfx"],
+            Screen::Cutscene => &["cutscene.gfx", "popuplayer.gfx"],
+            Screen::Conversation => &["conversation.gfx", "popuplayer.gfx"],
+            Screen::WorldMap => &["worldmap.gfx", "popuplayer.gfx"],
+            Screen::Store => &["store.gfx", "popuplayer.gfx", "tooltips.gfx"],
+            Screen::Chanters => &["chanters.gfx", "popuplayer.gfx", "tooltips.gfx"],
+            Screen::LevelUp => &["levelup.gfx", "popuplayer.gfx", "tooltips.gfx"],
+            // The quickbar stays up over the screens items and abilities are dragged from.
+            Screen::Inventory => &[
+                "inventory.gfx",
+                "quickbar.gfx",
+                "navbar.gfx",
+                "popuplayer.gfx",
+                "tooltips.gfx",
+            ],
+            Screen::CharacterRecord => &[
+                "characterrecord.gfx",
+                "navbar.gfx",
+                "popuplayer.gfx",
+                "tooltips.gfx",
+            ],
+            Screen::Tactics => &[
+                "tactics.gfx",
+                "navbar.gfx",
+                "popuplayer.gfx",
+                "tooltips.gfx",
+            ],
+            Screen::AreaMap => &["map.gfx", "navbar.gfx", "popuplayer.gfx", "tooltips.gfx"],
+            Screen::PartyPicker => &["partypicker.gfx", "popuplayer.gfx"],
             Screen::Death => &["deathscreen.gfx"],
             // Its save names and confirmations are dialog boxes on the popup layer.
             Screen::SaveLoad => &["saveload.gfx", "popuplayer.gfx"],
             // Quick Play and finishing ask for confirmation on the popup layer.
             Screen::CharGen => &["chargen.gfx", "popuplayer.gfx"],
-            Screen::Journal => &["journal.gfx", "navbar.gfx", "tooltips.gfx"],
-            Screen::Skills | Screen::SpellsTalents => {
-                &["abilities.gfx", "navbar.gfx", "tooltips.gfx"]
-            }
+            Screen::Journal => &[
+                "journal.gfx",
+                "navbar.gfx",
+                "popuplayer.gfx",
+                "tooltips.gfx",
+            ],
+            Screen::Skills | Screen::SpellsTalents => &[
+                "abilities.gfx",
+                "quickbar.gfx",
+                "navbar.gfx",
+                "popuplayer.gfx",
+                "tooltips.gfx",
+            ],
             // Settings that need confirming (a new resolution) ask on the popup layer.
             Screen::Options => &["optionsmenu.gfx", "popuplayer.gfx"],
             // Over the screen it was opened from (see `with_examine`).
