@@ -73,6 +73,39 @@ the six remaining Origins kinds. Disabled-event sets, other object routes, modul
 script-side `HandleEvent`, and
 all direct-dispatch callers remain outside this bounded fix.
 
+## Seven-kind extension comparison
+
+The fresh comparison of exact main `0328859e` and runtime head `021acd47`
+has 32 successful s01–s16 exits. All 35 complete saves are byte-identical.
+All sixteen story logs, ordered plot-write traces, engine-log traces and
+command traces agree. The complete inherited final plot maps agree at every
+step. All twelve health files agree, including 10,556 inspections and 61
+before/after heal pairs. Four 600-tick repeat/save-reload checks and all six
+origins pass.
+
+Seventy-two installed-table probes cover all nine traced kinds, with
+scriptless objects and explicit overrides. The seven additional kinds show
+the intended selection change; creature/placeable controls agree on both
+binaries. The corpus passes in 421 seconds with 563,678 entries, 10,652
+archives, 155,719 GFF round trips and all 774 typed placeable walkmeshes.
+Archive, read, encrypted and typed failures are zero; the existing 5,219
+undeclared-action diagnostics remain nonfatal.
+
+Separate DA2 repeats and all four complete paired saves agree. Save/reload
+differs on both binaries only at `next_effect_id`, from 2 to 3. Both hidden
+Human Noble and Dwarf Commoner chargen click-throughs pass on each binary.
+Visually inspected, staged comparisons include absolute RGB Delta ×4 panels
+at a maximum-channel threshold greater than 2/255. Human Noble changes six
+pixels (0.000651%); Dwarf Commoner is pixel-identical. Both deltas are
+essentially zero.
+
+Fresh standalone Tower controls pass on both binaries, with the beacon
+cleared, Flemeth reached and complete final saves equal. Each takes 560 steps
+and 11,965 tool calls; main completes in 34 seconds and the candidate in 28.
+The pinned master-input hashes match the preceding standalone control.
+Private evidence is under
+`codex-mods-target/gaps/scr065-physical-event-routes/`.
+
 ## Initial creature/placeable comparison
 
 The full s01–s16 comparison of main `d87590e5` and runtime head `636e792f`
