@@ -703,16 +703,19 @@ struct Line {
     /// cutscene has ended.
     cut_seen: bool,
     cut_done: bool,
+    /// Its own referenced cutscene has started. Automatic continuation waits for it.
+    owns_cut: bool,
 }
 
 impl Line {
-    /// Whether it has played: its voice-over's (or reading) time has passed, or the
-    /// cutscene that spoke it has ended. The executable gives a line that plays its own
-    /// cutscene the cutscene's length (`GameModeDialog` 0x68e5be-0x68e5ff: the line's
-    /// timer +0x2c4 is the cutscene's 5000, +0x8). Provisional: a line whose cutscene is
-    /// played by the cutscene mode (a `CUTR` reference) is taken to end with it the same
-    /// way.
+    /// Whether it has played. An automatic continuation waits for the line's own
+    /// referenced cut to complete (GameModeDialog 0x68de74–0x68df57), keeping its camera
+    /// and actors with the line. The presentation clock can run ahead of the cutscene's
+    /// capped simulation clock on slow frames.
     fn played(&self) -> bool {
+        if self.waits && self.owns_cut && !self.cut_done && self.t.is_finite() {
+            return false;
+        }
         self.cut_done || self.t >= self.voice_ms.unwrap_or_else(|| line_ms(&self.key.1))
     }
 }
@@ -2363,9 +2366,11 @@ impl UiLayer {
             self.stage.bridge.bind(values);
             let waits = thedas_ui::binding::awaits_continue(&sim);
             let cutscene = sim.world.cutscene.is_some();
+            let owns_cut =
+                sim.game == thedas_vfs::Game::Origins && sim.conversation_line_cutscene().is_some();
             let line = thedas_ui::binding::conversation(&sim).map(|d| {
                 let key: LineKey = (d.dialog, d.line, d.replies.iter().map(|r| r.0).collect());
-                (key, waits, cutscene)
+                (key, waits, cutscene, owns_cut)
             });
             // Before a game, the start menu, or the screen it opened (options, the load
             // screen).
@@ -2431,13 +2436,15 @@ impl UiLayer {
             );
         }
         self.line = match (line, self.line.take()) {
-            (Some((key, _, cutscene)), Some(mut l)) if l.key == key => {
+            (Some((key, _, cutscene, owns_cut)), Some(mut l)) if l.key == key => {
                 l.t += dt_ms;
                 l.cut_done |= l.cut_seen && !cutscene;
+                l.cut_done |= l.owns_cut && !owns_cut;
                 l.cut_seen |= cutscene;
+                l.owns_cut |= owns_cut;
                 Some(l)
             }
-            (Some((key, waits, cutscene)), _) => Some(Line {
+            (Some((key, waits, cutscene, owns_cut)), _) => Some(Line {
                 key,
                 t: 0.0,
                 voice_ms: None,
@@ -2446,6 +2453,7 @@ impl UiLayer {
                 continued: false,
                 cut_seen: cutscene,
                 cut_done: false,
+                owns_cut,
             }),
             (None, _) => None,
         };
@@ -4316,6 +4324,41 @@ mod tests {
         assert_eq!(line_ms("  "), 100.0);
         assert!(line_ms("Short.") < line_ms("A much longer line that takes a while to read."));
         assert_eq!(line_ms(&"x".repeat(1000)), 12_000.0);
+    }
+
+    #[test]
+    fn a_referenced_cut_finishes_before_its_line_automatically_continues() {
+        let mut line = Line {
+            key: ("dialog".into(), "A cinematic line.".into(), vec![1]),
+            t: 3000.0,
+            voice_ms: Some(2976.0),
+            voiced: true,
+            waits: true,
+            continued: false,
+            cut_seen: true,
+            cut_done: false,
+            owns_cut: true,
+        };
+        // Oskias node 17 has a 2.976 s voice and a 3.217 s cut. Presentation time
+        // can also run ahead of the cut's capped simulation clock on slow frames.
+        assert!(!line.played());
+        line.t = 15_000.0;
+        line.voice_ms = None;
+        assert!(!line.played());
+        line.cut_done = true;
+        assert!(line.played());
+
+        // A later line spoken during another line's cut keeps its own timing.
+        line.cut_done = false;
+        line.owns_cut = false;
+        assert!(line.played());
+        // Reply choices and an explicit skip retain their existing behavior.
+        line.owns_cut = true;
+        line.waits = false;
+        assert!(line.played());
+        line.waits = true;
+        line.t = f64::INFINITY;
+        assert!(line.played());
     }
 
     #[test]
