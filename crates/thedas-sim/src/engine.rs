@@ -3805,12 +3805,18 @@ pub fn call(
         // Where a follower would stand behind the party leader (see `Sim::follow_leader`).
         "GetFollowerWouldBeLocation" => {
             let who = obj(a, 0);
-            let hero = h.sim.world.hero.and_then(|x| h.object(x));
-            let l = match (hero, h.object(who)) {
-                // DAOrigins.exe's handler (0x666650) gives the follower's slot of the default
-                // formation table around the leader (see `crate::sim::behind`).
-                (Some(leader), Some(me)) => {
-                    let i = leader.followers.iter().position(|&f| f == who).unwrap_or(0);
+            let leader = h.sim.world.controlled().and_then(|x| h.object(x));
+            let l = match (leader, h.object(who)) {
+                // Origins 0x666650 -> 0x632bb0 and DA2 0x4ec6f0 -> 0x4df260
+                // use the controlled leader and the same slot selector as following.
+                (Some(leader), Some(me)) if leader.id != who => {
+                    let i = h
+                        .sim
+                        .follower_formation(leader.id)
+                        .into_iter()
+                        .find_map(|(id, slot)| (id == who).then_some(slot))
+                        // Provisional: retain the old slot-zero fallback for non-members.
+                        .unwrap_or(0);
                     Location {
                         area: leader.area.or(me.area).unwrap_or(OBJECT_INVALID),
                         position: crate::sim::behind(leader.position, leader.facing, i),
@@ -13493,6 +13499,63 @@ mod coverage_tests {
             script: "test".into(),
         };
         call(&mut h, caller, &f, a).unwrap().unwrap()
+    }
+
+    #[test]
+    fn follower_locations_use_the_controlled_leaders_party_slots() {
+        for game in [thedas_vfs::Game::Origins, thedas_vfs::Game::DragonAge2] {
+            let table = EngineTable::parse(
+                b"#define ENGINE_STRUCTURE_0 location\nlocation GetFollowerWouldBeLocation(object o) = 0;",
+            ).unwrap();
+            let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(table), 7);
+            s.game = game;
+            let area = s.world.spawn(ObjectKind::Area, "a");
+            let members: Vec<_> = (0..4)
+                .map(|i| s.world.spawn(ObjectKind::Creature, &format!("member{i}")))
+                .collect();
+            let escort = s.world.spawn(ObjectKind::Creature, "escort");
+            s.world.hero = Some(members[0]);
+            s.world.get_mut(members[0]).unwrap().followers = members[1..].to_vec();
+            s.world.get_mut(members[0]).unwrap().escorts = vec![escort];
+            for (i, id) in members.iter().copied().chain([escort]).enumerate() {
+                let o = s.world.get_mut(id).unwrap();
+                o.area = Some(area);
+                o.position = [20.0 * i as f32, 30.0, 0.0];
+                o.facing = 270.0;
+            }
+            for (leader_index, &leader) in members.iter().enumerate() {
+                s.world.controlled = Some(leader);
+                let pos = s.world.get(leader).unwrap().position;
+                for (i, who) in members.iter().copied().chain([escort]).enumerate() {
+                    if who == leader {
+                        continue;
+                    }
+                    let Value::Engine {
+                        handle: Some(h), ..
+                    } = run(
+                        &mut s,
+                        leader,
+                        "GetFollowerWouldBeLocation",
+                        &[Value::Object(who)],
+                    )
+                    .unwrap()
+                    else {
+                        panic!("location handle");
+                    };
+                    let Some(EngineData::Location(l)) = s.world.handle(Some(h)) else {
+                        panic!("location");
+                    };
+                    let slot = if i == 0 { leader_index - 1 } else { i - 1 };
+                    assert_eq!(l.area, area);
+                    assert_eq!(
+                        l.position,
+                        crate::sim::behind(pos, 270.0, slot),
+                        "{game:?}, leader={leader_index}, member={i}"
+                    );
+                    assert_eq!(l.facing, 270.0);
+                }
+            }
+        }
     }
 
     #[test]
