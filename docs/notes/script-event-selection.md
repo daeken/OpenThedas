@@ -25,8 +25,7 @@ The creature constructor installs the secondary interface at `+0x70`
 (`0x6b9f59`, vtable `0xb1035c`); the placeable constructor installs its
 corresponding interface at `0x750d61` (vtable `0xb1bf5c`). Both tables select
 `0x69a130` at slot `+0x28`. That method adjusts back to the primary object
-and forwards the event to `0x698960`. These two concrete paths establish
-the scope of the replacement correction.
+and forwards the event to `0x698960`.
 
 Queued delivery reaches the same selector. The generic message dispatcher
 `0x64a8c0` resolves the target's CCObject and calls primary virtual `+0xc8`.
@@ -34,8 +33,32 @@ The creature implementation `0x6a25c0` and placeable implementation
 `0x74d030` forward message kind 10 to `0x698a50`. Its branch at `0x698afd`
 calls `0x698960` at `0x698b11`.
 
-`Sim::deliver` now follows this precedence for Origins creatures and
-placeables: a nonempty table-114 `Script` cell, then an explicit override
+Seven further physical object kinds have the same secondary dispatch slot.
+Each complete constructor calls the CCObject base constructor `0x699670`
+before installing its concrete primary and secondary interfaces. The writes
+below are constructor installations, rather than destructor resets.
+
+| Kind | Secondary-interface write | Secondary vtable | Primary queued-message handler |
+| --- | --- | --- | --- |
+| Item | `0x756abf` | `0xb1c4f4` | `0x753b10` |
+| Trigger | `0x79b116` | `0xb1fdcc` | `0x698a50` |
+| Sound | `0x7c1f7b` | `0xb21f64` | `0x698a50` |
+| Waypoint | `0x7c3a97` | `0xb226a4` | `0x698a50` |
+| Projectile | `0x7e8469` | `0xb23a8c` | `0x698a50` |
+| Store | `0x7ed8ba` | `0xb241ac` | `0x698a50` |
+| Area of effect | `0x7e5f76` | `0xb2372c` | `0x7e4a50` |
+
+All seven secondary slot `+0x28` entries select `0x69a130`. Their primary
+slot `+0xc8` entries select the queued-message handlers listed above. The
+item handler forwards message kind 10 to `0x698a50` at `0x753bc6`; the
+area-of-effect handler's default branch forwards it at `0x7e4ac1`. The other
+five use the base handler directly. Together with the generic dispatcher's
+CCObject lookup, these establish both direct and queued routes for all nine
+kinds. Module and area instead have explicit generic-dispatch branches;
+this physical-object trace does not establish their script selection.
+
+`Sim::deliver` follows this precedence for all nine traced Origins kinds:
+a nonempty table-114 `Script` cell, then an explicit override
 when present, then the object's own script. A table script can therefore
 handle an otherwise scriptless object and supersede either fallback.
 An explicitly selected empty script suppresses the object fallback and
@@ -43,14 +66,14 @@ silently consumes the event. String terminators are removed; whitespace
 does not turn a nonempty table script into a fallback. Selection happens
 at delivery rather than when the event is queued.
 
-Synthetic regressions execute scripts and verify the selected script,
+Synthetic regressions execute scripts on every traced kind and verify the selected script,
 scriptless objects, empty and missing table values, explicit-empty
-suppression, queued delivery, and preservation of DA2 and module/area
-routes. Disabled-event sets, other object routes, module/area senders,
+suppression, queued delivery, and preservation of all fifteen DA2 kinds and
+the six remaining Origins kinds. Disabled-event sets, other object routes, module/area senders,
 script-side `HandleEvent`, and
 all direct-dispatch callers remain outside this bounded fix.
 
-## Complete-world comparison
+## Initial creature/placeable comparison
 
 The full s01–s16 comparison of main `d87590e5` and runtime head `636e792f`
 has 32 successful exits, matching ending areas, sixteen matching story logs,
