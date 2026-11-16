@@ -1,5 +1,12 @@
 # Level mesh point-light selection
 
+The Cousland review now has an original hall draw trace. See
+[Cousland hall review](cousland-level-light-selection.md): the seven identified
+floor/carpet draws exclude the legacy sun and match this picker's point slots.
+The proposed cross-room fallback was rejected by that evidence. The original
+free-camera bright-window comparison still needs a matching exploration trace;
+this conversation-camera result does not establish framebuffer parity.
+
 Level mesh renderables take DAOrigins.exe's ordinary per-object pass (0x4654e0 →
 0x464310). They use the level lists: AffectsDomain exactly 1 is character-only;
 other domains belong to the level. RML 3164 controls light-room reach. Static

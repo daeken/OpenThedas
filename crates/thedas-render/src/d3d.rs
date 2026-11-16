@@ -2297,6 +2297,32 @@ mod tests {
     }
 
     #[test]
+    fn level_floor_rejects_a_bright_cross_room_light_omitted_from_reach() {
+        // Cousland's original hall trace excludes the distant sun from the floor's
+        // A/B/C, despite its sphere overlap and its rig's nonempty reach list. Use
+        // synthetic lights to guard against restoring legacy brightness admission.
+        let mut sun = point(100.0, 200.0, Some(DOMAIN_LEVEL), Some(79));
+        if let SceneLight::Point { color, .. } = &mut sun {
+            *color = Vec3::splat(4.0);
+        }
+        let lights = [
+            sun,
+            point(1.0, 12.0, Some(DOMAIN_LEVEL), Some(4)),
+            point(2.0, 10.0, Some(DOMAIN_LEVEL), Some(4)),
+            point(3.0, 8.0, Some(DOMAIN_LEVEL), Some(4)),
+        ];
+        let sphere = (Vec3::ZERO, 1.0);
+        assert!(xs(&pick_level_lights(&lights, sphere, DOMAIN_LEVEL).points).contains(&100.0));
+        let rooms = HashMap::from([(79, vec![42])]);
+        let floor = pick_lights(&lights, &rooms, sphere, Some(4), LightClass::Level);
+        assert_eq!(xs(&floor.points), [1.0, 2.0, 3.0]);
+        assert!(floor.dynamic.is_empty());
+        // The same light remains available to receivers that its rig does reach.
+        let reached = pick_lights(&lights, &rooms, sphere, Some(42), LightClass::Level);
+        assert_eq!(xs(&reached.points), [100.0]);
+    }
+
+    #[test]
     fn a_lights_intensity_weighs_its_pick_and_scales_its_colour() {
         let lit = |x: f32, i: f32| {
             let mut l = point(x, 5.0, None, None);
