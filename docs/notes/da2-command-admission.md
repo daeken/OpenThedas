@@ -65,6 +65,50 @@ payloads despite executor state, default same-type metadata, protected animation
 before and after readiness, successful ready handoff, invalid objects and
 snapshot reload.
 
-Matched encounter-10008 measurements and Origins regression results follow
-after the merged candidate completes its checks. No HP, damage or difficulty
-values are retuned.
+No HP, damage or difficulty values are retuned.
+
+## Matched validation
+
+Compared baseline `adf58096` with candidate `dc2c4b10`.
+Formatting and strict workspace/all-target clippy pass. Workspace tests: 1463 passed, 25 ignored, zero failures. Debug assertions are enabled; debug symbols are disabled for workspace checks.
+
+All seven paired Origins scenarios pass (14 executions): identical logs and plot sequences, eight identical checkpoint JSONs, no game over; Tower reaches Flemeth's hut. Four 600-tick fixtures pass repeated-run and save/reload determinism. Both full corpus runs pass with identical statistics. Diagnostic examples are also identical.
+
+The matched `da2-story-check --aid none` runs use seed 1, complete counters, zero script errors, zero developer heals and zero kill aids.
+
+- `main-adf58096`: fake_prologue 33 ms, real_prologue 210166 ms; first game over 310798 ms in encounter [10008].
+- `command4`: fake_prologue 33 ms, real_prologue 208566 ms; first game over 294330 ms in encounter [10008].
+
+| Fight | Baseline ms / result | Candidate ms / result |
+| --- | --- | --- |
+| 1: pro000ar_blightlands_fake, encounters [187, 10000, 10001, 10002] | 208400 / area_transition | 206800 / area_transition |
+| 2: pro000ar_blightlands_real, encounters [187] | 1100 / combat_ended | 1100 / combat_ended |
+| 3: pro000ar_blightlands_real, encounters [10003] | 23200 / combat_ended | 22600 / combat_ended |
+| 4: pro000ar_blightlands_real, encounters [10008] | 51100 / game_over | 36500 / game_over |
+
+Party totals below are damage / impact count; observed differences are reported without changing HP, damage, equipment or difficulty.
+
+| Fight | Actor | Baseline | Candidate |
+| --- | --- | --- | --- |
+| 1 | player | 3374.698246 / 358 | 3763.897029 / 365 |
+| 2 | player | 0.000000 / 0 | 0.000000 / 0 |
+| 2 | gen00fl_carver | 0.000000 / 0 | 0.000000 / 0 |
+| 2 | gen00fl_bethany | 0.000000 / 0 | 0.000000 / 0 |
+| 3 | player | 229.085861 / 31 | 254.303524 / 37 |
+| 3 | gen00fl_carver | 92.859954 / 14 | 185.153630 / 25 |
+| 3 | gen00fl_bethany | 278.054185 / 17 | 160.542845 / 13 |
+| 4 | player | 496.612649 / 78 | 443.900789 / 66 |
+| 4 | gen00fl_carver | 310.366518 / 52 | 214.514928 / 24 |
+| 4 | gen00fl_bethany | 183.497895 / 22 | 158.832486 / 10 |
+
+Full verdicts retain per-combatant ability totals, impact spacing, health, encounter teams and unimplemented-call counts in this job's local evidence.
+
+The full-story runs reach encounter 10008 after different earlier combat.
+At the end of encounter 10003, Hawke has 85.359428 -> 70.600662 HP and Carver
+160 -> 113.238899 HP; Bethany remains at 100 HP. Thus the full-story 10008
+duration is a progression observation, not an equal-start isolated fight
+benchmark. No starting HP, damage, equipment or difficulty data was changed.
+
+The simulation continues to identify an active front through its existing
+started-command deadline. DA2 preparation callback timing and the broader
+preparation lifecycle remain provisional; this repair does not redesign them.
