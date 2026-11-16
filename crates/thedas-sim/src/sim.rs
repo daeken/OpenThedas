@@ -859,7 +859,8 @@ impl Sim {
         value
     }
 
-    /// Delivers an event to an object's event script (or `script`, when given).
+    /// Delivers an event, with Origins creature/placeable table scripts taking priority
+    /// over an explicit `script` and the object's own script.
     pub fn deliver(&mut self, target: ObjectId, mut event: Event, script: Option<String>) {
         if event.target.is_none() {
             event.target = Some(target);
@@ -880,9 +881,29 @@ impl Sim {
             });
             return;
         };
-        let Some(script) = script.or_else(|| obj.script.clone()) else {
+        // Both verified +0x70 dispatch interfaces call CCObject::DispatchEvent
+        // (0x69a130 -> 0x698960). It first reads engineevents.Script by event type.
+        // Other object routes and DA2 have not been established by this trace.
+        let native_selection = self.game != thedas_vfs::Game::DragonAge2
+            && matches!(obj.kind, ObjectKind::Creature | ObjectKind::Placeable);
+        let table_script = native_selection
+            .then(|| self.world.tables().get(114, ""))
+            .flatten()
+            .and_then(|t| match t.cell("Script", i64::from(event.ty)) {
+                Some(thedas_formats::gda::Cell::String(s)) => {
+                    let s = s.trim_end_matches('\0');
+                    (!s.is_empty()).then(|| s.to_string())
+                }
+                _ => None,
+            });
+        let Some(script) = table_script.or(script).or_else(|| obj.script.clone()) else {
             return;
         };
+        // An explicitly selected empty script suppresses the object's fallback too.
+        // Native 0x6985f0 silently consumes the event after selection in this case.
+        if native_selection && script.trim_end_matches('\0').is_empty() {
+            return;
+        }
         self.world.trace.push(TraceEntry::EventDelivered {
             t: self.world.time_ms,
             target,
@@ -6642,6 +6663,163 @@ mod tests {
         let m = s.world.spawn(ObjectKind::Module, "module");
         s.world.module = Some(m);
         m
+    }
+
+    #[test]
+    fn origins_creature_and_placeable_event_scripts_use_table_then_explicit_then_object() {
+        use thedas_formats::gda::Cell;
+
+        for kind in [ObjectKind::Creature, ObjectKind::Placeable] {
+            let mut s = sim();
+            for script in ["table", "explicit", "object", " "] {
+                s.add_script(script, counter_script());
+            }
+            let who = s.world.spawn(kind, "actor");
+            // Queueing retains the event; the table is consulted when it is delivered.
+            s.world.queue_event(
+                0,
+                who,
+                Event {
+                    ty: 42,
+                    ..Event::default()
+                },
+                Some("explicit".into()),
+            );
+            s.world.tables().insert(
+                "#114",
+                &["Script"],
+                vec![(42, vec![Cell::String("table\0".into())])],
+            );
+            s.tick(0);
+            assert_eq!(s.world.get(who).unwrap().locals.ints.get("n"), Some(&1));
+            assert!(s.world.trace.entries.iter().any(|entry| matches!(entry,
+                TraceEntry::EventDelivered { script, target, ty: 42, .. }
+                    if script == "table" && *target == who)));
+
+            for (cell, explicit, object, expected) in [
+                (
+                    Cell::String("table".into()),
+                    Some("explicit"),
+                    Some("object"),
+                    Some("table"),
+                ),
+                (
+                    Cell::Empty,
+                    Some("explicit"),
+                    Some("object"),
+                    Some("explicit"),
+                ),
+                (
+                    Cell::String(String::new()),
+                    None,
+                    Some("object"),
+                    Some("object"),
+                ),
+                (
+                    Cell::String("\0".into()),
+                    None,
+                    Some("object"),
+                    Some("object"),
+                ),
+                // Nonempty means nonempty: whitespace is not trimmed into a fallback.
+                (
+                    Cell::String(" ".into()),
+                    Some("explicit"),
+                    Some("object"),
+                    Some(" "),
+                ),
+                (Cell::Empty, Some(""), Some("object"), None),
+                (Cell::Empty, None, Some(""), None),
+                (Cell::Empty, None, None, None),
+            ] {
+                s.world
+                    .tables()
+                    .insert("#114", &["Script"], vec![(42, vec![cell])]);
+                s.world.get_mut(who).unwrap().script = object.map(str::to_string);
+                s.world
+                    .get_mut(who)
+                    .unwrap()
+                    .locals
+                    .ints
+                    .insert("n".into(), 0);
+                s.world.trace.entries.clear();
+                s.deliver(
+                    who,
+                    Event {
+                        ty: 42,
+                        ..Event::default()
+                    },
+                    explicit.map(str::to_string),
+                );
+                assert_eq!(
+                    s.world.get(who).unwrap().locals.ints["n"],
+                    i32::from(expected.is_some())
+                );
+                let delivered: Vec<_> = s
+                    .world
+                    .trace
+                    .entries
+                    .iter()
+                    .filter_map(|entry| match entry {
+                        TraceEntry::EventDelivered { script, .. } => Some(script.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(delivered, expected.into_iter().collect::<Vec<_>>());
+                assert!(
+                    !s.world
+                        .trace
+                        .entries
+                        .iter()
+                        .any(|entry| matches!(entry, TraceEntry::Missing { .. }))
+                );
+            }
+            // An existing table without this event's row also takes the ordinary fallback.
+            s.world.get_mut(who).unwrap().script = Some("object".into());
+            s.world.trace.entries.clear();
+            s.deliver(
+                who,
+                Event {
+                    ty: 43,
+                    ..Event::default()
+                },
+                None,
+            );
+            assert!(s.world.trace.entries.iter().any(|entry| matches!(entry,
+                TraceEntry::EventDelivered { script, ty: 43, .. } if script == "object")));
+        }
+    }
+
+    #[test]
+    fn event_table_selection_preserves_da2_and_untraced_object_routes() {
+        for (game, kind) in [
+            (thedas_vfs::Game::DragonAge2, ObjectKind::Creature),
+            (thedas_vfs::Game::DragonAge2, ObjectKind::Placeable),
+            (thedas_vfs::Game::Origins, ObjectKind::Module),
+            (thedas_vfs::Game::Origins, ObjectKind::Area),
+        ] {
+            let mut s = sim();
+            s.game = game;
+            s.add_script("explicit", counter_script());
+            s.world.tables().insert(
+                "#114",
+                &["Script"],
+                vec![(42, vec![thedas_formats::gda::Cell::String("table".into())])],
+            );
+            let who = s.world.spawn(kind, "actor");
+            s.world.get_mut(who).unwrap().script = Some("object".into());
+            s.deliver(
+                who,
+                Event {
+                    ty: 42,
+                    ..Event::default()
+                },
+                Some("explicit".into()),
+            );
+            assert_eq!(s.world.get(who).unwrap().locals.ints.get("n"), Some(&1));
+            assert!(s.world.trace.entries.iter().any(|entry| matches!(entry,
+                TraceEntry::EventDelivered { script, .. } if script == "explicit")));
+        }
     }
 
     #[test]
