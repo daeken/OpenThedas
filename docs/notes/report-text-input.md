@@ -7,6 +7,27 @@ clears those two field settings after initialization, on that dialog instance.
 Ordinary `ask_text`, script name prompts, save names and character creation retain
 their field settings. Enter remains confirmation rather than a newline.
 
+Host ticks do not correspond to movie frames: under uneven scheduling the old
+`2..FOCUS_FRAMES` window could expire before `TextInput_mc_init` ran. Its late
+writes then restored the name limits or replaced early typing with the default
+input. The free-text policy now runs after every tick and before text input for
+the lifetime of the claimed popup clip. A marker on that clip identifies the
+engine question; a replacement script popup cannot inherit the policy even if
+its prompt text is identical.
+
+The initializer assigns the default text, limits and focus before installing
+`TextField.onKeyDown` as its final write. Until that handler exists, free-text
+dialogs capture characters, editing keys and Enter into an ordered queue rather
+than letting the movie accept them. Once initialization finishes, the policy is
+applied and the queued keys reach the field through normal input handling.
+Focus is established at that transition, independently of the ordinary prompts'
+focus-retry window. It is re-established through the installed focus handlers so
+an early mouse click cannot leave the field without its key listener.
+Closing or cancelling the dialog discards its remaining queue. The host also
+avoids focusing this field before initialization: doing that would cause the
+initializer's later focus assignment to skip `onSetFocus` and its key-listener
+registration. The normal name/script focus paths keep their existing behavior.
+
 Separately, the host text helper used a character's uppercase ASCII value as its
 virtual key code. Apostrophe therefore acted as Right, period as Delete, and
 `#`, `$`, `%` as End, Home, Left. Character input now carries character data
@@ -43,3 +64,69 @@ assets. It cycles name, report and choice boxes three times, checks the original
 20-character name limit while a report waits, cancels a blocked report, and types
 long punctuated notes. Run it explicitly with `--ignored`; the ordinary workspace
 suite also runs the asset-free text-input regression.
+
+The ignored `report_late_input_init_*` app tests deterministically advance thirty
+host ticks with zero movie time before letting initialization run. One types a
+long punctuated note after that late initialization and checks the following
+name prompt still has its 20-character limit. The other queues typing, selection,
+replacement, backspace and Enter before initialization, then verifies the exact
+submitted note. These use the installed movie and an offscreen GPU, without
+embedding assets. Run them with `THEDAS_INSTALL`, an isolated `HOME`, and
+`cargo test -j 2 -p thedas-app report_late_input_init -- --ignored --test-threads=1`
+through the shared cargo-slot wrapper.
+
+The 2026-11-15 loaded reproduction captured ten empty notes in forty reopens
+with the legacy build and native movie. A separate 160-reopen native sweep at a
+smaller viewport did not reproduce the character cap. To make that late-init
+case reliable, a private test overlay changed only the popup movie's frame-rate
+header from 60 to 5 fps; the fifth legacy reopen restored the 20-character limit.
+The overlay and all captured game data stay outside the repository. The original
+installed movie and its bytecode are unchanged.
+
+With the fix, twenty consecutive reopens in one loaded run saved every character
+of each 127-character punctuated note. The run alternated typing before and after
+initialization, used the same 5 fps overlay, and used a 640×360 hidden viewport to
+keep rendering costs within the replay's resource cap. Separate 1280×720 captures
+show both legacy failure modes and successful fixed notes. The runtime proof used
+an optimized debug build with assertions and overflow checks enabled; the ignored
+late-init tests and workspace checks use the normal debug/test settings.
+
+For a window-keyboard replay over `--control`, use
+`windowkey down|repeat|up KeyCode [JSON text]`, with winit's physical key names.
+For example, `windowkey down Quote "'"; windowkey up Quote` types an apostrophe,
+and `windowkey down Enter; windowkey up Enter` confirms the note. A space needs
+the JSON string `" "`. `windowkey down F8; windowkey up F8` opens the report
+through the same routing as the window. Semicolons separate steps; encode a
+literal semicolon in the JSON text as `"\u003b"`.
+
+These events share the window's `App::window_key` implementation, including
+`App::text_key`'s typing gate, modifier state, repeats, cutscene skip and game
+shortcuts. The older `type` and `key enter` steps call the UI directly and cannot
+verify the app's typing gate. The marking-choice box currently has no physical
+keyboard navigation; a replay can click its button without clicking the note's
+text field. Verify every saved `note.txt` and Enter submission separately:
+native character editing runs before Key-listener dispatch, so a missing
+confirmation listener alone does not demonstrate lost characters.
+
+The 2026-11-16 app-keyboard follow-up used the native movie in Tapster's Tavern,
+with a mouse click only on the marking-choice button. Both `8bf06c21` and
+`249769ac` passed sixteen consecutive ordinary reports, alternating immediate
+typing and a two-second wait. Four more reports after the bartender conversation
+produced one empty legacy note: the field did not exist when the keys arrived,
+the keys reached game shortcuts, and the app later re-asked the report. Its empty
+field then had focus and a registered Key listener. The fixed build passed all
+four. Both builds also passed four reports with the tactical tutorial active.
+
+Separately, the existing private 5 fps popup fixture produced one of eight exact
+legacy notes: all four immediate notes were lost and three delayed notes regained
+the name-field limit. The fixed build passed all eight. Thus #992's pending-input
+gate and lifetime policy address reproduced failures through App::text_key.
+These observations do not identify a missing Key listener as the cause of the
+character-input symptom: native character insertion precedes listener dispatch,
+and an empty note also disables the movie's Save report button. Windows' OS
+character-event delivery and OS window focus remain separate from movie focus;
+this hidden Mac replay exercises the shared app route, not Windows message
+generation.
+In a separate legacy timing-fixture diagnostic, a keyboard-only Ctrl+A and
+`Sera's retry` after initialization submitted exactly with Enter, with no further
+mouse click. Waiting for readiness was sufficient in that reproduced case.

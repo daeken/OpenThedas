@@ -137,12 +137,82 @@ impl GameJournal {
         let _ = std::fs::write(closed_path(&self.dir), b"");
     }
 
-    /// The checkpoint and the log as they stand, written out first (for an issue report).
-    pub fn files(&mut self) -> Option<(Vec<u8>, Vec<u8>)> {
+    /// Pins the journal's files and current byte length. A worker reads only this prefix;
+    /// later appends and checkpoint renames cannot change the report's journal.
+    pub fn files(&mut self) -> Option<ReportJournal> {
         self.writer.flush().ok()?;
-        let checkpoint = std::fs::read(checkpoint_path(&self.dir)).ok()?;
-        let log = std::fs::read(log_path(&self.dir)).ok()?;
-        Some((checkpoint, log))
+        let checkpoint = File::open(checkpoint_path(&self.dir)).ok()?;
+        let log = File::open(log_path(&self.dir)).ok()?;
+        let len = log.metadata().ok()?.len();
+        Some(ReportJournal {
+            checkpoint,
+            log,
+            len,
+        })
+    }
+}
+
+pub struct ReportJournal {
+    checkpoint: File,
+    log: File,
+    len: u64,
+}
+
+impl ReportJournal {
+    pub fn write(self, dir: &Path) -> std::io::Result<()> {
+        use std::io::Read as _;
+        std::io::copy(
+            &mut &self.checkpoint,
+            &mut File::create(dir.join("journal_checkpoint.json"))?,
+        )?;
+        std::io::copy(
+            &mut self.log.take(self.len),
+            &mut File::create(dir.join("journal.jsonl"))?,
+        )?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod report_tests {
+    use super::*;
+    use std::io::Write as _;
+
+    #[test]
+    fn a_report_keeps_the_press_time_prefix_through_appends_and_checkpoint_rotation() {
+        let dir =
+            std::env::temp_dir().join(format!("thedas-journal-report-{}", std::process::id()));
+        let out = dir.join("report");
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(checkpoint_path(&dir), b"checkpoint 1").unwrap();
+        std::fs::write(log_path(&dir), b"at press\n").unwrap();
+        let checkpoint = File::open(checkpoint_path(&dir)).unwrap();
+        let log = File::open(log_path(&dir)).unwrap();
+        let len = log.metadata().unwrap().len();
+        let report = ReportJournal {
+            checkpoint,
+            log,
+            len,
+        };
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(log_path(&dir))
+            .unwrap()
+            .write_all(b"after press\n")
+            .unwrap();
+        set_aside(&dir).unwrap();
+        std::fs::write(checkpoint_path(&dir), b"checkpoint 2").unwrap();
+        std::fs::write(log_path(&dir), b"new inputs\n").unwrap();
+        report.write(&out).unwrap();
+        assert_eq!(
+            std::fs::read(out.join("journal_checkpoint.json")).unwrap(),
+            b"checkpoint 1"
+        );
+        assert_eq!(
+            std::fs::read(out.join("journal.jsonl")).unwrap(),
+            b"at press\n"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
 

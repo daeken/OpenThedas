@@ -12,7 +12,34 @@
 use std::io::{BufRead, Write};
 
 use crate::commands::InputEntry;
-use crate::sim::Sim;
+use crate::sim::{Sim, SimError};
+
+/// Restore a journal checkpoint verbatim, retaining this session's resource tables.
+/// Ordinary `load_game` repairs old saves, clears transient state and queues area-load
+/// events; none of those operations happened when the journal took its checkpoint.
+/// The caller must open the checkpoint's module/resources first and verify its build.
+pub fn load_checkpoint(sim: &mut Sim, mut save: crate::save::SaveGame) -> Result<(), SimError> {
+    if save.format != crate::save::SAVE_FORMAT
+        || save.revision != crate::save::SAVE_REVISION
+        || save.module != sim.module_info.name
+    {
+        return Err(SimError::Parse(
+            "journal checkpoint".into(),
+            format!(
+                "format/revision/module {}/{}/{:?}, expected {}/{}/{:?}",
+                save.format,
+                save.revision,
+                save.module,
+                crate::save::SAVE_FORMAT,
+                crate::save::SAVE_REVISION,
+                sim.module_info.name
+            ),
+        ));
+    }
+    save.world.tables = sim.world.tables.clone();
+    sim.restore((save.world, save.talk));
+    Ok(())
+}
 
 /// The first line of a log: what it can be replayed onto.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]

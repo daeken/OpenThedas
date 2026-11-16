@@ -23,7 +23,7 @@ thedas-audio = { workspace = true, features = ["device"] }
 thedas-video.workspace = true
 anyhow.workspace = true
 clap.workspace = true
-winit.workspace = true
+winit = { workspace = true, features = ["serde"] }
 wgpu.workspace = true
 pollster.workspace = true
 glam.workspace = true

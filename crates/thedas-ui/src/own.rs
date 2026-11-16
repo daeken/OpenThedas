@@ -412,6 +412,12 @@ impl OwnMovie {
             .mouse_button(x, y, button as u8 & 3, down, button >= 5.0);
     }
 
+    /// Whether any clip is under window pixel (`x`, `y`).
+    pub fn has_clip_at(&self, x: f64, y: f64) -> bool {
+        let (x, y) = self.to_stage(x, y);
+        self.player.topmost_at(x, y).is_some()
+    }
+
     pub fn focused_text_at(&self, x: f64, y: f64) -> bool {
         let (x, y) = self.to_stage(x, y);
         self.player.focused_text_at(x, y)
