@@ -67,7 +67,7 @@ for number in (1033, 1036):
     fixture = case / "before-reply.json"
     fixture.write_text(json.dumps(state))
     home = Path(tempfile.mkdtemp(prefix="home-", dir=case))
-    steps = "run 1; reply 0; run 250; pad stick-left 1,0; run 250; quicksave"
+    steps = "run 1; reply 0; run 250; pad stick-left 1,0 250; quicksave"
     steps += "; run 250" * 48
     env = dict(os.environ, HOME=str(home), THEDAS_HIDDEN_WINDOW="1",
                THEDAS_MODS="none", THEDAS_NO_AUDIO="1", RUST_LOG="info")
@@ -82,7 +82,8 @@ for number in (1033, 1036):
     log = (case / "run.log").read_text()
     samples = re.findall(r"run 250: screens (\{[^}]*\})", log)
     for index, screens in enumerate(samples):
-        print(f"#{number} +{(index + 1) * 250:05}ms screens={screens}")
+        elapsed = 250 if index == 0 else (index + 2) * 250
+        print(f"#{number} +{elapsed:05}ms screens={screens}")
     saves = [p for p in (home / ".openthedas/saves").glob("*.json") if not p.name.endswith(".meta.json")]
     moves = []
     for path in saves:
