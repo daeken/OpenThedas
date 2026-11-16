@@ -110,9 +110,41 @@ paired runtime resume its saved deadlines and next-hand index.
 The old-save restart and resurrection cancellation are simulation compatibility
 choices. **Provisional** native save restoration and interruption of an active
 death task remain untraced.
-The existing area-parking policy holds events for departed areas. **Provisional**
-native area departure during a paired reaction remains untraced. An early area
-transition can therefore defer a paired victim's DEATH handler until returning.
+**Provisional departure completion:** native area unload during an in-flight paired
+death remains untraced. Before an area transition sends EXIT or parks the old
+area, complete that area's pending paired reactions and deliver their queued
+DEATH notifications immediately, at the current simulation time. Direct
+`enter_area` departures do the same before switching areas. Shorten the reaction's
+`ends_ms` to the departure time, retaining its final corpse pose. Remove the
+notification before calling scripts so a repeated/reentrant departure cannot
+deliver it twice. Already-held paired notifications for the departing area from
+older saves are also completed. Ordinary delayed events and deaths in other areas keep their existing
+deadlines. Staying in the area still uses the authored reaction deadline.
+
+This prevents a provisionally selected reaction duration from withholding story
+completion after departure. It does not claim native unload fidelity or change
+the untraced pair-selection callback. Replace this boundary if a native trace
+establishes a different policy.
+
+### The 12.5-second default-selection reactions
+
+There is no universal 12.5-second fallback constant. An audit of the shipped base
+Origins combat trees and `apr_base` identifies these creature types whose
+provisional first-playable default selection can resolve to a 12500 ms reaction:
+
+| Appearance | Type | Combat tree |
+| --- | --- | --- |
+| 47 | Ogre A | `c_dsogre_cbt.anb` |
+| 72 | Pride Demon | `c_pdemona_cbt.anb` |
+
+Both trees map `db_c_ws_blade_die_v1` (animation 268) and
+`db_c_dw_blade_die_v1` (270) to `c_dsogre.dblw_dmg_v1`, with duration 12.5 seconds
+and unit playback speeds. The first matching pair depends on the attacker's
+playable actions; the Tower run selects 268. These are asset-derived lengths
+under an untraced default selector, not verified native selection for those
+victims. Add-on/mod appearances using those trees inherit the same possibility;
+this inventory covers the base Origins assets. Missing playable pairs use the
+separate legacy 500 ms stored-result fallback, not 12.5 seconds.
 
 ## Oskias regression
 

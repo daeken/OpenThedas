@@ -1983,6 +1983,9 @@ impl Sim {
     }
 
     pub fn area_transition(&mut self, area: &str, waypoint: &str) {
+        if let Some(old) = self.world.area {
+            self.finish_area_death_blow_reactions(old);
+        }
         let t = self.world.time_ms;
         self.world.trace.push(TraceEntry::Log {
             t,
@@ -4684,6 +4687,9 @@ impl Sim {
             .find(|o| o.kind == ObjectKind::Area && o.template.eq_ignore_ascii_case(resref))
             .map(|o| o.id);
         if let Some(area) = known {
+            if let Some(old) = self.world.area.filter(|old| *old != area) {
+                self.finish_area_death_blow_reactions(old);
+            }
             for o in self.world.objects.values_mut() {
                 if o.area == Some(area) || o.id == area {
                     if let Some(a) = o.parked.take() {
@@ -4709,6 +4715,9 @@ impl Sim {
             .structs
             .first()
             .ok_or_else(|| SimError::Parse(resref.into(), "empty area".into()))?;
+        if let Some(old) = self.world.area {
+            self.finish_area_death_blow_reactions(old);
+        }
         let area = self.world.spawn(
             ObjectKind::Area,
             &text(root, "Tag").unwrap_or_else(|| resref.to_string()),

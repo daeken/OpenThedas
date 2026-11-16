@@ -228,6 +228,65 @@ impl Sim {
         }
     }
 
+    /// Provisional unload policy: complete paired deaths while their area and its
+    /// scripts are still available. Native in-flight death-task unload is untraced.
+    pub(crate) fn finish_area_death_blow_reactions(&mut self, area: ObjectId) {
+        if self.game != thedas_vfs::Game::Origins {
+            return;
+        }
+        let death = crate::sim::constant(&self.table, "EVENT_TYPE_DEATH");
+        let pending = |q: &crate::world::QueuedEvent| {
+            self.world.get(q.target).is_some_and(|o| {
+                o.area == Some(area)
+                    && o.dead
+                    && o.combat
+                        .death_blow_reaction
+                        .as_ref()
+                        .is_some_and(|r| q.event.ty == death && q.event.creator == Some(r.attacker))
+            })
+        };
+        // Preserve queue order, and remove notifications before invoking scripts:
+        // a reentrant departure must not deliver the same death twice.
+        let keys: Vec<_> = self
+            .world
+            .queue
+            .iter()
+            .filter(|(_, q)| pending(q))
+            .map(|(key, _)| *key)
+            .collect();
+        let held: Vec<_> = self
+            .world
+            .held
+            .iter()
+            .enumerate()
+            .filter(|(_, q)| pending(q))
+            .map(|(index, _)| index)
+            .collect();
+        let mut events: Vec<_> = keys
+            .into_iter()
+            .filter_map(|key| self.world.queue.remove(&key))
+            .collect();
+        let mut held_events: Vec<_> = held
+            .into_iter()
+            .rev()
+            .map(|index| self.world.held.remove(index))
+            .collect();
+        held_events.reverse();
+        events.extend(held_events);
+        let now = self.world.time_ms;
+        for q in events {
+            // Complete the reaction too, retaining its final pose for presentation.
+            if let Some(r) = self
+                .world
+                .get_mut(q.target)
+                .and_then(|o| o.combat.death_blow_reaction.as_mut())
+            {
+                r.ends_ms = r.ends_ms.min(now);
+            }
+            self.deliver(q.target, q.event, q.script);
+        }
+    }
+
     /// Handles an authored hit while leaving the animation command alive to its end.
     pub(crate) fn death_blow_impact(&mut self, id: ObjectId, due: u64) -> bool {
         let Some(blow) = self
@@ -712,5 +771,112 @@ mod tests {
         f.sim.tick(1000);
         assert_eq!(impacts(&f.sim), [(250, 4), (375, 4), (500, 5)]);
         assert!(f.sim.world.get(f.attacker).unwrap().combat.attack.is_none());
+    }
+
+    #[test]
+    fn departure_completes_paired_death_before_exit_and_never_repeats_it() {
+        let mut f = fixture(false);
+        let old = f.sim.world.get(f.victim).unwrap().area.unwrap();
+        f.sim.world.area = Some(old);
+        f.sim.world.hero = Some(f.attacker);
+        f.sim.world.get_mut(old).unwrap().template = "a".into();
+        f.sim.world.get_mut(old).unwrap().script = Some("area_probe".into());
+        let next = f.sim.world.spawn(ObjectKind::Area, "next");
+        f.sim.world.get_mut(next).unwrap().template = "next".into();
+        f.sim.tick(100);
+        f.sim.world.trace.entries.clear();
+        // Ordinary delayed events, even DEATH, must retain their own deadlines.
+        let ordinary = f.sim.world.spawn(ObjectKind::Creature, "ordinary");
+        f.sim.world.get_mut(ordinary).unwrap().area = Some(old);
+        f.sim.kill_with_event_delay(ordinary, f.attacker, 3000);
+        let unrelated = f.sim.new_event("ATTACK_IMPACT", Some(f.attacker));
+        f.sim.world.queue_event(3000, f.victim, unrelated, None);
+        f.sim.area_transition("next", "");
+        assert_eq!(f.sim.world.area, Some(next));
+        let victim = f.sim.world.get(f.victim).unwrap();
+        assert!(victim.parked.is_some());
+        assert_eq!(
+            victim.combat.death_blow_reaction.as_ref().unwrap().ends_ms,
+            100
+        );
+        let events: Vec<_> = f
+            .sim
+            .world
+            .trace
+            .entries
+            .iter()
+            .filter_map(|entry| match entry {
+                TraceEntry::EventDelivered { t, target, ty, .. } => Some((*t, *target, *ty)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(events, [(100, f.victim, 4), (100, old, 0)]);
+        assert!(
+            f.sim
+                .world
+                .queue
+                .values()
+                .any(|q| q.target == ordinary && q.event.ty == 4)
+        );
+        assert!(
+            f.sim
+                .world
+                .queue
+                .values()
+                .any(|q| q.target == f.victim && q.event.ty == 29)
+        );
+        f.sim.tick(4000);
+        f.sim.area_transition("a", "");
+        f.sim.tick(0);
+        assert_eq!(f.sim.world.trace.entries.iter().filter(|e| {
+            matches!(e, TraceEntry::EventDelivered { target, ty: 4, .. } if *target == f.victim)
+        }).count(), 1);
+    }
+
+    #[test]
+    fn direct_departure_flushes_saved_held_pair_but_spares_other_areas() {
+        for held in [false, true] {
+            let mut f = fixture(false);
+            let old = f.sim.world.get(f.victim).unwrap().area.unwrap();
+            f.sim.world.area = Some(old);
+            let next = f.sim.world.spawn(ObjectKind::Area, "next");
+            f.sim.world.get_mut(next).unwrap().template = "next".into();
+            f.sim.tick(100);
+            if held {
+                let key = *f.sim.world.queue.keys().next().unwrap();
+                let q = f.sim.world.queue.remove(&key).unwrap();
+                assert_eq!(q.event.ty, 4);
+                f.sim.world.held.push(q);
+                f.sim.world.get_mut(f.victim).unwrap().parked = Some(true);
+            }
+            let saved = f.sim.save_json().unwrap();
+            f.sim.load_json(&saved).unwrap();
+            f.sim.finish_area_death_blow_reactions(next);
+            assert!(!f.sim.world.queue.is_empty() || !f.sim.world.held.is_empty());
+            f.sim.enter_area("next", None).unwrap();
+            assert_eq!(
+                f.sim
+                    .world
+                    .get(f.victim)
+                    .unwrap()
+                    .combat
+                    .death_blow_reaction
+                    .as_ref()
+                    .unwrap()
+                    .ends_ms,
+                100
+            );
+            assert!(
+                f.sim
+                    .world
+                    .queue
+                    .values()
+                    .all(|q| q.target != f.victim || q.event.ty != 4)
+            );
+            assert!(f.sim.world.held.is_empty());
+            assert_eq!(f.sim.world.trace.entries.iter().filter(|e| {
+                matches!(e, TraceEntry::EventDelivered { t: 100, target, ty: 4, .. } if *target == f.victim)
+            }).count(), 1);
+        }
     }
 }
