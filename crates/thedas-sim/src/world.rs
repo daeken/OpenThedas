@@ -743,6 +743,9 @@ pub struct World {
     /// Each quest's latest journal entry, by plot GUID (see [`crate::journal`]).
     #[serde(default)]
     pub journal: BTreeMap<String, crate::journal::JournalMark>,
+    /// Explicit journal closure/removal, independent of plot flags (Origins).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) quest_states: BTreeMap<String, crate::journal::QuestState>,
     /// How many journal entries have been made (orders them).
     #[serde(default)]
     pub journal_seq: u64,
@@ -1036,6 +1039,7 @@ impl World {
             plots: BTreeMap::new(),
             nav_patches: BTreeMap::new(),
             journal: BTreeMap::new(),
+            quest_states: BTreeMap::new(),
             journal_seq: 0,
             recipes: BTreeSet::new(),
             active_quest: None,
