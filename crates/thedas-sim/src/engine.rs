@@ -3352,6 +3352,16 @@ pub fn call(
                 return ok(Value::Int(0));
             };
             let target = obj(a, 0);
+            if h.sim.game == thedas_vfs::Game::DragonAge2 {
+                let admitted = h.sim.da2_add_command(
+                    target,
+                    c,
+                    int(a, 2),
+                    int(a, 3) != 0,
+                    a.get(4).map_or(-1, |_| int(a, 4)),
+                );
+                return ok(Value::Int(i32::from(admitted)));
+            }
             let origins = h.sim.game == thedas_vfs::Game::Origins;
             let front = if origins {
                 int(a, 2) == 1
@@ -3429,30 +3439,12 @@ pub fn call(
                     }
                 }
             }
-            if front
-                && h.sim.game == thedas_vfs::Game::DragonAge2
-                && h.sim.world.get(target).is_some_and(|o| {
-                    o.commands
-                        .first()
-                        .is_some_and(|c| c.cancellable && c.name == "CommandUseAbility")
-                })
-            {
-                h.sim.finish_chained_ability(target);
-            }
             h.sim.world.trace.push(TraceEntry::Command {
                 t,
                 object: target,
                 command: c.name.clone(),
                 status: "queued".into(),
             });
-            if front
-                && h.sim
-                    .world
-                    .get(target)
-                    .is_some_and(|o| o.commands.first().is_some_and(|c| c.from.is_some()))
-            {
-                h.sim.da2_stop_locomotion(target);
-            }
             match h.sim.world.get_mut(target) {
                 Some(o) => {
                     if front {
