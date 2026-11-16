@@ -1070,6 +1070,9 @@ enum ResumeOffer {
 
 /// The ids of the offer to resume and of the box saying it failed.
 const RESUME_ID: u32 = 0x5245_5355;
+/// The question shown when the way back to the start menu fails (no answer is acted on).
+const RETURN_FAILED_ID: u32 = 0x5245_5446;
+
 const RESUME_FAILED_ID: u32 = RESUME_ID + 1;
 
 /// When `written` was, said as how long ago from `now`.
@@ -1512,7 +1515,7 @@ impl App {
         // The anti-aliasing slider offers what the device draws the world with; the choice
         // (4x unless the player chose) is the world's samples (see `sync_antialiasing`).
         ui.set_antialias_samples(
-            thedas_render::msaa::supported_samples(&ctx.adapter, config.format),
+            thedas_render::msaa::supported_samples(&ctx.adapter, &ctx.device, config.format),
             !upload::automated(),
         );
         if let (Some(live), Some(_)) = (&self.live, &self.screens) {
@@ -4757,7 +4760,18 @@ impl App {
             if matches!(r, ui::FrontEnd::StartMenu) {
                 match live::Live::open(&self.install, &self.module, start, &self.shaders) {
                     Ok(l) => self.install_live(l),
-                    Err(e) => log::warn!("front end: {r:?} failed: {e:#}"),
+                    Err(e) => {
+                        log::warn!("front end: {r:?} failed: {e:#}");
+                        // Say so: the game just carries on, which looks like a dead button.
+                        if let Some(g) = self.gfx.as_mut() {
+                            g.ui.ask_choice(
+                                RETURN_FAILED_ID,
+                                &format!("The start menu could not be opened: {e:#}"),
+                                "OK",
+                                "OK",
+                            );
+                        }
+                    }
                 }
                 continue;
             }

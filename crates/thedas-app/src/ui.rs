@@ -1145,6 +1145,14 @@ impl UiLayer {
                     screens.menu = None;
                 }
             }
+            // A movie picked up an item or ability to drop on another movie (the values it
+            // set under `GUI.DragData` say what): until the button is released
+            // `GUI.Dragging` is 1, and the movies' drop targets take it from there.
+            "GUI.StartDragging" => {
+                if let Ok(mut s) = self.shown.lock() {
+                    s.dragging = true;
+                }
+            }
             "GameModeController.ExitToStartMenuMessage"
             | "GameModeController.ShutDownToStartMenuMessage" => {
                 self.requests.push(FrontEnd::StartMenu);
@@ -2297,6 +2305,7 @@ impl UiLayer {
         let resolution = self.stage.size();
         if let Ok(mut shown) = self.shown.lock() {
             shown.resolution = resolution;
+            shown.screens = screens.shown().iter().map(|s| *s as u32).collect();
             // A notification's entry is the journal's to open on while it is up.
             if journal.is_none() {
                 shown.journal_focus = None;
@@ -3475,6 +3484,12 @@ impl UiLayer {
     /// there is the interface's, not the world's. Provisional: the game hit-tests the movies'
     /// shapes; an opaque pixel stands in for that.
     pub fn covers(&self, x: f64, y: f64) -> bool {
+        // A button's hit area can be drawn clear (the tutorial panel's "View in codex"): the
+        // click is the interface's wherever a clip is, not only where a pixel shows.
+        self.stage.movies.iter().any(|m| m.has_clip_at(x, y)) || self.covers_pixel(x, y)
+    }
+
+    fn covers_pixel(&self, x: f64, y: f64) -> bool {
         let textures: Vec<wgpu::Texture> = self
             .stage
             .movies
@@ -3576,6 +3591,18 @@ impl UiLayer {
 
     pub fn mouse_button(&mut self, x: f64, y: f64, down: bool) {
         self.stage.mouse_button(x, y, down);
+        // The drop was seen by the movies under the mouse (they read `GUI.Dragging`); the
+        // drag is over.
+        if !down {
+            let dragging = self
+                .shown
+                .lock()
+                .map(|mut s| std::mem::replace(&mut s.dragging, false))
+                .unwrap_or(false);
+            if dragging {
+                self.stage.drop_external();
+            }
+        }
         // A click on a party portrait: portraits.gfx only says which member the mouse is
         // over (`GameModeExplore.GUITargetedPlayer`, set on roll-over and cleared on
         // roll-out; its own click handler is empty), and the game selects them.
