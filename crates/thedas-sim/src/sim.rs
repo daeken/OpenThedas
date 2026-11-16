@@ -156,6 +156,9 @@ pub struct Sim {
     /// Each door's collision for sight lines (`None`: its model has none) and the key of the
     /// model and placement it was built from (see `Sim::door_sight`).
     pub(crate) door_collisions: HashMap<ObjectId, (u64, Option<Arc<crate::collision::Collision>>)>,
+    /// Each area transition's interaction volume (see [`crate::contact`]) and the key of the
+    /// model and placement it was built from. Not saved.
+    pub(crate) contact_shapes: HashMap<ObjectId, (u64, Option<Arc<crate::collision::Collision>>)>,
     /// Walkers held up by another creature's body: since when, and whether that was
     /// reported (see `Sim::advance_movers`). Not saved.
     pub(crate) blocked_since: HashMap<ObjectId, (u64, bool)>,
@@ -182,6 +185,11 @@ pub struct Sim {
     /// The conversations being said in passing (see [`crate::dialog::AmbientTalk`]). Not
     /// saved.
     pub(crate) ambient: Vec<crate::dialog::AmbientTalk>,
+    /// When each creature's last line said in passing is over (world time, ms), kept when
+    /// its conversation is cleared: DAOrigins.exe's ambient manager tracks the speaker's
+    /// line apart from the conversation record, and does not start another line for a
+    /// speaker still saying one (0x6ffaa0 -> 0x6ff190). Not saved, like `ambient`.
+    pub(crate) ambient_speaking: std::collections::BTreeMap<ObjectId, u64>,
     /// The install's voice banks, for the lengths of voiced lines.
     pub voices: crate::voice::Voices,
     /// Every command given through [`Sim::apply`] since it was turned on (`Some`), for
@@ -673,6 +681,7 @@ impl Sim {
             current_effect_target: None,
             dialog_ambient: false,
             ambient: Vec::new(),
+            ambient_speaking: Default::default(),
             voices: crate::voice::Voices::new(),
             input_log: None,
             loads: 0,
@@ -684,6 +693,7 @@ impl Sim {
             collisions: HashMap::new(),
             placeable_collisions: HashMap::new(),
             door_collisions: HashMap::new(),
+            contact_shapes: HashMap::new(),
             blocked_since: HashMap::new(),
             sight_memo: Default::default(),
             prcscr: None,
@@ -752,6 +762,7 @@ impl Sim {
         self.door_cells.clear();
         self.placeable_collisions.clear();
         self.door_collisions.clear();
+        self.contact_shapes.clear();
         self.blocked_since.clear();
     }
 
@@ -2636,6 +2647,7 @@ impl Sim {
         } else {
             self.world.in_triggers.insert(id, now);
         }
+        self.update_placeable_contacts(id);
     }
 
     /// Re-arms a heartbeat after it fires, while the object still has one.
@@ -4357,18 +4369,13 @@ impl Sim {
             // is dead; rules_core answers it with UT_Talk, which begins the conversation.
             let target = cmd
                 .target
-                .filter(|&t| self.world.get(t).is_some_and(|o| !o.dead))
-                // A click must respect the ambient speaker's current line before
-                // dispatching DIALOGUE: UT_Talk clears ambient dialogs before calling
-                // BeginConversation, which otherwise bypasses its restart guard.
-                // The native ambient manager arbitrates a speaker's active line at
-                // 0x6ff190, before starting its voice (0x6ffaa0 -> 0x6fe4a0).
-                // Provisional: enforcing that lifetime before player dispatch is our
-                // boundary choice; the native command's earlier busy check is untraced.
-                .filter(|&t| {
-                    self.game != thedas_vfs::Game::Origins
-                        || !self.ambient.iter().any(|a| a.c.owner == t)
-                });
+                .filter(|&t| self.world.get(t).is_some_and(|o| !o.dead));
+            // Sent even while the target says something in passing: the executor has no
+            // such test, and UT_Talk clears the target's ambient dialogs before it begins
+            // the conversation, so a real conversation starts at once. A creature whose
+            // conversation is itself said in passing (the Dust Town beggar) does not begin
+            // its line again over the one it is saying: the ambient manager keeps the
+            // speaker's line apart from the cleared record ([`Sim::ambient_speaking`]).
             if let Some(t) = target {
                 if cmd.name == "CommandInitiateDialog"
                     && cmd.arrived

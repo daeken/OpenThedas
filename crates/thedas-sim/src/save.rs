@@ -273,6 +273,7 @@ impl Sim {
         self.talk = save.talk.filter(|c| !c.ended);
         // What was being said in passing belonged to the game left behind.
         self.ambient.clear();
+        self.ambient_speaking.clear();
         self.world.ambient_lines.clear();
         self.forget_world_caches();
         // Native DA2 template loading initializes race from appearance. Earlier saves
