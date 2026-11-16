@@ -2306,6 +2306,19 @@ pub fn call(
             20
         })),
         "GetTime" => ok(Value::Int((h.sim.world.time_ms / 1000) as i32)),
+        "GetPlayTime" if h.sim.game == thedas_vfs::Game::Origins => {
+            ok(Value::Int(if h.sim.world.module.is_some() {
+                (h.sim.world.time_ms / 1000) as i32
+            } else {
+                -1
+            }))
+        }
+        "GetMeleeRingPosition" if h.sim.game == thedas_vfs::Game::Origins => ok(Value::Vector(
+            h.sim.melee_ring_position(obj(a, 0), int(a, 1)),
+        )),
+        "GetWeaponsUnsheathedStatus" if h.sim.game == thedas_vfs::Game::Origins => {
+            ok(b(h.sim.weapons_unsheathed(obj(a, 0))))
+        }
         "ReadIniEntry" => ok(Value::String(String::new())),
         // Achievements belong to the player's profile, not the game: the simulation's profile has
         // none (by id or, the older form, by name).
@@ -6349,6 +6362,46 @@ mod tests {
     use thedas_vfs::Vfs;
 
     use super::*;
+
+    #[test]
+    fn ring_weapon_queries_dispatch_and_play_time_units() {
+        let table = Arc::new(EngineTable::parse(b"int GetPlayTime() = 830;\nvector GetMeleeRingPosition(object o, int i = 0) = 606;\nint GetWeaponsUnsheathedStatus(object o) = 160;").unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        assert_eq!(run(&mut s, 1, "GetPlayTime", &[]), Some(Value::Int(-1)));
+        s.world.module = Some(s.world.spawn(ObjectKind::Module, "module"));
+        s.world.time_ms = 123_999;
+        assert_eq!(run(&mut s, 1, "GetPlayTime", &[]), Some(Value::Int(123)));
+        let c = s.world.spawn(ObjectKind::Creature, "c");
+        s.world.get_mut(c).unwrap().position = [3.0, 2.0, 1.0];
+        assert_eq!(
+            run(
+                &mut s,
+                1,
+                "GetMeleeRingPosition",
+                &[Value::Object(c), Value::Int(0)]
+            ),
+            Some(Value::Vector([3.0, 2.0, 1.0]))
+        );
+        s.set_weapons_drawn(c, true);
+        assert_eq!(
+            run(&mut s, 1, "GetWeaponsUnsheathedStatus", &[Value::Object(c)]),
+            Some(Value::Int(1))
+        );
+        s.game = thedas_vfs::Game::DragonAge2;
+        for name in [
+            "GetPlayTime",
+            "GetMeleeRingPosition",
+            "GetWeaponsUnsheathedStatus",
+        ] {
+            let function = s.table.function_by_name(name).cloned().unwrap();
+            let mut host = ScriptHost {
+                sim: &mut s,
+                event: None,
+                script: "test".into(),
+            };
+            assert!(call(&mut host, 1, &function, &[]).is_none(), "{name}");
+        }
+    }
 
     const LDF: &str = "void SetCooldown(object o, int n, float f, string s) = 1;\n\
         void DoAutoSave() = 9001;\n\
