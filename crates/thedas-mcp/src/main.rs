@@ -1984,6 +1984,7 @@ impl Server {
                 impacted: false,
                 arrived: false,
                 da2_target_prepared: false,
+                da2_basic_attack_fallback: false,
                 path: Vec::new(),
                 turned_at: None,
             };
