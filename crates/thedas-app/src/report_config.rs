@@ -43,10 +43,16 @@ fn sanitize_ini(text: &str) -> String {
         if line.is_empty() || line.starts_with([';', '#']) {
             continue;
         }
-        if line.starts_with('[') && line.ends_with(']') {
-            secret_section = sensitive_key(line);
+        if line.starts_with('[') {
+            let Some(end) = line.find(']') else {
+                // Do not copy fields under an unparseable section header.
+                secret_section = true;
+                continue;
+            };
+            let section = &line[..=end];
+            secret_section = sensitive_key(section);
             if !secret_section {
-                out.push_str(line);
+                out.push_str(section);
                 out.push('\n');
             }
         } else if !secret_section
@@ -117,7 +123,7 @@ mod tests {
         assert_eq!(json["nested"]["volume"], 10);
         assert_eq!(
             sanitize_ini(
-                "; token=private\n; note=private\n# note=private\n[Video]\nWidth=1280\nAPI_KEY=private\n[Tokens]\nvalue=private\n[Audio]\nVolume=10\n"
+                "; token=private\n; note=private\n# note=private\n[Video] ; private\nWidth=1280\nAPI_KEY=private\n[Tokens] # comment\nvalue=private\n[broken\nvalue=private\n[Audio]\nVolume=10\n"
             ),
             "[Video]\nWidth=1280\n[Audio]\nVolume=10\n"
         );
