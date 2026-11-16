@@ -637,10 +637,13 @@ const ABI_PERSISTENT_AREA: u32 = 0x5d3e_0787;
 /// The M2DA id of `VFX Persistent`.
 const VFX_PERSISTENT_TABLE: i32 = 96;
 
-/// `GetClusterCenter`, as DAOrigins.exe works it out (0x671980):
-/// - The cluster's span is the ability's `aoe_param1` in `ABI_base` (or, for an ability with
-///   a lasting area, its `VFX Persistent` row's `Radius`), doubled for a sphere
-///   (`aoe_type` 1).
+/// `GetClusterCenter` (DAOrigins.exe 0x671980, DragonAge2.exe 0x51a4b0):
+/// - In Origins, the cluster's span is the ability's `aoe_param1` in `ABI_base`
+///   (or, for an ability with a lasting area, its `VFX Persistent` row's `Radius`),
+///   doubled for a sphere (`aoe_type` 1).
+/// - DA2 reads the persistent row through the upgradable ability column 0x53a8a258,
+///   then its radius and shape from table 96. A sphere doubles the radius. Ability
+///   302030 instead doubles its upgradable 0x15bdf19c parameter (0x51a588-0x51a5ff).
 /// - The candidates are the creatures the creator perceives. Each hostile one in turn is a
 ///   cluster's center; the others join it, in candidate order, when within the span of the
 ///   center and of every member already in (a quirk kept: distances are read from a table
@@ -685,24 +688,45 @@ fn cluster_center(
         })
         .collect();
     let tables = sim.world.tables.clone();
-    let abi = tables.get(0, "ABI_base");
-    let abi_cell = |col: &str| {
-        abi.as_ref()
-            .and_then(|t| t.cell(col, ability as i64).cloned())
-    };
-    let persistent = abi.as_ref().map_or(0, |t| {
-        cell_int(t.cell_by_hash(ABI_PERSISTENT_AREA, ability as i64))
-    });
-    let mut span = if persistent == 0 {
-        cell_float(abi_cell("aoe_param1").as_ref())
+    let span = if sim.game == thedas_vfs::Game::DragonAge2 {
+        if ability == 302030 {
+            2.0 * upgradable_ability_float(sim, creator, 0x15bd_f19c, ability)
+        } else {
+            let persistent = upgradable_ability_int(sim, creator, 0x53a8_a258, ability);
+            let area = tables.get(VFX_PERSISTENT_TABLE, "");
+            let cell = |column| {
+                area.as_ref()
+                    .filter(|_| persistent != 0)
+                    .and_then(|t| t.cell_by_hash(column, i64::from(persistent)))
+            };
+            let radius = cell_float(cell(0xad5f_b9f8));
+            if cell_int(cell(0x4de7_0e62)) == 1 {
+                2.0 * radius
+            } else {
+                radius
+            }
+        }
     } else {
-        tables
-            .get(VFX_PERSISTENT_TABLE, "")
-            .map_or(0.0, |t| cell_float(t.cell("Radius", persistent as i64)))
+        let abi = tables.get(0, "ABI_base");
+        let abi_cell = |col: &str| {
+            abi.as_ref()
+                .and_then(|t| t.cell(col, ability as i64).cloned())
+        };
+        let persistent = abi.as_ref().map_or(0, |t| {
+            cell_int(t.cell_by_hash(ABI_PERSISTENT_AREA, ability as i64))
+        });
+        let mut span = if persistent == 0 {
+            cell_float(abi_cell("aoe_param1").as_ref())
+        } else {
+            tables
+                .get(VFX_PERSISTENT_TABLE, "")
+                .map_or(0.0, |t| cell_float(t.cell("Radius", persistent as i64)))
+        };
+        if cell_int(abi_cell("aoe_type").as_ref()) == 1 {
+            span *= 2.0;
+        }
+        span
     };
-    if cell_int(abi_cell("aoe_type").as_ref()) == 1 {
-        span *= 2.0;
-    }
     let n = candidates.len();
     let hostile: Vec<bool> = candidates
         .iter()
@@ -13495,9 +13519,18 @@ mod coverage_tests {
         );
         t.insert(
             "#96",
-            &["ID", "Radius"],
-            vec![(7, vec![Cell::Int(7), Cell::Float(3.0)])],
+            &["ID", "Radius", "#ad5fb9f8", "#4de70e62"],
+            vec![(
+                7,
+                vec![
+                    Cell::Int(7),
+                    Cell::Float(3.0),
+                    Cell::Float(3.0),
+                    Cell::Int(0),
+                ],
+            )],
         );
+        t.insert("#1", &["#53a8a258"], vec![(2, vec![Cell::Int(7)])]);
         s.world.tables = Arc::new(t);
         let area = s.world.spawn(ObjectKind::Area, "area");
         s.world.hostility.insert((1, 2), true);
@@ -13605,6 +13638,113 @@ mod coverage_tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn da2_clusters_use_persistent_shapes_and_upgradable_ability_parameters() {
+        let mut s = sim();
+        s.game = thedas_vfs::Game::DragonAge2;
+        let tables = crate::m2da::Tables::empty();
+        tables.insert(
+            "ABI_base",
+            &["aoe_type", "aoe_param1"],
+            vec![(301030, vec![Cell::Int(1), Cell::Float(100.0)])],
+        );
+        tables.insert(
+            "#1",
+            &["#53a8a258", "#15bdf19c", "#d300f4d9"],
+            vec![
+                (0, vec![Cell::Int(1), Cell::Float(1.0)]),
+                (
+                    301030,
+                    vec![Cell::Int(301030), Cell::Float(0.0), Cell::Int(301031)],
+                ),
+                (301031, vec![Cell::Int(1)]),
+                (301040, vec![Cell::Int(301040)]),
+                (301050, vec![Cell::Int(0)]),
+                (301060, vec![Cell::Int(999999)]),
+                (
+                    302030,
+                    vec![Cell::Int(301040), Cell::Float(2.5), Cell::Int(302031)],
+                ),
+                (302031, vec![Cell::Int(0), Cell::Float(1.0)]),
+            ],
+        );
+        tables.insert(
+            "#96",
+            &["#ad5fb9f8", "#4de70e62"],
+            vec![
+                (0, vec![Cell::Float(100.0), Cell::Int(1)]),
+                (301030, vec![Cell::Float(2.5), Cell::Int(1)]),
+                (301031, vec![Cell::Float(3.5), Cell::Int(1)]),
+                (301040, vec![Cell::Float(2.5), Cell::Int(2)]),
+            ],
+        );
+        let tables = Arc::new(tables);
+        s.world.tables = tables.clone();
+        let area = s.world.spawn(ObjectKind::Area, "area");
+        s.world.hostility.insert((1, 2), true);
+        let put = |s: &mut Sim, group, x| {
+            let id = s.world.spawn(ObjectKind::Creature, "creature");
+            let o = s.world.get_mut(id).unwrap();
+            (o.area, o.group, o.position) = (Some(area), group, [x, 0.0, 0.0]);
+            o.properties.insert(7, (100.0, 100.0));
+            id
+        };
+        let mage = put(&mut s, 1, 0.0);
+        let lone = put(&mut s, 2, 100.0);
+        let a = put(&mut s, 2, 10.0);
+        let b = put(&mut s, 2, 14.0);
+        let far = put(&mut s, 2, 30.0);
+        s.world.get_mut(mage).unwrap().combat.perceived = vec![lone, a, b, far];
+        let center = |s: &mut Sim, ability| {
+            let result = run(
+                s,
+                mage,
+                "GetClusterCenter",
+                &[
+                    Value::Object(mage),
+                    Value::Int(ability),
+                    Value::Int(2),
+                    Value::Int(0),
+                    Value::Int(0),
+                ],
+            );
+            match result {
+                Some(Value::Engine { handle, .. }) => match s.world.handle(handle) {
+                    Some(EngineData::Location(l)) => (l.area, l.position),
+                    _ => panic!("no location"),
+                },
+                _ => panic!("no location"),
+            }
+        };
+        // Fireball's sphere spans 5 m, with Origins metadata giving a different answer.
+        assert_eq!(center(&mut s, 301030), (area, [12.0, 0.0, 0.0]));
+        s.game = thedas_vfs::Game::Origins;
+        assert_eq!(center(&mut s, 301030), (area, [38.5, 0.0, 0.0]));
+        s.game = thedas_vfs::Game::DragonAge2;
+        // Other shapes keep their radius. Zero, missing and unknown persistent rows
+        // have zero span, including a zero row containing otherwise valid metadata.
+        for ability in [301040, 301050, 301060, 301070] {
+            assert_eq!(center(&mut s, ability).0, OBJECT_INVALID, "{ability}");
+        }
+        s.world.get_mut(b).unwrap().position[0] = 16.0;
+        assert_eq!(center(&mut s, 301030).0, OBJECT_INVALID);
+        assert_eq!(center(&mut s, 302030).0, OBJECT_INVALID);
+        // A learned direct upgrade can change the persistent row itself.
+        s.world.get_mut(mage).unwrap().abilities.insert(301031);
+        assert_eq!(center(&mut s, 301030), (area, [13.0, 0.0, 0.0]));
+        // 302030 doubles its upgradable float even with a different persistent shape.
+        s.world.get_mut(mage).unwrap().abilities.insert(302031);
+        assert_eq!(center(&mut s, 302030), (area, [13.0, 0.0, 0.0]));
+        let saved = s.save_json().unwrap();
+        s.load_json(&saved).unwrap();
+        s.world.tables = tables;
+        assert_eq!(center(&mut s, 301030), (area, [13.0, 0.0, 0.0]));
+        assert_eq!(center(&mut s, 302030), (area, [13.0, 0.0, 0.0]));
+        s.world.tables = Arc::new(crate::m2da::Tables::empty());
+        assert_eq!(center(&mut s, 301030).0, OBJECT_INVALID);
+        assert_eq!(center(&mut s, 302030).0, OBJECT_INVALID);
     }
 
     #[test]
