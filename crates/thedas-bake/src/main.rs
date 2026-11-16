@@ -884,7 +884,8 @@ fn fit(
         }
         for (i, k) in lf.light_scale.iter().enumerate() {
             out.push_str(&format!(
-                "light {i} {k} {}\n",
+                "light {i} {k} {} {}\n",
+                lf.light_texels[i],
                 names.get(i).map(String::as_str).unwrap_or("?")
             ));
         }
@@ -1273,13 +1274,19 @@ fn lightset(
                     e.0 += Vec3::new(r.parse()?, g.parse()?, b.parse()?);
                     e.1 += 1;
                 }
-                ["light", i, k, ..] => {
+                ["light", i, k, rest @ ..] => {
+                    // Weighted by the texels each fit saw the light on (older fit files lack
+                    // the count: weight 1).
                     let (i, k): (usize, f64) = (i.parse()?, k.parse()?);
+                    let n = rest
+                        .first()
+                        .and_then(|n| n.parse::<u32>().ok())
+                        .unwrap_or(1);
                     if k > 0.0
                         && let Some(e) = scale.get_mut(i)
                     {
-                        e.0 += k;
-                        e.1 += 1;
+                        e.0 += k * n as f64;
+                        e.1 += n;
                     }
                 }
                 ["noshadow", i] => {
@@ -1319,8 +1326,12 @@ fn lightset(
                 "position": position,
                 "radius": radius,
                 "color": l.color.to_array(),
-                "baked_brightness": if n > 0 { Some(sum / n as f64) } else { None },
-                "fitted_atlases": n,
+                "baked_brightness": if n as usize >= thedas_bake::fit::MIN_LIGHT_TEXELS {
+                    Some(sum / n as f64)
+                } else {
+                    None
+                },
+                "fitted_texels": n,
                 "in_alpha": noshadow[i] == 0,
                 "shadow_reach": if reach[i].1 > 0 { reach[i].0 / reach[i].1 as f64 } else { 1.0 },
             })
