@@ -239,6 +239,27 @@ zero script errors. This fresh replay also narrows global processing starvation
 while leaving individual ability and damage parity open. Its supplied source
 chain includes earlier healplayer use.
 
+A later paired Darktown control on main `68797d17` and the merged heading/input
+candidate uses supplied fresh_06, Tomwise, then the remains-route ambush. The
+driver now uses the owned DA2 health potion (`gen_im_cns_pot_health_01`) and
+records actual consumption; the earlier driver only searched DAO poultice tags.
+Each build consumes one potion. Main remains bounded for 350 basic-attack
+iterations, then wipes during the ordinary player-approach recovery. The
+candidate clears the fight in 47.5 seconds of simulation time with Hawke,
+Bethany and Varric alive, then loots the Seal of Dumat from the remains.
+Both have zero script errors, developer heals, direct state-setting calls or
+forced kills. The supplied chain itself retains earlier healplayer use.
+
+During this control Bethany/Varric receive 439/439 one-second heartbeats on
+main and 57/56 on the candidate. Their completed Use Ability commands number
+15/5 and 19/15 respectively; Hawke completes 15 on each. The intervals include
+the post-fight walk/pickup on the candidate and the bounded/recovery phases on
+main. These counts support continuing follower processing, not parity of every
+ability or cinematic gate. The paired result measures the heading/input bundle
+with a basic-attack driver and an owned potion; the command-only selector
+control isolates the input flag. No native fight outcome or timing comparison
+is implied. The older patrol and pre-Ogre wipes remain separate diagnostics.
+
 Damage, health, chargen inputs and Karl combat are owned by the separate
 damage investigation. No balance adjustment or processing heuristic is
 introduced by this note.
