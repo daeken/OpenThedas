@@ -2491,6 +2491,11 @@ impl D3dPass {
             .for_each(|s| *s = None);
     }
 
+    /// The last opacity multiplier given to a scene draw, for diagnostics.
+    pub fn opacity(&self, draw: usize) -> Option<f32> {
+        self.opacity.get(draw).copied()
+    }
+
     /// Draws scene draw `draw` at `opacity` (0..1) of its material's: its shaders' engine
     /// fade (`mml_fOpacityMultiplier`, which the character pixel shaders write as their
     /// alpha, `Ch1.psh`: `mov oC0.w, c27.x`) is multiplied by it, and below 1 its opaque

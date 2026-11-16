@@ -633,11 +633,29 @@ fn worn_parts(sim: &Sim, o: &Object, prefix: &str, gear: Gear) -> (Vec<String>, 
         let model = format!("{prefix}_{ty}_{v}{LOD0}");
         has_model(sim, &model).then_some(model)
     };
+    let chest = worn("INVENTORY_SLOT_CHEST");
+    // Clothing's models (`cth`, `dm_cth_com_0`) have their own hands and feet, so the
+    // unclothed hands and feet are not drawn under it: their bare shins came through
+    // Oskias's trousers in Tapster's. Provisional: from the models, as Dragon Age II's
+    // clothing covers hands and feet; not traced in DAOrigins.exe.
+    let clothing = chest
+        .as_deref()
+        .is_some_and(|m| m.starts_with(&format!("{prefix}_cth_")));
     let mut out: Vec<String> = BODY_PARTS
         .iter()
         .zip(slots)
-        .map(|((_, nude), slot_name)| {
-            worn(slot_name).unwrap_or_else(|| format!("{prefix}_{nude}{LOD0}"))
+        .enumerate()
+        .filter_map(|(i, ((_, nude), slot_name))| {
+            let item = if i == 0 {
+                chest.clone()
+            } else {
+                worn(slot_name)
+            };
+            match item {
+                Some(m) => Some(m),
+                None if clothing => None,
+                None => Some(format!("{prefix}_{nude}{LOD0}")),
+            }
         })
         .collect();
     let helmet = worn("INVENTORY_SLOT_HEAD");
@@ -781,9 +799,36 @@ pub struct Motion {
 /// out of and in combat.
 pub const COL_AMBIENT_TREE: u32 = 0x5009_76ec;
 pub const COL_COMBAT_TREE: u32 = 0xde80_b418;
+/// `apr_base.gda`'s translation multipliers (x, y, z), read by the appearance setup
+/// (DAOrigins.exe 0x6a13c0) for its clips' translations: 0.73 for dwarves, 0.92 for elves
+/// (notes/nonhuman-clip-retarget-trace.md). Their names are not known.
+pub const COL_TRANSLATION_SCALE: [u32; 3] = [0xa397_7767, 0xba8c_4626, 0x91a1_15e5];
+
+/// A creature's translation multipliers (see [`COL_TRANSLATION_SCALE`]); `None` when its
+/// appearance's row lacks them (the exe then keeps (1, 1, 1)) or it is no creature.
+pub fn translation_scale(sim: &Sim, id: ObjectId) -> Option<[f32; 3]> {
+    let o = sim
+        .world
+        .get(id)
+        .filter(|o| o.kind == ObjectKind::Creature)?;
+    let t = sim.world.tables().get(0, "apr_base")?;
+    let app = o.appearance as i64;
+    let mut out = [1.0f32; 3];
+    for (k, hash) in COL_TRANSLATION_SCALE.iter().enumerate() {
+        out[k] = match t.cell_by_hash(*hash, app)? {
+            Cell::Float(v) => *v as f32,
+            Cell::Int(v) => *v as f32,
+            _ => return None,
+        };
+    }
+    Some(out)
+}
+
 /// Dragon Age II's `apr_base` column naming the damage-reaction tree
 /// (`humanoid_damage_reactions.anb` for humanoids and hurlocks), which holds the deaths
-/// (`die_quick_*`). Its name is not known, only its hash; DA:O's table has no such column.
+/// (`die_quick_*`). In Dragon Age: Origins the same hash is `AmbientOverride` (`dwarf.anb`,
+/// `child.anb`, ...: an appearance's extra ambient action tree, 0x748370;
+/// notes/nonhuman-clip-retarget-trace.md), not read here yet.
 pub const COL_DA2_REACTION_TREE: u32 = 0x3678_42f0;
 
 /// Actions in the trees (from `humanoid.anb`, `combat_humanoid.anb`, `movement.anb` and the
@@ -964,7 +1009,7 @@ fn creature_motion(sim: &Sim, o: &Object, standing: bool) -> Option<Motion> {
 pub const COL_PLACEABLE_TREE: u32 = 0x70f4_63fa;
 pub const COL_STATE_CONTROLLER: u32 = 0x9a32_0a51;
 
-/// A placeable's state: `State` (set by `SetPlaceableState` or an action's result), else
+/// A placeable's state: `State` (initialized from the instance, then changed by scripts), else
 /// its template's `AnimContState`.
 pub fn placeable_state(o: &Object) -> i32 {
     o.fields
