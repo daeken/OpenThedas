@@ -552,6 +552,7 @@ impl Sim {
                     && let Some(o) = self.world.get_mut(id)
                 {
                     o.active = true;
+                    o.da2_locomotion = None;
                 }
             }
             if let Some(stage) = &cut.da2_stage {

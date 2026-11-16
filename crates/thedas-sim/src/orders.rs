@@ -125,6 +125,7 @@ impl Sim {
 
     /// Counts an order the player gave `who` (see [`Sim::fail_blocked`]).
     pub(crate) fn note_player_order(&mut self, who: ObjectId) {
+        self.da2_stop_locomotion(who);
         if let Some(o) = self.world.get_mut(who) {
             o.combat.player_orders += 1;
         }
