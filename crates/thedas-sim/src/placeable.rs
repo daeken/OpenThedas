@@ -349,20 +349,25 @@ fn write_walkmesh_cells(
             let (cx, cy) = (cell(0), cell(1));
             if !cx.is_finite()
                 || !cy.is_finite()
-                || cx < 0.0
-                || cy < 0.0
                 || cx >= destination.columns as f32
                 || cy >= destination.rows as f32
             {
                 continue;
             }
+            // Native world-to-cell conversion clamps negative indices to zero
+            // (0xa49410 / 0xa49440), including footprints crossing the grid edge.
+            let (cx, cy) = (cx.max(0.0), cy.max(0.0));
             let index = cy as u32 * destination.columns + cx as u32;
             if let Some(v) = destination.data.get_mut(index as usize) {
+                // Kind access masks the low nibble (0xa49070); writes preserve
+                // destination flags in the upper nibble (0xa49550).
+                let kind = *v & 0xf;
                 let next = if clear {
-                    matches!(*v, 7 | 8).then_some(1)
+                    matches!(kind, 7 | 8).then_some(1)
                 } else {
-                    (*v < 8).then(|| source.data[(y * source.columns + x) as usize])
+                    (kind < 8).then(|| source.data[(y * source.columns + x) as usize] & 0xf)
                 };
+                let next = next.map(|kind| (*v & 0xf0) | kind);
                 if let Some(next) = next.filter(|&next| next != *v) {
                     *v = next;
                     writes.insert(index, next);
@@ -462,6 +467,21 @@ mod tests {
         let mut destination = grid(1, 1, vec![1]);
         write_walkmesh_cells(&mut destination, &small, [0.0; 3], 0.0, false);
         assert_eq!(destination.data, [9]);
+    }
+
+    #[test]
+    fn walkmesh_writes_preserve_destination_flags_and_clamp_negative_grid_edges() {
+        let source = grid(4, 1, vec![0xf8, 0xa1, 0x17, 0x28]);
+        let mut destination = grid(4, 1, vec![0x21, 0x47, 0x68, 0x89]);
+        write_walkmesh_cells(&mut destination, &source, [0.0; 3], 0.0, false);
+        assert_eq!(destination.data, [0x28, 0x41, 0x68, 0x89]);
+        write_walkmesh_cells(&mut destination, &source, [0.0; 3], 0.0, true);
+        assert_eq!(destination.data, [0x21, 0x41, 0x61, 0x89]);
+
+        let source = grid(2, 1, vec![8, 7]);
+        let mut destination = grid(1, 1, vec![0x31]);
+        write_walkmesh_cells(&mut destination, &source, [-2.0, -2.0, 0.0], 0.0, false);
+        assert_eq!(destination.data, [0x38]);
     }
 
     #[test]

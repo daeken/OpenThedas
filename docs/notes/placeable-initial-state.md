@@ -50,6 +50,9 @@ At `0xa46cc0`, operation 0 copies every transformed source cell kind over
 destination kinds below 8; destination kinds 8 and above survive. Operation
 1 changes destination kinds 7/8 to 1 without consulting the source kind.
 Neither changes heights or surface materials. Iteration is column then row.
+Kind reads mask the low nibble (`0xa49070`); writes preserve the destination's
+upper nibble (`0xa49550`). World-to-cell conversion clamps negative indices to
+zero (`0xa49410` / `0xa49440`), while positive out-of-range cells are protected.
 The implementation saves sparse per-area writes and uses the existing cache
 reconstruction on reload. Later transitions must replace the initial footprint
 too, so state setting now performs the same clear/install pair.
