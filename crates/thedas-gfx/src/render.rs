@@ -2211,9 +2211,9 @@ impl Renderer {
                     m0: [1.0, 0.0, 0.0, 0.0],
                     m1: [0.0, 1.0, 0.0, 0.0],
                     mul: [1.0; 4],
-                    // Darken's MIN blend can change the destination for a transparent source.
-                    // Other blends can omit the filtered picture's transparent exterior.
-                    clip: if blend == Blend::Darken {
+                    // Alpha masks clear their exterior; MIN darken also changes the
+                    // destination for a transparent source. Both need the full picture.
+                    clip: if matches!(blend, Blend::Darken | Blend::Alpha) {
                         b.clip
                     } else {
                         clip_intersect(b.clip, clip)
@@ -4103,6 +4103,8 @@ mod shadow_tests {
                     &[255, 0, 0, 255]
                 }
             );
+            renderer.render(&mut p, &mut Empty, (32, 32));
+            assert_eq!(renderer.capture().unwrap().2, pixels, "cached {mode:?}");
         }
     }
 
