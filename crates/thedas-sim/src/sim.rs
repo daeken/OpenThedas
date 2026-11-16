@@ -1325,6 +1325,9 @@ impl Sim {
                                     && c.ints.first() == Some(&1));
                             Some(at)
                         });
+                    if approached.is_some() {
+                        self.da2_stop_locomotion(id);
+                    }
                     // An ability whose impact comes before its animation ends deals the
                     // impact now and ends later (see `Sim::ability_timing`).
                     let impact = match approached {
@@ -2998,6 +3001,7 @@ impl Sim {
     }
 
     fn advance_movers(&mut self) {
+        self.advance_da2_locomotion();
         let now = self.world.time_ms;
         // (mover, start, start time, due, the points after the start)
         type Move = (ObjectId, [f32; 3], u64, u64, Vec<[f32; 3]>);
@@ -3131,6 +3135,9 @@ impl Sim {
                         }
                     }
                 }
+            }
+            if let Some((dx, dy)) = dir {
+                self.da2_locomotion_direction(id, crate::world::facing_toward(dx, dy));
             }
             if was != p {
                 self.update_triggers(id);
@@ -3400,6 +3407,7 @@ impl Sim {
                 _ => false,
             };
             if again {
+                self.da2_stop_locomotion(id);
                 if let Some(c) = self.world.get_mut(id).and_then(|o| o.commands.first_mut()) {
                     c.approach = None;
                     c.due = None;
@@ -3702,6 +3710,9 @@ impl Sim {
         if c.name == "CommandUseAbility" {
             self.complete_da2_combat_target(id);
         }
+        if c.from.is_some() {
+            self.da2_stop_locomotion(id);
+        }
         let t = self.world.time_ms;
         self.world.trace.push(TraceEntry::Command {
             t,
@@ -3906,6 +3917,7 @@ impl Sim {
                                 c.arrived = false;
                                 c.path = path;
                             }
+                            self.da2_begin_locomotion(id, true);
                             if best.is_none_or(|(b, bid)| (due, id) < (b, bid)) {
                                 best = Some((due, id));
                             }
@@ -4090,6 +4102,9 @@ impl Sim {
                             c.path = path;
                         }
                     }
+                    if walks {
+                        self.da2_begin_locomotion(id, cmd.ints.first() != Some(&0));
+                    }
                     self.world
                         .get(id)
                         .and_then(|o| o.commands.first())
@@ -4235,6 +4250,9 @@ impl Sim {
         };
         if let Some(location) = jump_location {
             cmd.location = Some(location);
+        }
+        if cmd.from.is_some() {
+            self.da2_stop_locomotion(id);
         }
         // A jump to an object lands beside it, where DAOrigins.exe's executor puts it
         // ([`Sim::jump_to_object_spot`]); with no such spot the jumper stays put.
