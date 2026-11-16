@@ -21,6 +21,7 @@ pub mod cnv;
 pub mod collision;
 pub mod combat;
 pub mod commands;
+pub mod contact;
 pub mod container;
 pub mod cutactors;
 pub mod cutscene;
