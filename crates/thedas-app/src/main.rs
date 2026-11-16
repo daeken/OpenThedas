@@ -1522,6 +1522,7 @@ impl App {
         );
         if let (Some(live), Some(_)) = (&self.live, &self.screens) {
             ui.attach(&live.sim);
+            seed_client_options(live, &ui);
             ui.set_saves(saves::SaveStore::new(self.saves_dir.clone()));
         }
         let reticle = reticle::ReticlePass::new(&ctx.device, config.format, 1);
@@ -6934,6 +6935,7 @@ fn main() -> Result<()> {
                     layer.set_settings_file(path.clone());
                 }
                 layer.attach(&l.sim);
+                seed_client_options(l, &layer);
                 layer.set_saves(saves::SaveStore::new(saves_dir.clone()));
                 let mut s = screens::Screens::new(l.front_end);
                 l.aiming = layer.play(&mut s, &l.sim, 0.0).pop();

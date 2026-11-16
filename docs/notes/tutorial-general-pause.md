@@ -96,3 +96,79 @@ Space repro above.
 A before/after comparison includes a third panel labeled `Delta ×4`. With any
 nonzero RGB-channel difference as the threshold, 5.229% of pixels change: the
 pause banner disappears and combat advances while the tutorial stays open.
+
+## Dalish tutorials-off encounter (2026-11-16)
+
+The second finding is
+`playtest-agent/findings/dalish-disabled-tutorial-pauses-combat.md` in the test
+data. Its untouched `dalish-combat-stuck.json` is at 35,813 ms in combat in
+`bed100ar_forest_clearing`. Training mode, step, expected event, argument and
+pause are all zero. There is no active or queued cutscene. The queue holds seven
+non-pausing tutorials followed by **Combat Basics**, `tut_combat_basic`, title
+264859/body 264857, the only pausing entry. Thus this is the ordinary tutorial
+pause, not an unfinished guided inventory or tactical-camera step. The queue
+and its pause are serialized, explaining persistence across reloads; a reload
+does not repeat the triggering combat event or repair the prior option delivery.
+
+### Original disabled-option path
+
+Static inspection of the same executable hash listed above establishes that
+tutorials-off skips **both** a new popup and its pause:
+
+- Profile option `client + 0x98` is registered under `ShowTutorials` at
+  `0x5e8b38–0x5e8bbf` (key string `0xb01448`, default true written at
+  `0x5e8b4c`). This is the same option checked before guided training at
+  `0x692ec1–0x692ed8`.
+- Plot-flag notification identifies a tutorial at `0x76014a–0x760154`, then
+  reads that profile option through `0x838210` at `0x760156–0x760162`.
+  Its false branch at `0x76016d` goes directly to `0x7601a7`, bypassing the
+  call to tutorial queuing `0x693f10` at `0x7601a2`.
+- The skipped callee would append the popup at `0x694080–0x694087`, inspect
+  the plot's pause request at `0x6940c0`, then in explore/combat set `+0x84`
+  and call general pause `0x5d6740(true, false)` at `0x6940db–0x6940ec`.
+  Disabled tutorials therefore never reach either operation. This trace
+  establishes suppression of new notifications; it does not establish that
+  changing the option consumes a popup already queued.
+
+### Replacement fault and fix
+
+`Sim::queue_tutorial` already checks `show_tutorials`, and `set_training_mode`
+also checks it. The fault was earlier: `input::handler_for` called `present`
+first, which consumed the checkbox's `ClientOptions.SetClientOptionMessage`
+into the presentation's options map. The bridge then marked the message
+`Handled`, so `apply_all`, which takes only `Send` messages, never delivered it
+to the simulation. The checkbox could be off while `Sim::show_tutorials` stayed
+true. Restore Defaults had the same delivery gap. The app's `option` test step
+explicitly sends to both sides and would conceal this bug.
+
+There was also a startup gap: window creation and the initial capture setup
+loaded the settings file and attached the UI without `seed_client_options`.
+That function was used only when installing another game in the running app.
+Starting a new process with `--save` therefore restored the disabled checkbox
+but left the simulation's tutorial option at its default. Both initial attach
+paths now seed the same journaled options as an in-process load.
+
+The synchronous handler now journals `ClientOptionMessage` for UI-owned option
+set/reset messages before acknowledging them. If the simulation is busy, both
+updates wait for the existing deferred path. Cancel restores the simulation's
+tutorial and combat-auto-pause options alongside difficulty. Existing stuck
+saves recover through the general Space unpause command from the first fix;
+the popup queue remains available.
+
+`movie_options_reach_the_sim_when_handled_now_or_deferred` exercises the real
+bridge acknowledgment/drain paths, tutorial disable, rejected training start,
+combat-auto-pause and Restore Defaults. A simulation test checks that a disabled
+tutorial plot flag queues no popup or pause, while a new notification after
+Restore Defaults does both.
+
+The additional external repro is
+`sim-work/repro/pausetutorial-dalish.sh <thedas-app>` in the test data. It uses
+the untouched finding save for Space recovery. To repeat the notification, a
+derived copy resets only the tutorial queue/pause and Combat Basics flag 0
+(`6AB6BC0D36304176B6DB4C5E5DD458CB`); encounter objects, orders and RNG remain
+unchanged. It sets that plot flag with tutorials enabled, disabled through the
+movie's original `ExternalCommands.SendMessageArgs`, after cancellation, after
+Restore Defaults, and after loading a persisted disabled option. All runs are
+sequential hidden captures with scratch HOME, no mods/audio and journal-based
+PASS/FAIL checks. The derived cases test the option-to-notification boundary,
+not a fresh walk from the origin's beginning.

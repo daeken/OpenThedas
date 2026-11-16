@@ -218,8 +218,8 @@ impl Sim {
 
     /// Queues a tutorial plot's popup for a flag just set: one per plot at a time (a plot
     /// already queued is skipped, 0x694032), pausing the game when the plot asks (0x6940c0).
-    /// Provisional: the game's Show Tutorials option is taken to be on, and a flag with no
-    /// text queues nothing.
+    /// Show Tutorials off skips both the popup and its pause (0x760156–0x7601a2).
+    /// Provisional: a flag with no text queues nothing.
     pub(crate) fn queue_tutorial(&mut self, info: &PlotInfo, flag: i32) {
         if flag >= DEFINED_FLAGS || !self.is_tutorial_kind(info.kind) || !self.show_tutorials {
             return;
@@ -1064,6 +1064,36 @@ mod tests {
             );
         }
         assert_eq!(s.world.quest_states, states);
+    }
+
+    #[test]
+    fn disabled_tutorial_flags_do_not_queue_or_pause() {
+        let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(EngineTable::default()), 1);
+        let mut combat = plot("tut_combat_basic", 13, None, &[(0, 20)]);
+        combat.pauses = true;
+        s.plots.insert(combat);
+        s.world.tables().insert(
+            "#108",
+            &["#eb84ee4d", "#12e4743c"],
+            vec![(13, vec![Cell::Int(1), Cell::Int(1)])],
+        );
+        let _ = s.strings.set([(20, "Combat Basics".into())].into());
+        s.input(
+            crate::commands::CommandSource::Player,
+            crate::commands::SimCommand::ClientOptionMessage {
+                name: crate::chargen::MSG_CLIENT_OPTION.into(),
+                args: vec!["GameOptions.ShowTutorials".into(), "0".into()],
+            },
+        );
+        s.set_plot_flag("tut_combat_basic", 0, true, false, OBJECT_INVALID);
+        assert!(s.world.tutorials.is_empty());
+        assert!(!s.tutorial_paused());
+        // Restoring tutorials allows a new notification to queue and pause again.
+        s.client_option_message("ClientOptions.RestoreDefaults", &[]);
+        s.set_plot_flag("tut_combat_basic", 0, false, false, OBJECT_INVALID);
+        s.set_plot_flag("tut_combat_basic", 0, true, false, OBJECT_INVALID);
+        assert_eq!(s.world.tutorials.len(), 1);
+        assert!(s.tutorial_paused());
     }
 
     #[test]

@@ -840,7 +840,8 @@ impl UiLayer {
     /// optionsmenu.gfx sets each option as the player changes it and sends
     /// `ClientOptions.CommitOptions` only from OK (and from its resolution confirmation), so
     /// what was set without it is dropped when the screen goes. The difficulty, which the
-    /// simulation keeps, is put back the way the screen sets it (the same message).
+    /// simulation keeps, and the tutorial/auto-pause settings it reads, are put back the
+    /// way the screen sets them (the same message).
     /// Provisional: the exe's own handling (its handlers at 0x7946c0) is not traced.
     fn options_screen(&mut self, up: bool, sim: &Arc<Mutex<Sim>>) {
         match (up, self.options_before.take()) {
@@ -858,22 +859,42 @@ impl UiLayer {
             }
             (true, before) => self.options_before = before,
             (false, Some((options, difficulty))) => {
+                let restored = [
+                    (thedas_ui::options::DIFFICULTY, f64::from(difficulty)),
+                    (
+                        "GameOptions.ShowTutorials",
+                        options
+                            .get("GameOptions.ShowTutorials")
+                            .copied()
+                            .unwrap_or(1.0),
+                    ),
+                    (
+                        "GameOptions.AutoPauseCombat",
+                        options
+                            .get("GameOptions.AutoPauseCombat")
+                            .copied()
+                            .unwrap_or(0.0),
+                    ),
+                ];
                 if let Ok(mut shown) = self.shown.lock() {
                     shown.options = options;
                 }
                 let mut sim = sim.lock().unwrap_or_else(|p| p.into_inner());
-                if sim.world.difficulty != difficulty {
-                    sim.input(
-                        thedas_sim::commands::CommandSource::Player,
-                        thedas_sim::commands::SimCommand::ClientOptionMessage {
-                            name: thedas_sim::chargen::MSG_CLIENT_OPTION.to_string(),
-                            args: [
-                                thedas_ui::options::DIFFICULTY.to_string(),
-                                difficulty.to_string(),
-                            ]
-                            .to_vec(),
-                        },
-                    );
+                let current = [
+                    f64::from(sim.world.difficulty),
+                    f64::from(u8::from(sim.show_tutorials)),
+                    f64::from(u8::from(sim.auto_pause_combat)),
+                ];
+                for ((name, value), current) in restored.into_iter().zip(current) {
+                    if value != current {
+                        sim.input(
+                            thedas_sim::commands::CommandSource::Player,
+                            thedas_sim::commands::SimCommand::ClientOptionMessage {
+                                name: thedas_sim::chargen::MSG_CLIENT_OPTION.to_string(),
+                                args: vec![name.to_string(), value.to_string()],
+                            },
+                        );
+                    }
                 }
             }
             (false, None) => {}
