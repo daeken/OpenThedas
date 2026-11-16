@@ -117,7 +117,8 @@ pub struct Object {
     /// see [`heading_of`] and [`facing_toward`].
     pub facing: f32,
     pub active: bool,
-    /// A placeable's runtime physics group override (Origins destruction writes 1).
+    /// A placeable's runtime physics group (Origins open doors/destruction use 1;
+    /// blocking door states restore the model's original group).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub placeable_group: Option<u32>,
     pub locals: Locals,

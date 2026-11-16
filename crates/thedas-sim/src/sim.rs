@@ -4796,6 +4796,7 @@ impl Sim {
                 _ => {}
             }
         }
+        self.init_placeable_state(id);
         self.created(id);
         id
     }
@@ -6008,6 +6009,200 @@ mod tests {
         let mut none = vec![args[0].clone()];
         assert_eq!(h.action_ref(1, &f("NoTwinRef"), &mut none).unwrap(), None);
         assert_eq!(none[0], args[0]);
+    }
+
+    #[test]
+    fn placed_initial_states_seed_the_controller_before_spawn_events() {
+        use thedas_formats::gda::Cell;
+        use thedas_formats::gff3::Field;
+        for game in [thedas_vfs::Game::Origins, thedas_vfs::Game::DragonAge2] {
+            for (initial, expected) in [
+                (None, None),
+                (Some(0), Some(0)),
+                (Some(1), Some(1)),
+                (Some(2), Some(2)),
+                (Some(3), Some(3)),
+                (Some(4), Some(4)),
+                (Some(5), Some(5)),
+                (Some(6), Some(0)),
+                (Some(65_538), Some(2)),
+                (Some(-1), Some(0)),
+            ] {
+                let mut s = sim();
+                s.game = game;
+                let tables = crate::m2da::Tables::empty();
+                tables.insert(
+                    "#93",
+                    &["#9a320a51"],
+                    vec![(0, vec![Cell::String("statecnt_door".into())])],
+                );
+                tables.insert(
+                    "statecnt_door",
+                    &["ID"],
+                    (0..6).map(|id| (id, vec![Cell::Int(id)])).collect(),
+                );
+                s.world.tables = Arc::new(tables);
+                let area = s.world.spawn(ObjectKind::Area, "home");
+                let mut inst = Struct {
+                    id: 0,
+                    fields: vec![Field {
+                        label: "AnimContState".into(),
+                        value: G3::Int(3),
+                    }],
+                };
+                if let Some(initial) = initial {
+                    inst.fields.push(Field {
+                        label: "InitialState".into(),
+                        value: G3::Int(initial),
+                    });
+                }
+                let are = Gff3 {
+                    file_type: *b"ARE ",
+                    file_version: *b"V3.2",
+                    structs: vec![inst.clone()],
+                };
+                let id = s.spawn_instance(&are, &inst, ObjectKind::Placeable, "", area);
+                assert_eq!(
+                    s.world.get(id).unwrap().fields.get("State").copied(),
+                    if game == thedas_vfs::Game::Origins {
+                        expected
+                    } else {
+                        None
+                    },
+                    "{game:?}: {initial:?}"
+                );
+                assert_eq!(s.world.get(id).unwrap().fields["AnimContState"], 3);
+                assert!(
+                    s.world.queue.is_empty(),
+                    "initialization sends no controller event"
+                );
+                assert!(
+                    s.world.destroy_at.is_empty(),
+                    "a Dead pose alone is not lethal health"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires an Origins THEDAS_INSTALL"]
+    fn installed_home_door_starts_open_and_locked_doors_offer_unlock() {
+        let install =
+            thedas_vfs::DaoInstall::open(std::env::var_os("THEDAS_INSTALL").unwrap()).unwrap();
+        let vfs = Arc::new(
+            install
+                .global_vfs(thedas_vfs::install::TextureQuality::High)
+                .unwrap(),
+        );
+        let table = Arc::new(EngineTable::parse(&vfs.read("script.ldf").unwrap().0).unwrap());
+        let mut s = Sim::new(vfs, table, 7);
+        s.install_root = Some(install.root().to_path_buf());
+        let area = s.enter_area("bdc210ar_players_home", None).unwrap();
+        let door = s
+            .world
+            .objects
+            .values()
+            .find(|o| o.area == Some(area) && o.template == "genip_door_dws_lrg")
+            .unwrap()
+            .id;
+        assert_eq!(s.world.get(door).unwrap().fields["InitialState"], 2);
+        assert_eq!(s.world.get(door).unwrap().fields["State"], 2);
+        assert_eq!(crate::engine::placeable_default_action(&s, door), Some(2)); // Close
+        assert_eq!(s.world.get(door).unwrap().placeable_group, Some(1));
+        assert!(!s.closed_doors(area).iter().any(|(id, _)| *id == door));
+        let before = s.world.nav_patches.clone();
+        s.set_placeable_state(door, 1);
+        assert_eq!(crate::engine::placeable_default_action(&s, door), Some(3)); // Unlock
+        assert!(s.closed_doors(area).iter().any(|(id, _)| *id == door));
+        assert!(
+            s.world
+                .get(door)
+                .unwrap()
+                .placeable_group
+                .is_some_and(|group| group & thedas_formats::phy::mask::NON_WALKABLE != 0)
+        );
+        assert_ne!(
+            s.world.nav_patches, before,
+            "the closed PWK replaces the open footprint"
+        );
+        let locked_cells = s
+            .closed_doors(area)
+            .into_iter()
+            .find(|(id, _)| *id == door)
+            .unwrap()
+            .1;
+        s.set_placeable_state(door, 0);
+        let unlocked_cells = s
+            .closed_doors(area)
+            .into_iter()
+            .find(|(id, _)| *id == door)
+            .unwrap()
+            .1;
+        assert!(
+            unlocked_cells
+                .iter()
+                .any(|cell| !locked_cells.contains(cell)),
+            "unlocking must refresh cached doorway cells"
+        );
+        s.set_placeable_state(door, 1);
+        let locked_grid = s.nav_grid(area).unwrap();
+        s.set_object_active(door, false);
+        let cleared_grid = s.nav_grid(area).unwrap();
+        let index = locked_grid
+            .data
+            .iter()
+            .zip(&cleared_grid.data)
+            .position(|(&old, &new)| old == 8 && new == 1)
+            .unwrap();
+        // A different footprint owner writes after deactivation. Repeating the
+        // same script request must not remove that owner's cells again.
+        let mut overwritten = (*cleared_grid).clone();
+        overwritten.data[index] = 8;
+        s.changed_nav_grids.insert(area, Arc::new(overwritten));
+        s.world
+            .nav_patches
+            .get_mut(&area)
+            .unwrap()
+            .insert(index as u32, 8);
+        s.set_object_active(door, false);
+        assert_eq!(s.nav_grid(area).unwrap().data[index], 8);
+        s.set_object_active(door, true);
+        let saved = s.save_json().unwrap();
+        s.load_json(&saved).unwrap();
+        assert_eq!(s.world.get(door).unwrap().fields["State"], 1);
+        let returned = s.enter_area("bdc210ar_players_home", None).unwrap();
+        assert_eq!(returned, area);
+        assert_eq!(s.world.get(door).unwrap().fields["State"], 1);
+        // An older save can hold an unloaded area's active door parked with
+        // active=false. Initialization must retain its actual collision state.
+        let o = s.world.get_mut(door).unwrap();
+        o.fields.insert("InitialState".into(), 1);
+        o.fields.remove("State");
+        o.parked = Some(true);
+        o.active = false;
+        let mut legacy = s.save_game();
+        legacy.revision = 9;
+        s.load_game(legacy).unwrap();
+        assert!(!s.world.get(door).unwrap().active);
+        s.enter_area("bdc210ar_players_home", None).unwrap();
+        assert!(s.closed_doors(area).iter().any(|(id, _)| *id == door));
+        let redcliffe = s.enter_area("arl100ar_redcliffe_village", None).unwrap();
+        for tag in ["arl100ip_door_dwyn", "arl100ip_door_owen"] {
+            let id = s
+                .world
+                .objects
+                .values()
+                .find(|o| o.area == Some(redcliffe) && o.tag == tag)
+                .unwrap()
+                .id;
+            assert_eq!(s.world.get(id).unwrap().fields["InitialState"], 1);
+            assert_eq!(s.world.get(id).unwrap().fields["State"], 1);
+            assert_eq!(
+                crate::engine::placeable_default_action(&s, id),
+                Some(3),
+                "{tag} must offer Unlock"
+            );
+        }
     }
 
     #[test]
