@@ -6271,15 +6271,17 @@ mod tests {
             );
         }
         s.game = thedas_vfs::Game::DragonAge2;
-        assert_eq!(
-            run(
-                &mut s,
-                creature,
-                "GetPlaceablePopupText",
-                &[Value::Object(door)]
-            ),
-            None
-        );
+        let function = s
+            .table
+            .function_by_name("GetPlaceablePopupText")
+            .unwrap()
+            .clone();
+        let mut host = crate::sim::ScriptHost {
+            sim: &mut s,
+            event: None,
+            script: "test".into(),
+        };
+        assert!(super::call(&mut host, creature, &function, &[Value::Object(door)]).is_none());
     }
 
     const LDF: &str = "void SetCooldown(object o, int n, float f, string s) = 1;\n\
