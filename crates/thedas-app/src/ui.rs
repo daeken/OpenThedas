@@ -1,6 +1,7 @@
 //! The Scaleform interface layer: movies played by `thedas-ui` into offscreen textures,
 //! composited over the scene with premultiplied alpha.
 
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
@@ -363,6 +364,8 @@ struct TextPopup {
     labels: [String; 2],
     frames: u8,
     free_text: bool,
+    input_ready: bool,
+    pending_keys: VecDeque<thedas_ui::UiKey>,
 }
 
 impl TextPopup {
@@ -700,16 +703,19 @@ struct Line {
     /// cutscene has ended.
     cut_seen: bool,
     cut_done: bool,
+    /// Its own referenced cutscene has started. Automatic continuation waits for it.
+    owns_cut: bool,
 }
 
 impl Line {
-    /// Whether it has played: its voice-over's (or reading) time has passed, or the
-    /// cutscene that spoke it has ended. The executable gives a line that plays its own
-    /// cutscene the cutscene's length (`GameModeDialog` 0x68e5be-0x68e5ff: the line's
-    /// timer +0x2c4 is the cutscene's 5000, +0x8). Provisional: a line whose cutscene is
-    /// played by the cutscene mode (a `CUTR` reference) is taken to end with it the same
-    /// way.
+    /// Whether it has played. An automatic continuation waits for the line's own
+    /// referenced cut to complete (GameModeDialog 0x68de74–0x68df57), keeping its camera
+    /// and actors with the line. The presentation clock can run ahead of the cutscene's
+    /// capped simulation clock on slow frames.
     fn played(&self) -> bool {
+        if self.waits && self.owns_cut && !self.cut_done && self.t.is_finite() {
+            return false;
+        }
         self.cut_done || self.t >= self.voice_ms.unwrap_or_else(|| line_ms(&self.key.1))
     }
 }
@@ -1743,6 +1749,8 @@ impl UiLayer {
             labels: [ok.into(), cancel.into()],
             frames: 0,
             free_text: false,
+            input_ready: false,
+            pending_keys: VecDeque::new(),
         });
     }
 
@@ -1757,7 +1765,7 @@ impl UiLayer {
         let Some(popup) = self.text_popup.take_if(|p| p.id == id) else {
             return;
         };
-        if self.stage.dialog_prompt().as_deref() == Some(&popup.prompt) {
+        if self.stage.owns_dialog(popup.id) {
             self.stage.call_in(
                 thedas_ui::stage::POPUP_LAYER,
                 "_global.PopupLayer.HideAllPopups",
@@ -1921,13 +1929,13 @@ impl UiLayer {
             return;
         };
         if popup.frames >= 2 {
-            // Up: its field takes the typing (see `Stage::focus_dialog_field`), for its first
-            // frames (later, a press on its buttons lets go of the focus on purpose).
-            if popup.frames < FOCUS_FRAMES
-                && self.stage.dialog_prompt().as_deref() == Some(&popup.prompt)
-            {
+            // Ordinary prompts retain their initial focus retries. Free text
+            // establishes focus at initialization, in allow_free_text_popup.
+            if popup.frames < FOCUS_FRAMES {
                 popup.frames += 1;
-                self.stage.focus_dialog_field();
+                if !popup.free_text && self.stage.owns_dialog(popup.id) {
+                    self.stage.focus_dialog_field();
+                }
             }
             return;
         }
@@ -1949,22 +1957,43 @@ impl UiLayer {
             if up.is_none() {
                 log::warn!("ui: a text box with no popup layer up");
                 self.text_popup = None;
+            } else if self.stage.dialog_prompt().as_deref() == Some(&popup.prompt) {
+                self.stage.claim_dialog(popup.id);
             }
         }
     }
 
-    /// The movie initializes its field during the tick. Apply the report policy
-    /// afterward, before rendering or accepting input on the first visible frame.
+    /// Host ticks and movie frames are independent. Keep the report policy for
+    /// the live clip's whole lifetime and deliver early keys only after its
+    /// initializer has finished writing the default text and Enter handler.
     fn allow_free_text_popup(&mut self) {
-        let Some(popup) = self.text_popup.as_ref() else {
+        let Some(popup) = self.text_popup.as_mut() else {
             return;
         };
-        if popup.free_text
-            && (2..FOCUS_FRAMES).contains(&popup.frames)
-            && self.stage.dialog_prompt().as_deref() == Some(&popup.prompt)
-        {
-            self.stage.allow_dialog_free_text();
+        if popup.free_text && popup.frames >= 2 && self.stage.owns_dialog(popup.id) {
+            // Init can finish after the host's focus retries have ended. Focus
+            // once its handler exists, including before replaying queued Enter.
+            popup.input_ready = self.stage.allow_dialog_free_text()
+                && (popup.input_ready || self.stage.focus_initialized_dialog_field());
+            if popup.input_ready {
+                while let Some(key) = popup.pending_keys.front().copied() {
+                    if !self.stage.owns_dialog(popup.id) {
+                        popup.pending_keys.clear();
+                        break;
+                    }
+                    if !self.stage.key(key) {
+                        break;
+                    }
+                    popup.pending_keys.pop_front();
+                }
+            }
         }
+    }
+
+    fn free_text_input_pending(&mut self) -> bool {
+        self.text_popup.as_ref().is_some_and(|p| {
+            p.free_text && p.frames >= 2 && !p.input_ready && self.stage.owns_dialog(p.id)
+        })
     }
 
     /// Shows a script's message box (`ShowPopup`, `World::popup`) on the popup layer, as the
@@ -2275,6 +2304,9 @@ impl UiLayer {
     /// ends (the screens start over with it).
     pub fn close_all(&mut self) {
         self.stage.movies.clear();
+        if let Ok(mut shown) = self.shown.lock() {
+            shown.dragging = false;
+        }
         self.line = None;
         self.floaties.clear();
         self.tooltip_text = None;
@@ -2297,6 +2329,10 @@ impl UiLayer {
             self.saves_listed = true;
             self.refresh_saves();
         }
+        // A movie's X can have closed it in the last tick. Reconcile that before
+        // binding the presentation and computing wanted screens; otherwise the old
+        // menu reopens its movie once while sync clears the player's toggle.
+        screens.note_open(&|m| self.stage.movies.iter().any(|x| x.name == m));
         self.screens_opened(screens, sim);
         // The journal, while its screen is up (built from the plots: it needs the simulation
         // mutably, which the bindings do not have).
@@ -2337,9 +2373,11 @@ impl UiLayer {
             self.stage.bridge.bind(values);
             let waits = thedas_ui::binding::awaits_continue(&sim);
             let cutscene = sim.world.cutscene.is_some();
+            let owns_cut =
+                sim.game == thedas_vfs::Game::Origins && sim.conversation_line_cutscene().is_some();
             let line = thedas_ui::binding::conversation(&sim).map(|d| {
                 let key: LineKey = (d.dialog, d.line, d.replies.iter().map(|r| r.0).collect());
-                (key, waits, cutscene)
+                (key, waits, cutscene, owns_cut)
             });
             // Before a game, the start menu, or the screen it opened (options, the load
             // screen).
@@ -2405,13 +2443,15 @@ impl UiLayer {
             );
         }
         self.line = match (line, self.line.take()) {
-            (Some((key, _, cutscene)), Some(mut l)) if l.key == key => {
+            (Some((key, _, cutscene, owns_cut)), Some(mut l)) if l.key == key => {
                 l.t += dt_ms;
                 l.cut_done |= l.cut_seen && !cutscene;
+                l.cut_done |= l.owns_cut && !owns_cut;
                 l.cut_seen |= cutscene;
+                l.owns_cut |= owns_cut;
                 Some(l)
             }
-            (Some((key, waits, cutscene)), _) => Some(Line {
+            (Some((key, waits, cutscene, owns_cut)), _) => Some(Line {
                 key,
                 t: 0.0,
                 voice_ms: None,
@@ -2420,6 +2460,7 @@ impl UiLayer {
                 continued: false,
                 cut_seen: cutscene,
                 cut_done: false,
+                owns_cut,
             }),
             (None, _) => None,
         };
@@ -2671,6 +2712,7 @@ impl UiLayer {
                 log::warn!("ui: the simulation does not handle {name} yet");
             }
         }
+        self.update_drag_image();
         aims
     }
 
@@ -3576,11 +3618,13 @@ impl UiLayer {
 
     pub fn mouse_move(&mut self, x: f64, y: f64) {
         self.stage.mouse_move(x, y);
+        self.update_drag_image();
     }
 
     /// The mouse left the window.
     pub fn mouse_leave(&mut self) {
         self.stage.mouse_leave();
+        self.stage.set_external_drag_image(None);
     }
 
     /// The mouse wheel turned `lines` (up positive) at (`x`, `y`): lists and text under the
@@ -3601,6 +3645,7 @@ impl UiLayer {
                 .unwrap_or(false);
             if dragging {
                 self.stage.drop_external();
+                self.stage.set_external_drag_image(None);
             }
         }
         // A click on a party portrait: portraits.gfx only says which member the mouse is
@@ -3613,6 +3658,18 @@ impl UiLayer {
         {
             self.portrait_clicked = Some(id as u32);
         }
+    }
+
+    fn update_drag_image(&mut self) {
+        let dragging = self.shown.lock().is_ok_and(|s| s.dragging);
+        let image = dragging
+            .then(|| self.stage.bridge.value("GUI.DragData.DragImage"))
+            .flatten();
+        let image = match &image {
+            Some(thedas_ui::UiValue::String(s)) => Some(s.as_str()),
+            _ => None,
+        };
+        self.stage.set_external_drag_image(image);
     }
 
     /// The party member whose portrait was clicked becomes the one the player controls, as
@@ -3643,19 +3700,28 @@ impl UiLayer {
         self.stage.click_as(button, x, y);
     }
 
-    /// Whether a movie's text field has focus (keys type into it, not the game's).
+    /// Whether text input belongs to a focused field or an initializing report box.
     pub fn typing(&mut self) -> bool {
-        self.stage.text_focus().is_some()
+        self.free_text_input_pending() || self.stage.text_focus().is_some()
     }
 
-    /// A key for the focused text field; false when there is none.
+    /// A key for the focused field, queued while our report field initializes.
     pub fn key(&mut self, key: thedas_ui::UiKey) -> bool {
+        self.allow_free_text_popup();
+        if self.free_text_input_pending() {
+            self.text_popup
+                .as_mut()
+                .unwrap()
+                .pending_keys
+                .push_back(key);
+            return true;
+        }
         self.stage.key(key)
     }
 
-    /// Types text into the focused text field; false when there is none.
+    /// Types text through the same initialization gate as individual key events.
     pub fn type_text(&mut self, text: &str) -> bool {
-        self.stage.type_text(text)
+        text.chars().all(|c| self.key(thedas_ui::UiKey::Char(c)))
     }
 
     /// Draws every movie over `frame`, in order: straight into it (see `thedas_ui::direct`),
@@ -3871,11 +3937,16 @@ fn gui_id(s: Screen, container: bool) -> Option<i32> {
 mod tests {
     use super::*;
 
-    /// Uses the installed movie, without a window or simulation. No game data is
-    /// embedded in this test. Run explicitly with THEDAS_INSTALL set.
-    #[test]
-    #[ignore]
-    fn report_popups_wait_cancel_and_keep_typing_across_name_and_choice_boxes() {
+    fn popup_property(ui: &mut UiLayer, path: &str) -> thedas_ui::UiValue {
+        ui.stage
+            .movies
+            .iter_mut()
+            .find(|m| m.name == thedas_ui::stage::POPUP_LAYER)
+            .unwrap()
+            .get(path)
+    }
+
+    fn installed_popup_ui() -> UiLayer {
         let install = thedas_vfs::DaoInstall::open(
             std::env::var_os("THEDAS_INSTALL").expect("THEDAS_INSTALL"),
         )
@@ -3892,6 +3963,290 @@ mod tests {
             &[thedas_ui::stage::POPUP_LAYER.into()],
             (1280, 720),
         );
+        for _ in 0..20 {
+            ui.stage.tick(1000.0 / 30.0);
+        }
+        ui
+    }
+
+    #[test]
+    #[ignore = "requires THEDAS_INSTALL and an offscreen GPU"]
+    fn journal_close_message_does_not_reopen_its_movie() {
+        let mut ui = installed_popup_ui();
+        let sim = Arc::new(Mutex::new(Sim::new(
+            ui.vfs.clone(),
+            Arc::new(thedas_script::EngineTable::default()),
+            1,
+        )));
+        ui.attach(&sim);
+        let mut screens = Screens::new(false);
+        ui.stage.movies[0].set("_root.thedas_retained", thedas_ui::UiValue::Bool(true));
+        screens.toggle(Screen::Journal);
+        for _ in 0..20 {
+            ui.play(&mut screens, &sim, 1000.0 / 30.0);
+        }
+        assert!(ui.stage.movies.iter().any(|m| m.name == "journal.gfx"));
+        // The X button's message, as read from journal.gfx's CloseButton_init.
+        ui.stage.call_in(
+            "journal.gfx",
+            "ExternalCommands.SendMessage",
+            &[thedas_ui::UiValue::String("GUI.HideFullScreenGUI".into())],
+        );
+        ui.play(&mut screens, &sim, 1000.0 / 30.0);
+        for _ in 0..5 {
+            ui.play(&mut screens, &sim, 1000.0 / 30.0);
+            assert_eq!(screens.menu, None);
+            assert_eq!(
+                screens.shown(),
+                &std::collections::BTreeSet::from([Screen::Hud])
+            );
+            assert!(!ui.stage.movies.iter().any(|m| m.name == "journal.gfx"));
+            assert_eq!(ui.shown.lock().unwrap().book_page, None);
+            for name in ["popuplayer.gfx", "navbar.gfx", "tooltips.gfx"] {
+                assert_eq!(ui.stage.movies.iter().filter(|m| m.name == name).count(), 1);
+            }
+            assert_eq!(
+                popup_property(&mut ui, "_root.thedas_retained"),
+                thedas_ui::UiValue::Bool(true)
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires THEDAS_INSTALL and an offscreen GPU"]
+    fn external_drag_image_tracks_mouse_and_clears_on_release() {
+        use thedas_ui::UiValue;
+        let mut ui = installed_popup_ui();
+        ui.stage.set_image(
+            "thedas_drag_test.png",
+            Some(&Rgba {
+                width: 1,
+                height: 2,
+                pixels: vec![255; 8],
+            }),
+        );
+        ui.stage.bridge.set_value(
+            "GUI.DragData.DragImage",
+            UiValue::String("thedas_drag_test.png".into()),
+        );
+        assert!(ui.front_end_message(&mut Screens::new(false), "GUI.StartDragging", &[]));
+        ui.mouse_move(640.0, 360.0);
+        let clip = "_root.thedas_external_drag";
+        assert_eq!(
+            popup_property(&mut ui, &format!("{clip}._width")),
+            UiValue::Number(29.0)
+        );
+        assert_eq!(
+            popup_property(&mut ui, &format!("{clip}._height")),
+            UiValue::Number(58.0)
+        );
+        assert_eq!(
+            popup_property(&mut ui, &format!("{clip}.hitTestDisable")),
+            UiValue::Bool(true)
+        );
+        let before = popup_property(&mut ui, &format!("{clip}._x"));
+        ui.mouse_move(740.0, 360.0);
+        let after = popup_property(&mut ui, &format!("{clip}._x"));
+        assert!(matches!((before, after), (UiValue::Number(a), UiValue::Number(b)) if b > a));
+        ui.mouse_button(740.0, 360.0, false);
+        assert!(!ui.shown.lock().unwrap().dragging);
+        assert_eq!(
+            popup_property(&mut ui, &format!("{clip}.image")),
+            UiValue::Undefined
+        );
+    }
+
+    #[test]
+    #[ignore = "requires THEDAS_INSTALL and an offscreen GPU"]
+    fn pending_tutorial_survives_journal_and_skills_toggles() {
+        use thedas_ui::UiValue;
+        let mut ui = installed_popup_ui();
+        let mut sim = Sim::new(
+            ui.vfs.clone(),
+            Arc::new(thedas_script::EngineTable::default()),
+            1,
+        );
+        sim.world.tutorials.push(thedas_sim::journal::Tutorial {
+            resref: "lesson".into(),
+            title: None,
+            text: None,
+            pauses: false,
+        });
+        let sim = Arc::new(Mutex::new(sim));
+        ui.attach(&sim);
+        let mut screens = Screens::new(false);
+        for _ in 0..20 {
+            ui.play(&mut screens, &sim, 1000.0 / 30.0);
+        }
+        ui.stage
+            .movies
+            .iter_mut()
+            .find(|m| m.name == "popuplayer.gfx")
+            .unwrap()
+            .set("_root.thedas_retained", UiValue::Bool(true));
+        for screen in [Screen::Journal, Screen::Skills] {
+            screens.toggle(screen);
+            ui.play(&mut screens, &sim, 100.0);
+            assert_eq!(
+                ui.stage.bridge.value("Tutorials.TutorialList"),
+                Some(UiValue::String(String::new()))
+            );
+            screens.toggle(screen);
+            for _ in 0..30 {
+                ui.play(&mut screens, &sim, 1000.0 / 30.0);
+                assert_eq!(
+                    ui.stage.bridge.value("Tutorials.TutorialList"),
+                    Some(UiValue::String("lesson".into()))
+                );
+                assert_eq!(sim.lock().unwrap().world.tutorials.len(), 1);
+                assert_eq!(
+                    popup_property(&mut ui, "_root.thedas_retained"),
+                    UiValue::Bool(true)
+                );
+            }
+            assert_eq!(
+                popup_property(
+                    &mut ui,
+                    "_root.TutorialContainer_mc.Fade_mc.Tutorial_mc.MovieHidden"
+                ),
+                UiValue::Bool(false)
+            );
+        }
+    }
+
+    fn delay_report_input_init(ui: &mut UiLayer) {
+        // Reports reopen the same movie after their marking choice closes.
+        ui.ask_choice(41, "Before report", "Continue", "Cancel");
+        for _ in 0..20 {
+            ui.show_text_popup();
+            ui.stage.tick(1000.0 / 30.0);
+        }
+        ui.stage.call_in(
+            thedas_ui::stage::POPUP_LAYER,
+            "_global.PopupLayer.ms_mcPopup.Buttons_mc.Button2_mc.SimulateButtonPush",
+            &[],
+        );
+        ui.cancel_text_popup(41);
+        ui.stage.tick(1000.0 / 30.0);
+        assert!(ui.stage.dialog_prompt().is_none());
+        ui.ask_free_text(42, "Late report", "", "Save", "Cancel");
+        // Many host ticks, zero movie frames: deterministically put the movie's
+        // initializer beyond the former FOCUS_FRAMES policy/focus window.
+        for _ in 0..FOCUS_FRAMES + 20 {
+            ui.show_text_popup();
+            ui.stage.tick(0.0);
+            ui.allow_free_text_popup();
+        }
+        let popup = ui.text_popup.as_ref().unwrap();
+        assert_eq!(popup.frames, FOCUS_FRAMES);
+        assert!(!popup.input_ready);
+        assert!(ui.stage.owns_dialog(42));
+        assert!(
+            ui.typing(),
+            "early input must be captured even before focus"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires THEDAS_INSTALL and an offscreen GPU"]
+    fn report_late_input_init_does_not_restore_name_limits() {
+        let mut ui = installed_popup_ui();
+        delay_report_input_init(&mut ui);
+        for _ in 0..20 {
+            ui.stage.tick(1000.0 / 30.0);
+            ui.allow_free_text_popup();
+        }
+        assert!(ui.text_popup.as_ref().unwrap().input_ready);
+        let note = "Sera's long report, 000123. #$% \"quoted\"! ".repeat(10);
+        assert!(ui.type_text(&note));
+        let field = "_global.PopupLayer.ms_mcPopup.TextInput_mc.TextField";
+        // The player exposes maxChars = 0 (unlimited) as null.
+        assert_eq!(
+            popup_property(&mut ui, &format!("{field}.maxChars")),
+            thedas_ui::UiValue::Null,
+        );
+        assert_eq!(
+            popup_property(&mut ui, &format!("{field}.restrict")),
+            thedas_ui::UiValue::Null,
+        );
+        assert_eq!(
+            popup_property(&mut ui, &format!("{field}.text")),
+            thedas_ui::UiValue::String(note.clone()),
+        );
+        assert!(ui.key(thedas_ui::UiKey::Enter));
+        assert_eq!(
+            ui.stage.bridge.value("GUIPopupLayer.InputText"),
+            Some(thedas_ui::UiValue::String(note))
+        );
+        assert!(ui.stage.dialog_prompt().is_none());
+        ui.cancel_text_popup(42);
+        // A new name prompt with identical wording is a different clip. It must
+        // retain the movie's limits after the free-text question has ended.
+        ui.ask_text(43, "Late report", "", "OK", "Cancel");
+        for _ in 0..20 {
+            ui.show_text_popup();
+            ui.stage.tick(1000.0 / 30.0);
+            ui.allow_free_text_popup();
+        }
+        assert_eq!(
+            popup_property(&mut ui, &format!("{field}.maxChars")),
+            thedas_ui::UiValue::Number(20.0),
+        );
+    }
+
+    #[test]
+    #[ignore = "requires THEDAS_INSTALL and an offscreen GPU"]
+    fn report_late_input_init_preserves_early_typing_edits_and_enter() {
+        let mut ui = installed_popup_ui();
+        delay_report_input_init(&mut ui);
+        // A user can click an authored field before its init handlers exist.
+        // That must not leave Enter without its key listener when init finishes.
+        ui.stage.focus_dialog_field();
+        assert!(ui.type_text("replace this"));
+        assert!(ui.key(thedas_ui::UiKey::SelectAll));
+        let note = "Sera's early report, 000123. #$% \"quoted\"! ".repeat(10);
+        assert!(ui.type_text(&note));
+        assert!(ui.type_text("x"));
+        assert!(ui.key(thedas_ui::UiKey::Backspace));
+        assert!(ui.key(thedas_ui::UiKey::Enter));
+        assert!(!ui.text_popup.as_ref().unwrap().pending_keys.is_empty());
+        for _ in 0..20 {
+            ui.stage.tick(1000.0 / 30.0);
+            ui.allow_free_text_popup();
+        }
+        assert!(ui.text_popup.as_ref().unwrap().pending_keys.is_empty());
+        assert_eq!(
+            ui.stage.bridge.value("GUIPopupLayer.InputText"),
+            Some(thedas_ui::UiValue::String(note))
+        );
+        assert!(ui.stage.dialog_prompt().is_none());
+        ui.cancel_text_popup(42);
+        delay_report_input_init(&mut ui);
+        assert!(ui.type_text("discard this queued input"));
+        ui.cancel_text_popup(42);
+        assert!(ui.text_popup.is_none());
+        ui.ask_text(43, "Late report", "Rowan", "OK", "Cancel");
+        for _ in 0..20 {
+            ui.show_text_popup();
+            ui.stage.tick(1000.0 / 30.0);
+            ui.allow_free_text_popup();
+        }
+        assert_eq!(
+            ui.stage.call_in(
+                thedas_ui::stage::POPUP_LAYER,
+                "_global.PopupLayer.ms_mcPopup.TextInput_mc.TextField.text.toString",
+                &[],
+            ),
+            Some(thedas_ui::UiValue::String("Rowan".into())),
+        );
+    }
+
+    /// Uses the installed movie, without a window or simulation. No game data is
+    /// embedded in this test. Run explicitly with THEDAS_INSTALL set.
+    #[test]
+    #[ignore]
+    fn report_popups_wait_cancel_and_keep_typing_across_name_and_choice_boxes() {
+        let mut ui = installed_popup_ui();
         let pump = |ui: &mut UiLayer| {
             for _ in 0..20 {
                 ui.show_text_popup();
@@ -3954,7 +4309,7 @@ mod tests {
                 // That must not erase the queued report's input flag or callbacks.
                 ui.stage.bridge.bind([]);
             }
-            // Type on the first tick with an input field, without extra settling frames.
+            // Type as soon as the report accepts input, without settling first.
             for _ in 0..20 {
                 ui.show_text_popup();
                 ui.stage.tick(1000.0 / 30.0);
@@ -3966,6 +4321,7 @@ mod tests {
             assert!(crate::box_shows(&mut ui, "Report"));
             let note = format!("Sera's report {n}: \"wrong\", 123. #$% ").repeat(30);
             assert!(ui.type_text(&note));
+            pump(&mut ui); // Early typing waits for TextInput_mc_init.
             assert_eq!(
                 ui.stage.call_in(
                     thedas_ui::stage::POPUP_LAYER,
@@ -4136,6 +4492,41 @@ mod tests {
         assert_eq!(line_ms("  "), 100.0);
         assert!(line_ms("Short.") < line_ms("A much longer line that takes a while to read."));
         assert_eq!(line_ms(&"x".repeat(1000)), 12_000.0);
+    }
+
+    #[test]
+    fn a_referenced_cut_finishes_before_its_line_automatically_continues() {
+        let mut line = Line {
+            key: ("dialog".into(), "A cinematic line.".into(), vec![1]),
+            t: 3000.0,
+            voice_ms: Some(2976.0),
+            voiced: true,
+            waits: true,
+            continued: false,
+            cut_seen: true,
+            cut_done: false,
+            owns_cut: true,
+        };
+        // Oskias node 17 has a 2.976 s voice and a 3.217 s cut. Presentation time
+        // can also run ahead of the cut's capped simulation clock on slow frames.
+        assert!(!line.played());
+        line.t = 15_000.0;
+        line.voice_ms = None;
+        assert!(!line.played());
+        line.cut_done = true;
+        assert!(line.played());
+
+        // A later line spoken during another line's cut keeps its own timing.
+        line.cut_done = false;
+        line.owns_cut = false;
+        assert!(line.played());
+        // Reply choices and an explicit skip retain their existing behavior.
+        line.owns_cut = true;
+        line.waits = false;
+        assert!(line.played());
+        line.waits = true;
+        line.t = f64::INFINITY;
+        assert!(line.played());
     }
 
     #[test]

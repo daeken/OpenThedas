@@ -91,6 +91,9 @@ fn cut_scene_lights(
 /// What the objects' scene was built for: each object's models. A change rebuilds it.
 type ObjectsKey = Vec<(u32, Vec<String>)>;
 
+#[path = "live_report.rs"]
+mod report_snapshot;
+
 /// The level of the current area, drawn first; built when the area's layout changes.
 pub struct LiveLevel {
     pub layout: String,
@@ -2074,12 +2077,22 @@ impl Live {
         }
         // Each creature's appearance scales its clips' translations (a dwarf sits lower than
         // the human clip's drop; see `thedas_render::skeleton::Layer::scale`).
-        let scales: std::collections::HashMap<ObjectId, [f32; 3]> = {
+        let (scales, scripted_roots, game) = {
             let sim = self.sim();
-            models
+            let scales: std::collections::HashMap<ObjectId, [f32; 3]> = models
                 .iter()
                 .filter_map(|m| thedas_ui::models::translation_scale(&sim, m.id).map(|s| (m.id, s)))
-                .collect()
+                .collect();
+            let scripted_roots: std::collections::HashSet<ObjectId> = models
+                .iter()
+                .filter(|m| {
+                    sim.world
+                        .get(m.id)
+                        .is_some_and(|o| keeps_scripted_root(o, sim.game))
+                })
+                .map(|m| m.id)
+                .collect();
+            (scales, scripted_roots, sim.game)
         };
         let (Some(level), Some(objects)) = (self.level.as_ref(), self.objects.as_mut()) else {
             return Ok(());
@@ -2138,8 +2151,10 @@ impl Live {
                 None => {
                     let mut at = m.position;
                     if m.kind == thedas_sim::world::ObjectKind::Creature
-                        && let Some(z) = floor_under(&level.collider, at)
+                        && !scripted_roots.contains(&m.id)
+                        && let Some(z) = floor_under(&level.collider, at, game)
                     {
+                        log::trace!("creature {} {} floor: {:?} -> {z}", m.id, m.tag, at);
                         at[2] = z;
                     }
                     (at, m.facing)
@@ -3026,23 +3041,125 @@ fn creature_shapes(
         .clone()
 }
 
-/// How far above or below its position a creature's drawn feet look for the floor
-/// (metres; see [`floor_under`]).
-pub const FLOOR_REACH: f32 = 0.25;
+/// Origins' controller step offset (0x6b20f3, 0xb0f28c), in metres.
+const FLOOR_STEP: f32 = 0.5;
+/// Origins' fixed downward controller displacement per move (0x6b6a3b, 0xb0f274),
+/// in metres; it is not multiplied by the frame time.
+const FLOOR_DROP: f32 = 9.81;
 
-/// The level's floor under a creature standing at `at`, within [`FLOOR_REACH`] of its
-/// height: DAOrigins.exe keeps movers on the physics floor (its ground helper 0x685430),
-/// which lies on the drawn floor, while the simulation keeps the pathing grid's quantized
-/// height, a centimetre or two below it (report 985: soles in the floor). Presentation
-/// only; the simulation's position is unchanged. A seat or table above the window (a
-/// sitter's chair) is not taken. Provisional: the window.
-fn floor_under(collider: &thedas_render::collide::Collider, at: [f32; 3]) -> Option<f32> {
+/// Ordinary animation playback (0x744870 -> 0x7a4390) does not run the path follower's
+/// downward controller move. In particular, do not re-ground a sitter onto its chair.
+/// Provisional: a stationary scripted animation is our presentation proxy for that
+/// separation; native controller lifetime and animation-driven movement are not modeled
+/// here. Only the active command owns the root; a queued animation does not. DA2 is
+/// unchanged. Cutscene-owned roots are handled separately by the posing branches above.
+fn keeps_scripted_root(o: &thedas_sim::world::Object, game: thedas_vfs::Game) -> bool {
+    game == thedas_vfs::Game::Origins
+        && o.commands
+            .first()
+            .is_some_and(|c| c.name == "CommandPlayAnimation" && c.from.is_none())
+}
+
+/// Restore the drawn feet to the floor using Origins' controller step-up allowance and
+/// downward reach, while the simulation retains its quantized pathing-grid height.
+/// This is the movement rule (0x6b6880), not the much wider teleport/placement helper
+/// 0x685430 (rays from Z+3 and Z+100). Placeables are in the native move mask 0x2011134;
+/// keeping sitters placed is an ownership rule, not a short ray that excludes furniture.
+///
+/// Provisional: a point ray over opaque render triangles approximates the native capsule
+/// movement over group-filtered PHY shapes, including its skin and slope handling. The
+/// two reaches are traced, but this is not a full CCT. DA2 retains its previous provisional
+/// +/-0.25 m query. See docs/notes/creature-floor-presentation.md.
+fn floor_under(
+    collider: &thedas_render::collide::Collider,
+    at: [f32; 3],
+    game: thedas_vfs::Game,
+) -> Option<f32> {
     let p = glam::Vec3::from_array(at);
-    let (from, to) = (
-        p + glam::Vec3::Z * FLOOR_REACH,
-        p - glam::Vec3::Z * FLOOR_REACH,
-    );
+    let (up, down) = match game {
+        thedas_vfs::Game::Origins => (FLOOR_STEP, FLOOR_DROP),
+        thedas_vfs::Game::DragonAge2 => (0.25, 0.25),
+    };
+    let (from, to) = (p + glam::Vec3::Z * up, p - glam::Vec3::Z * down);
     collider.first_hit(from, to).map(|f| from.lerp(to, f).z)
+}
+
+#[cfg(test)]
+mod floor_tests {
+    use super::{floor_under, keeps_scripted_root};
+    use glam::Vec3;
+    use thedas_render::collide::Collider;
+    use thedas_sim::world::{Command, Object, ObjectKind};
+    use thedas_vfs::Game;
+
+    fn floors(heights: &[f32]) -> Collider {
+        Collider::new(
+            heights
+                .iter()
+                .flat_map(|&z| {
+                    let a = Vec3::new(-1.0, -1.0, z);
+                    let b = Vec3::new(1.0, -1.0, z);
+                    let c = Vec3::new(1.0, 1.0, z);
+                    let d = Vec3::new(-1.0, 1.0, z);
+                    [[a, b, c], [a, c, d]]
+                })
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn feet_reach_a_stair_top_above_the_old_window() {
+        let collider = floors(&[13.0, 13.7]);
+        let at = [0.0, 0.0, 13.323];
+        assert!((floor_under(&collider, at, Game::Origins).unwrap() - 13.7).abs() < 1e-5);
+        assert_eq!(floor_under(&collider, at, Game::DragonAge2), None);
+        // The step allowance does not select another storey overhead.
+        assert_eq!(floor_under(&floors(&[0.51]), [0.0; 3], Game::Origins), None);
+    }
+
+    #[test]
+    fn soles_still_clear_small_grid_errors_and_the_downward_reach_is_bounded() {
+        let collider = floors(&[0.02]);
+        for game in [Game::Origins, Game::DragonAge2] {
+            assert!((floor_under(&collider, [0.0; 3], game).unwrap() - 0.02).abs() < 1e-5);
+        }
+        assert!(floor_under(&floors(&[-9.8]), [0.0; 3], Game::Origins).is_some());
+        assert_eq!(
+            floor_under(&floors(&[-9.82]), [0.0; 3], Game::Origins),
+            None
+        );
+        assert_eq!(
+            floor_under(&Collider::default(), [0.0; 3], Game::Origins),
+            None
+        );
+    }
+
+    #[test]
+    fn a_stationary_script_owns_its_root_even_when_a_chair_is_in_reach() {
+        let mut o = Object::new(1, ObjectKind::Creature, "sitter");
+        o.commands.push(Command {
+            name: "CommandPlayAnimation".into(),
+            ..Default::default()
+        });
+        // Furniture is not excluded by a shortened ray. The owner prevents the snap.
+        let chair = floors(&[0.0, 0.45]);
+        assert!((floor_under(&chair, o.position, Game::Origins).unwrap() - 0.45).abs() < 1e-5);
+        assert!(keeps_scripted_root(&o, Game::Origins));
+        assert!(!keeps_scripted_root(&o, Game::DragonAge2));
+        o.commands[0].from = Some((o.position, 0));
+        assert!(!keeps_scripted_root(&o, Game::Origins));
+        o.commands[0].from = None;
+        o.commands.insert(
+            0,
+            Command {
+                name: "CommandMoveToLocation".into(),
+                ..Default::default()
+            },
+        );
+        assert!(!keeps_scripted_root(&o, Game::Origins));
+        o.commands.clear();
+        assert!(!keeps_scripted_root(&o, Game::Origins));
+    }
 }
 
 /// Creatures are picked as upright cylinders this tall (metres). Provisional.
@@ -3430,6 +3547,19 @@ impl Live {
                             },
                         );
                         Some(format!("use {tag}"))
+                    }
+                    // A click on a corpse opens what it left, as the pad's A on it does: the
+                    // body bag has no model of its own to click.
+                    thedas_sim::world::ObjectKind::Creature if dead => {
+                        let bag = sim.corpse_body_bag(id)?;
+                        sim.input(
+                            thedas_sim::commands::CommandSource::Player,
+                            thedas_sim::commands::SimCommand::OrderUse {
+                                who: leader,
+                                target: bag,
+                            },
+                        );
+                        Some(format!("loot {tag}"))
                     }
                     _ => None,
                 }
