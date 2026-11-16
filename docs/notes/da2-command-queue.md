@@ -46,5 +46,55 @@ bounds and conversion, readiness, reload, completion and Origins behavior.
 The repair concerns the two waiting-queue getters. The broader native command
 admission and preparation lifecycle remains provisional.
 
-Installed-resource cadence, combat outcomes and regression checks are recorded
-with the PR and in the damage-investigation report.
+## Installed-resource cadence
+
+The modern task at `0x6d8860` and its event handler at `0x542a70` distinguish
+animation readiness from the animation endpoint. With the installed animation
+rows and these actors' attack-speed property of zero, the relevant deadlines
+from the cast start are as follows.
+
+| Attack | Impact or release | Ready | Animation end |
+| --- | --- | --- | --- |
+| Carver 3110 | 209 ms | 672 ms | 1,939 ms |
+| Carver 3111 | 181 ms | 672 ms | 1,696 ms |
+| Carver 3112 | 209 ms | 672 ms | 1,484 ms |
+| Carver 3113 | 245 ms | 672 ms | 1,393 ms |
+| Bethany 5510 | 200 ms | 570 ms | 2,100 ms |
+| Archer 6410–6413 | 270–300 ms | 2,330 ms | 2,566 ms |
+| Emissary 6510–6513 | 300 ms | No marker | 1,600 ms |
+
+The readiness values include the native 100 ms preparation interval. Basic
+combo variants and projectile flight account for some larger intervals between
+impacts of one ability ID. Cast-start spacing across the combo gives the
+corresponding cadence measurement.
+
+## Replay measurements
+
+The supplied `fresh3_02_real_arrival_main_d87590e5` checkpoint is replayed with
+the supplied driver, including ordinary attack orders whenever controlled
+Hawke idles. Main `249769ac` produces exactly the same 206,496 trace entries as
+the requested `d87590e5` control. The candidate clears the first six-hurlock
+fight in 22.6 seconds, compared with 29.8 seconds on main.
+
+In the second fight, Carver's median cast-start interval changes from 1,590 to
+672 ms. His damage events increase from six to fifteen and his damage total
+from 74.68973 to 193.02504. Bethany's median interval changes from 2,100 to
+570 ms. Hawke's damage total changes from 188.99231 to 373.39329. The main run
+wipes after 48.6 seconds. The candidate reaches the authored reinforcement wave
+and wipes after 38.9 seconds, so those durations cover different progression.
+Both runs have zero script errors, developer heals and forced kills.
+
+The frozen fake-prologue wave-one control clears its initial six enemies in
+147.20 seconds on main and 39.51 seconds with the repair. Hawke's mean basic
+damage is 5.589890 and 6.215137 over 87 and 82 impacts respectively. Each enemy
+loses exactly 100 HP. This historical checkpoint contains weapon power 5 from
+before the Champion equipment repair. It measures the same saved equipment on
+both builds. The complete probe also advances later waves.
+
+Strict workspace clippy and formatting pass. Workspace tests report 1,350
+passed, 22 ignored and zero failures. The connected fifteen-stage Origins
+comparison has identical logs, plot sequences and all seventeen produced JSON
+checkpoints. Its inherited progression stalls in Korcari Wilds and both board
+steps fail on the missing board. Four 600-tick Origins determinism controls
+pass repeat and save/reload comparisons. Independent fixture checks and the
+same-save DA2 control are recorded with the PR and investigation report.
