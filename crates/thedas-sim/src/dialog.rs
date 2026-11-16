@@ -552,6 +552,7 @@ impl Sim {
                     && let Some(o) = self.world.get_mut(id)
                 {
                     o.active = true;
+                    o.da2_locomotion = None;
                 }
             }
             if let Some(stage) = &cut.da2_stage {
@@ -1225,6 +1226,18 @@ impl Sim {
         self.talk.as_ref().and_then(|c| c.cut_from)
     }
 
+    /// The shown line's referenced cutscene while it is playing, including a final line
+    /// whose conversation has ended and is still being presented.
+    pub fn conversation_line_cutscene(&self) -> Option<&crate::cutscene::Cutscene> {
+        let c = self.talk.as_ref()?;
+        let name = c.dlg.nodes.get(c.line?)?.cutscene.as_deref()?;
+        let resource = crate::cutscene::Cutscene::resource(name);
+        self.world
+            .cutscene
+            .as_ref()
+            .filter(|cut| cut.from_dialog && cut.name == resource && c.cut_from == c.line)
+    }
+
     pub fn conversation_line(&self) -> Option<OpenLine<'_>> {
         let c = self.talk.as_ref().filter(|c| !c.ended)?;
         let node = c.line.and_then(|l| c.dlg.nodes.get(l));
@@ -1879,6 +1892,41 @@ mod tests {
             .iter()
             .map(|l| l.text.as_str())
             .collect()
+    }
+
+    #[test]
+    fn the_presented_line_owns_only_its_current_referenced_cutscene() {
+        let (mut sim, hero, npc) = passers_by();
+        let mut dlg = remarks("cinematic", &["First.", "Last."], false);
+        for node in &mut dlg.nodes {
+            node.ambient = false;
+        }
+        dlg.nodes[0].cutscene = Some("INTRO.CUT".into());
+        dlg.nodes[2].cutscene = Some("intro".into());
+        assert!(sim.open_conversation(hero, npc, dlg, None));
+        assert!(sim.conversation_line_cutscene().is_none());
+        sim.world.cutscene = Some(crate::cutscene::Cutscene {
+            name: "intro.cut".into(),
+            seconds: 4.0,
+            lines: Vec::new(),
+            elapsed_ms: 100,
+            from_dialog: true,
+            bound: Vec::new(),
+            placement: None,
+        });
+        assert!(sim.conversation_line_cutscene().is_some());
+        // Final lines remain presented after the conversation walker marks them ended.
+        sim.talk.as_mut().unwrap().ended = true;
+        assert!(sim.conversation_line_cutscene().is_some());
+        // A later line, a different resource, and a script's cut have separate ownership.
+        sim.talk.as_mut().unwrap().line = Some(2);
+        assert!(sim.conversation_line_cutscene().is_none());
+        sim.talk.as_mut().unwrap().line = Some(0);
+        sim.world.cutscene.as_mut().unwrap().name = "other.cut".into();
+        assert!(sim.conversation_line_cutscene().is_none());
+        sim.world.cutscene.as_mut().unwrap().name = "intro.cut".into();
+        sim.world.cutscene.as_mut().unwrap().from_dialog = false;
+        assert!(sim.conversation_line_cutscene().is_none());
     }
 
     #[test]
