@@ -633,11 +633,29 @@ fn worn_parts(sim: &Sim, o: &Object, prefix: &str, gear: Gear) -> (Vec<String>, 
         let model = format!("{prefix}_{ty}_{v}{LOD0}");
         has_model(sim, &model).then_some(model)
     };
+    let chest = worn("INVENTORY_SLOT_CHEST");
+    // Clothing's models (`cth`, `dm_cth_com_0`) have their own hands and feet, so the
+    // unclothed hands and feet are not drawn under it: their bare shins came through
+    // Oskias's trousers in Tapster's. Provisional: from the models, as Dragon Age II's
+    // clothing covers hands and feet; not traced in DAOrigins.exe.
+    let clothing = chest
+        .as_deref()
+        .is_some_and(|m| m.starts_with(&format!("{prefix}_cth_")));
     let mut out: Vec<String> = BODY_PARTS
         .iter()
         .zip(slots)
-        .map(|((_, nude), slot_name)| {
-            worn(slot_name).unwrap_or_else(|| format!("{prefix}_{nude}{LOD0}"))
+        .enumerate()
+        .filter_map(|(i, ((_, nude), slot_name))| {
+            let item = if i == 0 {
+                chest.clone()
+            } else {
+                worn(slot_name)
+            };
+            match item {
+                Some(m) => Some(m),
+                None if clothing => None,
+                None => Some(format!("{prefix}_{nude}{LOD0}")),
+            }
         })
         .collect();
     let helmet = worn("INVENTORY_SLOT_HEAD");
