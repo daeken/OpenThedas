@@ -186,6 +186,7 @@ thedas replay captures/report --install "$GAME" --save captures/replayed.json
 thedas replay captures/report.zip --install "$GAME"
 thedas replay captures/report --install "$GAME" --until 120000 --save captures/early.json
 thedas-app --install "$GAME" --save captures/replayed.json
+thedas-app --install "$GAME" --save captures/replayed.json --capture captures/replayed.png
 ```
 
 - The install defaults to `THEDAS_INSTALL`, then the path recorded in `report.json` (uploaded
@@ -215,6 +216,36 @@ thedas-app --install "$GAME" --save captures/replayed.json
   For an end-to-end synthetic report, run the app in a scratch HOME with `--journal` plus
   `--control`, play a few ticks, request `report` with a test note, then replay the resulting
   folder and zip using a CLI built at that same commit.
+
+#### Verified reports and recording gaps
+
+The serial validation at `9469b3e0` passed 10 replay tests and the workspace suite (1,332
+passed, 19 ignored), plus clippy with warnings denied. The 100-input synthetic simulation
+report matched as both a folder and zip (exit 0); an altered target returned 1, and build
+mismatch, truncated input and an output inside the report returned 2. A real `--until 1000`
+run stopped at 989 ms and exported a loadable save. The app rendered an exported replay save
+to PNG in a scratch HOME with its hidden-window setting.
+
+The following game-derived originals were tested on release builds at their header commits,
+with only the replay tool and additive checkpoint helper backported. Every logged input and
+intermediate hash passed; all original input files stayed unchanged. None of these originals
+matched the **complete** F8 saved state:
+
+| Report | Build | Inputs applied | Exit / first difference |
+| --- | --- | ---: | --- |
+| `2026-11-15-04-25-bdc210ar_players_home` | `d87f9ef2` | 13,343 | 1: 16 ms short; object 118's `combat.regen_ms` |
+| `2026-11-15-21-29-bdc130ar_tapsters_tavern` | `c006baa4` | 701 | 1: journal-entry `seq`, despite equal world clocks |
+| `2026-11-15-21-46-bdc200ar_slums` | `c006baa4` | 2,420 | 1: journal-entry `seq`; clock also 27 ms short |
+| Uploaded zip from issue #986 | `c006baa4` | 3,516 | 1: journal-entry `seq`; clock also 17 ms short |
+
+In a **separate diagnostic copy**, adding one 16 ms tick to the first log produced an exact
+complete-state match. Replay never invents that input itself. `GameJournal::files` flushes its
+writer without draining the sim's pending input log, so a report can omit its current frame.
+An independently driven F8 test reproduced this with a 100 ms gap and zero logged inputs.
+Journal-entry sequence differences are outside `world_hash` and are caught by the final
+structural comparison. These are recording/reconstruction gaps to investigate, not reasons
+to ignore differing fields. Keep real fixtures and proof logs outside git, under
+`OpenThedas-testdata/codex-captures/report-replay/`.
 
 ### Report and updater checks
 
