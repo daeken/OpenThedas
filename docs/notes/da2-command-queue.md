@@ -80,9 +80,12 @@ In the second fight, Carver's median cast-start interval changes from 1,590 to
 672 ms. His damage events increase from six to fifteen and his damage total
 from 74.68973 to 193.02504. Bethany's median interval changes from 2,100 to
 570 ms. Hawke's damage total changes from 188.99231 to 373.39329. The main run
-wipes after 48.6 seconds. The candidate reaches the authored reinforcement wave
-and wipes after 38.9 seconds, so those durations cover different progression.
-Both runs have zero script errors, developer heals and forced kills.
+wipes after 48.6 seconds with three initial enemies alive. The candidate
+defeats all seven initial enemies and wipes after 38.9 seconds. Both activate
+Team 21, at `t=679239` and `t=644667` respectively. Main receives zero
+reinforcement damage events before the wipe. The candidate receives 21 for
+130.47207 damage, so the durations cover different combat progression. Both
+runs have zero script errors, developer heals and forced kills.
 
 The frozen fake-prologue wave-one control clears its initial six enemies in
 147.20 seconds on main and 39.51 seconds with the repair. Hawke's mean basic
