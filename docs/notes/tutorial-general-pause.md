@@ -96,4 +96,47 @@ orders and RNG. Through the movie's original message API it compares enabled,
 disabled, Cancel, Restore Defaults, and persisted disabled options. This derived
 fixture is not a fresh walk from the origin's beginning.
 
-Final check results are recorded below after the merged build is validated.
+## Recorded validation (2026-11-16)
+
+Final integration `5e444b2` merges main `3a429faf`. Formatting, workspace/all-targets
+clippy with `-D warnings`, and debug workspace tests pass on that integration:
+**1,464 passed, 26 ignored, zero failed**. The original-popup-movie
+regression was also run explicitly and passed (one test).
+
+Release app/MCP captures, gates and detcheck were run at `7c85225` (merged main
+`adf58096`), against a baseline built from main `45e01895`. All nine panel cases
+and all seven option checks pass: the three untouched saves show Combat Basics,
+Space advances zero ms, and the actual Next arrow shows the attack instructions
+and advances 966 ms. Main reproduces the tooltip-hidden panel at alpha zero;
+candidate visible ancestors retain alpha at least 90 (the movie's normal fade
+clip reports about 95.7). Disabled notifications advance 966–967 ms without a
+popup pause; Cancel and Defaults restore pausing for new notifications.
+
+The isolated sequential gate covers s01–s12, s14 and s15 on both binaries:
+28 successful sweep runs, zero log differences, identical plot sequences and
+ending areas, and no refused saves. Both s13 runs reach Flemeth's hut with all
+24 trace checkpoints identical: last checkpoint 600 step calls / 12,633 MCP calls;
+final world time 1,979,312 ms. The complete final saves are identical.
+
+Detcheck covers five fixtures × two binaries × 600 ticks, each repeated and
+saved/reloaded halfway. All ten checks pass. Across the 20 detcheck saved states
+plus the s13 save, all fields match except four Dalish snapshots' tutorial lists:
+the pausing combat lesson is foregrounded and attack-instruction page 264858 is
+added. Combat, time, RNG, orders and plot flags remain identical.
+
+The later main merges contain the OpenGL-only MSAA fallback, conversation-camera
+presentation changes and removal of unused camera helpers, and a DA2-only
+cluster-candidate predicate change. `Stage::from_gff4` and `jump_camera` are
+unchanged; the Origins predicate and tutorial paths are unchanged. The tested
+captures use fixed cameras in combat with no conversation; the gate/detcheck use
+Origins headless simulation. The completed runtime evidence is retained with
+its original commit recorded above; fmt/clippy/workspace tests were rerun after
+the final integration. Runtime checks remain recorded at the earlier commit above.
+
+All heavy commands used `cargo-slot.sh`, Cargo used two jobs, and captures were
+hidden/silent/mods-disabled and sequential. Final raw artifacts are under
+`OpenThedas-testdata/codex-captures/pausetutorial/panel-validation/`.
+Three corrected media comparisons are staged with Delta ×4 and a threshold of
+any RGB channel difference >0: panel visibility 7.323611% changed pixels, Dalish
+foreground lesson 8.322361%, and Next progression 6.670208%. Superseded
+Space-unpause media was removed from staging.
