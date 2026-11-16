@@ -110,10 +110,12 @@ DA2 keeps its previous path.
 Presentation opacity interpolation, default-pose playback and other
 animation entry points remain open; this slice handles ordinary
 state-controller transition endpoints and removal. State-change PWK
-installation and full physics remain open as recorded in the walkmesh
-note. These static traces used the existing Origins analysis files. The
-original executable was never run, and this note contains only our own
-description.
+installation and door group restoration are implemented in
+`placeable-initial-state.md`; full physics remains open. Forced initialization
+selects the destination pose without starting a transition or scheduling its
+completion. Ordinary later changes retain transition playback and completion.
+These static traces used the existing Origins analysis files. The original
+executable was never run, and this note contains only our own description.
 
 ### Guarded removal delivery
 

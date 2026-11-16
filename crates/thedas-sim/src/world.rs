@@ -136,7 +136,11 @@ pub struct Object {
     /// see [`heading_of`] and [`facing_toward`].
     pub facing: f32,
     pub active: bool,
-    /// A placeable's runtime physics group override (Origins destruction writes 1).
+    /// DA2 locomotion mode and residual facing, independent of its command queue.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub da2_locomotion: Option<crate::da2_locomotion::Locomotion>,
+    /// A placeable's runtime physics group (Origins open doors/destruction use 1;
+    /// blocking door states restore the model's original group).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub placeable_group: Option<u32>,
     /// Origins state-controller playback, independent of a renderer observing the state.
@@ -153,6 +157,9 @@ pub struct Object {
     pub script: Option<String>,
     /// Conversation (`.dlg`) for creatures and placeables.
     pub dialog: Option<String>,
+    /// Authored Origins talk radius. Absent in older saves, which read it from resources.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interact_radius: Option<f32>,
     /// Creature properties (`properties.gda` ids): base and current value.
     pub properties: BTreeMap<i32, (f32, f32)>,
     /// What effects add to properties (`ApplyEffectModifyProperty`, from buffs and worn
@@ -279,9 +286,11 @@ impl Object {
             placeable_fade_at: None,
             origins_destroy_requested: false,
             active: true,
+            da2_locomotion: None,
             locals: Locals::default(),
             script: None,
             dialog: None,
+            interact_radius: None,
             properties: BTreeMap::new(),
             modifiers: BTreeMap::new(),
             quickslots: BTreeMap::new(),
@@ -349,7 +358,7 @@ pub struct Event {
     pub objects: Vec<ObjectId>,
     pub resources: Vec<String>,
     pub locations: Vec<Location>,
-    /// Dragon Age II's vector parameters (`SetEventVector`, `GetEventVector`).
+    /// Vector parameters, including Origins' requested target position.
     #[serde(default)]
     pub vectors: Vec<[f32; 3]>,
 }
@@ -366,6 +375,7 @@ pub struct Command {
     pub is_static: bool,
     pub target: Option<ObjectId>,
     pub location: Option<Location>,
+    /// Command-specific float. Player Initiate Dialog uses it for stalled-approach milliseconds.
     pub seconds: f32,
     /// `CommandMoveToObject`'s fMaxRange, raised to fMinRange by its builder
     /// (DAOrigins.exe 0x66f260). Older saves used only `seconds` (fMinRange).
@@ -384,8 +394,7 @@ pub struct Command {
     /// `Sim::advance_movers` and `turn_toward`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turned_at: Option<u64>,
-    /// For an attack whose target is out of reach: where the attacker is walking to first
-    /// (see `Sim::attack_reach`).
+    /// Where an attack, ability or player talk order is walking before executing.
     #[serde(default)]
     pub approach: Option<[f32; 3]>,
     /// For a melee attack: it found the target's melee ring full once and is waiting by it
@@ -411,12 +420,17 @@ pub struct Command {
     pub impacted: bool,
     /// For a melee attack: the walk to its place on the target's melee ring has just ended,
     /// so the attack's start step tests the range with its slack (see `Sim::approach_point`).
+    /// For player talk: its required approach succeeded, so dialogue can execute.
     #[serde(default)]
     pub arrived: bool,
     /// DA2's combat-target preparation has run for this command, before approach.
     /// Keep it across save/reload so a later combat exit is not undone on arrival.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub da2_target_prepared: bool,
+    /// Native DA2 command boolean 2, forwarded to CHOOSE_BASIC_ATTACK integer 2.
+    /// Ordinary player attack input enables the script's range fallback (0x47fc51).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub da2_basic_attack_fallback: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -566,6 +580,8 @@ pub struct PlotActions {
     pub disabled: bool,
     pub states: std::collections::BTreeMap<i32, i32>,
     pub counts: std::collections::BTreeMap<i32, i32>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub cooldowns: BTreeMap<i32, crate::plot_cooldown::PlotCooldown>,
 }
 
 /// A message box shown by `ShowPopup`: its text, kind (`nPopupType`), owner and whether it
@@ -746,6 +762,8 @@ pub struct World {
     /// [`World::controlled`]). Saved.
     #[serde(default)]
     pub controlled: Option<ObjectId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_request: Option<crate::target_request::TargetRequest>,
     pub party: Option<ObjectId>,
     /// Plot flags by (plot resource, flag).
     #[serde(with = "pairs")]
@@ -756,6 +774,9 @@ pub struct World {
     /// Each quest's latest journal entry, by plot GUID (see [`crate::journal`]).
     #[serde(default)]
     pub journal: BTreeMap<String, crate::journal::JournalMark>,
+    /// Explicit journal closure/removal, independent of plot flags (Origins).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) quest_states: BTreeMap<String, crate::journal::QuestState>,
     /// How many journal entries have been made (orders them).
     #[serde(default)]
     pub journal_seq: u64,
@@ -1047,10 +1068,12 @@ impl World {
             da2_encounter_order: Vec::new(),
             hero: None,
             controlled: None,
+            target_request: None,
             party: None,
             plots: BTreeMap::new(),
             nav_patches: BTreeMap::new(),
             journal: BTreeMap::new(),
+            quest_states: BTreeMap::new(),
             journal_seq: 0,
             recipes: BTreeSet::new(),
             active_quest: None,

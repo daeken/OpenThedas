@@ -137,6 +137,11 @@ pub struct Follow {
 }
 
 impl Follow {
+    /// The smoothed look point used by the last presented explore camera.
+    pub fn target(&self) -> Option<Vec3> {
+        self.pivot
+    }
+
     /// Behind a leader looking along `heading` (radians from +X), as the explore camera
     /// starts: at [`ZOOM_START`], [`NEAR_POLAR_DEG`] from overhead.
     pub fn behind(heading: f32) -> Self {
