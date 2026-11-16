@@ -207,6 +207,8 @@ struct Args {
     /// reticle), `pad a` (a game controller's button pressed and let go; `pad press rt`
     /// and `pad release rt` hold and let go), `pad stick-left X,Y MS` and
     /// `pad stick-right X,Y MS` (a stick held there while the game runs MS, then let go).
+    /// `windowkey down|repeat|up KeyCode [JSON text]` replays the window keyboard route,
+    /// e.g. `windowkey down Quote "'"; windowkey up Quote; windowkey down Enter`.
     #[arg(long, default_value = "")]
     steps: String,
     /// Module for `--save` and `--objects`; the install's base campaign when not given
@@ -3681,6 +3683,49 @@ impl App {
         true
     }
 
+    /// The window keyboard route, also used by control's `windowkey` replay.
+    /// Returns true when the key requests that the application close.
+    fn window_key(
+        &mut self,
+        code: KeyCode,
+        text: Option<&str>,
+        state: ElementState,
+        repeat: bool,
+    ) -> bool {
+        // A key skips a cutscene, as a click does. Provisional: the game's own
+        // skip key is not traced.
+        if state == ElementState::Pressed
+            && !repeat
+            && self
+                .screens
+                .as_ref()
+                .is_some_and(screens::Screens::in_cutscene)
+        {
+            if let Some(live) = self.live.as_ref() {
+                live.sim().input(
+                    thedas_sim::commands::CommandSource::Player,
+                    thedas_sim::commands::SimCommand::SkipCutscene,
+                );
+            }
+            return false;
+        }
+        if state == ElementState::Pressed && self.text_key(code, text) {
+            return false;
+        }
+        match state {
+            ElementState::Pressed => {
+                if !repeat && self.key_down(code) {
+                    return true;
+                }
+                self.keys.insert(code);
+            }
+            ElementState::Released => {
+                self.keys.remove(&code);
+            }
+        }
+        false
+    }
+
     /// Draws the level the way `path` says, or the other way than now for `None` (F11),
     /// from the next frame; returns the way it is drawn now.
     fn set_render_path(
@@ -4104,6 +4149,12 @@ impl App {
                 log.push(format!(
                     "key {k:?}: {}",
                     if typed { "typed" } else { "no text field" }
+                ));
+            }
+            Step::WindowKey(code, text, state, repeat) => {
+                self.quit |= self.window_key(*code, text.as_deref(), *state, *repeat);
+                log.push(format!(
+                    "windowkey {state:?} {code:?} {text:?} repeat={repeat}"
                 ));
             }
             Step::Wipe => {
@@ -5166,39 +5217,8 @@ impl ApplicationHandler for App {
                 let PhysicalKey::Code(code) = event.physical_key else {
                     return;
                 };
-                // A key skips a cutscene (and the movie it plays), as a click does.
-                // Provisional: the game's own skip key is not traced.
-                if event.state == ElementState::Pressed
-                    && !event.repeat
-                    && self
-                        .screens
-                        .as_ref()
-                        .is_some_and(screens::Screens::in_cutscene)
-                {
-                    if let Some(live) = self.live.as_ref() {
-                        live.sim().input(
-                            thedas_sim::commands::CommandSource::Player,
-                            thedas_sim::commands::SimCommand::SkipCutscene,
-                        );
-                    }
-                    return;
-                }
-                // While a movie's text field has focus, keys type into it (repeats too).
-                if event.state == ElementState::Pressed
-                    && self.text_key(code, event.text.as_deref())
-                {
-                    return;
-                }
-                match event.state {
-                    ElementState::Pressed => {
-                        if !event.repeat && self.key_down(code) {
-                            event_loop.exit();
-                        }
-                        self.keys.insert(code);
-                    }
-                    ElementState::Released => {
-                        self.keys.remove(&code);
-                    }
+                if self.window_key(code, event.text.as_deref(), event.state, event.repeat) {
+                    event_loop.exit();
                 }
             }
             WindowEvent::CursorMoved { position, .. } => self.cursor_to(position.x, position.y),
@@ -6025,6 +6045,9 @@ enum Step {
     /// A key for the focused text field (`key backspace`, `enter`, `delete`, `left`, `right`,
     /// `home`, `end`, `tab`, `escape`, `ctrl+a`).
     TextKey(thedas_ui::UiKey),
+    /// A window key event through App::text_key and the normal game key routing:
+    /// `windowkey down|repeat|up KeyCode [JSON text]` (winit's physical key names).
+    WindowKey(KeyCode, Option<String>, ElementState, bool),
     /// The whole party falls, as the game sees it after a wipe (for trying the death screen
     /// headless).
     Wipe,
@@ -6631,6 +6654,27 @@ fn parse_step(s: &str) -> Result<Step> {
         "key" if arg.eq_ignore_ascii_case("f11") => Step::Renderer(None),
         "wipe" => Step::Wipe,
         "type" => Step::Type(arg.to_string()),
+        "windowkey" => {
+            let mut words = arg.splitn(3, ' ');
+            let state = words.next().unwrap_or_default();
+            let name = words
+                .next()
+                .context("windowkey takes down|repeat|up KeyCode [JSON text]")?;
+            let code = serde_json::from_value(J::String(name.into()))
+                .with_context(|| format!("unknown windowkey physical key {name:?}"))?;
+            let (state, repeat) = match state {
+                "down" => (ElementState::Pressed, false),
+                "repeat" => (ElementState::Pressed, true),
+                "up" => (ElementState::Released, false),
+                _ => bail!("windowkey takes down|repeat|up KeyCode [JSON text]"),
+            };
+            let text = words
+                .next()
+                .map(serde_json::from_str::<String>)
+                .transpose()
+                .context("windowkey text must be a JSON string")?;
+            Step::WindowKey(code, text, state, repeat)
+        }
         "key" if text_key(arg).is_some() => {
             Step::TextKey(text_key(arg).unwrap_or(thedas_ui::UiKey::Enter))
         }
@@ -7229,6 +7273,9 @@ fn main() -> Result<()> {
                             "type {t:?}: {}",
                             if typed { "typed" } else { "no text field" }
                         );
+                    }
+                    Step::WindowKey(..) => {
+                        bail!("windowkey requires a window with --control");
                     }
                     &Step::TextKey(k) => {
                         let typed = played.as_mut().is_some_and(|(layer, _)| layer.key(k));
@@ -7904,6 +7951,26 @@ mod tests {
             Some(UiKey::SelectAll)
         );
         assert_eq!(text_edit_key(KeyCode::KeyA, false, false), None);
+    }
+
+    #[test]
+    fn window_keys_keep_physical_codes_text_and_repeats_separate() {
+        use ElementState::{Pressed, Released};
+        assert_eq!(
+            parse_steps(r#"windowkey down F8; windowkey up F8; windowkey down Quote "'"; windowkey repeat KeyA "A"; windowkey down Space " "; windowkey down Enter"#).unwrap(),
+            vec![
+                Step::WindowKey(KeyCode::F8, None, Pressed, false),
+                Step::WindowKey(KeyCode::F8, None, Released, false),
+                Step::WindowKey(KeyCode::Quote, Some("'".into()), Pressed, false),
+                Step::WindowKey(KeyCode::KeyA, Some("A".into()), Pressed, true),
+                Step::WindowKey(KeyCode::Space, Some(" ".into()), Pressed, false),
+                Step::WindowKey(KeyCode::Enter, None, Pressed, false),
+            ]
+        );
+        assert!(parse_steps("windowkey down NotAKey x").is_err());
+        assert!(parse_steps("windowkey sideways Enter").is_err());
+        assert!(parse_steps("windowkey down").is_err());
+        assert!(parse_steps("windowkey down KeyA unquoted").is_err());
     }
 
     #[test]
