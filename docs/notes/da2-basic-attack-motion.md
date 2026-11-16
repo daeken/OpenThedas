@@ -58,8 +58,9 @@ controller motion without that pathfinding predicate, and DA2's ordinary routing
 already retains a straight fallback when no grid route can be found.
 This is not a complete native PhysX controller or animation blend graph.
 Root rotation, native controller blending, arbitrary target-node bounds,
-terrain/static-wall collision, vertical steps and exact collision response remain separate work. The
-existing turn-to-target approximation supplies the initial orientation.
+terrain/static-wall collision, vertical steps and exact collision response
+remain separate work. The existing turn-to-target approximation supplies the
+initial orientation.
 Target-distance warping here covers object-targeted attacks; ground-targeted
 motion retains the unwarped curve. Old in-flight saves lacking a motion context
 are not retrofitted; subsequent casts acquire it normally.
@@ -70,3 +71,50 @@ Synthetic regressions cover the admitted flat GAD curve, timed interpolation,
 the close-range endpoint, motion before impact, save/reload halfway through
 the lunge, continued animation tail, interruption and Origins isolation.
 Installed-resource replay and regression-gate results are recorded with the PR.
+
+## Installed-resource controls
+
+Main `789834f2` and candidate `83e7333f` use frozen copies of the supplied
+checkpoints and `drive_da2.py`, with idle-Hawke attack orders and no developer
+healing, forced kills or stat/plot/activation writes. Intervals below are game
+time from the fight call, after approach/dialogue, rather than original-game
+timing measurements. All eight real-prologue/Karl controls have zero script
+errors or aids.
+
+| Control | Main | Candidate |
+| --- | --- | --- |
+| Fake wave's initial six defeated | 250.100 s | 192.109 s |
+| Mean Hawke basic health loss to those six | 5.31264, 81 events | 6.22526, 82 events |
+| First real fight | Clear, 48.6 s | Clear, 47.7 s |
+| Second real fight | Wipe, 52.1 s; Hawke 0 damage | Wipe, 40.5 s; Hawke 23.75755 damage |
+
+The supplied fake-wave checkpoint retains weapon power 5 from before the
+Champion-preset correction. This is a frozen checkpoint comparison, not a
+newly generated Champion preset or a full-prologue timing. Each initial enemy
+loses exactly 100 health in both probes; later waves can begin before the
+probe's complete fight call returns.
+
+The second real fight now delivers a 9.27509-damage 3310 hit, followed by two
+3110 hits. A separate same-save/same-order control at exactly three seconds
+places Hawke about 5.12 metres farther forward. Its shape query now includes
+the intended archer: the main query instead contains Hawke and a different
+hostile. This restores execution and recipients, without changing the damage
+formula. It does not guarantee victory with this basic-attack-only controller.
+
+The movement-trigger route executes `gentr_team_move` and sets plot flag 104;
+it also wipes on both builds. The six archers and emissary are already active
+members of the same authored initial team. The eight Team-21 reinforcements
+remain inactive through these fights. The full staging and Karl comparison
+is recorded in the stream report; neither supplies a native basis for a
+health, class-stat or enemy-damage adjustment.
+
+fmt and strict all-target workspace clippy pass. Workspace tests: 1,321 passed,
+19 ignored, zero failed, including movement from outside the Origins
+walkability mask, reload, impact/tail clock continuity and cancellation.
+The matched DAO sweep (s04, s07, s11, s14, s15 and s13; 12 executions) has
+zero log or plot-sequence differences and seven identical checkpoint JSONs.
+Tower is a baseline coverage limitation: all five seeds wipe on level 1 in
+both builds, despite the driver's output filename `13_flemeth_hut.json`.
+This does not establish a successful later-Tower playthrough. Four 600-tick
+DAO fixtures, including the named mid-Tower fight, are identical on repeat
+and through save/reload.
