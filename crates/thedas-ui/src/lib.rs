@@ -892,6 +892,12 @@ impl UiMovie {
         self.button_as(avm1::MOUSE_LEFT, x, y, down);
     }
 
+    /// Whether a clip of the movie is under window pixel (`x`, `y`): a button's hit area
+    /// counts though nothing is drawn there.
+    pub fn has_clip_at(&self, x: f64, y: f64) -> bool {
+        self.player.has_clip_at(x, y)
+    }
+
     /// Whether a click would stay in the focused text field, in window pixels.
     pub fn focused_text_at(&self, x: f64, y: f64) -> bool {
         self.player.focused_text_at(x, y)
