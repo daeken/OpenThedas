@@ -83,6 +83,9 @@ pub fn sim_values(sim: &Sim) -> BTreeMap<String, UiValue> {
 /// keeps for it.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Presentation {
+    /// Which screens are up (the app's screen numbers): a screen opening or closing makes the
+    /// values it reads be built again at once (see [`ValueCache`]).
+    pub screens: Vec<u32>,
     /// An item or ability is being dragged between movies (`GUI.StartDragging` until the
     /// button is released): `GUI.Dragging` reads 1, which the movies' drop targets look for.
     pub dragging: bool,
@@ -305,6 +308,9 @@ pub struct ValueCache {
     pub updates: Vec<(String, Vec<(String, UiValue)>)>,
     /// Groups no longer shown.
     pub drops: Vec<String>,
+    /// What the interface showed when the groups were built: a screen opening or a tab
+    /// picked changes what its values are, so every group is built again at once.
+    shown: Option<Presentation>,
     /// The interface's own time (the frames' durations added up), which the groups age by:
     /// real time in play, the steps' time when driven by a script.
     now_ms: f64,
@@ -321,6 +327,16 @@ impl ValueCache {
     /// Moves the interface's time on by a frame.
     pub fn advance(&mut self, dt_ms: f64) {
         self.now_ms += dt_ms;
+    }
+
+    /// Notes what the interface shows now; a change makes every group stale.
+    fn see(&mut self, shown: &Presentation) {
+        if self.shown.as_ref() != Some(shown) {
+            self.shown = Some(shown.clone());
+            for b in self.groups.values_mut() {
+                b.at_ms = f64::NEG_INFINITY;
+            }
+        }
     }
 
     /// Whether `group` must be built again (not built yet, built for another `token`, or
@@ -406,6 +422,7 @@ pub fn sim_values_cached(
     shown: &Presentation,
     cache: &mut ValueCache,
 ) -> BTreeMap<String, UiValue> {
+    cache.see(shown);
     sim_values_with(sim, shown, Some(cache))
 }
 
@@ -1028,7 +1045,9 @@ fn sim_values_with(
     // The training step shown (`trainingsteps.gda`'s row; 0 none), see `thedas_sim::training`.
     v.insert(
         "Tutorials.TrainingStep".into(),
-        num(if sim.tutorials_held() {
+        // Held back behind a screen, as the tutorial list is: the popup layer is over every
+        // screen now, and a step's panel over the journal or map is not the game's.
+        num(if tutorials_held {
             0
         } else {
             sim.world.training.step
@@ -1036,11 +1055,20 @@ fn sim_values_with(
     );
     // The tutorials' screen highlights (DAConstants `GUI_HIGHLIGHT_*`: 0 follower, 1
     // tactics, 2 inventory, 3 health poultice, 4 empty quickbar, 5 tactic preset, 6
-    // equipment slot, 7 unequipped item) are all off: no tutorial asks for one. A movie
-    // hearing nothing leaves its glow on (the portraits' halo, the quickbar's).
-    for i in 0..8 {
-        v.insert(format!("GUI.GuiHighlights.{i}"), num(i));
-        v.insert(format!("GUI.GuiHighlights.{i}.Highlight"), num(0));
+    // equipment slot, 7 unequipped item): on for what the training step under way points at
+    // (`HighlightGuiElement`), with its argument, off for the rest. A movie hearing nothing
+    // leaves its glow on (the portraits' halo, the quickbar's).
+    let training = sim.world.training;
+    for i in 0..8usize {
+        let on = training.highlighted & (1 << i) != 0;
+        v.insert(format!("GUI.GuiHighlights.{i}"), num(i as f64));
+        v.insert(format!("GUI.GuiHighlights.{i}.Highlight"), num(on as u8));
+        if on {
+            v.insert(
+                format!("GUI.GuiHighlights.{i}.HighlightArg"),
+                num(training.highlight_args[i]),
+            );
+        }
     }
     if let Some(who) = controlled.or(hero) {
         section(&mut cache, "Tactics", u64::from(who), &mut v, |v| {
