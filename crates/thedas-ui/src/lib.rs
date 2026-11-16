@@ -13,6 +13,7 @@ pub mod atlas;
 pub mod avm1;
 pub mod binding;
 pub mod chains;
+pub mod crossfade;
 pub mod input;
 pub mod keys;
 pub mod locomotion;
@@ -324,6 +325,13 @@ pub struct UiMovie {
     multiply_texture: Option<wgpu::Texture>,
     above_texture: Option<wgpu::Texture>,
     own_texture: Option<wgpu::Texture>,
+}
+
+impl UiMovie {
+    /// Engine tokens this movie has registered to read, in registration order.
+    pub fn observed_tokens(&self) -> impl Iterator<Item = &str> {
+        self.observers.iter().map(|(_, token)| token.as_str())
+    }
 }
 
 /// Clips a movie draws with the `multiply` blend onto what is under the interface (the
@@ -884,6 +892,12 @@ impl UiMovie {
         self.button_as(avm1::MOUSE_LEFT, x, y, down);
     }
 
+    /// Whether a clip of the movie is under window pixel (`x`, `y`): a button's hit area
+    /// counts though nothing is drawn there.
+    pub fn has_clip_at(&self, x: f64, y: f64) -> bool {
+        self.player.has_clip_at(x, y)
+    }
+
     /// Whether a click would stay in the focused text field, in window pixels.
     pub fn focused_text_at(&self, x: f64, y: f64) -> bool {
         self.player.focused_text_at(x, y)
@@ -1021,6 +1035,11 @@ impl UiMovie {
                 UiValue::List(args.to_vec()),
             ],
         )
+    }
+
+    /// Reads a movie variable directly, including primitive values such as zero.
+    pub fn get(&mut self, path: &str) -> UiValue {
+        own::from_host(&self.player.player.get_variable(path))
     }
 
     /// Sets a movie variable by path (`_global.GUISystem.OriginalStageWidth`), as Scaleform's

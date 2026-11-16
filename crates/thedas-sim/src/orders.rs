@@ -2,14 +2,15 @@
 //! Each replaces the member's queue with ordinary commands the simulation runs over time
 //! (a walk along the pathing grid, then the action), as clicking in the game does.
 //!
-//! Provisional: how close the original walks before talking or using is not traced.
+//! Origins talk preparation follows DAOrigins.exe 0x7452a0.
 
 use thedas_script::vm::ObjectId;
 
-use crate::sim::{Sim, constant};
-use crate::world::{Command, Location, facing_toward};
+use crate::fmath::DetMath;
+use crate::sim::{Approach, Sim, constant};
+use crate::world::{Command, Location, facing_toward, heading_of};
 
-/// How far short of a creature or placeable the walker stops to talk to or use it (metres,
+/// How far short of a creature or placeable the walker stops to use it (metres,
 /// on top of the two bodies' radii). Provisional.
 pub const INTERACT_GAP: f32 = 0.6;
 
@@ -33,6 +34,7 @@ fn command(sim: &Sim, ty: &str, name: &str) -> Command {
         impacted: false,
         arrived: false,
         da2_target_prepared: false,
+        da2_basic_attack_fallback: false,
         path: Vec::new(),
         turned_at: None,
         is_static: false,
@@ -72,6 +74,9 @@ impl Sim {
 
     /// Walks `who` to `to` (in its area), dropping what it was doing.
     pub fn order_move(&mut self, who: ObjectId, to: [f32; 3]) {
+        if self.target_request_click(who, thedas_script::vm::OBJECT_INVALID, to) {
+            return;
+        }
         self.note_player_order(who);
         let Some((area, from, facing)) = self
             .world
@@ -123,6 +128,7 @@ impl Sim {
 
     /// Counts an order the player gave `who` (see [`Sim::fail_blocked`]).
     pub(crate) fn note_player_order(&mut self, who: ObjectId) {
+        self.da2_stop_locomotion(who);
         if let Some(o) = self.world.get_mut(who) {
             o.combat.player_orders += 1;
         }
@@ -130,6 +136,9 @@ impl Sim {
 
     /// Walks `who` up to `target` and starts its conversation.
     pub fn order_talk(&mut self, who: ObjectId, target: ObjectId) {
+        if self.target_request_click(who, target, [0.0; 3]) {
+            return;
+        }
         self.note_player_order(who);
         let mut then = command(
             self,
@@ -137,7 +146,79 @@ impl Sim {
             "CommandStartConversation",
         );
         then.target = Some(target);
-        self.approach_then(who, target, then);
+        if self.game == thedas_vfs::Game::Origins {
+            let (Some(me), Some(t)) = (self.world.get(who), self.world.get(target)) else {
+                return;
+            };
+            if me.area.is_none() || me.area != t.area {
+                return;
+            }
+            let radius = self.interaction_radius(target);
+            self.world.get_mut(target).unwrap().interact_radius = Some(radius);
+            // Keep preparation and dialogue in one command. Native subcommand failure
+            // clears the pending dialogue (0x73cc7f -> 0x73c787).
+            then.name = "CommandInitiateDialog".into();
+            self.world.get_mut(who).unwrap().commands = vec![then];
+        } else {
+            self.approach_then(who, target, then);
+        }
+    }
+
+    /// Native Initiate Dialog preparation. Positive radii use 3D distance and the
+    /// target's front point; the default move-to-object band uses horizontal distance.
+    pub(crate) fn talk_approach(&mut self, who: ObjectId, cmd: &Command) -> Approach {
+        if cmd.arrived {
+            return Approach::InReach;
+        }
+        // AddCommand can admit a previous command again with fresh execution state.
+        if let Some(c) = self.world.get_mut(who).and_then(|o| o.commands.first_mut()) {
+            c.seconds = 0.0;
+        }
+        let Some((from, to, facing, target)) = self.world.get(who).and_then(|me| {
+            let target = cmd.target?;
+            let t = self.world.get(target)?;
+            (me.area.is_some() && me.area == t.area).then_some((
+                me.position,
+                t.position,
+                t.facing,
+                target,
+            ))
+        }) else {
+            return Approach::InReach;
+        };
+        let radius = self.interaction_radius(target);
+        let (dx, dy, dz) = (from[0] - to[0], from[1] - to[1], from[2] - to[2]);
+        let spot = if radius > 0.0 {
+            let reach = radius + self.body_radius(who);
+            if dx * dx + dy * dy + dz * dz <= reach * reach {
+                return Approach::InReach;
+            }
+            let angle = heading_of(facing).to_radians();
+            [
+                to[0] + angle.dcos() * reach,
+                to[1] + angle.dsin() * reach,
+                to[2],
+            ]
+        } else {
+            let reach = (self.body_radius(who) + 1.0).max(3.0);
+            let horizontal = (dx * dx + dy * dy).sqrt();
+            if horizontal <= reach + 0.05 {
+                return Approach::InReach;
+            }
+            // Use the existing native move-to-object goal search at the default band.
+            let mut movement = cmd.clone();
+            movement.seconds = reach;
+            movement.max_range = Some(reach);
+            let Some(goal) = self.move_to_object_goal(who, &movement) else {
+                return Approach::InReach;
+            };
+            goal.position
+        };
+        let distance = ((spot[0] - from[0]).powi(2)
+            + (spot[1] - from[1]).powi(2)
+            + (spot[2] - from[2]).powi(2))
+        .sqrt();
+        Approach::Walk(distance, spot)
     }
 
     /// Has `who` use `ability` on `target` (itself for an ability used on its user), from
@@ -205,6 +286,9 @@ impl Sim {
 
     /// Walks `who` up to `target` (a door, a container, a lever) and uses it.
     pub fn order_use(&mut self, who: ObjectId, target: ObjectId) {
+        if self.target_request_click(who, target, [0.0; 3]) {
+            return;
+        }
         self.note_player_order(who);
         let mut then = command(self, "COMMAND_TYPE_USE_OBJECT", "CommandUseObject");
         then.target = Some(target);
@@ -291,7 +375,14 @@ mod tests {
     use crate::world::ObjectKind;
 
     fn sim() -> (Sim, ObjectId, ObjectId) {
-        let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(EngineTable::default()), 1);
+        let table = EngineTable::parse(
+            b"int EVENT_TYPE_DIALOGUE = 18;\n\
+              int EVENT_TYPE_COMMAND_COMPLETE = 500;\n\
+              int COMMAND_TYPE_START_CONVERSATION = 18;\n\
+              int COMMAND_FAILED_INVALID_PATH = -4;\n",
+        )
+        .unwrap();
+        let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(table), 1);
         let area = s.world.spawn(ObjectKind::Area, "a");
         let hero = s.world.spawn(ObjectKind::Creature, "hero");
         let npc = s.world.spawn(ObjectKind::Creature, "npc");
@@ -320,8 +411,9 @@ mod tests {
     }
 
     #[test]
-    fn talking_walks_up_to_the_target_first() {
+    fn da2_talking_keeps_its_existing_approach() {
         let (mut s, hero, npc) = sim();
+        s.game = thedas_vfs::Game::DragonAge2;
         s.order_talk(hero, npc);
         let q = &s.world.get(hero).unwrap().commands;
         assert_eq!(q.len(), 2);
@@ -337,6 +429,200 @@ mod tests {
         let q = &s.world.get(hero).unwrap().commands;
         assert_eq!(q.len(), 1);
         assert_eq!(q[0].name, "CommandUseObject");
+    }
+
+    fn dialogue_requested(s: &Sim, npc: ObjectId) -> bool {
+        s.world.trace.entries.iter().any(|e| {
+            matches!(e,
+            crate::trace::TraceEntry::EventQueued { target, ty: 18, .. } if *target == npc)
+        })
+    }
+
+    #[test]
+    fn authored_talk_radius_includes_only_the_actors_body_and_needs_no_path() {
+        let (mut s, hero, npc) = sim();
+        s.world.trace.keep = true;
+        s.world.get_mut(npc).unwrap().interact_radius = Some(3.5);
+        let reach = 3.5 + s.body_radius(hero);
+        let from = [10.0 - reach + 1e-5, 0.0, 0.0];
+        s.world.get_mut(hero).unwrap().position = from;
+        s.order_talk(hero, npc);
+        s.tick(600);
+        assert_eq!(s.world.get(hero).unwrap().position, from);
+        assert!(dialogue_requested(&s, npc));
+        s.world.get_mut(hero).unwrap().position[0] -= 0.01;
+        s.order_talk(hero, npc);
+        s.tick(0);
+        assert!(s.world.get(hero).unwrap().commands[0].approach.is_some());
+    }
+
+    #[test]
+    fn authored_talk_approach_uses_the_targets_front_and_faces_it() {
+        let (mut s, hero, npc) = sim();
+        s.world.trace.keep = true;
+        s.world.get_mut(npc).unwrap().interact_radius = Some(5.0);
+        s.world.get_mut(npc).unwrap().facing = 0.0;
+        s.order_talk(hero, npc);
+        s.tick(0);
+        let goal = s.world.get(hero).unwrap().commands[0].approach.unwrap();
+        assert!((goal[0] - 10.0).abs() < 1e-4);
+        assert!((goal[1] - (5.0 + s.body_radius(hero))).abs() < 1e-4);
+        s.tick(10_000);
+        assert_eq!(s.world.get(hero).unwrap().position, goal);
+        assert!((s.world.get(hero).unwrap().facing - 180.0).abs() < 1e-4);
+        assert!(dialogue_requested(&s, npc));
+    }
+
+    #[test]
+    fn authored_talk_range_checks_height() {
+        let (mut s, hero, npc) = sim();
+        s.world.get_mut(npc).unwrap().interact_radius = Some(3.5);
+        s.world.get_mut(hero).unwrap().position = [10.0, 0.0, 5.0];
+        s.order_talk(hero, npc);
+        s.tick(0);
+        assert!(s.world.get(hero).unwrap().commands[0].approach.is_some());
+    }
+
+    #[test]
+    fn default_talk_band_is_horizontal_with_native_slack() {
+        for radius in [0.0, -1.0] {
+            let (mut s, hero, npc) = sim();
+            s.world.trace.keep = true;
+            s.world.get_mut(npc).unwrap().interact_radius = Some(radius);
+            let from = [6.96, 0.0, 2.0];
+            s.world.get_mut(hero).unwrap().position = from;
+            s.order_talk(hero, npc);
+            s.tick(600);
+            assert_eq!(s.world.get(hero).unwrap().position, from);
+            assert!(dialogue_requested(&s, npc));
+            s.world.get_mut(hero).unwrap().position[0] = 6.94;
+            s.order_talk(hero, npc);
+            s.tick(0);
+            let goal = s.world.get(hero).unwrap().commands[0].approach.unwrap();
+            assert!((goal[0] - 7.0).abs() < 1e-4);
+        }
+    }
+
+    #[test]
+    fn a_default_talk_approach_stops_when_the_target_moves_into_range() {
+        let (mut s, hero, npc) = sim();
+        s.world.trace.keep = true;
+        s.order_talk(hero, npc);
+        s.tick(0);
+        s.world.get_mut(npc).unwrap().position = [2.0, 0.0, 0.0];
+        s.tick(100);
+        let stopped = s.world.get(hero).unwrap().position;
+        s.tick(600);
+        assert_eq!(s.world.get(hero).unwrap().position, stopped);
+        assert!(stopped[0] < 2.0);
+        assert!(dialogue_requested(&s, npc));
+    }
+
+    #[test]
+    fn failed_talk_approach_drops_the_dialogue_and_preserves_later_orders() {
+        let (mut s, hero, npc) = sim();
+        s.world.trace.keep = true;
+        s.order_talk(hero, npc);
+        s.tick(0);
+        let wait = command(&s, "", "CommandWait");
+        s.world.get_mut(hero).unwrap().commands.push(wait);
+        s.fail_front_command(hero, "COMMAND_FAILED_INVALID_PATH");
+        assert_eq!(s.world.get(hero).unwrap().commands[0].name, "CommandWait");
+        s.tick(2000);
+        assert!(!dialogue_requested(&s, npc));
+    }
+
+    #[test]
+    fn a_talk_approach_blocked_by_the_target_fails_after_reload() {
+        let (mut s, hero, npc) = sim();
+        s.world.trace.keep = true;
+        s.world.get_mut(npc).unwrap().interact_radius = Some(0.1);
+        s.world.get_mut(npc).unwrap().facing = 90.0;
+        s.order_talk(hero, npc);
+        s.tick(0);
+        // The target moves into the required approach after preparation.
+        s.world.get_mut(npc).unwrap().position = [1.0, 0.0, 0.0];
+        for _ in 0..10 {
+            s.tick(100);
+        }
+        assert!(!s.world.get(hero).unwrap().commands.is_empty());
+        assert!(s.world.get(hero).unwrap().commands[0].seconds > 0.0);
+        let saved = s.save_game();
+        s.load_game(saved).unwrap();
+        for _ in 0..20 {
+            s.tick(100);
+        }
+        assert!(s.world.get(hero).unwrap().commands.is_empty());
+        assert!(!dialogue_requested(&s, npc));
+    }
+
+    #[test]
+    fn a_talk_approach_resumes_its_goal_across_save_reload() {
+        let (mut s, hero, npc) = sim();
+        s.world.trace.keep = true;
+        s.world.get_mut(npc).unwrap().interact_radius = Some(3.5);
+        s.order_talk(hero, npc);
+        s.tick(200);
+        let goal = s.world.get(hero).unwrap().commands[0].approach.unwrap();
+        s.load_game(s.save_game()).unwrap();
+        s.tick(10_000);
+        assert_eq!(s.world.get(hero).unwrap().position, goal);
+        assert!(dialogue_requested(&s, npc));
+    }
+
+    #[test]
+    fn a_successful_authored_approach_does_not_repeat_the_range_test() {
+        let (mut s, hero, npc) = sim();
+        s.world.trace.keep = true;
+        s.world.get_mut(npc).unwrap().interact_radius = Some(3.5);
+        s.order_talk(hero, npc);
+        s.tick(0);
+        let goal = s.world.get(hero).unwrap().commands[0].approach.unwrap();
+        s.world.get_mut(npc).unwrap().position[0] = 20.0;
+        s.tick(10_000);
+        assert_eq!(s.world.get(hero).unwrap().position, goal);
+        assert!(dialogue_requested(&s, npc));
+    }
+
+    #[test]
+    fn a_large_tick_cannot_complete_a_blocked_talk_or_its_following_order_early() {
+        let (mut s, hero, npc) = sim();
+        s.world.trace.keep = true;
+        s.world.get_mut(npc).unwrap().interact_radius = Some(0.1);
+        s.world.get_mut(npc).unwrap().facing = 90.0;
+        s.order_talk(hero, npc);
+        s.tick(0);
+        s.world.get_mut(npc).unwrap().position = [1.0, 0.0, 0.0];
+        let mut wait = command(&s, "", "CommandWait");
+        wait.seconds = 5.0;
+        s.world.get_mut(hero).unwrap().commands.push(wait);
+        s.tick(20_000);
+        let at = |name: &str, result: &str| {
+            s.world
+                .trace
+                .entries
+                .iter()
+                .find_map(|e| match e {
+                    crate::trace::TraceEntry::Command {
+                        t, command, status, ..
+                    } if command == name && status == result => Some(*t),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        let failed = at("CommandInitiateDialog", "failed -4");
+        assert_eq!(at("CommandWait", "complete") - failed, 5000);
+        assert!(!dialogue_requested(&s, npc));
+    }
+
+    #[test]
+    fn a_retried_talk_starts_a_fresh_blocking_timer() {
+        let (mut s, hero, npc) = sim();
+        s.order_talk(hero, npc);
+        // AddCommand resets executor fields while retaining the command's floats.
+        s.world.get_mut(hero).unwrap().commands[0].seconds = 2500.0;
+        s.tick(0);
+        assert_eq!(s.world.get(hero).unwrap().commands[0].seconds, 0.0);
     }
 
     #[test]
