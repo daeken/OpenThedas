@@ -59,7 +59,8 @@ after 3000 ms. The request at 0x696a60 preserves the first pending request.
 Opacity advances using client delta divided by 500 through 0x695a90.
 
 Animation playback, replacement/completion delivery, fading and destruction
-scheduling remain open under SCR-009. State-change PWK installation and
-full physics remain open as recorded in the walkmesh note. These static
+scheduling remain open under SCR-009. State-change PWK installation and door
+group restoration are implemented in `placeable-initial-state.md`; full
+physics remains open. These static
 traces used the existing Origins analysis files. The original executable
 was never run, and this note contains only our own description.

@@ -867,6 +867,17 @@ fn gui_table(vfs: &Vfs) -> Vec<Option<String>> {
 }
 
 impl GameAudio {
+    pub fn report_sounds(&self) -> serde_json::Value {
+        let now = std::time::Instant::now();
+        serde_json::json!({
+            "window_s": 10, "limit": 512,
+            "starts": self.engine.recent_starts().map(|s| serde_json::json!({
+                "age_s": now.saturating_duration_since(s.at).as_secs_f32(),
+                "event": s.event, "position": s.position, "sample": s.programmer_sound,
+            })).collect::<Vec<_>>(),
+        })
+    }
+
     /// The game's sound on the default output; `None` (logged) with no output device.
     pub fn open(install: &Path, module: &str, vfs: &Arc<Vfs>, language: &str) -> Option<GameAudio> {
         let output = thedas_audio::device::Output::open()?;
