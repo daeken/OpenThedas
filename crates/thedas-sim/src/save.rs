@@ -50,7 +50,9 @@ pub const SAVE_FORMAT: u32 = 1;
 ///   Earlier saves without State receive that initial value and its PWK footprint;
 ///   explicit saved states and their existing pathing writes are preserved.
 ///   An older no-op setter that left no State field cannot be distinguished.
-pub const SAVE_REVISION: u32 = 10;
+/// - 11: Origins death blows retain paired animation deadlines. Earlier opaque active
+///   death-blow commands restart preparation when loaded.
+pub const SAVE_REVISION: u32 = 11;
 
 /// The trace channel loading reports save damage on.
 pub const SAVE_CHANNEL: i32 = -7;
@@ -250,6 +252,19 @@ impl Sim {
         world.tables = self.world.tables.clone();
         world.trace = std::mem::take(&mut self.world.trace);
         world.trace.entries.clear();
+        // Older snapshots timed a death blow as an opaque 500 ms command. Its
+        // animation start was not saved, so restart preparation at the load time.
+        // A saved paired runtime already has exact deadlines and resumes intact.
+        if self.game == thedas_vfs::Game::Origins && save_revision < 11 {
+            for object in world.objects.values_mut() {
+                if object.combat.death_blow.is_none()
+                    && let Some(command) = object.commands.first_mut()
+                    && command.name == "CommandDeathBlow"
+                {
+                    command.due = None;
+                }
+            }
+        }
         // No training step survives a load: the exe disables saving while training mode is on
         // (script.ldf, SetTrainingMode: "Unpausing, Saving, Item Destruction" are disabled),
         // so no save of the original holds one, and a step waiting for a party member who is
