@@ -2120,13 +2120,16 @@ impl Sim {
     /// How long a command takes once it reaches the front of its queue. Waits take their time,
     /// weapon switches and jumps are done at once, and a move is timed by the straight-line
     /// distance at its owner's walk or run speed ([`Sim::command_speed`]); the walk itself
-    /// follows the pathing grid ([`crate::nav`]). Provisional: anything else takes half a
-    /// second, not its animation's length. Every command takes at least a
+    /// follows the pathing grid ([`crate::nav`]). Origins' PlayAnimation waits for its
+    /// animation chain and requested loops. Provisional: other commands take half a
+    /// second. Every command takes at least a
     /// millisecond, so scripts that queue a new command when one completes cannot loop
     /// forever within one instant.
-    fn command_duration(&self, id: ObjectId, cmd: &Command) -> u64 {
+    fn command_duration(&mut self, id: ObjectId, cmd: &Command) -> u64 {
         let ms = if cmd.name == "CommandWait" {
             (cmd.seconds.max(0.0) * 1000.0) as u64
+        } else if cmd.name == "CommandPlayAnimation" && self.game == thedas_vfs::Game::Origins {
+            self.play_animation_duration(id, cmd).unwrap_or(0)
         } else if cmd.name == "CommandSwitchWeaponSet" {
             // Done as soon as it runs (its executor, 0x7a1ed0, returns complete).
             0
@@ -2854,6 +2857,9 @@ impl Sim {
             .filter_map(|&id| self.world.get(id))
             .filter_map(|o| {
                 let c = o.commands.first()?;
+                if c.name == "CommandPlayAnimation" {
+                    return None;
+                }
                 let (from, t0) = c.from?;
                 let due = c.due?;
                 let points =
@@ -3551,6 +3557,12 @@ impl Sim {
                     }
                 }
                 None => {
+                    if !da2
+                        && cmd.name != "CommandWait"
+                        && let Some(o) = self.world.get_mut(id)
+                    {
+                        o.looping_animation = None;
+                    }
                     if self.game == thedas_vfs::Game::DragonAge2
                         && cmd.name == "CommandUseAbility"
                         && cmd.ints.first() == Some(&1)
@@ -3835,11 +3847,14 @@ impl Sim {
                             }
                         }
                     }
-                    let d = now + ms.max(1);
+                    let d = now.saturating_add(ms.max(1));
+                    let play_animation = cmd.name == "CommandPlayAnimation"
+                        && self.game == thedas_vfs::Game::Origins;
                     if let Some(c) = self.world.get_mut(id).and_then(|o| o.commands.first_mut()) {
                         c.due = Some(d);
                         if c.name.starts_with("CommandMoveTo")
                             || c.name == "CommandMoveAwayFromObject"
+                            || play_animation
                         {
                             c.from = pos.map(|p| (p, now));
                             c.path = path;
@@ -4137,7 +4152,16 @@ impl Sim {
         if cmd.name == "CommandUseAbility" {
             self.complete_da2_combat_target(id);
         }
+        let continuing = if self.game == thedas_vfs::Game::Origins {
+            self.continuing_animation(&cmd)
+        } else {
+            None
+        };
+        let result = if continuing.is_some() { 2 } else { 1 };
         if let Some(o) = self.world.get_mut(id) {
+            if continuing.is_some() {
+                o.looping_animation = continuing;
+            }
             o.combat.previous_command = Some(cmd.clone());
         }
         self.update_perception();
@@ -4145,10 +4169,10 @@ impl Sim {
             t: self.world.time_ms,
             object: id,
             command: cmd.name.clone(),
-            status: "complete".into(),
+            status: if result == 2 { "looping" } else { "complete" }.into(),
         });
         let mut ev = self.new_event("COMMAND_COMPLETE", Some(id));
-        ev.ints = vec![cmd.ty, 1];
+        ev.ints = vec![cmd.ty, result];
         self.world.queue_event(0, id, ev, None);
     }
 
@@ -6781,7 +6805,7 @@ mod tests {
             is_static: false,
         };
         let o = s.world.get_mut(id).unwrap();
-        o.commands.push(cmd("CommandPlayAnimation", 0.0));
+        o.commands.push(cmd("CommandSheatheWeapons", 0.0));
         o.commands.push(cmd("CommandWait", 2.0));
         s.tick(100);
         assert_eq!(s.world.get(id).unwrap().commands.len(), 2);

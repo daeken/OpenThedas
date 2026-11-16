@@ -2183,8 +2183,8 @@ const SPELL_CONJURING_SPEEDS: i32 = 0x87;
 /// The animation tables (M2DA 0, `anim_*.gda`): the tree action an animation id plays
 /// (0x5cb558 maps the actions to ids), and the animation that follows it (0x5ca6c3: a
 /// conjure's start is followed by its loop).
-const COL_ANIM_ACTION: u32 = 0x7a39_8af9;
-const COL_ANIM_NEXT: u32 = 0xffc3_72e7;
+pub(crate) const COL_ANIM_ACTION: u32 = 0x7a39_8af9;
+pub(crate) const COL_ANIM_NEXT: u32 = 0xffc3_72e7;
 /// Animation event kinds that deliver an ability: the creature's animation-event handler
 /// (0x6c0bf0, its switch at 0x6c0c37) sends `ABILITY_CAST_IMPACT` on kind 7 (0x6c0c5f,
 /// 0x6af430); kind 9 goes on (0x6c0d2e, 0x694ee0) to the creature's release (0x6b6f60),
@@ -2280,7 +2280,7 @@ impl Sim {
     /// The trees a creature's ability animations are looked up in, first to last: its main
     /// weapon's own tree (`bitm_base.gda`, e.g. `Staff.anb`), its weapon-style tree, its
     /// combat tree. Provisional (see [`Sim::ability_timing`]).
-    fn ability_trees(&self, id: ObjectId) -> Vec<String> {
+    pub(crate) fn ability_trees(&self, id: ObjectId) -> Vec<String> {
         let mut trees = Vec::new();
         let slot = constant_of(self, "INVENTORY_SLOT_MAIN");
         let weapon = self
@@ -2315,7 +2315,11 @@ impl Sim {
 
     /// An action's animation in the first of `trees` that has it (cached by tree and
     /// action).
-    fn ability_anim(&mut self, trees: &[String], action: &str) -> Option<AbilityAnimLen> {
+    pub(crate) fn ability_anim(
+        &mut self,
+        trees: &[String],
+        action: &str,
+    ) -> Option<AbilityAnimLen> {
         for tree in trees {
             let key = format!("{tree}|{action}");
             let found = match self.ability_anims.get(&key) {
@@ -2370,7 +2374,7 @@ pub(crate) struct AbilityAnimLen {
 /// as DAOrigins.exe's test (0x695390) reads it when the creature has no animation component
 /// to ask (0x6953ad -> 0x5ca610 with mask 1): set on the conjure loops (4097), clear on
 /// their starts (4096). With a component it asks the component (0xa5e940), not traced.
-fn anim_loops(anims: &crate::m2da::Table, anim: i64) -> bool {
+pub(crate) fn anim_loops(anims: &crate::m2da::Table, anim: i64) -> bool {
     matches!(anims.cell_by_hash(COL_ANIM_FLAGS, anim), Some(thedas_formats::gda::Cell::Int(v)) if v & 1 != 0)
 }
 

@@ -906,7 +906,7 @@ fn creature_motion(sim: &Sim, o: &Object, standing: bool) -> Option<Motion> {
         });
     }
     if let Some(c) = o.commands.first().filter(|_| !standing) {
-        if c.from.is_some() {
+        if c.from.is_some() && c.name != "CommandPlayAnimation" {
             let list = if fighting {
                 trees(&[&combat_move, &movement])
             } else {
@@ -938,6 +938,13 @@ fn creature_motion(sim: &Sim, o: &Object, standing: bool) -> Option<Motion> {
                 });
             }
         }
+    }
+    if !standing
+        && !fighting
+        && let Some(c) = &o.looping_animation
+        && let Some(m) = played_animation(sim, o, c, &trees(&[&ambient, &combat]))
+    {
+        return Some(m);
     }
     Some(Motion {
         trees: if fighting {
@@ -1054,11 +1061,10 @@ pub const COL_ANIM_ACTION: u32 = 0x7a39_8af9;
 
 /// What a creature playing `CommandPlayAnimation` (nAnimation, nLoops, bPlayNext,
 /// bBlendIn; `script.ldf`) shows: the `anim_base.gda` row's action in its ambient trees.
-/// An animation played forever (nLoops -1: the ambient system's sitting, leaning and
-/// working loops, `ambient_anim_patterns.gda`) loops on the world's clock, out of step per
-/// creature; any other plays from the command's start, held at its end. Provisional: the
-/// executable's command executor and its loop count are not traced; the simulation ends
-/// the command after half a second and the ambient scripts queue it again.
+/// Animation-table loops repeat from their recorded start, including the loop left
+/// playing after COMMAND_LOOPING releases the queue. Provisional: the
+/// presentation still shows the initial action rather than following the command's
+/// transition/loop/end stages; the simulation times those stages separately.
 fn played_animation(
     sim: &Sim,
     o: &Object,
@@ -1066,19 +1072,32 @@ fn played_animation(
     trees: &[String],
 ) -> Option<Motion> {
     let id = *c.ints.first()?;
-    let action = text(
-        sim.world
-            .tables()
-            .get(0, "anim_base")?
-            .cell_by_hash(COL_ANIM_ACTION, id as i64),
-    )?;
+    let origins = sim.game == thedas_vfs::Game::Origins;
+    let anims = sim
+        .world
+        .tables()
+        .get(0, if origins { "" } else { "anim_base" })?;
+    let action = text(anims.cell_by_hash(COL_ANIM_ACTION, id as i64))?;
     let now = sim.world.time_ms;
-    let looping = c.ints.get(1) == Some(&-1);
-    let time = if looping {
+    let looping = if origins {
+        c.ints.get(1).is_some_and(|&n| n != 0)
+            && matches!(anims.cell_by_hash(0x12a0_2374, id as i64), Some(Cell::Int(flags)) if flags & 1 != 0)
+    } else {
+        c.ints.get(1) == Some(&-1)
+    };
+    let time = if looping && c.from.is_none() {
         now as f32 / 1000.0 + (o.id % 97) as f32 * 0.37
     } else {
-        let start = c.due.map_or(now, |d| d.saturating_sub(500));
-        now.saturating_sub(start) as f32 / 1000.0
+        let start = c.from.map_or_else(
+            || c.due.map_or(now, |d| d.saturating_sub(500)),
+            |(_, start)| start,
+        );
+        let speed = if origins && c.seconds > 0.0 {
+            c.seconds
+        } else {
+            1.0
+        };
+        now.saturating_sub(start) as f32 / 1000.0 * speed
     };
     Some(Motion {
         trees: trees.to_vec(),
@@ -1767,6 +1786,93 @@ mod tests {
             .fields
             .insert(CORPSE_APPEARANCE.into(), 8);
         assert_eq!(model(&s).as_deref(), Some(DEFAULT_CORPSE_MODEL));
+    }
+
+    #[test]
+    fn a_scripted_animation_uses_its_recorded_start_with_a_long_deadline() {
+        use std::sync::Arc;
+        use thedas_script::{EngineTable, vm::Value};
+        use thedas_sim::{sim::ScriptHost, world::EngineData};
+        use thedas_vfs::Vfs;
+        let table = EngineTable::parse(
+            b"#define ENGINE_STRUCTURE_2 command\n\
+            command CommandPlayAnimation(int a) = 569;\n",
+        )
+        .unwrap();
+        let f = table
+            .function_by_name("CommandPlayAnimation")
+            .unwrap()
+            .clone();
+        let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(table), 1);
+        s.world.tables().insert(
+            "#0",
+            &["#7a398af9", "#12a02374"],
+            vec![
+                (10, vec![Cell::String("emote".into()), Cell::Int(0)]),
+                (11, vec![Cell::String("sit".into()), Cell::Int(1)]),
+            ],
+        );
+        s.world.tables().insert(
+            "apr_base",
+            &["#500976ec", "#de80b418"],
+            vec![(
+                0,
+                vec![
+                    Cell::String("emotes.anb".into()),
+                    Cell::String("combat.anb".into()),
+                ],
+            )],
+        );
+        let id = s.world.spawn(ObjectKind::Creature, "actor");
+        let mut host = ScriptHost {
+            sim: &mut s,
+            event: None,
+            script: "test".into(),
+        };
+        let Some(Value::Engine { handle, .. }) =
+            thedas_sim::engine::call(&mut host, id, &f, &[Value::Int(10)])
+                .unwrap()
+                .unwrap()
+        else {
+            panic!("handle")
+        };
+        let Some(EngineData::Command(cmd)) = s.world.handle(handle) else {
+            panic!("command")
+        };
+        let mut cmd = cmd.clone();
+        cmd.due = Some(4500);
+        cmd.from = Some(([0.0; 3], 1000));
+        s.world.time_ms = 1750;
+        let m = played_animation(&s, s.world.get(id).unwrap(), &cmd, &[]).unwrap();
+        assert!((m.time - 0.75).abs() < 1e-6);
+        s.world.get_mut(id).unwrap().commands.push(cmd.clone());
+        let m = motion(&s, s.world.get(id).unwrap()).unwrap();
+        assert_eq!(
+            m.actions[0], "emote",
+            "a recorded start does not make an animation run"
+        );
+        assert!((m.time - 0.75).abs() < 1e-6);
+        // Saves from before start-time tracking retain their previous presentation.
+        cmd.from = None;
+        cmd.due = Some(2000);
+        let m = played_animation(&s, s.world.get(id).unwrap(), &cmd, &[]).unwrap();
+        assert!((m.time - 0.25).abs() < 1e-6);
+        cmd.from = Some(([0.0; 3], 1000));
+        cmd.ints = vec![11, 2];
+        let m = played_animation(&s, s.world.get(id).unwrap(), &cmd, &[]).unwrap();
+        assert!(m.looping, "finite table-marked loops also repeat");
+        cmd.ints = vec![10, -1];
+        let m = played_animation(&s, s.world.get(id).unwrap(), &cmd, &[]).unwrap();
+        assert!(!m.looping, "an entering animation does not repeat");
+        cmd.ints = vec![11, -1];
+        let o = s.world.get_mut(id).unwrap();
+        o.commands.clear();
+        o.looping_animation = Some(cmd);
+        let m = motion(&s, s.world.get(id).unwrap()).unwrap();
+        assert_eq!(m.actions[0], "sit");
+        assert!(m.looping);
+        let idle = standing_motion(&s, s.world.get(id).unwrap()).unwrap();
+        assert_eq!(idle.actions[0], action::PAUSE);
     }
 
     #[test]
