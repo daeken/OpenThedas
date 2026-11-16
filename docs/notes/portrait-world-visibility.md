@@ -8,8 +8,12 @@ hero portrait. Its cached portrait and the renderer's visibility state are not
 part of the simulation save.
 
 Replaying the report's `session.jsonl` through the playtest harness, starting at
-`start human-noble`, reproduces the black HUD portrait after the introduction and
-after movement. Inventory still draws the hero.
+`start human-noble`, reproduces the black HUD portrait after the introduction.
+The issue also reports persistence after movement and a working inventory
+paperdoll. The local older replay's later movement/inventory actions reached
+different UI states, so those frames are diagnostic rather than matched-state
+comparisons. A merged-source new-game run using offered dialogue replies shows
+the portrait both before and after movement, and a working inventory paperdoll.
 
 Engine diagnostics at the first portrait capture after character creation showed
 ten hero model draws ready, with renderer draw opacity **0**. The introduction's
