@@ -386,6 +386,7 @@ impl Blend {
     }
 }
 
+#[derive(Clone)]
 struct Op {
     mesh: Arc<GpuMesh>,
     uniform: u32,
@@ -468,7 +469,18 @@ pub struct Renderer {
     pub draws: usize,
     filters: crate::filters::Filters,
     filter_stack: Vec<DisplayId>,
+    /// Flattened filter/layer pictures, reused when their actual draw inputs agree.
+    filtered: HashMap<DisplayId, Filtered>,
+    filtered_seen: std::collections::HashSet<DisplayId>,
     masking: bool,
+}
+
+struct Filtered {
+    source: Build,
+    filters: Vec<crate::swf::Filter>,
+    size: (u32, u32),
+    scale: u32,
+    mesh: Option<Arc<GpuMesh>>,
 }
 
 /// A pipeline: blend, stencil use, target format, samples.
@@ -655,6 +667,8 @@ impl Renderer {
             draws: 0,
             filters: crate::filters::Filters::new(device, format),
             filter_stack: Vec::new(),
+            filtered: HashMap::new(),
+            filtered_seen: Default::default(),
             masking: false,
         }
     }
@@ -807,6 +821,9 @@ impl Renderer {
             if w == 0 || h == 0 || rgba.len() != w as usize * h as usize * 4 {
                 return;
             }
+            // Same-size updates keep their bindings, but change the pixels sampled by
+            // a flattened subtree (a portrait or paperdoll, including nested layers).
+            self.filtered.clear();
             let mut pixels = rgba.to_vec();
             premultiply(&mut pixels);
             if let Some(old) = old
@@ -822,6 +839,7 @@ impl Renderer {
                 *slot = Some(EngineImage { texture, binding });
             }
         } else if let Some(old) = old {
+            self.filtered.clear();
             // Keep existing meshes valid while clearing the target, and reuse its storage
             // if the engine supplies another frame of the same size later.
             write_image(
@@ -884,6 +902,7 @@ impl Renderer {
             clip: [0.0; 4],
         };
         self.stats = RenderStats::default();
+        self.filtered_seen.clear();
         let started = std::time::Instant::now();
         let root = player.vm.root;
         self.walk(
@@ -905,6 +924,7 @@ impl Renderer {
             .retain(|d, _| player.vm.display.get(*d).is_some());
         self.drawings
             .retain(|d, _| player.vm.display.get(*d).is_some());
+        self.filtered.retain(|d, _| self.filtered_seen.contains(d));
         b
     }
 
@@ -2108,34 +2128,59 @@ impl Renderer {
                 &mut source,
             );
             self.filter_stack.pop();
-            let targets = self.create_targets((view.w as u32, view.h as u32));
-            self.draw_build(source, &targets);
-            let output = self.filters.apply(
-                &self.device,
-                &self.queue,
-                targets.output,
-                &filters,
-                view.k * 20.0,
-            );
-            let binding = self.make_tex(&output, crate::gpu::SAMPLER_CLAMP);
-            let mesh = Mesh {
-                paint: Paint::Solid,
-                vertices: [
-                    (-1.0, 1.0, 0.0, 0.0),
-                    (1.0, 1.0, 1.0, 0.0),
-                    (1.0, -1.0, 1.0, 1.0),
-                    (-1.0, -1.0, 0.0, 1.0),
-                ]
-                .map(|(x, y, u, v)| Vertex {
-                    pos: [x, y],
-                    uv: [u, v],
-                    color: [255; 4],
-                    extrude: [0.0; 2],
-                })
-                .to_vec(),
-                indices: vec![0, 1, 2, 0, 2, 3],
+            self.filtered_seen.insert(d);
+            let size = (view.w as u32, view.h as u32);
+            let scale = (view.k * 20.0).to_bits();
+            let hit = self.filtered.get(&d).filter(|f| {
+                f.size == size
+                    && f.scale == scale
+                    && f.filters == filters
+                    && f.source.same_picture(&source)
+            });
+            let mesh = if let Some(hit) = hit {
+                hit.mesh.clone()
+            } else {
+                let targets = self.create_targets(size);
+                self.draw_build(source.clone(), &targets);
+                let output = self.filters.apply(
+                    &self.device,
+                    &self.queue,
+                    targets.output,
+                    &filters,
+                    f32::from_bits(scale),
+                );
+                let binding = self.make_tex(&output, crate::gpu::SAMPLER_CLAMP);
+                let mesh = Mesh {
+                    paint: Paint::Solid,
+                    vertices: [
+                        (-1.0, 1.0, 0.0, 0.0),
+                        (1.0, 1.0, 1.0, 0.0),
+                        (1.0, -1.0, 1.0, 1.0),
+                        (-1.0, -1.0, 0.0, 1.0),
+                    ]
+                    .map(|(x, y, u, v)| Vertex {
+                        pos: [x, y],
+                        uv: [u, v],
+                        color: [255; 4],
+                        extrude: [0.0; 2],
+                    })
+                    .to_vec(),
+                    indices: vec![0, 1, 2, 0, 2, 3],
+                };
+                let mesh = self.upload(&mesh, Some(binding), 1.0, Matrix::IDENTITY);
+                self.filtered.insert(
+                    d,
+                    Filtered {
+                        source,
+                        filters,
+                        size,
+                        scale,
+                        mesh: mesh.clone(),
+                    },
+                );
+                mesh
             };
-            if let Some(mesh) = self.upload(&mesh, Some(binding), 1.0, Matrix::IDENTITY) {
+            if let Some(mesh) = mesh {
                 let u = b.uniforms.len() as u32;
                 b.uniforms.push(DrawU {
                     m0: [1.0, 0.0, 0.0, 0.0],
@@ -2630,6 +2675,7 @@ struct Viewport {
     h: f32,
 }
 
+#[derive(Clone)]
 struct Build {
     ops: Vec<Op>,
     uniforms: Vec<DrawU>,
@@ -2811,6 +2857,22 @@ impl Grid {
 }
 
 impl Build {
+    /// Compare the ordered draw inputs, retaining the meshes so their identities cannot
+    /// be recycled underneath a cache entry. Uniforms include transforms, tint, masks
+    /// and viewport; nested filters contribute their own cached output meshes.
+    fn same_picture(&self, other: &Self) -> bool {
+        bytemuck::cast_slice::<DrawU, u8>(&self.uniforms)
+            == bytemuck::cast_slice::<DrawU, u8>(&other.uniforms)
+            && self.ops.len() == other.ops.len()
+            && self.ops.iter().zip(&other.ops).all(|(a, b)| {
+                Arc::ptr_eq(&a.mesh, &b.mesh)
+                    && a.uniform == b.uniform
+                    && a.blend == b.blend
+                    && a.stencil == b.stencil
+                    && a.reference == b.reference
+            })
+    }
+
     fn push(&mut self, m: &Arc<GpuMesh>, u: u32, blend: Blend, stencil: u32) {
         let mut un = self.uniforms[u as usize];
         if m.fixed_rgb {
@@ -3177,6 +3239,147 @@ mod shadow_tests {
             ..Default::default()
         });
         id
+    }
+
+    #[test]
+    fn filtered_pictures_reuse_draw_inputs_and_follow_changes() {
+        let (device, queue) = crate::gpu::test_device();
+        let mut p = blend_player();
+        let root = p.vm.root;
+        let group = crate::player::create_empty(&mut p.vm, root, "filtered", 1).unwrap();
+        p.vm.display.get_mut(group).unwrap().filters = vec![crate::swf::Filter::Blur {
+            blur: (3.0, 3.0),
+            passes: 1,
+        }];
+        let child = quad(&mut p, group, 0, [255, 0, 0, 255], 320.0);
+        let sibling = quad(&mut p, root, 2, [0, 0, 255, 255], 80.0);
+        let mut r = Renderer::new(&device, &queue, wgpu::TextureFormat::Rgba8Unorm);
+        r.render(&mut p, &mut Empty, (32, 32));
+        let cached = r.filtered[&group].mesh.clone().unwrap();
+        let first = r.capture().unwrap();
+        r.render(&mut p, &mut Empty, (32, 32));
+        assert!(Arc::ptr_eq(
+            &cached,
+            r.filtered[&group].mesh.as_ref().unwrap()
+        ));
+        assert_eq!(r.capture().unwrap(), first);
+        // A changing sibling (e.g. the name field's caret) must not redo the filter.
+        p.vm.display.get_mut(sibling).unwrap().matrix.tx = 480.0;
+        r.render(&mut p, &mut Empty, (32, 32));
+        assert!(Arc::ptr_eq(
+            &cached,
+            r.filtered[&group].mesh.as_ref().unwrap()
+        ));
+
+        for change in 0..7 {
+            let old = r.filtered[&group].mesh.clone().unwrap();
+            let size = if change == 6 { (64, 48) } else { (32, 32) };
+            match change {
+                0 => p.vm.display.get_mut(group).unwrap().matrix.tx = 80.0,
+                1 => p.vm.display.get_mut(child).unwrap().color.mul[0] = 0.5,
+                2 => p.vm.display.get_mut(child).unwrap().matrix.ty = 80.0,
+                3 => {
+                    p.vm.display
+                        .get_mut(child)
+                        .unwrap()
+                        .clip_mut()
+                        .unwrap()
+                        .drawing
+                        .as_mut()
+                        .unwrap()
+                        .fills[0]
+                        .0 = [0, 255, 0, 255];
+                }
+                4 => {
+                    p.vm.display.get_mut(group).unwrap().filters = vec![crate::swf::Filter::Blur {
+                        blur: (7.0, 7.0),
+                        passes: 2,
+                    }]
+                }
+                5 => p.vm.display.get_mut(child).unwrap().visible = false,
+                _ => {}
+            }
+            r.render(&mut p, &mut Empty, size);
+            assert!(
+                !Arc::ptr_eq(&old, r.filtered[&group].mesh.as_ref().unwrap()),
+                "change {change}"
+            );
+            let cached_pixels = r.capture().unwrap();
+            // Recompute the same frame without retained filter pictures, pixel for pixel.
+            r.filtered.clear();
+            r.render(&mut p, &mut Empty, size);
+            assert_eq!(r.capture().unwrap(), cached_pixels, "change {change}");
+        }
+        p.vm.display.get_mut(group).unwrap().visible = false;
+        r.render(&mut p, &mut Empty, (32, 32));
+        assert!(
+            !r.filtered.contains_key(&group),
+            "hidden pictures release their targets"
+        );
+    }
+
+    #[test]
+    fn nested_filtered_pictures_follow_same_size_engine_image_updates() {
+        use crate::swf::{ExternalImage, Fill, Shape};
+
+        let (device, queue) = crate::gpu::test_device();
+        let mut p = blend_player();
+        let root = p.vm.root;
+        let layer = crate::player::create_empty(&mut p.vm, root, "layer", 0).unwrap();
+        p.vm.display.get_mut(layer).unwrap().blend = BlendMode::Layer;
+        let child = crate::player::create_empty(&mut p.vm, layer, "portrait", 0).unwrap();
+        let shape = Arc::new(Shape {
+            bounds: Rect {
+                x_max: 640,
+                y_max: 640,
+                ..Default::default()
+            },
+            fills: vec![Fill::Bitmap {
+                id: 1,
+                matrix: Matrix::IDENTITY,
+                repeat: false,
+                smooth: true,
+            }],
+            ..Default::default()
+        });
+        let mut movie = Movie {
+            stage: p.vm.movie.stage,
+            ..Default::default()
+        };
+        movie.characters.insert(
+            1,
+            Character::Image(ExternalImage {
+                format: 14,
+                width: 2,
+                height: 2,
+                export_name: String::new(),
+                file: "paperdoll.dds".into(),
+            }),
+        );
+        movie.characters.insert(2, Character::Shape(shape.clone()));
+        p.vm.movie = Arc::new(movie);
+        let o = p.vm.display.get_mut(child).unwrap();
+        o.kind = Kind::Shape(shape, 2);
+        o.filters = vec![crate::swf::Filter::Blur {
+            blur: (3.0, 3.0),
+            passes: 1,
+        }];
+        let mut r = Renderer::new(&device, &queue, wgpu::TextureFormat::Rgba8Unorm);
+        for color in [[255, 0, 0, 255], [0, 0, 255, 255]] {
+            r.set_engine_image("paperdoll", Some((2, 2, &color.repeat(4))));
+            r.render(&mut p, &mut Empty, (32, 32));
+            let (_, _, pixels) = r.capture().unwrap();
+            assert_eq!(&pixels[(16 * 32 + 16) * 4..(16 * 32 + 17) * 4], &color);
+            let cached = r.filtered[&layer].mesh.clone().unwrap();
+            r.render(&mut p, &mut Empty, (32, 32));
+            assert!(Arc::ptr_eq(
+                &cached,
+                r.filtered[&layer].mesh.as_ref().unwrap()
+            ));
+        }
+        r.set_engine_image("paperdoll", None);
+        r.render(&mut p, &mut Empty, (32, 32));
+        assert!(r.capture().unwrap().2.iter().all(|b| *b == 0));
     }
 
     #[test]
