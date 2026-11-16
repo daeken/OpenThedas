@@ -2341,7 +2341,7 @@ impl Sim {
                 }
             }
             self.move_object(id, p, None);
-            if Some(id) == self.world.hero {
+            if Some(id) == self.world.controlled() {
                 self.follow_leader(id);
             }
             self.tick(((d / speed) * 1000.0).round().max(1.0) as u64);
@@ -2359,21 +2359,50 @@ impl Sim {
         door.is_none()
     }
 
-    /// Keeps the hero's followers with it as [`Sim::walk`] steps it along: each living
+    /// Followers and their slots before movement eligibility is tested. Both Origins
+    /// (0x631d90, called at 0x760f68) and DA2 (0x5c6f90, called at 0x5e181c)
+    /// use party index - 1; member zero takes the controlled member's vacated slot.
+    /// Non-party followers follow the party, never preceding its active members.
+    pub(crate) fn follower_formation(&self, leader: ObjectId) -> Vec<(ObjectId, usize)> {
+        let members = crate::engine::party_of(self);
+        let Some(leader_index) = members.iter().position(|&id| id == leader) else {
+            return Vec::new();
+        };
+        let mut formation: Vec<_> = members
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|&(_, id)| id != leader)
+            .map(|(i, id)| {
+                let index = if i == 0 { leader_index } else { i };
+                (id, index - 1)
+            })
+            .collect();
+        if let Some(hero) = self.world.hero.and_then(|h| self.world.get(h)) {
+            for (i, &id) in hero.escorts.iter().enumerate() {
+                if !members.contains(&id) {
+                    formation.push((id, members.len() + i - 1));
+                }
+            }
+        }
+        formation
+    }
+
+    /// Keeps the party with its leader as [`Sim::walk`] steps it along: each living
     /// follower in the same area that follows the leader (`SetFollowPartyLeader`, on unless
     /// turned off) and is not fighting or busy with anything but waiting or its own follow
     /// move is put on its formation slot behind the leader ([`behind`], the exe's table at
     /// 0xc0d240). Provisional: followers are placed rather than walked (this serves the
     /// stepped walk of the tools; in play `Sim::keep_party_together` runs them there).
     pub fn follow_leader(&mut self, leader: ObjectId) {
-        let Some((pos, area, facing, followers)) = self.world.get(leader).map(|o| {
-            let mut all = o.followers.clone();
-            all.extend(o.escorts.iter().copied());
-            (o.position, o.area, o.facing, all)
-        }) else {
+        let Some((pos, area, facing)) = self
+            .world
+            .get(leader)
+            .map(|o| (o.position, o.area, o.facing))
+        else {
             return;
         };
-        for (i, f) in followers.into_iter().enumerate() {
+        for (f, i) in self.follower_formation(leader) {
             // A move of its own (a script's order, such as Alistair's walk to the tent after
             // Ostagar's war council) is left to finish: carried along meanwhile, it was
             // resumed when the walk stopped, and the follower walked back across the camp.
@@ -2398,10 +2427,10 @@ impl Sim {
     /// follows the leader (`SetFollowPartyLeader`, on unless turned off), is not fighting
     /// and has nothing to do but wait or its own follow move runs to its place behind the
     /// leader once it is more than [`FOLLOW_START`] from it, and is sent on again when that
-    /// place moves more than [`FOLLOW_RETARGET`] from where it is heading. Places are where
-    /// followers arrive with the leader (`behind`). Provisional: the original's party follow
-    /// (its distances, formation and pathing) is not traced; this keeps followers with the
-    /// leader the way [`Sim::follow_leader`] does for [`Sim::walk`].
+    /// place moves more than [`FOLLOW_RETARGET`] from where it is heading. Places use the
+    /// ordinary follow table (`behind`), with the same membership order as
+    /// [`Sim::follow_leader`]. Provisional: movement-vector heading, formation mirroring,
+    /// perception-based warping and the full native re-target rule are not modelled.
     pub fn keep_party_together(&mut self) {
         let combat = constant(&self.table, "GM_COMBAT");
         let Some(leader) = self.world.controlled().or(self.world.hero) else {
@@ -2443,11 +2472,7 @@ impl Sim {
                 .first()
                 .is_some_and(|c| c.name.starts_with("CommandMoveTo") && c.from.is_some())
         });
-        let followers: Vec<ObjectId> = crate::engine::party_of(self)
-            .into_iter()
-            .filter(|&f| f != leader)
-            .collect();
-        for (i, f) in followers.into_iter().enumerate() {
+        for (f, i) in self.follower_formation(leader) {
             let ours = self.following.contains(&f);
             let Some(o) = self.world.get(f) else { continue };
             let free = !o.dead
@@ -6505,6 +6530,56 @@ mod tests {
     }
 
     #[test]
+    fn arrival_does_not_place_active_recruits_twice() {
+        for game in [thedas_vfs::Game::Origins, thedas_vfs::Game::DragonAge2] {
+            let table =
+                EngineTable::parse(format!("{LDF}\nint FOLLOWER_STATE_ACTIVE = 1;\n").as_bytes())
+                    .unwrap();
+            let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(table), 7);
+            s.game = game;
+            let old = s.world.spawn(ObjectKind::Area, "old");
+            let area = s.world.spawn(ObjectKind::Area, "next");
+            s.world.get_mut(area).unwrap().template = "next".into();
+            s.world.area = Some(old);
+            let hero = s.world.spawn(ObjectKind::Creature, "hero");
+            let a = s.world.spawn(ObjectKind::Creature, "a");
+            let b = s.world.spawn(ObjectKind::Creature, "b");
+            s.world.hero = Some(hero);
+            s.world.get_mut(hero).unwrap().followers = vec![a, b];
+            let active = constant(&s.table, "FOLLOWER_STATE_ACTIVE");
+            assert_ne!(active, 0);
+            for id in [hero, a, b] {
+                let o = s.world.get_mut(id).unwrap();
+                o.area = Some(old);
+                if id != hero {
+                    o.fields.insert("FollowerState".into(), active);
+                }
+            }
+            assert_eq!(s.party_pool(), [a, b]);
+            let wp = s.world.spawn(ObjectKind::Waypoint, "entry");
+            let o = s.world.get_mut(wp).unwrap();
+            o.area = Some(area);
+            o.position = [20.0, 30.0, 0.0];
+            s.area_transition("next", "entry");
+            for (id, want) in [(a, [19.0, 29.5, 0.0]), (b, [21.0, 29.5, 0.0])] {
+                assert_eq!(s.world.get(id).unwrap().position, want, "{game:?}");
+                let enters = s
+                    .world
+                    .queue
+                    .values()
+                    .filter(|q| q.target == area && q.event.objects == [id])
+                    .count();
+                assert_eq!(enters, 1, "each recruit hears ENTER once");
+            }
+            // Loading a historical bad position must not silently rearrange the save.
+            s.world.get_mut(a).unwrap().position = [20.0, 27.5, 0.0];
+            let saved = s.save_game();
+            s.load_game(saved).unwrap();
+            assert_eq!(s.world.get(a).unwrap().position, [20.0, 27.5, 0.0]);
+        }
+    }
+
+    #[test]
     fn arrival_keeps_blocked_points_and_searches_off_grid() {
         let mut s = sim();
         let area = s.world.spawn(ObjectKind::Area, "a");
@@ -6937,6 +7012,110 @@ mod tests {
             p[1] > 5.0 && p[0].abs() < 1.0,
             "on his way to the tent: {p:?}"
         );
+    }
+
+    #[test]
+    fn following_preserves_party_slots_when_any_member_leads() {
+        for game in [thedas_vfs::Game::Origins, thedas_vfs::Game::DragonAge2] {
+            for timed in [false, true] {
+                for leader_index in 0..4 {
+                    let mut s = sim();
+                    s.game = game;
+                    let area = s.world.spawn(ObjectKind::Area, "a");
+                    let members: Vec<_> = (0..4)
+                        .map(|i| s.world.spawn(ObjectKind::Creature, &format!("member{i}")))
+                        .collect();
+                    let escort = s.world.spawn(ObjectKind::Creature, "escort");
+                    let leader = members[leader_index];
+                    s.world.hero = Some(members[0]);
+                    s.world.controlled = Some(leader);
+                    s.world.get_mut(members[0]).unwrap().followers = members[1..].to_vec();
+                    s.world.get_mut(members[0]).unwrap().escorts = vec![escort];
+                    for id in members.iter().copied().chain([escort]) {
+                        let o = s.world.get_mut(id).unwrap();
+                        o.area = Some(area);
+                        o.position = [-20.0; 3];
+                    }
+                    let pos = [20.0, 30.0, 0.0];
+                    let o = s.world.get_mut(leader).unwrap();
+                    o.position = pos;
+                    o.facing = 270.0;
+                    if timed {
+                        s.keep_party_together();
+                    } else {
+                        s.follow_leader(leader);
+                    }
+                    // Native 0x631d90: member zero takes the leader's vacated slot;
+                    // all other members retain index - 1. Escorts follow the party.
+                    for (i, id) in members.iter().copied().chain([escort]).enumerate() {
+                        let o = s.world.get(id).unwrap();
+                        if id == leader {
+                            assert!(o.commands.is_empty());
+                            assert_eq!(o.position, pos);
+                            continue;
+                        }
+                        let slot = if i == 0 { leader_index - 1 } else { i - 1 };
+                        let want = behind(pos, 270.0, slot);
+                        let got = if timed {
+                            o.commands
+                                .first()
+                                .and_then(|c| c.location)
+                                .unwrap()
+                                .position
+                        } else {
+                            o.position
+                        };
+                        assert_eq!(
+                            got, want,
+                            "{game:?}, timed={timed}, leader={leader_index}, member={i}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ineligible_followers_keep_their_slots_reserved() {
+        for timed in [false, true] {
+            let mut s = sim();
+            let area = s.world.spawn(ObjectKind::Area, "a");
+            let members: Vec<_> = (0..5)
+                .map(|i| s.world.spawn(ObjectKind::Creature, &format!("member{i}")))
+                .collect();
+            s.world.hero = Some(members[0]);
+            s.world.get_mut(members[0]).unwrap().followers = members[1..].to_vec();
+            for &id in &members {
+                let o = s.world.get_mut(id).unwrap();
+                o.area = Some(area);
+                o.position = [20.0, 30.0, 0.0];
+            }
+            s.world.get_mut(members[0]).unwrap().position = [0.0; 3];
+            s.world.get_mut(members[1]).unwrap().dead = true;
+            s.world.get_mut(members[2]).unwrap().area = None;
+            s.world
+                .get_mut(members[3])
+                .unwrap()
+                .fields
+                .insert("FollowPartyLeader".into(), 0);
+            if timed {
+                s.keep_party_together();
+            } else {
+                s.follow_leader(members[0]);
+            }
+            for &id in &members[1..4] {
+                let o = s.world.get(id).unwrap();
+                assert_eq!(o.position, [20.0, 30.0, 0.0]);
+                assert!(o.commands.is_empty());
+            }
+            let o = s.world.get(members[4]).unwrap();
+            let got = if timed {
+                o.commands[0].location.unwrap().position
+            } else {
+                o.position
+            };
+            assert_eq!(got, behind([0.0; 3], 0.0, 3));
+        }
     }
 
     #[test]
