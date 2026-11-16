@@ -245,8 +245,8 @@ introduced by this note.
 
 ## Implemented heading slice
 
-DA2 translating creatures now use the existing elapsed-time yaw limiter, including
-its saved last-turn timestamp. Ordinary started moves retain their body heading
+DA2 creatures translating under scheduled movement now use the existing elapsed-time
+yaw limiter, including its saved last-turn timestamp. Ordinary started moves retain their body heading
 at arrival. Native completion
 `0x675fae -> 0x8a60e0` stops the follower without installing that bearing.
 Explicit jumps, placement and non-creature movers keep their facing behavior. Origins follows the
@@ -258,6 +258,10 @@ round-trip, and a bent route whose arrival bearing differs from the original
 order. This implements the scalar body-yaw step during translation. Persistent
 locomotion modes, stationary turn completion, performance processing ownership,
 the direction filter and complete command admission remain separate work.
+The tools' separate stepped `Sim::walk` helper still installs each leg's facing
+directly and places idle followers into formation. Fresh route replays using
+`move_hero` therefore do not validate native player walking or follower physics.
+The command-only heading controls exercise the scheduled movement path instead.
 
 The shared scalar helper also retains its existing half-turn convention.
 Native `0x8c8780` obtains signed headings from direction vectors, and `0x8c8ff0`
