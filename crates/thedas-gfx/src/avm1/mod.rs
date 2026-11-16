@@ -605,7 +605,7 @@ impl Vm {
                     }
                     Kind::Display(d) => {
                         if let Some(dobj) = self.display.get(*d) {
-                            for c in dobj.children.values().rev() {
+                            for c in dobj.children.values() {
                                 if let Some(co) = self.display.get(*c) {
                                     if !co.name.is_empty() && seen.insert(co.name.clone()) {
                                         out.push(co.name.clone());

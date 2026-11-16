@@ -207,6 +207,8 @@ struct Args {
     /// reticle), `pad a` (a game controller's button pressed and let go; `pad press rt`
     /// and `pad release rt` hold and let go), `pad stick-left X,Y MS` and
     /// `pad stick-right X,Y MS` (a stick held there while the game runs MS, then let go).
+    /// `windowkey down|repeat|up KeyCode [JSON text]` replays the window keyboard route,
+    /// e.g. `windowkey down Quote "'"; windowkey up Quote; windowkey down Enter`.
     #[arg(long, default_value = "")]
     steps: String,
     /// Module for `--save` and `--objects`; the install's base campaign when not given
@@ -2846,6 +2848,13 @@ impl App {
             }
             return;
         }
+        let capture_started = Instant::now();
+        let capture = report::Capture {
+            presentation: report::presentation_snapshot(self),
+            settings: self.settings.clone(),
+            data_dir: saves::data_dir(),
+        };
+        let presentation_ms = capture_started.elapsed().as_secs_f64() * 1000.0;
         let mut info = json!({
             "build": report::build_info(),
             "settings": self.started_with,
@@ -2880,6 +2889,9 @@ impl App {
         let mut trace = None;
         let mut journal = None;
         let mut pause = false;
+        let metadata_ms = capture_started.elapsed().as_secs_f64() * 1000.0 - presentation_ms;
+        let mut save_clone_ms = 0.0;
+        let mut trace_ms = 0.0;
         if let Some(live) = self.live.as_mut() {
             if !live.front_end {
                 journal = live.journal.as_mut().and_then(|j| j.files());
@@ -2888,17 +2900,25 @@ impl App {
                 info["game"]["hero"] = json!(sim.world.hero.map(|h| sim.display_name(h)));
                 info["game"]["area_name"] = json!(sim.world.area.map(|a| sim.display_name(a)));
                 info["game"]["coverage"] = sim.world.trace.coverage();
-                match sim.save_json() {
-                    Ok(b) => now_save = Some(b),
-                    Err(e) => log::warn!("report: the game's state: {e}"),
-                }
+                let stage = Instant::now();
+                now_save = Some(report::ReportSave::Game(Box::new(sim.save_game())));
+                save_clone_ms = stage.elapsed().as_secs_f64() * 1000.0;
+                let stage = Instant::now();
                 trace = serde_json::to_value(&sim.world.trace.recent).ok();
+                trace_ms = stage.elapsed().as_secs_f64() * 1000.0;
                 drop(sim);
                 pause = !live.paused;
             }
         }
-        let dir = self.recorder.start(now_save, trace, journal, info);
-        log::info!("report: started in {}", dir.display());
+        info["capture_ms"] = json!(capture_started.elapsed().as_secs_f64() * 1000.0);
+        info["capture_timings_ms"] = json!({ "presentation": presentation_ms, "metadata": metadata_ms,
+            "save_clone": save_clone_ms, "trace": trace_ms });
+        let dir = self.recorder.start(now_save, trace, journal, info, capture);
+        log::info!(
+            "report: captured state in {:.2} ms; started in {}",
+            capture_started.elapsed().as_secs_f64() * 1000.0,
+            dir.display()
+        );
         // The frame as presented, read back as the next one is drawn; drawn again
         // offscreen where the surface cannot be read back.
         let readable = self
@@ -3111,7 +3131,13 @@ impl App {
     /// One frame of reports: a snapshot of the game when one is due, and a report under
     /// way finished once its screenshot and note are in.
     fn report_frame(&mut self, dt_ms: f64) {
-        self.recorder.frame(dt_ms);
+        let context = report::frame_context(self);
+        let dt_ms = self
+            .gfx
+            .as_ref()
+            .and_then(|g| g.frames.last_frame_ms())
+            .unwrap_or(dt_ms);
+        self.recorder.frame(dt_ms, context);
         for a in std::mem::take(&mut self.mark_answers) {
             self.mark_answer(a);
         }
@@ -3657,6 +3683,49 @@ impl App {
         true
     }
 
+    /// The window keyboard route, also used by control's `windowkey` replay.
+    /// Returns true when the key requests that the application close.
+    fn window_key(
+        &mut self,
+        code: KeyCode,
+        text: Option<&str>,
+        state: ElementState,
+        repeat: bool,
+    ) -> bool {
+        // A key skips a cutscene, as a click does. Provisional: the game's own
+        // skip key is not traced.
+        if state == ElementState::Pressed
+            && !repeat
+            && self
+                .screens
+                .as_ref()
+                .is_some_and(screens::Screens::in_cutscene)
+        {
+            if let Some(live) = self.live.as_ref() {
+                live.sim().input(
+                    thedas_sim::commands::CommandSource::Player,
+                    thedas_sim::commands::SimCommand::SkipCutscene,
+                );
+            }
+            return false;
+        }
+        if state == ElementState::Pressed && self.text_key(code, text) {
+            return false;
+        }
+        match state {
+            ElementState::Pressed => {
+                if !repeat && self.key_down(code) {
+                    return true;
+                }
+                self.keys.insert(code);
+            }
+            ElementState::Released => {
+                self.keys.remove(&code);
+            }
+        }
+        false
+    }
+
     /// Draws the level the way `path` says, or the other way than now for `None` (F11),
     /// from the next frame; returns the way it is drawn now.
     fn set_render_path(
@@ -3757,6 +3826,23 @@ impl App {
                 if let Some(live) = self.live.as_ref() {
                     live.switch_weapon_set();
                     log::info!("weapon set switched");
+                }
+            }
+            // In a conversation the number keys pick the replies (1 is the first), not the
+            // quickbar: the conversation screen lists them numbered.
+            c if self.live.is_some()
+                && quickslot_key(c).is_some()
+                && self
+                    .screens
+                    .as_ref()
+                    .is_some_and(|s| s.shown().contains(&screens::Screen::Conversation)) =>
+            {
+                let n = quickslot_key(c).unwrap_or(0) as usize;
+                if let Some(live) = self.live.as_mut() {
+                    let have = live.sim().dialog_state().map_or(0, |d| d.replies.len());
+                    if n < have {
+                        log::info!("{}", reply(live, n));
+                    }
                 }
             }
             // The quickbar's first ten slots: 1 to 9, then 0.
@@ -4065,6 +4151,12 @@ impl App {
                     if typed { "typed" } else { "no text field" }
                 ));
             }
+            Step::WindowKey(code, text, state, repeat) => {
+                self.quit |= self.window_key(*code, text.as_deref(), *state, *repeat);
+                log.push(format!(
+                    "windowkey {state:?} {code:?} {text:?} repeat={repeat}"
+                ));
+            }
             Step::Wipe => {
                 if let Some(l) = self.live.as_ref() {
                     wipe(&mut l.sim());
@@ -4235,6 +4327,10 @@ impl App {
                     _ => KeyCode::KeyI,
                 });
                 log.push(format!("{m:?}"));
+            }
+            &Step::RawKey(code) => {
+                self.key_down(code);
+                log.push(format!("rawkey {code:?}"));
             }
             &Step::Leader(n) => {
                 let tag = self.live.as_mut().and_then(|l| l.choose_leader(n));
@@ -5121,39 +5217,8 @@ impl ApplicationHandler for App {
                 let PhysicalKey::Code(code) = event.physical_key else {
                     return;
                 };
-                // A key skips a cutscene (and the movie it plays), as a click does.
-                // Provisional: the game's own skip key is not traced.
-                if event.state == ElementState::Pressed
-                    && !event.repeat
-                    && self
-                        .screens
-                        .as_ref()
-                        .is_some_and(screens::Screens::in_cutscene)
-                {
-                    if let Some(live) = self.live.as_ref() {
-                        live.sim().input(
-                            thedas_sim::commands::CommandSource::Player,
-                            thedas_sim::commands::SimCommand::SkipCutscene,
-                        );
-                    }
-                    return;
-                }
-                // While a movie's text field has focus, keys type into it (repeats too).
-                if event.state == ElementState::Pressed
-                    && self.text_key(code, event.text.as_deref())
-                {
-                    return;
-                }
-                match event.state {
-                    ElementState::Pressed => {
-                        if !event.repeat && self.key_down(code) {
-                            event_loop.exit();
-                        }
-                        self.keys.insert(code);
-                    }
-                    ElementState::Released => {
-                        self.keys.remove(&code);
-                    }
+                if self.window_key(code, event.text.as_deref(), event.state, event.repeat) {
+                    event_loop.exit();
                 }
             }
             WindowEvent::CursorMoved { position, .. } => self.cursor_to(position.x, position.y),
@@ -5980,6 +6045,9 @@ enum Step {
     /// A key for the focused text field (`key backspace`, `enter`, `delete`, `left`, `right`,
     /// `home`, `end`, `tab`, `escape`, `ctrl+a`).
     TextKey(thedas_ui::UiKey),
+    /// A window key event through App::text_key and the normal game key routing:
+    /// `windowkey down|repeat|up KeyCode [JSON text]` (winit's physical key names).
+    WindowKey(KeyCode, Option<String>, ElementState, bool),
     /// The whole party falls, as the game sees it after a wipe (for trying the death screen
     /// headless).
     Wipe,
@@ -6103,6 +6171,9 @@ enum Step {
     /// A movement key held or let go (`keydown w`, `keyup w`; w, a, s, d, q or e), as the
     /// keyboard holds it.
     HoldKey(KeyCode, bool),
+    /// `rawkey NAME`: a key pressed as the window delivers it (1 to 0, space, enter, escape,
+    /// tab), so what the game does with the key itself is tested.
+    RawKey(KeyCode),
     /// The highlight key held or let go (`allnames on`, `allnames off`): every creature near
     /// shows its name, as while Tab is down.
     AllNames(bool),
@@ -6450,6 +6521,23 @@ fn parse_step(s: &str) -> Result<Step> {
         "key" if arg.eq_ignore_ascii_case("space") => Step::Pause,
         "key" if arg == "/" => Step::SwapWeapons,
         "key" if arg.eq_ignore_ascii_case("f10") => Step::ModMode,
+        "rawkey" => Step::RawKey(match arg.trim().to_ascii_lowercase().as_str() {
+            "1" => KeyCode::Digit1,
+            "2" => KeyCode::Digit2,
+            "3" => KeyCode::Digit3,
+            "4" => KeyCode::Digit4,
+            "5" => KeyCode::Digit5,
+            "6" => KeyCode::Digit6,
+            "7" => KeyCode::Digit7,
+            "8" => KeyCode::Digit8,
+            "9" => KeyCode::Digit9,
+            "0" => KeyCode::Digit0,
+            "space" => KeyCode::Space,
+            "enter" => KeyCode::Enter,
+            "escape" => KeyCode::Escape,
+            "tab" => KeyCode::Tab,
+            other => bail!("rawkey takes 1 to 0, space, enter, escape or tab, not {other:?}"),
+        }),
         "modmode" => Step::ModMode,
         "modselect" if !arg.is_empty() => Step::ModSelect(arg.to_string()),
         "modframe" => Step::ModFrame(arg.parse().context("modframe takes a frame number")?),
@@ -6566,6 +6654,27 @@ fn parse_step(s: &str) -> Result<Step> {
         "key" if arg.eq_ignore_ascii_case("f11") => Step::Renderer(None),
         "wipe" => Step::Wipe,
         "type" => Step::Type(arg.to_string()),
+        "windowkey" => {
+            let mut words = arg.splitn(3, ' ');
+            let state = words.next().unwrap_or_default();
+            let name = words
+                .next()
+                .context("windowkey takes down|repeat|up KeyCode [JSON text]")?;
+            let code = serde_json::from_value(J::String(name.into()))
+                .with_context(|| format!("unknown windowkey physical key {name:?}"))?;
+            let (state, repeat) = match state {
+                "down" => (ElementState::Pressed, false),
+                "repeat" => (ElementState::Pressed, true),
+                "up" => (ElementState::Released, false),
+                _ => bail!("windowkey takes down|repeat|up KeyCode [JSON text]"),
+            };
+            let text = words
+                .next()
+                .map(serde_json::from_str::<String>)
+                .transpose()
+                .context("windowkey text must be a JSON string")?;
+            Step::WindowKey(code, text, state, repeat)
+        }
         "key" if text_key(arg).is_some() => {
             Step::TextKey(text_key(arg).unwrap_or(thedas_ui::UiKey::Enter))
         }
@@ -7165,6 +7274,9 @@ fn main() -> Result<()> {
                             if typed { "typed" } else { "no text field" }
                         );
                     }
+                    Step::WindowKey(..) => {
+                        bail!("windowkey requires a window with --control");
+                    }
                     &Step::TextKey(k) => {
                         let typed = played.as_mut().is_some_and(|(layer, _)| layer.key(k));
                         println!(
@@ -7248,7 +7360,9 @@ fn main() -> Result<()> {
                         println!("allnames {on}");
                     }
                     // The movement keys are the window's (see `App::key_walk`).
-                    Step::HoldKey(..) => println!("keydown and keyup need a window"),
+                    Step::HoldKey(..) | Step::RawKey(..) => {
+                        println!("keydown, keyup and rawkey need a window")
+                    }
                     Step::AskChoice(prompt) => {
                         if let Some((layer, _)) = played.as_mut() {
                             layer.ask_choice(0, prompt, "Yes", "No");
@@ -7837,6 +7951,26 @@ mod tests {
             Some(UiKey::SelectAll)
         );
         assert_eq!(text_edit_key(KeyCode::KeyA, false, false), None);
+    }
+
+    #[test]
+    fn window_keys_keep_physical_codes_text_and_repeats_separate() {
+        use ElementState::{Pressed, Released};
+        assert_eq!(
+            parse_steps(r#"windowkey down F8; windowkey up F8; windowkey down Quote "'"; windowkey repeat KeyA "A"; windowkey down Space " "; windowkey down Enter"#).unwrap(),
+            vec![
+                Step::WindowKey(KeyCode::F8, None, Pressed, false),
+                Step::WindowKey(KeyCode::F8, None, Released, false),
+                Step::WindowKey(KeyCode::Quote, Some("'".into()), Pressed, false),
+                Step::WindowKey(KeyCode::KeyA, Some("A".into()), Pressed, true),
+                Step::WindowKey(KeyCode::Space, Some(" ".into()), Pressed, false),
+                Step::WindowKey(KeyCode::Enter, None, Pressed, false),
+            ]
+        );
+        assert!(parse_steps("windowkey down NotAKey x").is_err());
+        assert!(parse_steps("windowkey sideways Enter").is_err());
+        assert!(parse_steps("windowkey down").is_err());
+        assert!(parse_steps("windowkey down KeyA unquoted").is_err());
     }
 
     #[test]

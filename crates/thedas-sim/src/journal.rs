@@ -16,8 +16,9 @@
 //!   plots of that type, locked until one of their flags is set, showing the text of every
 //!   flag set.
 //!
-//! Provisional: the executable's plot manager, which decides what the journal holds, is not
-//! traced; the rules above are read from the plot files and journal.gfx.
+//! CloseQuestGroup and RemoveQuest follow the Origins handlers; the flag-driven listing
+//! and parent-heading reconstruction still approximate the executable's separate pending
+//! entry list. See `docs/notes/script-journal-natives.md`.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -93,6 +94,14 @@ pub struct JournalMark {
     /// Not yet read in the journal (its `Updated`).
     #[serde(default)]
     pub unread: bool,
+}
+
+/// Origins' journal-list state, independent of the plot's script flags.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct QuestState {
+    pub completed: bool,
+    pub archived: bool,
+    pub removed: bool,
 }
 
 /// A HUD notification (notifications.gfx's `Party.Alerts.N`): a quest's new journal entry or
@@ -176,8 +185,24 @@ pub struct JournalView {
 }
 
 impl Sim {
-    /// Notes a quest's new journal entry when one of its flags with journal text is set
-    /// (called as flags are set).
+    fn origins_quest_state(&self, guid: &str) -> Option<&QuestState> {
+        if self.game == thedas_vfs::Game::Origins {
+            self.world.quest_states.get(guid)
+        } else {
+            None
+        }
+    }
+
+    fn journal_resource(&mut self, resource: &str) -> Option<Arc<PlotInfo>> {
+        let resource = resource.trim_end_matches('\0');
+        let vfs = self.vfs.clone();
+        self.plots.all(&vfs).into_iter().find(|p| {
+            p.resref.eq_ignore_ascii_case(resource)
+                || p.resref
+                    .trim_start_matches("plt_")
+                    .eq_ignore_ascii_case(resource)
+        })
+    }
     /// Whether a plot type is a tutorial's.
     fn is_tutorial_kind(&self, kind: i32) -> bool {
         self.world
@@ -239,9 +264,17 @@ impl Sim {
         }
     }
 
+    /// Notes a quest's new journal entry when one of its flags with journal text is set.
     pub(crate) fn note_journal_flag(&mut self, info: &PlotInfo, flag: i32) {
         if flag >= DEFINED_FLAGS || !info.journal.get(&flag).is_some_and(|&t| self.has_text(t)) {
             return;
+        }
+        // Later journal text can recreate an entry that RemoveQuest discarded.
+        if self
+            .origins_quest_state(&info.guid)
+            .is_some_and(|s| s.removed)
+        {
+            self.world.quest_states.remove(&info.guid);
         }
         self.world.journal_seq += 1;
         let seq = self.world.journal_seq;
@@ -268,7 +301,11 @@ impl Sim {
         } else {
             return;
         };
-        let completed = kind == ALERT_QUEST && info.finals.iter().any(|&f| self.flag_on(info, f));
+        let completed = kind == ALERT_QUEST
+            && (info.finals.iter().any(|&f| self.flag_on(info, f))
+                || self
+                    .origins_quest_state(&info.guid)
+                    .is_some_and(|s| s.completed));
         let alert = Alert {
             kind,
             resref: info.resref.clone(),
@@ -343,6 +380,137 @@ impl Sim {
         }
     }
 
+    /// Native 846: a group closes its active root quests; a plot closes that entry.
+    pub(crate) fn close_quest_group(&mut self, resource: &str) {
+        let Some(info) = self.journal_resource(resource) else {
+            return;
+        };
+        if info.kind != KIND_GROUP {
+            self.close_quest_plot(&info.resref);
+            return;
+        }
+        let view = self.journal();
+        let parents: BTreeMap<&str, Option<&str>> = view
+            .active
+            .iter()
+            .map(|q| (q.resref.as_str(), q.parent.as_deref()))
+            .collect();
+        let depth = |q: &QuestView| {
+            let mut key = q.resref.as_str();
+            let mut depth = 0;
+            while let Some(Some(parent)) = parents.get(key) {
+                depth += 1;
+                if depth > parents.len() {
+                    break;
+                }
+                key = parent;
+            }
+            depth
+        };
+        // The native only activates children after their parent is active. Our
+        // reconstructed headings likewise precede children for this traversal;
+        // closing a root makes later child lookups miss.
+        let mut entries: Vec<&QuestView> = view
+            .active
+            .iter()
+            .filter(|q| q.group == info.resref)
+            .collect();
+        entries.sort_by(|a, b| {
+            depth(a)
+                .cmp(&depth(b))
+                .then(a.seq.cmp(&b.seq))
+                .then(a.resref.cmp(&b.resref))
+        });
+        for q in entries {
+            self.close_quest_plot(&q.resref);
+        }
+    }
+
+    fn close_quest_plot(&mut self, resource: &str) {
+        let view = self.journal();
+        let Some(selected) = view.active.iter().find(|q| q.resref == resource) else {
+            return;
+        };
+        let Some(info) = self.plot_info(resource) else {
+            return;
+        };
+        self.world
+            .quest_states
+            .entry(info.guid.clone())
+            .or_default()
+            .completed = true;
+        // 0x6f5416: a subquest's Completed flag changes without moving its root.
+        if selected.parent.is_some() {
+            return;
+        }
+        let parents: BTreeMap<&str, Option<&str>> = view
+            .active
+            .iter()
+            .map(|q| (q.resref.as_str(), q.parent.as_deref()))
+            .collect();
+        for q in &view.active {
+            let mut key = q.resref.as_str();
+            let mut under = false;
+            for _ in 0..=parents.len() {
+                if key == resource {
+                    under = true;
+                    break;
+                }
+                let Some(Some(parent)) = parents.get(key) else {
+                    break;
+                };
+                key = parent;
+            }
+            if !under {
+                continue;
+            }
+            if let Some(plot) = self.plot_info(&q.resref) {
+                self.world
+                    .quest_states
+                    .entry(plot.guid.clone())
+                    .or_default()
+                    .archived = true;
+                if let Some(mark) = self.world.journal.get_mut(&plot.guid) {
+                    mark.unread = false;
+                }
+            }
+        }
+        if self
+            .world
+            .active_quest
+            .clone()
+            .and_then(|r| self.plot_info(&r))
+            .is_some_and(|p| p.guid == info.guid)
+        {
+            self.world.active_quest = None;
+        }
+    }
+
+    /// Native 850 removes one entry from the journal lists, retaining plot flags.
+    pub(crate) fn remove_quest(&mut self, resource: &str) {
+        let Some(info) = self
+            .journal_resource(resource)
+            .filter(|p| p.kind != KIND_GROUP)
+        else {
+            return;
+        };
+        let view = self.journal();
+        if !view
+            .active
+            .iter()
+            .chain(&view.completed)
+            .any(|q| q.resref == info.resref)
+        {
+            return;
+        }
+        self.world.journal.remove(&info.guid);
+        self.world
+            .quest_states
+            .entry(info.guid.clone())
+            .or_default()
+            .removed = true;
+    }
+
     /// Whether a journal text says something: many flags name a string that is empty.
     fn has_text(&self, strref: u32) -> bool {
         self.string(strref).is_some_and(|t| !t.trim().is_empty())
@@ -373,6 +541,10 @@ impl Sim {
             .iter()
             .filter(|p| matches!(p.kind, KIND_QUEST | KIND_CHANTERS))
         {
+            let state = self.origins_quest_state(&p.guid);
+            if state.is_some_and(|s| s.removed) {
+                continue;
+            }
             let Some(parent) = p.parent.as_deref().and_then(find) else {
                 continue;
             };
@@ -408,7 +580,8 @@ impl Sim {
                 resref: p.resref.clone(),
                 name: p.name_strref,
                 description: p.journal.get(&flag).copied(),
-                completed: p.finals.iter().any(|&f| self.flag_on(p, f)),
+                completed: p.finals.iter().any(|&f| self.flag_on(p, f))
+                    || state.is_some_and(|s| s.completed),
                 group: top.resref.clone(),
                 parent: (parent.kind != KIND_GROUP).then(|| parent.resref.clone()),
                 seq: mark.map_or(0, |m| m.seq),
@@ -419,7 +592,7 @@ impl Sim {
                 name: top.name_strref,
                 priority: top.priority,
             });
-            if quest.completed {
+            if state.map_or(quest.completed, |s| s.archived) {
                 view.completed.push(quest);
             } else {
                 view.active.push(quest);
@@ -452,6 +625,10 @@ impl Sim {
                     continue;
                 }
                 let Some(info) = find(&parent) else { continue };
+                let state = self.origins_quest_state(&info.guid);
+                if state.is_some_and(|s| s.removed) {
+                    continue;
+                }
                 let grand = info
                     .parent
                     .as_deref()
@@ -462,13 +639,13 @@ impl Sim {
                     resref: info.resref.clone(),
                     name: info.name_strref,
                     description: None,
-                    completed,
+                    completed: state.map_or(completed, |s| s.completed),
                     group: q.group.clone(),
                     parent: grand,
                     seq: q.seq,
                     updated: false,
                 };
-                if completed {
+                if state.map_or(completed, |s| s.archived) {
                     view.completed.push(heading);
                 } else {
                     view.active.push(heading);
@@ -634,6 +811,259 @@ mod tests {
             parent: parent.map(str::to_string),
             ..Default::default()
         }
+    }
+
+    fn native_quest_sim() -> Sim {
+        let table = EngineTable::parse(
+            b"void CloseQuestGroup(string s) = 846;\nvoid RemoveQuest(string s) = 850;\n",
+        )
+        .unwrap();
+        let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(table), 1);
+        for name in ["group_a", "group_b"] {
+            s.plots.insert(plot(name, KIND_GROUP, None, &[]));
+        }
+        for (name, parent, text) in [
+            ("a_root", "group_a", 10),
+            ("a_child", "a_root", 20),
+            ("a_grand", "a_child", 30),
+            ("a_other", "group_a", 40),
+            ("b_root", "group_b", 50),
+            ("a_unseen", "group_a", 60),
+        ] {
+            let mut p = plot(name, KIND_QUEST, Some(parent), &[(0, text), (1, text + 1)]);
+            p.guid = format!("NATIVE_{}", name.to_ascii_uppercase());
+            s.plots.insert(p);
+        }
+        let _ = s.strings.set(
+            (10..=61)
+                .map(|n| (n, format!("journal text {n}")))
+                .collect(),
+        );
+        for name in ["a_root", "a_child", "a_grand", "a_other", "b_root"] {
+            s.set_plot_flag(name, 0, true, false, OBJECT_INVALID);
+        }
+        s
+    }
+
+    fn native_quest_call(s: &mut Sim, name: &str, resource: &str) {
+        let f = s.table.function_by_name(name).unwrap().clone();
+        let mut h = crate::sim::ScriptHost {
+            sim: s,
+            event: None,
+            script: "test".into(),
+        };
+        assert!(
+            crate::engine::call(
+                &mut h,
+                OBJECT_INVALID,
+                &f,
+                &[thedas_script::vm::Value::String(resource.into())]
+            )
+            .unwrap()
+            .unwrap()
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn native_closing_a_root_archives_its_active_subtree_without_setting_plot_flags() {
+        let mut s = native_quest_sim();
+        s.world.active_quest = Some("a_root".into());
+        let flags = s.world.plots.clone();
+        let seq = s.world.journal_seq;
+        let alerts = (s.world.alerts.clone(), s.world.uber_alerts.clone());
+        native_quest_call(&mut s, "CloseQuestGroup", "a_root");
+        let view = s.journal();
+        assert_eq!(view.active.len(), 2);
+        assert_eq!(view.completed.len(), 3);
+        for q in &view.completed {
+            assert_eq!(q.completed, q.resref == "plt_a_root");
+            assert!(!q.updated);
+        }
+        assert!(s.world.active_quest.is_none());
+        assert_eq!(s.world.plots, flags);
+        assert_eq!(s.world.journal_seq, seq);
+        assert_eq!(
+            (s.world.alerts.clone(), s.world.uber_alerts.clone()),
+            alerts
+        );
+    }
+
+    #[test]
+    fn native_closing_a_subquest_changes_its_bit_without_archiving_the_parent() {
+        let mut s = native_quest_sim();
+        s.world.active_quest = Some("a_root".into());
+        native_quest_call(&mut s, "CloseQuestGroup", "plt_a_child");
+        let view = s.journal();
+        assert_eq!(view.active.len(), 5);
+        assert!(view.completed.is_empty());
+        let child = view
+            .active
+            .iter()
+            .find(|q| q.resref == "plt_a_child")
+            .unwrap();
+        assert!(child.completed && child.updated);
+        assert!(
+            !view
+                .active
+                .iter()
+                .find(|q| q.resref == "plt_a_root")
+                .unwrap()
+                .completed
+        );
+        assert_eq!(s.world.active_quest.as_deref(), Some("a_root"));
+    }
+
+    #[test]
+    fn native_closing_a_heading_is_case_insensitive_and_repeated_closure_is_inert() {
+        let mut s = native_quest_sim();
+        s.set_plot_flag("a_root", 0, false, false, OBJECT_INVALID);
+        assert!(
+            s.journal()
+                .active
+                .iter()
+                .any(|q| { q.resref == "plt_a_root" && q.description.is_none() && !q.completed })
+        );
+        s.world.active_quest = Some("a_child".into());
+        native_quest_call(&mut s, "CloseQuestGroup", "PLT_A_ROOT\0");
+        let view = s.journal();
+        let root = view
+            .completed
+            .iter()
+            .find(|q| q.resref == "plt_a_root")
+            .unwrap();
+        assert!(root.completed);
+        assert_eq!(view.completed.len(), 3);
+        // Only the root's selector is cleared by the handler.
+        assert_eq!(s.world.active_quest.as_deref(), Some("a_child"));
+        let states = s.world.quest_states.clone();
+        native_quest_call(&mut s, "CloseQuestGroup", "a_root");
+        assert_eq!(s.world.quest_states, states);
+    }
+
+    #[test]
+    fn native_group_closure_only_affects_entries_already_active_in_that_group() {
+        let mut s = native_quest_sim();
+        native_quest_call(&mut s, "CloseQuestGroup", "group_a");
+        let view = s.journal();
+        assert_eq!(
+            view.active
+                .iter()
+                .map(|q| q.resref.as_str())
+                .collect::<Vec<_>>(),
+            vec!["plt_b_root"]
+        );
+        assert_eq!(view.completed.len(), 4);
+        assert!(!s.world.quest_states.contains_key("NATIVE_A_UNSEEN"));
+        s.set_plot_flag("a_unseen", 0, true, false, OBJECT_INVALID);
+        assert!(
+            s.journal()
+                .active
+                .iter()
+                .any(|q| q.resref == "plt_a_unseen")
+        );
+    }
+
+    #[test]
+    fn native_removal_retains_flags_and_later_text_recreates_the_entry() {
+        let mut s = native_quest_sim();
+        s.world.active_quest = Some("plt_a_child".into());
+        let flags = s.world.plots.clone();
+        native_quest_call(&mut s, "RemoveQuest", "a_child");
+        let view = s.journal();
+        assert!(!view.active.iter().any(|q| q.resref == "plt_a_child"));
+        assert!(view.active.iter().any(|q| q.resref == "plt_a_grand"));
+        assert_eq!(s.world.plots, flags);
+        // The removal handler does not write the active-quest selector.
+        assert_eq!(s.world.active_quest.as_deref(), Some("plt_a_child"));
+        s.set_plot_flag("a_child", 1, true, false, OBJECT_INVALID);
+        assert!(!s.world.quest_states.contains_key("NATIVE_A_CHILD"));
+        let child = s
+            .journal()
+            .active
+            .into_iter()
+            .find(|q| q.resref == "plt_a_child")
+            .unwrap();
+        assert_eq!(child.description, Some(21));
+        assert!(!child.completed);
+    }
+
+    #[test]
+    fn native_removal_handles_completed_entries_and_does_not_recreate_removed_headings() {
+        let mut s = native_quest_sim();
+        native_quest_call(&mut s, "CloseQuestGroup", "a_root");
+        native_quest_call(&mut s, "RemoveQuest", "a_root");
+        let view = s.journal();
+        assert!(!view.completed.iter().any(|q| q.resref == "plt_a_root"));
+        assert!(view.completed.iter().any(|q| q.resref == "plt_a_child"));
+    }
+
+    #[test]
+    fn native_missing_unseen_group_removal_and_guid_arguments_do_nothing() {
+        let mut s = native_quest_sim();
+        let flags = s.world.plots.clone();
+        let marks = s.world.journal.clone();
+        for (function, resource) in [
+            ("CloseQuestGroup", "missing"),
+            ("CloseQuestGroup", "a_unseen"),
+            ("RemoveQuest", "missing"),
+            ("RemoveQuest", "group_a"),
+            ("RemoveQuest", "a_unseen"),
+            ("CloseQuestGroup", "NATIVE_A_ROOT"),
+            ("RemoveQuest", "NATIVE_A_ROOT"),
+        ] {
+            native_quest_call(&mut s, function, resource);
+        }
+        assert!(s.world.quest_states.is_empty());
+        assert_eq!(s.world.plots, flags);
+        assert_eq!(s.world.journal, marks);
+    }
+
+    #[test]
+    fn native_journal_state_survives_json_and_older_worlds_default_to_no_overrides() {
+        let mut s = native_quest_sim();
+        native_quest_call(&mut s, "CloseQuestGroup", "group_a");
+        native_quest_call(&mut s, "RemoveQuest", "a_other");
+        let mut restored = native_quest_sim();
+        let tables = restored.world.tables();
+        restored.world = serde_json::from_slice(&serde_json::to_vec(&s.world).unwrap()).unwrap();
+        restored.world.tables = tables;
+        let a = s.journal();
+        let b = restored.journal();
+        assert_eq!(a.active, b.active);
+        assert_eq!(a.completed, b.completed);
+        let mut value = serde_json::to_value(&s.world).unwrap();
+        value.as_object_mut().unwrap().remove("quest_states");
+        let old: crate::World = serde_json::from_value(value).unwrap();
+        assert!(old.quest_states.is_empty());
+    }
+
+    #[test]
+    fn native_journal_dispatch_and_overrides_leave_da2_unchanged() {
+        let mut s = native_quest_sim();
+        native_quest_call(&mut s, "CloseQuestGroup", "a_root");
+        let states = s.world.quest_states.clone();
+        s.game = thedas_vfs::Game::DragonAge2;
+        assert_eq!(s.journal().active.len(), 5);
+        assert!(s.journal().completed.is_empty());
+        for name in ["CloseQuestGroup", "RemoveQuest"] {
+            let f = s.table.function_by_name(name).unwrap().clone();
+            let mut h = crate::sim::ScriptHost {
+                sim: &mut s,
+                event: None,
+                script: "test".into(),
+            };
+            assert!(
+                crate::engine::call(
+                    &mut h,
+                    OBJECT_INVALID,
+                    &f,
+                    &[thedas_script::vm::Value::String("a_root".into())]
+                )
+                .is_none()
+            );
+        }
+        assert_eq!(s.world.quest_states, states);
     }
 
     #[test]
