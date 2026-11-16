@@ -1440,6 +1440,11 @@ impl AreaRenderer {
         self.d3d.world(draw)
     }
 
+    /// The opacity multiplier last given to a draw, including cutscene hiding.
+    pub fn draw_opacity(&self, draw: usize) -> Option<f32> {
+        self.d3d.opacity(draw)
+    }
+
     pub fn set_transform(&mut self, ctx: &GpuContext, draw: usize, transform: glam::Mat4) {
         if let Some(Some(i)) = self.stand_in_of.get(draw) {
             let model = transform.to_cols_array_2d();

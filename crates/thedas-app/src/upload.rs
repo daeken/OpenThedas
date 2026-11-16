@@ -32,11 +32,23 @@ const ZIPPED: &[&str] = &[
     "save_before.json",
     "journal_checkpoint.json",
     "journal.jsonl",
+    "presentation.json",
+    "frames.json",
+    "log.full.txt",
+    "options.ini",
+    "launcher.json",
 ];
 
 /// The journal's files (the game since its last checkpoint, input by input): left out
 /// when the report would be over the limit with them.
 const JOURNAL: &[&str] = &["journal_checkpoint.json", "journal.jsonl"];
+/// Give way after the journal, in this order. Presentation always stays.
+const OPTIONAL: &[&str] = &[
+    "log.full.txt",
+    "frames.json",
+    "options.ini",
+    "launcher.json",
+];
 
 /// Set when the game is driven by a client or a test (`--control`, a hidden window): then
 /// nothing is sent or fetched (reports, verdicts, the update check), so a test under a
@@ -130,24 +142,21 @@ pub fn send(dir: &Path, url: &str) -> Result<String> {
     if let Some(install) = info["settings"]["install"].as_object_mut() {
         install.remove("root");
     }
-    let mut files: Vec<(String, Vec<u8>)> = Vec::new();
-    for name in ZIPPED {
-        let bytes = match *name {
-            "report.json" => serde_json::to_vec_pretty(&info)?,
-            _ => match std::fs::read(dir.join(name)) {
-                Ok(b) => b,
-                Err(_) => continue,
-            },
-        };
-        files.push((name.to_string(), redact(bytes, home.as_deref())));
-    }
+    let files = report_files(dir, &info, home.as_deref())?;
     let id = info["id"].as_str().unwrap_or("report").to_string();
     // The marked copy, when the player marked spots: it shows what they pointed at.
     let shot = std::fs::read(dir.join("screenshot_marked.png"))
         .or_else(|_| std::fs::read(dir.join("screenshot.png")))
         .ok();
-    let packed = pack(files, shot, MAX_UPLOAD, half_size, |left_out| {
-        info["journal_left_out"] = json!(left_out);
+    let packed = pack(files, shot, MAX_UPLOAD, half_size, |name, why| {
+        if name == "journal" {
+            info["journal_left_out"] = json!(why);
+        } else {
+            if !info["files_left_out"].is_object() {
+                info["files_left_out"] = json!({});
+            }
+            info["files_left_out"][name] = json!(why);
+        }
         let bytes = serde_json::to_vec_pretty(&info).unwrap_or_default();
         // The report's folder says so too.
         let _ = std::fs::write(dir.join("report.json"), &bytes);
@@ -161,44 +170,82 @@ pub fn send(dir: &Path, url: &str) -> Result<String> {
     post(url, &message, &parts)
 }
 
+fn report_files(dir: &Path, info: &J, home: Option<&str>) -> Result<Vec<(String, Vec<u8>)>> {
+    let mut files = Vec::new();
+    for name in ZIPPED {
+        let bytes = match *name {
+            "report.json" => serde_json::to_vec_pretty(&info)?,
+            _ => match std::fs::read(dir.join(name)) {
+                Ok(b) => b,
+                Err(_) => continue,
+            },
+        };
+        files.push((name.to_string(), redact(bytes, home)));
+    }
+    Ok(files)
+}
+
 /// A report packed for sending: the zip, and the screenshot beside it.
 struct Packed {
     zip: Vec<u8>,
     shot: Option<Vec<u8>>,
 }
 
-/// Packs a report's files and screenshot into at most `max` bytes. The journal is the only
-/// part ever left out, and only after a half-size screenshot was tried: the full report
-/// with the screenshot; else with the screenshot at half size; else without the journal
-/// (`left_out` is told why and gives report.json again, saying so), with the screenshot
-/// full, then half size, then none. An error when even that is over.
+/// Tries a smaller screenshot, then drops the journal, then OPTIONAL, then the
+/// screenshot. Presentation and the original report files always stay. Each omission
+/// is recorded through `left_out`, which returns the updated report.json.
 fn pack(
     mut files: Vec<(String, Vec<u8>)>,
     shot: Option<Vec<u8>>,
     max: usize,
     half: impl Fn(&[u8]) -> Result<Vec<u8>>,
-    mut left_out: impl FnMut(String) -> Vec<u8>,
+    mut left_out: impl FnMut(&str, String) -> Vec<u8>,
 ) -> Result<Packed> {
     let fits = |zip: &[u8], png: Option<&Vec<u8>>| zip.len() + png.map_or(0, |p| p.len()) <= max;
-    let halved = shot.as_deref().and_then(|p| half(p).ok());
     let mut zip = zip(&files)?;
     if fits(&zip, shot.as_ref()) {
         return Ok(Packed { zip, shot });
     }
-    if shot.is_some() && fits(&zip, halved.as_ref()) {
+    // Only decode/resize when needed. A failed resize must not silently drop the image
+    // before the journal and supplemental files have had their turn.
+    let halved = shot.as_deref().and_then(|p| half(p).ok());
+    if let Some(png) = &halved
+        && fits(&zip, Some(png))
+    {
         return Ok(Packed { zip, shot: halved });
     }
-    if files.iter().any(|(n, _)| JOURNAL.contains(&n.as_str())) {
+    for name in std::iter::once("journal").chain(OPTIONAL.iter().copied()) {
+        let omitted = |n: &str| {
+            if name == "journal" {
+                JOURNAL.contains(&n)
+            } else {
+                n == name
+            }
+        };
+        if !files.iter().any(|(n, _)| omitted(n)) {
+            continue;
+        }
         let why = format!(
             "{} bytes zipped with the screenshot, over the {max} byte limit; it is in the report's folder",
             zip.len() + shot.as_ref().map_or(0, |p| p.len())
         );
-        files.retain(|(n, _)| !JOURNAL.contains(&n.as_str()));
-        let report = left_out(why);
+        files.retain(|(n, _)| !omitted(n));
+        let report = left_out(name, why);
         if let Some(r) = files.iter_mut().find(|(n, _)| n == "report.json") {
             r.1 = report;
         }
         zip = self::zip(&files)?;
+        if shot.is_none() && fits(&zip, None) {
+            return Ok(Packed { zip, shot: None });
+        }
+        for png in [shot.as_ref(), halved.as_ref()].into_iter().flatten() {
+            if fits(&zip, Some(png)) {
+                return Ok(Packed {
+                    zip,
+                    shot: Some(png.clone()),
+                });
+            }
+        }
     }
     if zip.len() > max {
         bail!(
@@ -206,11 +253,7 @@ fn pack(
             zip.len()
         );
     }
-    let shot = [shot, halved]
-        .into_iter()
-        .flatten()
-        .find(|p| fits(&zip, Some(p)));
-    Ok(Packed { zip, shot })
+    Ok(Packed { zip, shot: None })
 }
 
 /// The message: the player's note first, then where and on what.
@@ -320,7 +363,7 @@ pub fn post_text(url: &str, content: &str) -> Result<()> {
 }
 
 /// The player's home folder as text, for [`redact`].
-fn home() -> Option<String> {
+pub(crate) fn home() -> Option<String> {
     std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(|h| h.to_string_lossy().to_string())
@@ -328,7 +371,7 @@ fn home() -> Option<String> {
 }
 
 /// `bytes` with the home folder's path written `~` (as it is, and as JSON escapes it).
-fn redact(bytes: Vec<u8>, home: Option<&str>) -> Vec<u8> {
+pub(crate) fn redact(bytes: Vec<u8>, home: Option<&str>) -> Vec<u8> {
     let Some(home) = home else {
         return bytes;
     };
@@ -430,8 +473,138 @@ pub fn zip(files: &[(String, Vec<u8>)]) -> Result<Vec<u8>> {
 mod tests {
     use super::*;
 
+    fn noise(n: usize, seed: u64) -> Vec<u8> {
+        let mut x = seed;
+        (0..n)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x as u8
+            })
+            .collect()
+    }
+
+    fn unpack(bytes: &[u8]) -> std::collections::BTreeMap<String, Vec<u8>> {
+        use std::io::Read as _;
+        let mut archive = ::zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        (0..archive.len())
+            .map(|i| {
+                let mut file = archive.by_index(i).unwrap();
+                let mut bytes = Vec::new();
+                file.read_to_end(&mut bytes).unwrap();
+                (file.name().to_string(), bytes)
+            })
+            .collect()
+    }
+
     #[test]
-    fn only_the_journal_is_left_out_and_only_after_a_smaller_screenshot() {
+    fn supplemental_files_give_way_in_order_and_presentation_always_stays() {
+        let files = vec![
+            ("report.json".into(), b"{}".to_vec()),
+            ("presentation.json".into(), noise(1000, 1)),
+            ("save_now.json".into(), noise(1000, 2)),
+            ("journal.jsonl".into(), noise(4000, 3)),
+            ("log.full.txt".into(), noise(4000, 4)),
+            ("frames.json".into(), noise(4000, 5)),
+            ("options.ini".into(), noise(4000, 6)),
+            ("launcher.json".into(), noise(4000, 7)),
+        ];
+        let mut omitted = Vec::new();
+        let packed = pack(
+            files.clone(),
+            Some(noise(2000, 8)),
+            10_000,
+            |p| Ok(p[..p.len() / 2].to_vec()),
+            |name, _| {
+                omitted.push(name.to_string());
+                b"{}".to_vec()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            omitted,
+            ["journal", "log.full.txt", "frames.json", "options.ini"]
+        );
+        assert!(packed.zip.len() + packed.shot.as_ref().map_or(0, Vec::len) <= 10_000);
+        let contents = unpack(&packed.zip);
+        assert!(contents.contains_key("presentation.json"));
+        assert!(contents.contains_key("launcher.json"));
+        assert!(!contents.contains_key("frames.json"));
+        assert!(pack(files, None, 1000, |_| unreachable!(), |_, _| b"{}".to_vec()).is_err());
+    }
+
+    #[test]
+    fn missing_screenshot_and_failed_resize_still_respect_omission_order() {
+        let files = vec![
+            ("report.json".into(), b"{}".to_vec()),
+            ("presentation.json".into(), noise(1000, 1)),
+            ("journal.jsonl".into(), noise(8000, 2)),
+            ("log.full.txt".into(), noise(1000, 3)),
+        ];
+        let mut omitted = Vec::new();
+        let packed = pack(
+            files.clone(),
+            None,
+            5000,
+            |_| unreachable!(),
+            |name, _| {
+                omitted.push(name.to_string());
+                b"{}".to_vec()
+            },
+        )
+        .unwrap();
+        assert_eq!(omitted, ["journal"]);
+        assert!(unpack(&packed.zip).contains_key("log.full.txt"));
+        omitted.clear();
+        let packed = pack(
+            files,
+            Some(noise(9000, 4)),
+            5000,
+            |_| anyhow::bail!("bad png"),
+            |name, _| {
+                omitted.push(name.to_string());
+                b"{}".to_vec()
+            },
+        )
+        .unwrap();
+        assert_eq!(omitted, ["journal", "log.full.txt"]);
+        assert!(packed.shot.is_none());
+        assert!(unpack(&packed.zip).contains_key("presentation.json"));
+    }
+
+    #[test]
+    fn every_new_file_is_archived_and_redacted_without_adding_setup_files() {
+        let dir =
+            std::env::temp_dir().join(format!("thedas-upload-capture-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in ZIPPED {
+            std::fs::write(dir.join(name), b"/Users/fixture/settings").unwrap();
+        }
+        std::fs::write(dir.join("discord-webhook"), b"must not be read").unwrap();
+        let files = report_files(
+            &dir,
+            &json!({ "path": "/Users/fixture/report" }),
+            Some("/Users/fixture"),
+        )
+        .unwrap();
+        let contents = unpack(&zip(&files).unwrap());
+        assert_eq!(contents.len(), ZIPPED.len());
+        for name in [
+            "presentation.json",
+            "frames.json",
+            "log.full.txt",
+            "options.ini",
+            "launcher.json",
+        ] {
+            assert_eq!(contents[name], b"~/settings");
+        }
+        assert!(!contents.contains_key("discord-webhook"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn journal_gives_way_after_a_smaller_screenshot() {
         let noise = |n: usize, seed: u64| {
             let mut x = seed;
             (0..n)
@@ -454,13 +627,28 @@ mod tests {
         let shot = Some(noise(4000, 3));
         let mut told = None;
         // Everything fits.
-        let p = pack(files(1000), shot.clone(), 10_000, half, |_| unreachable!()).unwrap();
+        let p = pack(
+            files(1000),
+            shot.clone(),
+            10_000,
+            half,
+            |_, _| unreachable!(),
+        )
+        .unwrap();
         assert_eq!(p.shot.as_ref().map(|s| s.len()), Some(4000));
         // A half-size screenshot keeps the journal in.
-        let p = pack(files(3000), shot.clone(), 7_500, half, |_| unreachable!()).unwrap();
+        let p = pack(
+            files(3000),
+            shot.clone(),
+            7_500,
+            half,
+            |_, _| unreachable!(),
+        )
+        .unwrap();
         assert_eq!(p.shot.as_ref().map(|s| s.len()), Some(2000));
         // Too big even so: the journal goes, report.json says so, the screenshot stays.
-        let p = pack(files(8000), shot, 7_500, half, |why| {
+        let p = pack(files(8000), shot, 7_500, half, |name, why| {
+            assert_eq!(name, "journal");
             told = Some(why);
             b"{\"journal_left_out\":1}".to_vec()
         })

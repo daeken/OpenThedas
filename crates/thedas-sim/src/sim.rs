@@ -23,7 +23,7 @@ use thedas_script::{Ncs, Vm};
 use thedas_vfs::Vfs;
 
 use crate::trace::TraceEntry;
-use crate::world::{Command, Event, Location, Object, ObjectKind, World};
+use crate::world::{Command, Event, Location, Object, ObjectKind, World, facing_toward};
 
 #[derive(Debug, thiserror::Error)]
 pub enum SimError {
@@ -248,6 +248,10 @@ const WAYPOINT_REACHED: f32 = 0.05;
 /// How long a walker held up by bodies may make no progress before it is reported.
 const BLOCKED_REPORT_MS: u64 = 3_000;
 
+/// Native locomotion's ordinary stalled-movement limit (0x7a9830), twice the
+/// 1000 ms setting at 0xc0f6c8. Its alternate state uses one interval.
+const TALK_BLOCKED_MS: u64 = 2_000;
+
 /// A move along a body's surface whose inward part is this little of it (rounding left by
 /// a slide) does not meet the body.
 const GRAZE: f32 = 1.0e-3;
@@ -443,6 +447,9 @@ fn formation_position(p: [f32; 3], facing: f32, [x, y]: [f32; 2]) -> [f32; 3] {
 /// snaps once a step would pass the way. Differences under 1e-6° are left (0xb596b8). Not
 /// ported: the follower's filter on the asked-for way before this (0xa63fd7-0xa64026, a
 /// blend toward the route's way of `1 - 0.9^ceil(d / 0.075)` for a step of `d` metres).
+/// DA2 uses the same scalar law at 0x8a6110 (moving caller 0x8b11e4): its constants are
+/// 0.4 at 0xc23498, 0.28 at 0xc237f0, 1/180 at 0xbf3d54 and epsilon at 0xc2442c.
+/// See da2-performance-processing.md for the separate locomotion/controller lifecycle.
 pub(crate) fn turn_toward(facing: f32, want: f32, dt: f32) -> f32 {
     let e = (want - facing + 180.0).rem_euclid(360.0) - 180.0;
     if e.abs() <= 1e-6 || dt <= 0.0 {
@@ -476,9 +483,9 @@ fn direction_along(from: [f32; 3], points: &[[f32; 3]], f: f32) -> Option<(f32, 
     dir
 }
 
-/// Where an attacker goes before its attack starts (see `Sim::approach_point`).
+/// Where an actor goes before attacking, using an ability or talking.
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum Approach {
+pub(crate) enum Approach {
     /// In reach already: the attack starts.
     InReach,
     /// Walk this far to this point first.
@@ -1230,8 +1237,27 @@ impl Sim {
                 }
                 (_, Some((due, id))) if due <= until => {
                     self.world.time_ms = self.world.time_ms.max(due);
+                    let talking = self
+                        .world
+                        .get(id)
+                        .and_then(|o| o.commands.first())
+                        .is_some_and(|c| c.name == "CommandInitiateDialog");
                     self.advance_movers();
                     self.advance_da2_projectiles();
+                    // Body contact can extend or fail this approach while advancing.
+                    // Its old deadline cannot complete the talk or a later order.
+                    if talking
+                        && self
+                            .world
+                            .get(id)
+                            .and_then(|o| o.commands.first())
+                            .is_none_or(|c| {
+                                c.name != "CommandInitiateDialog"
+                                    || c.due.is_none_or(|d| d > self.world.time_ms)
+                            })
+                    {
+                        continue;
+                    }
                     let da2 = self.game == thedas_vfs::Game::DragonAge2;
                     let cancellable = self
                         .world
@@ -1266,6 +1292,7 @@ impl Sim {
                             c.due = None;
                             c.from = None;
                             c.arrived = c.name == "CommandAttack"
+                                || c.name == "CommandInitiateDialog"
                                 || (da2
                                     && c.name == "CommandUseAbility"
                                     && c.ints.first() == Some(&1));
@@ -2510,6 +2537,7 @@ impl Sim {
                 impacted: false,
                 arrived: false,
                 da2_target_prepared: false,
+                da2_basic_attack_fallback: false,
                 path: Vec::new(),
                 turned_at: None,
                 is_static: false,
@@ -3006,13 +3034,41 @@ impl Sim {
                 let left = path_length(p, &rest);
                 let progressed = crate::engine::dist(was, p) > 0.01;
                 if let Some(c) = self.world.get_mut(id).and_then(|o| o.commands.first_mut()) {
+                    if c.name == "CommandInitiateDialog" {
+                        // Keep elapsed time on the command so save/reload preserves it.
+                        // Native progress is 0.02 m (0x7a97bd). Provisional: the
+                        // alternate one-interval locomotion state is not modelled.
+                        c.seconds = if crate::engine::dist(was, p) > 0.02 {
+                            0.0
+                        } else {
+                            c.seconds + now.saturating_sub(c.turned_at.unwrap_or(t0)) as f32
+                        };
+                    }
                     c.from = Some((p, now));
                     c.due = Some(now + ((left / speed) * 1000.0).max(1.0) as u64);
                     c.path = rest;
                 }
                 self.note_blocked(id, progressed);
+                if self
+                    .world
+                    .get(id)
+                    .and_then(|o| o.commands.first())
+                    .is_some_and(|c| {
+                        c.name == "CommandInitiateDialog" && c.seconds > TALK_BLOCKED_MS as f32
+                    })
+                {
+                    self.fail_front_command(id, "COMMAND_FAILED_INVALID_PATH");
+                    self.blocked_since.remove(&id);
+                    continue;
+                }
             } else {
                 self.blocked_since.remove(&id);
+                if let Some(c) = self.world.get_mut(id).and_then(|o| o.commands.first_mut())
+                    && c.name == "CommandInitiateDialog"
+                    && crate::engine::dist(was, p) > 0.02
+                {
+                    c.seconds = 0.0;
+                }
             }
             // Triggers are crossed on the way, not only where a move ends: a move replaced
             // before it finishes (a held stick re-aiming the hero ahead, a new click) still
@@ -3032,13 +3088,12 @@ impl Sim {
                 }
                 self.update_triggers(id);
             }
-            let da2 = self.game == thedas_vfs::Game::DragonAge2;
             if let Some(o) = self.world.get_mut(id) {
                 o.position = p;
                 if let Some((dx, dy)) = dir {
                     let want = crate::world::facing_toward(dx, dy);
-                    // Dragon Age II's follower is not traced: it faces the way at once.
-                    if da2 {
+                    if self.game == thedas_vfs::Game::DragonAge2 && o.kind != ObjectKind::Creature {
+                        // DA2's traced locomotion component belongs to creatures.
                         o.facing = want;
                     } else {
                         let since = o.commands.first().and_then(|c| c.turned_at).unwrap_or(t0);
@@ -3065,8 +3120,43 @@ impl Sim {
                         c.due = Some(now);
                         c.from = Some((here, now));
                         c.path = vec![here];
+                        if c.name == "CommandInitiateDialog" {
+                            c.approach = Some(here);
+                        }
                     }
                 }
+            }
+        }
+        // DA2's task-37 motion is sampled on its own animation clock. Changing
+        // an impact deadline to the tail must not rewind its position.
+        for (id, wanted) in self.da2_animation_positions() {
+            let Some((was, area)) = self.world.get(id).map(|o| (o.position, o.area)) else {
+                continue;
+            };
+            if was == wanted {
+                continue;
+            }
+            let at = self.slide_past_bodies(id, was, wanted).unwrap_or(wanted);
+            if was == at {
+                continue;
+            }
+            if let Some(area) = area
+                && self.door_sight(area).blocks(was, at)
+            {
+                continue;
+            }
+            // Task 37 drives the actor controller, not a pathfinding route. In
+            // particular, Origins' grid walkability mask is not a DA2 motion
+            // constraint: authored DA2 placements can be outside that mask.
+            // Use the same trigger-crossing samples as ordinary locomotion.
+            let steps = (crate::engine::dist(was, at) / TRIGGER_STEP).ceil().max(1.) as usize;
+            for i in 1..=steps {
+                let f = i as f32 / steps as f32;
+                self.move_object(
+                    id,
+                    std::array::from_fn(|j| was[j] + (at[j] - was[j]) * f),
+                    None,
+                );
             }
         }
     }
@@ -3074,6 +3164,14 @@ impl Sim {
     /// Puts a `CommandMoveToObject` walker that stepped inside its minimum range back out
     /// to it, on the line from the target.
     fn stop_at_range(&mut self, id: ObjectId) {
+        if self
+            .world
+            .get(id)
+            .and_then(|o| o.commands.first())
+            .is_some_and(|c| c.name == "CommandInitiateDialog")
+        {
+            return;
+        }
         if self.game == thedas_vfs::Game::Origins
             && self
                 .world
@@ -3110,7 +3208,7 @@ impl Sim {
     /// target. Keep the goal in the command's saved location. Provisional: the alternate
     /// LOS-goal search (nonzero native float 4), failed-search fallback 0x73e7f0 and
     /// replanning a moving target (0x7a50f0) are not modelled.
-    fn move_to_object_goal(&mut self, id: ObjectId, cmd: &Command) -> Option<Location> {
+    pub(crate) fn move_to_object_goal(&mut self, id: ObjectId, cmd: &Command) -> Option<Location> {
         let mover = self.world.get(id)?;
         let target = self.world.get(cmd.target?)?;
         let area = mover.area?;
@@ -3153,7 +3251,7 @@ impl Sim {
         let Some(c) = o.commands.first() else {
             return false;
         };
-        if !c.name.starts_with("CommandMoveToObject") {
+        if c.name != "CommandInitiateDialog" && !c.name.starts_with("CommandMoveToObject") {
             return false;
         }
         let Some(t) = c.target.and_then(|t| self.world.get(t)) else {
@@ -3164,6 +3262,10 @@ impl Sim {
         }
         let d = ((t.position[0] - o.position[0]).powi(2) + (t.position[1] - o.position[1]).powi(2))
             .sqrt();
+        if c.name == "CommandInitiateDialog" {
+            return self.interaction_radius(t.id) <= 0.0
+                && d <= (self.body_radius(id) + 1.0).max(3.0) + RANGE_SLACK;
+        }
         let min = c.seconds.max(0.0);
         // Legacy/DA2 moves retain their target-centred range approximation and the
         // lower-bound correction in `stop_at_range`.
@@ -3195,7 +3297,10 @@ impl Sim {
                     c.approach.is_some()
                         && c.from.is_some()
                         && c.target.is_some_and(|t| t != o.id)
-                        && (c.name == "CommandAttack" || c.name == "CommandUseAbility")
+                        && matches!(
+                            c.name.as_str(),
+                            "CommandAttack" | "CommandUseAbility" | "CommandInitiateDialog"
+                        )
                 })
             })
             // On a fixed grid of world time, so that ticks shorter than the period (the app's
@@ -3698,6 +3803,7 @@ impl Sim {
                     // gets there).
                     // So does a caster out of its ability's range.
                     let approach = match cmd.name.as_str() {
+                        "CommandInitiateDialog" => Some(self.talk_approach(id, &cmd)),
                         "CommandAttack" => Some(self.approach_point(id, &cmd)),
                         "CommandUseAbility"
                             if self.game == thedas_vfs::Game::DragonAge2
@@ -3727,6 +3833,20 @@ impl Sim {
                             let path = if walk.is_some() {
                                 match self.route_to(id, stop) {
                                     crate::nav::Routed::Path(p) => p,
+                                    crate::nav::Routed::Straight
+                                        if cmd.name == "CommandInitiateDialog"
+                                            && self
+                                                .world
+                                                .get(id)
+                                                .and_then(|o| o.area)
+                                                .and_then(|area| self.nav_grid(area))
+                                                .is_some() =>
+                                    {
+                                        // A required talk approach cannot succeed through
+                                        // the generic failed-route straight-line fallback.
+                                        self.fail_front_command(id, "COMMAND_FAILED_INVALID_PATH");
+                                        continue;
+                                    }
                                     crate::nav::Routed::Straight => Vec::new(),
                                     crate::nav::Routed::InvalidPath => {
                                         self.fail_front_command(id, "COMMAND_FAILED_INVALID_PATH");
@@ -4157,10 +4277,16 @@ impl Sim {
             // A walk that was under way ends facing as the walker's body faces: DAOrigins.exe's
             // ordinary arrival stops and resets the route (0x6a9430 -> 0xa63ac0) and sets no
             // facing, so the bearing the order was given with (the player's click, a held
-            // stick's aim) does not snap onto the body at the end. Jumps, placements and
-            // Dragon Age II's moves (its follower not traced) take the location's facing.
-            let keeps_facing =
-                walked && cmd.from.is_some() && self.game != thedas_vfs::Game::DragonAge2;
+            // stick's aim) does not snap onto the body at the end. DA2 completion likewise
+            // stops the follower (0x675fae -> 0x8a60e0) without assigning that bearing.
+            // Jumps and placements still take the location's facing.
+            let keeps_facing = walked
+                && cmd.from.is_some()
+                && (self.game != thedas_vfs::Game::DragonAge2
+                    || self
+                        .world
+                        .get(id)
+                        .is_some_and(|o| o.kind == ObjectKind::Creature));
             if let Some(obj) = self.world.get_mut(id) {
                 obj.position = l.position;
                 obj.area = Some(l.area);
@@ -4190,7 +4316,10 @@ impl Sim {
             self.finish_attack(id, cmd.target.unwrap_or(OBJECT_INVALID));
         } else if cmd.name == "CommandUseAbility" && !cmd.impacted {
             self.finish_ability(id, &cmd);
-        } else if cmd.name == "CommandStartConversation" {
+        } else if matches!(
+            cmd.name.as_str(),
+            "CommandStartConversation" | "CommandInitiateDialog"
+        ) {
             // DAOrigins.exe's executor (0x7a3700) sends the target EVENT_TYPE_DIALOGUE (18),
             // its creator the one talking and its resource the conversation, unless the target
             // is dead; rules_core answers it with UT_Talk, which begins the conversation.
@@ -4209,6 +4338,16 @@ impl Sim {
                         || !self.ambient.iter().any(|a| a.c.owner == t)
                 });
             if let Some(t) = target {
+                if cmd.name == "CommandInitiateDialog"
+                    && cmd.arrived
+                    && self.interaction_radius(t) > 0.0
+                {
+                    let there = self.world.get(t).unwrap().position;
+                    if let Some(me) = self.world.get_mut(id) {
+                        me.facing =
+                            facing_toward(there[0] - me.position[0], there[1] - me.position[1]);
+                    }
+                }
                 let mut ev = self.new_event("DIALOGUE", Some(id));
                 ev.resources = vec![cmd.strings.first().cloned().unwrap_or_default()];
                 ev.objects = vec![id];
@@ -4708,6 +4847,9 @@ impl Sim {
             }
         }
         read_text_fields(o, inst);
+        if field(inst, "InteractRadius").is_some() {
+            o.interact_radius = Some(float(inst, "InteractRadius"));
+        }
         apply_placeable_useable(o, self.game);
         // A waypoint's map note text (a talk-table id), which the area map shows.
         if let Some(s) = strref(inst, "MapNote") {
@@ -4756,6 +4898,7 @@ impl Sim {
                 _ => {}
             }
         }
+        self.init_placeable_state(id);
         self.created(id);
         id
     }
@@ -4787,6 +4930,40 @@ fn template_appearance(t: &Gff3) -> Option<i32> {
 }
 
 impl Sim {
+    /// Older saves omitted this float. Recover placed overrides before the template,
+    /// using the area's resource and instance tag, even after the creature has moved.
+    pub(crate) fn interaction_radius(&self, id: ObjectId) -> f32 {
+        let Some(o) = self.world.get(id) else {
+            return 0.0;
+        };
+        if let Some(radius) = o.interact_radius {
+            return radius;
+        }
+        let placed = o
+            .area
+            .and_then(|area| self.world.get(area))
+            .and_then(|area| {
+                let are = self
+                    .read_gff3(&format!("{}.are", area.template.to_ascii_lowercase()))
+                    .ok()?;
+                let root = are.structs.first()?;
+                list_of(root, "CreatureList").iter().find_map(|&i| {
+                    let inst = are.structs.get(i as usize)?;
+                    (text(inst, "Tag").is_some_and(|tag| tag.eq_ignore_ascii_case(&o.tag))
+                        && resref_field(inst, "TemplateResRef")
+                            .is_some_and(|template| template.eq_ignore_ascii_case(&o.template))
+                        && field(inst, "InteractRadius").is_some())
+                    .then(|| float(inst, "InteractRadius"))
+                })
+            });
+        placed.unwrap_or_else(|| {
+            self.read_gff3(&format!("{}.utc", o.template.to_ascii_lowercase()))
+                .ok()
+                .and_then(|t| t.structs.first().map(|r| float(r, "InteractRadius")))
+                .unwrap_or(0.0)
+        })
+    }
+
     /// The appearance creature `id`'s template gives it, when the template can be read and
     /// gives one.
     pub(crate) fn original_appearance(&self, id: ObjectId) -> Option<i32> {
@@ -4810,6 +4987,7 @@ fn apply_template(o: &mut crate::world::Object, t: &Gff3) {
     o.dialog = resref_field(r, "DialogResRef")
         .or_else(|| resref_field(r, "Conversation"))
         .or_else(|| resref_field(r, "ConversationResR"));
+    o.interact_radius = Some(float(r, "InteractRadius"));
     o.name_strref = strref(r, "LocName");
     o.immortal = int(r, "Immortal").unwrap_or(0) != 0;
     o.plot = int(r, "Plot").unwrap_or(0) != 0;
@@ -5871,6 +6049,66 @@ mod tests {
     }
 
     #[test]
+    fn da2_walking_turns_over_elapsed_time_and_keeps_it_across_reload() {
+        let mut s = sim();
+        s.game = thedas_vfs::Game::DragonAge2;
+        let area = s.world.spawn(ObjectKind::Area, "a");
+        let walker = s.world.spawn(ObjectKind::Creature, "walker");
+        s.world.get_mut(walker).unwrap().area = Some(area);
+        // Initially facing +Y, asked to walk +X: native 0x8a6110 turns about
+        // -22.85 degrees on the first 33 ms step, rather than snapping to 270.
+        s.order_move(walker, [30.0, 0.0, 0.0]);
+        s.tick(33);
+        let first = s.world.get(walker).unwrap().facing;
+        assert!((first - 337.15384).abs() < 0.01, "{first}");
+        assert!(s.world.get(walker).unwrap().position[0] > 0.0);
+        // Other work at the same timestamp spends no second turning budget.
+        s.tick(0);
+        assert_eq!(s.world.get(walker).unwrap().facing, first);
+        let mut loaded = sim();
+        loaded.game = s.game;
+        loaded.world = serde_json::from_str(&serde_json::to_string(&s.world).unwrap()).unwrap();
+        s.tick(33);
+        loaded.tick(33);
+        let expected = s.world.get(walker).unwrap();
+        let actual = loaded.world.get(walker).unwrap();
+        assert!(expected.facing < first && expected.facing > 270.0);
+        assert_eq!(actual.facing, expected.facing);
+        assert_eq!(actual.position, expected.position);
+        assert_eq!(actual.commands, expected.commands);
+    }
+
+    #[test]
+    fn da2_path_arrival_preserves_body_heading_instead_of_the_orders_bearing() {
+        let mut s = sim();
+        s.game = thedas_vfs::Game::DragonAge2;
+        let area = s.world.spawn(ObjectKind::Area, "a");
+        let walker = s.world.spawn(ObjectKind::Creature, "walker");
+        s.world.get_mut(walker).unwrap().area = Some(area);
+        s.order_move(walker, [1.0, 1.0, 0.0]);
+        s.tick(0);
+        let c = s
+            .world
+            .get_mut(walker)
+            .unwrap()
+            .commands
+            .first_mut()
+            .unwrap();
+        c.path = vec![[1.0, 0.0, 0.0], [1.0, 1.0, 0.0]];
+        c.due = Some(100);
+        c.location.as_mut().unwrap().facing = 123.0;
+        s.world.time_ms = 100;
+        s.advance_movers();
+        let before = s.world.get(walker).unwrap().facing;
+        assert_eq!(before, 0.0); // The last leg faces +Y.
+        s.finish_command(walker);
+        let o = s.world.get(walker).unwrap();
+        assert_eq!(o.position, [1.0, 1.0, 0.0]);
+        assert_eq!(o.facing, before);
+        assert!(o.commands.is_empty());
+    }
+
+    #[test]
     fn dragon_age_2_reference_functions_run_as_their_twins() {
         let ldf = "#define ENGINE_STRUCTURE_0 event\n\
             event Event(int nType) = 0;\n\
@@ -5908,6 +6146,265 @@ mod tests {
         let mut none = vec![args[0].clone()];
         assert_eq!(h.action_ref(1, &f("NoTwinRef"), &mut none).unwrap(), None);
         assert_eq!(none[0], args[0]);
+    }
+
+    #[test]
+    fn placed_initial_states_seed_the_controller_before_spawn_events() {
+        use thedas_formats::gda::Cell;
+        use thedas_formats::gff3::Field;
+        for game in [thedas_vfs::Game::Origins, thedas_vfs::Game::DragonAge2] {
+            for (initial, expected) in [
+                (None, None),
+                (Some(0), Some(0)),
+                (Some(1), Some(1)),
+                (Some(2), Some(2)),
+                (Some(3), Some(3)),
+                (Some(4), Some(4)),
+                (Some(5), Some(5)),
+                (Some(6), Some(0)),
+                (Some(65_538), Some(2)),
+                (Some(-1), Some(0)),
+            ] {
+                let mut s = sim();
+                s.game = game;
+                let tables = crate::m2da::Tables::empty();
+                tables.insert(
+                    "#93",
+                    &["#9a320a51"],
+                    vec![(0, vec![Cell::String("statecnt_door".into())])],
+                );
+                tables.insert(
+                    "statecnt_door",
+                    &["ID"],
+                    (0..6).map(|id| (id, vec![Cell::Int(id)])).collect(),
+                );
+                s.world.tables = Arc::new(tables);
+                let area = s.world.spawn(ObjectKind::Area, "home");
+                let mut inst = Struct {
+                    id: 0,
+                    fields: vec![Field {
+                        label: "AnimContState".into(),
+                        value: G3::Int(3),
+                    }],
+                };
+                if let Some(initial) = initial {
+                    inst.fields.push(Field {
+                        label: "InitialState".into(),
+                        value: G3::Int(initial),
+                    });
+                }
+                let are = Gff3 {
+                    file_type: *b"ARE ",
+                    file_version: *b"V3.2",
+                    structs: vec![inst.clone()],
+                };
+                let id = s.spawn_instance(&are, &inst, ObjectKind::Placeable, "", area);
+                assert_eq!(
+                    s.world.get(id).unwrap().fields.get("State").copied(),
+                    if game == thedas_vfs::Game::Origins {
+                        expected
+                    } else {
+                        None
+                    },
+                    "{game:?}: {initial:?}"
+                );
+                assert_eq!(s.world.get(id).unwrap().fields["AnimContState"], 3);
+                assert!(
+                    s.world.queue.is_empty(),
+                    "initialization sends no controller event"
+                );
+                assert!(
+                    s.world.destroy_at.is_empty(),
+                    "a Dead pose alone is not lethal health"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires an Origins THEDAS_INSTALL"]
+    fn installed_home_door_starts_open_and_locked_doors_offer_unlock() {
+        let install =
+            thedas_vfs::DaoInstall::open(std::env::var_os("THEDAS_INSTALL").unwrap()).unwrap();
+        let vfs = Arc::new(
+            install
+                .global_vfs(thedas_vfs::install::TextureQuality::High)
+                .unwrap(),
+        );
+        let table = Arc::new(EngineTable::parse(&vfs.read("script.ldf").unwrap().0).unwrap());
+        let mut s = Sim::new(vfs, table, 7);
+        s.install_root = Some(install.root().to_path_buf());
+        let area = s.enter_area("bdc210ar_players_home", None).unwrap();
+        let door = s
+            .world
+            .objects
+            .values()
+            .find(|o| o.area == Some(area) && o.template == "genip_door_dws_lrg")
+            .unwrap()
+            .id;
+        assert_eq!(s.world.get(door).unwrap().fields["InitialState"], 2);
+        assert_eq!(s.world.get(door).unwrap().fields["State"], 2);
+        assert_eq!(crate::engine::placeable_default_action(&s, door), Some(2)); // Close
+        assert_eq!(s.world.get(door).unwrap().placeable_group, Some(1));
+        assert!(!s.closed_doors(area).iter().any(|(id, _)| *id == door));
+        let before = s.world.nav_patches.clone();
+        s.set_placeable_state(door, 1);
+        assert_eq!(crate::engine::placeable_default_action(&s, door), Some(3)); // Unlock
+        assert!(s.closed_doors(area).iter().any(|(id, _)| *id == door));
+        assert!(
+            s.world
+                .get(door)
+                .unwrap()
+                .placeable_group
+                .is_some_and(|group| group & thedas_formats::phy::mask::NON_WALKABLE != 0)
+        );
+        assert_ne!(
+            s.world.nav_patches, before,
+            "the closed PWK replaces the open footprint"
+        );
+        let locked_cells = s
+            .closed_doors(area)
+            .into_iter()
+            .find(|(id, _)| *id == door)
+            .unwrap()
+            .1;
+        s.set_placeable_state(door, 0);
+        let unlocked_cells = s
+            .closed_doors(area)
+            .into_iter()
+            .find(|(id, _)| *id == door)
+            .unwrap()
+            .1;
+        assert!(
+            unlocked_cells
+                .iter()
+                .any(|cell| !locked_cells.contains(cell)),
+            "unlocking must refresh cached doorway cells"
+        );
+        s.set_placeable_state(door, 1);
+        let locked_grid = s.nav_grid(area).unwrap();
+        s.set_object_active(door, false);
+        let cleared_grid = s.nav_grid(area).unwrap();
+        let index = locked_grid
+            .data
+            .iter()
+            .zip(&cleared_grid.data)
+            .position(|(&old, &new)| old == 8 && new == 1)
+            .unwrap();
+        // A different footprint owner writes after deactivation. Repeating the
+        // same script request must not remove that owner's cells again.
+        let mut overwritten = (*cleared_grid).clone();
+        overwritten.data[index] = 8;
+        s.changed_nav_grids.insert(area, Arc::new(overwritten));
+        s.world
+            .nav_patches
+            .get_mut(&area)
+            .unwrap()
+            .insert(index as u32, 8);
+        s.set_object_active(door, false);
+        assert_eq!(s.nav_grid(area).unwrap().data[index], 8);
+        s.set_object_active(door, true);
+        let saved = s.save_json().unwrap();
+        s.load_json(&saved).unwrap();
+        assert_eq!(s.world.get(door).unwrap().fields["State"], 1);
+        let returned = s.enter_area("bdc210ar_players_home", None).unwrap();
+        assert_eq!(returned, area);
+        assert_eq!(s.world.get(door).unwrap().fields["State"], 1);
+        // An older save can hold an unloaded area's active door parked with
+        // active=false. Initialization must retain its actual collision state.
+        let o = s.world.get_mut(door).unwrap();
+        o.fields.insert("InitialState".into(), 1);
+        o.fields.remove("State");
+        o.parked = Some(true);
+        o.active = false;
+        let mut legacy = s.save_game();
+        legacy.revision = 9;
+        s.load_game(legacy).unwrap();
+        assert!(!s.world.get(door).unwrap().active);
+        s.enter_area("bdc210ar_players_home", None).unwrap();
+        assert!(s.closed_doors(area).iter().any(|(id, _)| *id == door));
+        let redcliffe = s.enter_area("arl100ar_redcliffe_village", None).unwrap();
+        for tag in ["arl100ip_door_dwyn", "arl100ip_door_owen"] {
+            let id = s
+                .world
+                .objects
+                .values()
+                .find(|o| o.area == Some(redcliffe) && o.tag == tag)
+                .unwrap()
+                .id;
+            assert_eq!(s.world.get(id).unwrap().fields["InitialState"], 1);
+            assert_eq!(s.world.get(id).unwrap().fields["State"], 1);
+            assert_eq!(
+                crate::engine::placeable_default_action(&s, id),
+                Some(3),
+                "{tag} must offer Unlock"
+            );
+        }
+    }
+
+    #[test]
+    fn talk_radii_load_template_and_instance_values_and_recover_older_saves() {
+        use thedas_formats::gff3::Field;
+        let dir = std::env::temp_dir().join(format!("thedas-talk-radius-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = |label: &str, value| Field {
+            label: label.into(),
+            value,
+        };
+        let template = Gff3 {
+            file_type: *b"UTC ",
+            file_version: *b"V3.2",
+            structs: vec![Struct {
+                id: 0,
+                fields: vec![f("InteractRadius", G3::Float(5.0))],
+            }],
+        };
+        let instance = Struct {
+            id: 0,
+            fields: vec![
+                f("Tag", G3::ExoString(b"bartender".to_vec())),
+                f("TemplateResRef", G3::ResRef(b"merchant".to_vec())),
+                f("InteractRadius", G3::Float(3.5)),
+            ],
+        };
+        let are = Gff3 {
+            file_type: *b"ARE ",
+            file_version: *b"V3.2",
+            structs: vec![
+                Struct {
+                    id: 0,
+                    fields: vec![f("CreatureList", G3::List(vec![1]))],
+                },
+                instance.clone(),
+            ],
+        };
+        let files = [dir.join("merchant.utc"), dir.join("tavern.are")];
+        std::fs::write(&files[0], template.write().unwrap()).unwrap();
+        std::fs::write(&files[1], are.write().unwrap()).unwrap();
+        let mut s = sim();
+        let mut vfs = Vfs::new();
+        vfs.push_files(&files, "test");
+        s.vfs = Arc::new(vfs);
+        let area = s.world.spawn(ObjectKind::Area, "tavern");
+        s.world.get_mut(area).unwrap().template = "tavern".into();
+        let npc = s.spawn_instance(&are, &instance, ObjectKind::Creature, "utc", area);
+        assert_eq!(s.world.get(npc).unwrap().interact_radius, Some(3.5));
+        assert_eq!(s.interaction_radius(npc), 3.5);
+        let dynamic =
+            s.create_from_template(ObjectKind::Creature, "merchant", Some(area), [0.0; 3], 0.0);
+        assert_eq!(s.interaction_radius(dynamic), 5.0);
+        // Simulate a pre-change save, whose objects have no radius member.
+        let mut json = serde_json::to_value(s.world.get(npc).unwrap()).unwrap();
+        json.as_object_mut().unwrap().remove("interact_radius");
+        *s.world.get_mut(npc).unwrap() = serde_json::from_value(json).unwrap();
+        s.world.get_mut(dynamic).unwrap().interact_radius = None;
+        assert_eq!(s.interaction_radius(npc), 3.5);
+        assert_eq!(s.interaction_radius(dynamic), 5.0);
+        let mut zero = instance;
+        zero.fields.last_mut().unwrap().value = G3::Float(0.0);
+        let zero = s.spawn_instance(&are, &zero, ObjectKind::Creature, "utc", area);
+        assert_eq!(s.interaction_radius(zero), 0.0);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -6172,6 +6669,7 @@ mod tests {
             impacted: false,
             arrived: false,
             da2_target_prepared: false,
+            da2_basic_attack_fallback: false,
             path: Vec::new(),
             turned_at: None,
             is_static: false,
@@ -7004,6 +7502,7 @@ mod tests {
             impacted: false,
             arrived: false,
             da2_target_prepared: false,
+            da2_basic_attack_fallback: false,
             path: Vec::new(),
             turned_at: None,
             is_static: false,
@@ -7100,6 +7599,7 @@ mod tests {
             impacted: false,
             arrived: false,
             da2_target_prepared: false,
+            da2_basic_attack_fallback: false,
             path: Vec::new(),
             turned_at: None,
             is_static: false,
@@ -7146,6 +7646,7 @@ mod tests {
             impacted: false,
             arrived: false,
             da2_target_prepared: false,
+            da2_basic_attack_fallback: false,
             path: Vec::new(),
             turned_at: None,
             is_static: false,
@@ -7266,6 +7767,7 @@ mod tests {
             impacted: false,
             arrived: false,
             da2_target_prepared: false,
+            da2_basic_attack_fallback: false,
             path: Vec::new(),
             turned_at: None,
             is_static: false,
@@ -7472,6 +7974,7 @@ mod tests {
                 impacted: false,
                 arrived: false,
                 da2_target_prepared: false,
+                da2_basic_attack_fallback: false,
                 path: Vec::new(),
                 turned_at: None,
                 is_static: false,
@@ -7526,6 +8029,7 @@ mod tests {
             impacted: false,
             arrived: false,
             da2_target_prepared: false,
+            da2_basic_attack_fallback: false,
             path: Vec::new(),
             turned_at: None,
             is_static: false,
@@ -7674,6 +8178,7 @@ mod tests {
             impacted: false,
             arrived: false,
             da2_target_prepared: false,
+            da2_basic_attack_fallback: false,
             path: Vec::new(),
             turned_at: None,
             is_static: false,
@@ -7744,6 +8249,7 @@ mod tests {
             impacted: false,
             arrived: false,
             da2_target_prepared: false,
+            da2_basic_attack_fallback: false,
             path: Vec::new(),
             turned_at: None,
             is_static: false,
@@ -7798,6 +8304,7 @@ mod tests {
             impacted: false,
             arrived: false,
             da2_target_prepared: false,
+            da2_basic_attack_fallback: false,
             path: Vec::new(),
             turned_at: None,
             is_static: false,
@@ -8028,6 +8535,7 @@ mod tests {
                 impacted: false,
                 arrived: false,
                 da2_target_prepared: false,
+                da2_basic_attack_fallback: false,
                 path: Vec::new(),
                 turned_at: None,
                 is_static: false,
@@ -8058,6 +8566,7 @@ mod tests {
             impacted: false,
             arrived: false,
             da2_target_prepared: false,
+            da2_basic_attack_fallback: false,
             path: Vec::new(),
             turned_at: None,
             is_static: false,
@@ -8142,6 +8651,7 @@ mod tests {
             impacted: false,
             arrived: false,
             da2_target_prepared: false,
+            da2_basic_attack_fallback: false,
             path: Vec::new(),
             turned_at: None,
             is_static: false,
@@ -8210,6 +8720,7 @@ mod tests {
             impacted: false,
             arrived: false,
             da2_target_prepared: false,
+            da2_basic_attack_fallback: false,
             path: Vec::new(),
             turned_at: None,
             is_static: false,
@@ -8439,6 +8950,7 @@ mod tests {
             impacted: false,
             arrived: false,
             da2_target_prepared: false,
+            da2_basic_attack_fallback: false,
             path: Vec::new(),
             turned_at: None,
             is_static: false,
