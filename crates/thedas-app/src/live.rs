@@ -269,6 +269,8 @@ pub struct Live {
     swings: thedas_ui::models::PlaceableSwings,
     /// Creatures' starts and stops (see [`thedas_ui::locomotion`]).
     locomotion: thedas_ui::locomotion::Locomotion,
+    /// Crossfades between creatures' animations outside movement.
+    crossfade: thedas_ui::crossfade::Crossfade,
     /// Objects drawn faded, by id: their opacity (0..1; missing is 1). The camera fades a
     /// creature it is inside (DAOrigins.exe 0x6c4130 eases it to 0.05).
     pub opacity: std::collections::HashMap<ObjectId, f32>,
@@ -285,6 +287,8 @@ pub struct Live {
     pub detail: thedas_render::scene::Detail,
     /// The conversation camera's resources and current shot.
     talk_camera: crate::talkcam::TalkCamera,
+    /// The creature the conversation camera hides (see [`crate::talkcam::TalkCamera::hidden`]).
+    talk_hidden: Option<ObjectId>,
     /// The playing cutscene's camera tracks.
     cutscene_camera: crate::cutcam::CutsceneCamera,
     /// The creatures cutscenes and conversation lines pose (see [`crate::cutactors`]).
@@ -445,7 +449,7 @@ pub static ANTIALIASING_FORCED: std::sync::atomic::AtomicBool =
 
 /// The most samples a pixel at or under `wanted` that the adapter supports for `format`.
 fn supported_samples(ctx: &GpuContext, format: wgpu::TextureFormat, wanted: u32) -> u32 {
-    thedas_render::msaa::supported_samples(&ctx.adapter, format)
+    thedas_render::msaa::supported_samples(&ctx.adapter, &ctx.device, format)
         .into_iter()
         .filter(|&n| n <= wanted.max(1))
         .max()
@@ -748,6 +752,7 @@ impl Live {
             models: ModelCache::default(),
             swings: Default::default(),
             locomotion: Default::default(),
+            crossfade: Default::default(),
             opacity: Default::default(),
             cache: RenderCache::default(),
             async_loads: false,
@@ -768,6 +773,7 @@ impl Live {
             render_path: Default::default(),
             detail: Default::default(),
             talk_camera: Default::default(),
+            talk_hidden: None,
             cutscene_camera: Default::default(),
             cut_actors: Default::default(),
             cut_light_model: None,
@@ -1290,7 +1296,8 @@ impl Live {
     /// Rebuilds [`Live::opacity`] from every fade that sets one, multiplied together (a
     /// missing entry is opaque). Each source keeps its own values; add another fade (a
     /// corpse's decay) here rather than writing `opacity` directly. Sources: the game
-    /// camera's fade ([`crate::camfade`]).
+    /// camera's fade ([`crate::camfade`]), corpses' decay and the conversation listener the
+    /// default framing hides ([`crate::talkcam::TalkCamera::hidden`]).
     fn combine_opacity(&mut self) {
         self.opacity.clear();
         for (id, alpha) in self.camera_fade.faded() {
@@ -1300,6 +1307,10 @@ impl Live {
         let corpses = self.sim().corpse_fades();
         for (id, alpha) in corpses {
             *self.opacity.entry(id).or_insert(1.0) *= alpha;
+        }
+        // The listener a conversation's default framing hides.
+        if let Some(id) = self.talk_hidden {
+            self.opacity.insert(id, 0.0);
         }
         self.opacity.retain(|_, a| *a < 1.0);
     }
@@ -1433,6 +1444,14 @@ impl Live {
         &mut self,
         base: &thedas_render::Camera,
     ) -> Option<thedas_render::Camera> {
+        let view = self.conversation_view(base);
+        // The default framing hides its listener (see `TalkCamera::hidden`).
+        self.combine_opacity();
+        view
+    }
+
+    fn conversation_view(&mut self, base: &thedas_render::Camera) -> Option<thedas_render::Camera> {
+        self.talk_hidden = None;
         let sim = self.sim.lock().unwrap_or_else(|p| p.into_inner());
         // A cutscene that played over this line (the opening `start_wake.cut` over City
         // Elf's first line) leaves its last view for the rest of the line: the original
@@ -1463,8 +1482,11 @@ impl Live {
         let faces = self.objects.as_ref().map(|o| &o.faces);
         let face = |id| faces.and_then(|f| f.get(&id).copied());
         let posed = &self.posed;
-        self.talk_camera
-            .camera(&sim, base, &face, &|id| drawn_root(posed, id))
+        let view = self
+            .talk_camera
+            .camera(&sim, base, &face, &|id| drawn_root(posed, id));
+        self.talk_hidden = self.talk_camera.hidden();
+        view
     }
 
     /// The playing cutscene's camera (see [`crate::cutcam`]); `base` gives the clip planes.
@@ -1864,6 +1886,7 @@ impl Live {
         };
         self.swings.apply(&sim, &mut models);
         self.locomotion.apply(&sim, &mut models);
+        self.crossfade.apply(&sim, &mut models);
         let was = self.staged;
         self.staged = staged.map(|(id, s)| (id, s.mark, s.facing));
         if self.staged.map(|s| s.0) != was.map(|s| s.0) {
@@ -2049,12 +2072,24 @@ impl Live {
                 self.travel = false;
             }
         }
+        // Each creature's appearance scales its clips' translations (a dwarf sits lower than
+        // the human clip's drop; see `thedas_render::skeleton::Layer::scale`).
+        let scales: std::collections::HashMap<ObjectId, [f32; 3]> = {
+            let sim = self.sim();
+            models
+                .iter()
+                .filter_map(|m| thedas_ui::models::translation_scale(&sim, m.id).map(|s| (m.id, s)))
+                .collect()
+        };
         let (Some(level), Some(objects)) = (self.level.as_ref(), self.objects.as_mut()) else {
             return Ok(());
         };
         let mut posed: Vec<(Mat4, Option<Clip>)> = Vec::with_capacity(models.len());
         for m in &models {
             let mut c = m.motion.as_ref().map(clip);
+            if let Some(c) = c.as_mut() {
+                c.translation_scale = Some(scales.get(&m.id).copied().unwrap_or([1.0; 3]));
+            }
             let none = Vec::new();
             let held = kept.get(&m.id).unwrap_or(&none);
             let (at, facing) = match posing.get(&m.id) {
@@ -2100,7 +2135,15 @@ impl Live {
                     }
                     (at, show.facing)
                 }
-                None => (m.position, m.facing),
+                None => {
+                    let mut at = m.position;
+                    if m.kind == thedas_sim::world::ObjectKind::Creature
+                        && let Some(z) = floor_under(&level.collider, at)
+                    {
+                        at[2] = z;
+                    }
+                    (at, m.facing)
+                }
             };
             // Head tracking: the pose animations of a creature that looks at another, or is
             // turning back from it.
@@ -2981,6 +3024,25 @@ fn creature_shapes(
             )
         })
         .clone()
+}
+
+/// How far above or below its position a creature's drawn feet look for the floor
+/// (metres; see [`floor_under`]).
+pub const FLOOR_REACH: f32 = 0.25;
+
+/// The level's floor under a creature standing at `at`, within [`FLOOR_REACH`] of its
+/// height: DAOrigins.exe keeps movers on the physics floor (its ground helper 0x685430),
+/// which lies on the drawn floor, while the simulation keeps the pathing grid's quantized
+/// height, a centimetre or two below it (report 985: soles in the floor). Presentation
+/// only; the simulation's position is unchanged. A seat or table above the window (a
+/// sitter's chair) is not taken. Provisional: the window.
+fn floor_under(collider: &thedas_render::collide::Collider, at: [f32; 3]) -> Option<f32> {
+    let p = glam::Vec3::from_array(at);
+    let (from, to) = (
+        p + glam::Vec3::Z * FLOOR_REACH,
+        p - glam::Vec3::Z * FLOOR_REACH,
+    );
+    collider.first_hit(from, to).map(|f| from.lerp(to, f).z)
 }
 
 /// Creatures are picked as upright cylinders this tall (metres). Provisional.
