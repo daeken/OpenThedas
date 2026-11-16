@@ -5419,6 +5419,7 @@ name = "thedas-vfs"
 version = "0.1.0"
 dependencies = [
  "blowfish",
+ "cc",
  "dirs",
  "flate2",
  "log",
