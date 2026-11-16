@@ -1159,6 +1159,10 @@ impl Sim {
         c = match next {
             Some(n) => self.speak(c, n),
             None => Conversation {
+                // The selected reply has no next line. Do not leave the answered
+                // NPC line on screen to be timed and continued a second time.
+                // DAOrigins.exe 0x68dbca-0x68dbd5 ends the dialog on this path.
+                line: None,
                 ended: true,
                 replies: Vec::new(),
                 ..c
@@ -1422,6 +1426,39 @@ mod tests {
         let st = sim.choose_reply(0).unwrap();
         assert_eq!(st.line, "line 13");
         assert!(st.ended);
+    }
+
+    #[test]
+    fn a_reply_without_a_next_line_does_not_replay_the_answered_line() {
+        // Kasch and the Tapster's bartender end on a reply with no children.
+        // A real terminal NPC line still needs to be presented; taking a reply
+        // that ends the exchange must instead clear the line already answered.
+        for game in [thedas_vfs::Game::Origins, thedas_vfs::Game::DragonAge2] {
+            let mut sim = Sim::new(
+                std::sync::Arc::new(thedas_vfs::Vfs::new()),
+                std::sync::Arc::new(thedas_script::EngineTable::default()),
+                1,
+            );
+            sim.game = game;
+            let hero = sim.world.spawn(crate::world::ObjectKind::Creature, "hero");
+            let npc = sim.world.spawn(crate::world::ObjectKind::Creature, "npc");
+            sim.world.hero = Some(hero);
+            let dlg = Dlg::from_gff4(&doc(), "test").unwrap();
+            assert!(sim.open_conversation(hero, npc, dlg.clone(), None));
+            assert_eq!(sim.dialog_state().unwrap().line, "line 10");
+            assert_eq!(sim.dialog_state().unwrap().replies.len(), 2);
+            let state = sim.choose_reply(1).unwrap();
+            assert!(state.ended);
+            assert!(state.line.is_empty());
+            assert!(state.replies.is_empty());
+            assert!(sim.conversation_line().is_none());
+            assert!(sim.talk.as_ref().unwrap().staged.is_empty());
+
+            assert!(sim.open_conversation(hero, npc, dlg, None));
+            let state = sim.choose_reply(0).unwrap();
+            assert!(state.ended);
+            assert_eq!(state.line, "line 13", "a new terminal NPC line still plays");
+        }
     }
 
     #[test]
