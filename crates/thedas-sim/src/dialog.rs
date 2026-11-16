@@ -442,10 +442,20 @@ impl Sim {
         // (see [`Sim::advance_ambient`]). Presentation is told of it.
         if c.ambient_run {
             let (voiced, ms) = self.ambient_line_time(&c, line);
+            let text = self.node_text(&node);
+            // An entry with no text is passed over, not presented (0x7f206e-0x7f207b take
+            // the bypass at 0x7f2139): it takes no time and shows nothing.
+            if text.is_empty() {
+                c.ended = replies.is_empty();
+                c.replies = replies;
+                return c;
+            }
+            let until = self.world.time_ms + u64::from(ms);
+            let end = self.ambient_speaking.entry(speaker).or_insert(until);
+            *end = (*end).max(until);
             if self.world.ambient_lines.len() >= 64 {
                 self.world.ambient_lines.remove(0);
             }
-            let text = self.node_text(&node);
             self.world.ambient_lines.push(crate::world::AmbientLine {
                 speaker,
                 dialog: c.dlg.name.clone(),
@@ -542,6 +552,7 @@ impl Sim {
                     && let Some(o) = self.world.get_mut(id)
                 {
                     o.active = true;
+                    o.da2_locomotion = None;
                 }
             }
             if let Some(stage) = &cut.da2_stage {
@@ -858,6 +869,20 @@ impl Sim {
         {
             return true;
         }
+        // Nor does a speaker still saying a line in passing begin another, even once its
+        // conversation was cleared (`ClearAmbientDialogs`, as UT_Talk does on a click):
+        // DAOrigins.exe's ambient manager refuses a line for a speaker whose line is still
+        // going (0x6ffaa0 -> 0x6ff190). Clicking the Dust Town beggar again and again
+        // began his remark over each time.
+        if ambient(self)
+            && self.game == thedas_vfs::Game::Origins
+            && self
+                .ambient_speaking
+                .get(&target)
+                .is_some_and(|&until| until > self.world.time_ms)
+        {
+            return true;
+        }
         let c = Conversation {
             ambient_run: ambient(self),
             ..c
@@ -976,6 +1001,10 @@ impl Sim {
     /// voiced. Provisional: the exe counts a line as voiced when its voice started to play,
     /// so with voices off or a sample that fails it takes the unvoiced time.
     fn ambient_line_time(&mut self, c: &Conversation, line: usize) -> (bool, u32) {
+        // A line with no text is not presented (see [`Sim::speak`]) and takes no time.
+        if self.node_text(&c.dlg.nodes[line]).is_empty() {
+            return (false, 0);
+        }
         let female = self.player_is_female(c.player);
         let voice = match (&self.install_root, c.dlg.nodes[line].strref) {
             (Some(root), Some(strref)) => self.voices.line_ms(root, &c.dlg.name, strref, female),
@@ -1003,6 +1032,8 @@ impl Sim {
     /// modes (0x6ff5a3 to 0x6ff633), here they run with the simulation's clock; they are
     /// not saved.
     pub(crate) fn advance_ambient(&mut self, ms: u64) {
+        let now = self.world.time_ms;
+        self.ambient_speaking.retain(|_, until| *until > now);
         if self.ambient.is_empty() {
             return;
         }
@@ -1189,6 +1220,18 @@ impl Sim {
     /// queued it; the conversation may have moved on to a later line meanwhile).
     pub fn cutscene_line(&self) -> Option<usize> {
         self.talk.as_ref().and_then(|c| c.cut_from)
+    }
+
+    /// The shown line's referenced cutscene while it is playing, including a final line
+    /// whose conversation has ended and is still being presented.
+    pub fn conversation_line_cutscene(&self) -> Option<&crate::cutscene::Cutscene> {
+        let c = self.talk.as_ref()?;
+        let name = c.dlg.nodes.get(c.line?)?.cutscene.as_deref()?;
+        let resource = crate::cutscene::Cutscene::resource(name);
+        self.world
+            .cutscene
+            .as_ref()
+            .filter(|cut| cut.from_dialog && cut.name == resource && c.cut_from == c.line)
     }
 
     pub fn conversation_line(&self) -> Option<OpenLine<'_>> {
@@ -1815,6 +1858,41 @@ mod tests {
     }
 
     #[test]
+    fn the_presented_line_owns_only_its_current_referenced_cutscene() {
+        let (mut sim, hero, npc) = passers_by();
+        let mut dlg = remarks("cinematic", &["First.", "Last."], false);
+        for node in &mut dlg.nodes {
+            node.ambient = false;
+        }
+        dlg.nodes[0].cutscene = Some("INTRO.CUT".into());
+        dlg.nodes[2].cutscene = Some("intro".into());
+        assert!(sim.open_conversation(hero, npc, dlg, None));
+        assert!(sim.conversation_line_cutscene().is_none());
+        sim.world.cutscene = Some(crate::cutscene::Cutscene {
+            name: "intro.cut".into(),
+            seconds: 4.0,
+            lines: Vec::new(),
+            elapsed_ms: 100,
+            from_dialog: true,
+            bound: Vec::new(),
+            placement: None,
+        });
+        assert!(sim.conversation_line_cutscene().is_some());
+        // Final lines remain presented after the conversation walker marks them ended.
+        sim.talk.as_mut().unwrap().ended = true;
+        assert!(sim.conversation_line_cutscene().is_some());
+        // A later line, a different resource, and a script's cut have separate ownership.
+        sim.talk.as_mut().unwrap().line = Some(2);
+        assert!(sim.conversation_line_cutscene().is_none());
+        sim.talk.as_mut().unwrap().line = Some(0);
+        sim.world.cutscene.as_mut().unwrap().name = "other.cut".into();
+        assert!(sim.conversation_line_cutscene().is_none());
+        sim.world.cutscene.as_mut().unwrap().name = "intro.cut".into();
+        sim.world.cutscene.as_mut().unwrap().from_dialog = false;
+        assert!(sim.conversation_line_cutscene().is_none());
+    }
+
+    #[test]
     fn a_conversation_said_in_passing_says_one_line_at_a_time() {
         // King Endrin at the feast answered "Quickly, find Trian and send him to me." and
         // nobody heard it: the whole conversation was run at once and kept from the
@@ -1874,7 +1952,8 @@ mod tests {
                 sim.order_talk(hero, npc);
                 sim.tick(600);
             }
-            assert_eq!(requested(&sim), game != thedas_vfs::Game::Origins);
+            // DIALOGUE goes to the target every time (rules_core decides what to do).
+            assert!(requested(&sim));
             assert_eq!(said(&sim), ["one"]);
             sim.tick(u64::from(AMBIENT_LINE_MS));
             sim.world.trace.entries.clear();
@@ -1885,6 +1964,39 @@ mod tests {
                 "a new click is accepted after the line ends"
             );
         }
+    }
+
+    #[test]
+    fn a_cleared_ambient_line_is_not_begun_again_while_it_is_still_said() {
+        // UT_Talk clears the target's ambient dialogs, then begins the conversation: for
+        // a creature whose conversation is itself said in passing, that must not start its
+        // line over while the line is still going (the Dust Town beggar).
+        let (mut sim, hero, npc) = passers_by();
+        assert!(sim.open_conversation(hero, npc, remarks("beggar", &["one"], true), None));
+        for _ in 0..5 {
+            sim.tick(600);
+            sim.clear_ambient(npc);
+            assert!(sim.open_conversation(hero, npc, remarks("beggar", &["one"], true), None));
+        }
+        assert_eq!(said(&sim), ["one"]);
+        sim.tick(u64::from(AMBIENT_LINE_MS));
+        sim.clear_ambient(npc);
+        assert!(sim.open_conversation(hero, npc, remarks("beggar", &["one"], true), None));
+        assert_eq!(
+            said(&sim),
+            ["one", "one"],
+            "said again once the line is over"
+        );
+    }
+
+    #[test]
+    fn an_ambient_entry_without_text_is_passed_over_at_once() {
+        // Tapster's patrons begin on an empty routing entry: it showed nothing for seven
+        // seconds before their first line (0x7f206e takes the bypass for empty text).
+        let (mut sim, hero, npc) = passers_by();
+        assert!(sim.open_conversation(hero, npc, remarks("patron", &["", "two"], true), None));
+        sim.tick(100);
+        assert_eq!(said(&sim), ["two"]);
     }
 
     #[test]

@@ -230,6 +230,7 @@ impl Faces {
                 name: anim.name.clone(),
                 length: 0.0,
                 additive: true,
+                unscaled: false,
                 tracks,
                 scalars: Vec::new(),
                 colors: Vec::new(),
