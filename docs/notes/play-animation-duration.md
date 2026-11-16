@@ -116,17 +116,20 @@ with it. These replace 500 ms deadlines, so ambient callbacks, random draws and
 later combat/movement can occur in a different order. Four 600-tick determinism
 cases passed repeat and save/reload comparisons for both binaries.
 
-The reference gate's night, father, Joining and Lothering steps retain identical
+The original reference gate's night, father, Joining and Lothering steps retained identical
 ordered plot writes and effective final flags. The board step differs by seven
 flags: its candidate checkpoint cannot route to the board and does not advance
 time on retries. Main also rejects that move from the same checkpoint. The
-extended chained candidate run exposes a full-queue retry cycle at Gilmore's
+extended chained candidate run exposed a cleared-command retry cycle at Gilmore's
 first reply: player_core/rules_core continually requeue CommandWait after
-queue-full failures, result -2, for dog and mother at one instant. A control retaining an
+cleared-command failures, result -2, for dog and mother at one instant. A control retaining an
 active conversation reproduces the cycle in both main and candidate. These
-state-dependent blockers require sim review before landing; they are not fixed
-by restoring invented animation deadlines. No queue admission, path routing,
-effect-expiry or quickbar logic was changed here.
+state-dependent blockers required sim review before landing; restoring invented
+animation deadlines would hide them. The [queue follow-up](origins-command-queue-failure.md)
+corrects the initial queue-full diagnosis, separates event dispatch from command
+starts, and traces the native waiting/executor boundary. Its validation follows
+the current merged main rather than this historical baseline. Path routing,
+effect-expiry and quickbar logic remain outside this animation change.
 
 The independent frozen Tower input stalls in main's event/mover loop. Candidate
 reaches Flemeth's hut on its second attempt (6,348 steps, 135,372 calls; the

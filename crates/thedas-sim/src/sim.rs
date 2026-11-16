@@ -1241,7 +1241,18 @@ impl Sim {
             // Then the earliest of the next event and the next finishing command; events
             // first on a tie. Both run at their own time, so delays chain correctly.
             let event = self.world.queue.keys().next().map(|k| k.0);
-            let command = self.next_command();
+            // Origins pumps due messages without running the command updater between
+            // them (0x64ae30). Starting a waiting command here lets a cleared-command
+            // callback clear that newly started replacement and send itself another
+            // same-time failure forever. Admission still sends the zero-delay failure;
+            // drain those messages before starting the next executor (0x73d320).
+            let command = if self.game == thedas_vfs::Game::Origins
+                && event.is_some_and(|due| due <= self.world.time_ms)
+            {
+                None
+            } else {
+                self.next_command()
+            };
             // A pending transition comes before anything else due at or after its time.
             if let (Some(_), Some(at)) = (&self.world.transition, self.world.transition_at) {
                 let first = event.into_iter().chain(command.map(|c| c.0)).min();
@@ -5850,6 +5861,8 @@ mod tests {
             command CommandWait(float seconds) = 1;\n\
             int AddCommand(object who, command cmd, int front, int fixed, int behavior) = 2;\n\
             command CommandAttack(object target) = 3;\n\
+            int GetLocalInt(object who, string name) = 63;\n\
+            void SetLocalInt(object who, string name, int value) = 64;\n\
             int COMMAND_TYPE_ATTACK = 1;\n\
             int COMMAND_TYPE_WAIT = 13;\n\
             int EVENT_TYPE_COMMAND_COMPLETE = 1004;\n\
@@ -5894,6 +5907,151 @@ mod tests {
                 .unwrap(),
             Some(Value::Int(1))
         );
+    }
+
+    #[test]
+    fn origins_cleared_wait_retries_drain_before_restarting_commands() {
+        let mut s = add_command_sim();
+        s.world.trace.keep = true;
+        s.world.time_ms = 100;
+        let area = s.world.spawn(ObjectKind::Area, "hall");
+        let actors = [
+            s.world.spawn(ObjectKind::Creature, "dog"),
+            s.world.spawn(ObjectKind::Creature, "mother"),
+        ];
+
+        // Own callback: count deliveries, then AddCommand(SELF, Wait(2), 0, 0, 1).
+        // The counter's guard makes the old same-time retry cycle fail an assertion
+        // instead of hanging the test process. No production event budget is involved.
+        let mut code = Vec::new();
+        let name = |b: &mut Vec<u8>| b.extend([0x04, 0x05, 0, 1, b'n']);
+        let self_ = |b: &mut Vec<u8>| b.extend([0x04, 0x06, 0, 0, 0, 0]);
+        name(&mut code);
+        self_(&mut code);
+        code.extend([0x05, 0, 0, 63, 2, 0x04, 0x03, 0, 0, 0, 1, 0x14, 0x20]);
+        name(&mut code);
+        self_(&mut code);
+        code.extend([0x05, 0, 0, 64, 3]);
+        name(&mut code);
+        self_(&mut code);
+        code.extend([0x05, 0, 0, 63, 2, 0x04, 0x03, 0, 0, 0, 64, 0x0f, 0x20]);
+        let branch = code.len();
+        code.extend([0x1f, 0, 0, 0, 0, 0]);
+        for value in [1_i32, 0, 0] {
+            code.extend([0x04, 0x03]);
+            code.extend(value.to_be_bytes());
+        }
+        code.extend([0x04, 0x04]);
+        code.extend(2_f32.to_be_bytes());
+        code.extend([0x05, 0, 0, 1, 1]);
+        self_(&mut code);
+        code.extend([0x05, 0, 0, 2, 5, 0x1b, 0]);
+        code.extend((-4_i32).to_be_bytes());
+        let offset = (code.len() - branch) as i32;
+        code[branch + 2..branch + 6].copy_from_slice(&offset.to_be_bytes());
+        code.extend([0x20, 0]);
+        let mut bytes = b"NCS V1.0B".to_vec();
+        bytes.extend(((13 + code.len()) as u32).to_be_bytes());
+        bytes.extend(code);
+        s.add_script("retry", Ncs::parse(&bytes).unwrap());
+
+        for actor in actors {
+            let o = s.world.get_mut(actor).unwrap();
+            o.area = Some(area);
+            o.script = Some("retry".into());
+            // More than ten commands, with an active executor and a waiting tail.
+            for i in 0..16 {
+                o.commands.push(Command {
+                    ty: 13,
+                    name: "CommandWait".into(),
+                    seconds: 2.,
+                    due: (i == 0).then_some(2100),
+                    strings: vec![i.to_string()],
+                    ..Default::default()
+                });
+            }
+            for _ in 0..3 {
+                let mut event = s.new_event("COMMAND_COMPLETE", Some(actor));
+                event.ints = vec![13, -2];
+                s.world.queue_event(0, actor, event, None);
+            }
+        }
+        let saved = s.save_json().unwrap();
+        for _ in 0..2 {
+            s.load_json(&saved).unwrap();
+            s.tick(0);
+            assert_eq!(s.world.time_ms, 100);
+            assert!(s.world.trace.script_errors.is_empty());
+            assert!(s.world.queue.is_empty());
+            for actor in actors {
+                let o = s.world.get(actor).unwrap();
+                assert_eq!(o.locals.ints.get("n"), Some(&4));
+                assert_eq!(o.commands.len(), 19);
+                assert_eq!(o.commands[0].due, Some(2100));
+                assert_eq!(o.commands[0].strings, ["1"]);
+                assert!(o.commands[1..].iter().all(|c| c.due.is_none()));
+                let previous = o.combat.previous_command.as_ref().unwrap();
+                assert_eq!(previous.strings, ["0"]);
+            }
+            let failures: Vec<_> = s
+                .world
+                .trace
+                .entries
+                .iter()
+                .filter_map(|e| match e {
+                    TraceEntry::Command { object, status, .. } if status == "failed -2" => {
+                        Some(*object)
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(failures, actors);
+            s.tick(1);
+            assert_eq!(s.world.time_ms, 101);
+            assert!(s.world.queue.is_empty());
+        }
+    }
+
+    #[test]
+    fn origins_command_admission_has_no_ten_entry_limit() {
+        for front in [0, 1] {
+            let mut s = add_command_sim();
+            let actor = s.world.spawn(ObjectKind::Creature, "actor");
+            let active = Command {
+                ty: 13,
+                name: "CommandWait".into(),
+                due: Some(2000),
+                ..Default::default()
+            };
+            s.world
+                .get_mut(actor)
+                .unwrap()
+                .commands
+                .push(active.clone());
+            for i in 0..64 {
+                add_command(
+                    &mut s,
+                    actor,
+                    Command {
+                        ty: 13,
+                        name: "CommandWait".into(),
+                        seconds: i as f32,
+                        ..Default::default()
+                    },
+                    front,
+                    0,
+                    0,
+                );
+            }
+            let o = s.world.get(actor).unwrap();
+            assert_eq!(o.commands.len(), 65);
+            assert_eq!(o.commands[0], active);
+            for (i, c) in o.commands[1..].iter().enumerate() {
+                assert_eq!(c.seconds, if front == 1 { 63 - i } else { i } as f32);
+            }
+            assert!(s.world.queue.is_empty());
+            assert!(o.combat.previous_command.is_none());
+        }
     }
 
     #[test]
@@ -5966,6 +6124,11 @@ mod tests {
             assert_eq!(events.len(), usize::from(cleared));
             if cleared {
                 assert_eq!(events[0].event.ints, vec![1, -2]);
+                assert_eq!(events[0].event.creator, Some(who));
+                assert_eq!(
+                    events[0].event.objects,
+                    vec![who, if same_target { 123 } else { OBJECT_INVALID }]
+                );
                 assert_eq!(
                     s.world
                         .get(who)
