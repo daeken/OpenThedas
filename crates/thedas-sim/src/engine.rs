@@ -6105,6 +6105,15 @@ impl Sim {
         }
         // Scripts bring the dead back by giving them health (module_core's
         // HandleEvent_Resurrection applies no effect). Provisional.
+        if p == health
+            && vt == current
+            && self
+                .world
+                .get(id)
+                .is_some_and(|o| o.dead && o.properties.get(&health).is_some_and(|v| v.1 > 0.0))
+        {
+            self.cancel_death_blow_reaction(id);
+        }
         if let Some(o) = self.world.get_mut(id) {
             if p == health
                 && vt == current

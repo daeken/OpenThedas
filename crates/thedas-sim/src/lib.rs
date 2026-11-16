@@ -29,6 +29,7 @@ mod da2_animation;
 mod da2_items;
 mod da2_projectile;
 mod da2_properties;
+pub mod deathblow;
 pub mod decay;
 pub mod derived;
 pub mod dialog;

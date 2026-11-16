@@ -53,9 +53,13 @@ these, so they are the places where one person or stream can take a large, separ
 
 - **Many commands do nothing.** Attack, ability, the moves (including move-away and multi-point
   walks), jumps, turn, wait, weapon switch, conversation and use run. Play-animation, sheathe,
-  death blow, fly and the rest sit in the queue for half a second and report success
+  fly and the rest sit in the queue for half a second and report success
   (`SIM-001`, `SIM-002`, `SCR-055`). Scripts build the idle ones at about 1,200 call sites, led
   by play-animation (829) and fly (353).
+- **Death-blow selection and placement remain partial.** Origins exposes paired reactions,
+  applies authored hand hits, zeroes paired victims' health at reaction start, and sends
+  DEATH at reaction end. Default variant selection, placement blending and large-creature
+  geometry remain provisional. [Executor trace](notes/deathblow-executor.md).
 - **Effects are mostly stored, not enforced.** The engine acts on death, resurrection,
   area-of-effect, upkeep and damage over time. Other effect types go to the target's script and
   are then only kept; the effect table's flags that should block movement, combat or talents
