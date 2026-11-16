@@ -1484,6 +1484,9 @@ impl Sim {
 
     /// Orders a creature to attack another, as the player does by clicking an enemy.
     pub fn order_attack(&mut self, attacker: ObjectId, target: ObjectId) {
+        if self.target_request_click(attacker, target, [0.0; 3]) {
+            return;
+        }
         self.note_player_order(attacker);
         let mut cmd = crate::world::Command {
             ty: constant_of(self, "COMMAND_TYPE_ATTACK"),
