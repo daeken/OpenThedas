@@ -90,3 +90,43 @@ keep rendering costs within the replay's resource cap. Separate 1280×720 captur
 show both legacy failure modes and successful fixed notes. The runtime proof used
 an optimized debug build with assertions and overflow checks enabled; the ignored
 late-init tests and workspace checks use the normal debug/test settings.
+
+For a window-keyboard replay over `--control`, use
+`windowkey down|repeat|up KeyCode [JSON text]`, with winit's physical key names.
+For example, `windowkey down Quote "'"; windowkey up Quote` types an apostrophe,
+and `windowkey down Enter; windowkey up Enter` confirms the note. A space needs
+the JSON string `" "`. `windowkey down F8; windowkey up F8` opens the report
+through the same routing as the window. Semicolons separate steps; encode a
+literal semicolon in the JSON text as `"\u003b"`.
+
+These events share the window's `App::window_key` implementation, including
+`App::text_key`'s typing gate, modifier state, repeats, cutscene skip and game
+shortcuts. The older `type` and `key enter` steps call the UI directly and cannot
+verify the app's typing gate. The marking-choice box currently has no physical
+keyboard navigation; a replay can click its button without clicking the note's
+text field. Verify every saved `note.txt` and Enter submission separately:
+native character editing runs before Key-listener dispatch, so a missing
+confirmation listener alone does not demonstrate lost characters.
+
+The 2026-11-16 app-keyboard follow-up used the native movie in Tapster's Tavern,
+with a mouse click only on the marking-choice button. Both `8bf06c21` and
+`249769ac` passed sixteen consecutive ordinary reports, alternating immediate
+typing and a two-second wait. Four more reports after the bartender conversation
+produced one empty legacy note: the field did not exist when the keys arrived,
+the keys reached game shortcuts, and the app later re-asked the report. Its empty
+field then had focus and a registered Key listener. The fixed build passed all
+four. Both builds also passed four reports with the tactical tutorial active.
+
+Separately, the existing private 5 fps popup fixture produced one of eight exact
+legacy notes: all four immediate notes were lost and three delayed notes regained
+the name-field limit. The fixed build passed all eight. Thus #992's pending-input
+gate and lifetime policy address reproduced failures through App::text_key.
+These observations do not identify a missing Key listener as the cause of the
+character-input symptom: native character insertion precedes listener dispatch,
+and an empty note also disables the movie's Save report button. Windows' OS
+character-event delivery and OS window focus remain separate from movie focus;
+this hidden Mac replay exercises the shared app route, not Windows message
+generation.
+In a separate legacy timing-fixture diagnostic, a keyboard-only Ctrl+A and
+`Sera's retry` after initialization submitted exactly with Enter, with no further
+mouse click. Waiting for readiness was sufficient in that reproduced case.
