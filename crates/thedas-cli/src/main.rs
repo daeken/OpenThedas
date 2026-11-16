@@ -4,6 +4,7 @@ mod audio;
 mod autoplay;
 mod corpus;
 mod dump;
+mod replay;
 mod script;
 mod sim;
 mod tree;
@@ -32,6 +33,20 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Reproduce an F8 report and compare the result with its save_now.json.
+    Replay {
+        /// A report folder or zip (no extraction is needed).
+        report: PathBuf,
+        /// Game install; defaults to THEDAS_INSTALL, then the report's install path.
+        #[arg(long)]
+        install: Option<PathBuf>,
+        /// Stop before the first input that would pass this absolute game time (ms).
+        #[arg(long)]
+        until: Option<u64>,
+        /// Write the replayed state, including on a mismatch or early stop.
+        #[arg(long)]
+        save: Option<PathBuf>,
+    },
     /// List the entries of an ERF or RIM archive.
     Ls { archive: PathBuf },
     /// Extract entries from an archive (all of them if no names are given).
@@ -352,6 +367,22 @@ fn run() -> Result<()> {
         thedas_vfs::keys_file::set_path(keys);
     }
     match cli.command {
+        Command::Replay {
+            report,
+            install,
+            until,
+            save,
+        } => {
+            let result = replay::run(&report, install.as_deref(), until, save.as_deref());
+            let code = match result {
+                Ok(code) => code,
+                Err(e) => {
+                    eprintln!("cannot replay: {e:#}");
+                    2
+                }
+            };
+            std::process::exit(code);
+        }
         Command::Ls { archive } => ls(&archive),
         Command::Play {
             install,
