@@ -18,14 +18,12 @@ use thedas_vfs::Vfs;
 use crate::camera::Camera;
 use crate::d3d::{
     ConstantContext, D3dProgram, DrawLights, LightClass, StageConstants, TextureSource, ambient_of,
-    pick_level_lights, pick_lights, pick_rig_lights, sampler_texture,
+    pick_lights, pick_rig_lights, sampler_texture,
 };
 use crate::gpu::{DEPTH_FORMAT, GpuContext, TextureCache};
 
 /// The partitions' size as a float, for the half-pixel fix-up constant.
-use crate::scene::{
-    AreaScene, DOMAIN_CHARACTERS, DOMAIN_LEVEL, SceneLight, SceneMaterial, SceneMesh,
-};
+use crate::scene::{AreaScene, SceneLight, SceneMaterial, SceneMesh};
 
 /// How `CULL_CW` / `CULL_CCW` map onto wgpu. D3D9 culls by screen-space winding; whether our
 /// right-handed camera mirrors the original's is checked by comparing against captures
@@ -268,9 +266,8 @@ pub(crate) struct D3dPass {
     flicker: std::sync::Mutex<crate::flicker::Flickers>,
     /// How many of `scene_lights` are the scene's own.
     own_lights: usize,
-    /// Per scene draw, what its lights were picked by when the pass was made: its bounding
-    /// sphere and room as placed, and whether it is one of the level's own draws.
-    placed: Vec<((Vec3, f32), Option<i64>, bool)>,
+    /// Per scene draw, the light-selection sphere and room used when the pass was made.
+    placed: Vec<((Vec3, f32), Option<i64>)>,
     /// Per draw, its lights picked again with the added lights, where they differ from
     /// those the pass was made with; a moved object's re-picked lights (`relit`) come first.
     extra_lit: Vec<Option<DrawLights>>,
@@ -818,14 +815,7 @@ fn repick(
             let lights = match picked.iter().find(|(c, _)| *c == class) {
                 Some((_, l)) => l.clone(),
                 None => {
-                    // Level-class draws of an object keep the old rule (see
-                    // `pick_level_lights`), as before: the characters' domain.
-                    let l = match class {
-                        LightClass::Level => {
-                            pick_level_lights(input.lights, bound, DOMAIN_CHARACTERS)
-                        }
-                        c => pick_lights(input.lights, input.light_rooms, bound, room, c),
-                    };
+                    let l = pick_lights(input.lights, input.light_rooms, bound, room, class);
                     picked.push((class, l.clone()));
                     l
                 }
@@ -837,31 +827,6 @@ fn repick(
         }
     }
     changed
-}
-
-/// A draw's lights as a pass picks them when it is made, from `lights`: by its material's
-/// light class, its bounding sphere and room as placed, and whether it is one of the
-/// level's own draws (see [`pick_level_lights`]).
-fn pick_as_built(
-    lights: &[SceneLight],
-    light_rooms: &HashMap<i64, Vec<i64>>,
-    class: LightClass,
-    sphere: (Vec3, f32),
-    room: Option<i64>,
-    level_own: bool,
-) -> DrawLights {
-    match class {
-        LightClass::Level => pick_level_lights(
-            lights,
-            sphere,
-            if level_own {
-                DOMAIN_LEVEL
-            } else {
-                DOMAIN_CHARACTERS
-            },
-        ),
-        c => pick_lights(lights, light_rooms, sphere, room, c),
-    }
 }
 
 /// The smallest sphere holding two spheres.
@@ -1832,17 +1797,18 @@ impl D3dPass {
                 textures: textures_group,
                 slot,
                 draw: di,
-                // By its material's render class: characters from the characters' lights,
-                // placeables from the level's, among those whose room reaches the draw's.
-                // Level-class draws keep the old rule (`pick_level_lights`): the level's own
-                // meshes with the level's domain, an object's with the characters'.
-                lights: pick_as_built(
+                // Level mesh renderables also take 0x4654e0 -> 0x464310: class/domain,
+                // room reach and versioned influence on the owning node's MSH sphere.
+                lights: pick_lights(
                     &scene.lights,
                     &scene.light_rooms,
-                    classes[di],
-                    d.sphere,
+                    if di < scene.static_draws {
+                        d.light_sphere(mesh)
+                    } else {
+                        d.sphere
+                    },
                     d.room_id,
-                    di < scene.static_draws,
+                    classes[di],
                 ),
                 multipass,
                 lod: d.lod,
@@ -2186,7 +2152,16 @@ impl D3dPass {
                 .draws
                 .iter()
                 .enumerate()
-                .map(|(di, d)| (d.sphere, d.room_id, di < scene.static_draws))
+                .map(|(di, d)| {
+                    (
+                        if di < scene.static_draws {
+                            d.light_sphere(&scene.meshes[d.mesh])
+                        } else {
+                            d.sphere
+                        },
+                        d.room_id,
+                    )
+                })
                 .collect(),
             extra_lit: Vec::new(),
             light_rooms: scene.light_rooms.clone(),
@@ -2435,7 +2410,7 @@ impl D3dPass {
             if relit[k].is_some() {
                 continue;
             }
-            let Some(&(sphere, room, level_own)) = self.placed.get(d.draw) else {
+            let Some(&(sphere, room)) = self.placed.get(d.draw) else {
                 continue;
             };
             if let Some(near) = &near
@@ -2450,14 +2425,7 @@ impl D3dPass {
                 .get(d.draw)
                 .copied()
                 .unwrap_or(LightClass::Character);
-            let lights = pick_as_built(
-                &self.scene_lights,
-                &self.light_rooms,
-                class,
-                sphere,
-                room,
-                level_own,
-            );
+            let lights = pick_lights(&self.scene_lights, &self.light_rooms, sphere, room, class);
             let now = (lights != d.lights).then_some(lights);
             if self.extra_lit[k] != now {
                 self.extra_lit[k] = now;
@@ -3521,6 +3489,7 @@ impl D3dPass {
 
 #[cfg(test)]
 mod tests {
+    use crate::scene::{DOMAIN_CHARACTERS, DOMAIN_LEVEL};
     #[test]
     fn blended_draws_fall_in_the_submission_queues_groups() {
         use super::{TransparencyGroup as G, transparency_group as g};
@@ -3573,6 +3542,7 @@ mod tests {
                 vertex_offset: 0,
                 start_index: 0,
                 elements: vec![],
+                sphere: None,
                 bounds: None,
             },
             raw_vertices: vec![],
@@ -3675,23 +3645,20 @@ mod tests {
         ]);
         let rooms = HashMap::new();
         let sphere = (Vec3::ZERO, 1.0);
-        let xs = |lights: &[SceneLight], class, level_own| -> Vec<(f32, f32)> {
-            pick_as_built(lights, &rooms, class, sphere, None, level_own)
+        let xs = |lights: &[SceneLight], class| -> Vec<(f32, f32)> {
+            pick_lights(lights, &rooms, sphere, None, class)
                 .points
                 .iter()
                 .map(|p| (p.0.x, p.2.x))
                 .collect()
         };
         // The level's own draws and the placeables take the level's; characters theirs.
-        assert_eq!(xs(&own, LightClass::Level, true), [(1.0, 1.0)]);
-        assert_eq!(xs(&all, LightClass::Level, true), [(1.0, 1.0), (3.0, 0.5)]);
-        assert_eq!(xs(&all, LightClass::Prop, false), [(1.0, 1.0), (3.0, 0.5)]);
-        assert_eq!(
-            xs(&all, LightClass::Character, false),
-            [(2.0, 1.0), (3.0, 0.5)]
-        );
+        assert_eq!(xs(&own, LightClass::Level), [(1.0, 1.0)]);
+        assert_eq!(xs(&all, LightClass::Level), [(1.0, 1.0), (3.0, 0.5)]);
+        assert_eq!(xs(&all, LightClass::Prop), [(1.0, 1.0), (3.0, 0.5)]);
+        assert_eq!(xs(&all, LightClass::Character), [(2.0, 1.0), (3.0, 0.5)]);
         // Taken away again, the pick is as the pass was made.
-        assert_eq!(xs(&all[..2], LightClass::Character, false), [(2.0, 1.0)]);
+        assert_eq!(xs(&all[..2], LightClass::Character), [(2.0, 1.0)]);
     }
 
     #[test]
