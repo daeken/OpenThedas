@@ -126,6 +126,9 @@ pub struct Object {
     pub script: Option<String>,
     /// Conversation (`.dlg`) for creatures and placeables.
     pub dialog: Option<String>,
+    /// Authored Origins talk radius. Absent in older saves, which read it from resources.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interact_radius: Option<f32>,
     /// Creature properties (`properties.gda` ids): base and current value.
     pub properties: BTreeMap<i32, (f32, f32)>,
     /// What effects add to properties (`ApplyEffectModifyProperty`, from buffs and worn
@@ -252,6 +255,7 @@ impl Object {
             locals: Locals::default(),
             script: None,
             dialog: None,
+            interact_radius: None,
             properties: BTreeMap::new(),
             modifiers: BTreeMap::new(),
             quickslots: BTreeMap::new(),
@@ -336,6 +340,7 @@ pub struct Command {
     pub is_static: bool,
     pub target: Option<ObjectId>,
     pub location: Option<Location>,
+    /// Command-specific float. Player Initiate Dialog uses it for stalled-approach milliseconds.
     pub seconds: f32,
     /// `CommandMoveToObject`'s fMaxRange, raised to fMinRange by its builder
     /// (DAOrigins.exe 0x66f260). Older saves used only `seconds` (fMinRange).
@@ -354,8 +359,7 @@ pub struct Command {
     /// `Sim::advance_movers` and `turn_toward`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turned_at: Option<u64>,
-    /// For an attack whose target is out of reach: where the attacker is walking to first
-    /// (see `Sim::attack_reach`).
+    /// Where an attack, ability or player talk order is walking before executing.
     #[serde(default)]
     pub approach: Option<[f32; 3]>,
     /// For a melee attack: it found the target's melee ring full once and is waiting by it
@@ -381,6 +385,7 @@ pub struct Command {
     pub impacted: bool,
     /// For a melee attack: the walk to its place on the target's melee ring has just ended,
     /// so the attack's start step tests the range with its slack (see `Sim::approach_point`).
+    /// For player talk: its required approach succeeded, so dialogue can execute.
     #[serde(default)]
     pub arrived: bool,
     /// DA2's combat-target preparation has run for this command, before approach.
