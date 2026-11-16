@@ -1201,6 +1201,18 @@ impl Sim {
         items
     }
 
+    /// The body bag a dead creature left (`GetCreatureBodyBag`), when it is still in the
+    /// world and active: what a click on the corpse opens. In the original the player loots a
+    /// corpse by clicking the body; the bag itself has no model to click (appearance 16).
+    pub fn corpse_body_bag(&self, creature: ObjectId) -> Option<ObjectId> {
+        let c = self.world.get(creature).filter(|c| c.dead)?;
+        let bag = *c.fields.get(BODY_BAG_FIELD)? as ObjectId;
+        self.world
+            .get(bag)
+            .filter(|b| b.kind == ObjectKind::Placeable && b.active && b.area == c.area)
+            .map(|b| b.id)
+    }
+
     /// `SpawnBodyBag`: leaves a container where a creature fell holding its droppable items
     /// (all of them when forced) and its money. Nothing is left when there is nothing to
     /// take: no money and no items to drop (DAOrigins.exe 0x6a90d0, the check 0x6a91e0
@@ -1312,6 +1324,22 @@ mod body_bag_tests {
         assert_eq!(b.appearance, 16);
         assert!(b.interactive);
         assert_eq!(b.money, 5);
+    }
+
+    #[test]
+    fn a_click_on_a_corpse_finds_the_bag_it_left() {
+        let mut s = sim_with_bag_template();
+        let foe = s.world.spawn(ObjectKind::Creature, "foe");
+        s.world.get_mut(foe).unwrap().money = 5;
+        // Alive, or dead without a bag: nothing to open.
+        assert_eq!(s.corpse_body_bag(foe), None);
+        s.world.get_mut(foe).unwrap().dead = true;
+        assert_eq!(s.corpse_body_bag(foe), None);
+        let bag = s.spawn_body_bag(foe, false).unwrap();
+        assert_eq!(s.corpse_body_bag(foe), Some(bag));
+        // A bag that is gone (taken away, inactive) is not offered.
+        s.world.get_mut(bag).unwrap().active = false;
+        assert_eq!(s.corpse_body_bag(foe), None);
     }
 
     #[test]

@@ -3431,6 +3431,19 @@ impl Live {
                         );
                         Some(format!("use {tag}"))
                     }
+                    // A click on a corpse opens what it left, as the pad's A on it does: the
+                    // body bag has no model of its own to click.
+                    thedas_sim::world::ObjectKind::Creature if dead => {
+                        let bag = sim.corpse_body_bag(id)?;
+                        sim.input(
+                            thedas_sim::commands::CommandSource::Player,
+                            thedas_sim::commands::SimCommand::OrderUse {
+                                who: leader,
+                                target: bag,
+                            },
+                        );
+                        Some(format!("loot {tag}"))
+                    }
                     _ => None,
                 }
             }
