@@ -96,6 +96,9 @@ purge here.
 
 Installed `rules_core` handles COMMAND_COMPLETE at bytecode `0x17db`, reads
 type/result at `0x17dd..0x181b`, then calls normal AI `0x20df1` at `0x1ca1`.
+For attack (1) and use-ability (25) completions, `0x1bec..0x1bff` reads
+event object 1 and supplies that target to the AI call. Dropping the target is
+therefore a change to the retry input, including after a failed approach.
 For an uncontrolled creature outside exploration/combat mode,
 `0x20fbb..0x21070` chooses another idle command and admits it through wrapper
 `0x160ae`. The selector's wait branches construct a 1- or 2-second wait
@@ -118,6 +121,13 @@ size/index getters now omit the active executor and use unsigned 16-bit
 indices. GetCurrentCommand only returns a started command in Origins. DA2 keeps
 its existing scheduling and getter behavior.
 
+The same owner/target marshalling now covers ordinary completion, failed
+approaches and rejected preparation in Origins; a path-action failure retains
+its blocker at object 2. Rejected preparation also records the previous command
+before notification. The preexisting failure-result selection and approach
+retry delay are unchanged; this repair does not add a delay to cleared-command
+callbacks.
+
 Synthetic tests cover two actors retrying cleared waits at one instant, tails
 larger than ten entries, replay from a saved event batch, continued clock
 advancement, callback result/owner/target and 64 front/back admissions without
@@ -125,6 +135,8 @@ dropped commands or invented failures. Getter coverage checks active/waiting
 separation, index conversion, reload and completion in both games. The test
 callback has a finite guard so the old scheduler fails an assertion instead
 of hanging the test process; production has no added event budget.
+Additional tests check successful, invalid-path, path-action and preparation
+rejection payloads, previous-command retention and DA2's existing behavior.
 
 The complete command lifecycle, interruption overrides, duplicate coalescing
 and separate ClearAllCommands API remain outside this bounded repair. The
