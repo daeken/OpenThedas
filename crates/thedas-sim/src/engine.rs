@@ -8124,6 +8124,7 @@ mod tests {
             s.world = serde_json::from_str(&serde_json::to_string(&s.world).unwrap()).unwrap();
             assert_eq!(size(&mut s, who), Some(Value::Int(if da2 { 2 } else { 3 })));
             s.world.get_mut(who).unwrap().commands[0].cancellable = false;
+            s.world = serde_json::from_str(&serde_json::to_string(&s.world).unwrap()).unwrap();
             s.tick(900);
             assert_eq!(
                 command_at(&mut s, who, 0).unwrap().seconds,
