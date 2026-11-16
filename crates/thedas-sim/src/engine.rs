@@ -3599,6 +3599,10 @@ pub fn call(
                 }
             })))
         }
+        "MoveAllItems" if h.sim.game == thedas_vfs::Game::Origins => {
+            h.sim.move_all_items(obj(a, 0), obj(a, 1));
+            void()
+        }
         "MoveItem" => {
             let (from, to, item) = (obj(a, 0), obj(a, 1), obj(a, 2));
             let had = h.object(from).is_some_and(|o| o.inventory.contains(&item));
