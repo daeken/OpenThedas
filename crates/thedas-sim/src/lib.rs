@@ -28,6 +28,7 @@ pub mod cutscene;
 pub mod cuttracks;
 mod da2_animation;
 mod da2_items;
+pub mod da2_locomotion;
 mod da2_projectile;
 mod da2_properties;
 pub mod decay;
