@@ -3759,6 +3759,23 @@ impl App {
                     log::info!("weapon set switched");
                 }
             }
+            // In a conversation the number keys pick the replies (1 is the first), not the
+            // quickbar: the conversation screen lists them numbered.
+            c if self.live.is_some()
+                && quickslot_key(c).is_some()
+                && self
+                    .screens
+                    .as_ref()
+                    .is_some_and(|s| s.shown().contains(&screens::Screen::Conversation)) =>
+            {
+                let n = quickslot_key(c).unwrap_or(0) as usize;
+                if let Some(live) = self.live.as_mut() {
+                    let have = live.sim().dialog_state().map_or(0, |d| d.replies.len());
+                    if n < have {
+                        log::info!("{}", reply(live, n));
+                    }
+                }
+            }
             // The quickbar's first ten slots: 1 to 9, then 0.
             c if self.live.is_some() && quickslot_key(c).is_some() => {
                 let slot = quickslot_key(c).unwrap_or(0);
@@ -4235,6 +4252,10 @@ impl App {
                     _ => KeyCode::KeyI,
                 });
                 log.push(format!("{m:?}"));
+            }
+            &Step::RawKey(code) => {
+                self.key_down(code);
+                log.push(format!("rawkey {code:?}"));
             }
             &Step::Leader(n) => {
                 let tag = self.live.as_mut().and_then(|l| l.choose_leader(n));
@@ -6103,6 +6124,9 @@ enum Step {
     /// A movement key held or let go (`keydown w`, `keyup w`; w, a, s, d, q or e), as the
     /// keyboard holds it.
     HoldKey(KeyCode, bool),
+    /// `rawkey NAME`: a key pressed as the window delivers it (1 to 0, space, enter, escape,
+    /// tab), so what the game does with the key itself is tested.
+    RawKey(KeyCode),
     /// The highlight key held or let go (`allnames on`, `allnames off`): every creature near
     /// shows its name, as while Tab is down.
     AllNames(bool),
@@ -6450,6 +6474,23 @@ fn parse_step(s: &str) -> Result<Step> {
         "key" if arg.eq_ignore_ascii_case("space") => Step::Pause,
         "key" if arg == "/" => Step::SwapWeapons,
         "key" if arg.eq_ignore_ascii_case("f10") => Step::ModMode,
+        "rawkey" => Step::RawKey(match arg.trim().to_ascii_lowercase().as_str() {
+            "1" => KeyCode::Digit1,
+            "2" => KeyCode::Digit2,
+            "3" => KeyCode::Digit3,
+            "4" => KeyCode::Digit4,
+            "5" => KeyCode::Digit5,
+            "6" => KeyCode::Digit6,
+            "7" => KeyCode::Digit7,
+            "8" => KeyCode::Digit8,
+            "9" => KeyCode::Digit9,
+            "0" => KeyCode::Digit0,
+            "space" => KeyCode::Space,
+            "enter" => KeyCode::Enter,
+            "escape" => KeyCode::Escape,
+            "tab" => KeyCode::Tab,
+            other => bail!("rawkey takes 1 to 0, space, enter, escape or tab, not {other:?}"),
+        }),
         "modmode" => Step::ModMode,
         "modselect" if !arg.is_empty() => Step::ModSelect(arg.to_string()),
         "modframe" => Step::ModFrame(arg.parse().context("modframe takes a frame number")?),
@@ -7248,7 +7289,9 @@ fn main() -> Result<()> {
                         println!("allnames {on}");
                     }
                     // The movement keys are the window's (see `App::key_walk`).
-                    Step::HoldKey(..) => println!("keydown and keyup need a window"),
+                    Step::HoldKey(..) | Step::RawKey(..) => {
+                        println!("keydown, keyup and rawkey need a window")
+                    }
                     Step::AskChoice(prompt) => {
                         if let Some((layer, _)) = played.as_mut() {
                             layer.ask_choice(0, prompt, "Yes", "No");
