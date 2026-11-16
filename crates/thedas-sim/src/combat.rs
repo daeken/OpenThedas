@@ -105,6 +105,9 @@ pub struct CombatData {
     /// DA2's `SetAbilityResult`: the command and result captured for the later impact.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ability_cast: Option<AbilityCast>,
+    /// DA2 animation-driven locomotion, independent of the pending impact deadline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) animation_motion: Option<crate::da2_animation::AnimationMotion>,
     /// Milliseconds gathered towards the next regeneration pass (see `Sim::regenerate`).
     #[serde(default)]
     pub regen_ms: u64,
@@ -323,6 +326,9 @@ impl Sim {
     pub(crate) fn complete_da2_combat_target(&mut self, id: ObjectId) {
         if self.game != thedas_vfs::Game::DragonAge2 {
             return;
+        }
+        if let Some(o) = self.world.get_mut(id) {
+            o.combat.animation_motion = None;
         }
         let member = crate::engine::party_of(self).contains(&id)
             || self
@@ -1666,6 +1672,7 @@ impl Sim {
             && let Some(o) = self.world.get_mut(id)
         {
             o.combat.ability_cast = None;
+            o.combat.animation_motion = None;
         }
         let target = cmd.target.unwrap_or(OBJECT_INVALID);
         let ability = cmd.ints.first().copied().unwrap_or(0);
