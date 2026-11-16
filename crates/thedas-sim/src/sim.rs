@@ -2622,6 +2622,60 @@ impl Sim {
         (routed, std::mem::take(&mut self.route_approach))
     }
 
+    /// DAOrigins.exe's goal adjustment for a path request (0x73e7f0): with `u` the
+    /// direction from `to` toward `from` in XY and `h` half a pathing cell, the point
+    /// `to + h*u`, then rows `r = h, 2h, ...` out to 2 m, each from `-n` to `+n` sideways
+    /// (`n = (r + 0.01)/h`, points `to + r*u + k*h*(u.y, -u.x)`), the first walkable one
+    /// winning, at the floor's height; failing those, the safe-location search round `to`
+    /// out to the same 2 m. Provisional: walkable cells stand in for the exe's point test
+    /// (0x73de70) and its height queries.
+    fn repair_goal(
+        &mut self,
+        area: ObjectId,
+        g: &thedas_formats::level::NavGrid,
+        id: ObjectId,
+        from: [f32; 3],
+        to: [f32; 3],
+    ) -> Option<[f32; 3]> {
+        const REACH: f32 = 2.0;
+        let floor = |q: [f32; 2]| {
+            g.cell([q[0], q[1], to[2]])
+                .filter(|&c| crate::nav::walkable(g, c))
+                .map(|c| [q[0], q[1], crate::nav::height(g, c)])
+        };
+        let (dx, dy) = (from[0] - to[0], from[1] - to[1]);
+        let len = (dx * dx + dy * dy).sqrt();
+        let h = g.cell_size * 0.5;
+        if len > 1e-6 && h > 0.0 {
+            let u = [dx / len, dy / len];
+            if let Some(q) = floor([to[0] + h * u[0], to[1] + h * u[1]]) {
+                return Some(q);
+            }
+            let mut r = h;
+            while r <= REACH {
+                let n = ((r + 0.01) / h) as i32;
+                for k in -n..=n {
+                    let s = k as f32 * h;
+                    let q = [to[0] + r * u[0] + s * u[1], to[1] + r * u[1] - s * u[0]];
+                    if let Some(q) = floor(q) {
+                        return Some(q);
+                    }
+                }
+                r += h;
+            }
+        }
+        self.safe_search(
+            area,
+            to,
+            crate::nav::SafeSearch {
+                radius: REACH,
+                body_radius: 0.0,
+                mover: Some(id),
+                standable_keeps: false,
+            },
+        )
+    }
+
     fn route_inner(&mut self, id: ObjectId, to: [f32; 3]) -> crate::nav::Routed {
         use crate::nav::Routed;
         self.route_approach.clear();
@@ -2714,13 +2768,35 @@ impl Sim {
         } else {
             crate::nav::route_avoiding(&g, from, to, &locked)
         };
-        let Some(p) = unlocked_route.or_else(|| crate::nav::route(&g, from, to)) else {
+        let origins = self.game == thedas_vfs::Game::Origins;
+        let mut found = unlocked_route.or_else(|| crate::nav::route(&g, from, to));
+        // Origins 0x73ea80 moves a goal that is not on walkable ground (0xa62a90) before
+        // it searches: back toward the walker, up to 2 m (0x73e7f0; see
+        // docs/notes/path-fallback-endpoints.md). Ambient walkers' random destinations
+        // often land in walls or on another floor; without this they took the straight
+        // fallback below, through fountains and floors. Provisional: done here only when
+        // the search to the goal as given fails (the exe does it first), and walkable
+        // cells stand in for the exe's point test (0x73de70).
+        let mut to = to;
+        if found.is_none() && origins && !crate::nav::on_walkable(&g, to) {
+            if let Some(q) = self.repair_goal(area, &g, id, from, to) {
+                to = q;
+                found = crate::nav::route(&g, from, to);
+            }
+        }
+        let Some(p) = found else {
             // Origins 0x73ea80 tries a collision-tested direct path after a failed search
             // only when |start.z - goal.z| <= 0.5 (0x73ee88, constant 0xb1b7b4).
             // Status 5/8 then stops locomotion and returns INVALID_PATH (-4) in
             // 0x7a9130. Do not turn a failed tall route into a walk through the level.
-            // The flat fallback's collision test and DA2's path failures remain untraced.
-            if self.game == thedas_vfs::Game::Origins && (from[2] - to[2]).abs() > 0.5 {
+            if origins && (from[2] - to[2]).abs() > 0.5 {
+                return Routed::InvalidPath;
+            }
+            // The flat fallback (0x685920) tests three ground segments against the area's
+            // physics (mask 0x24), failing on any hit. Provisional stand-in on the grid
+            // ([`crate::nav::flat_fallback_clear`]): no wall cell across the line, and no
+            // walkable floor rising more than 0.5 m over it.
+            if origins && !crate::nav::flat_fallback_clear(&g, from, to) {
                 return Routed::InvalidPath;
             }
             return Routed::Straight;
