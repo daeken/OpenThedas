@@ -8,6 +8,12 @@
 //! - `input` with `"steps"`: input played into the game in order, in `--steps` syntax
 //!   (`click X,Y; run MS; key i; ...`). The reply comes once every step has played, `run`
 //!   steps taking that long in the game's own frames.
+//!   `windowkey down|repeat|up KeyCode [JSON text]` uses the window's keyboard route,
+//!   including App::text_key's typing gate, modifiers and game shortcuts. KeyCode
+//!   is a winit physical key name (e.g. `F8`, `Quote`, `KeyA`, `Enter`). Supply the
+//!   window event's character text as a JSON string, e.g. `windowkey down Quote "'"`
+//!   or `windowkey down Space " "`. As with other steps, semicolons separate steps.
+//!   Unlike `type` and `key enter`, this can test app-level keyboard routing.
 //! - `screenshot`: the frame as the player sees it, read back from the window as it is
 //!   presented (`"presented": true`; drawn again offscreen where the window's surface cannot
 //!   be read, and `"presented": false` while the window has no frame to present, e.g.

@@ -58,6 +58,8 @@ pub struct TalkCamera {
     held: Option<(LineKey, Staged)>,
     /// The presentation clock (milliseconds; it runs while the world is stopped too).
     clock_ms: f64,
+    /// The listener the default framing hides (see [`TalkCamera::hidden`]).
+    hidden: Option<ObjectId>,
     /// The line shown and when it came up on the clock.
     shown: Option<(LineKey, f64)>,
 }
@@ -132,6 +134,7 @@ impl TalkCamera {
         face: &dyn Fn(ObjectId) -> Option<Vec3>,
         roots: &DrawnRoots,
     ) -> Option<Camera> {
+        self.hidden = None;
         let open = sim.conversation_line()?;
         let choosing = open.choosing;
         let line: LineKey = ((open.dialog.to_ascii_lowercase(), open.owner), open.line);
@@ -195,9 +198,9 @@ impl TalkCamera {
             log::debug!("unstaged line: speaker {said:?} is not in the area");
             return None;
         };
-        let listener = here(listener)
-            .filter(|o| o.id != speaker)
-            .map(|o| Vec3::from_array(o.position));
+        let listener = here(listener).filter(|o| o.id != speaker);
+        self.hidden = listener.map(|o| o.id);
+        let listener = listener.map(|o| Vec3::from_array(o.position));
         log::debug!(
             "unstaged line: speaker {} ({said}) at {:?} facing {}, eyes {:?}, listener at {:?}",
             s.tag,
@@ -213,6 +216,16 @@ impl TalkCamera {
             listener,
             base,
         ))
+    }
+
+    /// The creature the last [`Self::camera`] hides: the listener of a line seen in the
+    /// default framing. DAOrigins.exe's non-cinematic dialog update gives the listener it
+    /// framed from (0x68d270) opacity 0 (0x68de3f, 0x68e0ba-0x68e0ca); the cinematic branch
+    /// (0x68de54) and the conversation's end (0x68d810) give it back 1. Both are set at
+    /// once, not faded. Provisional: the listener is our approximation of 0x68d270 (see
+    /// [`TalkCamera::camera`]).
+    pub fn hidden(&self) -> Option<ObjectId> {
+        self.hidden
     }
 
     /// The frame buffer effects the shown line's own cutscene has running (its kind-19

@@ -277,6 +277,11 @@ impl Tracker {
         self.state == State::Tracking
     }
 
+    /// The last world-space target, retained while returning to rest.
+    pub fn target(&self) -> Option<Vec3> {
+        self.target
+    }
+
     /// Scales the parts' speeds from the table's (0x6c9f10): a cutscene's head tracking
     /// action gives its own scale.
     pub fn set_speed_scale(&mut self, scale: f32) {

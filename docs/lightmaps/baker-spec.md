@@ -223,8 +223,10 @@ it is derived from game data, it lives outside the repository, in OpenThedas-tes
   atlases); `runtime_ambient`: the room light model's ambient, when it has one.
 - `lights[]`: every level light (the bake's order: non-character points, then the sun) with
   `name`, `kind`, `position` (for the sun, the direction toward it), `radius`, runtime
-  `color`; `baked_brightness`: mean fitted RGB-pass brightness where it was seen
-  (`null` = not seen); `in_alpha`: whether the shadow pass took it; `shadow_reach`: the share
+  `color`; `baked_brightness`: fitted RGB-pass brightness, the mean over atlases weighted by
+  the texels each fit saw the light on (`fitted_texels`); `null` when that total is under 200
+  (a light fitted on a few dozen texels soaks up unrelated residual: scales of 60–80 were
+  seen), and a single fit leaves such a light out too; `in_alpha`: whether the shadow pass took it; `shadow_reach`: the share
   of its radius the shadow pass reached (the bake radius; 1 when not fitted).
 - `found[]`: baked-only lights recovered from the RGB residual: `position`, `radius`,
   `color` (colour × brightness), and the `atlas` whose fit found them. Fits of neighbouring

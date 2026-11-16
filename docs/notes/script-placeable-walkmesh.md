@@ -26,8 +26,9 @@ it by the object's placement and maps it to the area's grid. Source cell
 kinds do not mask this visit. Only destination kinds 7/8 become kind 1;
 other kinds, heights and surface materials survive. Coordinates use the
 native half-cell adjustment and truncation. Operation 0 is different: it
-copies source kinds into destination cells below 8. It remains unimplemented
-with the ordinary state-change walkmesh installation path.
+copies source kinds into destination cells below 8. Initial state loading,
+ordinary state changes and active toggles now use that installation path;
+see `placeable-initial-state.md`.
 
 The following 0x74d350(0) writes physics group **1**, including on repeated
 dead writes, through the model's physics object. It does not clear Active.
@@ -54,8 +55,8 @@ delta divided by 500 and clamps the result to [0, 1]. The immediate-opacity
 path is 0x695c20; completion uses 0x695c00 instead. This is separate from
 Active and must not be replaced by immediate hiding. No timer, animation
 completion or object removal is inferred from this health write. The
-state-controller animation/completion path, fading, state-change operation
-0, full physics and DA2 remain open under SCR-009.
+state-controller animation/completion path, fading, full physics and DA2 remain
+open under SCR-009. State-change operation 0 is now implemented.
 
 Validation includes synthetic transformed grids, null state entries and
 malformed-grid rejection, plus all four real destructive appearances on
