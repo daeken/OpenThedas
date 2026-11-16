@@ -25,8 +25,7 @@ The creature constructor installs the secondary interface at `+0x70`
 (`0x6b9f59`, vtable `0xb1035c`); the placeable constructor installs its
 corresponding interface at `0x750d61` (vtable `0xb1bf5c`). Both tables select
 `0x69a130` at slot `+0x28`. That method adjusts back to the primary object
-and forwards the event to `0x698960`. These two concrete paths establish
-the scope of the replacement correction.
+and forwards the event to `0x698960`.
 
 Queued delivery reaches the same selector. The generic message dispatcher
 `0x64a8c0` resolves the target's CCObject and calls primary virtual `+0xc8`.
@@ -34,8 +33,32 @@ The creature implementation `0x6a25c0` and placeable implementation
 `0x74d030` forward message kind 10 to `0x698a50`. Its branch at `0x698afd`
 calls `0x698960` at `0x698b11`.
 
-`Sim::deliver` now follows this precedence for Origins creatures and
-placeables: a nonempty table-114 `Script` cell, then an explicit override
+Seven further physical object kinds have the same secondary dispatch slot.
+Each complete constructor calls the CCObject base constructor `0x699670`
+before installing its concrete primary and secondary interfaces. The writes
+below are constructor installations, rather than destructor resets.
+
+| Kind | Secondary-interface write | Secondary vtable | Primary queued-message handler |
+| --- | --- | --- | --- |
+| Item | `0x756abf` | `0xb1c4f4` | `0x753b10` |
+| Trigger | `0x79b116` | `0xb1fdcc` | `0x698a50` |
+| Sound | `0x7c1f7b` | `0xb21f64` | `0x698a50` |
+| Waypoint | `0x7c3a97` | `0xb226a4` | `0x698a50` |
+| Projectile | `0x7e8469` | `0xb23a8c` | `0x698a50` |
+| Store | `0x7ed8ba` | `0xb241ac` | `0x698a50` |
+| Area of effect | `0x7e5f76` | `0xb2372c` | `0x7e4a50` |
+
+All seven secondary slot `+0x28` entries select `0x69a130`. Their primary
+slot `+0xc8` entries select the queued-message handlers listed above. The
+item handler forwards message kind 10 to `0x698a50` at `0x753bc6`; the
+area-of-effect handler's default branch forwards it at `0x7e4ac1`. The other
+five use the base handler directly. Together with the generic dispatcher's
+CCObject lookup, these establish both direct and queued routes for all nine
+kinds. Module and area instead have explicit generic-dispatch branches;
+this physical-object trace does not establish their script selection.
+
+`Sim::deliver` follows this precedence for all nine traced Origins kinds:
+a nonempty table-114 `Script` cell, then an explicit override
 when present, then the object's own script. A table script can therefore
 handle an otherwise scriptless object and supersede either fallback.
 An explicitly selected empty script suppresses the object fallback and
@@ -43,14 +66,47 @@ silently consumes the event. String terminators are removed; whitespace
 does not turn a nonempty table script into a fallback. Selection happens
 at delivery rather than when the event is queued.
 
-Synthetic regressions execute scripts and verify the selected script,
+Synthetic regressions execute scripts on every traced kind and verify the selected script,
 scriptless objects, empty and missing table values, explicit-empty
-suppression, queued delivery, and preservation of DA2 and module/area
-routes. Disabled-event sets, other object routes, module/area senders,
+suppression, queued delivery, and preservation of all fifteen DA2 kinds and
+the six remaining Origins kinds. Disabled-event sets, other object routes, module/area senders,
 script-side `HandleEvent`, and
 all direct-dispatch callers remain outside this bounded fix.
 
-## Complete-world comparison
+## Seven-kind extension comparison
+
+The fresh comparison of exact main `0328859e` and runtime head `021acd47`
+has 32 successful s01–s16 exits. All 35 complete saves are byte-identical.
+All sixteen story logs, ordered plot-write traces, engine-log traces and
+command traces agree. The complete inherited final plot maps agree at every
+step. All twelve health files agree, including 10,556 inspections and 61
+before/after heal pairs. Four 600-tick repeat/save-reload checks and all six
+origins pass.
+
+Seventy-two installed-table probes cover all nine traced kinds, with
+scriptless objects and explicit overrides. The seven additional kinds show
+the intended selection change; creature/placeable controls agree on both
+binaries. The corpus passes in 421 seconds with 563,678 entries, 10,652
+archives, 155,719 GFF round trips and all 774 typed placeable walkmeshes.
+Archive, read, encrypted and typed failures are zero; the existing 5,219
+undeclared-action diagnostics remain nonfatal.
+
+Separate DA2 repeats and all four complete paired saves agree. Save/reload
+differs on both binaries only at `next_effect_id`, from 2 to 3. Both hidden
+Human Noble and Dwarf Commoner chargen click-throughs pass on each binary.
+Visually inspected, staged comparisons include absolute RGB Delta ×4 panels
+at a maximum-channel threshold greater than 2/255. Human Noble changes six
+pixels (0.000651%); Dwarf Commoner is pixel-identical. Both deltas are
+essentially zero.
+
+Fresh standalone Tower controls pass on both binaries, with the beacon
+cleared, Flemeth reached and complete final saves equal. Each takes 560 steps
+and 11,965 tool calls; main completes in 34 seconds and the candidate in 28.
+The pinned master-input hashes match the preceding standalone control.
+Private evidence is under
+`codex-mods-target/gaps/scr065-physical-event-routes/`.
+
+## Initial creature/placeable comparison
 
 The full s01–s16 comparison of main `d87590e5` and runtime head `636e792f`
 has 32 successful exits, matching ending areas, sixteen matching story logs,
