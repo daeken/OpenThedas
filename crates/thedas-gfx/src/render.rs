@@ -224,6 +224,7 @@ struct DrawU {
 }
 
 struct GpuMesh {
+    bounds: [f32; 4],
     /// Where the vertices are in the arena, and the triangles (relative to that start).
     verts: crate::gpu::VRange,
     indices: Arc<[u32]>,
@@ -480,6 +481,7 @@ struct Filtered {
     filters: Vec<crate::swf::Filter>,
     size: (u32, u32),
     scale: u32,
+    clip: [f32; 4],
     mesh: Option<Arc<GpuMesh>>,
 }
 
@@ -1382,7 +1384,24 @@ impl Renderer {
         }
         let verts = self.arena.alloc(&self.device, &self.queue, &m.vertices);
         let rect = mesh_rect(m);
+        let bounds = m.vertices.iter().fold(
+            [
+                f32::INFINITY,
+                f32::INFINITY,
+                f32::NEG_INFINITY,
+                f32::NEG_INFINITY,
+            ],
+            |b, v| {
+                [
+                    b[0].min(v.pos[0]),
+                    b[1].min(v.pos[1]),
+                    b[2].max(v.pos[0]),
+                    b[3].max(v.pos[1]),
+                ]
+            },
+        );
         Some(Arc::new(GpuMesh {
+            bounds,
             rect,
             verts,
             indices: Arc::from(m.indices.as_slice()),
@@ -2137,9 +2156,14 @@ impl Renderer {
                     && f.filters == filters
                     && f.source.same_picture(&source)
             });
-            let mesh = if let Some(hit) = hit {
-                hit.mesh.clone()
+            let (mesh, clip) = if let Some(hit) = hit {
+                (hit.mesh.clone(), hit.clip)
             } else {
+                let clip = crate::filters::picture_bounds(
+                    source.bounds(size),
+                    &filters,
+                    f32::from_bits(scale),
+                );
                 let targets = self.create_targets(size);
                 self.draw_build(source.clone(), &targets);
                 let output = self.filters.apply(
@@ -2175,10 +2199,11 @@ impl Renderer {
                         filters,
                         size,
                         scale,
+                        clip,
                         mesh: mesh.clone(),
                     },
                 );
-                mesh
+                (mesh, clip)
             };
             if let Some(mesh) = mesh {
                 let u = b.uniforms.len() as u32;
@@ -2186,7 +2211,13 @@ impl Renderer {
                     m0: [1.0, 0.0, 0.0, 0.0],
                     m1: [0.0, 1.0, 0.0, 0.0],
                     mul: [1.0; 4],
-                    clip: b.clip,
+                    // Darken's MIN blend can change the destination for a transparent source.
+                    // Other blends can omit the filtered picture's transparent exterior.
+                    clip: if blend == Blend::Darken {
+                        b.clip
+                    } else {
+                        clip_intersect(b.clip, clip)
+                    },
                     ..Default::default()
                 });
                 b.push(&mesh, u, blend, stencil);
@@ -2857,6 +2888,60 @@ impl Grid {
 }
 
 impl Build {
+    /// Conservative screen bounds of colour draws, including the vertex shader's
+    /// one-pixel fringe and glyph snapping. Stencil-only draws add no colour.
+    fn bounds(&self, size: (u32, u32)) -> [f32; 4] {
+        let mut out = [
+            f32::INFINITY,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NEG_INFINITY,
+        ];
+        for op in &self.ops {
+            if op.stencil != Stencil::Content {
+                continue;
+            }
+            let u = &self.uniforms[op.uniform as usize];
+            let [x0, y0, x1, y1] = op.mesh.bounds;
+            let mut r = [
+                f32::INFINITY,
+                f32::INFINITY,
+                f32::NEG_INFINITY,
+                f32::NEG_INFINITY,
+            ];
+            for (x, y) in [(x0, y0), (x1, y0), (x1, y1), (x0, y1)] {
+                let px = ((u.m0[0] * x + u.m0[1] * y + u.m0[2]) * 0.5 + 0.5) * size.0 as f32;
+                let py = (0.5 - (u.m1[0] * x + u.m1[1] * y + u.m1[2]) * 0.5) * size.1 as f32;
+                if !px.is_finite() || !py.is_finite() {
+                    return [0.0, 0.0, size.0 as f32, size.1 as f32];
+                }
+                r = [
+                    r[0].min(px - 2.0),
+                    r[1].min(py - 2.0),
+                    r[2].max(px + 2.0),
+                    r[3].max(py + 2.0),
+                ];
+            }
+            if u.clip != [0.0; 4] {
+                r = clip_intersect(r, u.clip);
+            }
+            if r[0] >= r[2] || r[1] >= r[3] {
+                continue;
+            }
+            out = [
+                out[0].min(r[0]),
+                out[1].min(r[1]),
+                out[2].max(r[2]),
+                out[3].max(r[3]),
+            ];
+        }
+        if out[0] >= out[2] || out[1] >= out[3] {
+            [1.0, 1.0, 0.0, 0.0]
+        } else {
+            out
+        }
+    }
+
     /// Compare the ordered draw inputs, retaining the meshes so their identities cannot
     /// be recycled underneath a cache entry. Uniforms include transforms, tint, masks
     /// and viewport; nested filters contribute their own cached output meshes.
@@ -3380,6 +3465,82 @@ mod shadow_tests {
         r.set_engine_image("paperdoll", None);
         r.render(&mut p, &mut Empty, (32, 32));
         assert!(r.capture().unwrap().2.iter().all(|b| *b == 0));
+    }
+
+    #[test]
+    fn filtered_bounds_preserve_full_picture_pixels() {
+        use crate::swf::{Color, Filter};
+        let (device, queue) = crate::gpu::test_device();
+        let filters = [
+            Filter::Blur {
+                blur: (3.5, 5.5),
+                passes: 2,
+            },
+            Filter::Glow {
+                color: Color {
+                    r: 0,
+                    g: 255,
+                    b: 0,
+                    a: 180,
+                },
+                blur: (5.0, 3.0),
+                strength: 1.5,
+                inner: false,
+                knockout: false,
+                composite_source: true,
+                passes: 1,
+            },
+            Filter::DropShadow {
+                color: Color {
+                    r: 20,
+                    g: 30,
+                    b: 40,
+                    a: 200,
+                },
+                blur: (3.0, 5.0),
+                angle: 0.7,
+                distance: 4.5,
+                strength: 1.0,
+                inner: false,
+                knockout: false,
+                hide_object: false,
+                passes: 1,
+            },
+        ];
+        for filter in filters {
+            for size in [(32, 32), (64, 48)] {
+                let mut p = blend_player();
+                let root = p.vm.root;
+                quad(&mut p, root, 0, [40, 80, 120, 255], 640.0);
+                let d = quad(&mut p, root, 1, [255, 0, 0, 180], 160.0);
+                let o = p.vm.display.get_mut(d).unwrap();
+                o.filters = vec![filter.clone()];
+                o.matrix = Matrix {
+                    a: 0.7,
+                    b: 0.2,
+                    c: -0.1,
+                    d: 0.2,
+                    tx: 200.0,
+                    ty: 160.0,
+                };
+                let mut r = Renderer::new(&device, &queue, wgpu::TextureFormat::Rgba8Unorm);
+                r.render(&mut p, &mut Empty, size);
+                let bounded = r.capture().unwrap();
+                let clip = r.filtered[&d].clip;
+                assert!((clip[2] - clip[0]) * (clip[3] - clip[1]) < (size.0 * size.1) as f32);
+                r.filtered.get_mut(&d).unwrap().clip = [0.0; 4];
+                r.render(&mut p, &mut Empty, size);
+                assert_eq!(r.capture().unwrap(), bounded, "{filter:?} {size:?}");
+                // MIN darken is deliberately kept full-screen: transparent samples
+                // still affect its destination, unlike ordinary source-over blending.
+                p.vm.display.get_mut(d).unwrap().blend = BlendMode::Darken;
+                r.render(&mut p, &mut Empty, size);
+                let dark = r.capture().unwrap();
+                r.filtered.get_mut(&d).unwrap().clip = clip;
+                r.render(&mut p, &mut Empty, size);
+                assert_eq!(r.capture().unwrap(), dark);
+            }
+        }
     }
 
     #[test]
