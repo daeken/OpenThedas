@@ -590,7 +590,7 @@ impl Sim {
     /// The closed doors of an area with the pathing-grid cells of their doorways: doors are
     /// the placeables whose appearance's state controller (`placeable_types.gda`) is
     /// `StateCnt_Door`; a door is closed in states 0 and 1 (`statecnt_door.gda`:
-    /// Closed_Unlocked, Closed_Locked), its state being field `State` (`SetPlaceableState`)
+    /// Closed_Unlocked, Closed_Locked), its state being field `State` (initially `InitialState`)
     /// or else the template's `AnimContState`. The doorway is the walkable cells within
     /// [`DOORWAY_RADIUS`] of the door.
     pub fn closed_doors(
@@ -618,7 +618,7 @@ impl Sim {
                     o.active
                         && (state == 0 || state == 1)
                         && o.placeable_group
-                            .is_none_or(|g| g & thedas_formats::phy::mask::CREATURES != 0)
+                            .is_none_or(|g| g & thedas_formats::phy::mask::NON_WALKABLE != 0)
                 })
             })
             .cloned()
