@@ -5218,6 +5218,13 @@ pub fn call(
             }
             void()
         }
+        "GetAILevel" if h.sim.game == thedas_vfs::Game::DragonAge2 => {
+            ok(Value::Int(h.sim.da2_ai_level(obj(a, 0))))
+        }
+        "SetAILevel" if h.sim.game == thedas_vfs::Game::DragonAge2 => {
+            h.sim.da2_set_ai_level(obj(a, 0), int(a, 1));
+            void()
+        }
         "SetAILevel" => {
             if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
                 o.fields.insert("AILevel".into(), int(a, 1));
