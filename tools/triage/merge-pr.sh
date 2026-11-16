@@ -29,8 +29,27 @@ cd "$wt"
 main_sha=$(git rev-parse --short HEAD)
 git merge -q --no-edit "refs/remotes/pr/$pr" || { echo "merge conflict: resolve by hand"; exit 2; }
 
-# The crates the PR touches (workspace member = first path component under crates/).
-crates=$(git diff --name-only "origin/$base" HEAD | sed -n 's#^crates/\([^/]*\)/.*#\1#p' | sort -u | sed 's/^/-p /' | tr '\n' ' ')
+# The crates the PR touches (first path component under crates/), plus every workspace crate that
+# depends on them, directly or not (a thedas-ui change reaches thedas-app and thedas-mcp).
+# thedas-app cannot be built in the cloud (it needs the ALSA headers): it is left out and the
+# note below says so, so its checks fall to the Mac (or a Windows cross-clippy by hand).
+touched=$(git diff --name-only "origin/$base" HEAD | sed -n 's#^crates/\([^/]*\)/.*#\1#p' | sort -u | tr '\n' ' ')
+crates=$(cargo metadata --no-deps --format-version 1 | TOUCHED="$touched" python3 -c '
+import json, os, sys
+m = json.load(sys.stdin)
+deps = {p["name"]: {d["name"] for d in p["dependencies"]} for p in m["packages"]}
+todo = [c for c in os.environ["TOUCHED"].split() if c in deps]
+hit = set(todo)
+while todo:
+    c = todo.pop()
+    for n, d in deps.items():
+        if c in d and n not in hit:
+            hit.add(n); todo.append(n)
+skip = {"thedas-app"}
+if hit & skip:
+    sys.stderr.write("note: thedas-app is affected but not checked in the cloud\n")
+print(" ".join("-p " + n for n in sorted(hit - skip)))
+')
 echo "== PR $pr head ${head:0:8} on $base $main_sha; crates: ${crates:-none}"
 git diff --stat "origin/$base" HEAD | tail -3
 

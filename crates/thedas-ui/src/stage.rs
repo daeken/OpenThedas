@@ -671,6 +671,30 @@ impl Stage {
         }
     }
 
+    /// Tags a newly shown engine dialog. The tag dies with the clip, so a later
+    /// script box (even with the same prompt) cannot inherit its input policy.
+    pub fn claim_dialog(&mut self, id: u32) {
+        if let Some(m) = self.movies.iter_mut().find(|m| m.name == POPUP_LAYER) {
+            m.set(
+                "_global.PopupLayer.ms_mcPopup.thedas_text_id",
+                UiValue::Number(id as f64),
+            );
+        }
+    }
+
+    /// Whether the live clip is the engine dialog claimed with `id`.
+    pub fn owns_dialog(&mut self, id: u32) -> bool {
+        self.dialog_up()
+            && self
+                .movies
+                .iter_mut()
+                .find(|m| m.name == POPUP_LAYER)
+                .is_some_and(|m| {
+                    m.get("_global.PopupLayer.ms_mcPopup.thedas_text_id")
+                        == UiValue::Number(id as f64)
+                })
+    }
+
     /// The movies that take the mouse: all of them, or only the popup layer while one of its
     /// dialogs is up (it pushes the `GUIPopup` context then and pops it when the dialog
     /// closes). Provisional: the game's context system decides which input reaches which
@@ -789,21 +813,46 @@ impl Stage {
         }
     }
 
-    /// Report notes opt out of popuplayer.gfx's `TextInput_mc_init` name defaults
-    /// (`maxChars = 20`, `restrict` set even with `GUIPopupLayer.Filter = 0`). Apply
-    /// after that initializer runs, to this dialog instance only.
-    pub fn allow_dialog_free_text(&mut self) {
+    /// Establishes focus once initialization has installed the field's handlers.
+    /// A click before init can already have focused it; blur first so onSetFocus
+    /// still registers its key listener. Used only at a free-text dialog's ready
+    /// transition, before delivering any queued keys.
+    pub fn focus_initialized_dialog_field(&mut self) -> bool {
         if !self.dialog_up() {
-            return;
+            return false;
         }
         let Some(m) = self.movies.iter_mut().find(|m| m.name == POPUP_LAYER) else {
-            return;
+            return false;
+        };
+        let field = "_global.PopupLayer.ms_mcPopup.TextInput_mc.TextField";
+        if m.call(&format!("{field}.type.toString"), &[]) != UiValue::String("input".into()) {
+            return false;
+        }
+        m.call("_global.Selection.setFocus", &[UiValue::Null]);
+        m.call(
+            "_global.Selection.setFocus",
+            &[UiValue::String(field.into())],
+        );
+        focused_input_field(m).is_some()
+    }
+
+    /// Report notes opt out of popuplayer.gfx's `TextInput_mc_init` name defaults
+    /// (`maxChars = 20`, `restrict` set even with `GUIPopupLayer.Filter = 0`). Apply
+    /// on every tick of this dialog. Returns whether the initializer has finished
+    /// assigning its default text and installed the field's Enter handler.
+    pub fn allow_dialog_free_text(&mut self) -> bool {
+        if !self.dialog_up() {
+            return false;
+        }
+        let Some(m) = self.movies.iter_mut().find(|m| m.name == POPUP_LAYER) else {
+            return false;
         };
         let field = "_global.PopupLayer.ms_mcPopup.TextInput_mc.TextField";
         if m.call(&format!("{field}.type.toString"), &[]) == UiValue::String("input".into()) {
             m.set(&format!("{field}.maxChars"), UiValue::Number(0.0));
             m.set(&format!("{field}.restrict"), UiValue::Null);
         }
+        m.call("_global.thedas_dialog_input_ready", &[]) == UiValue::Bool(true)
     }
 
     /// A dialog box's text field keeps the focus through a click that leaves the box up

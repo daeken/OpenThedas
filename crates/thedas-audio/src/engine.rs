@@ -18,6 +18,7 @@
 use std::collections::HashMap;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use thedas_formats::fev::{
     Category, Event, EventBody, Fev, PARAM_DISTANCE, SoundDef, SoundDefTemplate, WaveformKind,
@@ -253,6 +254,8 @@ struct Loaded {
 }
 
 pub struct AudioEngine {
+    /// Successful event starts for issue reports; at most ten seconds / 512 events.
+    recent_starts: std::collections::VecDeque<SoundStart>,
     pub library: Arc<Library>,
     pub mixer: Arc<Mutex<Mixer>>,
     instances: Vec<Instance>,
@@ -277,6 +280,14 @@ pub struct AudioEngine {
     pub synchronous: bool,
     tx: Sender<Loaded>,
     rx: Receiver<Loaded>,
+}
+
+#[derive(Clone, Debug)]
+pub struct SoundStart {
+    pub at: Instant,
+    pub event: String,
+    pub position: Option<[f32; 3]>,
+    pub programmer_sound: Option<String>,
 }
 
 fn bus_for(category: &str) -> Bus {
@@ -358,6 +369,7 @@ impl AudioEngine {
         }
         let (tx, rx) = channel();
         AudioEngine {
+            recent_starts: Default::default(),
             library,
             mixer,
             instances: Vec::new(),
@@ -378,6 +390,14 @@ impl AudioEngine {
             tx,
             rx,
         }
+    }
+
+    /// Recent event starts, oldest first. Reading this does not affect playback.
+    pub fn recent_starts(&self) -> impl Iterator<Item = &SoundStart> {
+        let now = Instant::now();
+        self.recent_starts
+            .iter()
+            .filter(move |s| now.duration_since(s.at) <= Duration::from_secs(10))
     }
 
     fn random(&mut self) -> u64 {
@@ -525,6 +545,21 @@ impl AudioEngine {
             "audio: play {path} (pitch x{rate:.3} = {:+.2} semitones, random gain x{random_gain:.3})",
             12.0 * rate.log2()
         );
+        let now = Instant::now();
+        while self
+            .recent_starts
+            .front()
+            .is_some_and(|s| now.duration_since(s.at) > Duration::from_secs(10))
+            || self.recent_starts.len() >= 512
+        {
+            self.recent_starts.pop_front();
+        }
+        self.recent_starts.push_back(SoundStart {
+            at: now,
+            event: path.to_string(),
+            position: inst.options.position,
+            programmer_sound: inst.options.programmer_sound.clone(),
+        });
         self.instances.push(inst);
         self.update(0.0);
         Some(handle)
@@ -1562,6 +1597,30 @@ mod tests {
         run(&mut e, &m, 0.2);
         assert!(!e.is_playing(h));
         assert_eq!(m.lock().unwrap().active(), 0);
+    }
+
+    #[test]
+    fn report_sound_starts_keep_successes_and_expire_after_ten_seconds() {
+        let (mut e, _) = engine("report-starts");
+        assert!(e.play("missing/project", PlayOptions::default()).is_none());
+        assert_eq!(e.recent_starts().count(), 0);
+        e.play(
+            "test/grp/loop",
+            PlayOptions {
+                position: Some([1.0, 2.0, 3.0]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let start = e.recent_starts().next().unwrap();
+        assert_eq!(start.event, "test/grp/loop");
+        assert_eq!(start.position, Some([1.0, 2.0, 3.0]));
+        e.recent_starts.front_mut().unwrap().at = Instant::now() - Duration::from_secs(11);
+        assert_eq!(e.recent_starts().count(), 0);
+        for _ in 0..520 {
+            e.play("test/grp/loop", PlayOptions::default()).unwrap();
+        }
+        assert_eq!(e.recent_starts.len(), 512);
     }
 
     #[test]
