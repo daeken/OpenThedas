@@ -47,6 +47,17 @@ fn obj(a: &[Value], i: usize) -> ObjectId {
     }
 }
 
+/// DA2's waiting queue is separate from its active executor (0x4fd460,
+/// 0x5a8d40). Our started front carries that executor's deadline.
+fn script_command_queue(sim: &Sim, who: ObjectId) -> &[Command] {
+    let Some(o) = sim.world.get(who) else {
+        return &[];
+    };
+    let active = sim.game == thedas_vfs::Game::DragonAge2
+        && o.commands.first().is_some_and(|c| c.due.is_some());
+    &o.commands[usize::from(active)..]
+}
+
 /// The independent placeable current, retaining explicit currents from older saves.
 pub(crate) fn origins_placeable_health(o: &Object) -> i32 {
     o.properties.get(&7).map_or_else(
@@ -3600,9 +3611,13 @@ pub fn call(
             void()
         }
         "GetCommandByIndex" => {
-            let c = h
-                .object(obj(a, 0))
-                .and_then(|o| o.commands.get(int(a, 1).max(0) as usize).cloned());
+            let index = if h.sim.game == thedas_vfs::Game::DragonAge2 {
+                // 0x5c2400 consumes the index as an unsigned 16-bit value.
+                int(a, 1) as u16 as usize
+            } else {
+                int(a, 1).max(0) as usize
+            };
+            let c = script_command_queue(h.sim, obj(a, 0)).get(index).cloned();
             let hd = c.map(|c| h.sim.world.store(EngineData::Command(c)));
             ok(Value::Engine {
                 ty: ty.command,
@@ -3649,7 +3664,7 @@ pub fn call(
             ok(Value::Int(exists as i32))
         }
         "GetCommandQueueSize" => ok(Value::Int(
-            h.object(obj(a, 0)).map_or(0, |o| o.commands.len() as i32),
+            script_command_queue(h.sim, obj(a, 0)).len() as i32
         )),
         // Cancelling a command in progress completes it (COMMAND_RESULT_INVALID), which is
         // how the AI notices it has nothing to do. Provisional.
@@ -8044,6 +8059,81 @@ mod tests {
             script: "test".into(),
         };
         call(&mut h, caller, &f, a).unwrap().unwrap()
+    }
+
+    #[test]
+    fn da2_command_queue_omits_the_active_executor_and_keeps_waiting_indexes() {
+        fn command_at(s: &mut Sim, who: ObjectId, index: i32) -> Option<Command> {
+            let Some(Value::Engine { handle, .. }) = run(
+                s,
+                who,
+                "GetCommandByIndex",
+                &[Value::Object(who), Value::Int(index)],
+            ) else {
+                panic!("expected command handle");
+            };
+            match s.world.handle(handle) {
+                Some(EngineData::Command(command)) => Some(command.clone()),
+                _ => None,
+            }
+        }
+
+        for game in [thedas_vfs::Game::DragonAge2, thedas_vfs::Game::Origins] {
+            let table = EngineTable::parse(
+                b"#define ENGINE_STRUCTURE_2 command\n\
+                int GetCommandQueueSize(object o) = 724;\n\
+                command GetCommandByIndex(object o, int i) = 536;\n\
+                int COMMAND_TYPE_WAIT = 13;\n",
+            )
+            .unwrap();
+            let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(table), 1);
+            s.game = game;
+            let who = s.world.spawn(ObjectKind::Creature, "actor");
+            let size = |s: &mut Sim, id| run(s, who, "GetCommandQueueSize", &[Value::Object(id)]);
+            assert_eq!(size(&mut s, who), Some(Value::Int(0)));
+            assert_eq!(size(&mut s, OBJECT_INVALID), Some(Value::Int(0)));
+            assert_eq!(command_at(&mut s, OBJECT_INVALID, 0), None);
+            s.order_wait(who, 1.);
+            // Before the scheduler starts it, the front is still waiting.
+            assert_eq!(size(&mut s, who), Some(Value::Int(1)));
+            assert_eq!(command_at(&mut s, who, 0).unwrap().seconds, 1.);
+            s.tick(100);
+            let da2 = game == thedas_vfs::Game::DragonAge2;
+            assert_eq!(size(&mut s, who), Some(Value::Int(i32::from(!da2))));
+            assert_eq!(command_at(&mut s, who, 0).is_none(), da2);
+            let mut next = s.world.get(who).unwrap().commands[0].clone();
+            next.due = None;
+            next.seconds = 2.;
+            s.world.get_mut(who).unwrap().commands.push(next.clone());
+            next.seconds = 3.;
+            s.world.get_mut(who).unwrap().commands.push(next);
+            assert_eq!(size(&mut s, who), Some(Value::Int(if da2 { 2 } else { 3 })));
+            assert_eq!(
+                command_at(&mut s, who, 0).unwrap().seconds,
+                if da2 { 2. } else { 1. }
+            );
+            assert_eq!(command_at(&mut s, who, -1).is_none(), da2);
+            assert_eq!(command_at(&mut s, who, i32::MAX), None);
+            assert_eq!(command_at(&mut s, who, 65536).is_some(), da2);
+            if da2 {
+                assert_eq!(command_at(&mut s, who, -65536).unwrap().seconds, 2.);
+            }
+            // A ready animation still belongs to the executor. Reload keeps
+            // the same queue boundary, including older records without readiness.
+            s.world.get_mut(who).unwrap().commands[0].cancellable = true;
+            s.world = serde_json::from_str(&serde_json::to_string(&s.world).unwrap()).unwrap();
+            assert_eq!(size(&mut s, who), Some(Value::Int(if da2 { 2 } else { 3 })));
+            s.world.get_mut(who).unwrap().commands[0].cancellable = false;
+            s.world = serde_json::from_str(&serde_json::to_string(&s.world).unwrap()).unwrap();
+            s.tick(900);
+            assert_eq!(
+                command_at(&mut s, who, 0).unwrap().seconds,
+                if da2 { 3. } else { 2. }
+            );
+            assert_eq!(size(&mut s, who), Some(Value::Int(if da2 { 1 } else { 2 })));
+            s.world.get_mut(who).unwrap().commands.clear();
+            assert_eq!(size(&mut s, who), Some(Value::Int(0)));
+        }
     }
 
     #[test]
