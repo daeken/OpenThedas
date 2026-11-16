@@ -5926,6 +5926,17 @@ pub fn call(
             h.sim.world.queue_event(delay, caller, ev, Some(script));
             void()
         }
+        // DA2 0x4ebfd0 pushes the desktop platform constant, independent of
+        // the replacement engine's host OS.
+        "GetPlatform" if h.sim.game == thedas_vfs::Game::DragonAge2 => ok(Value::Int(1)),
+        // DA2 0x4f08f0 stops a model's additive channel; 0x4ecfc0 invokes a
+        // player-screen hit effect. Neither returns a script value or changes
+        // combat state. Their presentation systems are not simulated here.
+        "StopAdditiveAnimation" | "DoPlayerHitEffect"
+            if h.sim.game == thedas_vfs::Game::DragonAge2 =>
+        {
+            void()
+        }
         // Presentation only.
         "PlayAdditiveAnimation" | "SignalDamage" => void(),
         // Creature switches that DAOrigins.exe sets in one handler (0x66be50), kept on the
@@ -15363,5 +15374,40 @@ mod coverage_tests {
                     .contains_key("IsDestroyable")
             );
         }
+    }
+    #[test]
+    fn da2_desktop_platform_and_presentation_stubs_leave_simulation_unchanged() {
+        let table = Arc::new(EngineTable::parse(
+            b"int GetPlatform() = 694;\nvoid StopAdditiveAnimation(object o, int n) = 932;\nvoid DoPlayerHitEffect(int n, int step) = 936;\n"
+        ).unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        s.game = thedas_vfs::Game::DragonAge2;
+        let who = s.world.spawn(ObjectKind::Creature, "actor");
+        let before = s.save_json().unwrap();
+        assert_eq!(run(&mut s, who, "GetPlatform", &[]), Some(Value::Int(1)));
+        for target in [who, OBJECT_INVALID] {
+            assert_eq!(
+                run(
+                    &mut s,
+                    who,
+                    "StopAdditiveAnimation",
+                    &[Value::Object(target), Value::Int(3)]
+                ),
+                None
+            );
+        }
+        for effect in [-1, 0, 1, 5] {
+            assert_eq!(
+                run(
+                    &mut s,
+                    who,
+                    "DoPlayerHitEffect",
+                    &[Value::Int(effect), Value::Int(2)]
+                ),
+                None
+            );
+        }
+        assert_eq!(s.save_json().unwrap(), before);
+        assert!(s.world.trace.unimplemented.is_empty());
     }
 }
