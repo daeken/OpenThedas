@@ -46,6 +46,9 @@ pub struct AreaEntry {
 #[derive(Clone, Debug, Default, serde::Serialize)]
 pub struct ModuleInfo {
     pub name: String,
+    /// The campaign's additional package names (Origins CIF field 17124).
+    /// The module manager's IsPackageLoaded lookup searches this list.
+    pub packages: Vec<String>,
     pub script: Option<String>,
     pub start_area: Option<String>,
     pub start_position: [f32; 3],
@@ -5529,7 +5532,8 @@ fn cif_vars(g: &Gff4) -> Vec<(String, thedas_formats::gff4::Value)> {
 }
 
 /// The campaign file: script (17104), start area (17101), start position (17102) and the area
-/// tree (3290). Field meanings provisional, read from `singleplayer.cif`.
+/// tree (3290). Origins' additional package list is field 17124 (0x5fd7f3).
+/// Other field meanings remain provisional, read from `singleplayer.cif`.
 fn parse_cif(g: &Gff4) -> ModuleInfo {
     let s = |l: u32| {
         g.field(g.root, l)
@@ -5542,6 +5546,15 @@ fn parse_cif(g: &Gff4) -> ModuleInfo {
         start_area: s(17101).or_else(|| s(17100)),
         ..Default::default()
     };
+    if let Some(thedas_formats::gff4::Value::List(Some(thedas_formats::List::String(packages)))) =
+        g.field(g.root, 17124)
+    {
+        info.packages = packages
+            .iter()
+            .flatten()
+            .map(|name| name.trim_end_matches('\0').to_string())
+            .collect();
+    }
     if let Some(thedas_formats::gff4::Value::Vec3(p)) = g.field(g.root, 17102) {
         info.start_position = *p;
     }
@@ -5767,6 +5780,47 @@ impl ScriptHost<'_> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn package_loaded_campaign_cif_reads_its_explicit_dependency_list() {
+        use thedas_formats::gff4::{
+            FieldDef, FourCC, List, StructData, StructTemplate, Value as G, Version,
+        };
+        let mut g = Gff4 {
+            version: Version::V40,
+            platform: FourCC::new(b"PC  "),
+            file_type: FourCC::new(b"CIF "),
+            file_version: FourCC::new(b"V0.1"),
+            templates: vec![StructTemplate {
+                label: FourCC::new(b"CIF "),
+                fields: vec![FieldDef {
+                    label: 17124,
+                    type_code: 14,
+                    flags: 0x8000,
+                    offset: 0,
+                }],
+                size: 4,
+            }],
+            structs: vec![StructData {
+                template: 0,
+                values: vec![G::List(Some(List::String(vec![
+                    Some("core_ep1\0".into()),
+                    None,
+                    Some("another".into()),
+                ])))],
+            }],
+            root: StructId(0),
+            shared_strings: None,
+        };
+        let parsed = Gff4::parse(&g.write().unwrap()).unwrap();
+        assert_eq!(parse_cif(&parsed).packages, vec!["core_ep1", "another"]);
+        g.structs[0].values[0] = G::List(None);
+        let parsed = Gff4::parse(&g.write().unwrap()).unwrap();
+        assert!(parse_cif(&parsed).packages.is_empty());
+        g.templates[0].fields.clear();
+        g.structs[0].values.clear();
+        assert!(parse_cif(&g).packages.is_empty());
+    }
+
     fn add_command_sim() -> Sim {
         let ldf = "#define ENGINE_STRUCTURE_2 command\n\
             command CommandWait(float seconds) = 1;\n\

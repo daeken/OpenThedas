@@ -2361,6 +2361,15 @@ pub fn call(
         // such record gives 0. Ours: whether the stack mounts that add-in, which applies the
         // registry's own gates and not the authorization (FMT-011).
         "GetPRCEnabled" => ok(b(h.sim.vfs.addin_enabled(&string(a, 0)))),
+        "IsPackageLoaded" if h.sim.game == thedas_vfs::Game::Origins => {
+            // 0x6657b0 -> 0x5fbc10: case-folded equality against the module
+            // manager's package list, populated from CIF field 17124. Installed
+            // add-ins, aliases and resource layer labels do not answer this query.
+            let package = string(a, 0);
+            ok(b(h.sim.module_info.packages.iter().any(|name| {
+                name.eq_ignore_ascii_case(package.trim_end_matches('\0'))
+            })))
+        }
         "IsPackageLoaded" => {
             // Inferred (#862): whether a package's archives are in our resource stack.
             let pkg = format!("packages/{}/", string(a, 0).to_ascii_lowercase());
@@ -7159,6 +7168,68 @@ mod tests {
                 &[Value::Object(item), Value::Int(0), Value::Int(0)]
             )
             .is_none()
+        );
+    }
+
+    #[test]
+    fn package_loaded_native_862_reads_campaign_dependencies_not_installed_addins_or_layer_names() {
+        let mut vfs = Vfs::new();
+        vfs.set_addins(vec!["dao_prc_ep_1".into()]);
+        vfs.push_files(&[], "packages/core_ep1/data/installed-only.erf");
+        let table = EngineTable::default().with_inferred();
+        assert_eq!(table.function(862).unwrap().name, "IsPackageLoaded");
+        let mut s = Sim::new(Arc::new(vfs), Arc::new(table), 1);
+        let query = |s: &mut Sim, name: &str| {
+            run(
+                s,
+                OBJECT_INVALID,
+                "IsPackageLoaded",
+                &[Value::String(name.into())],
+            )
+        };
+        assert_eq!(query(&mut s, "core_ep1"), Some(Value::Int(0)));
+        assert_eq!(query(&mut s, "dao_prc_ep_1"), Some(Value::Int(0)));
+        s.module_info.packages = vec!["core_ep1".into()];
+        for name in ["core_ep1", "CORE_EP1", "core_ep1\0"] {
+            assert_eq!(query(&mut s, name), Some(Value::Int(1)));
+        }
+        for name in [
+            "core",
+            "core_ep",
+            "core_ep1/",
+            " core_ep1",
+            "core_ep1 ",
+            "dao_prc_ep_1",
+            "",
+        ] {
+            assert_eq!(query(&mut s, name), Some(Value::Int(0)));
+        }
+        // Save restoration retains the already-loaded campaign's dependencies.
+        let save = s.save_game();
+        s.load_game(save).unwrap();
+        assert_eq!(query(&mut s, "core_ep1"), Some(Value::Int(1)));
+        s.module_info.packages.clear();
+        assert_eq!(query(&mut s, "core_ep1"), Some(Value::Int(0)));
+    }
+
+    #[test]
+    fn package_loaded_da2_retains_the_previous_resource_layer_query() {
+        let mut vfs = Vfs::new();
+        vfs.push_files(&[], "packages/core_ep1/data/installed-only.erf");
+        let mut s = Sim::new(
+            Arc::new(vfs),
+            Arc::new(EngineTable::default().with_inferred()),
+            1,
+        );
+        s.game = thedas_vfs::Game::DragonAge2;
+        assert_eq!(
+            run(
+                &mut s,
+                OBJECT_INVALID,
+                "IsPackageLoaded",
+                &[Value::String("core_ep1".into())]
+            ),
+            Some(Value::Int(1))
         );
     }
 
