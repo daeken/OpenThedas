@@ -150,16 +150,14 @@ impl Sim {
         self.world.tutorial_paused && !self.tutorials_held()
     }
 
-    /// The player's general unpause request (DAOrigins.exe 0x5d6740). Only guided
-    /// training vetoes it unless its expected action is TRAINING_UNPAUSE. Ordinary
-    /// tutorial popups use this same general pause setter (0x6940ec), so their text
-    /// can stay on screen while the world resumes.
+    /// The player's unpause request. A popup's pause belongs to its Next/Close
+    /// action, as captured in Combat Basics; Space cannot dismiss that pause.
     pub fn unpause(&mut self) -> bool {
-        if self.training_paused() && !self.training_event("UNPAUSE", 0) {
+        if self.tutorial_paused() {
             return false;
         }
-        if !self.tutorials_held() {
-            self.world.tutorial_paused = false;
+        if self.training_paused() && !self.training_event("UNPAUSE", 0) {
+            return false;
         }
         true
     }
@@ -238,7 +236,7 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_tutorial_unpause_keeps_the_popup_and_replays() {
+    fn ordinary_tutorial_next_releases_pause_and_replays() {
         use crate::commands::{CommandSource, SimCommand};
         use crate::replay::{JournalWriter, replay};
 
@@ -252,10 +250,16 @@ mod tests {
         s.world.tutorial_paused = true;
         let checkpoint = s.world.clone();
         let mut journal = JournalWriter::start(&mut s, "test", Vec::new()).unwrap();
-        assert!(s.input(CommandSource::Player, SimCommand::Unpause));
+        assert!(!s.input(CommandSource::Player, SimCommand::Unpause));
+        assert!(s.tutorial_paused());
+        assert_eq!(s.world.tutorials.len(), 1);
+        assert!(s.input(
+            CommandSource::Player,
+            SimCommand::ConsumeTutorial { all: false }
+        ));
         journal.take(&mut s).unwrap();
         assert!(!s.tutorial_paused());
-        assert_eq!(s.world.tutorials.len(), 1, "the lesson remains readable");
+        assert!(s.world.tutorials.is_empty());
         assert_eq!(s.world.time_ms, checkpoint.time_ms);
 
         let mut again = sim();
@@ -264,10 +268,10 @@ mod tests {
         let report = replay(&mut again, &log[..], "test", false);
         assert_eq!(
             (report.applied, report.mismatch, report.refused),
-            (1, None, None)
+            (2, None, None)
         );
         assert!(!again.tutorial_paused());
-        assert_eq!(again.world.tutorials.len(), 1);
+        assert!(again.world.tutorials.is_empty());
     }
 
     #[test]
@@ -277,11 +281,9 @@ mod tests {
         let mut s = sim();
         s.set_training_mode(2);
         s.begin_training_step(2, 1073, 0);
-        s.world.tutorial_paused = true;
         delivered(&mut s);
         assert!(!s.input(CommandSource::Player, SimCommand::Unpause));
         assert!(s.training_paused());
-        assert!(s.tutorial_paused(), "a refused request releases no pause");
         assert_eq!(s.world.training.expected, 1073);
         assert!(delivered(&mut s).is_empty());
 

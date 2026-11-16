@@ -154,8 +154,7 @@ pub enum SimCommand {
     SetTrainingMode {
         mode: i32,
     },
-    /// The player's unpause request: guided training may refuse it; an ordinary
-    /// tutorial's general pause can be released without dismissing its text.
+    /// The player's unpause request: guided training or a pausing popup may refuse it.
     Unpause,
     ConsumeTutorial {
         all: bool,

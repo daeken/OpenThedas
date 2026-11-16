@@ -859,7 +859,7 @@ impl Live {
             );
             return;
         }
-        // A tutorial's general pause lasts until unpause or popup dismissal.
+        // A tutorial's pause lasts until its Next/Close action.
         if self.sim().tutorial_paused() {
             return;
         }
@@ -3859,8 +3859,8 @@ impl Live {
         self.aiming.take().map(|a| a.ability)
     }
 
-    /// Space toggles the effective pause. The simulation decides whether guided
-    /// training accepts unpause and releases an ordinary tutorial's general pause.
+    /// Space toggles the effective pause. The simulation retains a popup's pause
+    /// and decides whether guided training accepts an unpause request.
     pub fn toggle_pause(&mut self) {
         let mut sim = self.sim();
         if self.paused || sim.training_paused() || sim.tutorial_paused() {

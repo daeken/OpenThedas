@@ -2428,12 +2428,26 @@ impl UiLayer {
         // A screen that closes takes its tooltip with it: the movie that showed it is gone
         // and cannot clear it (a picker's tooltip stayed drawn over the HUD; a portrait's
         // over the tactics screen that replaced the HUD).
+        // Fixed tooltips share the tutorial's corner, and the movie fades the
+        // tutorial to zero alpha while one is up. A paused lesson must retain
+        // its release button even when a quickbar tooltip was left under the
+        // mouse/controller cursor. Later non-pausing pages allow tooltips again.
         if !changes.closed.is_empty() || !changes.opened.is_empty() {
             for k in ["GUI.TooltipText", "GUITooltips.TooltipText"] {
                 self.stage
                     .bridge
                     .set_value(k, thedas_ui::UiValue::String(String::new()));
             }
+        }
+        if screens.menu.is_none()
+            && sim
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .tutorial_paused()
+        {
+            self.stage
+                .bridge
+                .set_value("GUI.TooltipText", thedas_ui::UiValue::String(String::new()));
         }
         // The store's close button: the simulation's store closes too.
         if changes.dismissed.contains(&Screen::Store) {
@@ -4074,6 +4088,61 @@ mod tests {
         assert_eq!(
             popup_property(&mut ui, &format!("{clip}.image")),
             UiValue::Undefined
+        );
+    }
+
+    #[test]
+    #[ignore = "requires THEDAS_INSTALL and an offscreen GPU"]
+    fn a_fixed_tooltip_cannot_hide_a_pausing_tutorial() {
+        use thedas_ui::UiValue;
+        let mut ui = installed_popup_ui();
+        let mut sim = Sim::new(
+            ui.vfs.clone(),
+            Arc::new(thedas_script::EngineTable::default()),
+            1,
+        );
+        sim.world.tutorials.push(thedas_sim::journal::Tutorial {
+            resref: "lesson".into(),
+            title: None,
+            text: None,
+            pauses: true,
+        });
+        sim.world.tutorial_paused = true;
+        let sim = Arc::new(Mutex::new(sim));
+        ui.attach(&sim);
+        let mut screens = Screens::new(false);
+        for _ in 0..30 {
+            ui.stage
+                .bridge
+                .set_value("GUI.TooltipText", UiValue::String("Item tooltip".into()));
+            ui.play(&mut screens, &sim, 1000.0 / 30.0);
+        }
+        assert_eq!(
+            ui.stage.bridge.value("GUI.TooltipText"),
+            Some(UiValue::String(String::new()))
+        );
+        let alpha = popup_property(&mut ui, "_root.TutorialContainer_mc.Fade_mc._alpha");
+        assert!(
+            matches!(alpha, UiValue::Number(a) if a >= 90.0),
+            "{alpha:?}"
+        );
+        assert_eq!(
+            popup_property(
+                &mut ui,
+                "_root.TutorialContainer_mc.Fade_mc.Tutorial_mc.MovieHidden"
+            ),
+            UiValue::Bool(false)
+        );
+        sim.lock().unwrap().consume_tutorial(false);
+        for _ in 0..30 {
+            ui.stage
+                .bridge
+                .set_value("GUI.TooltipText", UiValue::String("Item tooltip".into()));
+            ui.play(&mut screens, &sim, 1000.0 / 30.0);
+        }
+        assert_eq!(
+            ui.stage.bridge.value("GUI.TooltipText"),
+            Some(UiValue::String("Item tooltip".into()))
         );
     }
 

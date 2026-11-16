@@ -760,7 +760,7 @@ pub struct World {
     /// [`crate::journal::Tutorial`]).
     #[serde(default)]
     pub tutorials: Vec<crate::journal::Tutorial>,
-    /// Whether a tutorial paused the game: unpause or an empty queue releases it.
+    /// Whether a tutorial paused the game: its Next/Close action releases it.
     #[serde(default)]
     pub tutorial_paused: bool,
     /// The training tutorial under way, if any (see [`crate::training`]).

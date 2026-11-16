@@ -402,6 +402,9 @@ impl Sim {
         if self.world.tutorials.is_empty() {
             self.world.tutorial_paused = false;
         }
+        if self.world.tutorial_paused {
+            self.prepare_pausing_tutorials();
+        }
         if save_revision < 8 {
             self.restore_template_abilities();
         }
