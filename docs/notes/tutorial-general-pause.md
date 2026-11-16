@@ -63,7 +63,36 @@ sequential hidden, silent, mods-disabled captures in separate scratch HOME
 directories. It requires the untouched save to remain frozen and Space to
 journal unpause and advance time without consuming the tutorial queue.
 
-Runtime replay on current main, compilation, tests and regression gates were
-blocked before starting: the required `cargo-slot.sh` wrapper returned 99
-because the external volume had 12 GB free, below its 15 GB minimum. The patch
-and repro are prepared but their runtime results remain unverified.
+## Validation after resuming (2026-11-16)
+
+Merged main `6d66c10e` and built separate main/candidate release app and MCP
+binaries in the job's target directory. The hidden-window repro fails on main
+with `Space did not journal unpause`. It passes on the merged candidate: the
+untouched save remains frozen, Space journals `Unpause` and advances the world
+966 ms, and no tutorial-consume command is issued. The captured candidate frame
+also shows the pause banner gone while Combat Basics remains visible.
+
+The workspace debug build, `cargo fmt --all -- --check`, and
+`cargo clippy --workspace --all-targets -- -D warnings` pass. Workspace tests
+pass: 1,394 passed, 25 ignored, zero failed, including all three new tests.
+Heavy commands used `cargo-slot.sh`, with Cargo limited to two jobs.
+
+An isolated copy of `gate_round2.sh`, adapted only for job-local paths,
+prebuilt binaries and sequential runs, covers s01-s12 and s13 on both variants.
+All twelve sweep steps return zero and have zero log differences, identical
+plot-flag sequences and ending areas, and no refused saves. The s13 logs match
+after normalizing artifact paths and excluding wall-time diagnostics: all 22
+trace checkpoints match (last: 550 step calls, 11,919 MCP calls), and both
+complete saved states are identical in Flemeth's hut at world time 1,918,259 ms.
+
+Detcheck runs 600 ticks on each of four fixtures: siege start, Ostagar arrival,
+Wilds vials and the named tower midfight. All eight variant/fixture checks match
+both straight-through repetitions and save/reload halfway. The sixteen complete
+saved states (straight runs, halfway saves and reloaded runs) also match between
+main and candidate. There are no behavior differences in these gates; elapsed
+times and artifact paths vary. The intended difference is exercised by the
+Space repro above.
+
+A before/after comparison includes a third panel labeled `Delta ×4`. With any
+nonzero RGB-channel difference as the threshold, 5.229% of pixels change: the
+pause banner disappears and combat advances while the tutorial stays open.
