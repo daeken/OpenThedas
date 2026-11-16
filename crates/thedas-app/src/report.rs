@@ -189,7 +189,7 @@ fn log_lines() -> (Vec<Arc<str>>, u64) {
 
 /// What a report keeps between presses: the snapshots, the input and the frame times.
 pub struct Recorder {
-    snapshots: VecDeque<Snapshot>,
+    snapshots: VecDeque<Arc<Snapshot>>,
     /// When the next snapshot is due (now, when none is).
     next_snapshot: Option<Instant>,
     input: VecDeque<(Instant, String)>,
@@ -257,7 +257,7 @@ impl Recorder {
         if self.snapshots.len() >= SNAPSHOTS_KEPT {
             self.snapshots.pop_front();
         }
-        self.snapshots.push_back(s);
+        self.snapshots.push_back(Arc::new(s));
     }
 
     /// A snapshot could not be taken (saving refused, nothing playing): try again in
@@ -274,7 +274,7 @@ impl Recorder {
 
     /// The snapshot a report made `now` calls "before": the youngest at least
     /// [`BEFORE_AGE`] old, else the oldest there is.
-    pub fn before(&self, now: Instant) -> Option<&Snapshot> {
+    pub fn before(&self, now: Instant) -> Option<&Arc<Snapshot>> {
         self.snapshots
             .iter()
             .rev()
@@ -351,7 +351,7 @@ impl Recorder {
             dir: path.clone(),
             info,
             now_save,
-            before: before.map(|s| s.save),
+            before,
             log,
             input,
             trace,
@@ -684,7 +684,7 @@ struct Files {
     dir: PathBuf,
     info: J,
     now_save: Option<ReportSave>,
-    before: Option<Vec<u8>>,
+    before: Option<Arc<Snapshot>>,
     log: Vec<Arc<str>>,
     input: Vec<String>,
     trace: Option<J>,
@@ -710,7 +710,7 @@ impl Files {
             }
         }
         if let Some(s) = &self.before {
-            put("save_before.json", s)?;
+            put("save_before.json", &s.save)?;
         }
         let mut log = Vec::new();
         for l in self
@@ -983,6 +983,9 @@ mod tests {
             info,
             Capture::default(),
         );
+        // The worker retains the immutable before-save even when a new game clears
+        // the recorder's ring; starting a report does not copy its large byte buffer.
+        r.forget();
         wait_written(&path);
         assert!(r.busy());
         assert!(
