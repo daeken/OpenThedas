@@ -1344,6 +1344,7 @@ impl Sim {
     /// Native death-animation tasks zero health at start and notify scripts at end
     /// (0x7ab31d and 0x7ab401). Ordinary effect-driven deaths notify immediately.
     pub(crate) fn kill_with_event_delay(&mut self, id: ObjectId, killer: ObjectId, delay: u64) {
+        self.da2_reset_locomotion(id);
         let health = constant_of(self, "PROPERTY_DEPLETABLE_HEALTH");
         let now = self.world.time_ms;
         if let Some(o) = self.world.get_mut(id) {
