@@ -142,3 +142,65 @@ The complete command lifecycle, interruption overrides, duplicate coalescing
 and separate ClearAllCommands API remain outside this bounded repair. The
 simulator does not reproduce the pump's wall-clock budget: its event processing
 remains deterministic.
+
+## Merged regression and timing differences
+
+Final baseline is main `adf58096`. Three independently started s01-s16 chains
+use the same frozen driver, without copying any JSON checkpoint into a chain:
+C is unmodified main, A adds only the queue/completion repairs, and B adds
+the animation implementation as well. All 48 step processes succeeded. All
+three chains passed expected-area, zero-save-refusal, completed-Gilmore and
+board-distance checks, and reached camp. Each board distance was 0.0 m.
+The final B Tower step reached Flemeth's hut in its first attempt. A also
+finished its bounded third-floor standoff; its longer fight is retained in
+the evidence rather than skipped by the driver.
+
+The captured active-conversation control still stalls on C until its
+45-second watchdog. A and B drain the same-time batch, advance the clock and
+finish Gilmore. B passes all four 600-tick determinism cases (siege, Ostagar,
+Wilds vials, named Tower midfight), both repeat and save/reload. Formatting,
+workspace all-target Clippy with warnings denied, and workspace tests pass:
+1,469 passed, 25 ignored, zero failed. The separate completion-focused run
+passes 10 tests, including the new success/failure/rejection event cases.
+
+A and B have identical queue/completion repair code. Their remaining simulator
+differences are animation execution, loop completion/pose state and float-3
+animation speed. This isolates the following differences as animation-timing
+cascades; it does not make the resulting optional game state byte-identical.
+Plot names and effective values were checked through the game's plot metadata
+and ordinary flag reads, including defaults. Raw main C versus B ends with
+just the dog-item and genlock-emissary codex differences below. A versus B
+ends with nine differences:
+
+| Flags (A → B at camp) | First difference and evidence |
+| --- | --- |
+| `DOG_MAIN_GIVES_RANDOM_ITEM` (false → true) | s02: both drivers make the same fetch request, but their preceding bark variant and random-item outcome differ. B writes flag 20 at 43,486 ms. Earlier animation callbacks/RNG draws have already diverged. |
+| `BHN_MAIN_BATTLE_IN_MAIN_HALL_COMPLETE`, `BHN_MAIN_ENTERED_BLOCKED_PASSAGE`, `BHN_GILMORE_GUARDS_RUN_IN` (false → true) | s05: retimed siege movement/combat and NPC callbacks produce the blocked-passage entry, completed hall battle and guard arrival in B. Both chains finish Gilmore and escape through the father scene. These are actual trigger/callback history differences, not reordered copies of the same writes. |
+| `BHN_FATHER_GORE_LEVEL` (false → true) | s07: B records the father's gore-state branch at 535,929 ms in the retimed siege sequence. Both chains reach Ostagar on attempt 1. |
+| `PRE_TT_ASKED_ALISTAIR_TRUTH`, `APP_ALISTAIR_DEC_VLOW` (false → true) | s08: the changed timing of Alistair's mage exchange relative to walk/interact gives B an additional optional companion conversation. The recorded replies include the truth question and the approval-lowering reply; the corresponding writes occur at 550,145 and 552,145 ms. A does not run that extra conversation. |
+| `COD_CRT_GENLOCK_EMISSARY_UNLOCKED` (true → false) | s13: A/C's Tower encounter/combat history unlocks this codex entry; B's does not. The encounter templates, kill order and RNG history differ after retimed upstream callbacks. This is an optional codex outcome; all three chains kill the ogre, light the beacon and reach Flemeth. |
+| `TUT_COMBAT_INJURY_1` (true → false) | s13: A writes the injury tutorial at 4,711,295 ms during its longer fight/recovery history; B does not. The unchanged survival harness records 19 Tower heals for A and 15 for B, with no kill aids on either side. |
+
+Seven additional flag differences are transient. At s05 B has already recorded
+`AUTOSS_BHN_FRONT_GATE_AND_GILMORE`, `BHN_MOTHER_TOLD_GO_TO_PANTRY`,
+`BHN_MOTHER_DESTINATION_LARDER`, `BHN_GILMORE_ENTERED_MAIN_HALL` and
+`BHN_GILMORE_LEAVES_TO_FIGHT`; their stored values agree again at s06.
+The enemy-ranks tutorial differs at s07-s09 and the modal-ability tutorial at
+s09; both agree again at s10. These follow different callback/checkpoint and
+combat/tutorial timing, not missing mandatory progression.
+
+The remaining saved-field differences fall into the same measured cascade:
+command/event deadlines and queues; animation and continuing-pose metadata;
+RNG, encounters, combat, loot, effects and corpse lifetimes; resulting door,
+movement and trigger histories; optional conversations, tutorials, popups,
+plots and journal entries; and creation/handle/sequence counters. Spawn and
+item differences shift object IDs, including area IDs, so literal ID-indexed
+JSON comparisons amplify the difference count. All checkpoint area tags and
+required progression checks still agree. No animation duration was shortened.
+
+Reproducible evidence is under the job's external capture directory,
+`playanim/queue-blockers/complete-events`: source/binary/input hashes, all
+three gate summaries and invariant reports, full checkpoint comparisons,
+named flag reads, plot-write times and the animation-only source diffs.
+The earlier `resume-20261116-2000` run is retained as a failed intermediate
+comparison; its pre-completion-repair Tower timeout is not reported as a pass.

@@ -137,3 +137,21 @@ existing harness supplies 42 heals). This is a divergent comparison, not a clean
 Tower parity result. Detailed input hashes, traces and captures accompany the
 job report. Temporary diagnostic code was removed and the production binary
 rebuilt.
+
+## Final merged validation
+
+The queue/completion follow-up now passes the full fresh s01-s16 chain on
+main `adf58096`, including Gilmore, the Tower, the board (0.0 m) and camp.
+Unmodified main and the repair-only control also pass all 16 steps, with
+zero save refusals across all 48 processes. Four determinism cases pass repeat
+and save/reload comparisons. Workspace checks pass with 1,469 tests passed,
+25 ignored and zero failures.
+
+The [queue trace and regression review](origins-command-queue-failure.md)
+maps every remaining plot difference and the saved-state difference classes.
+Against unmodified main the final plot differences are the dog's random-item
+flag and the genlock-emissary codex unlock. The repair-only animation control
+isolates nine final timing-cascade flags, including optional dialogue and
+combat/tutorial outcomes. These are functional effects of changed callback,
+RNG and combat timing, not a claim of identical saved worlds. Animation
+deadlines and the implementation limits described above are unchanged.
