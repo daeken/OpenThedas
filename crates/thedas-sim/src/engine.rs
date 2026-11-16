@@ -3757,9 +3757,28 @@ pub fn call(
                 .unwrap_or(0),
         )),
         "SetEventScript" => {
-            let script = string(a, 1).trim_end_matches(".ncs").to_string();
+            let resource = string(a, 1);
+            let origins = h.sim.game == thedas_vfs::Game::Origins;
+            // Origins 0x658aa0 takes the prefix before the first period and assigns
+            // CCObjects, areas and modules. See notes/script-set-event-script.md.
+            let script = if origins {
+                resource.split('.').next().unwrap_or_default()
+            } else {
+                resource.trim_end_matches(".ncs")
+            };
             if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
-                o.script = (!script.is_empty()).then_some(script);
+                if origins
+                    && matches!(
+                        o.kind,
+                        ObjectKind::Stage
+                            | ObjectKind::Party
+                            | ObjectKind::Map
+                            | ObjectKind::MapPin
+                    )
+                {
+                    return void();
+                }
+                o.script = (!script.is_empty()).then(|| script.to_string());
             }
             void()
         }
@@ -7317,6 +7336,130 @@ mod tests {
             ],
         );
         assert!(s.world.trace.entries.is_empty());
+    }
+
+    #[test]
+    fn event_script_assignment_uses_the_origins_prefix_and_object_interfaces() {
+        let table = Arc::new(
+            EngineTable::parse(b"void SetEventScript(object o, string s) = 122;").unwrap(),
+        );
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        let caller = s.world.spawn(ObjectKind::Creature, "caller");
+        s.world.get_mut(caller).unwrap().script = Some("caller_script".into());
+        let recipient = s.world.spawn(ObjectKind::Placeable, "recipient");
+        // Hand-written bytecode calls action 122 with a separate explicit recipient.
+        let script_name = b"replacement.part.NCS";
+        let mut code = vec![0x04, 0x05];
+        code.extend_from_slice(&(script_name.len() as u16).to_be_bytes());
+        code.extend_from_slice(script_name);
+        code.extend_from_slice(&[0x04, 0x06]);
+        code.extend_from_slice(&recipient.to_be_bytes());
+        code.extend_from_slice(&[0x05, 0x00, 0x00, 122, 2, 0x20, 0x00]);
+        let mut bytes = b"NCS V1.0B".to_vec();
+        bytes.extend_from_slice(&((13 + code.len()) as u32).to_be_bytes());
+        bytes.extend_from_slice(&code);
+        s.add_script("setter", thedas_script::Ncs::parse(&bytes).unwrap());
+        s.run_script("setter", caller, None);
+        assert!(s.world.trace.script_errors.is_empty());
+        assert_eq!(
+            s.world.get(recipient).unwrap().script.as_deref(),
+            Some("replacement")
+        );
+        for game in [thedas_vfs::Game::Origins, thedas_vfs::Game::DragonAge2] {
+            s.game = game;
+            for kind in [
+                ObjectKind::Module,
+                ObjectKind::Area,
+                ObjectKind::Creature,
+                ObjectKind::Placeable,
+                ObjectKind::Item,
+                ObjectKind::Trigger,
+                ObjectKind::Sound,
+                ObjectKind::Waypoint,
+                ObjectKind::Projectile,
+                ObjectKind::Store,
+                ObjectKind::AreaOfEffect,
+                ObjectKind::Stage,
+                ObjectKind::Party,
+                ObjectKind::Map,
+                ObjectKind::MapPin,
+            ] {
+                let target = s.world.spawn(kind, "target");
+                let supported = game != thedas_vfs::Game::Origins
+                    || !matches!(
+                        kind,
+                        ObjectKind::Stage
+                            | ObjectKind::Party
+                            | ObjectKind::Map
+                            | ObjectKind::MapPin
+                    );
+                for (input, origins, da2) in [
+                    ("script", "script", "script"),
+                    ("MiXeD.NCS", "MiXeD", "MiXeD.NCS"),
+                    ("script.ncs", "script", "script"),
+                    ("script.ncs.ncs", "script", "script"),
+                    ("script.part.ncs", "script", "script.part"),
+                    ("script.nss", "script", "script.nss"),
+                    ("script.", "script", "script."),
+                    (".script", "", ".script"),
+                    ("", "", ""),
+                    ("  script .ncs", "  script ", "  script "),
+                    ("dir.name/script", "dir", "dir.name/script"),
+                    ("é漢🙂.NCS", "é漢🙂", "é漢🙂.NCS"),
+                ] {
+                    s.world.get_mut(target).unwrap().script = Some("previous".into());
+                    let before = s.save_json().unwrap();
+                    assert_eq!(
+                        run(
+                            &mut s,
+                            caller,
+                            "SetEventScript",
+                            &[Value::Object(target), Value::String(input.into())],
+                        ),
+                        None
+                    );
+                    let expected = if !supported {
+                        "previous"
+                    } else if game == thedas_vfs::Game::Origins {
+                        origins
+                    } else {
+                        da2
+                    };
+                    assert_eq!(
+                        s.world.get(target).unwrap().script.as_deref(),
+                        (!expected.is_empty()).then_some(expected),
+                        "{game:?} {kind:?} {input:?}"
+                    );
+                    assert_eq!(
+                        s.world.get(caller).unwrap().script.as_deref(),
+                        Some("caller_script")
+                    );
+                    if !supported {
+                        assert_eq!(s.save_json().unwrap(), before);
+                    }
+                    let saved = s.save_json().unwrap();
+                    s.load_json(&saved).unwrap();
+                    assert_eq!(
+                        s.world.get(target).unwrap().script.as_deref(),
+                        (!expected.is_empty()).then_some(expected)
+                    );
+                    assert!(s.world.queue.is_empty());
+                }
+            }
+            let before = s.save_json().unwrap();
+            for target in [OBJECT_INVALID, 0x12345678] {
+                run(
+                    &mut s,
+                    caller,
+                    "SetEventScript",
+                    &[
+                        Value::Object(target),
+                        Value::String("replacement.part".into()),
+                    ],
+                );
+            }
+            assert_eq!(s.save_json().unwrap(), before);
+        }
     }
 
     #[test]
