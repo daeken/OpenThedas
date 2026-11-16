@@ -870,7 +870,7 @@ impl Sim {
         value
     }
 
-    /// Delivers an event, with Origins creature/placeable table scripts taking priority
+    /// Delivers an event, with Origins physical-object table scripts taking priority
     /// over an explicit `script` and the object's own script.
     pub fn deliver(&mut self, target: ObjectId, mut event: Event, script: Option<String>) {
         if event.target.is_none() {
@@ -892,11 +892,22 @@ impl Sim {
             });
             return;
         };
-        // Both verified +0x70 dispatch interfaces call CCObject::DispatchEvent
-        // (0x69a130 -> 0x698960). It first reads engineevents.Script by event type.
-        // Other object routes and DA2 have not been established by this trace.
+        // These nine +0x70 interfaces forward through 0x69a130 to 0x698960;
+        // their queued-message paths also reach that selector via 0x698a50.
+        // Other object routes and DA2 keep their previous script selection.
         let native_selection = self.game != thedas_vfs::Game::DragonAge2
-            && matches!(obj.kind, ObjectKind::Creature | ObjectKind::Placeable);
+            && matches!(
+                obj.kind,
+                ObjectKind::Creature
+                    | ObjectKind::Placeable
+                    | ObjectKind::Item
+                    | ObjectKind::Trigger
+                    | ObjectKind::Sound
+                    | ObjectKind::Waypoint
+                    | ObjectKind::Projectile
+                    | ObjectKind::Store
+                    | ObjectKind::AreaOfEffect
+            );
         let table_script = native_selection
             .then(|| self.world.tables().get(114, ""))
             .flatten()
@@ -6692,10 +6703,20 @@ mod tests {
     }
 
     #[test]
-    fn origins_creature_and_placeable_event_scripts_use_table_then_explicit_then_object() {
+    fn origins_physical_event_scripts_use_table_then_explicit_then_object() {
         use thedas_formats::gda::Cell;
 
-        for kind in [ObjectKind::Creature, ObjectKind::Placeable] {
+        for kind in [
+            ObjectKind::Creature,
+            ObjectKind::Placeable,
+            ObjectKind::Item,
+            ObjectKind::Trigger,
+            ObjectKind::Sound,
+            ObjectKind::Waypoint,
+            ObjectKind::Projectile,
+            ObjectKind::Store,
+            ObjectKind::AreaOfEffect,
+        ] {
             let mut s = sim();
             for script in ["table", "explicit", "object", " "] {
                 s.add_script(script, counter_script());
@@ -6821,8 +6842,25 @@ mod tests {
         for (game, kind) in [
             (thedas_vfs::Game::DragonAge2, ObjectKind::Creature),
             (thedas_vfs::Game::DragonAge2, ObjectKind::Placeable),
+            (thedas_vfs::Game::DragonAge2, ObjectKind::Item),
+            (thedas_vfs::Game::DragonAge2, ObjectKind::Trigger),
+            (thedas_vfs::Game::DragonAge2, ObjectKind::Sound),
+            (thedas_vfs::Game::DragonAge2, ObjectKind::Waypoint),
+            (thedas_vfs::Game::DragonAge2, ObjectKind::Projectile),
+            (thedas_vfs::Game::DragonAge2, ObjectKind::Store),
+            (thedas_vfs::Game::DragonAge2, ObjectKind::AreaOfEffect),
+            (thedas_vfs::Game::DragonAge2, ObjectKind::Module),
+            (thedas_vfs::Game::DragonAge2, ObjectKind::Area),
+            (thedas_vfs::Game::DragonAge2, ObjectKind::Party),
+            (thedas_vfs::Game::DragonAge2, ObjectKind::Stage),
+            (thedas_vfs::Game::DragonAge2, ObjectKind::Map),
+            (thedas_vfs::Game::DragonAge2, ObjectKind::MapPin),
             (thedas_vfs::Game::Origins, ObjectKind::Module),
             (thedas_vfs::Game::Origins, ObjectKind::Area),
+            (thedas_vfs::Game::Origins, ObjectKind::Party),
+            (thedas_vfs::Game::Origins, ObjectKind::Stage),
+            (thedas_vfs::Game::Origins, ObjectKind::Map),
+            (thedas_vfs::Game::Origins, ObjectKind::MapPin),
         ] {
             let mut s = sim();
             s.game = game;
