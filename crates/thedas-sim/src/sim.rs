@@ -1305,6 +1305,16 @@ impl Sim {
                         continue;
                     }
                     let da2 = self.game == thedas_vfs::Game::DragonAge2;
+                    if !da2
+                        && self
+                            .world
+                            .get(id)
+                            .and_then(|o| o.commands.first())
+                            .is_some_and(|c| c.name == "CommandDeathBlow")
+                        && self.death_blow_impact(id, due)
+                    {
+                        continue;
+                    }
                     let cancellable = self
                         .world
                         .get_mut(id)
@@ -1994,6 +2004,9 @@ impl Sim {
     }
 
     pub fn area_transition(&mut self, area: &str, waypoint: &str) {
+        if let Some(old) = self.world.area {
+            self.finish_area_death_blow_reactions(old);
+        }
         let t = self.world.time_ms;
         self.world.trace.push(TraceEntry::Log {
             t,
@@ -3790,8 +3803,15 @@ impl Sim {
         let fronts: Vec<(ObjectId, Option<u64>, Option<Command>)> = self
             .world
             .objects
-            .values()
+            .values_mut()
             .filter_map(|o| {
+                if o.combat.death_blow.is_some()
+                    && o.commands
+                        .first()
+                        .is_none_or(|c| c.name != "CommandDeathBlow")
+                {
+                    o.combat.death_blow = None;
+                }
                 let c = o.commands.first()?;
                 Some(match c.due {
                     Some(d) if !da2 => (o.id, Some(d), None),
@@ -4101,7 +4121,15 @@ impl Sim {
                             }
                         }
                     }
-                    let mut ms = attack_ms.unwrap_or_else(|| self.command_duration(id, &cmd));
+                    let death_blow_ms = if !da2 && cmd.name == "CommandDeathBlow" {
+                        origins_prepared = true;
+                        self.start_death_blow(id, &cmd)
+                    } else {
+                        None
+                    };
+                    let mut ms = death_blow_ms
+                        .or(attack_ms)
+                        .unwrap_or_else(|| self.command_duration(id, &cmd));
                     let walks = cmd.name.starts_with("CommandMoveTo")
                         || cmd.name == "CommandMoveAwayFromObject";
                     if cmd.name == "CommandMoveToMultiLocations" && !cmd.path.is_empty() {
@@ -4394,20 +4422,22 @@ impl Sim {
         if cmd.name == "CommandAttack" {
             self.finish_attack(id, cmd.target.unwrap_or(OBJECT_INVALID));
         } else if cmd.name == "CommandDeathBlow" {
-            // A finishing move lands the blow the attack it replaced had been given: when a
-            // hit would kill and the rules choose a death blow, rules_core stores the
-            // killing result (`SetAttackResult`) and then puts this command at the front
-            // of the queue, and the result is sent as the impact by the death blow's
-            // animation, like any attack's (DAOrigins.exe's animation event handler,
-            // 0x6c0bf0, sends the stored slot through 0x6a6230 for every hit event,
-            // whatever the command). Without it the kill was thrown away and the next
-            // attack rolled again: a boss, whose death is always a death blow, could not
-            // die (the Dalish origin's bereskarn stood at 2 of 250 health for good).
-            // Provisional: the command's own executor is not traced; the blow lands when
-            // the command's time is up, not at the animation's hit event, the pair is not
-            // moved into place, and the attack the script says the command clears stays
-            // queued behind it (it ends at once against the dead target).
-            self.finish_attack(id, cmd.target.unwrap_or(OBJECT_INVALID));
+            if self.game == thedas_vfs::Game::Origins
+                && self
+                    .world
+                    .get(id)
+                    .is_some_and(|o| o.combat.death_blow.is_some())
+            {
+                // Authored hits were delivered by death_blow_impact. Paired clips
+                // without a hit marker end without inventing another attack impact.
+                if let Some(o) = self.world.get_mut(id) {
+                    o.combat.death_blow = None;
+                    o.combat.attack = None;
+                }
+            } else {
+                // Provisional fallback for unavailable pair resources and DA2.
+                self.finish_attack(id, cmd.target.unwrap_or(OBJECT_INVALID));
+            }
         } else if cmd.name == "CommandUseAbility" && !cmd.impacted {
             self.finish_ability(id, &cmd);
         } else if matches!(
@@ -4725,6 +4755,9 @@ impl Sim {
             .find(|o| o.kind == ObjectKind::Area && o.template.eq_ignore_ascii_case(resref))
             .map(|o| o.id);
         if let Some(area) = known {
+            if let Some(old) = self.world.area.filter(|old| *old != area) {
+                self.finish_area_death_blow_reactions(old);
+            }
             for o in self.world.objects.values_mut() {
                 if o.area == Some(area) || o.id == area {
                     if let Some(a) = o.parked.take() {
@@ -4750,6 +4783,9 @@ impl Sim {
             .structs
             .first()
             .ok_or_else(|| SimError::Parse(resref.into(), "empty area".into()))?;
+        if let Some(old) = self.world.area {
+            self.finish_area_death_blow_reactions(old);
+        }
         let area = self.world.spawn(
             ObjectKind::Area,
             &text(root, "Tag").unwrap_or_else(|| resref.to_string()),
