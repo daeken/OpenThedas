@@ -224,6 +224,8 @@ struct DrawU {
 }
 
 struct GpuMesh {
+    /// Conservative source-picture support; filtered quads retain their image's
+    /// bounds here even though their GPU geometry spans the viewport.
     bounds: [f32; 4],
     /// Where the vertices are in the arena, and the triangles (relative to that start).
     verts: crate::gpu::VRange,
@@ -2191,7 +2193,15 @@ impl Renderer {
                     .to_vec(),
                     indices: vec![0, 1, 2, 0, 2, 3],
                 };
-                let mesh = self.upload(&mesh, Some(binding), 1.0, Matrix::IDENTITY);
+                let mut mesh = self.upload(&mesh, Some(binding), 1.0, Matrix::IDENTITY);
+                if let Some(m) = mesh.as_mut().and_then(Arc::get_mut) {
+                    m.bounds = [
+                        clip[0] * 2.0 / view.w - 1.0,
+                        1.0 - clip[3] * 2.0 / view.h,
+                        clip[2] * 2.0 / view.w - 1.0,
+                        1.0 - clip[1] * 2.0 / view.h,
+                    ];
+                }
                 self.filtered.insert(
                     d,
                     Filtered {
@@ -2903,6 +2913,9 @@ impl Build {
             }
             let u = &self.uniforms[op.uniform as usize];
             let [x0, y0, x1, y1] = op.mesh.bounds;
+            if x0 > x1 || y0 > y1 {
+                continue;
+            }
             let mut r = [
                 f32::INFINITY,
                 f32::INFINITY,
@@ -3541,6 +3554,26 @@ mod shadow_tests {
                 assert_eq!(r.capture().unwrap(), dark);
             }
         }
+    }
+
+    #[test]
+    fn filtered_alpha_keeps_enclosing_picture_bounds_tight() {
+        let (device, queue) = crate::gpu::test_device();
+        let mut p = blend_player();
+        let root = p.vm.root;
+        quad(&mut p, root, 0, [255, 0, 0, 255], 640.0);
+        let layer = crate::player::create_empty(&mut p.vm, root, "layer", 1).unwrap();
+        p.vm.display.get_mut(layer).unwrap().blend = BlendMode::Layer;
+        quad(&mut p, layer, 0, [0, 255, 0, 255], 160.0);
+        let mask = quad(&mut p, layer, 1, [0, 0, 0, 128], 80.0);
+        p.vm.display.get_mut(mask).unwrap().blend = BlendMode::Alpha;
+        let mut r = Renderer::new(&device, &queue, wgpu::TextureFormat::Rgba8Unorm);
+        r.render(&mut p, &mut Empty, (32, 32));
+        assert!(r.filtered[&layer].clip[2] < 16.0);
+        let bounded = r.capture().unwrap();
+        r.filtered.get_mut(&layer).unwrap().clip = [0.0; 4];
+        r.render(&mut p, &mut Empty, (32, 32));
+        assert_eq!(r.capture().unwrap(), bounded);
     }
 
     #[test]
