@@ -45,6 +45,47 @@ facing request creates the state. Full native save import is separate.
 
 ## Validation
 
-Validation and matched story-check measurements are recorded after the final
-candidate build. No health, damage, difficulty, ability cooldown or class-stat
-constants are changed.
+Merged source `bac4f227` is compared with main `765648d0`. The untouched
+`da2-story-check --aid none` gate and a separate observational replay have the
+same milestones, combat metrics, counters and real-arrival checkpoint JSONs.
+Only wall-clock fields differ between each instrumented/uninstrumented pair.
+Neither build reaches Karl; both first wipe in encounter 10008, Team 6.
+
+| Fight observed by the story driver | Main | Candidate |
+| --- | --- | --- |
+| Fake prologue, through area transition | 206.7 s | 208.4 s |
+| Trailing Ogre observation after transition | 1.1 s | 1.1 s |
+| First real encounter 10003 | 23.0 s, clear | 23.2 s, clear |
+| Emissary encounter 10008 | 36.1 s, wipe | 50.0 s, wipe |
+
+The real-prologue milestone occurs at 208466 / 210166 ms and first game over
+at 293898 / 309698 ms. All four controls have zero script errors, developer
+heals and kill aids. IsMoving disappears from the candidate's unimplemented
+counter (main: 338). In an exercised fake-wave query at 3300 ms, ability_core's
+query of the moving hurlock returns true rather than the default false.
+
+In the emissary interval, actual health removed by Hawke changes from
+367.752041 in 56 impacts to 596.194033 in 75; Carver from 191.481519 in 20 to
+190.773570 in 41; Bethany from 204.265792 in 12 to 494.434747 in 39. These
+are complete driver-defined fight intervals with changed commands, targets and
+RNG progression, not matched native damage-roll experiments. Median basic
+cast-start gaps remain 672 ms for Hawke/Carver, 570 ms for Bethany and 1600 ms
+for the emissary. Several archers retain the traced 2330 ms cadence; shorter
+intervals on other archers require the separate command-admission audit.
+No health, damage, difficulty, ability cooldown or class-stat constants change.
+
+Formatting and strict workspace/all-target clippy pass. Debug workspace tests:
+1386 passed, 22 ignored, zero failed. Release MCP, CLI and app builds pass.
+Six serial Origins scenarios per binary have zero log or plot-sequence diffs
+and seven identical complete checkpoints, all without game over. The Tower
+fixture reaches Flemeth's hut on both builds. Four 600-tick Origins fixtures
+pass repeat and save/reload determinism. Origins corpus: all 32864 files pass,
+with the existing 5219 undeclared-action diagnostics.
+
+An isolated same-input facing request advances exactly 100 ms with fixed
+translation. Baseline faces 250 degrees immediately; the candidate retains a
+turn at 198.618286 degrees and IsMoving is true. The heading law advances on
+its actual intervening simulation updates. One fixed renderer/camera produces
+the staged before/after/delta triptych: absolute RGB delta multiplied by four,
+4.42284% of scene pixels above an any-channel threshold of 2/255. This is a
+facing/query control, not original-game combat parity evidence.
