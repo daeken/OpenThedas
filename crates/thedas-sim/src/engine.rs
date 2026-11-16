@@ -6958,14 +6958,13 @@ mod tests {
     }
 
     #[test]
-    fn small_native_da2_dispatch_preserves_implemented_movement_query() {
+    fn small_native_da2_dispatch_preserves_implemented_queries() {
         let mut s = small_native_sim();
         s.game = thedas_vfs::Game::DragonAge2;
         for name in [
             "GetVectorMagnitude",
             "GetVectorNormalize",
             "GetCreatureAttribute",
-            "GetAILevel",
             "GetAOEFlags",
             "GetMapPinState",
             "GetRoamLocation",
@@ -7001,6 +7000,42 @@ mod tests {
         assert_eq!(
             run(&mut s, creature, "IsMoving", &[Value::Object(creature)]),
             Some(Value::Int(0))
+        );
+        // Main also implements DA2's automatic priority and manual lock.
+        // Check its invalid-object result and both priority modes here.
+        assert_eq!(
+            run(
+                &mut s,
+                creature,
+                "GetAILevel",
+                &[Value::Object(OBJECT_INVALID)]
+            ),
+            Some(Value::Int(-1))
+        );
+        s.world.hero = Some(creature);
+        assert_eq!(
+            run(&mut s, creature, "GetAILevel", &[Value::Object(creature)]),
+            Some(Value::Int(4))
+        );
+        run(
+            &mut s,
+            creature,
+            "SetAILevel",
+            &[Value::Object(creature), Value::Int(2)],
+        );
+        assert_eq!(
+            run(&mut s, creature, "GetAILevel", &[Value::Object(creature)]),
+            Some(Value::Int(2))
+        );
+        run(
+            &mut s,
+            creature,
+            "SetAILevel",
+            &[Value::Object(creature), Value::Int(-1)],
+        );
+        assert_eq!(
+            run(&mut s, creature, "GetAILevel", &[Value::Object(creature)]),
+            Some(Value::Int(4))
         );
     }
 
