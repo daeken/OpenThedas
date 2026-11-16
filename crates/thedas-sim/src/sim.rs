@@ -2900,13 +2900,12 @@ impl Sim {
         let reach = crate::engine::dist(a, b) + mine + 2.0;
         // The creature the walker is making for is not walked round: it stops against it.
         let goal = me.commands.first().and_then(|c| c.target);
-        let bodies: Vec<([f32; 2], f32, bool)> = self
-            .world
-            .objects
-            .values()
+        let creatures = self.world.creature_ids();
+        let bodies: Vec<([f32; 2], f32, bool)> = creatures
+            .iter()
+            .filter_map(|&c| self.world.get(c))
             .filter(|o| {
                 o.id != id
-                    && o.kind == crate::world::ObjectKind::Creature
                     && o.area == Some(area)
                     && o.active
                     && !o.dead
@@ -2952,16 +2951,19 @@ impl Sim {
             return false;
         };
         let mine = self.capsule_radius(id);
-        self.world.objects.values().any(|o| {
-            o.id != id
-                && o.kind == crate::world::ObjectKind::Creature
-                && o.area == Some(area)
-                && o.active
-                && !o.dead
-                && o.parked.is_none()
-                && ((o.position[0] - p[0]).powi(2) + (o.position[1] - p[1]).powi(2)).sqrt()
-                    < mine + self.capsule_radius(o.id)
-        })
+        let creatures = self.world.creature_ids();
+        creatures
+            .iter()
+            .filter_map(|&c| self.world.get(c))
+            .any(|o| {
+                o.id != id
+                    && o.area == Some(area)
+                    && o.active
+                    && !o.dead
+                    && o.parked.is_none()
+                    && ((o.position[0] - p[0]).powi(2) + (o.position[1] - p[1]).powi(2)).sqrt()
+                        < mine + self.capsule_radius(o.id)
+            })
     }
 
     /// Keeps track of a walker held up by bodies, logging once when it has made no progress
@@ -3453,14 +3455,13 @@ impl Sim {
         // The other melee attackers of the same target hold their places on its ring.
         let mine = self.body_radius(id);
         let target_r = self.body_radius(target);
-        let held: Vec<(i32, i32)> = self
-            .world
-            .objects
-            .values()
+        let creatures = self.world.creature_ids();
+        let held: Vec<(i32, i32)> = creatures
+            .iter()
+            .filter_map(|&c| self.world.get(c))
             .filter(|o| {
                 o.id != id
                     && o.id != target
-                    && o.kind == crate::world::ObjectKind::Creature
                     && o.area == me.area
                     && o.active
                     && !o.dead
