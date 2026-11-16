@@ -3,6 +3,8 @@
 /gamedata
 /extracted
 /reports
+/.capture-venv
+__pycache__/
 *.erf
 *.rim
 *.tlk
