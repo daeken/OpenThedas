@@ -1330,6 +1330,7 @@ impl Sim {
 
     /// Marks a creature dead, clears what it was doing and sends it `EVENT_TYPE_DEATH`.
     pub fn kill(&mut self, id: ObjectId, killer: ObjectId) {
+        self.da2_reset_locomotion(id);
         let health = constant_of(self, "PROPERTY_DEPLETABLE_HEALTH");
         let now = self.world.time_ms;
         if let Some(o) = self.world.get_mut(id) {

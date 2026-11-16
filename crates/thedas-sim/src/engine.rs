@@ -1521,7 +1521,19 @@ pub fn call(
             void()
         }
         "GetFacing" => ok(Value::Float(h.object(obj(a, 0)).map_or(0.0, |o| o.facing))),
+        "IsMoving" if h.sim.game == thedas_vfs::Game::DragonAge2 => ok(b(h
+            .object(obj(a, 0))
+            .filter(|o| o.kind == ObjectKind::Creature)
+            .and_then(|o| o.da2_locomotion.as_ref())
+            .is_some_and(crate::da2_locomotion::Locomotion::is_moving))),
         "SetFacing" => {
+            if h.sim.game == thedas_vfs::Game::DragonAge2
+                && h.object(obj(a, 0))
+                    .is_some_and(|o| o.kind == ObjectKind::Creature)
+            {
+                h.sim.da2_turn_to(obj(a, 0), float(a, 1));
+                return void();
+            }
             if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
                 o.facing = float(a, 1);
             }
@@ -3311,6 +3323,14 @@ pub fn call(
                 command: c.name.clone(),
                 status: "queued".into(),
             });
+            if front
+                && h.sim
+                    .world
+                    .get(target)
+                    .is_some_and(|o| o.commands.first().is_some_and(|c| c.from.is_some()))
+            {
+                h.sim.da2_stop_locomotion(target);
+            }
             match h.sim.world.get_mut(target) {
                 Some(o) => {
                     if front {
@@ -3708,6 +3728,9 @@ pub fn call(
                 }
             });
             if let Some(cmd) = running {
+                if cmd.from.is_some() {
+                    h.sim.da2_stop_locomotion(who);
+                }
                 if cmd.name == "CommandUseAbility" {
                     h.sim.complete_da2_combat_target(who);
                 }
@@ -3722,6 +3745,7 @@ pub fn call(
         }
         "ClearAllCommands" => {
             let who = obj(a, 0);
+            h.sim.da2_stop_locomotion(who);
             let running = h.sim.world.get_mut(who).and_then(|o| {
                 let first = o
                     .commands
@@ -5760,6 +5784,25 @@ pub fn call(
         }
         "SetFacingObject" => {
             let target = h.object(obj(a, 1)).map(|o| o.position);
+            if h.sim.game == thedas_vfs::Game::DragonAge2 {
+                if let (Some(t), Some(o)) = (target, h.object(obj(a, 0))) {
+                    let (dx, dy) = (t[0] - o.position[0], t[1] - o.position[1]);
+                    if dx * dx + dy * dy > 1e-6 {
+                        let facing = crate::world::facing_toward(dx, dy)
+                            + if a.get(2).is_some_and(|_| int(a, 2) == 0) {
+                                180.
+                            } else {
+                                0.
+                            };
+                        if int(a, 3) == 0 && o.kind == ObjectKind::Creature {
+                            h.sim.da2_turn_to(obj(a, 0), facing);
+                        } else if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
+                            o.facing = facing.rem_euclid(360.);
+                        }
+                    }
+                }
+                return void();
+            }
             if let (Some(t), Some(o)) = (target, h.sim.world.get_mut(obj(a, 0))) {
                 o.facing = crate::world::facing_toward(t[0] - o.position[0], t[1] - o.position[1]);
             }
@@ -8226,6 +8269,99 @@ mod tests {
             script: "test".into(),
         };
         call(&mut h, caller, &f, a).unwrap().unwrap()
+    }
+
+    #[test]
+    fn da2_locomotion_getter_tracks_start_stop_turn_and_reload() {
+        let table = EngineTable::parse(
+            b"int IsMoving(object o) = 388;\n\
+              void SetFacingObject(object o, object t, int invert = 1, int instant = 0) = 24;\n\
+              void ClearCurrentCommand(object o) = 1;\n\
+              int COMMAND_TYPE_MOVE_TO_LOCATION = 2;\n",
+        )
+        .unwrap();
+        let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(table.clone()), 1);
+        s.game = thedas_vfs::Game::DragonAge2;
+        let area = s.world.spawn(ObjectKind::Area, "area");
+        let who = s.world.spawn(ObjectKind::Creature, "walker");
+        let target = s.world.spawn(ObjectKind::Creature, "target");
+        s.world.area = Some(area);
+        s.world.get_mut(who).unwrap().area = Some(area);
+        s.world.get_mut(target).unwrap().area = Some(area);
+        s.world.get_mut(target).unwrap().position = [0., -10., 0.];
+        let moving = |s: &mut Sim, id| run(s, who, "IsMoving", &[Value::Object(id)]);
+        assert_eq!(moving(&mut s, who), Some(Value::Int(0)));
+        assert_eq!(moving(&mut s, OBJECT_INVALID), Some(Value::Int(0)));
+        assert_eq!(moving(&mut s, area), Some(Value::Int(0)));
+
+        s.order_move(who, [10., 0., 0.]);
+        assert_eq!(
+            moving(&mut s, who),
+            Some(Value::Int(0)),
+            "queued is not moving"
+        );
+        s.tick(1);
+        assert_eq!(moving(&mut s, who), Some(Value::Int(1)));
+        run(&mut s, who, "ClearCurrentCommand", &[Value::Object(who)]);
+        let stopped_at = s.world.get(who).unwrap().position;
+        assert_eq!(
+            moving(&mut s, who),
+            Some(Value::Int(1)),
+            "soft stop retains a mode"
+        );
+        s.tick(1);
+        assert_eq!(
+            moving(&mut s, who),
+            Some(Value::Int(1)),
+            "residual facing enters mode 4"
+        );
+        assert_eq!(s.world.get(who).unwrap().position, stopped_at);
+
+        let saved = serde_json::to_string(&s.world).unwrap();
+        let mut restored = Sim::new(Arc::new(Vfs::new()), Arc::new(table), 1);
+        restored.game = s.game;
+        restored.world = serde_json::from_str(&saved).unwrap();
+        assert_eq!(moving(&mut restored, who), Some(Value::Int(1)));
+        s.tick(500);
+        restored.tick(500);
+        assert_eq!(s.world.get(who), restored.world.get(who));
+        assert_eq!(moving(&mut s, who), Some(Value::Int(0)));
+
+        run(
+            &mut s,
+            who,
+            "SetFacingObject",
+            &[
+                Value::Object(who),
+                Value::Object(target),
+                Value::Int(1),
+                Value::Int(0),
+            ],
+        );
+        assert!(s.world.get(who).unwrap().commands.is_empty());
+        assert_eq!(
+            moving(&mut s, who),
+            Some(Value::Int(1)),
+            "a stationary turn counts"
+        );
+        s.tick(500);
+        assert_eq!(moving(&mut s, who), Some(Value::Int(0)));
+        s.da2_turn_to(who, 45.);
+        s.da2_reset_locomotion(who);
+        assert_eq!(
+            moving(&mut s, who),
+            Some(Value::Int(0)),
+            "performance reset clears motion"
+        );
+
+        s.game = thedas_vfs::Game::Origins;
+        s.order_move(who, [20., 0., 0.]);
+        s.tick(1);
+        assert!(
+            !serde_json::to_string(s.world.get(who).unwrap())
+                .unwrap()
+                .contains("da2_locomotion")
+        );
     }
 
     #[test]
