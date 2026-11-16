@@ -90,3 +90,20 @@ keep rendering costs within the replay's resource cap. Separate 1280×720 captur
 show both legacy failure modes and successful fixed notes. The runtime proof used
 an optimized debug build with assertions and overflow checks enabled; the ignored
 late-init tests and workspace checks use the normal debug/test settings.
+
+For a window-keyboard replay over `--control`, use
+`windowkey down|repeat|up KeyCode [JSON text]`, with winit's physical key names.
+For example, `windowkey down Quote "'"; windowkey up Quote` types an apostrophe,
+and `windowkey down Enter; windowkey up Enter` confirms the note. A space needs
+the JSON string `" "`. `windowkey down F8; windowkey up F8` opens the report
+through the same routing as the window. Semicolons separate steps; encode a
+literal semicolon in the JSON text as `"\u003b"`.
+
+These events share the window's `App::window_key` implementation, including
+`App::text_key`'s typing gate, modifier state, repeats, cutscene skip and game
+shortcuts. The older `type` and `key enter` steps call the UI directly and cannot
+verify the app's typing gate. The marking-choice box currently has no physical
+keyboard navigation; a replay can click its button without clicking the note's
+text field. Verify every saved `note.txt` and Enter submission separately:
+native character editing runs before Key-listener dispatch, so a missing
+confirmation listener alone does not demonstrate lost characters.
