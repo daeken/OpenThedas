@@ -110,6 +110,7 @@ paired runtime resume its saved deadlines and next-hand index.
 The old-save restart and resurrection cancellation are simulation compatibility
 choices. **Provisional** native save restoration and interruption of an active
 death task remain untraced.
+
 **Provisional departure completion:** native area unload during an in-flight paired
 death remains untraced. Before an area transition sends EXIT or parks the old
 area, complete that area's pending paired reactions and deliver their queued
@@ -118,8 +119,15 @@ DEATH notifications immediately, at the current simulation time. Direct
 `ends_ms` to the departure time, retaining its final corpse pose. Remove the
 notification before calling scripts so a repeated/reentrant departure cannot
 deliver it twice. Already-held paired notifications for the departing area from
-older saves are also completed. Ordinary delayed events and deaths in other areas keep their existing
-deadlines. Staying in the area still uses the authored reaction deadline.
+older saves are also completed. Drain the immediate notification chain generated
+by those DEATH handlers before EXIT/parking too: the Tower ogre signals its area
+asynchronously, and parking that signal still loses the plot completion even
+after DEATH itself is delivered. Track newly queued events so pre-existing events
+retain their order and deadlines, and do not advance time to future follow-ups.
+Notifications to other parked areas retain the ordinary holding policy.
+Ordinary delayed events and deaths in other areas
+keep their existing deadlines. Staying in the area still uses the authored reaction
+deadline.
 
 This prevents a provisionally selected reaction duration from withholding story
 completion after departure. It does not claim native unload fidelity or change
@@ -160,7 +168,7 @@ asset durations are 3133 and 3467 ms. The repro checks reaction and IsDead at 0 
 DEATH exactly once at 3467 ms, and the authored hit schedule. This attacker clip
 contains no kind-1 hit, so its expected stored-hit schedule is empty.
 
-## Validation and regression differences
+## Initial PR validation and regression differences
 
 Baseline is merged main `c609d2b7`. Formatting and workspace/all-target clippy with
 warnings denied pass. Debug workspace tests pass with 1385 passed and 22 ignored,
@@ -196,7 +204,7 @@ The seven absent plot events are Alistair's event-on true/false and tower-base
 true/false pulses, `PRE_BEACON_NIGHT_CAMP_TOWER_TALK_DONE`, one combat-basic
 tutorial pulse, and the injury tutorial. `PRE_BEACON_TOWER_REACHED` is set in both.
 
-### Independent master-save Tower run
+### Initial master-save Tower comparison (before departure completion)
 
 Both runs reach Flemeth's hut. Main takes 560 step calls, 11965 MCP calls and 25
 harness heals, ending at 1918259 ms. The branch takes 604 step calls, 12661 MCP
@@ -218,7 +226,8 @@ held-event list. Consequently the branch defers `PRE_BEACON_TOWER_OGRE_DEAD`,
 `AUTOSS_PRE_OGRE_SLAIN`, ogre codex, and Aegis loot/codex updates. Its beacon use
 sets `PRE_BEACON_REACHED`. These four main-only and three branch-only flags account
 for every final plot-state difference. Native selection and departure handling
-need follow-up tracing before treating this Tower variant as parity-verified.
+still need follow-up tracing. The departure-completion revision below supersedes
+this initial Tower result.
 
 ### Determinism and presentation
 
@@ -232,3 +241,79 @@ staged comparison includes amplified absolute RGB delta ×4. Pixels with any
 channel difference greater than 2/255 comprise 6.034722% of the frame. Rendering
 currently shows the generic death animation and the new placement. Consumption
 of the paired reaction action is the rendering handoff described above.
+
+## Departure-completion review validation (2026-11-16)
+
+Merged `origin/main` at `6d66c10e`. The merge preserves main's DA2 locomotion reset
+inside the shared kill helper. Formatting and workspace/all-target clippy with
+warnings denied pass on the merged code. Debug workspace tests pass with
+**1403 passed, 25 ignored, 0 failed**, including all twelve paired-death tests.
+The three departure regressions cover completion before EXIT and parking,
+exactly-once notification across return, save/load of queued and held deaths,
+the immediate script-notification chain, and isolation from pre-existing
+immediate events, delayed events and other areas.
+
+The rebuilt candidate passes the Oskias repro: reaction and IsDead at 0 ms,
+attacker completion at 3133 ms, and DEATH exactly once at 3467 ms. All six
+repeat/save-reload detchecks pass again, using the five 600-tick saves and the
+50-tick active paired snapshot described above. Builds and headless runs use
+the dedicated target directory and shared cargo-slot wrapper, with serial MCP
+processes. Main and candidate use isolated build fingerprints to prevent a stale
+baseline executable from being reused as the candidate.
+
+### Tower departure and loot acceptance are separate checks
+
+The unchanged fast-beacon recipe reaches Flemeth's hut on both binaries. Main
+takes 560 step calls / 11965 MCP calls / 25 harness heals; the candidate takes
+604 / 12661 / 23. Its ogre reaction starts at 1965667 ms and would naturally
+finish at 1978167 ms. Departure instead delivers DEATH exactly once at
+1971612 ms, before all three area EXIT notifications at that same timestamp.
+The ogre's immediate area notification is also delivered before parking. Neither
+the paired DEATH nor that notification remains held. Ogre-dead, ogre-slay
+autosave and ogre codex now match main.
+
+**The unchanged fast recipe does not have full loot/plot parity.** It polls
+IsDead to finish combat and immediately enumerates body bags for looting. At
+that point the paired victim has no body bag yet: its DEATH handler creates it.
+The recipe then walks to and uses the beacon, with no later loot pass. Aegis is
+present in the departed area's bag, but was never taken by the hero, so its
+pickup codex remains unset. The late ogre-dead callback also observes Alistair
+already near the beacon: the shipped plot handler sets `PRE_BEACON_REACHED`
+when he is within 2.5 m of the beacon waypoint, and leaves its beacon-dialog
+event active when the transition interrupts it. The fast run's remaining final
+differences are Aegis codex, beacon-reached, Alistair event-on, and the two
+combat-dependent injury/salve tutorials. Delivering DEATH at departure cannot
+retroactively perform an earlier item pickup or reproduce earlier proximity.
+No inventory transfer or plot-flag reset is invented to hide these differences.
+
+A second master-save comparison uses the same recipe with one explicit adapter
+on **both** binaries: after combat, wait for any active paired reaction deadline
+before the existing dialogue/loot pass. It advances ordinary simulation time;
+it does not alter a save, shorten a clip or write a plot flag. On the candidate
+only the ogre needs this wait. Both runs reach Flemeth's hut with **identical
+final Tower plot flags**, including ogre-dead and the absence of beacon-reached.
+Both have ogre-slay autosave, ogre codex, Aegis in the hero's inventory, and
+Aegis codex. Main takes 560 step calls / 13007 MCP calls / 25 heals, ending at
+1918259 ms; the candidate takes 605 / 13572 / 23, ending at 1988412 ms. The extra
+MCP calls inspect pending reactions. Candidate DEATH runs at its natural
+1978167 ms deadline, before EXIT at 1980712 ms.
+
+The reaction-aware plot traces contain 212 / 196 events. Main has ten additional
+combat-basic tutorial pulses and two additional Alistair release-hounds cycles
+(event-on and release-hounds, each true/false). Their final values agree. The
+only remaining final **global** flag differences are the candidate's injury and
+salve tutorials, caused by the previously explained combat/RNG divergence.
+There are no remaining Tower, loot, autosave or codex differences in this run.
+
+The fast run exercises the provisional departure boundary; the reaction-aware
+run exercises complete corpse looting and final story parity. This distinction
+is necessary because the traced executor deliberately separates IsDead from
+DEATH. The fast run is not presented as passing unchanged-recipe loot parity.
+The external `s13-counts.sh` adapter selects the second mode with
+`DEATHBLOW_WAIT_CORPSES=1`. Logs and assertions are in
+`codex-captures/deathblow/departure/tower-analysis-fast.log` and
+`tower-analysis-wait.log`, with saves/traces under
+`gate/trace_deathblow-departure-{A,B}` and
+`gate/trace_deathblow-departure-wait-{A,B}`. The external collector also corrects
+its nonexistent `objects` MCP call to `list_objects`; both final Tower variants
+return zero and collect their traces successfully.

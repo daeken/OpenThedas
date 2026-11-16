@@ -273,7 +273,11 @@ impl Sim {
             .collect();
         held_events.reverse();
         events.extend(held_events);
+        if events.is_empty() {
+            return;
+        }
         let now = self.world.time_ms;
+        let previous_sequence = self.world.queue.keys().map(|&(_, seq)| seq).max();
         for q in events {
             // Complete the reaction too, retaining its final pose for presentation.
             if let Some(r) = self
@@ -282,6 +286,33 @@ impl Sim {
                 .and_then(|o| o.combat.death_blow_reaction.as_mut())
             {
                 r.ends_ms = r.ends_ms.min(now);
+            }
+            self.deliver(q.target, q.event, q.script);
+        }
+        // DEATH handlers can signal their area asynchronously (the Tower ogre
+        // does). Finish that immediate notification chain before parking, without
+        // advancing time or draining events that preceded these completions.
+        while let Some(key) = self
+            .world
+            .queue
+            .keys()
+            .find(|&&(at, seq)| {
+                at <= now && previous_sequence.is_none_or(|previous| seq > previous)
+            })
+            .copied()
+        {
+            let q = self
+                .world
+                .queue
+                .remove(&key)
+                .expect("selected queued event");
+            if self
+                .world
+                .get(q.target)
+                .is_some_and(|o| o.parked.is_some() && o.id != area && o.area != Some(area))
+            {
+                self.world.held.push(q);
+                continue;
             }
             self.deliver(q.target, q.event, q.script);
         }
@@ -459,7 +490,7 @@ mod tests {
         let mut vfs = Vfs::new();
         vfs.push_directory(&directory, false, "synthetic deathblow")
             .unwrap();
-        let table = EngineTable::parse(b"int PROPERTY_DEPLETABLE_HEALTH = 7;\nint EVENT_TYPE_DEATH = 4;\nint EVENT_TYPE_ATTACK_IMPACT = 29;\n").unwrap();
+        let table = EngineTable::parse(b"#define ENGINE_STRUCTURE_0 event\nevent GetCurrentEvent() = 0;\nvoid SignalEvent(object target, event e, int immediate) = 1;\nint PROPERTY_DEPLETABLE_HEALTH = 7;\nint EVENT_TYPE_DEATH = 4;\nint EVENT_TYPE_ATTACK_IMPACT = 29;\n").unwrap();
         let mut sim = Sim::new(Arc::new(vfs), Arc::new(table), 7);
         sim.world.trace.keep = true;
         let tables = sim.world.tables();
@@ -878,5 +909,62 @@ mod tests {
                 matches!(e, TraceEntry::EventDelivered { t: 100, target, ty: 4, .. } if *target == f.victim)
             }).count(), 1);
         }
+    }
+
+    #[test]
+    fn departure_runs_immediate_death_completion_chain_but_not_existing_events() {
+        use thedas_script::ncs::Ncs;
+
+        let mut f = fixture(false);
+        // Literal object 1 in NCS denotes OBJECT_INVALID, so use later ids for
+        // the explicitly addressed notification receivers.
+        let area = f.sim.world.spawn(ObjectKind::Area, "completion_area");
+        for id in [f.attacker, f.victim] {
+            f.sim.world.get_mut(id).unwrap().area = Some(area);
+        }
+        let terminal = f.sim.world.spawn(ObjectKind::Creature, "terminal");
+        let o = f.sim.world.get_mut(terminal).unwrap();
+        o.area = Some(area);
+        o.script = Some("terminal_probe".into());
+        f.sim.world.get_mut(area).unwrap().script = Some("area_probe".into());
+        let forward = |target: ObjectId| {
+            // SignalEvent(target, GetCurrentEvent(), FALSE).
+            let mut body = vec![0x04, 0x03, 0, 0, 0, 0, 0x05, 0, 0, 0, 0, 0x04, 0x06];
+            body.extend(target.to_be_bytes());
+            body.extend([0x05, 0, 0, 1, 3, 0x20, 0]);
+            let mut bytes = b"NCS V1.0B".to_vec();
+            bytes.extend(((13 + body.len()) as u32).to_be_bytes());
+            bytes.extend(body);
+            Ncs::parse(&bytes).unwrap()
+        };
+        f.sim.add_script("death_probe", forward(area));
+        f.sim.add_script("area_probe", forward(terminal));
+        f.sim.tick(100);
+        f.sim.world.trace.entries.clear();
+        let unrelated = f.sim.new_event("ATTACK_IMPACT", Some(f.attacker));
+        f.sim
+            .world
+            .queue_event(0, terminal, unrelated.clone(), None);
+        f.sim.world.queue_event(3000, terminal, unrelated, None);
+        f.sim.finish_area_death_blow_reactions(area);
+        let delivered: Vec<_> = f
+            .sim
+            .world
+            .trace
+            .entries
+            .iter()
+            .filter_map(|e| match e {
+                TraceEntry::EventDelivered { t, target, ty, .. } => Some((*t, *target, *ty)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            delivered,
+            [(100, f.victim, 4), (100, area, 4), (100, terminal, 4)],
+            "{:?}",
+            f.sim.world.trace.entries
+        );
+        assert_eq!(f.sim.world.queue.len(), 2);
+        assert!(f.sim.world.queue.values().all(|q| q.event.ty == 29));
     }
 }

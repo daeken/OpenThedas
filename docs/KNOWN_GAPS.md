@@ -58,7 +58,8 @@ these, so they are the places where one person or stream can take a large, separ
   by play-animation (829) and fly (353).
 - **Death-blow selection and placement remain partial.** Origins exposes paired reactions,
   applies authored hand hits, zeroes paired victims' health at reaction start, and sends
-  DEATH at reaction end. Default variant selection, placement blending and large-creature
+  DEATH at reaction end, completing pending paired deaths early on area departure.
+  Departure completion, default variant selection, placement blending and large-creature
   geometry remain provisional. [Executor trace](notes/deathblow-executor.md).
 - **Effects are mostly stored, not enforced.** The engine acts on death, resurrection,
   area-of-effect, upkeep and damage over time. Other effect types go to the target's script and
