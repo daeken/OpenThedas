@@ -20,6 +20,106 @@ pub struct PlotCooldown {
     pub script: Option<String>,
 }
 
+impl PlotCooldown {
+    fn event(&self, action: i32, creator: Option<ObjectId>) -> Event {
+        Event {
+            ty: self.event_type,
+            creator,
+            target: Some(self.recipient),
+            ints: vec![action],
+            ..Default::default()
+        }
+    }
+}
+
+impl Sim {
+    fn plot_action_group(&self, action: i32) -> Option<i32> {
+        let table = self.world.tables().get(142, "")?;
+        if !table.rows.contains_key(&i64::from(action)) {
+            return None;
+        }
+        Some(match table.cell_by_hash(0x16a3_cb96, i64::from(action)) {
+            Some(Cell::Int(n)) => *n as i32,
+            _ => 0,
+        })
+    }
+
+    pub(crate) fn set_plot_action_cooldown(
+        &mut self,
+        action: i32,
+        seconds: f32,
+        mut state: PlotCooldown,
+    ) {
+        if self.game != thedas_vfs::Game::Origins
+            || seconds < 0.0
+            || seconds.is_nan()
+            || self.plot_action_group(action).is_none()
+        {
+            return;
+        }
+        self.advance_plot_action_cooldowns();
+        state.total_bits = seconds.to_bits();
+        state.remaining_bits = seconds.to_bits();
+        state.percent_bits = 1.0_f32.to_bits();
+        state.last_ms = self.world.time_ms;
+        self.world.plot_actions.cooldowns.insert(action, state);
+    }
+
+    /// CooldownTime and CooldownPercent reflected by the native action record.
+    pub fn plot_action_cooldown(&self, action: i32) -> Option<(f32, f32)> {
+        self.world.plot_actions.cooldowns.get(&action).map(|c| {
+            (
+                f32::from_bits(c.remaining_bits),
+                f32::from_bits(c.percent_bits),
+            )
+        })
+    }
+
+    pub(crate) fn advance_plot_action_cooldowns(&mut self) {
+        if self.game != thedas_vfs::Game::Origins {
+            return;
+        }
+        let now = self.world.time_ms;
+        let actions: Vec<_> = self.world.plot_actions.cooldowns.keys().copied().collect();
+        for action in actions {
+            let active = self
+                .world
+                .controlled()
+                .and_then(|id| self.world.get(id))
+                .is_some_and(|o| o.kind == ObjectKind::Creature)
+                && self.world.plot_actions.set != 0
+                && self.plot_action_group(action) == Some(self.world.plot_actions.set)
+                && self
+                    .world
+                    .plot_actions
+                    .states
+                    .get(&action)
+                    .copied()
+                    .unwrap_or(0)
+                    != 0;
+            let Some(c) = self.world.plot_actions.cooldowns.get_mut(&action) else {
+                continue;
+            };
+            let elapsed = now.saturating_sub(c.last_ms) as f32 / 1000.0;
+            c.last_ms = now;
+            let remaining = f32::from_bits(c.remaining_bits);
+            if !active || remaining <= 0.0 || remaining.is_nan() {
+                continue;
+            }
+            let remaining = (remaining - elapsed).max(0.0);
+            c.remaining_bits = remaining.to_bits();
+            c.percent_bits = (remaining / f32::from_bits(c.total_bits)).to_bits();
+            if remaining == 0.0 {
+                // Mark expiry before synchronous delivery, so a reentrant setter
+                // can safely replace this record without delivering it twice.
+                let c = c.clone();
+                let event = c.event(action, self.world.controlled());
+                self.deliver(c.recipient, event, c.script);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -222,105 +322,5 @@ mod tests {
         assert!(crate::engine::call(&mut h, hero, &f, &[]).is_none());
         s.tick(1000);
         assert_eq!(s.plot_action_cooldown(1), Some((2.0, 1.0)));
-    }
-}
-
-impl PlotCooldown {
-    fn event(&self, action: i32, creator: Option<ObjectId>) -> Event {
-        Event {
-            ty: self.event_type,
-            creator,
-            target: Some(self.recipient),
-            ints: vec![action],
-            ..Default::default()
-        }
-    }
-}
-
-impl Sim {
-    fn plot_action_group(&self, action: i32) -> Option<i32> {
-        let table = self.world.tables().get(142, "")?;
-        if !table.rows.contains_key(&i64::from(action)) {
-            return None;
-        }
-        Some(match table.cell_by_hash(0x16a3_cb96, i64::from(action)) {
-            Some(Cell::Int(n)) => *n as i32,
-            _ => 0,
-        })
-    }
-
-    pub(crate) fn set_plot_action_cooldown(
-        &mut self,
-        action: i32,
-        seconds: f32,
-        mut state: PlotCooldown,
-    ) {
-        if self.game != thedas_vfs::Game::Origins
-            || seconds < 0.0
-            || seconds.is_nan()
-            || self.plot_action_group(action).is_none()
-        {
-            return;
-        }
-        self.advance_plot_action_cooldowns();
-        state.total_bits = seconds.to_bits();
-        state.remaining_bits = seconds.to_bits();
-        state.percent_bits = 1.0_f32.to_bits();
-        state.last_ms = self.world.time_ms;
-        self.world.plot_actions.cooldowns.insert(action, state);
-    }
-
-    /// CooldownTime and CooldownPercent reflected by the native action record.
-    pub fn plot_action_cooldown(&self, action: i32) -> Option<(f32, f32)> {
-        self.world.plot_actions.cooldowns.get(&action).map(|c| {
-            (
-                f32::from_bits(c.remaining_bits),
-                f32::from_bits(c.percent_bits),
-            )
-        })
-    }
-
-    pub(crate) fn advance_plot_action_cooldowns(&mut self) {
-        if self.game != thedas_vfs::Game::Origins {
-            return;
-        }
-        let now = self.world.time_ms;
-        let actions: Vec<_> = self.world.plot_actions.cooldowns.keys().copied().collect();
-        for action in actions {
-            let active = self
-                .world
-                .controlled()
-                .and_then(|id| self.world.get(id))
-                .is_some_and(|o| o.kind == ObjectKind::Creature)
-                && self.world.plot_actions.set != 0
-                && self.plot_action_group(action) == Some(self.world.plot_actions.set)
-                && self
-                    .world
-                    .plot_actions
-                    .states
-                    .get(&action)
-                    .copied()
-                    .unwrap_or(0)
-                    != 0;
-            let Some(c) = self.world.plot_actions.cooldowns.get_mut(&action) else {
-                continue;
-            };
-            let elapsed = now.saturating_sub(c.last_ms) as f32 / 1000.0;
-            c.last_ms = now;
-            let remaining = f32::from_bits(c.remaining_bits);
-            if !active || remaining <= 0.0 || remaining.is_nan() {
-                continue;
-            }
-            let remaining = (remaining - elapsed).max(0.0);
-            c.remaining_bits = remaining.to_bits();
-            c.percent_bits = (remaining / f32::from_bits(c.total_bits)).to_bits();
-            if remaining == 0.0 {
-                // Mark expiry before synchronous delivery, so a reentrant setter
-                // can safely replace this record without delivering it twice.
-                let c = c.clone();
-                let event = c.event(action, self.world.controlled());
-                self.deliver(c.recipient, event, c.script);
-            }
-        }
     }
 }
