@@ -156,6 +156,9 @@ pub struct Sim {
     /// Each door's collision for sight lines (`None`: its model has none) and the key of the
     /// model and placement it was built from (see `Sim::door_sight`).
     pub(crate) door_collisions: HashMap<ObjectId, (u64, Option<Arc<crate::collision::Collision>>)>,
+    /// Each area transition's interaction volume (see [`crate::contact`]) and the key of the
+    /// model and placement it was built from. Not saved.
+    pub(crate) contact_shapes: HashMap<ObjectId, (u64, Option<Arc<crate::collision::Collision>>)>,
     /// Walkers held up by another creature's body: since when, and whether that was
     /// reported (see `Sim::advance_movers`). Not saved.
     pub(crate) blocked_since: HashMap<ObjectId, (u64, bool)>,
@@ -690,6 +693,7 @@ impl Sim {
             collisions: HashMap::new(),
             placeable_collisions: HashMap::new(),
             door_collisions: HashMap::new(),
+            contact_shapes: HashMap::new(),
             blocked_since: HashMap::new(),
             sight_memo: Default::default(),
             prcscr: None,
@@ -758,6 +762,7 @@ impl Sim {
         self.door_cells.clear();
         self.placeable_collisions.clear();
         self.door_collisions.clear();
+        self.contact_shapes.clear();
         self.blocked_since.clear();
     }
 
@@ -2631,6 +2636,7 @@ impl Sim {
         } else {
             self.world.in_triggers.insert(id, now);
         }
+        self.update_placeable_contacts(id);
     }
 
     /// Re-arms a heartbeat after it fires, while the object still has one.
