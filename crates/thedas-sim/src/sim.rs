@@ -6034,6 +6034,44 @@ mod tests {
         }
     }
 
+    #[test]
+    fn da2_selection_can_clear_the_active_command_before_tasks_exist() {
+        let mut s = da2_preparation_sim();
+        let area = s.world.spawn(ObjectKind::Area, "arena");
+        let who = s.world.spawn(ObjectKind::Creature, "actor");
+        s.world.get_mut(who).unwrap().area = Some(area);
+        let mut code = Vec::new();
+        for value in [1, 0, 1] {
+            prep_int(&mut code, value);
+        }
+        code.extend([4, 4]);
+        code.extend(5_f32.to_be_bytes());
+        prep_action(&mut code, 8, 1);
+        prep_obj(&mut code, who);
+        prep_action(&mut code, 9, 5);
+        prep_drop(&mut code);
+        prep_int(&mut code, 1);
+        prep_obj(&mut code, who);
+        prep_action(&mut code, 7, 2);
+        prep_script(&mut s, who, code);
+        s.order_ability(who, 1, who, "");
+        assert_eq!(s.next_command(), None);
+        assert!(s.world.trace.script_errors.is_empty());
+        let o = s.world.get(who).unwrap();
+        assert_eq!(o.commands.len(), 1);
+        assert_eq!(o.commands[0].name, "CommandWait");
+        assert!(o.commands[0].due.is_none());
+        assert_eq!(o.combat.previous_command.as_ref().unwrap().ty, 25);
+        assert_eq!(
+            s.world
+                .queue
+                .values()
+                .map(|q| q.event.ints.clone())
+                .collect::<Vec<_>>(),
+            vec![vec![25, -2]]
+        );
+    }
+
     fn add_command_sim() -> Sim {
         let ldf = "#define ENGINE_STRUCTURE_2 command\n\
             command CommandWait(float seconds) = 1;\n\
