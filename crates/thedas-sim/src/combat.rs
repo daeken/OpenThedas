@@ -1523,14 +1523,19 @@ impl Sim {
             arrived: false,
             da2_target_prepared: false,
             da2_basic_attack_fallback: self.game == thedas_vfs::Game::DragonAge2,
+            da2_player_issued: false,
             path: Vec::new(),
             turned_at: None,
             is_static: false,
         };
         self.da2_default_attack_command(&mut cmd);
-        if let Some(o) = self.world.get_mut(attacker) {
+        if self.game == thedas_vfs::Game::DragonAge2 {
+            self.da2_player_command(attacker, cmd);
+        } else if let Some(o) = self.world.get_mut(attacker) {
             o.commands.clear();
             o.commands.push(cmd);
+        }
+        if let Some(o) = self.world.get_mut(attacker) {
             o.combat.in_combat = true;
         }
     }
@@ -1641,6 +1646,7 @@ impl Sim {
             arrived: false,
             da2_target_prepared: false,
             da2_basic_attack_fallback: false,
+            da2_player_issued: false,
             path: Vec::new(),
             turned_at: None,
             is_static: false,
@@ -3994,6 +4000,7 @@ mod tests {
                 arrived: false,
                 da2_target_prepared: false,
                 da2_basic_attack_fallback: false,
+                da2_player_issued: false,
                 path: Vec::new(),
                 turned_at: None,
                 is_static: false,
