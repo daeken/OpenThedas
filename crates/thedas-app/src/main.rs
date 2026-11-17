@@ -52,6 +52,7 @@ mod audio;
 mod camfade;
 mod chargen_stage;
 mod control;
+mod conversation_input;
 mod cursor;
 mod cutactors;
 mod cutcam;
@@ -3961,7 +3962,10 @@ impl App {
 
     /// The left button goes down or up at the cursor.
     fn left_button(&mut self, pressed: bool) {
-        self.left_down = pressed;
+        let was_down = std::mem::replace(&mut self.left_down, pressed);
+        if pressed && was_down {
+            return;
+        }
         let (x, y) = self.cursor;
         self.recorder.input(format!(
             "{} {x:.0},{y:.0}",
@@ -4002,7 +4006,9 @@ impl App {
         }
         if double {
             if let Some(g) = self.gfx.as_mut() {
-                if self.screens.as_ref().is_some_and(|s| !s.exploring()) {
+                if self.screens.as_ref().is_some_and(|s| {
+                    !s.exploring() && !s.shown().contains(&screens::Screen::Conversation)
+                }) {
                     g.ui.click_as(
                         thedas_ui::avm1::MOUSE_LEFT + thedas_ui::avm1::DOUBLE_CLICK,
                         x,
@@ -4022,8 +4028,8 @@ impl App {
                     .as_ref()
                     .is_none_or(|s| world_takes_click(&g.ui, s, x, y));
             }
-            g.ui.mouse_button(x, y, pressed);
-            if pressed && !to_world && self.live.is_some() && self.screens.is_some() {
+            let accepted = g.ui.mouse_button(x, y, pressed);
+            if accepted && pressed && !to_world && self.live.is_some() && self.screens.is_some() {
                 g.ui.clicked();
             }
         }
@@ -5364,11 +5370,12 @@ fn line_is_voiced(audio: &audio::GameAudio, sim: &thedas_sim::Sim) -> bool {
             .is_some_and(|l| l.vo_mode != 0)
 }
 
-/// The voice-over the line on screen wants: the conversation's line, else a cutscene's line
+/// The voice-over the line on screen wants: the still-presented conversation line (including
+/// a terminal NPC line), else a cutscene's line
 /// that has its own voice. With [`audio::GameAudio::line_voice`] this says whether the line
 /// is voiced (and for how long) as soon as it is chosen, before its voice plays.
 pub(crate) fn voice_line(sim: &thedas_sim::Sim) -> Option<audio::VoiceLine> {
-    let line = sim.conversation_line().and_then(|l| {
+    let line = sim.presented_conversation_line().and_then(|l| {
         let female = sim
             .world
             .get(l.player)
@@ -5850,8 +5857,8 @@ impl padplay::Host for HeadlessHost<'_> {
                 layer.render_movies();
                 let w = world_takes_click(layer, s, x, y);
                 layer.mouse_move(x, y);
-                layer.mouse_button(x, y, down);
-                if down && !w {
+                let accepted = layer.mouse_button(x, y, down);
+                if accepted && down && !w {
                     layer.clicked();
                 }
                 w
@@ -7169,11 +7176,11 @@ fn main() -> Result<()> {
                                 layer.render_movies();
                                 let w = world_takes_click(layer, s, x, y);
                                 layer.mouse_move(x, y);
-                                layer.mouse_button(x, y, true);
-                                layer.mouse_button(x, y, false);
-                                if !w {
+                                let accepted = layer.mouse_button(x, y, true);
+                                if accepted && !w {
                                     layer.clicked();
                                 }
+                                layer.mouse_button(x, y, false);
                                 w
                             }
                             None => true,
