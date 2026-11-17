@@ -916,6 +916,14 @@ impl UiLayer {
                             .copied()
                             .unwrap_or(0.0),
                     ),
+                    (
+                        "GameOptions.ShowGore",
+                        if options.get("GameOptions.ShowGore").copied().unwrap_or(1.0) != 0.0 {
+                            1.0
+                        } else {
+                            0.0
+                        },
+                    ),
                 ];
                 if let Ok(mut shown) = self.shown.lock() {
                     shown.options = options;
@@ -925,6 +933,7 @@ impl UiLayer {
                     f64::from(sim.world.difficulty),
                     f64::from(u8::from(sim.show_tutorials)),
                     f64::from(u8::from(sim.auto_pause_combat)),
+                    f64::from(u8::from(sim.show_gore)),
                 ];
                 for ((name, value), current) in restored.into_iter().zip(current) {
                     if value != current {

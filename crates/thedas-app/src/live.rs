@@ -1965,6 +1965,18 @@ impl Live {
                 strref: l.strref,
                 female: l.female,
             });
+        let gore: Vec<Option<f32>> = models
+            .iter()
+            .map(|m| {
+                sim.world
+                    .get(m.id)
+                    .filter(|o| {
+                        sim.game == thedas_vfs::Game::Origins
+                            && o.kind == thedas_sim::world::ObjectKind::Creature
+                    })
+                    .map(|o| if sim.show_gore { o.gore_level } else { 0.0 })
+            })
+            .collect();
         let glancers: Vec<ObjectId> = match (exploring, hero, self.looks.glance_reach()) {
             (true, Some(hero), Some(_)) => models
                 .iter()
@@ -2236,6 +2248,9 @@ impl Live {
                 self.opacity.get(&m.id).copied().unwrap_or(1.0)
             };
             objects.renderer.set_prop_opacity(ctx, &objects.scene, i, o);
+            if let Some(amount) = gore.get(i).copied().flatten() {
+                objects.renderer.set_prop_gore(&objects.scene, i, amount);
+            }
         }
         // A cutscene's lights join the level's, for the level and for the objects, and so
         // do the lights of the visual effects (as they stood last frame).
