@@ -95,8 +95,7 @@ enum Collision {
     Sweep,
     /// Far half: no sweep; whatever pull is left eases out fast.
     Free,
-    /// The far end. Provisional: the exe only checks the camera is not inside something
-    /// (0x6c3180), which is not traced.
+    /// The far end checks eye clearance in outdoor layouts (0x6c3180).
     Overhead,
 }
 
@@ -134,6 +133,12 @@ pub struct Follow {
     eye: Option<Vec3>,
     /// A script's zoom target (+0x50), eased to by the update; none once reached.
     zoom_target: Option<f32>,
+    /// Zoom before the player's last outward input, until it can be checked in the scene.
+    zoomed_out_from: Option<f32>,
+    /// An outdoor tactical entry that failed the clearance check (+0x9e).
+    tactical_pending: bool,
+    /// The outdoor tactical eye overlaps physics (+0x26 from 0x6c2930).
+    tactical_eye_blocked: bool,
 }
 
 impl Follow {
@@ -155,6 +160,9 @@ impl Follow {
             ease: 0.0,
             eye: None,
             zoom_target: None,
+            zoomed_out_from: None,
+            tactical_pending: false,
+            tactical_eye_blocked: false,
         };
         let t = f.zoom_t();
         f.pitch = (FAR_POLAR_DEG + (NEAR_POLAR_DEG - FAR_POLAR_DEG) * t - 90.0).to_radians();
@@ -189,6 +197,12 @@ impl Follow {
             return false;
         }
         let before = self.zoom;
+        if steps < 0.0 {
+            self.zoomed_out_from = self.zoomed_out_from.or(Some(before));
+        } else if steps > 0.0 {
+            self.zoomed_out_from = None;
+            self.tactical_pending = false;
+        }
         self.zoom = (self.zoom + steps * ZOOM_STEP).clamp(ZOOM_MIN, ZOOM_MAX);
         self.zoom_target = None;
         before < ZOOM_MAX && self.zoom >= ZOOM_MAX
@@ -199,8 +213,71 @@ impl Follow {
     /// as the player reaching the near end.
     pub fn set_zoom_level(&mut self, level: f32) {
         if level.is_finite() {
+            self.zoomed_out_from = None;
+            self.tactical_pending = false;
             self.zoom_target = Some((2.0 * level.clamp(0.0, 1.0) - 1.0).clamp(ZOOM_MIN, ZOOM_MAX));
         }
+    }
+
+    /// The explore controller snaps an outward crossing of the split to tactical zoom
+    /// (0x76fbf0). Outdoor layouts first test the uncorrected eye (0x76f380, 0x76faa0).
+    /// A pending switch retries with 10 times the overlap radius and static line of sight
+    /// (0x76fbc0). At full tactical zoom an eye overlap flags the next zoom update
+    /// (0x6c3180); 0x7edbe1 then dispatches even with zero input.
+    pub fn resolve_tactical(
+        &mut self,
+        feet: Vec3,
+        height: f32,
+        exterior: bool,
+        sweep: Sweep,
+        sight_clear: &dyn Fn(Vec3, Vec3) -> bool,
+    ) {
+        if let Some(before) = self.zoomed_out_from.take()
+            && before >= ZOOM_SPLIT
+            && self.zoom < ZOOM_SPLIT
+        {
+            let (eye, _) = self.uncorrected_shot(feet, height, before);
+            self.tactical_pending = exterior && sweep(eye, eye, SWEEP_RADIUS).is_some();
+            self.zoom = if self.tactical_pending {
+                ZOOM_SPLIT
+            } else {
+                ZOOM_MIN
+            };
+        }
+        if exterior
+            && self.zoom <= ZOOM_MIN
+            && self.tactical_eye_blocked
+            && self.zoom_target.is_none()
+        {
+            self.zoom = ZOOM_SPLIT;
+            self.tactical_pending = true;
+        }
+        if self.tactical_pending {
+            let (eye, pivot) = self.uncorrected_shot(feet, height, self.zoom);
+            if !exterior
+                || (sweep(eye, eye, 10.0 * SWEEP_RADIUS).is_none() && sight_clear(eye, pivot))
+            {
+                self.zoom = ZOOM_MIN;
+                self.tactical_pending = false;
+            }
+        }
+        self.tactical_eye_blocked = exterior && self.zoom <= ZOOM_MIN && {
+            let (eye, _) = self.uncorrected_shot(feet, height, self.zoom);
+            sweep(eye, eye, SWEEP_RADIUS).is_some()
+        };
+    }
+
+    fn uncorrected_shot(&self, feet: Vec3, height: f32, zoom: f32) -> (Vec3, Vec3) {
+        let far_pitch = (FAR_POLAR_DEG - 90.0).to_radians();
+        let t = ((ZOOM_SPLIT - zoom) / (ZOOM_SPLIT - ZOOM_MIN)).clamp(0.0, 1.0);
+        let pitch = self.pitch + (far_pitch - self.pitch) * t;
+        let h = self
+            .height
+            .unwrap_or(height + (DEFAULT_LOOK_HEIGHT - height) * t);
+        let pivot = feet + Vec3::Z * h;
+        let distance = FAR_DISTANCE + (NEAR_DISTANCE - FAR_DISTANCE) * (zoom + 1.0) * 0.5;
+        let camera = Camera::new(pivot, self.yaw, pitch);
+        (pivot - camera.forward() * distance, pivot)
     }
 
     /// Eases the zoom towards a script's target, `dt` seconds on (at once when `dt` is 0).
@@ -572,6 +649,62 @@ mod tests {
             Some(0.0)
         });
         assert!((dist(&c) - g.distance()).abs() < 1e-3, "{}", dist(&c));
+    }
+
+    #[test]
+    fn entering_tactical_snaps_to_the_far_end_indoors() {
+        let mut f = Follow::behind(0.0);
+        f.zoom(-6.0);
+        f.resolve_tactical(
+            FEET,
+            DEFAULT_LOOK_HEIGHT,
+            false,
+            &|_, _, _| Some(0.0),
+            &|_, _| false,
+        );
+        assert_eq!(f.zoom, ZOOM_MIN);
+        f.reset(1.0);
+        assert_eq!(f.zoom, ZOOM_MIN);
+    }
+
+    #[test]
+    fn outdoor_tactical_entry_waits_for_both_clearance_and_sight() {
+        let mut f = Follow::behind(0.0);
+        f.zoom(-8.0);
+        f.resolve_tactical(
+            FEET,
+            DEFAULT_LOOK_HEIGHT,
+            true,
+            &|a, b, r| {
+                assert_eq!(a, b);
+                assert!(r == 0.25 || r == 2.5);
+                Some(0.0)
+            },
+            &|_, _| panic!("sight is tested after clearance"),
+        );
+        assert_eq!(f.zoom, ZOOM_SPLIT);
+        assert!(f.tactical_pending);
+        f.resolve_tactical(FEET, DEFAULT_LOOK_HEIGHT, true, &|_, _, _| None, &|_, _| {
+            false
+        });
+        assert_eq!(f.zoom, ZOOM_SPLIT);
+        f.resolve_tactical(FEET, DEFAULT_LOOK_HEIGHT, true, &|_, _, _| None, &|_, _| {
+            true
+        });
+        assert_eq!(f.zoom, ZOOM_MIN);
+        assert!(!f.tactical_pending);
+    }
+
+    #[test]
+    fn an_overlapping_tactical_eye_delays_the_next_frame_without_input() {
+        let mut f = Follow::behind(0.0);
+        f.zoom = ZOOM_MIN;
+        let wall = |_: Vec3, _: Vec3, _| Some(0.0);
+        f.resolve_tactical(FEET, DEFAULT_LOOK_HEIGHT, true, &wall, &|_, _| true);
+        assert_eq!(f.zoom, ZOOM_MIN);
+        f.resolve_tactical(FEET, DEFAULT_LOOK_HEIGHT, true, &wall, &|_, _| true);
+        assert_eq!(f.zoom, ZOOM_SPLIT);
+        assert!(f.tactical_pending);
     }
 
     #[test]

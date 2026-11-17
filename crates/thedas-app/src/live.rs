@@ -108,8 +108,11 @@ pub struct LiveLevel {
     pub cutaway_height: f32,
     /// The cutaway value its renderer last got ([`Cutaway`]).
     cutaway_shown: f32,
-    /// Its solid surfaces, which the game camera keeps on the party's side of.
+    /// Render surfaces for picking, and for the provisional DA2 camera.
     pub collider: thedas_render::collide::Collider,
+    /// Origins camera collision comes from the layout's PHY shapes.
+    camera_physics: Option<(thedas_sim::collision::Collision, bool)>,
+    room_visibility: std::collections::HashMap<i64, thedas_render::scene::RoomVisibility>,
 }
 
 /// The area's creatures and placeables, drawn over the level; rebuilt (alone) when an object
@@ -129,6 +132,8 @@ pub struct LiveObjects {
     /// The placeables' opaque surfaces as drawn (doors, furniture), which the game camera
     /// keeps on the near side of, as it does the level's.
     solid: thedas_render::collide::Collider,
+    /// Origins placeable models' local collision, indexed by their world object.
+    camera_physics: Vec<(ObjectId, Arc<thedas_sim::collision::Collision>)>,
     /// Placeables that animate (doors), apart from `solid`: their surfaces as posed, rebuilt
     /// as they move. DAOrigins.exe's door collision is a shape under the leaf's mesh node
     /// (`plc_doorlgdwf_05_0.phy`: `DoorLow` > `cobj` > `shap`), so it swings with the leaf.
@@ -550,6 +555,16 @@ fn build_level_with(
         started.elapsed().as_secs_f64()
     );
     let collider = thedas_render::collide::Collider::from_scene(&scene);
+    let camera_physics = (install.game() == thedas_vfs::Game::Origins)
+        .then(|| {
+            let (data, _) = vfs.read(&format!("{layout}.arl")).ok()?;
+            let arl = thedas_formats::Arl::parse(&data).ok()?;
+            Some((
+                thedas_sim::collision::load_camera_layout(&vfs, &arl),
+                arl.layout_sun,
+            ))
+        })
+        .flatten();
     Ok(LiveLevel {
         layout: layout.to_string(),
         vfs: Arc::new(vfs),
@@ -559,6 +574,8 @@ fn build_level_with(
         deferred_load_failed: false,
         area_id: None,
         collider,
+        camera_physics,
+        room_visibility: scene.room_visibility,
     })
 }
 
@@ -1145,12 +1162,8 @@ impl Live {
         self.failed_layout = Some(layout.to_string());
     }
 
-    /// Where a sphere of `radius` metres (0: a segment) moving from `from` to `to` first
-    /// touches a solid surface (share of the way), if it does: the level's, or a
-    /// placeable's as drawn (a door shut across a doorway). DAOrigins.exe's camera sweeps
-    /// its static geometry and placeables (group mask 0x1024, 0x6c3758); provisional: these
-    /// are their drawn triangles rather than their physics shapes.
-    pub fn sweep(&self, from: glam::Vec3, to: glam::Vec3, radius: f32) -> Option<f32> {
+    /// The provisional camera collider for DA2 and layouts without readable Origins data.
+    fn sweep_draws(&self, from: glam::Vec3, to: glam::Vec3, radius: f32) -> Option<f32> {
         let level = self
             .level
             .as_ref()
@@ -1167,6 +1180,42 @@ impl Live {
         }
     }
 
+    /// Sweep Origins' layout and active placeables using the executable's group mask
+    /// (0x6c3758). Transform through the current pose of each placeable. Animated door
+    /// states with group 1 are excluded by the same mask.
+    fn sweep_physics(
+        &self,
+        level: &thedas_sim::collision::Collision,
+        from: glam::Vec3,
+        to: glam::Vec3,
+        radius: f32,
+        mask: u32,
+    ) -> Option<f32> {
+        let includes = |s: &thedas_sim::collision::ShapeInfo| s.mask & mask != 0;
+        let layout = level.sweep(from.to_array(), to.to_array(), radius, includes);
+        let Some(objects) = &self.objects else {
+            return layout;
+        };
+        let sim = self.sim();
+        objects
+            .camera_physics
+            .iter()
+            .filter_map(|(id, collision)| {
+                let object = sim.world.get(*id).filter(|o| o.active)?;
+                if object
+                    .placeable_group
+                    .is_some_and(|group| group & mask == 0)
+                {
+                    return None;
+                }
+                let inverse = Prop::placement(object.position, object.facing).inverse();
+                let local = |p| inverse.transform_point3(p).to_array();
+                collision.sweep(local(from), local(to), radius, includes)
+            })
+            .chain(layout)
+            .reduce(f32::min)
+    }
+
     /// The game camera this frame following the party leader (see [`crate::follow`]), when
     /// the leader is in the current area.
     pub fn follow_camera(
@@ -1177,7 +1226,20 @@ impl Live {
     ) -> Option<thedas_render::Camera> {
         let feet = self.leader_feet()?;
         let height = self.leader_look_height();
-        Some(follow.camera_clear(feet, height, dt, base, &|a, b, r| self.sweep(a, b, r)))
+        if let Some((physics, exterior)) =
+            self.level.as_ref().and_then(|l| l.camera_physics.as_ref())
+        {
+            let sweep =
+                |a, b, r| self.sweep_physics(physics, a, b, r, thedas_formats::phy::mask::CAMERA);
+            let sight = |a, b| {
+                self.sweep_physics(physics, a, b, 0.0, thedas_formats::phy::mask::STATIC)
+                    .is_none()
+            };
+            follow.resolve_tactical(feet, height, *exterior, &sweep, &sight);
+            Some(follow.camera_clear(feet, height, dt, base, &sweep))
+        } else {
+            Some(follow.camera_clear(feet, height, dt, base, &|a, b, r| self.sweep_draws(a, b, r)))
+        }
     }
 
     /// The game camera's fade of the creatures it is inside (see [`crate::camfade`]), `dt`
@@ -1252,6 +1314,9 @@ impl Live {
             && l.cutaway_shown != v
         {
             l.renderer.set_cutaway(ctx, v);
+            if l.camera_physics.is_some() {
+                l.renderer.set_tree_cutaway(ctx, v);
+            }
             l.cutaway_shown = v;
         }
         if let Some(o) = self.objects.as_mut()
@@ -1259,6 +1324,22 @@ impl Live {
         {
             o.renderer.set_cutaway(ctx, v);
             o.cutaway_shown = v;
+        }
+    }
+
+    fn apply_room_visibility(&mut self) {
+        let visible = self.level.as_ref().and_then(|level| {
+            let (collision, exterior) = level.camera_physics.as_ref()?;
+            // Outdoor RMLs are grid sectors (0x5d1899, 0x5d18c4). The room
+            // array queried by the portal walk is populated by the indoor loader.
+            if *exterior {
+                return None;
+            }
+            crate::rooms::visible_rooms(&self.sim(), collision, &level.room_visibility)
+        });
+        if let Some(level) = self.level.as_mut() {
+            log::trace!("{}: visible rooms {:?}", level.layout, visible);
+            level.renderer.set_visible_rooms(visible);
         }
     }
 
@@ -2607,6 +2688,7 @@ impl Live {
         }
         self.set_shader_time();
         self.apply_cutaway(ctx);
+        self.apply_room_visibility();
         self.give_effect_lights(ctx);
         let aim = self.reticle(camera, (width, height), self.cursor);
         let format = self.format.unwrap_or(thedas_render::gpu::CAPTURE_FORMAT);
@@ -2776,6 +2858,7 @@ impl Live {
         }
         self.set_shader_time();
         self.apply_cutaway(ctx);
+        self.apply_room_visibility();
         self.give_effect_lights(ctx);
         let cut_effects = self.cut_effects();
         let aim = self.reticle(camera, (width, height), self.cursor);
@@ -2899,6 +2982,13 @@ impl Live {
         let mut shapes = std::collections::HashMap::new();
         let mut unseen_shapes = std::collections::HashMap::new();
         let mut placeable_draws = Vec::new();
+        let mut camera_physics = Vec::new();
+        let mut model_collision = std::collections::HashMap::new();
+        let physics_vfs = self
+            .level
+            .as_ref()
+            .filter(|l| l.camera_physics.is_some())
+            .map(|l| &l.vfs);
         let mut moving = std::collections::HashMap::new();
         for (i, (m, p)) in models.iter().zip(&scene.props).enumerate() {
             if m.kind == thedas_sim::world::ObjectKind::Creature
@@ -2942,6 +3032,19 @@ impl Live {
                 );
             } else if placeable {
                 placeable_draws.extend(p.draws.clone());
+            }
+            if placeable && let Some(vfs) = physics_vfs {
+                let collision = model_collision.entry(&m.models).or_insert_with(|| {
+                    let placed: Vec<_> = m
+                        .models
+                        .iter()
+                        .map(|m| (m.clone(), [0.0; 3], 0.0))
+                        .collect();
+                    Arc::new(thedas_sim::collision::load_placeables(vfs, &placed))
+                });
+                if !collision.is_empty() {
+                    camera_physics.push((m.id, collision.clone()));
+                }
             }
             if interactive {
                 let shape =
@@ -2999,6 +3102,7 @@ impl Live {
             faces,
             unseen_shapes,
             solid,
+            camera_physics,
             moving,
             bodies: models
                 .iter()

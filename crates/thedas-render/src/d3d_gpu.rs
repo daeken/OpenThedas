@@ -190,11 +190,15 @@ pub(crate) struct D3dPass {
     /// Per pipeline, its texture bindings' layout (for the faded variants).
     layouts: Vec<wgpu::BindGroupLayout>,
     fade_consts: wgpu::BindGroupLayout,
+    fade_instance_consts: wgpu::BindGroupLayout,
     color_format: wgpu::TextureFormat,
     /// The samples a pixel of the frame it draws into (see [`D3dCache::samples`]).
     samples: u32,
     /// Per scene draw, the opacity its object is drawn at (1: as its material says).
     opacity: Vec<f32>,
+    shown_rooms: Option<std::collections::HashSet<i64>>,
+    draw_rooms: Vec<Option<i64>>,
+    emitter_rooms: Vec<Option<i64>>,
     /// Per-instance appearance gore, independent of shared materials.
     gore: Vec<Option<f32>>,
     pub draws: Vec<D3dDraw>,
@@ -2064,9 +2068,13 @@ impl D3dPass {
             pipelines,
             layouts,
             fade_consts: consts_layout,
+            fade_instance_consts: instanced_layout,
             color_format,
             samples,
             opacity: vec![1.0; scene.draws.len()],
+            shown_rooms: None,
+            draw_rooms: scene.draws.iter().map(|d| d.room_id).collect(),
+            emitter_rooms: scene.emitters.iter().map(|e| e.room_id).collect(),
             gore: vec![None; scene.draws.len()],
             draws,
             buffer,
@@ -2207,7 +2215,10 @@ impl D3dPass {
         let lights = DrawLights::default();
         let mut quads = Vec::new();
         for d in &self.particles {
-            let Some(e) = emitters.get(d.emitter) else {
+            let Some(e) = emitters
+                .get(d.emitter)
+                .filter(|_| self.emitter_room_shown(d.emitter))
+            else {
                 d.count.store(0, std::sync::atomic::Ordering::Relaxed);
                 continue;
             };
@@ -2486,6 +2497,25 @@ impl D3dPass {
         self.opacity.get(draw).copied()
     }
 
+    pub(crate) fn set_visible_rooms(&mut self, rooms: Option<std::collections::HashSet<i64>>) {
+        self.shown_rooms = rooms;
+    }
+
+    fn room_shown(&self, room: Option<i64>) -> bool {
+        match (room, &self.shown_rooms) {
+            (Some(room), Some(shown)) => shown.contains(&room),
+            _ => true,
+        }
+    }
+
+    pub(crate) fn draw_room_shown(&self, draw: usize) -> bool {
+        self.room_shown(self.draw_rooms.get(draw).copied().flatten())
+    }
+
+    pub(crate) fn emitter_room_shown(&self, emitter: usize) -> bool {
+        self.room_shown(self.emitter_rooms.get(emitter).copied().flatten())
+    }
+
     /// Draws scene draw `draw` at `opacity` (0..1) of its material's: its shaders' engine
     /// fade (`mml_fOpacityMultiplier`, which the character pixel shaders write as their
     /// alpha, `Ch1.psh`: `mov oC0.w, c27.x`) is multiplied by it, and below 1 its opaque
@@ -2507,21 +2537,55 @@ impl D3dPass {
         }
         for k in 0..self.draws.len() {
             let d = &self.draws[k];
-            if d.draw != draw || self.pipelines[d.pipeline].blended {
-                continue;
+            if d.draw == draw {
+                self.ensure_faded_pipeline(ctx, d.pipeline);
             }
-            let pi = d.pipeline;
-            if self.faded[pi].is_none() {
-                self.faded[pi] = Some(create_pipeline_faded(
-                    &ctx.device,
-                    &self.pipelines[pi].program,
-                    &self.fade_consts,
-                    &self.layouts[pi],
-                    self.color_format,
-                    true,
-                    self.samples,
-                ));
+        }
+    }
+
+    /// The SpeedTree model's collision-object flag (0x533f0e) enables the same cutaway
+    /// value as the roofs, floored at 0.12 (0x4670c8, 0x52cc94). Only branches switch
+    /// to a blended pass (0x52cd27); leaves and fronds keep their LOD alpha tests.
+    pub(crate) fn set_tree_cutaway(&mut self, ctx: &GpuContext, value: f32) {
+        let opacity = value.clamp(0.12, 1.0);
+        for (i, tree) in self.trees.iter_mut().enumerate() {
+            if let Some(tree) = tree.as_mut().filter(|tree| tree.has_collision) {
+                tree.alpha_multiplier = opacity;
+                if self.tree_lods[i]
+                    .as_ref()
+                    .is_some_and(|lod| lod.part == crate::scene::TreePart::Branches)
+                {
+                    self.opacity[i] = opacity;
+                }
             }
+        }
+        if opacity < 1.0 {
+            for k in 0..self.draws.len() {
+                let d = &self.draws[k];
+                if self.is_faded(d) {
+                    self.ensure_faded_pipeline(ctx, d.pipeline);
+                }
+            }
+        }
+    }
+
+    fn ensure_faded_pipeline(&mut self, ctx: &GpuContext, pipeline: usize) {
+        if self.faded[pipeline].is_none() && !self.pipelines[pipeline].blended {
+            let program = &self.pipelines[pipeline].program;
+            let consts = if program.instanced {
+                &self.fade_instance_consts
+            } else {
+                &self.fade_consts
+            };
+            self.faded[pipeline] = Some(create_pipeline_faded(
+                &ctx.device,
+                program,
+                consts,
+                &self.layouts[pipeline],
+                self.color_format,
+                true,
+                self.samples,
+            ));
         }
     }
 
@@ -2816,7 +2880,8 @@ impl D3dPass {
                     // its render nodes carry the fadeoutobject bit, which no shadow group
                     // draws).
                     let faded = self.opacity.get(c.draw).is_some_and(|&o| o < 1.0);
-                    [0, 1].map(|k| !faded && in_partition(&p[k], centre, radius))
+                    let shown = !faded && self.draw_room_shown(c.draw);
+                    [0, 1].map(|k| shown && in_partition(&p[k], centre, radius))
                 })
                 .collect();
             let key = shadow_key(&p, &self.casters, &visible, &self.worlds, &self.bones);
@@ -2903,6 +2968,9 @@ impl D3dPass {
             .map(|d| {
                 if warm {
                     return true;
+                }
+                if !self.draw_room_shown(d.draw) {
+                    return false;
                 }
                 if self.tree_lods.get(d.draw).is_some_and(|l| l.is_some())
                     && tree_frame.get(d.draw).is_none_or(|f| f.is_none())
@@ -3431,8 +3499,8 @@ impl D3dPass {
         v.get(i).copied().unwrap_or(v.is_empty())
     }
 
-    /// Groups this frame's instanced draws in view by pipeline, mesh, textures, slot chunk
-    /// and index range, and writes the instance list: each group's slots, in draw order.
+    /// Groups this frame's instanced draws in view by pipeline, fade, mesh, textures, slot
+    /// chunk and index range, and writes the instance list in draw order.
     fn group_instances(
         &self,
         ctx: &GpuContext,
@@ -3445,6 +3513,7 @@ impl D3dPass {
         type Key = (
             usize,
             usize,
+            bool,
             usize,
             (usize, Option<usize>, Option<usize>),
             (u32, u32),
@@ -3459,7 +3528,14 @@ impl D3dPass {
                 Some(Some((first, n, _))) => (*first, *n),
                 _ => (0, u32::MAX),
             };
-            let key = (d.chunk, d.pipeline, d.mesh, d.textures_key, range);
+            let key = (
+                d.chunk,
+                d.pipeline,
+                self.is_faded(d),
+                d.mesh,
+                d.textures_key,
+                range,
+            );
             let g = *by_key.entry(key).or_insert_with(|| {
                 members.push((i, range, Vec::new()));
                 members.len() - 1
@@ -3490,6 +3566,9 @@ impl D3dPass {
         indices: &wgpu::Buffer,
         count: u32,
     ) {
+        let pipeline = self
+            .faded_pipeline(d)
+            .unwrap_or(&self.pipelines[d.pipeline].pipeline);
         if d.instanced {
             // Drawn by its group's leader, with the group's other draws as instances.
             let inst = self.instancing.lock().unwrap_or_else(|e| e.into_inner());
@@ -3501,7 +3580,7 @@ impl D3dPass {
             else {
                 return;
             };
-            pass.set_pipeline(&self.pipelines[d.pipeline].pipeline);
+            pass.set_pipeline(pipeline);
             pass.set_bind_group(0, consts, &[]);
             pass.set_bind_group(1, &d.textures, &[]);
             pass.set_vertex_buffer(0, d.vertices.slice(..));
@@ -3510,10 +3589,7 @@ impl D3dPass {
             pass.draw_indexed(first.min(end)..end, 0, start..start + n);
             return;
         }
-        let faded = self
-            .faded_pipeline(d)
-            .unwrap_or(&self.pipelines[d.pipeline].pipeline);
-        pass.set_pipeline(faded);
+        pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &d.consts, &[]);
         pass.set_bind_group(1, &d.textures, &[]);
         pass.set_vertex_buffer(0, d.vertices.slice(..));

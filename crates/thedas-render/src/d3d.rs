@@ -751,6 +751,10 @@ pub struct TreeConstants {
     pub wind_offset: f32,
     /// Which of the level's five winds (0.2 s apart) moves it.
     pub wind: usize,
+    /// Models with SpeedTree collision objects share the scene's tactical cutaway.
+    pub has_collision: bool,
+    /// The current whole-tree fade, independent of the part's LOD alpha reference.
+    pub alpha_multiplier: f32,
     /// For the level's billboard batch (`SPT_Billboards0`), `g_v360TexCoords`: per billboard
     /// image, two opposite corners in the billboard atlas, (corner 2's u, v, corner 0's u, v)
     /// (DAOrigins.exe 0x530b70, speedtree-exe-trace §7). Empty for other draws.
@@ -806,7 +810,7 @@ impl TreeConstants {
                 ]]
             }
             "g_fWindMatrixOffset" => vec![[self.wind_offset, 0.0, 0.0, 0.0]],
-            "g_fAlphaMultiplier" => vec![[1.0, 0.0, 0.0, 0.0]],
+            "g_fAlphaMultiplier" => vec![[self.alpha_multiplier, 0.0, 0.0, 0.0]],
             "g_amWindMatrices" => wind
                 .matrices
                 .iter()
@@ -1414,6 +1418,9 @@ impl ConstantContext<'_> {
         if c.name == "mml_fGoreThreshold" {
             return true;
         }
+        if c.name == "g_fAlphaMultiplier" && self.tree.is_some_and(|tree| tree.has_collision) {
+            return true;
+        }
         // A flickering light's colour changes every frame.
         if self.lights.flickers()
             && (matches!(usage, Some("LightsArray" | "LightsArrayDirected"))
@@ -1654,6 +1661,8 @@ mod tests {
             leaf_angle_scalars: [0.0; 2],
             wind_offset: 0.0,
             wind: 0,
+            has_collision: false,
+            alpha_multiplier: 1.0,
             billboard_images: std::sync::Arc::from([[0.1, 0.9, 0.3, 0.6]]),
         };
         let v = |name| t.value(name, Vec3::new(0.0, 2.0, -1.0), None, &WindFrame::STILL);

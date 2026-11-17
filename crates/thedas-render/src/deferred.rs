@@ -2944,7 +2944,7 @@ fn casters<'a>(
     let (vertices, bones) = streams;
     let mut result: Vec<_> = draws
         .iter()
-        .filter(|d| d.casts && !d3d.is_faded(&d3d.draws[d.k]))
+        .filter(|d| d.casts && d3d.draw_room_shown(d.draw) && !d3d.is_faded(&d3d.draws[d.k]))
         .filter_map(|d| {
             Some(crate::deferred_shadow::Caster {
                 mesh: meshes.get(d.mesh)?,
@@ -2967,7 +2967,7 @@ fn casters<'a>(
     result.extend(
         cutouts
             .iter()
-            .filter(|d| !d3d.is_faded(&d3d.draws[d.k]))
+            .filter(|d| d3d.draw_room_shown(d.draw) && !d3d.is_faded(&d3d.draws[d.k]))
             .filter_map(|d| {
                 Some(crate::deferred_shadow::Caster {
                     mesh: meshes.get(d.mesh)?,

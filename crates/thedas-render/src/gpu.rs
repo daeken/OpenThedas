@@ -566,10 +566,11 @@ impl RenderCache {
 }
 
 /// A transparent item of a frame (see [`AreaRenderer::transparent_order`]): a blended draw
-/// (by index into `blended`) or a particle draw.
+/// (by index into `blended` or `opaque`) or a particle draw.
 #[derive(Clone, Copy, Debug)]
 enum Transparent {
     Draw(usize),
+    FadedTree(usize),
     Particles(usize),
 }
 
@@ -1286,6 +1287,7 @@ impl AreaRenderer {
         self.d3d
             .glowing_emitters()
             .into_iter()
+            .filter(|&i| self.d3d.emitter_room_shown(i))
             .filter_map(|i| {
                 let tint = self
                     .emitter_tints
@@ -1505,6 +1507,17 @@ impl AreaRenderer {
                 state.opacity = value;
             }
         }
+    }
+
+    /// The Origins SpeedTree models that fade with the architecture (0x52cc94).
+    pub fn set_tree_cutaway(&mut self, ctx: &GpuContext, value: f32) {
+        self.d3d.set_tree_cutaway(ctx, value);
+    }
+
+    /// Enables the environment models of the visible layout rooms. Unassigned draws
+    /// (sky and level-wide models) stay visible.
+    pub fn set_visible_rooms(&mut self, rooms: Option<std::collections::HashSet<i64>>) {
+        self.d3d.set_visible_rooms(rooms);
     }
 
     /// Set a creature appearance's gore threshold on its body and attachments
@@ -2323,7 +2336,11 @@ impl AreaRenderer {
         let faded =
             |r: &DrawRef| matches!(*r, DrawRef::D3d(i) if self.d3d.is_faded(&self.d3d.draws[i]));
         let solid = self.opaque.iter().filter(|(_, r)| opaque && !faded(r));
-        let faded_opaque = self.opaque.iter().filter(|(_, r)| transparent && faded(r));
+        let faded_opaque = self.opaque.iter().filter(|(_, r)| {
+            transparent
+                && faded(r)
+                && !matches!(*r, DrawRef::D3d(i) if self.d3d.transparency_group(i) == crate::d3d_gpu::TransparencyGroup::Trees)
+        });
         for (di, r) in solid.chain(faded_opaque) {
             self.draw_one(pass, *di, r, deferred);
         }
@@ -2336,6 +2353,10 @@ impl AreaRenderer {
             match t {
                 Transparent::Draw(k) => {
                     let (di, r) = &self.blended[k];
+                    self.draw_one(pass, *di, r, deferred);
+                }
+                Transparent::FadedTree(k) => {
+                    let (di, r) = &self.opaque[k];
                     self.draw_one(pass, *di, r, deferred);
                 }
                 Transparent::Particles(k) if self.only_draws.is_none() => {
@@ -2356,6 +2377,14 @@ impl AreaRenderer {
         use crate::d3d_gpu::TransparencyGroup;
         let camera = self.d3d.camera_at();
         let mut items: Vec<(TransparencyGroup, f32, Transparent)> = Vec::new();
+        for (k, (_, r)) in self.opaque.iter().enumerate() {
+            if let DrawRef::D3d(i) = *r
+                && self.d3d.is_faded(&self.d3d.draws[i])
+                && self.d3d.transparency_group(i) == TransparencyGroup::Trees
+            {
+                items.push((TransparencyGroup::Trees, 0.0, Transparent::FadedTree(k)));
+            }
+        }
         for (k, (_, r)) in self.blended.iter().enumerate() {
             let (group, distance) = match *r {
                 DrawRef::D3d(i) => {

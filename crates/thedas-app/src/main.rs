@@ -82,6 +82,7 @@ mod padplay;
 mod report;
 mod reticle;
 mod rings;
+mod rooms;
 mod saves;
 mod screens;
 mod talkcam;
