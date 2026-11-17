@@ -641,7 +641,8 @@ const PORTRAIT_RETRY_MS: f64 = 1000.0;
 
 /// What the portraits show, by member (the party, and the followers picked in an open party
 /// picker: see [`crate::live::portrait_subjects`]): who, in which slot, with which
-/// appearance, head morph and equipment. They are drawn again when it changes.
+/// appearance, head morph and equipment. [`crate::live::Live::portrait_key`] also tracks
+/// the models that have become available to render these inputs.
 pub fn portrait_key(sim: &thedas_sim::Sim) -> Vec<(u32, u64)> {
     use std::hash::{Hash, Hasher};
     crate::live::portrait_subjects(sim)
@@ -4547,5 +4548,36 @@ mod tests {
         assert!(!clock.due(vec![(1, 8), (2, 9)], PORTRAIT_RETRY_MS - 1.0));
         assert!(clock.due(vec![(1, 8), (2, 9)], 1.0));
         assert_ne!(PortraitClock::name(1, 1), PortraitClock::name(1, 2));
+    }
+
+    #[test]
+    fn portrait_inputs_invalidate_the_cached_drawing() {
+        use thedas_sim::world::ObjectKind;
+        let mut sim = Sim::new(
+            Arc::new(Vfs::new()),
+            Arc::new(thedas_script::EngineTable::default()),
+            1,
+        );
+        let hero = sim.world.spawn(ObjectKind::Creature, "hero");
+        sim.world.hero = Some(hero);
+        let mut clock = PortraitClock::default();
+        assert!(clock.due(portrait_key(&sim), 0.0));
+        clock.drew(&[hero]);
+        for change in [
+            |o: &mut thedas_sim::world::Object| o.head_morph = Some("hm_face".into()),
+            |o: &mut thedas_sim::world::Object| o.appearance += 1,
+            |o: &mut thedas_sim::world::Object| {
+                o.equipment.insert(1, 42);
+            },
+            |o: &mut thedas_sim::world::Object| {
+                o.face_choices
+                    .insert(thedas_sim::appearance::PORTRAIT_DISTANCE, 0.8);
+            },
+        ] {
+            assert!(!clock.due(portrait_key(&sim), 60_000.0));
+            change(sim.world.get_mut(hero).unwrap());
+            assert!(clock.due(portrait_key(&sim), 0.0));
+            clock.drew(&[hero]);
+        }
     }
 }

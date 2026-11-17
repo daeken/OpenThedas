@@ -6000,7 +6000,7 @@ fn draw_likenesses(
     let Some(screens) = screens else {
         return;
     };
-    let key = ui::portrait_key(&live.sim());
+    let key = live.portrait_key();
     if ui.wants_portraits(key, dt) {
         let shots = live.portraits(ctx, ui::PORTRAIT_SIZE);
         ui.set_portraits(shots);
@@ -7191,7 +7191,7 @@ fn main() -> Result<()> {
                                     level.map(|x| x.layout.as_str()),
                                     level.map(|x| &x.vfs),
                                 );
-                                let key = ui::portrait_key(&l.sim());
+                                let key = l.portrait_key();
                                 if layer.wants_portraits(key, dt) {
                                     let shots = l.portraits(&ctx, ui::PORTRAIT_SIZE);
                                     layer.set_portraits(shots);
