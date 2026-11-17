@@ -3228,12 +3228,12 @@ impl UiLayer {
             .iter()
             .position(|m| m.name == "floatylayer.gfx")
         else {
-            // No layer up: what scripts showed meanwhile is dropped.
-            sim.lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .world
-                .floaties
-                .clear();
+            let mut sim = sim.lock().unwrap_or_else(|p| p.into_inner());
+            sim.world.floaties.clear();
+            // DAOrigins.exe (0x63c260) invokes the status message on the live floaty
+            // layer and returns if it is absent. Do not replay these messages when
+            // the HUD opens after a cutscene or conversation.
+            sim.world.status_messages.clear();
             self.floaties.clear();
             self.stat_floaties.clear();
             return;
@@ -4201,6 +4201,73 @@ mod tests {
             ui.stage.tick(1000.0 / 30.0);
         }
         ui
+    }
+
+    #[test]
+    #[ignore = "requires THEDAS_INSTALL and an offscreen GPU"]
+    fn status_messages_expire_while_the_floaty_layer_is_closed() {
+        use thedas_ui::UiValue;
+
+        let mut ui = installed_popup_ui();
+        let mut sim = Sim::new(
+            ui.vfs.clone(),
+            Arc::new(thedas_script::EngineTable::default()),
+            1,
+        );
+        sim.world.cutscene = Some(thedas_sim::cutscene::Cutscene {
+            name: "opening.cut".into(),
+            seconds: 1.0,
+            lines: Vec::new(),
+            elapsed_ms: 0,
+            from_dialog: false,
+            bound: Vec::new(),
+            placement: None,
+        });
+        let sim = Arc::new(Mutex::new(sim));
+        ui.attach(&sim);
+        let mut screens = Screens::new(false);
+        let camera = thedas_render::Camera::new(glam::Vec3::ZERO, 0.0, 0.0);
+        let dt = 1000.0 / 30.0;
+
+        ui.play(&mut screens, &sim, dt);
+        assert!(screens.shown().contains(&Screen::Cutscene));
+        sim.lock()
+            .unwrap()
+            .world
+            .status_messages
+            .push(("Opening status".into(), 0xffffff));
+        ui.update_floaties(&sim, &camera, dt, &|_| 0.0);
+
+        {
+            let mut sim = sim.lock().unwrap();
+            sim.world.cutscene = None;
+            sim.world.training.step = 1;
+        }
+        for _ in 0..20 {
+            ui.play(&mut screens, &sim, dt);
+            ui.update_floaties(&sim, &camera, dt, &|_| 0.0);
+        }
+        assert!(screens.shown().contains(&Screen::Hud));
+        assert_eq!(
+            popup_property(&mut ui, "_root.TrainingTutorial_mc._visible"),
+            UiValue::Bool(true)
+        );
+        let count = |ui: &mut UiLayer| {
+            ui.stage.call_in(
+                "floatylayer.gfx",
+                "_global.StatusMessageRoller.StatusMessages.length.toString",
+                &[],
+            )
+        };
+        assert_eq!(count(&mut ui), Some(UiValue::String("0".into())));
+
+        sim.lock()
+            .unwrap()
+            .world
+            .status_messages
+            .push(("HUD status".into(), 0xffffff));
+        ui.update_floaties(&sim, &camera, dt, &|_| 0.0);
+        assert_eq!(count(&mut ui), Some(UiValue::String("1".into())));
     }
 
     #[test]
