@@ -881,8 +881,9 @@ pub fn weapon_style(sim: &Sim, o: &Object) -> Option<&'static str> {
 /// How long an attack plays when the script set no duration (milliseconds). Provisional.
 pub const DEFAULT_ATTACK_MS: u64 = 1500;
 
-/// What a creature's body is doing: dead (the death animation from when it died, then its
-/// last pose), attacking (the attack animation over the attack's duration), moving (a
+/// What a creature's body is doing: a paired death blow (its recorded action and start,
+/// retaining the victim's final pose), dead (the death animation from when it died, then
+/// its last pose), attacking (the attack animation over the attack's duration), moving (a
 /// run), or standing (pause, the combat stance when fighting). Looping animations start at
 /// a different point per creature so a crowd does not move in step. Provisional: the
 /// original picks among variants (`attk_v1`..`v6`, weapon styles) that are not modelled.
@@ -942,6 +943,36 @@ fn creature_motion(sim: &Sim, o: &Object, standing: bool) -> Option<Motion> {
     let fighting = o.combat.in_combat;
     // Looked up only where it is shown: it reads the creature's equipment.
     let style = || weapon_style(sim, o).map(|s| format!("{s}.anb"));
+    if !standing {
+        // IsDead is already true during a paired reaction. Its saved action must win
+        // over generic death and remain the corpse pose until resurrection clears it.
+        let paired = o
+            .combat
+            .death_blow_reaction
+            .as_ref()
+            .map(|r| (&r.action, r.started_ms, r.ends_ms))
+            .or_else(|| {
+                o.combat
+                    .death_blow
+                    .as_ref()
+                    .map(|a| (&a.action, a.started_ms, a.ends_ms))
+            });
+        if let Some((action, started, ends)) = paired {
+            return Some(Motion {
+                trees: sim.ability_trees(o.id),
+                actions: vec![action.clone()],
+                // Departure can shorten the deadline: jump to the actual clip end,
+                // rather than holding a partially completed fall at departure time.
+                time: if now >= ends {
+                    f32::MAX
+                } else {
+                    secs(now.saturating_sub(started))
+                },
+                looping: false,
+                blend: Vec::new(),
+            });
+        }
+    }
     if o.dead && !standing {
         // From when it died, held on the last frame; a death of unknown time (a save from
         // before deaths were timed) shows the last frame. Dragon Age II's creatures die in
@@ -2064,6 +2095,202 @@ mod tests {
         // A death of unknown time shows the end of the animation.
         s.world.get_mut(id).unwrap().died_at = None;
         assert_eq!(motion(&s, s.world.get(id).unwrap()).unwrap().time, f32::MAX);
+    }
+
+    fn paired_death_fixture() -> (Sim, ObjectId, ObjectId) {
+        use std::sync::Arc;
+        use thedas_script::EngineTable;
+        use thedas_sim::deathblow::{DeathBlow, DeathBlowImpact, DeathBlowReaction};
+        use thedas_sim::world::Command;
+        use thedas_vfs::Vfs;
+        let table = EngineTable::parse(
+            b"int INVENTORY_SLOT_MAIN = 0;\nint INVENTORY_SLOT_OFFHAND = 1;\nint EVENT_TYPE_DEATH = 4;\n",
+        )
+        .unwrap();
+        let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(table), 1);
+        let st = |v: &str| Cell::String(format!("{v}\0"));
+        for worksheet in ["apr_base", "#2"] {
+            s.world.tables().insert(
+                worksheet,
+                &["#500976ec", "#de80b418"],
+                vec![(15, vec![st("humanoid.anb"), st("combat_humanoid.anb")])],
+            );
+        }
+        s.world.tables().insert(
+            "#6",
+            &["#8bf8fc78", "#c0d6c7f2"],
+            vec![(2, vec![st("weapon_override.anb"), st("melee")])],
+        );
+        let weapon = s.world.spawn(ObjectKind::Item, "sword");
+        s.world
+            .get_mut(weapon)
+            .unwrap()
+            .fields
+            .insert("BaseItem".into(), 2);
+        let attacker = s.world.spawn(ObjectKind::Creature, "attacker");
+        let victim = s.world.spawn(ObjectKind::Creature, "victim");
+        let a = s.world.get_mut(attacker).unwrap();
+        a.appearance = 15;
+        a.equipment.insert(0, weapon);
+        a.commands.push(Command {
+            name: "CommandDeathBlow".into(),
+            due: Some(4_000),
+            ..Default::default()
+        });
+        a.combat.death_blow = Some(DeathBlow {
+            victim,
+            started_ms: 1_000,
+            ends_ms: 4_000,
+            animation: 300,
+            action: "db_h_ow_attk_v1".into(),
+            impacts: vec![DeathBlowImpact {
+                at_ms: 1_500,
+                hand: 0,
+            }],
+            next_impact: 1,
+        });
+        let v = s.world.get_mut(victim).unwrap();
+        v.appearance = 15;
+        v.dead = true;
+        // Died-at is deliberately different: playback follows the paired start.
+        v.died_at = Some(500);
+        v.combat.death_blow_reaction = Some(DeathBlowReaction {
+            attacker,
+            started_ms: 1_000,
+            ends_ms: 5_000,
+            animation: 306,
+            action: "db_h_ow_die_v1".into(),
+        });
+        s.world.time_ms = 2_250;
+        (s, attacker, victim)
+    }
+
+    fn paired_motion(s: &Sim, id: ObjectId) -> Motion {
+        motion(s, s.world.get(id).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn paired_death_actions_resume_at_their_recorded_starts_without_mutating_state() {
+        let (mut s, attacker, victim) = paired_death_fixture();
+        s.world
+            .get_mut(attacker)
+            .unwrap()
+            .combat
+            .death_blow
+            .as_mut()
+            .unwrap()
+            .started_ms = 750;
+        let before = s.save_json().unwrap();
+        let a = paired_motion(&s, attacker);
+        let v = paired_motion(&s, victim);
+        assert_eq!(a.actions, ["db_h_ow_attk_v1"]);
+        assert_eq!(v.actions, ["db_h_ow_die_v1"]);
+        assert_eq!(
+            a.trees,
+            ["weapon_override.anb", "ow.anb", "combat_humanoid.anb"]
+        );
+        assert_eq!(v.trees, ["combat_humanoid.anb"]);
+        for (m, elapsed) in [(a, 1.5), (v, 1.25)] {
+            assert_eq!(m.time, elapsed);
+            assert!(!m.looping);
+            assert!(m.blend.is_empty());
+        }
+        assert_eq!(
+            standing_motion(&s, s.world.get(victim).unwrap())
+                .unwrap()
+                .actions,
+            [action::PAUSE]
+        );
+        assert_eq!(before, s.save_json().unwrap());
+    }
+
+    #[test]
+    fn paired_death_reaction_holds_its_final_pose_at_and_after_the_deadline() {
+        let (mut s, attacker, victim) = paired_death_fixture();
+        for now in [5_000, 5_001, 60_000] {
+            s.world.time_ms = now;
+            // The attacker's command has completed; the corpse keeps its reaction.
+            s.world.get_mut(attacker).unwrap().combat.death_blow = None;
+            let m = paired_motion(&s, victim);
+            assert_eq!(m.actions, ["db_h_ow_die_v1"]);
+            assert_eq!(m.time, f32::MAX);
+            assert!(!m.looping);
+        }
+    }
+
+    #[test]
+    fn paired_death_motion_survives_save_load_mid_reaction() {
+        let (s, attacker, victim) = paired_death_fixture();
+        let (mut loaded, _, _) = paired_death_fixture();
+        loaded.load_json(&s.save_json().unwrap()).unwrap();
+        for id in [attacker, victim] {
+            assert_eq!(paired_motion(&s, id), paired_motion(&loaded, id));
+            loaded.world.time_ms = 3_000;
+            assert_eq!(paired_motion(&loaded, id).time, 2.0);
+            loaded.world.time_ms = s.world.time_ms;
+        }
+        loaded.world.time_ms = 5_000;
+        assert_eq!(paired_motion(&loaded, victim).time, f32::MAX);
+    }
+
+    #[test]
+    fn resurrection_releases_the_paired_corpse_pose() {
+        let (mut s, _, victim) = paired_death_fixture();
+        s.world.time_ms = 6_000;
+        assert_eq!(paired_motion(&s, victim).time, f32::MAX);
+        s.apply_effect(
+            victim,
+            thedas_sim::world::Effect {
+                ty: thedas_sim::combat::EFFECT_TYPE_RESURRECTION,
+                ..Default::default()
+            },
+        );
+        let v = s.world.get(victim).unwrap();
+        assert!(!v.dead);
+        assert!(v.combat.death_blow_reaction.is_none());
+        assert_eq!(paired_motion(&s, victim).actions, [action::PAUSE]);
+        assert!(paired_motion(&s, victim).looping);
+    }
+
+    #[test]
+    fn departure_shortened_reaction_holds_the_clip_end_instead_of_the_departure_frame() {
+        let (mut s, attacker, victim) = paired_death_fixture();
+        let old = s.world.spawn(ObjectKind::Area, "old");
+        let next = s.world.spawn(ObjectKind::Area, "next");
+        s.world.get_mut(next).unwrap().template = "next".into();
+        s.world.area = Some(old);
+        s.world.get_mut(victim).unwrap().area = Some(old);
+        s.world.queue_event(
+            2_750,
+            victim,
+            thedas_sim::world::Event {
+                ty: 4,
+                creator: Some(attacker),
+                ..Default::default()
+            },
+            None,
+        );
+        assert_eq!(paired_motion(&s, victim).time, 1.25);
+        s.enter_area("next", None).unwrap();
+        assert_eq!(
+            s.world
+                .get(victim)
+                .unwrap()
+                .combat
+                .death_blow_reaction
+                .as_ref()
+                .unwrap()
+                .ends_ms,
+            2_250
+        );
+        let held = paired_motion(&s, victim);
+        assert_eq!(held.time, f32::MAX);
+        assert_eq!(held.actions, ["db_h_ow_die_v1"]);
+        let (mut loaded, _, _) = paired_death_fixture();
+        loaded.load_json(&s.save_json().unwrap()).unwrap();
+        assert_eq!(paired_motion(&loaded, victim), held);
+        loaded.world.time_ms = 60_000;
+        assert_eq!(paired_motion(&loaded, victim), held);
     }
 
     #[test]

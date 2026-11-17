@@ -601,7 +601,6 @@ const PRESENTATION: &[&str] = &[
     "PlayMusic",
     "SetMusicIntensity",
     "SendToRunDatabase",
-    "SetCreatureGoreLevel",
     // Only the indicator on the quickbar; the modal effect itself is the scripts'.
     "Engine_SetModalAbilityGUI",
     // An icon over a creature's head (DAOrigins.exe 0x662db0): interface only.
@@ -687,7 +686,8 @@ const VFX_PERSISTENT_TABLE: i32 = 96;
 /// `bReturnFirstMatch` is read but unused. Provisional: the candidates are the
 /// simulation's perception list (the engine's perception query, which also drops creatures
 /// beyond a per-creature limit, is not traced). Origins excludes creatures whose integer
-/// current health is at most zero (0x6a3660). DA2's predicate still needs tracing.
+/// current health is at most zero (0x6a3660). DA2 drops dead creatures before
+/// indexing (0x51a670), using the death byte through 0x52e810.
 fn cluster_center(
     sim: &mut Sim,
     creator: ObjectId,
@@ -712,7 +712,12 @@ fn cluster_center(
                     .get(&7)
                     .is_some_and(|&(_, current)| (1.0..2147483648.0).contains(&current))
             } else {
-                o.dead
+                // DA2 0x51a670..0x51a69d: discard the dead before assigning
+                // candidate indexes, including the unselectable index zero.
+                if o.dead {
+                    return None;
+                }
+                false
             };
             Some((c, o.position, excluded))
         })
@@ -877,7 +882,7 @@ fn applied_effect(
     Some(e)
 }
 
-/// Applies a visual effect (type 4) to an object as any effect is applied; an instant one,
+/// Applies a visual effect (type 4) through the game's effect dispatcher; an instant one,
 /// which leaves nothing on the object, is noted for presentation ([`crate::world::InstantVfx`]).
 fn apply_visual_or_effect(h: &mut ScriptHost, target: ObjectId, e: Effect) {
     let instant = constant(&h.sim.table, "EFFECT_DURATION_TYPE_INSTANT");
@@ -3361,6 +3366,16 @@ pub fn call(
                 return ok(Value::Int(0));
             };
             let target = obj(a, 0);
+            if h.sim.game == thedas_vfs::Game::DragonAge2 {
+                let admitted = h.sim.da2_add_command(
+                    target,
+                    c,
+                    int(a, 2),
+                    int(a, 3) != 0,
+                    a.get(4).map_or(-1, |_| int(a, 4)),
+                );
+                return ok(Value::Int(i32::from(admitted)));
+            }
             let origins = h.sim.game == thedas_vfs::Game::Origins;
             let front = if origins {
                 int(a, 2) == 1
@@ -3439,30 +3454,12 @@ pub fn call(
                     }
                 }
             }
-            if front
-                && h.sim.game == thedas_vfs::Game::DragonAge2
-                && h.sim.world.get(target).is_some_and(|o| {
-                    o.commands
-                        .first()
-                        .is_some_and(|c| c.cancellable && c.name == "CommandUseAbility")
-                })
-            {
-                h.sim.finish_chained_ability(target);
-            }
             h.sim.world.trace.push(TraceEntry::Command {
                 t,
                 object: target,
                 command: c.name.clone(),
                 status: "queued".into(),
             });
-            if front
-                && h.sim
-                    .world
-                    .get(target)
-                    .is_some_and(|o| o.commands.first().is_some_and(|c| c.from.is_some()))
-            {
-                h.sim.da2_stop_locomotion(target);
-            }
             match h.sim.world.get_mut(target) {
                 Some(o) => {
                     // Origins uses a growing list, not a ten-command capacity.
@@ -4675,7 +4672,43 @@ pub fn call(
         // area ahead of the scripts' CreateObject calls, and returns TRUE: a loading
         // optimisation the simulation does without (it creates objects when asked).
         "CreatePool" => ok(Value::Int(1)),
-        "GetCreatureGoreLevel" => ok(Value::Float(0.0)),
+        // Origins keeps gore on the creature appearance. Scripts own accumulation,
+        // healing and resets. DA2's native appearance path remains untraced.
+        "GetCreatureGoreLevel" => ok(Value::Float(
+            if h.sim.game == thedas_vfs::Game::Origins && h.sim.show_gore {
+                h.object(obj(a, 0))
+                    .filter(|o| o.kind == ObjectKind::Creature)
+                    .map_or(0.0, |o| o.gore_level)
+            } else {
+                0.0
+            },
+        )),
+        "SetCreatureGoreLevel" => {
+            if h.sim.game == thedas_vfs::Game::Origins {
+                // 0x747c40 clamps before writing every body/equipment slot.
+                let value = float(a, 1);
+                if let Some(o) = h
+                    .sim
+                    .world
+                    .get_mut(obj(a, 0))
+                    .filter(|o| o.kind == ObjectKind::Creature)
+                {
+                    o.gore_level = if value.is_finite() {
+                        value.clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    };
+                }
+            } else {
+                *h.sim
+                    .world
+                    .trace
+                    .presentation
+                    .entry(name.to_string())
+                    .or_default() += 1;
+            }
+            void()
+        }
         "GetCreaturePropertyType" => {
             ok(Value::Int(if h.sim.game == thedas_vfs::Game::DragonAge2 {
                 property_bounds(h.sim, int(a, 1)).map_or(0, |b| b.0)
@@ -5936,6 +5969,17 @@ pub fn call(
             ev.strings = vec![script.clone()];
             let delay = h.sim.world.rng.below(150).max(0) as u64 + int(a, 4).max(0) as u64;
             h.sim.world.queue_event(delay, caller, ev, Some(script));
+            void()
+        }
+        // DA2 0x4ebfd0 pushes the desktop platform constant, independent of
+        // the replacement engine's host OS.
+        "GetPlatform" if h.sim.game == thedas_vfs::Game::DragonAge2 => ok(Value::Int(1)),
+        // DA2 0x4f08f0 stops a model's additive channel; 0x4ecfc0 invokes a
+        // player-screen hit effect. Neither returns a script value or changes
+        // combat state. Their presentation systems are not simulated here.
+        "StopAdditiveAnimation" | "DoPlayerHitEffect"
+            if h.sim.game == thedas_vfs::Game::DragonAge2 =>
+        {
             void()
         }
         // Presentation only.
@@ -12695,6 +12739,77 @@ mod tests {
     }
 
     #[test]
+    fn origins_gore_is_saved_clamped_and_masked_by_the_client_option() {
+        let table = Arc::new(
+            EngineTable::parse(
+                br#"
+            float GetCreatureGoreLevel(object o) = 719;
+            void SetCreatureGoreLevel(object o, float f) = 720;
+        "#,
+            )
+            .unwrap(),
+        );
+        let mut sim = Sim::new(Arc::new(Vfs::new()), table, 1);
+        let creature = sim.world.spawn(ObjectKind::Creature, "creature");
+        let item = sim.world.spawn(ObjectKind::Item, "item");
+        let who = [Value::Object(creature)];
+        assert_eq!(
+            run(&mut sim, creature, "GetCreatureGoreLevel", &who),
+            Some(Value::Float(0.0))
+        );
+        for (value, expected) in [(-1.0, 0.0), (2.0, 1.0), (0.42, 0.42)] {
+            run(
+                &mut sim,
+                creature,
+                "SetCreatureGoreLevel",
+                &[Value::Object(creature), Value::Float(value)],
+            );
+            assert_eq!(
+                run(&mut sim, creature, "GetCreatureGoreLevel", &who),
+                Some(Value::Float(expected))
+            );
+        }
+        for id in [item, OBJECT_INVALID] {
+            run(
+                &mut sim,
+                creature,
+                "SetCreatureGoreLevel",
+                &[Value::Object(id), Value::Float(1.0)],
+            );
+            assert_eq!(
+                run(
+                    &mut sim,
+                    creature,
+                    "GetCreatureGoreLevel",
+                    &[Value::Object(id)]
+                ),
+                Some(Value::Float(0.0))
+            );
+        }
+        sim.client_option_message(
+            crate::chargen::MSG_CLIENT_OPTION,
+            &["GameOptions.ShowGore".into(), "0".into()],
+        );
+        assert_eq!(
+            run(&mut sim, creature, "GetCreatureGoreLevel", &who),
+            Some(Value::Float(0.0))
+        );
+        assert_eq!(sim.world.get(creature).unwrap().gore_level, 0.42);
+        sim.client_option_message("ClientOptions.RestoreDefaults", &[]);
+        assert_eq!(
+            run(&mut sim, creature, "GetCreatureGoreLevel", &who),
+            Some(Value::Float(0.42))
+        );
+        let object = sim.world.get(creature).unwrap();
+        let mut saved = serde_json::to_value(object).unwrap();
+        let restored: crate::world::Object = serde_json::from_value(saved.clone()).unwrap();
+        assert_eq!(restored.gore_level, 0.42);
+        saved.as_object_mut().unwrap().remove("gore_level");
+        let old: crate::world::Object = serde_json::from_value(saved).unwrap();
+        assert_eq!(old.gore_level, 0.0);
+    }
+
+    #[test]
     fn dispatch_cleanup_preserves_hero_defaults_and_presentation_routing() {
         let table = Arc::new(
             EngineTable::parse(
@@ -12773,14 +12888,24 @@ mod tests {
                     &mut s,
                     hero,
                     "SetCreatureGoreLevel",
-                    &[Value::Object(hero), Value::Float(1.0)]
+                    &[Value::Object(hero), Value::Float(1.0)],
                 ),
                 None
             );
-            assert_eq!(
-                s.world.trace.presentation.get("SetCreatureGoreLevel"),
-                Some(&1)
-            );
+            if game == thedas_vfs::Game::Origins {
+                assert_eq!(s.world.get(hero).unwrap().gore_level, 1.0);
+                assert!(
+                    !s.world
+                        .trace
+                        .presentation
+                        .contains_key("SetCreatureGoreLevel")
+                );
+            } else {
+                assert_eq!(
+                    s.world.trace.presentation.get("SetCreatureGoreLevel"),
+                    Some(&1)
+                );
+            }
             assert!(
                 s.world.trace.entries.is_empty(),
                 "the later log arm is unreachable"
@@ -13585,6 +13710,135 @@ mod coverage_tests {
             };
             apply_visual_or_effect(&mut h, target, effect);
             assert_eq!(s.world.get(target).unwrap().effects.len(), 2, "case {case}");
+        }
+    }
+
+    #[test]
+    fn origins_visual_effects_bypass_validation_without_disturbing_current_effect() {
+        for game in [thedas_vfs::Game::Origins, thedas_vfs::Game::DragonAge2] {
+            let table = EngineTable::parse(
+                format!(
+                    "{LDF}\nvoid SetIsCurrentEffectValid(int valid) = 201;\n\
+                     void Engine_ApplyEffectOnObject(int d, effect e, object o, float f, object c, int a) = 202;\n"
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+            let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(table), 7);
+            s.game = game;
+            s.world.trace.keep = true;
+            let target = s.world.spawn(ObjectKind::Creature, "visual_target");
+            s.world.hero = Some(target);
+            s.world.get_mut(target).unwrap().script = Some("reject".into());
+            // Synthetic hook: SetIsCurrentEffectValid(0); return.
+            let code = [4, 3, 0, 0, 0, 0, 5, 0, 0, 201, 1, 0x20, 0];
+            let mut bytes = b"NCS V1.0B".to_vec();
+            bytes.extend(((13 + code.len()) as u32).to_be_bytes());
+            bytes.extend(code);
+            s.add_script("reject", thedas_script::Ncs::parse(&bytes).unwrap());
+            let outer = Effect {
+                ty: 1012,
+                ints: vec![42],
+                ..Default::default()
+            };
+            s.current_effect = Some((outer.clone(), false));
+            s.current_effect_target = Some(target);
+            for entry in 0..4 {
+                let effect = Effect {
+                    ty: 4,
+                    ints: vec![3006],
+                    creator: Some(target),
+                    duration_type: 5,
+                    ..Default::default()
+                };
+                let handle = s.world.store_new_effect(effect.clone());
+                let effect_value = Value::Engine {
+                    ty: 3,
+                    handle: Some(handle),
+                };
+                match entry {
+                    0 => {
+                        run(
+                            &mut s,
+                            target,
+                            "ApplyEffectVisualEffect",
+                            &[
+                                Value::Object(target),
+                                Value::Object(target),
+                                Value::Int(3006),
+                                Value::Int(5),
+                                Value::Float(0.0),
+                                Value::Int(0),
+                            ],
+                        );
+                    }
+                    1 => {
+                        run(
+                            &mut s,
+                            target,
+                            "Engine_ApplyEffectOnObject",
+                            &[
+                                Value::Int(5),
+                                effect_value,
+                                Value::Object(target),
+                                Value::Float(0.0),
+                                Value::Object(target),
+                                Value::Int(0),
+                            ],
+                        );
+                    }
+                    2 => {
+                        run(
+                            &mut s,
+                            target,
+                            "Engine_ApplyEffectOnParty",
+                            &[
+                                Value::Int(5),
+                                effect_value,
+                                Value::Float(0.0),
+                                Value::Object(target),
+                                Value::Int(0),
+                                Value::Int(0),
+                            ],
+                        );
+                    }
+                    _ => s.apply_effect(target, effect),
+                }
+                assert_eq!(s.current_effect, Some((outer.clone(), false)));
+                assert_eq!(s.current_effect_target, Some(target));
+            }
+            let native = game == thedas_vfs::Game::Origins;
+            let effects = s.world.get(target).unwrap().effects.clone();
+            assert_eq!(effects.len(), if native { 4 } else { 0 });
+            for effect in &effects {
+                assert!(effect.id > 0);
+                assert_eq!(effect.visual_target, Some(target));
+                assert_eq!(effect.creator, Some(target));
+                assert_eq!(effect.expires, None);
+                assert!(s.remove_effect(target, effect));
+            }
+            assert_eq!(
+                s.world
+                    .trace
+                    .entries
+                    .iter()
+                    .filter(|e| matches!(e,
+                        crate::trace::TraceEntry::ScriptStart { script, .. } if script == "reject"
+                    ))
+                    .count(),
+                if native { 0 } else { 4 },
+            );
+            // Script-defined effects still execute and obey the rejecting hook.
+            s.apply_effect(
+                target,
+                Effect {
+                    ty: 1001,
+                    duration_type: 3,
+                    ..Default::default()
+                },
+            );
+            assert!(s.world.get(target).unwrap().effects.is_empty());
+            assert_eq!(s.current_effect, Some((outer, false)));
         }
     }
 
@@ -14446,6 +14700,162 @@ mod coverage_tests {
     }
 
     #[test]
+    fn remove_all_effects_death_filter_removes_stun_and_preserves_exemptions() {
+        let mut s = sim();
+        let tables = crate::m2da::Tables::empty();
+        tables.insert(
+            "effects",
+            &["IgnoreDeath"],
+            vec![
+                (1027, vec![Cell::Int(0)]), // stun
+                (1017, vec![Cell::Int(0)]), // damage over time
+                (1068, vec![Cell::Int(1)]), // mabari dominance
+            ],
+        );
+        s.world.tables = Arc::new(tables);
+        let c = s.world.spawn(ObjectKind::Creature, "fallen");
+        let effects: Vec<_> = [
+            (1027, 2, 0),
+            (1027, 3, 0), // permanent does not mean survives death
+            (1017, 2, 0),
+            (1068, 3, 0),
+            (1012, 3, 500_001),
+            (1012, 4, 0),
+            (1012, 5, 0),
+            (7, 6, 0),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(i, (ty, duration_type, ability))| Effect {
+            id: i as i32 + 1,
+            ty,
+            duration_type,
+            ability,
+            expires: (duration_type == 2).then_some(100_000),
+            ..Default::default()
+        })
+        .collect();
+        for keep_injuries in [true, false] {
+            s.world.get_mut(c).unwrap().effects = effects.clone();
+            s.kill(c, OBJECT_INVALID);
+            run(
+                &mut s,
+                c,
+                "RemoveAllEffects",
+                &[
+                    Value::Object(c),
+                    Value::Int(keep_injuries as i32),
+                    Value::Int(1),
+                ],
+            );
+            let remaining: Vec<_> = s
+                .world
+                .get(c)
+                .unwrap()
+                .effects
+                .iter()
+                .map(|e| e.id)
+                .collect();
+            assert_eq!(
+                remaining,
+                if keep_injuries {
+                    vec![4, 5, 6, 7, 8]
+                } else {
+                    vec![4, 6, 7, 8]
+                }
+            );
+            // Expiration must not blanket-clear a corpse's persistent effects.
+            s.expire_effects();
+            assert_eq!(s.world.get(c).unwrap().effects.len(), remaining.len());
+        }
+    }
+
+    #[test]
+    fn removing_stun_from_a_corpse_runs_its_callback_once_and_survives_save_reload() {
+        let table = EngineTable::parse(
+            b"\
+            int EVENT_TYPE_REMOVE_EFFECT = 32;\n\
+            int PROPERTY_DEPLETABLE_HEALTH = 7;\n\
+            int PROPERTY_VALUE_MODIFIER = 4;\n\
+            void UpdateCreatureProperty(object o, int p, float v, int t) = 1;\n\
+            void RemoveAllEffects(object o, int i, int d) = 2;\n",
+        )
+        .unwrap();
+        let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(table), 1);
+        let c = s.world.spawn(ObjectKind::Creature, "fallen");
+        // Our synthetic removal callback restores the stun's Dexterity modifier:
+        // UpdateCreatureProperty(OBJECT_SELF, 2, 1000.0, 4).
+        let mut code = vec![4, 3];
+        code.extend(4_i32.to_be_bytes());
+        code.extend([4, 4]);
+        code.extend(1000_f32.to_be_bytes());
+        code.extend([4, 3]);
+        code.extend(2_i32.to_be_bytes());
+        code.extend([4, 6]);
+        code.extend(0_u32.to_be_bytes());
+        code.extend([5, 0, 0, 1, 4, 0x20, 0]);
+        let mut bytes = b"NCS V1.0B".to_vec();
+        bytes.extend(((13 + code.len()) as u32).to_be_bytes());
+        bytes.extend(code);
+        s.add_script("restore_stun", thedas_script::Ncs::parse(&bytes).unwrap());
+        let stun = Effect {
+            id: 1,
+            ty: 1027,
+            duration_type: 2,
+            expires: Some(100_000),
+            ..Default::default()
+        };
+        let o = s.world.get_mut(c).unwrap();
+        o.script = Some("restore_stun".into());
+        o.modifiers.insert(2, -1000.0);
+        o.effects.push(stun.clone());
+        s.kill(c, OBJECT_INVALID);
+        s.current_effect = Some((
+            Effect {
+                ty: 7,
+                ..Default::default()
+            },
+            true,
+        ));
+        s.current_effect_target = Some(c);
+        run(
+            &mut s,
+            c,
+            "RemoveAllEffects",
+            &[Value::Object(c), Value::Int(1), Value::Int(1)],
+        );
+        let o = s.world.get(c).unwrap();
+        assert!(o.dead && o.effects.is_empty());
+        assert_eq!(o.modifiers.get(&2).copied().unwrap_or(0.0), 0.0);
+        assert_eq!(
+            s.current_effect.as_ref().unwrap().0.ty,
+            7,
+            "nested removal restores the killing effect"
+        );
+        assert_eq!(s.current_effect_target, Some(c));
+        assert!(
+            !s.remove_effect(c, &stun),
+            "already removed; callback must not run twice"
+        );
+        let saved = s.save_json().unwrap();
+        s.load_json(&saved).unwrap();
+        assert!(s.world.get(c).unwrap().dead);
+        assert!(s.world.get(c).unwrap().effects.is_empty());
+        s.world.time_ms = 100_000;
+        s.expire_effects();
+        assert_eq!(
+            s.world
+                .get(c)
+                .unwrap()
+                .modifiers
+                .get(&2)
+                .copied()
+                .unwrap_or(0.0),
+            0.0
+        );
+    }
+
+    #[test]
     fn ghost_and_quickbar_switches_are_kept_on_the_creature() {
         let mut s = sim();
         let c = s.world.spawn(ObjectKind::Creature, "c");
@@ -14608,6 +15018,17 @@ mod coverage_tests {
         let (got_area, p) = center(&mut s, vec![x2, a2, b2, c2], 1, 3, 0);
         assert_eq!(got_area, area);
         assert!((p[0] - 309.5 / 3.0).abs() < 1e-4 && (p[1] - 1.0).abs() < 1e-4);
+
+        // DA2 removes a corpse before indexing: the sole living hostile is
+        // then index zero and cannot win. A living first-candidate control can.
+        s.game = thedas_vfs::Game::DragonAge2;
+        s.world.get_mut(lone).unwrap().dead = true;
+        assert_eq!(center(&mut s, vec![lone, a], 1, 1, 0).0, OBJECT_INVALID);
+        s.world.get_mut(lone).unwrap().dead = false;
+        assert_eq!(
+            center(&mut s, vec![lone, a], 1, 1, 0),
+            (area, [20.0, 0.0, 0.0])
+        );
 
         for game in [thedas_vfs::Game::Origins, thedas_vfs::Game::DragonAge2] {
             s.game = game;
@@ -15421,5 +15842,40 @@ mod coverage_tests {
                     .contains_key("IsDestroyable")
             );
         }
+    }
+    #[test]
+    fn da2_desktop_platform_and_presentation_stubs_leave_simulation_unchanged() {
+        let table = Arc::new(EngineTable::parse(
+            b"int GetPlatform() = 694;\nvoid StopAdditiveAnimation(object o, int n) = 932;\nvoid DoPlayerHitEffect(int n, int step) = 936;\n"
+        ).unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        s.game = thedas_vfs::Game::DragonAge2;
+        let who = s.world.spawn(ObjectKind::Creature, "actor");
+        let before = s.save_json().unwrap();
+        assert_eq!(run(&mut s, who, "GetPlatform", &[]), Some(Value::Int(1)));
+        for target in [who, OBJECT_INVALID] {
+            assert_eq!(
+                run(
+                    &mut s,
+                    who,
+                    "StopAdditiveAnimation",
+                    &[Value::Object(target), Value::Int(3)]
+                ),
+                None
+            );
+        }
+        for effect in [-1, 0, 1, 5] {
+            assert_eq!(
+                run(
+                    &mut s,
+                    who,
+                    "DoPlayerHitEffect",
+                    &[Value::Int(effect), Value::Int(2)]
+                ),
+                None
+            );
+        }
+        assert_eq!(s.save_json().unwrap(), before);
+        assert!(s.world.trace.unimplemented.is_empty());
     }
 }

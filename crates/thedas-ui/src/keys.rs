@@ -207,8 +207,10 @@ pub const TAGS: &[(&str, Tag)] = &[
     ("TacticsKey", Tag::Action("ToggleTactics")),
     ("ZoomInMouse", Tag::Action("ZoomIn")),
     ("ZoomOutMouse", Tag::Action("ZoomOut")),
-    // left-click, right-click, left-clicking, right-clicking, Left-clicking, Left-click,
-    // Right-click, right.
+    // Unswapped buttons, as ReplaceDesignerTags selects them with SwapMouseButtons = 0.
+    // core_en-us.tlk: 399131 = right-click, 399132 = left-click (not numerical left/right
+    // order); 399133/4 = right/left-clicking, 399135/6 = Right/Left-clicking,
+    // 330711/2 = Left/Right-click, 399137/8 = right/left.
     ("LeftClickDefault", Tag::Text(399132)),
     ("RightClickDefault", Tag::Text(399131)),
     ("LeftClickingDefault", Tag::Text(399134)),
@@ -294,6 +296,35 @@ pub fn replace_key_tags(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unswapped_mouse_tags_keep_the_shipped_tlk_button_names() {
+        // The strings shipped in core_en-us.tlk. In particular the orders lesson uses
+        // RightClickDefaultCapped, not a tag whose name refers to the selection button.
+        let strings = |id| {
+            Some(
+                match id {
+                    399131 => "right-click",
+                    399132 => "left-click",
+                    399133 => "right-clicking",
+                    399134 => "left-clicking",
+                    399135 => "Right-clicking",
+                    399136 => "Left-clicking",
+                    330711 => "Left-click",
+                    330712 => "Right-click",
+                    399137 => "right",
+                    399138 => "left",
+                    _ => return None,
+                }
+                .to_string(),
+            )
+        };
+        let text = "<LeftClickDefault/>|<RightClickDefault/>|<LeftClickingDefault/>|<RightClickingDefault/>|<LeftClickingDefaultCapped/>|<LeftClickDefaultCapped/>|<RightClickDefaultCapped/>|<RightButtonDefault/>";
+        assert_eq!(
+            replace_key_tags(text, |_| None, strings),
+            "left-click|right-click|left-clicking|right-clicking|Left-clicking|Left-click|Right-click|right"
+        );
+    }
 
     #[test]
     fn inputs_have_inputmap_rows() {

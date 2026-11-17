@@ -170,6 +170,10 @@ pub struct Object {
     /// template's `Appearance Data`. Saved.
     #[serde(default)]
     pub head_morph: Option<String>,
+    /// Origins appearance gore, set by scripts (0x65d650 -> 0x747c40). The original
+    /// saves appearance field 0x3fc4. Older replacement-engine saves start clean.
+    #[serde(default)]
+    pub gore_level: f32,
     /// Character creation's appearance sliders as the player left them (slider id, see
     /// [`crate::appearance`], to value). Saved, as the face they make is the player's.
     #[serde(default)]
@@ -273,6 +277,7 @@ impl Object {
             decay_forced: false,
             ambient_ms: 0.0,
             head_morph: None,
+            gore_level: 0.0,
             face_choices: BTreeMap::new(),
             immortal: false,
             health_floor_one: false,
@@ -343,7 +348,7 @@ pub struct Command {
     /// `COMMAND_TYPE_*`.
     pub ty: i32,
     pub name: String,
-    /// Origins' AddCommand bStatic: ordinary add behavior cannot clear this command.
+    /// AddCommand bStatic; native active-command clearing rules differ by game.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub is_static: bool,
     pub target: Option<ObjectId>,
@@ -1252,10 +1257,9 @@ impl World {
     }
 
     pub fn by_tag(&self, tag: &str) -> impl Iterator<Item = &Object> {
-        let tag = tag.to_ascii_lowercase();
         self.objects
             .values()
-            .filter(move |o| o.tag.to_ascii_lowercase() == tag)
+            .filter(move |o| o.tag.eq_ignore_ascii_case(tag))
     }
 
     /// Removes an object `delay_ms` from now.

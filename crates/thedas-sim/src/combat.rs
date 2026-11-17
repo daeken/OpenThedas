@@ -29,6 +29,8 @@
 //! - **Effects.** `ApplyEffectOnObject` runs the target's `EVENT_TYPE_APPLY_EFFECT` handler at
 //!   once, with `GetCurrentEffect` returning the effect. Unless the handler calls
 //!   `SetIsCurrentEffectValid(FALSE)`, an effect with a duration stays on the target.
+//!   Origins visual effects instead use the native type-4 handler without that event
+//!   (see `docs/notes/origins-visual-effect-dispatch.md`).
 //! - **Resurrection.** An accepted `EFFECT_TYPE_RESURRECTION` brings the target back; its
 //!   handler restores health.
 //! - **Death.** An `EFFECT_TYPE_DEATH` that its handler accepts kills the target (the rules
@@ -36,7 +38,7 @@
 //!   or below and is neither immortal nor plot dies and gets `EVENT_TYPE_DEATH`, with the
 //!   killer as creator and object 0.
 //!
-//! All of this is provisional: event layouts are read from how `rules_core` reads them, and
+//! Except where native addresses are cited, this is provisional: event layouts are read from how `rules_core` reads them, and
 //! the range and default attack time are guesses, not values taken from the executable.
 
 use serde::{Deserialize, Serialize};
@@ -961,8 +963,8 @@ impl Sim {
         self.world.get(seen).is_some_and(|o| o.combat.stealth) && self.hostile(who, seen)
     }
 
-    /// Runs a target's `APPLY_EFFECT` handler for an effect, keeps it if it lasts, and
-    /// checks for death afterwards.
+    /// Applies an effect, using the native Origins visual path or the target's
+    /// `APPLY_EFFECT` handler, and keeps it if it lasts.
     pub fn apply_effect(&mut self, target: ObjectId, mut effect: Effect) {
         if self.world.get(target).is_none() {
             return;
@@ -982,6 +984,16 @@ impl Sim {
                 effect.ty, creator, effect.floats
             ),
         });
+        // DAOrigins.exe 0x7a0ee8..0x7a0f1a dispatches type 4 to 0x7a00a0,
+        // which attaches the visual without raising APPLY_EFFECT (0x79fe90).
+        // Do not expose this visual as the current script effect, including when
+        // it is applied from inside another effect's handler. DA2 is untraced.
+        if self.game == thedas_vfs::Game::Origins && effect.ty == 4 {
+            if effect.duration_type != constant_of(self, "EFFECT_DURATION_TYPE_INSTANT") {
+                self.world.get_mut(target).unwrap().effects.push(effect);
+            }
+            return;
+        }
         let health = constant_of(self, "PROPERTY_DEPLETABLE_HEALTH");
         let health_of = |s: &Sim| {
             s.world
@@ -1116,6 +1128,11 @@ impl Sim {
             None => None,
         };
         let Some(effect) = removed else { return false };
+        // The paired native type-4 removal handler (0x7a0150) detaches the
+        // visual without REMOVE_EFFECT, just as application bypasses the hook.
+        if self.game == thedas_vfs::Game::Origins && effect.ty == 4 {
+            return true;
+        }
         // An area of effect goes with its effect (DAOrigins.exe 0x7a0520).
         let aoe = (effect.ty == crate::aoe::EFFECT_TYPE_AOE)
             .then(|| effect.objects.first().copied())
@@ -2410,8 +2427,9 @@ impl Sim {
 
     /// The trees a creature's ability animations are looked up in, first to last: its main
     /// weapon's own tree (`bitm_base.gda`, e.g. `Staff.anb`), its weapon-style tree, its
-    /// combat tree. Provisional (see [`Sim::ability_timing`]).
-    pub(crate) fn ability_trees(&self, id: ObjectId) -> Vec<String> {
+    /// combat tree. Read-only: presentation also uses this order for paired death-blow
+    /// actions already selected by the simulation. Provisional (see [`Sim::ability_timing`]).
+    pub fn ability_trees(&self, id: ObjectId) -> Vec<String> {
         let mut trees = Vec::new();
         let slot = constant_of(self, "INVENTORY_SLOT_MAIN");
         let weapon = self
