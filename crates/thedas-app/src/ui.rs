@@ -881,7 +881,8 @@ impl UiLayer {
     /// optionsmenu.gfx sets each option as the player changes it and sends
     /// `ClientOptions.CommitOptions` only from OK (and from its resolution confirmation), so
     /// what was set without it is dropped when the screen goes. The difficulty, which the
-    /// simulation keeps, is put back the way the screen sets it (the same message).
+    /// simulation keeps, and the tutorial/auto-pause settings it reads, are put back the
+    /// way the screen sets them (the same message).
     /// Provisional: the exe's own handling (its handlers at 0x7946c0) is not traced.
     fn options_screen(&mut self, up: bool, sim: &Arc<Mutex<Sim>>) {
         match (up, self.options_before.take()) {
@@ -899,22 +900,51 @@ impl UiLayer {
             }
             (true, before) => self.options_before = before,
             (false, Some((options, difficulty))) => {
+                let restored = [
+                    (thedas_ui::options::DIFFICULTY, f64::from(difficulty)),
+                    (
+                        "GameOptions.ShowTutorials",
+                        options
+                            .get("GameOptions.ShowTutorials")
+                            .copied()
+                            .unwrap_or(1.0),
+                    ),
+                    (
+                        "GameOptions.AutoPauseCombat",
+                        options
+                            .get("GameOptions.AutoPauseCombat")
+                            .copied()
+                            .unwrap_or(0.0),
+                    ),
+                    (
+                        "GameOptions.ShowGore",
+                        if options.get("GameOptions.ShowGore").copied().unwrap_or(1.0) != 0.0 {
+                            1.0
+                        } else {
+                            0.0
+                        },
+                    ),
+                ];
                 if let Ok(mut shown) = self.shown.lock() {
                     shown.options = options;
                 }
                 let mut sim = sim.lock().unwrap_or_else(|p| p.into_inner());
-                if sim.world.difficulty != difficulty {
-                    sim.input(
-                        thedas_sim::commands::CommandSource::Player,
-                        thedas_sim::commands::SimCommand::ClientOptionMessage {
-                            name: thedas_sim::chargen::MSG_CLIENT_OPTION.to_string(),
-                            args: [
-                                thedas_ui::options::DIFFICULTY.to_string(),
-                                difficulty.to_string(),
-                            ]
-                            .to_vec(),
-                        },
-                    );
+                let current = [
+                    f64::from(sim.world.difficulty),
+                    f64::from(u8::from(sim.show_tutorials)),
+                    f64::from(u8::from(sim.auto_pause_combat)),
+                    f64::from(u8::from(sim.show_gore)),
+                ];
+                for ((name, value), current) in restored.into_iter().zip(current) {
+                    if value != current {
+                        sim.input(
+                            thedas_sim::commands::CommandSource::Player,
+                            thedas_sim::commands::SimCommand::ClientOptionMessage {
+                                name: thedas_sim::chargen::MSG_CLIENT_OPTION.to_string(),
+                                args: vec![name.to_string(), value.to_string()],
+                            },
+                        );
+                    }
                 }
             }
             (false, None) => {}
@@ -2527,12 +2557,26 @@ impl UiLayer {
         // A screen that closes takes its tooltip with it: the movie that showed it is gone
         // and cannot clear it (a picker's tooltip stayed drawn over the HUD; a portrait's
         // over the tactics screen that replaced the HUD).
+        // Fixed tooltips share the tutorial's corner, and the movie fades the
+        // tutorial to zero alpha while one is up. A paused lesson must retain
+        // its release button even when a quickbar tooltip was left under the
+        // mouse/controller cursor. Later non-pausing pages allow tooltips again.
         if !changes.closed.is_empty() || !changes.opened.is_empty() {
             for k in ["GUI.TooltipText", "GUITooltips.TooltipText"] {
                 self.stage
                     .bridge
                     .set_value(k, thedas_ui::UiValue::String(String::new()));
             }
+        }
+        if screens.menu.is_none()
+            && sim
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .tutorial_paused()
+        {
+            self.stage
+                .bridge
+                .set_value("GUI.TooltipText", thedas_ui::UiValue::String(String::new()));
         }
         // The store's close button: the simulation's store closes too.
         if changes.dismissed.contains(&Screen::Store) {
@@ -4203,6 +4247,61 @@ mod tests {
         assert_eq!(
             popup_property(&mut ui, &format!("{clip}.image")),
             UiValue::Undefined
+        );
+    }
+
+    #[test]
+    #[ignore = "requires THEDAS_INSTALL and an offscreen GPU"]
+    fn a_fixed_tooltip_cannot_hide_a_pausing_tutorial() {
+        use thedas_ui::UiValue;
+        let mut ui = installed_popup_ui();
+        let mut sim = Sim::new(
+            ui.vfs.clone(),
+            Arc::new(thedas_script::EngineTable::default()),
+            1,
+        );
+        sim.world.tutorials.push(thedas_sim::journal::Tutorial {
+            resref: "lesson".into(),
+            title: None,
+            text: None,
+            pauses: true,
+        });
+        sim.world.tutorial_paused = true;
+        let sim = Arc::new(Mutex::new(sim));
+        ui.attach(&sim);
+        let mut screens = Screens::new(false);
+        for _ in 0..30 {
+            ui.stage
+                .bridge
+                .set_value("GUI.TooltipText", UiValue::String("Item tooltip".into()));
+            ui.play(&mut screens, &sim, 1000.0 / 30.0);
+        }
+        assert_eq!(
+            ui.stage.bridge.value("GUI.TooltipText"),
+            Some(UiValue::String(String::new()))
+        );
+        let alpha = popup_property(&mut ui, "_root.TutorialContainer_mc.Fade_mc._alpha");
+        assert!(
+            matches!(alpha, UiValue::Number(a) if a >= 90.0),
+            "{alpha:?}"
+        );
+        assert_eq!(
+            popup_property(
+                &mut ui,
+                "_root.TutorialContainer_mc.Fade_mc.Tutorial_mc.MovieHidden"
+            ),
+            UiValue::Bool(false)
+        );
+        sim.lock().unwrap().consume_tutorial(false);
+        for _ in 0..30 {
+            ui.stage
+                .bridge
+                .set_value("GUI.TooltipText", UiValue::String("Item tooltip".into()));
+            ui.play(&mut screens, &sim, 1000.0 / 30.0);
+        }
+        assert_eq!(
+            ui.stage.bridge.value("GUI.TooltipText"),
+            Some(UiValue::String("Item tooltip".into()))
         );
     }
 

@@ -2,6 +2,19 @@
 
 use std::sync::LazyLock;
 
+static SOFT_SHADOWS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Improved sun filtering and partition blending. This only changes receiver sampling;
+/// false restores the traced filters. May be changed between frames for paired benchmarks.
+pub fn set_soft_shadows(enabled: bool) {
+    SOFT_SHADOWS.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether improved sun-shadow sampling is enabled for the next frame.
+pub fn soft_shadows() -> bool {
+    SOFT_SHADOWS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub(crate) struct Config {
     pub punch: bool,
     pub objects: bool,

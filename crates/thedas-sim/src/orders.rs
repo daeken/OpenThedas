@@ -49,6 +49,7 @@ impl Sim {
     /// Makes `who` the party member the player controls (the hero when `None`, or when `who`
     /// is not in the party): its AI stops and the rest follow it.
     pub fn set_controlled(&mut self, who: Option<ObjectId>) {
+        self.world.script_controlled = None;
         self.world.controlled = who.filter(|&w| crate::engine::party_of(self).contains(&w));
     }
 

@@ -861,7 +861,7 @@ impl Live {
             );
             return 1;
         }
-        // A tutorial that pauses the game holds it until its popup is dismissed.
+        // A tutorial's pause lasts until its Next/Close action.
         if self.sim().tutorial_paused() {
             return 0;
         }
@@ -1965,6 +1965,18 @@ impl Live {
                 strref: l.strref,
                 female: l.female,
             });
+        let gore: Vec<Option<f32>> = models
+            .iter()
+            .map(|m| {
+                sim.world
+                    .get(m.id)
+                    .filter(|o| {
+                        sim.game == thedas_vfs::Game::Origins
+                            && o.kind == thedas_sim::world::ObjectKind::Creature
+                    })
+                    .map(|o| if sim.show_gore { o.gore_level } else { 0.0 })
+            })
+            .collect();
         let glancers: Vec<ObjectId> = match (exploring, hero, self.looks.glance_reach()) {
             (true, Some(hero), Some(_)) => models
                 .iter()
@@ -2236,6 +2248,9 @@ impl Live {
                 self.opacity.get(&m.id).copied().unwrap_or(1.0)
             };
             objects.renderer.set_prop_opacity(ctx, &objects.scene, i, o);
+            if let Some(amount) = gore.get(i).copied().flatten() {
+                objects.renderer.set_prop_gore(&objects.scene, i, amount);
+            }
         }
         // A cutscene's lights join the level's, for the level and for the objects, and so
         // do the lights of the visual effects (as they stood last frame).
@@ -2708,6 +2723,13 @@ impl Live {
                 });
             }
         }
+        log::trace!(
+            target: "thedas_app::talkcam",
+            "conversation/cutscene frame effects: time_ms={}, dof={:?}, fades={:?}",
+            sim.world.time_ms,
+            out.depth_of_field,
+            out.fades
+        );
         out
     }
 
@@ -3280,6 +3302,17 @@ mod floor_tests {
         assert_eq!(floor_under(&collider, at, Game::DragonAge2), None);
         // The step allowance does not select another storey overhead.
         assert_eq!(floor_under(&floors(&[0.51]), [0.0; 3], Game::Origins), None);
+    }
+
+    #[test]
+    fn proving_platform_top_is_in_reach_of_both_saved_creature_roots() {
+        // A raised platform over the room floor, matching report 1105. Both
+        // creatures can reach its top once conversation layers release the root.
+        let platform = floors(&[-2.02, -1.5]);
+        for z in [-1.6898366, -1.6646719] {
+            let top = floor_under(&platform, [0.0, 0.0, z], Game::Origins).unwrap();
+            assert!((top + 1.5).abs() < 1e-5, "{top}");
+        }
     }
 
     #[test]
@@ -4036,9 +4069,6 @@ impl Live {
         Some(out)
     }
 
-    /// The player's pause key (Space). During a training tutorial the game may not be
-    /// unpaused: the key is the training action `EVENT_TYPE_TRAINING_UNPAUSE` instead (see
-    /// `thedas_sim::training`), and the player's own pause is left as it was.
     /// The controlled party member switches to its other weapon set, as the quickbar's
     /// weapon set button does (the / key, the pad's RT+A).
     pub fn switch_weapon_set(&self) {
@@ -4064,20 +4094,23 @@ impl Live {
         self.aiming.take().map(|a| a.ability)
     }
 
+    /// Space toggles the effective pause. The simulation retains a popup's pause
+    /// and decides whether guided training accepts an unpause request.
     pub fn toggle_pause(&mut self) {
         let mut sim = self.sim();
-        if sim.training_paused() {
-            sim.input(
+        if self.paused || sim.training_paused() || sim.tutorial_paused() {
+            let accepted = sim.input(
                 thedas_sim::commands::CommandSource::Player,
-                thedas_sim::commands::SimCommand::TrainingEvent {
-                    name: "UNPAUSE".to_string(),
-                    arg: 0,
-                },
+                thedas_sim::commands::SimCommand::Unpause,
             );
+            drop(sim);
+            if accepted {
+                self.paused = false;
+            }
             return;
         }
         drop(sim);
-        self.paused = !self.paused;
+        self.paused = true;
     }
 
     /// Makes party member `n` (0 is the hero) the leader the player controls.

@@ -218,8 +218,9 @@ impl Sim {
 
     /// Queues a tutorial plot's popup for a flag just set: one per plot at a time (a plot
     /// already queued is skipped, 0x694032), pausing the game when the plot asks (0x6940c0).
-    /// Provisional: the game's Show Tutorials option is taken to be on, and a flag with no
-    /// text queues nothing.
+    /// Show Tutorials off skips both the popup and its pause (0x760156–0x7601a2).
+    /// A flag with no text queues nothing. Origins' pausing combat lessons include
+    /// their following text pages; only the first page holds the pause (QA capture).
     pub(crate) fn queue_tutorial(&mut self, info: &PlotInfo, flag: i32) {
         if flag >= DEFINED_FLAGS || !self.is_tutorial_kind(info.kind) || !self.show_tutorials {
             return;
@@ -244,12 +245,54 @@ impl Sim {
         });
         if info.pauses {
             self.world.tutorial_paused = true;
+            self.prepare_pausing_tutorials();
         }
     }
 
-    /// Takes the tutorial shown off the queue, or all of them; the game resumes once none is
-    /// left if a tutorial paused it.
+    /// Restore the remaining pages of a paused lesson, including in older saves
+    /// that serialized only its first page. Keep the lesson responsible for the
+    /// pause in front of an older backlog, so its Next button is reachable.
+    /// Provisional: foreground priority is a recovery policy; the native queue
+    /// appends. Following text flags match the captured two-page combat lesson;
+    /// other page layouts have not been captured in the original.
+    pub(crate) fn prepare_pausing_tutorials(&mut self) {
+        if self.game != thedas_vfs::Game::Origins {
+            return;
+        }
+        let Some(index) = self.world.tutorials.iter().position(|t| t.pauses) else {
+            return;
+        };
+        let first = self.world.tutorials.remove(index);
+        let mut pages = vec![first.clone()];
+        if let Some(info) = self.plots.get(&self.vfs, &first.resref)
+            && let Some((&flag, _)) = info
+                .journal
+                .iter()
+                .find(|(_, text)| Some(**text) == first.text)
+        {
+            for (_, &text) in info.journal.range((flag + 1)..) {
+                if self.has_text(text)
+                    && !self
+                        .world
+                        .tutorials
+                        .iter()
+                        .any(|t| t.resref == first.resref && t.text == Some(text))
+                {
+                    pages.push(Tutorial {
+                        text: Some(text),
+                        pauses: false,
+                        ..first.clone()
+                    });
+                }
+            }
+        }
+        self.world.tutorials.splice(0..0, pages);
+    }
+
+    /// Next takes the page shown off the queue; Close takes all of them. A
+    /// non-pausing following page does not inherit the page just consumed's pause.
     pub fn consume_tutorial(&mut self, all: bool) {
+        let consumed_pause = self.world.tutorials.first().is_some_and(|t| t.pauses);
         loop {
             if self.world.tutorials.is_empty() {
                 break;
@@ -259,7 +302,11 @@ impl Sim {
                 break;
             }
         }
-        if self.world.tutorials.is_empty() {
+        if self.world.tutorials.is_empty()
+            || (self.game == thedas_vfs::Game::Origins
+                && consumed_pause
+                && !self.world.tutorials.iter().any(|t| t.pauses))
+        {
             self.world.tutorial_paused = false;
         }
     }
@@ -1067,11 +1114,41 @@ mod tests {
     }
 
     #[test]
+    fn disabled_tutorial_flags_do_not_queue_or_pause() {
+        let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(EngineTable::default()), 1);
+        let mut combat = plot("tut_combat_basic", 13, None, &[(0, 20)]);
+        combat.pauses = true;
+        s.plots.insert(combat);
+        s.world.tables().insert(
+            "#108",
+            &["#eb84ee4d", "#12e4743c"],
+            vec![(13, vec![Cell::Int(1), Cell::Int(1)])],
+        );
+        let _ = s.strings.set([(20, "Combat Basics".into())].into());
+        s.input(
+            crate::commands::CommandSource::Player,
+            crate::commands::SimCommand::ClientOptionMessage {
+                name: crate::chargen::MSG_CLIENT_OPTION.into(),
+                args: vec!["GameOptions.ShowTutorials".into(), "0".into()],
+            },
+        );
+        s.set_plot_flag("tut_combat_basic", 0, true, false, OBJECT_INVALID);
+        assert!(s.world.tutorials.is_empty());
+        assert!(!s.tutorial_paused());
+        // Restoring tutorials allows a new notification to queue and pause again.
+        s.client_option_message("ClientOptions.RestoreDefaults", &[]);
+        s.set_plot_flag("tut_combat_basic", 0, false, false, OBJECT_INVALID);
+        s.set_plot_flag("tut_combat_basic", 0, true, false, OBJECT_INVALID);
+        assert_eq!(s.world.tutorials.len(), 1);
+        assert!(s.tutorial_paused());
+    }
+
+    #[test]
     fn tutorial_flags_queue_popups_that_next_and_close_take_off() {
         let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(EngineTable::default()), 1);
         s.plots
             .insert(plot("tut_explore", 13, None, &[(0, 10), (1, 11)]));
-        let mut combat = plot("tut_combat_basic", 13, None, &[(0, 20)]);
+        let mut combat = plot("tut_combat_basic", 13, None, &[(0, 20), (1, 21)]);
         combat.pauses = true;
         s.plots.insert(combat);
         s.plots
@@ -1085,7 +1162,7 @@ mod tests {
             ],
         );
         let _ = s.strings.set(
-            [10, 11, 20, 30]
+            [10, 11, 20, 21, 30]
                 .into_iter()
                 .map(|t| (t, format!("text {t}")))
                 .collect(),
@@ -1106,13 +1183,29 @@ mod tests {
             .collect();
         assert_eq!(
             queued,
-            [("tut_explore", Some(10)), ("tut_combat_basic", Some(20))]
+            [
+                ("tut_combat_basic", Some(20)),
+                ("tut_combat_basic", Some(21)),
+                ("tut_explore", Some(10)),
+            ]
         );
         assert!(s.world.tutorial_paused);
-        // Next takes the first off; the pause holds while any is left.
+        // Old saves contain only page one, behind older notifications. Repair is
+        // idempotent and reconstructs the same queue as a fresh notification.
+        let expected = s.world.tutorials.clone();
+        s.world.tutorials.remove(1);
+        let first = s.world.tutorials.remove(0);
+        s.world.tutorials.push(first);
+        s.prepare_pausing_tutorials();
+        s.prepare_pausing_tutorials();
+        assert_eq!(s.world.tutorials, expected);
+        // Next shows page two and releases page one's pause, with the old
+        // notification still pending. No plot flag is set to manufacture it.
         assert!(s.journal_message(MSG_CONSUME_TUTORIAL, &["0".into()]));
-        assert_eq!(s.world.tutorials.len(), 1);
-        assert!(s.world.tutorial_paused);
+        assert_eq!(s.world.tutorials.len(), 2);
+        assert_eq!(s.world.tutorials[0].text, Some(21));
+        assert!(!s.world.tutorials[0].pauses);
+        assert!(!s.world.tutorial_paused);
         s.set_plot_flag("tut_explore", 1, false, false, o);
         s.set_plot_flag("tut_explore", 1, true, false, o);
         // Close takes them all off and the game resumes.
