@@ -16,11 +16,18 @@ use crate::gpu::DEPTH_FORMAT;
 /// beyond WebGPU's guaranteed 1 and 4 (2x, 8x on Apple GPUs) are usable only on a device
 /// made with `TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES`; without it they would fail to
 /// validate (a 2x terrain pipeline panics the level build).
+///
+/// On the OpenGL backend only 1: the depth resolve reads a `texture_depth_multisampled_2d`,
+/// which naga cannot write as GLSL, so a multisampled level build panics there (a Windows
+/// machine or VM without Vulkan or DX12).
 pub fn supported_samples(
     adapter: &wgpu::Adapter,
     device: &wgpu::Device,
     format: wgpu::TextureFormat,
 ) -> Vec<u32> {
+    if !multisample_backend(adapter.get_info().backend) {
+        return vec![1];
+    }
     let specific = device
         .features()
         .contains(wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES);
@@ -34,6 +41,11 @@ pub fn supported_samples(
         }
     }
     out
+}
+
+/// Whether `backend` can run the multisampled passes (see [`supported_samples`]).
+fn multisample_backend(backend: wgpu::Backend) -> bool {
+    backend != wgpu::Backend::Gl
 }
 
 const RESOLVE_DEPTH: &str = r#"
@@ -364,5 +376,18 @@ impl MsaaTargets {
         pass.set_pipeline(&self.fill);
         pass.set_bind_group(0, &group, &[]);
         pass.draw(0..3, 0..1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::multisample_backend;
+
+    #[test]
+    fn opengl_offers_no_multisampling() {
+        assert!(!multisample_backend(wgpu::Backend::Gl));
+        assert!(multisample_backend(wgpu::Backend::Vulkan));
+        assert!(multisample_backend(wgpu::Backend::Metal));
+        assert!(multisample_backend(wgpu::Backend::Dx12));
     }
 }

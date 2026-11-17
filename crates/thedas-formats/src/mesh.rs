@@ -38,6 +38,8 @@ pub mod field {
 
     pub const BOUNDS_MIN: u32 = 8017;
     pub const BOUNDS_MAX: u32 = 8018;
+    /// Chunk-local (centre.xyz, radius), read by DAOrigins.exe at 0x57edf2.
+    pub const BOUNDS_SPHERE: u32 = 8019;
 }
 
 /// `D3DDECLTYPE`.
@@ -246,6 +248,8 @@ pub struct MeshChunk {
     pub start_index: u32,
     pub elements: Vec<VertexElement>,
     pub bounds: Option<([f32; 3], [f32; 3])>,
+    /// The stored light-selection sphere (8019), independent of the placement/LOD bound.
+    pub sphere: Option<[f32; 4]>,
 }
 
 impl MeshChunk {
@@ -448,6 +452,12 @@ fn read_chunk(gff: &Gff4, c: StructId) -> TypedResult<MeshChunk> {
         }
         None => None,
     };
+    let sphere = d
+        .structs(c, field::BOUNDS)?
+        .first()
+        .map(|&b| d.opt_vec4(b, field::BOUNDS_SPHERE, 0.0))
+        .transpose()?
+        .flatten();
     Ok(MeshChunk {
         vertex_size: d.u32(c, field::VERTEX_SIZE)?,
         vertex_count: d.u32(c, field::VERTEX_COUNT)?,
@@ -460,6 +470,7 @@ fn read_chunk(gff: &Gff4, c: StructId) -> TypedResult<MeshChunk> {
         name,
         elements,
         bounds,
+        sphere,
     })
 }
 
@@ -963,6 +974,35 @@ mod tests {
             ],
         );
         b.finish(root)
+    }
+
+    #[test]
+    fn reads_authored_chunk_sphere_without_rebuilding_it_from_the_box() {
+        let mut b = Builder::new(b"MESH");
+        let bounds = b.add(
+            b"bbox",
+            vec![
+                (field::BOUNDS_MIN, Value::Vec3([-10.0; 3])),
+                (field::BOUNDS_MAX, Value::Vec3([10.0; 3])),
+                (field::BOUNDS_SPHERE, Value::Vec4([1.0, 2.0, 3.0, 7.0])),
+            ],
+        );
+        let c = b.add(
+            b"chnk",
+            vec![
+                (field::VERTEX_SIZE, Value::U32(12)),
+                (field::VERTEX_COUNT, Value::U32(0)),
+                (field::INDEX_COUNT, Value::U32(0)),
+                (field::BOUNDS, structs(&[bounds])),
+            ],
+        );
+        let chunk = read_chunk(&b.finish(c), c).unwrap();
+        assert_eq!(chunk.sphere, Some([1.0, 2.0, 3.0, 7.0]));
+        assert_eq!(chunk.bounds, Some(([-10.0; 3], [10.0; 3])));
+        assert_eq!(
+            Msh::from_gff4(&sample(&[0, 1, 2, 2, 1, 0])).unwrap().chunks[0].sphere,
+            None
+        );
     }
 
     #[test]
