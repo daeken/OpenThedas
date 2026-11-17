@@ -863,6 +863,9 @@ pub struct ConstantContext<'a> {
     pub world: Mat4,
     pub camera: Vec3,
     pub material: &'a SceneMaterial,
+    /// Appearance override for mml_fGoreThreshold (Origins 0x6b73c0).
+    /// None reads the material's authored amount.
+    pub gore: Option<f32>,
     pub lightmap: Option<&'a LightmapRef>,
     pub lights: &'a DrawLights,
     pub ambient: Vec3,
@@ -1317,6 +1320,9 @@ impl ConstantContext<'_> {
                 }
                 Value::Vectors(v)
             }
+            (_, "mml_fGoreThreshold") if self.gore.is_some() => {
+                Value::Vectors(vec![[self.gore.unwrap_or(0.0), 0.0, 0.0, 0.0]])
+            }
             // The engine's fade: fully opaque unless the material says otherwise.
             (_, "mml_fOpacityMultiplier") if self.material_value(&c.name).is_none() => {
                 Value::Vectors(vec![[1.0, 0.0, 0.0, 0.0]])
@@ -1403,6 +1409,9 @@ impl ConstantContext<'_> {
     /// draw was made. Mirrors the cases of [`ConstantContext::value`].
     pub fn per_frame(&self, c: &Constant) -> bool {
         let usage = find_param(self.material, &c.name).and_then(|p| p.usage.as_deref());
+        if c.name == "mml_fGoreThreshold" {
+            return true;
+        }
         // A flickering light's colour changes every frame.
         if self.lights.flickers()
             && (matches!(usage, Some("LightsArray" | "LightsArrayDirected"))
@@ -1572,6 +1581,24 @@ pub fn sampler_texture(
             },
         );
     }
+    // Appearance creation installs Gore_Default on character materials
+    // (0xa60f00/0xa6746f), replacing the authoring placeholder Aur_WhiteVol.
+    // Provisional: preserve explicit custom maps, whose precedence is untraced.
+    if param.name.eq_ignore_ascii_case("mml_tGoreMap")
+        && material.texture(&param.name).is_none()
+        && param.default.as_deref().is_some_and(|name| {
+            name.eq_ignore_ascii_case("Aur_WhiteVol") || name.eq_ignore_ascii_case("Gore_Default")
+        })
+        && matches!(
+            material.material_name().as_str(),
+            "character.mat" | "face.mat" | "weapon.mat" | "cloth.mat"
+        )
+    {
+        return (
+            Some(sampler),
+            TextureSource::ResourceOr("gore_default.dds".into(), "aur_whitevol.dds".into()),
+        );
+    }
     let default = param
         .default
         .as_deref()
@@ -1672,6 +1699,103 @@ mod tests {
     }
 
     #[test]
+    fn gore_uses_the_appearance_amount_and_volume_texture() {
+        let mut material = SceneMaterial {
+            mao: "synthetic.mao".into(),
+            object: MaterialObject::parse(br#"<MaterialObject Name="fixture"><Material Name="character.mat"/>
+                <Float Name="mml_fGoreThreshold" value="0.25"/></MaterialObject>"#).unwrap(),
+            definition: Some(Arc::new(MaterialDef::parse(br#"<Material Name="Character"><ParameterSet Name="p">
+                <Parameter Type="Float" Name="mml_fGoreThreshold" Default="0"/>
+                <Parameter Type="Texture" Name="mml_tGoreMap" SamplerName="smpGore" Default="Aur_WhiteVol"/>
+                </ParameterSet></Material>"#).unwrap())),
+            semantic: "Default".into(), render_class: None, technique: None,
+        };
+        let lights = DrawLights::default();
+        let mut cc = ConstantContext {
+            view: Mat4::IDENTITY,
+            projection: Mat4::IDENTITY,
+            world: Mat4::IDENTITY,
+            camera: Vec3::ZERO,
+            material: &material,
+            gore: None,
+            lightmap: None,
+            lights: &lights,
+            ambient: Vec3::ZERO,
+            bones: &[],
+            irradiance: None,
+            sun: None,
+            fog: [[0.0; 4]; 2],
+            sky: None,
+            clouds: [[0.0; 4]; 3],
+            time: 0.0,
+            shadow: NO_SHADOW_DATA,
+            partition: None,
+            tree: None,
+            winds: &[],
+            flicker: &[],
+        };
+        let t = table(vec![constant(
+            "mml_fGoreThreshold",
+            RegisterSet::Float4,
+            29,
+            1,
+            ParamClass::Scalar,
+        )]);
+        assert!(cc.per_frame(&t.constants[0]));
+        assert_eq!(cc.fill(Some(&t)).floats[29], [0.25, 0.0, 0.0, 0.0]);
+        let mut registers = cc.fill(Some(&t));
+        for amount in [0.6, 0.0, 0.01] {
+            cc.gore = Some(amount);
+            cc.fill_into(Some(&t), &mut registers, |i| cc.per_frame(&t.constants[i]));
+            assert_eq!(registers.floats[29], [amount, 0.0, 0.0, 0.0]);
+        }
+        // Sharing a material cannot change another instance's authored amount.
+        cc.gore = None;
+        assert_eq!(cc.fill(Some(&t)).floats[29][0], 0.25);
+        let samplers = table(vec![constant(
+            "smpGore",
+            RegisterSet::Sampler,
+            8,
+            1,
+            ParamClass::Object,
+        )]);
+        assert_eq!(
+            sampler_texture(
+                Some(&samplers),
+                8,
+                TextureType::Volume,
+                &material,
+                None,
+                None
+            ),
+            (
+                Some("smpGore".into()),
+                TextureSource::ResourceOr("gore_default.dds".into(), "aur_whitevol.dds".into())
+            )
+        );
+        material
+            .object
+            .textures
+            .push(thedas_formats::material::TextureBinding {
+                parameter: "mml_tGoreMap".into(),
+                res_name: "custom_gore".into(),
+                requires_id: false,
+            });
+        assert_eq!(
+            sampler_texture(
+                Some(&samplers),
+                8,
+                TextureType::Volume,
+                &material,
+                None,
+                None
+            )
+            .1,
+            TextureSource::ResourceOr("custom_gore.dds".into(), "aur_whitevol.dds".into())
+        );
+    }
+
+    #[test]
     fn fills_constants_by_name() {
         let xml = br#"<MaterialObject Name="t"><Material Name="static.mat"/>
             <Float Name="mml_fOpacityMultiplier" value="0.5"/></MaterialObject>"#;
@@ -1707,6 +1831,7 @@ mod tests {
             world,
             camera: Vec3::ZERO,
             material: &material,
+            gore: None,
             lightmap: Some(&lm),
             lights: &lights,
             ambient: Vec3::new(0.1, 0.2, 0.3),
@@ -1843,6 +1968,7 @@ mod tests {
             world: Mat4::IDENTITY,
             camera: Vec3::ZERO,
             material: &material,
+            gore: None,
             lightmap: None,
             lights: &lights,
             ambient: Vec3::ZERO,
@@ -1978,6 +2104,7 @@ mod tests {
             world: Mat4::from_translation(Vec3::new(5.0, 0.0, 0.0)),
             camera: Vec3::ZERO,
             material: &material,
+            gore: None,
             lightmap: None,
             lights: &lights,
             ambient: Vec3::ZERO,
@@ -2170,6 +2297,7 @@ mod tests {
             world: Mat4::from_translation(Vec3::new(5.0, 0.0, 0.0)),
             camera: Vec3::ZERO,
             material: &material,
+            gore: None,
             lightmap: Some(&lm),
             lights: &lights,
             ambient: Vec3::ZERO,
@@ -2244,6 +2372,7 @@ mod tests {
                 world,
                 camera: Vec3::ZERO,
                 material: &material,
+                gore: None,
                 lightmap: None,
                 lights: &lights,
                 ambient: Vec3::ZERO,
@@ -2395,6 +2524,7 @@ mod tests {
             world: Mat4::IDENTITY,
             camera: Vec3::ZERO,
             material: &material,
+            gore: None,
             lightmap: None,
             lights: &picked,
             ambient: Vec3::ZERO,

@@ -1965,6 +1965,18 @@ impl Live {
                 strref: l.strref,
                 female: l.female,
             });
+        let gore: Vec<Option<f32>> = models
+            .iter()
+            .map(|m| {
+                sim.world
+                    .get(m.id)
+                    .filter(|o| {
+                        sim.game == thedas_vfs::Game::Origins
+                            && o.kind == thedas_sim::world::ObjectKind::Creature
+                    })
+                    .map(|o| if sim.show_gore { o.gore_level } else { 0.0 })
+            })
+            .collect();
         let glancers: Vec<ObjectId> = match (exploring, hero, self.looks.glance_reach()) {
             (true, Some(hero), Some(_)) => models
                 .iter()
@@ -2210,12 +2222,35 @@ impl Live {
         }
         objects.follow_poses();
         for (i, m) in models.iter().enumerate() {
+            if m.kind == thedas_sim::world::ObjectKind::Creature
+                && log::log_enabled!(target: "thedas_app::animation", log::Level::Trace)
+                && let Some(c) = &posed[i].1
+            {
+                let clips: Vec<_> = std::iter::once(c)
+                    .chain(&c.layers)
+                    .map(|c| {
+                        (
+                            &c.trees,
+                            &c.actions,
+                            c.time,
+                            c.weight,
+                            self.animator
+                                .cached_animation_resource(c)
+                                .map(|(name, _)| name),
+                        )
+                    })
+                    .collect();
+                log::trace!(target: "thedas_app::animation", "posed {} {}: {:?}", m.id, m.tag, clips);
+            }
             let o = if hidden.contains(&m.id) {
                 0.0
             } else {
                 self.opacity.get(&m.id).copied().unwrap_or(1.0)
             };
             objects.renderer.set_prop_opacity(ctx, &objects.scene, i, o);
+            if let Some(amount) = gore.get(i).copied().flatten() {
+                objects.renderer.set_prop_gore(&objects.scene, i, amount);
+            }
         }
         // A cutscene's lights join the level's, for the level and for the objects, and so
         // do the lights of the visual effects (as they stood last frame).
@@ -2688,6 +2723,13 @@ impl Live {
                 });
             }
         }
+        log::trace!(
+            target: "thedas_app::talkcam",
+            "conversation/cutscene frame effects: time_ms={}, dof={:?}, fades={:?}",
+            sim.world.time_ms,
+            out.depth_of_field,
+            out.fades
+        );
         out
     }
 
@@ -2859,6 +2901,26 @@ impl Live {
         let mut placeable_draws = Vec::new();
         let mut moving = std::collections::HashMap::new();
         for (i, (m, p)) in models.iter().zip(&scene.props).enumerate() {
+            if m.kind == thedas_sim::world::ObjectKind::Creature
+                && log::log_enabled!(log::Level::Trace)
+            {
+                let sim = self.sim();
+                let appearance = sim.world.get(m.id).map(|o| o.appearance);
+                let skeletons: Vec<_> = scene
+                    .prop_skeletons(i)
+                    .into_iter()
+                    .map(|s| (s, &scene.skeleton_models[s], scene.skeletons[s].bones.len()))
+                    .collect();
+                log::trace!(
+                    "animation binding {} {}: apr_base row {:?}, models {:?}, skeletons {:?}, motion {:?}",
+                    m.id,
+                    m.tag,
+                    appearance,
+                    m.models,
+                    skeletons,
+                    m.motion
+                );
+            }
             let (interactive, placeable) = {
                 let sim = self.sim();
                 let placeable = sim
