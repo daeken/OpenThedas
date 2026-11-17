@@ -417,6 +417,9 @@ pub struct Command {
     /// Ordinary player attack input enables the script's range fallback (0x47fc51).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub da2_basic_attack_fallback: bool,
+    /// Native DA2 command +0x10. Distinct from the selector's boolean 2.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub da2_player_issued: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
