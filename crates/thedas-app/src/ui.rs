@@ -369,6 +369,12 @@ struct TextPopup {
 }
 
 impl TextPopup {
+    /// How many buttons the box shows: one per label, a trailing empty one left out (the
+    /// popup layer shows `NumButtons` of them, as a script's one-button `ShowPopup` does).
+    fn buttons(&self) -> usize {
+        if self.labels[1].is_empty() { 1 } else { 2 }
+    }
+
     /// Write immediately before showing: the previous dialog's answer and a script's
     /// bindings can change these shared values while this question waits.
     fn write_values(&self, b: &thedas_ui::protocol::GameBridge) {
@@ -378,7 +384,10 @@ impl TextPopup {
             &format!("{k}.DialogBoxText"),
             UiValue::String(self.prompt.clone()),
         );
-        b.set_value(&format!("{k}.NumButtons"), UiValue::Number(2.0));
+        b.set_value(
+            &format!("{k}.NumButtons"),
+            UiValue::Number(self.buttons() as f64),
+        );
         b.set_value(
             &format!("{k}.InputBox"),
             UiValue::Number(f64::from(u8::from(self.text.is_some()))),
@@ -485,6 +494,7 @@ pub struct UiLayer {
     shown: Arc<Mutex<thedas_ui::binding::Presentation>>,
     /// The conversation line on screen and how far it has played.
     line: Option<Line>,
+    conversation_press: crate::conversation_input::ConversationPress,
     /// The level whose resources and minimap the interface has.
     level: Option<String>,
     /// Frames since the minimap's creatures were last sent.
@@ -572,7 +582,7 @@ pub struct UiLayer {
     /// The creature the mouse is over (see [`UiLayer::set_hovered`]).
     hovered: Option<thedas_script::vm::ObjectId>,
     /// A conversation line's continue the movie could not send (see `continue_conversation`).
-    continue_pending: bool,
+    continue_pending: Option<LineKey>,
     next_floaty: u32,
     portraits: PortraitClock,
     paperdoll: PaperdollClock,
@@ -641,7 +651,8 @@ const PORTRAIT_RETRY_MS: f64 = 1000.0;
 
 /// What the portraits show, by member (the party, and the followers picked in an open party
 /// picker: see [`crate::live::portrait_subjects`]): who, in which slot, with which
-/// appearance, head morph and equipment. They are drawn again when it changes.
+/// appearance, head morph and equipment. [`crate::live::Live::portrait_key`] also tracks
+/// the models that have become available to render these inputs.
 pub fn portrait_key(sim: &thedas_sim::Sim) -> Vec<(u32, u64)> {
     use std::hash::{Hash, Hasher};
     crate::live::portrait_subjects(sim)
@@ -693,6 +704,9 @@ struct Line {
     /// How long its voice-over runs (milliseconds), when it has one: it plays that long
     /// instead of a reading time.
     voice_ms: Option<f64>,
+    /// Presentation time when audio first reported the playing voice's duration. Loading
+    /// can hold the voice long after the simulation chose this line.
+    voice_at: f64,
     /// Whether conversation.gfx was last told the line has a voice-over (see
     /// `UiLayer::play`).
     voiced: bool,
@@ -708,6 +722,13 @@ struct Line {
 }
 
 impl Line {
+    fn set_voice_ms(&mut self, ms: Option<f64>) {
+        if self.voice_ms.is_none() && ms.is_some() {
+            self.voice_at = self.t;
+        }
+        self.voice_ms = ms;
+    }
+
     /// Whether it has played. An automatic continuation waits for the line's own
     /// referenced cut to complete (GameModeDialog 0x68de74–0x68df57), keeping its camera
     /// and actors with the line. The presentation clock can run ahead of the cutscene's
@@ -716,7 +737,13 @@ impl Line {
         if self.waits && self.owns_cut && !self.cut_done && self.t.is_finite() {
             return false;
         }
-        self.cut_done || self.t >= self.voice_ms.unwrap_or_else(|| line_ms(&self.key.1))
+        if self.cut_done || self.t == f64::INFINITY {
+            return true;
+        }
+        match self.voice_ms {
+            Some(ms) => self.t - self.voice_at >= ms,
+            None => !self.voiced && self.t >= line_ms(&self.key.1),
+        }
     }
 }
 
@@ -731,6 +758,20 @@ pub fn line_ms(text: &str) -> f64 {
     } else {
         (1500.0 + 55.0 * chars).min(12_000.0)
     }
+}
+
+/// Every response collected in a frame belongs to the line just presented. A movie
+/// callback and the engine's automatic continue can both answer the same click; neither
+/// may answer the next line, or bypass a voice that is still playing.
+fn ready_conversation_responses(messages: &mut Vec<GameMessage>, ready: bool) {
+    let mut answered = !ready;
+    messages.retain(|message| {
+        if matches!(message, GameMessage::Send(name, _) if name == thedas_ui::input::SELECT_RESPONSE) {
+            !std::mem::replace(&mut answered, true)
+        } else {
+            true
+        }
+    });
 }
 
 impl UiLayer {
@@ -806,7 +847,7 @@ impl UiLayer {
     /// [`crate::audio`]), or has no voice-over.
     pub fn set_line_voice_ms(&mut self, ms: Option<f64>) {
         if let Some(l) = self.line.as_mut() {
-            l.voice_ms = ms;
+            l.set_voice_ms(ms);
         }
     }
 
@@ -1019,8 +1060,9 @@ impl UiLayer {
             options_before: None,
             show_all_names: false,
             line_voiced: false,
+            conversation_press: Default::default(),
             settings_file: None,
-            continue_pending: false,
+            continue_pending: None,
             next_floaty: 1,
             portraits: PortraitClock::default(),
             paperdoll: PaperdollClock::default(),
@@ -1762,6 +1804,12 @@ impl UiLayer {
         self.ask(id, prompt, None, a, b);
     }
 
+    /// Tells the player something with the game's own message box and a single button
+    /// (`ok`): the answer's `accepted` is true, and its text is empty.
+    pub fn ask_ok(&mut self, id: u32, prompt: &str, ok: &str) {
+        self.ask(id, prompt, None, ok, "");
+    }
+
     fn ask(&mut self, id: u32, prompt: &str, text: Option<&str>, ok: &str, cancel: &str) {
         self.text_popup = Some(TextPopup {
             id,
@@ -2329,6 +2377,8 @@ impl UiLayer {
             shown.dragging = false;
         }
         self.line = None;
+        self.continue_pending = None;
+        self.conversation_press.screen(false, true);
         self.floaties.clear();
         self.tooltip_text = None;
         self.tooltip_relayout = 0;
@@ -2424,7 +2474,77 @@ impl UiLayer {
         {
             shown.examine = None;
         }
+        let line_changed = line.as_ref().map(|(key, ..)| key) != self.line.as_ref().map(|l| &l.key);
+        if line_changed {
+            self.continue_pending = None;
+        }
+        self.line = match (line, self.line.take()) {
+            (Some((key, _, cutscene, owns_cut)), Some(mut l)) if l.key == key => {
+                l.t += dt_ms;
+                l.cut_done |= l.cut_seen && !cutscene;
+                l.cut_done |= l.owns_cut && !owns_cut;
+                l.cut_seen |= cutscene;
+                l.owns_cut |= owns_cut;
+                Some(l)
+            }
+            (Some((key, waits, cutscene, owns_cut)), _) => {
+                log::debug!(
+                    "conversation new line: {key:?} waits={waits} voiced={} cut={cutscene} owns_cut={owns_cut}",
+                    self.line_voiced
+                );
+                Some(Line {
+                    key,
+                    t: 0.0,
+                    voice_ms: None,
+                    voice_at: 0.0,
+                    voiced: self.line_voiced,
+                    waits,
+                    continued: false,
+                    cut_seen: cutscene,
+                    cut_done: false,
+                    owns_cut,
+                })
+            }
+            (None, _) => None,
+        };
+        // Movie construction reads these values too. Do not expose the binding's default
+        // ready flag or unvoiced flag while the conversation movie initializes.
+        if let Some(l) = &self.line {
+            self.stage.bridge.set_values([
+                (
+                    "Conversation.ResponsesReady".into(),
+                    thedas_ui::UiValue::Number(l.played() as u8 as f64),
+                ),
+                (
+                    "Conversation.HasVO".into(),
+                    thedas_ui::UiValue::Number(
+                        (self.line_voiced || l.voice_ms.is_some()) as u8 as f64,
+                    ),
+                ),
+            ]);
+        }
         let changes = screens.sync(want, &mut self.stage);
+        self.conversation_press.screen(
+            screens.shown().contains(&Screen::Conversation),
+            line_changed || changes.opened.contains(&Screen::Conversation),
+        );
+        if line_changed && let Some(l) = &self.line {
+            // A single empty continue can become a single real reply. The count remains
+            // one, so the movie's list observer must hear it again to reload its text.
+            self.stage.bridge.set_value(
+                "Conversation.Responses",
+                thedas_ui::UiValue::Number(l.key.2.len() as f64),
+            );
+            if let Some(m) = self
+                .stage
+                .movies
+                .iter_mut()
+                .find(|m| m.name == "conversation.gfx")
+            {
+                m.resend_observers(|token| token == "Conversation.Responses");
+            }
+        }
+
         // A screen that closes takes its tooltip with it: the movie that showed it is gone
         // and cannot clear it (a picker's tooltip stayed drawn over the HUD; a portrait's
         // over the tactics screen that replaced the HUD).
@@ -2477,28 +2597,6 @@ impl UiLayer {
                 thedas_sim::commands::SimCommand::PartyPickerSubmit,
             );
         }
-        self.line = match (line, self.line.take()) {
-            (Some((key, _, cutscene, owns_cut)), Some(mut l)) if l.key == key => {
-                l.t += dt_ms;
-                l.cut_done |= l.cut_seen && !cutscene;
-                l.cut_done |= l.owns_cut && !owns_cut;
-                l.cut_seen |= cutscene;
-                l.owns_cut |= owns_cut;
-                Some(l)
-            }
-            (Some((key, waits, cutscene, owns_cut)), _) => Some(Line {
-                key,
-                t: 0.0,
-                voice_ms: None,
-                voiced: self.line_voiced,
-                waits,
-                continued: false,
-                cut_seen: cutscene,
-                cut_done: false,
-                owns_cut,
-            }),
-            (None, _) => None,
-        };
         // Whether the line is voiced (`Conversation.HasVO`): conversation.gfx's
         // `UpdateMainText` hides a voiced NPC line when the Subtitles option is "No
         // subtitles" (`ClientOptions.GameOptions.SubtitlesLevel` 0, the default), and shows
@@ -2539,7 +2637,17 @@ impl UiLayer {
             );
             // The conversation screen is not up while a cutscene plays: the line goes on
             // once it is.
-            if played && l.waits && !l.continued {
+            if played && l.waits && !l.continued && self.conversation_press.up {
+                log::debug!(
+                    "conversation auto-continue: key={:?} t={} voice={:?} voiced={} cut_seen={} cut_done={} owns_cut={}",
+                    l.key,
+                    l.t,
+                    l.voice_ms,
+                    l.voiced,
+                    l.cut_seen,
+                    l.cut_done,
+                    l.owns_cut
+                );
                 l.continued = true;
                 self.continue_conversation();
             }
@@ -2613,7 +2721,9 @@ impl UiLayer {
                 Vec::new(),
             ));
         }
-        if std::mem::take(&mut self.continue_pending) {
+        if let Some(key) = self.continue_pending.take()
+            && self.line.as_ref().is_some_and(|l| l.key == key)
+        {
             messages.push(GameMessage::Send(
                 "Conversation.SelectResponse".into(),
                 vec!["0".into()],
@@ -2654,6 +2764,10 @@ impl UiLayer {
             self.stage
                 .call_in("tooltips.gfx", thedas_ui::avm1::TOOLTIP_RELAYOUT, &[]);
         }
+        ready_conversation_responses(
+            &mut messages,
+            self.conversation_press.up && self.line.as_ref().is_some_and(Line::played),
+        );
         let ignored = {
             let mut sim = sim.lock().unwrap_or_else(|p| p.into_inner());
             thedas_ui::input::apply_all(&mut sim, &messages)
@@ -2756,6 +2870,10 @@ impl UiLayer {
     /// `ContinueButtonAction`). Provisional: the game's input bindings for the conversation's
     /// contexts are not traced; any click stands in for them.
     pub fn clicked(&mut self) {
+        log::debug!("conversation click: {:?}", self.line_state());
+        if !self.conversation_press.up {
+            return;
+        }
         let Some(l) = self.line.as_mut() else {
             return;
         };
@@ -2863,16 +2981,18 @@ impl UiLayer {
     /// conversation.gfx's continue action (it sends `Conversation.SelectResponse 0` when the
     /// line has nothing to choose).
     fn continue_conversation(&mut self) {
+        let Some(key) = self.line.as_ref().map(|l| l.key.clone()) else {
+            return;
+        };
         let Some(m) = self
             .stage
             .movies
             .iter_mut()
             .find(|m| m.name == "conversation.gfx")
         else {
-            // The screen is not up yet (a conversation's first line, empty, plays out
-            // before its movie has loaded): the game's continue is sent for it, else the
-            // conversation waited for ever.
-            self.continue_pending = true;
+            // Movie loading failed or has not completed: queue the continue for this
+            // line only, so it cannot answer a later conversation.
+            self.continue_pending = Some(key);
             return;
         };
         // The movie's continue does nothing while it believes the line has replies to pick
@@ -2880,7 +3000,7 @@ impl UiLayer {
         let stale =
             m.call("_global.Conversation.HasResponses", &[]) == thedas_ui::UiValue::Bool(true);
         if stale {
-            self.continue_pending = true;
+            self.continue_pending = Some(key);
         } else {
             m.call("_global.Conversation.ContinueButtonAction", &[]);
         }
@@ -3668,10 +3788,13 @@ impl UiLayer {
         self.stage.mouse_wheel(x, y, lines);
     }
 
-    pub fn mouse_button(&mut self, x: f64, y: f64, down: bool) {
-        self.stage.mouse_button(x, y, down);
-        // The drop was seen by the movies under the mouse (they read `GUI.Dragging`); the
-        // drag is over.
+    pub fn mouse_button(&mut self, x: f64, y: f64, down: bool) -> bool {
+        let accepted = self.conversation_press.button(down);
+        if accepted {
+            self.stage.mouse_button(x, y, down);
+        }
+        // The drag is over even if its release belonged to a screen that just closed.
+        // Only an accepted release is delivered to the current movie's drop targets.
         if !down {
             let dragging = self
                 .shown
@@ -3686,13 +3809,15 @@ impl UiLayer {
         // A click on a party portrait: portraits.gfx only says which member the mouse is
         // over (`GameModeExplore.GUITargetedPlayer`, set on roll-over and cleared on
         // roll-out; its own click handler is empty), and the game selects them.
-        if !down
+        if accepted
+            && !down
             && let Some(thedas_ui::UiValue::Number(id)) =
                 self.stage.bridge.value("GameModeExplore.GUITargetedPlayer")
             && id > 0.0
         {
             self.portrait_clicked = Some(id as u32);
         }
+        accepted
     }
 
     fn update_drag_image(&mut self) {
@@ -3732,6 +3857,15 @@ impl UiLayer {
     }
 
     pub fn click_as(&mut self, button: f64, x: f64, y: f64) {
+        if self.conversation_press.up
+            && button == thedas_ui::avm1::MOUSE_LEFT + thedas_ui::avm1::DOUBLE_CLICK
+        {
+            if self.mouse_button(x, y, true) {
+                self.clicked();
+            }
+            self.mouse_button(x, y, false);
+            return;
+        }
         self.stage.click_as(button, x, y);
     }
 
@@ -3970,6 +4104,22 @@ fn gui_id(s: Screen, container: bool) -> Option<i32> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_message_with_one_button_shows_one_button() {
+        let popup = |cancel: &str| TextPopup {
+            id: 1,
+            prompt: "The start menu could not be opened".into(),
+            text: None,
+            labels: ["OK".into(), cancel.into()],
+            frames: 0,
+            free_text: false,
+            input_ready: false,
+            pending_keys: VecDeque::new(),
+        };
+        assert_eq!(popup("").buttons(), 1);
+        assert_eq!(popup("Cancel").buttons(), 2);
+    }
+
     use super::*;
 
     fn popup_property(ui: &mut UiLayer, path: &str) -> thedas_ui::UiValue {
@@ -4584,12 +4734,84 @@ mod tests {
         assert_eq!(line_ms(&"x".repeat(1000)), 12_000.0);
     }
 
+    fn timing_line(text: &str, voiced: bool) -> Line {
+        Line {
+            key: ("dialog".into(), text.into(), vec![1]),
+            t: 0.0,
+            voice_ms: None,
+            voice_at: 0.0,
+            voiced,
+            waits: true,
+            continued: false,
+            cut_seen: false,
+            cut_done: false,
+            owns_cut: false,
+        }
+    }
+
+    #[test]
+    fn a_voiced_empty_line_waits_for_its_voice_duration() {
+        let mut line = timing_line("", true);
+        for t in [0.0, 100.0, 12_000.0, 60_000.0] {
+            line.t = t;
+            assert!(!line.played());
+        }
+        line.t = f64::INFINITY;
+        assert!(
+            line.played(),
+            "a deliberate skip still works without metadata"
+        );
+    }
+
+    #[test]
+    fn a_delayed_voice_plays_from_its_start_not_the_dialogs_start() {
+        let mut line = timing_line("A line chosen behind a loading screen.", true);
+        line.t = 5000.0;
+        line.set_voice_ms(Some(2000.0));
+        assert!(!line.played());
+        line.t = 6000.0;
+        line.set_voice_ms(Some(2000.0));
+        assert_eq!(
+            line.voice_at, 5000.0,
+            "later frames must not restart the clock"
+        );
+        line.t = 6999.0;
+        assert!(!line.played());
+        line.t = 7000.0;
+        assert!(line.played());
+    }
+
+    #[test]
+    fn unvoiced_lines_keep_their_reading_time() {
+        for text in ["", "An unvoiced line."] {
+            let mut line = timing_line(text, false);
+            line.t = line_ms(text) - 1.0;
+            assert!(!line.played());
+            line.t += 1.0;
+            assert!(line.played());
+        }
+    }
+
+    #[test]
+    fn a_frame_cannot_answer_an_unplayed_or_a_second_line() {
+        let response =
+            |n: &str| GameMessage::Send(thedas_ui::input::SELECT_RESPONSE.into(), vec![n.into()]);
+        let other = GameMessage::Send("Party.HideAlert".into(), vec![]);
+        let mut messages = vec![response("0"), other.clone(), response("1")];
+        ready_conversation_responses(&mut messages, false);
+        assert_eq!(messages, std::slice::from_ref(&other));
+        let mut messages = vec![response("0"), other.clone(), response("0")];
+        ready_conversation_responses(&mut messages, true);
+        assert_eq!(messages, [response("0"), other]);
+    }
+
     #[test]
     fn a_referenced_cut_finishes_before_its_line_automatically_continues() {
         let mut line = Line {
             key: ("dialog".into(), "A cinematic line.".into(), vec![1]),
             t: 3000.0,
             voice_ms: Some(2976.0),
+            voice_at: 0.0,
             voiced: true,
             waits: true,
             continued: false,
@@ -4609,6 +4831,7 @@ mod tests {
         // A later line spoken during another line's cut keeps its own timing.
         line.cut_done = false;
         line.owns_cut = false;
+        line.voice_ms = Some(2976.0);
         assert!(line.played());
         // Reply choices and an explicit skip retain their existing behavior.
         line.owns_cut = true;
@@ -4637,5 +4860,36 @@ mod tests {
         assert!(!clock.due(vec![(1, 8), (2, 9)], PORTRAIT_RETRY_MS - 1.0));
         assert!(clock.due(vec![(1, 8), (2, 9)], 1.0));
         assert_ne!(PortraitClock::name(1, 1), PortraitClock::name(1, 2));
+    }
+
+    #[test]
+    fn portrait_inputs_invalidate_the_cached_drawing() {
+        use thedas_sim::world::ObjectKind;
+        let mut sim = Sim::new(
+            Arc::new(Vfs::new()),
+            Arc::new(thedas_script::EngineTable::default()),
+            1,
+        );
+        let hero = sim.world.spawn(ObjectKind::Creature, "hero");
+        sim.world.hero = Some(hero);
+        let mut clock = PortraitClock::default();
+        assert!(clock.due(portrait_key(&sim), 0.0));
+        clock.drew(&[hero]);
+        for change in [
+            |o: &mut thedas_sim::world::Object| o.head_morph = Some("hm_face".into()),
+            |o: &mut thedas_sim::world::Object| o.appearance += 1,
+            |o: &mut thedas_sim::world::Object| {
+                o.equipment.insert(1, 42);
+            },
+            |o: &mut thedas_sim::world::Object| {
+                o.face_choices
+                    .insert(thedas_sim::appearance::PORTRAIT_DISTANCE, 0.8);
+            },
+        ] {
+            assert!(!clock.due(portrait_key(&sim), 60_000.0));
+            change(sim.world.get_mut(hero).unwrap());
+            assert!(clock.due(portrait_key(&sim), 0.0));
+            clock.drew(&[hero]);
+        }
     }
 }

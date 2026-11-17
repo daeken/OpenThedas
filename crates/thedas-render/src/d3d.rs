@@ -479,9 +479,8 @@ fn flicker_slot(l: &SceneLight, index: usize) -> Option<u32> {
 /// rest to 0x464310).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LightClass {
-    /// Level geometry (and anything else neither character nor prop). Traced: the level's
-    /// point lists and no ambient light nodes; not yet applied, these draws keep the old
-    /// rule ([`pick_level_lights`]).
+    /// Level geometry (and anything else neither character nor prop): the level's point
+    /// lists and no ambient light nodes (0x4654e0 -> 0x464310).
     Level,
     /// Placeables (`Prop`): the level's point lists, and the brightest ambient light node.
     Prop,
@@ -568,9 +567,11 @@ pub fn influence(
 /// lists 0x464e30 fills): from the point lights of the draw's class ([`LightClass::takes`])
 /// whose room reaches the draw's room ([`reaches`]), ranked by [`influence`] on the draw's
 /// bounding sphere, those above zero; up to three static lights (A, B, C) and two others
-/// (D, E). Ties keep the scene's order (the exe's sort is not stable).
+/// (D, E). Selected links sort by lower Version, then descending influence (0x461eb0).
+/// Ties keep the scene's order (provisional: the exe's sort is not stable).
 ///
-/// Not mirrored (provisional): the light groups (a `CanBeOccluded` light reaches only the
+/// Not mirrored (provisional): the special priority byte +0x194, cached links and
+/// selection transitions, the light groups (a `CanBeOccluded` light reaches only the
 /// objects whose group set, ARL 3800, holds its id), the hidden-owner test of the D/E
 /// lists, and an object's second room.
 pub fn pick_lights(
@@ -585,20 +586,8 @@ pub fn pick_lights(
     })
 }
 
-/// The light choice for level draws ([`LightClass::Level`]), kept as it was before the
-/// light manager was traced: up to three point lights whose radius reaches the draw's
-/// bounding sphere and whose affect domain (read as a mask) includes `domain` (a missing
-/// domain matches any), strongest first by colour brightness times the shader's
-/// attenuation at the sphere centre; no room test, no D/E lights.
-///
-/// Not yet applied to level draws: the traced rule ([`pick_lights`] with
-/// [`LightClass::Level`]: domains other than 1, the room test with RML 3164, `R − d`
-/// ranking, static lights in A-C and the others in D-E; and no ambient light node) is the
-/// same selection function the exe runs for every object, but whether level meshes reach
-/// it by the per-object pass (0x4654e0) is not verified, and applied to them it loses the
-/// bright window light on the Cousland hall's floor and darkens the Highever hall, which
-/// the original appears to keep. With no reference for those views it waits for one.
-/// Provisional.
+/// Legacy brightness/attenuation picker, retained for comparison probes. The renderer
+/// uses [`pick_lights`] for level meshes as well as characters and props.
 pub fn pick_level_lights(lights: &[SceneLight], sphere: (Vec3, f32), domain: i64) -> DrawLights {
     let mut cands: Vec<(f32, Vec3, f32, Vec3, Option<u32>)> = lights
         .iter()
@@ -654,7 +643,7 @@ fn pick_where(
     sphere: (Vec3, f32),
     keep: impl Fn(Option<i64>, Option<i64>) -> bool,
 ) -> DrawLights {
-    type Candidate = (f32, (Vec3, f32, Vec3), Option<u32>);
+    type Candidate = (f32, (Vec3, f32, Vec3), Option<u32>, i64);
     let mut points: Vec<Candidate> = Vec::new();
     let mut dynamic: Vec<Candidate> = Vec::new();
     for (i, l) in lights.iter().enumerate() {
@@ -688,6 +677,7 @@ fn pick_where(
                 w,
                 (*position, *radius, *color * *intensity),
                 flicker_slot(l, i),
+                *version,
             ));
         }
     }
@@ -695,10 +685,15 @@ fn pick_where(
     let mut best = |mut v: Vec<Candidate>, n: usize, first: usize| {
         v.sort_by(|a, b| b.0.total_cmp(&a.0));
         v.truncate(n);
+        // Membership is by influence (0x463fcc); the selected links then sort by
+        // lower Version first, descending influence within a version (0x461eb0).
+        // The special priority byte +0x194 defaults to zero; runtime overrides and
+        // cached/transitioning links are not represented here (provisional).
+        v.sort_by(|a, b| a.3.cmp(&b.3).then_with(|| b.0.total_cmp(&a.0)));
         for (slot, c) in v.iter().enumerate() {
             flicker[first + slot] = c.2;
         }
-        v.into_iter().map(|(_, l, _)| l).collect()
+        v.into_iter().map(|(_, l, _, _)| l).collect()
     };
     let points = best(points, 3, 0);
     let dynamic = best(dynamic, 2, 3);
@@ -716,9 +711,8 @@ fn pick_where(
 /// light of the level. Characters (0x465570 passes 0) get none.
 ///
 /// Level geometry gets none from this path either (0x464310 without the `prop` flag skips
-/// the ambient list at 0x4644eb), but that rule is not applied to level draws yet (see
-/// [`pick_level_lights`]): `D3dPass` keeps their room's ambient and this returns zero for
-/// them.
+/// the ambient list at 0x4644eb). Level-owned draws use this zero ambient; placed objects
+/// of Level class retain their room ambient (provisional).
 pub fn ambient_of(lights: &[SceneLight], class: LightClass) -> Vec3 {
     if class != LightClass::Prop {
         return Vec3::ZERO;
@@ -1207,8 +1201,9 @@ impl ConstantContext<'_> {
     }
 
     fn value(&self, c: &Constant) -> Option<Value> {
-        let usage = find_param(self.material, &c.name).and_then(|p| p.usage.clone());
-        let usage = usage.as_deref().unwrap_or("");
+        let usage = find_param(self.material, &c.name)
+            .and_then(|p| p.usage.as_deref())
+            .unwrap_or("");
         let world_view = self.view * self.world;
         // Matrices: a usage ending in `Trans` (`ModelViewProjectionTrans`, `PartTrans`) is
         // the layout the shaders bound to it read as rows (`mad` by the vertex's
@@ -2303,6 +2298,32 @@ mod tests {
     }
 
     #[test]
+    fn level_floor_rejects_a_bright_cross_room_light_omitted_from_reach() {
+        // Cousland's original hall trace excludes the distant sun from the floor's
+        // A/B/C, despite its sphere overlap and its rig's nonempty reach list. Use
+        // synthetic lights to guard against restoring legacy brightness admission.
+        let mut sun = point(100.0, 200.0, Some(DOMAIN_LEVEL), Some(79));
+        if let SceneLight::Point { color, .. } = &mut sun {
+            *color = Vec3::splat(4.0);
+        }
+        let lights = [
+            sun,
+            point(1.0, 12.0, Some(DOMAIN_LEVEL), Some(4)),
+            point(2.0, 10.0, Some(DOMAIN_LEVEL), Some(4)),
+            point(3.0, 8.0, Some(DOMAIN_LEVEL), Some(4)),
+        ];
+        let sphere = (Vec3::ZERO, 1.0);
+        assert!(xs(&pick_level_lights(&lights, sphere, DOMAIN_LEVEL).points).contains(&100.0));
+        let rooms = HashMap::from([(79, vec![42])]);
+        let floor = pick_lights(&lights, &rooms, sphere, Some(4), LightClass::Level);
+        assert_eq!(xs(&floor.points), [1.0, 2.0, 3.0]);
+        assert!(floor.dynamic.is_empty());
+        // The same light remains available to receivers that its rig does reach.
+        let reached = pick_lights(&lights, &rooms, sphere, Some(42), LightClass::Level);
+        assert_eq!(xs(&reached.points), [100.0]);
+    }
+
+    #[test]
     fn a_lights_intensity_weighs_its_pick_and_scales_its_colour() {
         let lit = |x: f32, i: f32| {
             let mut l = point(x, 5.0, None, None);
@@ -2472,6 +2493,34 @@ mod tests {
         );
         assert_eq!(xs(&picked.points), [0.0]);
         assert_eq!(xs(&picked.dynamic), [1.0, 2.0]);
+    }
+
+    #[test]
+    fn membership_uses_influence_before_version_orders_the_selected_slots() {
+        let mut lights = vec![
+            point(1.0, 5.0, None, None),
+            point(2.0, 5.0, None, None),
+            point(3.0, 5.0, None, None),
+            point(4.0, 5.0, None, None),
+        ];
+        if let SceneLight::Point { version, color, .. } = &mut lights[0] {
+            *version = 1;
+            *color = Vec3::splat(60.0); // score 50, so selected before the version-0 lights
+        }
+        if let SceneLight::Point { color, .. } = &mut lights[1] {
+            *color = Vec3::ZERO; // version 0 still has score 4 and takes slot A
+        }
+        let picked = pick_lights(
+            &lights,
+            &HashMap::new(),
+            (Vec3::ZERO, 1.0),
+            None,
+            LightClass::Level,
+        );
+        assert_eq!(xs(&picked.points), [2.0, 3.0, 1.0]);
+        assert_eq!(picked.points[0].2, Vec3::ZERO);
+        // Sorting the entire candidate list by Version before truncation would lose x=1.
+        assert!(!xs(&picked.points).contains(&4.0));
     }
 
     #[test]
