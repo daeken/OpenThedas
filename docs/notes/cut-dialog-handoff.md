@@ -95,3 +95,16 @@ the conversation opens on the replies.
 The match is local to the cut and current graph walk. Textless ASLNs follow
 the existing reference path. The tests build synthetic graphs and cut
 timelines.
+
+## Control-channel replays
+
+Each replay loads the F8 report's `save_before.json` in a hidden window.
+The audio log records a real event handle for each of TLK 41525 and 41526
+exactly once per run. The movie has four live replies at node 18 in
+each case, with no automatic `Conversation.SelectResponse` at handoff.
+
+| Path | Track 41526 | Conversation at handoff |
+| --- | --- | --- |
+| Skip at 10.427 s | Starts in the cut and retains its event across the skip | Subtitle cleared. Replies show after the voice finishes. |
+| Full 16 s playback | Starts and finishes in the cut | Subtitle cleared. Replies are ready. |
+| Skip at 5.535 s | Starts once in the conversation | The unheard line is subtitled while it plays, followed by the replies. |
