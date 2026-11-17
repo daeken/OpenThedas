@@ -9373,10 +9373,7 @@ mod tests {
             // Before the scheduler starts it, the front is still waiting.
             assert_eq!(size(&mut s, who), Some(Value::Int(1)));
             assert_eq!(command_at(&mut s, who, 0).unwrap().seconds, 1.);
-            assert_eq!(
-                current(&mut s),
-                (game == thedas_vfs::Game::DragonAge2).then_some(1.)
-            );
+            assert_eq!(current(&mut s), None);
             s.tick(100);
             assert_eq!(current(&mut s), Some(1.));
             assert_eq!(size(&mut s, who), Some(Value::Int(0)));
