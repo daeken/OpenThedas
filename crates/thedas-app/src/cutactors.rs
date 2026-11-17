@@ -545,8 +545,15 @@ mod tests {
         let report = std::path::PathBuf::from(std::env::var_os("THEDAS_ARMOR_REPORT").unwrap());
         // Both sides of the recorded equipment change, then a fresh reload already worn.
         for save in ["save_before.json", "save_now.json", "save_now.json"] {
+            let base = std::sync::Arc::new(
+                thedas_vfs::DaoInstall::open(&install)
+                    .unwrap()
+                    .play_vfs(thedas_vfs::install::TextureQuality::High)
+                    .unwrap(),
+            );
             let live = crate::live::Live::open(
                 std::path::Path::new(&install),
+                base,
                 "single player",
                 crate::live::Start::Save(&report.join(save)),
                 "original",

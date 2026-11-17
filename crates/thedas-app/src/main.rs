@@ -455,22 +455,23 @@ pub fn programs_cached(
 /// loads the scene.
 fn load(
     install: &Path,
+    base_vfs: Arc<Vfs>,
     area: &str,
     shaders: &str,
     props: &[thedas_render::Prop],
     detail: thedas_render::scene::Detail,
 ) -> Result<Loaded> {
-    let install = DaoInstall::open(install)?;
-    let mut vfs = install.play_vfs(TextureQuality::High)?;
     if area == "none" {
         return Ok(Loaded {
-            vfs: Arc::new(vfs),
+            vfs: base_vfs,
             scene: None,
             shaders: shaders.to_string(),
             frame_effects: true,
             render_path: Default::default(),
         });
     }
+    let install = DaoInstall::open(install)?;
+    let mut vfs = base_vfs.as_ref().clone();
     let level = match install.mount_level(&mut vfs, area) {
         Ok(mount) => mount.level,
         Err(_) => {
@@ -854,6 +855,8 @@ struct App {
     /// A loading screen is up for the level being built (see `Live::loading`).
     load_screen_up: bool,
     loaded: Loaded,
+    /// The run's play stack, without viewer or per-level mounts.
+    base_vfs: Arc<Vfs>,
     /// The running game, when playing.
     live: Option<live::Live>,
     /// The game camera, when following the party leader (playing; F toggles free-fly).
@@ -4907,7 +4910,13 @@ impl App {
             // A game (new or loaded) opens on a worker while the window keeps presenting,
             // the running one held behind it (see `Live::hold`); the start menu opens at once.
             if matches!(r, ui::FrontEnd::StartMenu) {
-                match live::Live::open(&self.install, &self.module, start, &self.shaders) {
+                match live::Live::open(
+                    &self.install,
+                    self.base_vfs.clone(),
+                    &self.module,
+                    start,
+                    &self.shaders,
+                ) {
                     Ok(l) => self.install_live(l),
                     Err(e) => {
                         log::warn!("front end: {r:?} failed: {e:#}");
@@ -4927,8 +4936,9 @@ impl App {
                 log::info!("front end: {r:?} ignored, a game is already opening");
                 continue;
             }
-            let (install, module, shaders) = (
+            let (install, base_vfs, module, shaders) = (
                 self.install.clone(),
+                self.base_vfs.clone(),
                 self.module.clone(),
                 self.shaders.clone(),
             );
@@ -4946,7 +4956,9 @@ impl App {
                         (None, Some(dir)) => live::Start::Resume(dir),
                         (None, None) => live::Start::NewGame,
                     };
-                    let _ = tx.send(live::Live::open(&install, &module, start, &shaders));
+                    let _ = tx.send(live::Live::open(
+                        &install, base_vfs, &module, start, &shaders,
+                    ));
                 });
             match spawned {
                 Ok(_) => {
@@ -6959,9 +6971,13 @@ fn main() -> Result<()> {
         Some(live::Start::Menu)
     };
     let boot = matches!(start, Some(live::Start::Menu));
+    // One play stack for this run. Sessions and level builds share its archive handles;
+    // each mounts level resources on its own clone.
+    let base_vfs = Arc::new(DaoInstall::open(&install)?.play_vfs(TextureQuality::High)?);
     let mut live = match start {
         Some(start) => Some(live::Live::open(
             &install,
+            base_vfs.clone(),
             &args.module,
             start,
             &args.shaders,
@@ -6995,7 +7011,14 @@ fn main() -> Result<()> {
         args.soft_shadows
     );
     let vfx = parse_vfx(&args.vfx)?;
-    let mut loaded = load(&install, area, &args.shaders, &vfx, detail)?;
+    let mut loaded = load(
+        &install,
+        base_vfs.clone(),
+        area,
+        &args.shaders,
+        &vfx,
+        detail,
+    )?;
     loaded.frame_effects = args.frame_effects == "on";
     loaded.render_path = thedas_render::RenderPath::parse(&args.renderer).unwrap_or_default();
     if let Some(l) = live.as_mut() {
@@ -7644,7 +7667,13 @@ fn main() -> Result<()> {
                             ui::FrontEnd::Load(b) => live::Start::SaveBytes(b),
                             ui::FrontEnd::StartMenu => live::Start::Menu,
                         };
-                        let mut n = live::Live::open(&install, &args.module, start, &args.shaders)?;
+                        let mut n = live::Live::open(
+                            &install,
+                            base_vfs.clone(),
+                            &args.module,
+                            start,
+                            &args.shaders,
+                        )?;
                         n.shader_time = args.time;
                         n.movies_wait = true;
                         layer.close_all();
@@ -7811,6 +7840,7 @@ fn main() -> Result<()> {
         }
     }
     let mut app = App {
+        base_vfs,
         load_screen_up: false,
         loaded,
         live,
