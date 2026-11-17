@@ -526,15 +526,29 @@ pub fn handler(sim: Arc<Mutex<Sim>>) -> MessageHandler {
 pub fn handler_for(sim: Arc<Mutex<Sim>>, shown: Arc<Mutex<Presentation>>) -> MessageHandler {
     Arc::new(move |name: &str, args: &[String]| {
         let mut p = shown.lock().ok()?;
+        let mut sim = sim.try_lock().ok()?;
         if present(&mut p, name, args) {
-            let sim = sim.try_lock().ok()?;
+            // Options belong to the interface, but the simulation also reads tutorials
+            // and combat auto-pause. A Handled message never reaches apply_all, so deliver
+            // its simulation input before acknowledging it to the movie.
+            if matches!(
+                name,
+                crate::options::MSG_SET | crate::options::MSG_RESTORE_DEFAULTS
+            ) {
+                sim.input(
+                    thedas_sim::commands::CommandSource::Player,
+                    thedas_sim::commands::SimCommand::ClientOptionMessage {
+                        name: name.to_string(),
+                        args: args.to_vec(),
+                    },
+                );
+            }
             return Some(
                 crate::binding::sim_values_for(&sim, &p)
                     .into_iter()
                     .collect(),
             );
         }
-        let mut sim = sim.try_lock().ok()?;
         // Replies are picked after the tick, as the MCP does: the movie does not read the
         // next line back in the same call. Dismissed notifications are dropped after the
         // frame too: notifications.gfx names its alerts by their place in `Party.Alerts`,
@@ -771,6 +785,48 @@ mod tests {
             Arc::new(thedas_script::EngineTable::default()),
             1,
         )
+    }
+
+    #[test]
+    fn movie_options_reach_the_sim_when_handled_now_or_deferred() {
+        use crate::protocol::GameBridge;
+        for busy in [false, true] {
+            let sim = Arc::new(Mutex::new(sim()));
+            let shown = Arc::new(Mutex::new(Presentation::default()));
+            let bridge = GameBridge::new(Arc::new(|_| None));
+            bridge.set_message_handler(Some(handler_for(sim.clone(), shown.clone())));
+            let send = |text: &str| {
+                let call = crate::UiCall {
+                    movie: "optionsmenu.gfx".into(),
+                    kind: crate::CallKind::FsCommand,
+                    name: "SendMessageArgs".into(),
+                    args: vec![UiValue::String(text.into())],
+                };
+                let held = busy.then(|| sim.lock().unwrap());
+                bridge.respond(&call);
+                let message = bridge.handle(call).unwrap();
+                assert_eq!(matches!(message, GameMessage::Send(..)), busy);
+                drop(held);
+                let ignored = apply_all(&mut sim.lock().unwrap(), &[message]);
+                for (name, args) in ignored {
+                    assert!(present(&mut shown.lock().unwrap(), &name, &args));
+                }
+            };
+            send("ClientOptions.SetClientOptionMessage GameOptions.ShowTutorials 0");
+            assert!(!sim.lock().unwrap().show_tutorials);
+            assert_eq!(
+                shown.lock().unwrap().options["GameOptions.ShowTutorials"],
+                0.0
+            );
+            sim.lock().unwrap().set_training_mode(1);
+            assert_eq!(sim.lock().unwrap().world.training.mode, 0);
+            send("ClientOptions.SetClientOptionMessage GameOptions.AutoPauseCombat 1");
+            assert!(sim.lock().unwrap().auto_pause_combat);
+            send("ClientOptions.RestoreDefaults");
+            assert!(sim.lock().unwrap().show_tutorials);
+            assert!(!sim.lock().unwrap().auto_pause_combat);
+            assert!(shown.lock().unwrap().options.is_empty());
+        }
     }
 
     #[test]
