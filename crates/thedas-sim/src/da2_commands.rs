@@ -11,6 +11,7 @@ fn same_payload(a: &Command, b: &Command) -> bool {
         // (for example sheathe versus unsheathe, both command type 39).
         && a.name == b.name
         && a.is_static == b.is_static
+        && a.da2_player_issued == b.da2_player_issued
         && a.target == b.target
         && (matches!(
             a.name.as_str(),
@@ -51,6 +52,12 @@ fn fresh(c: &mut Command) {
 }
 
 impl Sim {
+    /// Native combat input reaches 0x5d2330, then ordinary admission.
+    pub(crate) fn da2_player_command(&mut self, who: ObjectId, mut c: Command) {
+        c.da2_player_issued = true;
+        self.da2_add_command(who, c, 0, false, -1);
+    }
+
     pub(crate) fn da2_add_command(
         &mut self,
         who: ObjectId,
@@ -72,6 +79,21 @@ impl Sim {
         }
         c.is_static = is_static;
         fresh(&mut c);
+        // 0x5cd403: notify before inspecting the active command/default behavior.
+        // The callback may change either queue, so read them again afterwards.
+        if c.da2_player_issued {
+            let mut event = self.new_event("PLAYER_COMMAND_ADDED", Some(who));
+            event.objects = vec![who];
+            event.ints = vec![c.ty];
+            if event.ty != 0
+                && let Some(script) = self.world.get(who).and_then(|o| o.script.clone())
+            {
+                self.run_script(&script, who, Some(event));
+            }
+        }
+        let Some(o) = self.world.get(who) else {
+            return false;
+        };
         let running = o.commands.first().filter(|c| c.due.is_some());
         let equal = running.is_some_and(|old| same_payload(&c, old));
         // PlayAnimation and UseAbility share the native same-type comparison.
@@ -87,6 +109,15 @@ impl Sim {
         } else {
             behavior
         };
+        // 0x5cd4da: a player-issued active command downgrades hard clear,
+        // except for incoming native type 32.
+        let behavior =
+            if behavior == 2 && running.is_some_and(|old| old.da2_player_issued) && c.ty != 32 {
+                1
+            } else {
+                behavior
+            };
+        let active = usize::from(running.is_some());
         if matches!(behavior, 1 | 2) {
             // 0x5ca4c0: both paths prune ordinary waiting entries. The current
             // command is separate; equality prevents clearing it.
@@ -129,9 +160,8 @@ impl Sim {
                 self.world.queue_event(0, who, event, None);
             }
         }
-        // Native ordinary script commands have +0x10 zero. Equal active ones
-        // return success without being inserted again (0x5cd54e).
-        if equal {
+        // 0x5cd53d: equal player-issued ability/animation commands still queue.
+        if equal && !(kind(c.ty) == 25 && c.da2_player_issued) {
             return true;
         }
         self.world.trace.push(TraceEntry::Command {
@@ -445,5 +475,140 @@ mod tests {
             false,
             0
         ));
+    }
+
+    #[test]
+    fn player_flag_distinguishes_payloads_and_only_equal_abilities_queue_again() {
+        for (ty, name) in [
+            (25, "CommandUseAbility"),
+            (14, "CommandPlayAnimation"),
+            (13, "CommandWait"),
+        ] {
+            for player in [false, true] {
+                let (mut s, who) = sim();
+                let current = Command {
+                    ty,
+                    name: name.into(),
+                    da2_player_issued: player,
+                    due: Some(1000),
+                    ..Default::default()
+                };
+                let mut other = current.clone();
+                other.da2_player_issued = !player;
+                assert!(!same_payload(&current, &other));
+                s.world.get_mut(who).unwrap().commands = vec![current.clone(), wait(5.)];
+                assert!(add(&mut s, who, current.clone(), 0, false, 1));
+                let commands = &s.world.get(who).unwrap().commands;
+                assert_eq!(commands[0], current);
+                assert_eq!(commands.len(), if player && ty != 13 { 2 } else { 1 });
+                if commands.len() == 2 {
+                    assert!(commands[1].due.is_none());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn player_active_downgrades_hard_clear_except_for_native_type_32() {
+        for player in [false, true] {
+            for ty in [13, 32] {
+                let (mut s, who) = sim();
+                let current = Command {
+                    is_static: true,
+                    da2_player_issued: player,
+                    due: Some(1000),
+                    ..wait(1.)
+                };
+                s.world.get_mut(who).unwrap().commands = vec![current.clone(), wait(5.)];
+                let incoming = Command { ty, ..wait(10.) };
+                assert!(add(&mut s, who, incoming.clone(), 0, false, 2));
+                let kept = player && ty != 32;
+                assert_eq!(
+                    s.world.get(who).unwrap().commands,
+                    if kept {
+                        vec![current, incoming]
+                    } else {
+                        vec![incoming]
+                    }
+                );
+                assert_eq!(s.world.queue.len(), usize::from(!kept));
+            }
+        }
+    }
+
+    #[test]
+    fn player_added_callback_precedes_admission_and_can_clear_the_old_front() {
+        let ldf = b"#define ENGINE_STRUCTURE_0 command\n#define ENGINE_STRUCTURE_1 event\nevent GetCurrentEvent()=1;\nint GetEventType(event e)=2;\nint GetEventInteger(event e, int i)=3;\nvoid SetLocalInt(object o, int n, int v)=4;\nint GetCommandQueueSize(object o)=5;\nvoid ClearAllCommands(object o)=6;\nint EVENT_TYPE_PLAYER_COMMAND_ADDED=94;\nint COMMAND_TYPE_USE_ABILITY=25;\n";
+        let mut s = Sim::new(
+            Arc::new(Vfs::new()),
+            Arc::new(EngineTable::parse(ldf).unwrap()),
+            1,
+        );
+        s.game = Game::DragonAge2;
+        let _area = s.world.spawn(ObjectKind::Area, "area");
+        let who = s.world.spawn(ObjectKind::Creature, "actor");
+        let mut code = Vec::new();
+        let integer = |code: &mut Vec<u8>, n: i32| {
+            code.extend([4, 3]);
+            code.extend(n.to_be_bytes());
+        };
+        let object = |code: &mut Vec<u8>| {
+            code.extend([4, 6]);
+            code.extend(who.to_be_bytes());
+        };
+        let action = |code: &mut Vec<u8>, n: u8, argc: u8| {
+            code.extend([5, 0, 0, n, argc]);
+        };
+        // Record type, command type, and waiting count before the incoming command.
+        action(&mut code, 1, 0);
+        action(&mut code, 2, 1);
+        integer(&mut code, 10);
+        object(&mut code);
+        action(&mut code, 4, 3);
+        integer(&mut code, 0);
+        action(&mut code, 1, 0);
+        action(&mut code, 3, 2);
+        integer(&mut code, 11);
+        object(&mut code);
+        action(&mut code, 4, 3);
+        object(&mut code);
+        action(&mut code, 5, 1);
+        integer(&mut code, 12);
+        object(&mut code);
+        action(&mut code, 4, 3);
+        object(&mut code);
+        action(&mut code, 6, 1);
+        code.extend([0x20, 0]);
+        let mut bytes = b"NCS V1.0B".to_vec();
+        bytes.extend(((13 + code.len()) as u32).to_be_bytes());
+        bytes.extend(code);
+        s.add_script("added.ncs", thedas_script::Ncs::parse(&bytes).unwrap());
+        let o = s.world.get_mut(who).unwrap();
+        o.script = Some("added.ncs".into());
+        o.locals.order = (0..13).map(|i| format!("slot{i}")).collect();
+        o.commands = vec![wait(5.)];
+        s.order_ability(who, 200, who, "");
+        assert!(
+            s.world.trace.script_errors.is_empty(),
+            "{:?}",
+            s.world.trace.script_errors
+        );
+        let o = s.world.get(who).unwrap();
+        assert_eq!(o.locals.ints["10"], 94);
+        assert_eq!(o.locals.ints["11"], 25);
+        assert_eq!(o.locals.ints["12"], 1);
+        assert_eq!(o.commands.len(), 1);
+        assert!(o.commands[0].da2_player_issued);
+        assert_eq!(o.commands[0].ints, vec![200]);
+        let saved = s.save_json().unwrap();
+        s.load_json(&saved).unwrap();
+        assert!(s.world.get(who).unwrap().commands[0].da2_player_issued);
+        let mut old = serde_json::to_value(&s.world.get(who).unwrap().commands[0]).unwrap();
+        old.as_object_mut().unwrap().remove("da2_player_issued");
+        assert!(
+            !serde_json::from_value::<Command>(old)
+                .unwrap()
+                .da2_player_issued
+        );
     }
 }

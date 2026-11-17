@@ -425,6 +425,9 @@ impl Sim {
         let speaker = match self.line_speaker_tag(&node, c.owner == c.player).as_str() {
             "OWNER" | "" => c.owner,
             "PLAYER" => c.player,
+            tag if self.game == thedas_vfs::Game::Origins => self
+                .cutscene_actor_object(tag, Some(c.owner), Some(c.player))
+                .unwrap_or(c.owner),
             tag => self.world.by_tag(tag).next().map_or(c.owner, |o| o.id),
         };
         let t = self.world.time_ms;

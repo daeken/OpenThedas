@@ -455,22 +455,23 @@ pub fn programs_cached(
 /// loads the scene.
 fn load(
     install: &Path,
+    base_vfs: Arc<Vfs>,
     area: &str,
     shaders: &str,
     props: &[thedas_render::Prop],
     detail: thedas_render::scene::Detail,
 ) -> Result<Loaded> {
-    let install = DaoInstall::open(install)?;
-    let mut vfs = install.play_vfs(TextureQuality::High)?;
     if area == "none" {
         return Ok(Loaded {
-            vfs: Arc::new(vfs),
+            vfs: base_vfs,
             scene: None,
             shaders: shaders.to_string(),
             frame_effects: true,
             render_path: Default::default(),
         });
     }
+    let install = DaoInstall::open(install)?;
+    let mut vfs = base_vfs.as_ref().clone();
     let level = match install.mount_level(&mut vfs, area) {
         Ok(mount) => mount.level,
         Err(_) => {
@@ -854,6 +855,8 @@ struct App {
     /// A loading screen is up for the level being built (see `Live::loading`).
     load_screen_up: bool,
     loaded: Loaded,
+    /// The run's play stack, without viewer or per-level mounts.
+    base_vfs: Arc<Vfs>,
     /// The running game, when playing.
     live: Option<live::Live>,
     /// The game camera, when following the party leader (playing; F toggles free-fly).
@@ -938,6 +941,8 @@ struct App {
     /// A report under way: its screenshot and the player's note, to come, and the client
     /// that asked for it (`--control`'s `report`), waiting for where it went.
     report_wait: Option<ReportWait>,
+    /// A failed report's message, kept until dismissed, and frames since last asked.
+    report_failure: Option<(String, u32)>,
     /// The settings the game was started with, for reports.
     started_with: J,
     /// The way back from a report: a fix offered, fetched and checked (see [`update`]).
@@ -1761,6 +1766,7 @@ impl App {
         self.serve_control(dt);
         self.pad_frame(dt);
         self.report_frame(dt);
+        self.report_failure_frame();
         self.resume_frame();
         self.mod_mode_frame(dt);
         self.returning_frame();
@@ -1900,6 +1906,10 @@ impl App {
             }
         }
         for a in g.ui.take_text_answers() {
+            if a.id == report::FAILED_ID {
+                self.report_failure = None;
+                continue;
+            }
             // OK sends (or saves) the report with the note; the other button keeps it on
             // this computer only, unsent.
             if (UPDATE_ASK_ID..UPDATE_ASK_ID + 5).contains(&a.id) {
@@ -2110,6 +2120,10 @@ impl App {
             }
         }
         for a in g.ui.take_text_answers() {
+            if a.id == report::FAILED_ID {
+                self.report_failure = None;
+                continue;
+            }
             // OK sends (or saves) the report with the note; the other button keeps it on
             // this computer only, unsent.
             if (UPDATE_ASK_ID..UPDATE_ASK_ID + 5).contains(&a.id) {
@@ -2860,7 +2874,7 @@ impl App {
     /// asked for. `note` answers the question instead (a client's); `reply` hears where the
     /// report went once it is written.
     fn report(&mut self, note: Option<String>, reply: Option<std::sync::mpsc::Sender<J>>) {
-        if self.recorder.busy() {
+        if self.recorder.busy() || self.report_failure.is_some() {
             if let Some(r) = reply {
                 let _ = r.send(control::failure("a report is already under way"));
             }
@@ -3225,7 +3239,7 @@ impl App {
                 }
             }
         }
-        let Some(dir) = self.recorder.finish() else {
+        let Some(result) = self.recorder.finish() else {
             return;
         };
         let Some(w) = self.report_wait.take() else {
@@ -3247,6 +3261,16 @@ impl App {
                 live.paused = false;
             }
         }
+        let dir = match result {
+            Ok(dir) => dir,
+            Err(message) => {
+                if let Some(r) = reply {
+                    let _ = r.send(control::failure(&message));
+                }
+                self.report_failure = Some((message, 0));
+                return;
+            }
+        };
         // Sent on when the player has set that up (see [`upload`]).
         if let (true, Some(d), Some(url)) = (w.send, dir.as_ref(), upload::webhook()) {
             upload::send_in_background(d.clone(), url);
@@ -3259,9 +3283,26 @@ impl App {
         }
     }
 
+    /// Retry if the popup layer is absent or a screen change loses the notice. Unlike
+    /// the optional report note, a failure notice waits until the player dismisses it.
+    fn report_failure_frame(&mut self) {
+        let (Some((message, frames)), Some(g)) = (self.report_failure.as_mut(), self.gfx.as_mut())
+        else {
+            return;
+        };
+        *frames = frames.saturating_add(1);
+        if !g.ui.stage.dialog_up() && (*frames == 1 || *frames > NOTE_REASK_FRAMES) {
+            g.ui.ask_ok(report::FAILED_ID, message, "OK");
+            *frames = 1;
+        }
+    }
+
     /// One frame of the way back from a report (see [`update`]): the check's result, the
     /// question up (asked again when lost, as the report's note), the answers, the fetch.
     fn returning_frame(&mut self) {
+        if self.report_failure.is_some() {
+            return;
+        }
         let answers = std::mem::take(&mut self.update_answers);
         for a in answers {
             self.update_answer(a);
@@ -4907,7 +4948,13 @@ impl App {
             // A game (new or loaded) opens on a worker while the window keeps presenting,
             // the running one held behind it (see `Live::hold`); the start menu opens at once.
             if matches!(r, ui::FrontEnd::StartMenu) {
-                match live::Live::open(&self.install, &self.module, start, &self.shaders) {
+                match live::Live::open(
+                    &self.install,
+                    self.base_vfs.clone(),
+                    &self.module,
+                    start,
+                    &self.shaders,
+                ) {
                     Ok(l) => self.install_live(l),
                     Err(e) => {
                         log::warn!("front end: {r:?} failed: {e:#}");
@@ -4927,8 +4974,9 @@ impl App {
                 log::info!("front end: {r:?} ignored, a game is already opening");
                 continue;
             }
-            let (install, module, shaders) = (
+            let (install, base_vfs, module, shaders) = (
                 self.install.clone(),
+                self.base_vfs.clone(),
                 self.module.clone(),
                 self.shaders.clone(),
             );
@@ -4946,7 +4994,9 @@ impl App {
                         (None, Some(dir)) => live::Start::Resume(dir),
                         (None, None) => live::Start::NewGame,
                     };
-                    let _ = tx.send(live::Live::open(&install, &module, start, &shaders));
+                    let _ = tx.send(live::Live::open(
+                        &install, base_vfs, &module, start, &shaders,
+                    ));
                 });
             match spawned {
                 Ok(_) => {
@@ -5009,7 +5059,10 @@ impl App {
     /// game not quit normally, newer than the newest save (see [`journal::resumable`]).
     /// Ours: the original has no journal.
     fn resume_frame(&mut self) {
-        if self.resume_offer != ResumeOffer::Unchecked || self.opening.is_some() {
+        if self.resume_offer != ResumeOffer::Unchecked
+            || self.opening.is_some()
+            || self.report_failure.is_some()
+        {
             return;
         }
         let at_menu = self.live.as_ref().is_some_and(|l| l.front_end)
@@ -6953,9 +7006,13 @@ fn main() -> Result<()> {
         Some(live::Start::Menu)
     };
     let boot = matches!(start, Some(live::Start::Menu));
+    // One play stack for this run. Sessions and level builds share its archive handles;
+    // each mounts level resources on its own clone.
+    let base_vfs = Arc::new(DaoInstall::open(&install)?.play_vfs(TextureQuality::High)?);
     let mut live = match start {
         Some(start) => Some(live::Live::open(
             &install,
+            base_vfs.clone(),
             &args.module,
             start,
             &args.shaders,
@@ -6989,7 +7046,14 @@ fn main() -> Result<()> {
         args.soft_shadows
     );
     let vfx = parse_vfx(&args.vfx)?;
-    let mut loaded = load(&install, area, &args.shaders, &vfx, detail)?;
+    let mut loaded = load(
+        &install,
+        base_vfs.clone(),
+        area,
+        &args.shaders,
+        &vfx,
+        detail,
+    )?;
     loaded.frame_effects = args.frame_effects == "on";
     loaded.render_path = thedas_render::RenderPath::parse(&args.renderer).unwrap_or_default();
     if let Some(l) = live.as_mut() {
@@ -7638,7 +7702,13 @@ fn main() -> Result<()> {
                             ui::FrontEnd::Load(b) => live::Start::SaveBytes(b),
                             ui::FrontEnd::StartMenu => live::Start::Menu,
                         };
-                        let mut n = live::Live::open(&install, &args.module, start, &args.shaders)?;
+                        let mut n = live::Live::open(
+                            &install,
+                            base_vfs.clone(),
+                            &args.module,
+                            start,
+                            &args.shaders,
+                        )?;
                         n.shader_time = args.time;
                         n.movies_wait = true;
                         layer.close_all();
@@ -7805,6 +7875,7 @@ fn main() -> Result<()> {
         }
     }
     let mut app = App {
+        base_vfs,
         load_screen_up: false,
         loaded,
         live,
@@ -7855,6 +7926,7 @@ fn main() -> Result<()> {
         intro_pad_held: false,
         zoom_key: 0.0,
         recorder: report::Recorder::new(report::Recorder::default_dir()),
+        report_failure: None,
         report_wait: None,
         returning: match &args.check_report {
             Some(dir) => Returning::Asking(Box::new(UpdatePrompt {

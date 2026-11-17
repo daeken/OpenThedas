@@ -1648,7 +1648,13 @@ impl Sim {
         }
         if !speaker.is_empty() {
             let hero = self.world.hero.unwrap_or(OBJECT_INVALID);
-            let target = self.world.by_tag(&speaker).next().map(|o| o.id);
+            // gen00cs_cutscene_end uses GetNearestObjectByTag from the hero.
+            // A global first-tag lookup can select a parked copy in another area.
+            let target = if self.game == thedas_vfs::Game::Origins {
+                self.cutscene_actor_object(&speaker, Some(hero), Some(hero))
+            } else {
+                self.world.by_tag(&speaker).next().map(|o| o.id)
+            };
             if let Some(target) = target {
                 self.start_conversation(hero, target, "");
             }
@@ -2647,6 +2653,7 @@ impl Sim {
                 arrived: false,
                 da2_target_prepared: false,
                 da2_basic_attack_fallback: false,
+                da2_player_issued: false,
                 path: Vec::new(),
                 turned_at: None,
                 is_static: false,
@@ -5315,6 +5322,24 @@ impl Sim {
 pub const SOUND_SET: &str = "SoundSet";
 
 fn read_text_fields(o: &mut crate::world::Object, s: &Struct) {
+    // An instance's explicit localized value replaces its template, including
+    // an empty value. Sim currently presents the English male talk table.
+    if o.kind == ObjectKind::Placeable {
+        match field(s, "LocPopupText") {
+            Some(G3::LocString(l)) => {
+                o.fields.insert("LocPopupText".into(), l.strref as i32);
+                o.text_fields.remove("LocPopupText");
+                if let Some((_, bytes)) = l.strings.iter().find(|(id, _)| *id == 0) {
+                    o.text_fields.insert("LocPopupText".into(), lossy(bytes));
+                }
+            }
+            Some(G3::StrRef(r)) => {
+                o.fields.insert("LocPopupText".into(), *r as i32);
+                o.text_fields.remove("LocPopupText");
+            }
+            _ => {}
+        }
+    }
     for label in TEXT_FIELDS {
         if let Some(v) = text(s, label) {
             o.text_fields.insert(label.to_string(), v);
@@ -7251,6 +7276,44 @@ mod tests {
     }
     use super::*;
 
+    #[test]
+    fn map_popup_natives_read_localized_template_and_instance_values() {
+        use thedas_formats::gff3::{Field, LocString};
+        let localized = |reference, strings| Struct {
+            id: 0,
+            fields: vec![Field {
+                label: "LocPopupText".into(),
+                value: G3::LocString(LocString {
+                    strref: reference,
+                    strings,
+                }),
+            }],
+        };
+        let mut o = crate::world::Object::new(1, ObjectKind::Placeable, "door");
+        read_text_fields(&mut o, &localized(17, vec![(0, b"Fallback\0".to_vec())]));
+        assert_eq!(o.fields.get("LocPopupText"), Some(&17));
+        assert_eq!(
+            o.text_fields.get("LocPopupText").map(String::as_str),
+            Some("Fallback")
+        );
+        read_text_fields(
+            &mut o,
+            &Struct {
+                id: 0,
+                fields: vec![],
+            },
+        );
+        assert_eq!(o.fields.get("LocPopupText"), Some(&17));
+        read_text_fields(
+            &mut o,
+            &localized(u32::MAX, vec![(2, b"Other language".to_vec())]),
+        );
+        assert_eq!(o.fields.get("LocPopupText"), Some(&-1));
+        assert!(!o.text_fields.contains_key("LocPopupText"));
+        read_text_fields(&mut o, &localized(0, vec![]));
+        assert_eq!(o.fields.get("LocPopupText"), Some(&0));
+    }
+
     const LDF: &str = "#define ENGINE_STRUCTURE_0 event\n\
         int GetLocalInt(object o, string s) = 63;\n\
         void SetLocalInt(object o, string s, int n) = 64;\n";
@@ -7568,6 +7631,7 @@ mod tests {
             arrived: false,
             da2_target_prepared: false,
             da2_basic_attack_fallback: false,
+            da2_player_issued: false,
             path: Vec::new(),
             turned_at: None,
             is_static: false,
@@ -8451,6 +8515,7 @@ mod tests {
             arrived: false,
             da2_target_prepared: false,
             da2_basic_attack_fallback: false,
+            da2_player_issued: false,
             path: Vec::new(),
             turned_at: None,
             is_static: false,
@@ -8652,6 +8717,7 @@ mod tests {
             arrived: false,
             da2_target_prepared: false,
             da2_basic_attack_fallback: false,
+            da2_player_issued: false,
             path: Vec::new(),
             turned_at: None,
             is_static: false,
@@ -8699,6 +8765,7 @@ mod tests {
             arrived: false,
             da2_target_prepared: false,
             da2_basic_attack_fallback: false,
+            da2_player_issued: false,
             path: Vec::new(),
             turned_at: None,
             is_static: false,
@@ -8820,6 +8887,7 @@ mod tests {
             arrived: false,
             da2_target_prepared: false,
             da2_basic_attack_fallback: false,
+            da2_player_issued: false,
             path: Vec::new(),
             turned_at: None,
             is_static: false,
@@ -9027,6 +9095,7 @@ mod tests {
                 arrived: false,
                 da2_target_prepared: false,
                 da2_basic_attack_fallback: false,
+                da2_player_issued: false,
                 path: Vec::new(),
                 turned_at: None,
                 is_static: false,
@@ -9082,6 +9151,7 @@ mod tests {
             arrived: false,
             da2_target_prepared: false,
             da2_basic_attack_fallback: false,
+            da2_player_issued: false,
             path: Vec::new(),
             turned_at: None,
             is_static: false,
@@ -9231,6 +9301,7 @@ mod tests {
             arrived: false,
             da2_target_prepared: false,
             da2_basic_attack_fallback: false,
+            da2_player_issued: false,
             path: Vec::new(),
             turned_at: None,
             is_static: false,
@@ -9302,6 +9373,7 @@ mod tests {
             arrived: false,
             da2_target_prepared: false,
             da2_basic_attack_fallback: false,
+            da2_player_issued: false,
             path: Vec::new(),
             turned_at: None,
             is_static: false,
@@ -9357,6 +9429,7 @@ mod tests {
             arrived: false,
             da2_target_prepared: false,
             da2_basic_attack_fallback: false,
+            da2_player_issued: false,
             path: Vec::new(),
             turned_at: None,
             is_static: false,
@@ -9588,6 +9661,7 @@ mod tests {
                 arrived: false,
                 da2_target_prepared: false,
                 da2_basic_attack_fallback: false,
+                da2_player_issued: false,
                 path: Vec::new(),
                 turned_at: None,
                 is_static: false,
@@ -9619,6 +9693,7 @@ mod tests {
             arrived: false,
             da2_target_prepared: false,
             da2_basic_attack_fallback: false,
+            da2_player_issued: false,
             path: Vec::new(),
             turned_at: None,
             is_static: false,
@@ -9704,6 +9779,7 @@ mod tests {
             arrived: false,
             da2_target_prepared: false,
             da2_basic_attack_fallback: false,
+            da2_player_issued: false,
             path: Vec::new(),
             turned_at: None,
             is_static: false,
@@ -9773,6 +9849,7 @@ mod tests {
             arrived: false,
             da2_target_prepared: false,
             da2_basic_attack_fallback: false,
+            da2_player_issued: false,
             path: Vec::new(),
             turned_at: None,
             is_static: false,
@@ -10003,6 +10080,7 @@ mod tests {
             arrived: false,
             da2_target_prepared: false,
             da2_basic_attack_fallback: false,
+            da2_player_issued: false,
             path: Vec::new(),
             turned_at: None,
             is_static: false,

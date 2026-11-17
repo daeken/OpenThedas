@@ -921,6 +921,7 @@ pub fn run(o: &Options) -> Result<()> {
     }
     let save = std::fs::read(o.save).with_context(|| format!("reading {}", o.save.display()))?;
     let mut sim = thedas_sim::session::open(&thedas_sim::session::SessionOptions {
+        base_vfs: None,
         install: o.install.to_path_buf(),
         module: o.module.to_string(),
         area: None,
