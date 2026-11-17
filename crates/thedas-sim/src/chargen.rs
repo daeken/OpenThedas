@@ -138,6 +138,7 @@ impl Sim {
                 match (args.first().map(|a| a.trim()), on) {
                     (Some("GameOptions.AutoPauseCombat"), Some(on)) => self.auto_pause_combat = on,
                     (Some("GameOptions.ShowTutorials"), Some(on)) => self.show_tutorials = on,
+                    (Some("GameOptions.ShowGore"), Some(on)) => self.show_gore = on,
                     _ => {}
                 }
                 false
@@ -146,6 +147,7 @@ impl Sim {
             "ClientOptions.RestoreDefaults" => {
                 self.auto_pause_combat = false;
                 self.show_tutorials = true;
+                self.show_gore = true;
                 false
             }
             MSG_COMMIT_OPTIONS => true,
