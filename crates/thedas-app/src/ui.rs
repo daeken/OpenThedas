@@ -868,10 +868,24 @@ impl UiLayer {
             }
             (true, before) => self.options_before = before,
             (false, Some((options, difficulty))) => {
+                let show_gore = options.get("GameOptions.ShowGore").copied().unwrap_or(1.0) != 0.0;
                 if let Ok(mut shown) = self.shown.lock() {
                     shown.options = options;
                 }
                 let mut sim = sim.lock().unwrap_or_else(|p| p.into_inner());
+                if sim.show_gore != show_gore {
+                    sim.input(
+                        thedas_sim::commands::CommandSource::Player,
+                        thedas_sim::commands::SimCommand::ClientOptionMessage {
+                            name: thedas_sim::chargen::MSG_CLIENT_OPTION.to_string(),
+                            args: [
+                                "GameOptions.ShowGore".into(),
+                                u8::from(show_gore).to_string(),
+                            ]
+                            .to_vec(),
+                        },
+                    );
+                }
                 if sim.world.difficulty != difficulty {
                     sim.input(
                         thedas_sim::commands::CommandSource::Player,

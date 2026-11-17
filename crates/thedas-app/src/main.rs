@@ -6265,7 +6265,11 @@ fn pad_steps(arg: &str) -> Result<Vec<Step>> {
 /// options screen before New Game reaches it here (the tutorials, auto-pause in combat).
 fn seed_client_options(l: &live::Live, ui: &ui::UiLayer) {
     let mut sim = l.sim();
-    for name in ["GameOptions.ShowTutorials", "GameOptions.AutoPauseCombat"] {
+    for name in [
+        "GameOptions.ShowTutorials",
+        "GameOptions.AutoPauseCombat",
+        "GameOptions.ShowGore",
+    ] {
         if let Some(v) = ui.client_option(name) {
             sim.input(
                 thedas_sim::commands::CommandSource::Player,

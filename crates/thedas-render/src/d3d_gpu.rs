@@ -187,6 +187,8 @@ pub(crate) struct D3dPass {
     samples: u32,
     /// Per scene draw, the opacity its object is drawn at (1: as its material says).
     opacity: Vec<f32>,
+    /// Per-instance appearance gore, independent of shared materials.
+    gore: Vec<Option<f32>>,
     pub draws: Vec<D3dDraw>,
     buffer: Option<wgpu::Buffer>,
     materials: Vec<SceneMaterial>,
@@ -2058,6 +2060,7 @@ impl D3dPass {
             color_format,
             samples,
             opacity: vec![1.0; scene.draws.len()],
+            gore: vec![None; scene.draws.len()],
             draws,
             buffer,
             materials: scene.materials.clone(),
@@ -2220,6 +2223,7 @@ impl D3dPass {
                 world: glam::Mat4::IDENTITY,
                 camera: camera.position,
                 material: &self.materials[d.material],
+                gore: None,
                 lightmap: None,
                 lights: &lights,
                 ambient: Vec3::ZERO,
@@ -2459,6 +2463,17 @@ impl D3dPass {
             .for_each(|s| *s = None);
     }
 
+    /// Set the appearance amount read by all passes of a scene draw.
+    pub fn set_gore(&mut self, draw: usize, amount: f32) {
+        if let Some(gore) = self.gore.get_mut(draw) {
+            *gore = Some(if amount.is_finite() {
+                amount.clamp(0.0, 1.0)
+            } else {
+                0.0
+            });
+        }
+    }
+
     /// The last opacity multiplier given to a scene draw, for diagnostics.
     pub fn opacity(&self, draw: usize) -> Option<f32> {
         self.opacity.get(draw).copied()
@@ -2601,6 +2616,7 @@ impl D3dPass {
             world: *world,
             camera: camera.position,
             material: self.materials.get(*material)?,
+            gore: None,
             lightmap: lightmap.as_ref(),
             lights: &lights,
             ambient: Vec3::ZERO,
@@ -2943,6 +2959,7 @@ impl D3dPass {
                 world: *world,
                 camera: camera.position,
                 material: &self.materials[*material],
+                gore: self.gore.get(d.draw).copied().flatten(),
                 lightmap: lightmap.as_ref(),
                 lights: match &rigged {
                     Some((_, l)) => l,
@@ -3234,6 +3251,7 @@ impl D3dPass {
                     world: *world,
                     camera: camera.position,
                     material,
+                    gore: None,
                     lightmap: None,
                     lights: &lights,
                     ambient: Vec3::ZERO,
