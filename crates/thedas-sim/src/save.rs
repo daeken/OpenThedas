@@ -52,7 +52,9 @@ pub const SAVE_FORMAT: u32 = 1;
 ///   An older no-op setter that left no State field cannot be distinguished.
 /// - 11: Origins death blows retain paired animation deadlines. Earlier opaque active
 ///   death-blow commands restart preparation when loaded.
-pub const SAVE_REVISION: u32 = 11;
+/// - 12: Origins visual effects bypass script validation. Earlier saves can have
+///   already-spawned creatures without their appearance's crust; restore missing crusts.
+pub const SAVE_REVISION: u32 = 12;
 
 /// The trace channel loading reports save damage on.
 pub const SAVE_CHANNEL: i32 = -7;
@@ -215,6 +217,54 @@ impl Sim {
                     o.appearance = app;
                 }
             }
+        }
+    }
+
+    /// Repairs our pre-revision-12 rejection of creature_core's spawn crust.
+    /// This is snapshot migration, not a native load event or a SPAWN replay.
+    fn restore_missing_spawn_crusts(&mut self) {
+        let Some(appearances) = self.world.tables.get(2, "") else {
+            return;
+        };
+        // World objects are ordered by ID, keeping new effect identities stable.
+        let missing: Vec<_> = self
+            .world
+            .objects
+            .values()
+            .filter(|o| {
+                o.kind == crate::world::ObjectKind::Creature
+                    && !o.dead
+                    && o.locals.ints.get("CREATURE_SPAWNED") == Some(&1)
+                    && o.locals.ints.get("CREATURE_SPAWN_DEAD") != Some(&1)
+            })
+            .filter_map(|o| {
+                let vfx = crate::engine::cell_int(
+                    appearances.cell("CRUST_EFFECT", i64::from(o.appearance)),
+                );
+                (vfx > 0
+                    && !o
+                        .effects
+                        .iter()
+                        .any(|e| e.ty == 4 && e.ints.first() == Some(&vfx)))
+                .then_some((o.id, vfx))
+            })
+            .collect();
+        for (id, vfx) in missing {
+            self.apply_effect(
+                id,
+                crate::world::Effect {
+                    ty: 4,
+                    creator: Some(id),
+                    ints: vec![vfx],
+                    duration_type: 5,
+                    ..Default::default()
+                },
+            );
+            self.world.trace.push(crate::trace::TraceEntry::Log {
+                t: self.world.time_ms,
+                channel: SAVE_CHANNEL,
+                text: format!("restored missing spawn crust {vfx} on {id} (save revision < 12)"),
+            });
         }
     }
 
@@ -423,6 +473,9 @@ impl Sim {
                 self.init_placeable_state(id);
             }
         }
+        if save_revision < 12 && self.game == thedas_vfs::Game::Origins {
+            self.restore_missing_spawn_crusts();
+        }
         // DA2 snapshots can contain PC followers initialized through the monster path
         // and already-perceived NPCs with no level. Rebuild only absent stats; the
         // predicates make this idempotent without changing Origins' save revision.
@@ -495,6 +548,116 @@ mod tests {
         let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(EngineTable::default()), 7);
         s.module_info.name = "test".into();
         s
+    }
+
+    #[test]
+    fn older_origins_saves_restore_only_missing_spawn_crusts_in_id_order() {
+        use crate::world::Effect;
+        use thedas_formats::gda::Cell;
+
+        for game in [thedas_vfs::Game::Origins, thedas_vfs::Game::DragonAge2] {
+            let mut s = sim();
+            s.game = game;
+            let tables = crate::m2da::Tables::empty();
+            // Synthetic appearance: the repair reads data rather than a wisp ID.
+            tables.insert("#2", &["CRUST_EFFECT"], vec![(77, vec![Cell::Int(4321)])]);
+            s.world.tables = Arc::new(tables);
+            let ids: Vec<_> = (0..9)
+                .map(|_| s.world.spawn(ObjectKind::Creature, "crust"))
+                .collect();
+            for &id in &ids {
+                let o = s.world.get_mut(id).unwrap();
+                o.appearance = 77;
+                o.locals.ints.insert("CREATURE_SPAWNED".into(), 1);
+            }
+            s.world.get_mut(ids[1]).unwrap().active = false; // Still needs its saved body.
+            s.world.get_mut(ids[2]).unwrap().dead = true;
+            s.world
+                .get_mut(ids[3])
+                .unwrap()
+                .locals
+                .ints
+                .insert("CREATURE_SPAWN_DEAD".into(), 1);
+            s.world
+                .get_mut(ids[4])
+                .unwrap()
+                .locals
+                .ints
+                .remove("CREATURE_SPAWNED");
+            s.world.get_mut(ids[5]).unwrap().appearance = 78; // No configured crust.
+            s.world.get_mut(ids[6]).unwrap().kind = ObjectKind::Placeable;
+            let existing = Effect {
+                id: 20,
+                ty: 4,
+                ints: vec![4321],
+                duration_type: 5,
+                ..Default::default()
+            };
+            s.world
+                .get_mut(ids[7])
+                .unwrap()
+                .effects
+                .push(existing.clone());
+            let unrelated = Effect {
+                id: 21,
+                ty: 4,
+                ints: vec![999],
+                duration_type: 3,
+                ..Default::default()
+            };
+            s.world
+                .get_mut(ids[8])
+                .unwrap()
+                .effects
+                .push(unrelated.clone());
+            let mut old = s.save_game();
+            old.revision = 11;
+            let input = serde_json::to_vec(&old).unwrap();
+            s.load_json(&input).unwrap();
+            let first = s.save_json().unwrap();
+            for &id in &[ids[0], ids[1], ids[8]] {
+                let effects = &s.world.get(id).unwrap().effects;
+                assert_eq!(
+                    effects.len(),
+                    usize::from(id == ids[8]) + usize::from(game == thedas_vfs::Game::Origins)
+                );
+                if game == thedas_vfs::Game::Origins {
+                    let effect = effects.last().unwrap();
+                    assert_eq!(
+                        (effect.ty, effect.ints.as_slice(), effect.duration_type),
+                        (4, &[4321][..], 5)
+                    );
+                    assert_eq!(
+                        (effect.creator, effect.visual_target, effect.expires),
+                        (Some(id), Some(id), None)
+                    );
+                    assert_eq!(
+                        effect.id,
+                        22 + if id == ids[0] {
+                            0
+                        } else if id == ids[1] {
+                            1
+                        } else {
+                            2
+                        }
+                    );
+                }
+            }
+            for &id in &ids[2..7] {
+                assert!(s.world.get(id).unwrap().effects.is_empty());
+            }
+            assert_eq!(s.world.get(ids[7]).unwrap().effects, [existing]);
+            assert_eq!(s.world.get(ids[8]).unwrap().effects[0], unrelated);
+            // The same damaged input repairs deterministically, and a migrated save
+            // is idempotent. Its explicit removal then stays removed on later loads.
+            s.load_json(&input).unwrap();
+            assert_eq!(s.save_json().unwrap(), first);
+            s.load_json(&first).unwrap();
+            assert_eq!(s.save_json().unwrap(), first);
+            s.world.get_mut(ids[0]).unwrap().effects.clear();
+            s.load_game(s.save_game()).unwrap();
+            assert!(s.world.get(ids[0]).unwrap().effects.is_empty());
+        }
     }
 
     #[test]
