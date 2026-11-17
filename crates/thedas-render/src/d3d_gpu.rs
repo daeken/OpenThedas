@@ -195,6 +195,8 @@ pub(crate) struct D3dPass {
     samples: u32,
     /// Per scene draw, the opacity its object is drawn at (1: as its material says).
     opacity: Vec<f32>,
+    /// Per-instance appearance gore, independent of shared materials.
+    gore: Vec<Option<f32>>,
     pub draws: Vec<D3dDraw>,
     buffer: Option<wgpu::Buffer>,
     materials: Vec<SceneMaterial>,
@@ -2065,6 +2067,7 @@ impl D3dPass {
             color_format,
             samples,
             opacity: vec![1.0; scene.draws.len()],
+            gore: vec![None; scene.draws.len()],
             draws,
             buffer,
             materials: scene.materials.clone(),
@@ -2227,6 +2230,7 @@ impl D3dPass {
                 world: glam::Mat4::IDENTITY,
                 camera: camera.position,
                 material: &self.materials[d.material],
+                gore: None,
                 lightmap: None,
                 lights: &lights,
                 ambient: Vec3::ZERO,
@@ -2466,6 +2470,17 @@ impl D3dPass {
             .for_each(|s| *s = None);
     }
 
+    /// Set the appearance amount read by all passes of a scene draw.
+    pub fn set_gore(&mut self, draw: usize, amount: f32) {
+        if let Some(gore) = self.gore.get_mut(draw) {
+            *gore = Some(if amount.is_finite() {
+                amount.clamp(0.0, 1.0)
+            } else {
+                0.0
+            });
+        }
+    }
+
     /// The last opacity multiplier given to a scene draw, for diagnostics.
     pub fn opacity(&self, draw: usize) -> Option<f32> {
         self.opacity.get(draw).copied()
@@ -2608,6 +2623,7 @@ impl D3dPass {
             world: *world,
             camera: camera.position,
             material: self.materials.get(*material)?,
+            gore: None,
             lightmap: lightmap.as_ref(),
             lights: &lights,
             ambient: Vec3::ZERO,
@@ -2951,6 +2967,7 @@ impl D3dPass {
                 world: *world,
                 camera: camera.position,
                 material: &self.materials[*material],
+                gore: self.gore.get(d.draw).copied().flatten(),
                 lightmap: lightmap.as_ref(),
                 lights: match &rigged {
                     Some((_, l)) => l,
@@ -3257,6 +3274,7 @@ impl D3dPass {
                     world: *world,
                     camera: camera.position,
                     material,
+                    gore: None,
                     lightmap: None,
                     lights: &lights,
                     ambient: Vec3::ZERO,
@@ -3380,26 +3398,30 @@ impl D3dPass {
         }
     }
 
-    /// Which draws the last frame showed or cast a shadow from (in the view, or a sun
-    /// partition's caster): by index into `draws`. Empty before any update.
+    /// Which scene draws the last frame showed or cast a shadow from. Several shader
+    /// passes can share one scene draw, and some scene draws use the stand-in renderer.
+    /// Empty before any update.
     pub fn seen_draws(&self) -> Vec<bool> {
-        let mut seen = self
-            .in_view
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
+        let in_view = self.in_view.lock().unwrap_or_else(|e| e.into_inner());
+        if in_view.is_empty() {
+            return Vec::new();
+        }
         let casting = self
             .caster_visible
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        for (c, v) in self.casters.iter().zip(casting.iter()) {
-            if (v[0] || v[1])
-                && let Some(s) = seen.get_mut(c.draw)
-            {
-                *s = true;
-            }
-        }
-        seen
+        scene_draws_seen(
+            self.worlds.len(),
+            self.draws
+                .iter()
+                .zip(in_view.iter())
+                .map(|(d, &v)| (d.draw, v)),
+            self.casters
+                .iter()
+                .zip(casting.iter())
+                .filter(|(_, v)| v[0] || v[1])
+                .map(|(c, _)| c.draw),
+        )
     }
 
     /// Whether draw `i` (an index into `draws`) is in this frame's view (see
@@ -3510,9 +3532,57 @@ impl D3dPass {
     }
 }
 
+/// Collapse pass visibility into the scene indices used by props and shadow casters.
+/// A draw with no translated pass keeps posing because its stand-in visibility is unknown.
+fn scene_draws_seen(
+    count: usize,
+    passes: impl IntoIterator<Item = (usize, bool)>,
+    casters: impl IntoIterator<Item = usize>,
+) -> Vec<bool> {
+    let mut seen = vec![None; count];
+    for (draw, visible) in passes {
+        seen[draw] = Some(seen[draw].unwrap_or(false) || visible);
+    }
+    for draw in casters {
+        seen[draw] = Some(true);
+    }
+    seen.into_iter().map(|v| v.unwrap_or(true)).collect()
+}
+
 #[cfg(test)]
 mod tests {
+    use super::scene_draws_seen;
     use crate::scene::{DOMAIN_CHARACTERS, DOMAIN_LEVEL};
+
+    #[test]
+    fn pose_visibility_uses_scene_draw_indices_after_multipass_materials() {
+        // The first prop has two passes. The visible third prop must not inherit
+        // the second prop's hidden flag when the animator indexes its scene draws.
+        assert_eq!(
+            scene_draws_seen(3, [(0, false), (0, false), (1, false), (2, true)], []),
+            [false, false, true],
+        );
+        // Visibility from any pass of a draw counts, regardless of pass order.
+        assert_eq!(
+            scene_draws_seen(2, [(1, false), (0, true), (1, true)], []),
+            [true, true],
+        );
+    }
+
+    #[test]
+    fn pose_visibility_combines_shadow_casters_in_scene_draw_indices() {
+        assert_eq!(
+            scene_draws_seen(3, [(0, false), (0, false), (1, false), (2, false)], [2]),
+            [false, false, true],
+        );
+    }
+
+    #[test]
+    fn pose_visibility_keeps_draws_without_translated_passes_current() {
+        assert_eq!(scene_draws_seen(3, [(1, false)], []), [true, false, true]);
+        assert_eq!(scene_draws_seen(2, [], []), [true, true]);
+    }
+
     #[test]
     fn blended_draws_fall_in_the_submission_queues_groups() {
         use super::{TransparencyGroup as G, transparency_group as g};
