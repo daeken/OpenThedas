@@ -1540,14 +1540,19 @@ impl Sim {
             arrived: false,
             da2_target_prepared: false,
             da2_basic_attack_fallback: self.game == thedas_vfs::Game::DragonAge2,
+            da2_player_issued: false,
             path: Vec::new(),
             turned_at: None,
             is_static: false,
         };
         self.da2_default_attack_command(&mut cmd);
-        if let Some(o) = self.world.get_mut(attacker) {
+        if self.game == thedas_vfs::Game::DragonAge2 {
+            self.da2_player_command(attacker, cmd);
+        } else if let Some(o) = self.world.get_mut(attacker) {
             o.commands.clear();
             o.commands.push(cmd);
+        }
+        if let Some(o) = self.world.get_mut(attacker) {
             o.combat.in_combat = true;
         }
     }
@@ -1658,6 +1663,7 @@ impl Sim {
             arrived: false,
             da2_target_prepared: false,
             da2_basic_attack_fallback: false,
+            da2_player_issued: false,
             path: Vec::new(),
             turned_at: None,
             is_static: false,
@@ -2723,6 +2729,7 @@ mod tests {
     use super::*;
 
     const LDF: &str = "int EVENT_TYPE_PERCEPTION_APPEAR = 25;\n\
+        int COMMAND_TYPE_USE_ABILITY = 25;\n\
         int EVENT_TYPE_MANA_STAM_DEPLETED = 64;\n\
         int EVENT_TYPE_PERCEPTION_DISAPPEAR = 26;\n\
         int EVENT_TYPE_DEATH = 4;\n\
@@ -4015,6 +4022,7 @@ mod tests {
                 arrived: false,
                 da2_target_prepared: false,
                 da2_basic_attack_fallback: false,
+                da2_player_issued: false,
                 path: Vec::new(),
                 turned_at: None,
                 is_static: false,
