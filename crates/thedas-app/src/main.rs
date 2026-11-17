@@ -941,6 +941,8 @@ struct App {
     /// A report under way: its screenshot and the player's note, to come, and the client
     /// that asked for it (`--control`'s `report`), waiting for where it went.
     report_wait: Option<ReportWait>,
+    /// A failed report's message, kept until dismissed, and frames since last asked.
+    report_failure: Option<(String, u32)>,
     /// The settings the game was started with, for reports.
     started_with: J,
     /// The way back from a report: a fix offered, fetched and checked (see [`update`]).
@@ -1764,6 +1766,7 @@ impl App {
         self.serve_control(dt);
         self.pad_frame(dt);
         self.report_frame(dt);
+        self.report_failure_frame();
         self.resume_frame();
         self.mod_mode_frame(dt);
         self.returning_frame();
@@ -1903,6 +1906,10 @@ impl App {
             }
         }
         for a in g.ui.take_text_answers() {
+            if a.id == report::FAILED_ID {
+                self.report_failure = None;
+                continue;
+            }
             // OK sends (or saves) the report with the note; the other button keeps it on
             // this computer only, unsent.
             if (UPDATE_ASK_ID..UPDATE_ASK_ID + 5).contains(&a.id) {
@@ -2113,6 +2120,10 @@ impl App {
             }
         }
         for a in g.ui.take_text_answers() {
+            if a.id == report::FAILED_ID {
+                self.report_failure = None;
+                continue;
+            }
             // OK sends (or saves) the report with the note; the other button keeps it on
             // this computer only, unsent.
             if (UPDATE_ASK_ID..UPDATE_ASK_ID + 5).contains(&a.id) {
@@ -2863,7 +2874,7 @@ impl App {
     /// asked for. `note` answers the question instead (a client's); `reply` hears where the
     /// report went once it is written.
     fn report(&mut self, note: Option<String>, reply: Option<std::sync::mpsc::Sender<J>>) {
-        if self.recorder.busy() {
+        if self.recorder.busy() || self.report_failure.is_some() {
             if let Some(r) = reply {
                 let _ = r.send(control::failure("a report is already under way"));
             }
@@ -3228,7 +3239,7 @@ impl App {
                 }
             }
         }
-        let Some(dir) = self.recorder.finish() else {
+        let Some(result) = self.recorder.finish() else {
             return;
         };
         let Some(w) = self.report_wait.take() else {
@@ -3250,6 +3261,16 @@ impl App {
                 live.paused = false;
             }
         }
+        let dir = match result {
+            Ok(dir) => dir,
+            Err(message) => {
+                if let Some(r) = reply {
+                    let _ = r.send(control::failure(&message));
+                }
+                self.report_failure = Some((message, 0));
+                return;
+            }
+        };
         // Sent on when the player has set that up (see [`upload`]).
         if let (true, Some(d), Some(url)) = (w.send, dir.as_ref(), upload::webhook()) {
             upload::send_in_background(d.clone(), url);
@@ -3262,9 +3283,26 @@ impl App {
         }
     }
 
+    /// Retry if the popup layer is absent or a screen change loses the notice. Unlike
+    /// the optional report note, a failure notice waits until the player dismisses it.
+    fn report_failure_frame(&mut self) {
+        let (Some((message, frames)), Some(g)) = (self.report_failure.as_mut(), self.gfx.as_mut())
+        else {
+            return;
+        };
+        *frames = frames.saturating_add(1);
+        if !g.ui.stage.dialog_up() && (*frames == 1 || *frames > NOTE_REASK_FRAMES) {
+            g.ui.ask_ok(report::FAILED_ID, message, "OK");
+            *frames = 1;
+        }
+    }
+
     /// One frame of the way back from a report (see [`update`]): the check's result, the
     /// question up (asked again when lost, as the report's note), the answers, the fetch.
     fn returning_frame(&mut self) {
+        if self.report_failure.is_some() {
+            return;
+        }
         let answers = std::mem::take(&mut self.update_answers);
         for a in answers {
             self.update_answer(a);
@@ -5021,7 +5059,10 @@ impl App {
     /// game not quit normally, newer than the newest save (see [`journal::resumable`]).
     /// Ours: the original has no journal.
     fn resume_frame(&mut self) {
-        if self.resume_offer != ResumeOffer::Unchecked || self.opening.is_some() {
+        if self.resume_offer != ResumeOffer::Unchecked
+            || self.opening.is_some()
+            || self.report_failure.is_some()
+        {
             return;
         }
         let at_menu = self.live.as_ref().is_some_and(|l| l.front_end)
@@ -7891,6 +7932,7 @@ fn main() -> Result<()> {
         intro_pad_held: false,
         zoom_key: 0.0,
         recorder: report::Recorder::new(report::Recorder::default_dir()),
+        report_failure: None,
         report_wait: None,
         returning: match &args.check_report {
             Some(dir) => Returning::Asking(Box::new(UpdatePrompt {

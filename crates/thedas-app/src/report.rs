@@ -360,8 +360,8 @@ impl Recorder {
             capture,
         };
         let (tx, rx) = mpsc::channel();
-        let (done_tx, done) = mpsc::channel();
-        if let Err(e) = std::thread::Builder::new()
+        let (done_tx, mut done) = mpsc::channel();
+        let writer = std::thread::Builder::new()
             .name("report writer".into())
             .spawn(move || {
                 let dir = files.dir.clone();
@@ -371,9 +371,13 @@ impl Recorder {
                 drop(files);
                 let result = written.and_then(|()| write_pending(&dir, rx));
                 let _ = done_tx.send(result);
-            })
-        {
+            });
+        if let Err(e) = writer {
             log::warn!("report: starting writer: {e}");
+            // Keep the OS reason even when no worker could be started.
+            let (failed_tx, failed_rx) = mpsc::channel();
+            let _ = failed_tx.send(Err(e.into()));
+            done = failed_rx;
         }
         self.pending = Some(Pending {
             dir: path.clone(),
@@ -422,8 +426,9 @@ impl Recorder {
     }
 
     /// Finishes the report once its screenshot and note are in. Returns its folder (`None`
-    /// when cancelled) once done.
-    pub fn finish(&mut self) -> Option<Option<PathBuf>> {
+    /// when cancelled), or a path-free message for the player on failure. A worker failure
+    /// is returned even if the screenshot or note has not arrived yet.
+    pub fn finish(&mut self) -> Option<Result<Option<PathBuf>, String>> {
         let p = self.pending.as_mut()?;
         if !p.finishing && p.shot.is_some() && p.note.is_some() {
             let _ = p.tx.send(WriteRequest::Finish(
@@ -441,18 +446,40 @@ impl Recorder {
         match result {
             Ok(true) => {
                 log::info!("report: written to {}", p.dir.display());
-                Some(Some(p.dir))
+                Some(Ok(Some(p.dir)))
             }
             Ok(false) => {
                 log::info!("report: cancelled");
-                Some(None)
+                Some(Ok(None))
             }
             Err(e) => {
                 log::warn!("report: writing {}: {e:#}", p.dir.display());
-                Some(None)
+                Some(Err(failure_message(&e)))
             }
         }
     }
+}
+
+/// Only OS-generated descriptions go on screen. The error chain can contain paths,
+/// config contents or a custom I/O message; the full chain stays in the log instead.
+fn failure_message(error: &anyhow::Error) -> String {
+    let mut message = "Report not saved. The game is fine.".to_string();
+    if let Some(error) = error
+        .chain()
+        .find_map(|e| e.downcast_ref::<std::io::Error>())
+    {
+        let reason = match error.raw_os_error() {
+            Some(code) => std::io::Error::from_raw_os_error(code),
+            None if error.kind() != std::io::ErrorKind::Other => std::io::Error::from(error.kind()),
+            None => return message,
+        };
+        let reason = reason.to_string();
+        let reason = reason.split(" (os error ").next().unwrap_or(&reason);
+        message.push(' ');
+        message.push_str(reason);
+        message.push('.');
+    }
+    message
 }
 
 struct Pending {
@@ -486,9 +513,9 @@ fn write_pending(dir: &std::path::Path, rx: mpsc::Receiver<WriteRequest>) -> Res
                 return Ok(false);
             }
             WriteRequest::Finish(Some(note), regions) => {
-                std::fs::write(dir.join("note.txt"), note)?;
+                std::fs::write(dir.join("note.txt"), note).context("writing the note")?;
                 if !regions.is_empty() {
-                    write_regions(dir, &regions)?;
+                    write_regions(dir, &regions).context("writing the marked spots")?;
                 }
                 return Ok(true);
             }
@@ -875,6 +902,8 @@ pub const NOTE_PROMPT_SEND: &str = "What went wrong? Say what you expected and w
 pub const MARK_ID: u32 = NOTE_ID + 1;
 pub const REGION_ID: u32 = NOTE_ID + 2;
 pub const MORE_MARKS_ID: u32 = NOTE_ID + 3;
+/// The dismissible notice when the writer could not save a report.
+pub const FAILED_ID: u32 = NOTE_ID + 4;
 
 /// What the question whether to mark spots says.
 pub const MARK_PROMPT: &str = "Want to point at something? Choose Mark spots, then drag a box \
@@ -924,6 +953,10 @@ mod tests {
     }
 
     fn finish(r: &mut Recorder) -> Option<PathBuf> {
+        finish_result(r).expect("report failed")
+    }
+
+    fn finish_result(r: &mut Recorder) -> Result<Option<PathBuf>, String> {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             if let Some(done) = r.finish() {
@@ -932,6 +965,129 @@ mod tests {
             assert!(Instant::now() < deadline, "writer did not finish");
             std::thread::sleep(Duration::from_millis(1));
         }
+    }
+
+    #[test]
+    fn writer_failure_without_a_note_or_screenshot_produces_a_notice() {
+        let dir = std::env::temp_dir().join(format!("thedas-report-failed-{}", std::process::id()));
+        // A file where the reports folder should be makes the real worker fail without
+        // changing permissions, exhausting descriptors or needing any game data.
+        std::fs::write(&dir, b"not a folder").unwrap();
+        let mut r = Recorder::new(&dir);
+        r.start(None, None, None, json!({}), Capture::default());
+        let message = finish_result(&mut r).unwrap_err();
+        assert!(message.starts_with("Report not saved. The game is fine."));
+        assert!(!message.contains(&dir.to_string_lossy().to_string()));
+        assert!(!r.busy());
+        std::fs::remove_file(dir).unwrap();
+    }
+
+    #[test]
+    fn note_and_region_write_failures_produce_a_notice() {
+        for marked in [false, true] {
+            let dir = std::env::temp_dir().join(format!(
+                "thedas-report-finish-failed-{}-{marked}",
+                std::process::id()
+            ));
+            let mut r = Recorder::new(&dir);
+            let path = r.start(None, None, None, json!({}), Capture::default());
+            wait_written(&path);
+            if marked {
+                r.add_region(Region {
+                    rect: [0.0, 0.0, 10.0, 10.0],
+                    note: "spot".into(),
+                });
+            } else {
+                std::fs::create_dir(path.join("note.txt")).unwrap();
+            }
+            // A note-less, screenshot-less report still has to report a write error.
+            // For marks, metadata writes succeed, then the missing image fails.
+            r.screenshot(Err(anyhow::anyhow!("no frame")));
+            r.note(Some(String::new()));
+            let message = finish_result(&mut r).unwrap_err();
+            assert!(message.starts_with("Report not saved. The game is fine."));
+            assert!(!r.busy());
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_missing_screenshot_is_only_a_warning_when_the_report_saves() {
+        for capture_failed in [false, true] {
+            let dir = std::env::temp_dir().join(format!(
+                "thedas-report-no-shot-{}-{capture_failed}",
+                std::process::id()
+            ));
+            let mut r = Recorder::new(&dir);
+            let path = r.start(None, None, None, json!({}), Capture::default());
+            wait_written(&path);
+            if capture_failed {
+                r.screenshot(Err(anyhow::anyhow!("no frame")));
+            } else {
+                std::fs::create_dir(path.join("screenshot.png")).unwrap();
+                r.screenshot(Ok(b"png".to_vec()));
+            }
+            r.note(Some(String::new()));
+            // An Ok completion never supplies a failure message to the app, whether
+            // capturing or writing the screenshot failed.
+            assert_eq!(finish_result(&mut r), Ok(Some(path.clone())));
+            assert_eq!(std::fs::read(path.join("note.txt")).unwrap(), b"");
+            assert!(!path.join("screenshot.png").is_file());
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn failure_messages_never_display_error_context_or_custom_io_text() {
+        let private = "/private/home/reports/note.txt";
+        let error = anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            private,
+        ))
+        .context(format!("writing {private}"));
+        let reason = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            failure_message(&error),
+            format!("Report not saved. The game is fine. {reason}.")
+        );
+        assert_eq!(
+            failure_message(&anyhow::anyhow!(private)),
+            "Report not saved. The game is fine."
+        );
+    }
+
+    #[test]
+    fn a_stopped_writer_produces_a_notice() {
+        let mut r = Recorder::new("unused");
+        let (tx, _rx) = mpsc::channel();
+        let (done_tx, done) = mpsc::channel();
+        drop(done_tx);
+        r.pending = Some(Pending {
+            dir: PathBuf::from("unused"),
+            shot: None,
+            note: None,
+            regions: Vec::new(),
+            tx,
+            done,
+            finishing: false,
+        });
+        assert_eq!(
+            finish_result(&mut r),
+            Err("Report not saved. The game is fine.".into())
+        );
+        assert!(!r.busy());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn too_many_open_files_keeps_the_known_reason_without_paths() {
+        // EMFILE on the Unix platforms supported by the game; no descriptor limit change.
+        let error = anyhow::Error::new(std::io::Error::from_raw_os_error(24))
+            .context("writing /private/home/reports/note.txt");
+        assert_eq!(
+            failure_message(&error),
+            "Report not saved. The game is fine. Too many open files."
+        );
     }
 
     fn snap(taken: Instant, time_ms: u64) -> Snapshot {
