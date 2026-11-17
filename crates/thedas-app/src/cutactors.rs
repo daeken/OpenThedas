@@ -167,16 +167,17 @@ impl CutsceneActors {
     /// What is playing now changed to `key` (none: nothing): what the last left running is
     /// kept, while the conversation stays open.
     fn switch(&mut self, key: Option<String>, open: bool) {
-        if self.source.as_ref().map(|(k, _)| k) == key.as_ref() {
-            return;
+        if self.source.as_ref().map(|(k, _)| k) != key.as_ref() {
+            for (id, anims) in self.ending.drain() {
+                self.kept.insert(id, anims);
+            }
+            self.source = key.map(|k| (k, self.clock_ms));
         }
-        for (id, anims) in self.ending.drain() {
-            self.kept.insert(id, anims);
-        }
+        // An unstaged line can leave the source at None while the conversation
+        // stays open. Its retained layers still expire when the conversation closes.
         if !open {
             self.kept.clear();
         }
-        self.source = key.map(|k| (k, self.clock_ms));
     }
 
     /// What the playing cutscene (`tracks`, its tracks) or the shown conversation line's own
@@ -472,4 +473,59 @@ fn own_creatures(sim: &Sim, tracks: &Tracks, bound: &[Bound]) -> Vec<(usize, Obj
         );
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn animation() -> CutAnimation {
+        CutAnimation {
+            tree: "conversation.dlb".into(),
+            node: "standing".into(),
+            time: 1.0,
+            unbounded: false,
+        }
+    }
+
+    #[test]
+    fn closing_an_unstaged_conversation_releases_both_creatures() {
+        let sim = Sim::new(
+            Arc::new(thedas_vfs::Vfs::new()),
+            Arc::new(thedas_script::EngineTable::default()),
+            1,
+        );
+        let mut actors = CutsceneActors::default();
+        actors.switch(Some("line:conversation:1".into()), true);
+        for id in [118, 313] {
+            actors.ending.insert(id, vec![animation()]);
+        }
+        // A line without staging leaves the previous layers playing while the
+        // conversation remains open. Its presentation source is already None.
+        actors.switch(None, true);
+        actors.switch(None, true);
+        assert_eq!(actors.kept.len(), 2);
+        // Closing the conversation keeps that source key and releases each
+        // creature to ordinary floor presentation.
+        let shown = actors.shown(&sim, None, &|_| None);
+        assert!(shown.kept.is_empty());
+        assert!(actors.ending.is_empty());
+    }
+
+    #[test]
+    fn repeated_open_lines_keep_their_clock_and_retained_layers() {
+        let mut actors = CutsceneActors::default();
+        actors.kept.insert(1, vec![animation()]);
+        let key = Some("line:conversation:1".to_string());
+        actors.switch(key.clone(), true);
+        actors.advance(500.0);
+        actors.ending.insert(2, vec![animation()]);
+        actors.switch(key, true);
+        assert_eq!(actors.source.as_ref().unwrap().1, 0.0);
+        assert_eq!(actors.kept[&1], vec![animation()]);
+        assert!(!actors.kept.contains_key(&2));
+        actors.switch(None, false);
+        assert!(actors.kept.is_empty());
+        assert!(actors.ending.is_empty());
+    }
 }
