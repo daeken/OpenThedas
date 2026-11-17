@@ -378,7 +378,10 @@ impl TextPopup {
             &format!("{k}.DialogBoxText"),
             UiValue::String(self.prompt.clone()),
         );
-        b.set_value(&format!("{k}.NumButtons"), UiValue::Number(2.0));
+        b.set_value(
+            &format!("{k}.NumButtons"),
+            UiValue::Number(if self.labels[1].is_empty() { 1.0 } else { 2.0 }),
+        );
         b.set_value(
             &format!("{k}.InputBox"),
             UiValue::Number(f64::from(u8::from(self.text.is_some()))),
@@ -1739,6 +1742,11 @@ impl UiLayer {
     /// is `a`, and its text is empty.
     pub fn ask_choice(&mut self, id: u32, prompt: &str, a: &str, b: &str) {
         self.ask(id, prompt, None, a, b);
+    }
+
+    /// A message the player dismisses with a single OK button, using the game's box.
+    pub fn ask_notice(&mut self, id: u32, prompt: &str) {
+        self.ask(id, prompt, None, "OK", "");
     }
 
     fn ask(&mut self, id: u32, prompt: &str, text: Option<&str>, ok: &str, cancel: &str) {
@@ -3936,6 +3944,46 @@ fn gui_id(s: Screen, container: bool) -> Option<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_notice_uses_one_ok_button_and_no_text_field() {
+        use thedas_ui::{UiValue, protocol::GameBridge};
+        let bridge = GameBridge::new(Arc::new(|_| None));
+        let popup = TextPopup {
+            id: crate::report::FAILED_ID,
+            prompt: "Report not saved. The game is fine.".into(),
+            text: None,
+            labels: ["OK".into(), String::new()],
+            frames: 0,
+            free_text: false,
+            input_ready: false,
+            pending_keys: VecDeque::new(),
+        };
+        popup.write_values(&bridge);
+        assert_eq!(
+            bridge.value("GUIPopupLayer.NumButtons"),
+            Some(UiValue::Number(1.0))
+        );
+        assert_eq!(
+            bridge.value("GUIPopupLayer.InputBox"),
+            Some(UiValue::Number(0.0))
+        );
+        assert_eq!(
+            bridge.value("GUIPopupLayer.Label0"),
+            Some(UiValue::String("OK".into()))
+        );
+        assert_eq!(
+            bridge.value("GUIPopupLayer.DialogBoxText"),
+            Some(UiValue::String(popup.prompt))
+        );
+        assert_eq!(
+            bridge.value("GUIPopupLayer.Callback0"),
+            Some(UiValue::String(format!(
+                "{TEXT_POPUP_RESULT} {} 1",
+                popup.id
+            )))
+        );
+    }
 
     fn popup_property(ui: &mut UiLayer, path: &str) -> thedas_ui::UiValue {
         ui.stage
