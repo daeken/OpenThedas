@@ -49,6 +49,10 @@ farther down the vector is still waiting, even if it retained a deadline.
 
 ## Scope
 
+The subsequent [player-issued combat command trace](da2-player-command-flags.md)
+extends admission to the attack and ability input paths described there.
+The scope below records this original script-admission repair.
+
 This implements ordinary script-issued admission through AddCommand. The
 native player-issued flag at command `+0x10`, its notification path, its
 hard-to-soft downgrade and the equal player-issued UseAbility exception are
