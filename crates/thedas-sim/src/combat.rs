@@ -2410,8 +2410,9 @@ impl Sim {
 
     /// The trees a creature's ability animations are looked up in, first to last: its main
     /// weapon's own tree (`bitm_base.gda`, e.g. `Staff.anb`), its weapon-style tree, its
-    /// combat tree. Provisional (see [`Sim::ability_timing`]).
-    pub(crate) fn ability_trees(&self, id: ObjectId) -> Vec<String> {
+    /// combat tree. Read-only: presentation also uses this order for paired death-blow
+    /// actions already selected by the simulation. Provisional (see [`Sim::ability_timing`]).
+    pub fn ability_trees(&self, id: ObjectId) -> Vec<String> {
         let mut trees = Vec::new();
         let slot = constant_of(self, "INVENTORY_SLOT_MAIN");
         let weapon = self
