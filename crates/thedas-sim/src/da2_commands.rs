@@ -24,6 +24,26 @@ fn same_payload(a: &Command, b: &Command) -> bool {
         && (a.name != "CommandMoveToMultiLocations" || a.path == b.path)
 }
 
+/// Native task protection is independent of static state and readiness.
+/// Movement tasks release it after setup; wait task 36 does likewise.
+fn task_protected(c: &Command) -> bool {
+    c.from.is_none()
+        // Placeholder selection precedes task construction.
+        && !(c.name == "CommandUseAbility" && c.ints.first() == Some(&1))
+        && matches!(
+            c.name.as_str(),
+            "CommandUseAbility"
+                | "CommandAttack"
+                | "CommandPlayAnimation"
+                | "CommandStartConversation"
+                | "CommandUseObject"
+                | "CommandJumpToObject"
+                | "CommandJumpToLocation"
+                | "CommandTurn"
+                | "CommandSwitchWeaponSet"
+        )
+}
+
 fn fresh(c: &mut Command) {
     c.due = None;
     c.from = None;
@@ -104,9 +124,9 @@ impl Sim {
                 .first()
                 .is_some_and(|old| {
                     old.due.is_some() && !equal && (!old.is_static || behavior == 2)
-                    // Task 37 is enqueued protected (0x6d861e..0x6d8629).
-                    // Ready handoff succeeds through the dispatcher instead.
-                    && (old.name != "CommandUseAbility" || old.from.is_some())
+                    // 0x5c6274: soft and hard clears respect the running task.
+                    // Successful ready handoff uses a separate override.
+                    && !task_protected(old)
                 });
             if clear {
                 let old = self.world.get_mut(who).unwrap().commands.remove(0);
