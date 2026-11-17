@@ -47,14 +47,14 @@ fn obj(a: &[Value], i: usize) -> ObjectId {
     }
 }
 
-/// DA2's waiting queue is separate from its active executor (0x4fd460,
-/// 0x5a8d40). Our started front carries that executor's deadline.
+/// Both games expose the waiting queue separately from the active executor:
+/// Origins 0x66d1c0 / 0x73c6d0, DA2 0x4fd460 / 0x5c2400. Our started front
+/// carries that executor's deadline.
 fn script_command_queue(sim: &Sim, who: ObjectId) -> &[Command] {
     let Some(o) = sim.world.get(who) else {
         return &[];
     };
-    let active = sim.game == thedas_vfs::Game::DragonAge2
-        && o.commands.first().is_some_and(|c| c.due.is_some());
+    let active = o.commands.first().is_some_and(|c| c.due.is_some());
     &o.commands[usize::from(active)..]
 }
 
@@ -3283,6 +3283,7 @@ pub fn call(
         "SetCommandFloat" => {
             // 0x66ee60 writes the indexed native float directly. MoveToObject's
             // builder stores maximum in slot 0 and minimum in slot 1 (0x66f39a).
+            // PlayAnimation reads its speed override from float 3 (0x7a4480).
             // Other command layouts remain provisional.
             let mut c = match h.sim.world.handle(handle(a, 0)) {
                 Some(EngineData::Command(c)) => c.clone(),
@@ -3299,6 +3300,10 @@ pub fn call(
                     0 => c.max_range = Some(float(a, 1)),
                     1 => c.seconds = float(a, 1),
                     _ => {}
+                }
+            } else if c.name == "CommandPlayAnimation" && h.sim.game == thedas_vfs::Game::Origins {
+                if index == 3 {
+                    c.seconds = float(a, 1);
                 }
             } else if index == 0 {
                 c.seconds = float(a, 1);
@@ -3338,6 +3343,10 @@ pub fn call(
                             1 => c.seconds,
                             _ => 0.0,
                         }
+                    } else if c.name == "CommandPlayAnimation"
+                        && h.sim.game == thedas_vfs::Game::Origins
+                    {
+                        if i == 3 { c.seconds } else { 0.0 }
                     } else if i == 0 {
                         c.seconds
                     } else {
@@ -3432,6 +3441,7 @@ pub fn call(
                         let result = constant(&h.sim.table, "COMMAND_FAILED_COMMAND_CLEARED");
                         let mut ev = h.sim.new_event("COMMAND_COMPLETE", Some(target));
                         ev.ints = vec![cleared.ty, result];
+                        ev.objects = vec![target, cleared.target.unwrap_or(OBJECT_INVALID)];
                         h.sim.world.trace.push(TraceEntry::Command {
                             t,
                             object: target,
@@ -3452,6 +3462,9 @@ pub fn call(
             });
             match h.sim.world.get_mut(target) {
                 Some(o) => {
+                    // Origins uses a growing list, not a ten-command capacity.
+                    // 0x73ccd0 / 0x698c30 only enforce the container's allocation
+                    // limit; -2 is an active command being cleared, not a full queue.
                     if front {
                         // The native active executor is separate from the waiting queue.
                         // Keep its simulation front in place if add behavior left it alive.
@@ -3480,7 +3493,10 @@ pub fn call(
         "GetCurrentCommand" => {
             let c = h
                 .object(obj(a, 0))
-                .and_then(|o| o.commands.first().cloned());
+                .and_then(|o| o.commands.first())
+                // Origins 0x73c5f0 reads only the separate active executor.
+                .filter(|c| h.sim.game != thedas_vfs::Game::Origins || c.due.is_some())
+                .cloned();
             let hd = c.map(|c| h.sim.world.store(EngineData::Command(c)));
             ok(Value::Engine {
                 ty: ty.command,
@@ -3795,12 +3811,8 @@ pub fn call(
             void()
         }
         "GetCommandByIndex" => {
-            let index = if h.sim.game == thedas_vfs::Game::DragonAge2 {
-                // 0x5c2400 consumes the index as an unsigned 16-bit value.
-                int(a, 1) as u16 as usize
-            } else {
-                int(a, 1).max(0) as usize
-            };
+            // Origins 0x73c6d0 and DA2 0x5c2400 consume unsigned 16-bit indices.
+            let index = int(a, 1) as u16 as usize;
             let c = script_command_queue(h.sim, obj(a, 0)).get(index).cloned();
             let hd = c.map(|c| h.sim.world.store(EngineData::Command(c)));
             ok(Value::Engine {
@@ -5522,8 +5534,14 @@ pub fn call(
                 o.fields.insert("CommandResult".into(), result);
                 if failed && !o.commands.is_empty() {
                     let c = o.commands.remove(0);
+                    if h.sim.game == thedas_vfs::Game::Origins {
+                        o.combat.previous_command = Some(c.clone());
+                    }
                     let mut ev = h.sim.new_event("COMMAND_COMPLETE", Some(who));
                     ev.ints = vec![c.ty, result];
+                    if h.sim.game == thedas_vfs::Game::Origins {
+                        ev.objects = vec![who, c.target.unwrap_or(OBJECT_INVALID)];
+                    }
                     h.sim.world.queue_event(0, who, ev, None);
                 }
             }
@@ -9010,7 +9028,55 @@ mod tests {
     }
 
     #[test]
-    fn da2_command_queue_omits_the_active_executor_and_keeps_waiting_indexes() {
+    fn origins_rejected_commands_keep_completion_arguments_and_previous_command() {
+        for game in [thedas_vfs::Game::Origins, thedas_vfs::Game::DragonAge2] {
+            let table = EngineTable::parse(
+                b"void SetCommandResult(object who, int result) = 716;\n\
+                int COMMAND_RESULT_FAILED = 0;\n\
+                int EVENT_TYPE_COMMAND_COMPLETE = 1004;\n",
+            )
+            .unwrap();
+            let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(table), 1);
+            s.game = game;
+            let who = s.world.spawn(ObjectKind::Creature, "actor");
+            let target = s.world.spawn(ObjectKind::Creature, "target");
+            let command = Command {
+                ty: 1,
+                name: "CommandAttack".into(),
+                target: Some(target),
+                due: Some(100),
+                ..Default::default()
+            };
+            s.world.get_mut(who).unwrap().commands.push(command.clone());
+            run(
+                &mut s,
+                who,
+                "SetCommandResult",
+                &[Value::Object(who), Value::Int(0)],
+            );
+            let event = s.world.queue.values().next().unwrap();
+            assert_eq!(event.target, who);
+            assert_eq!(event.event.creator, Some(who));
+            assert_eq!(event.event.ints, [1, 0]);
+            assert_eq!(
+                event.event.objects,
+                if game == thedas_vfs::Game::Origins {
+                    vec![who, target]
+                } else {
+                    Vec::new()
+                }
+            );
+            let actor = s.world.get(who).unwrap();
+            assert!(actor.commands.is_empty());
+            assert_eq!(
+                actor.combat.previous_command.as_ref(),
+                (game == thedas_vfs::Game::Origins).then_some(&command)
+            );
+        }
+    }
+
+    #[test]
+    fn command_queue_omits_the_active_executor_and_keeps_waiting_indexes() {
         fn command_at(s: &mut Sim, who: ObjectId, index: i32) -> Option<Command> {
             let Some(Value::Engine { handle, .. }) = run(
                 s,
@@ -9031,6 +9097,7 @@ mod tests {
                 b"#define ENGINE_STRUCTURE_2 command\n\
                 int GetCommandQueueSize(object o) = 724;\n\
                 command GetCommandByIndex(object o, int i) = 536;\n\
+                command GetCurrentCommand(object o) = 539;\n\
                 int COMMAND_TYPE_WAIT = 13;\n",
             )
             .unwrap();
@@ -9038,47 +9105,55 @@ mod tests {
             s.game = game;
             let who = s.world.spawn(ObjectKind::Creature, "actor");
             let size = |s: &mut Sim, id| run(s, who, "GetCommandQueueSize", &[Value::Object(id)]);
+            let current = |s: &mut Sim| {
+                let Some(Value::Engine { handle, .. }) =
+                    run(s, who, "GetCurrentCommand", &[Value::Object(who)])
+                else {
+                    panic!("expected command handle");
+                };
+                match s.world.handle(handle) {
+                    Some(EngineData::Command(c)) => Some(c.seconds),
+                    _ => None,
+                }
+            };
             assert_eq!(size(&mut s, who), Some(Value::Int(0)));
+            assert_eq!(current(&mut s), None);
             assert_eq!(size(&mut s, OBJECT_INVALID), Some(Value::Int(0)));
             assert_eq!(command_at(&mut s, OBJECT_INVALID, 0), None);
             s.order_wait(who, 1.);
             // Before the scheduler starts it, the front is still waiting.
             assert_eq!(size(&mut s, who), Some(Value::Int(1)));
             assert_eq!(command_at(&mut s, who, 0).unwrap().seconds, 1.);
+            assert_eq!(
+                current(&mut s),
+                (game == thedas_vfs::Game::DragonAge2).then_some(1.)
+            );
             s.tick(100);
-            let da2 = game == thedas_vfs::Game::DragonAge2;
-            assert_eq!(size(&mut s, who), Some(Value::Int(i32::from(!da2))));
-            assert_eq!(command_at(&mut s, who, 0).is_none(), da2);
+            assert_eq!(current(&mut s), Some(1.));
+            assert_eq!(size(&mut s, who), Some(Value::Int(0)));
+            assert_eq!(command_at(&mut s, who, 0), None);
             let mut next = s.world.get(who).unwrap().commands[0].clone();
             next.due = None;
             next.seconds = 2.;
             s.world.get_mut(who).unwrap().commands.push(next.clone());
             next.seconds = 3.;
             s.world.get_mut(who).unwrap().commands.push(next);
-            assert_eq!(size(&mut s, who), Some(Value::Int(if da2 { 2 } else { 3 })));
-            assert_eq!(
-                command_at(&mut s, who, 0).unwrap().seconds,
-                if da2 { 2. } else { 1. }
-            );
-            assert_eq!(command_at(&mut s, who, -1).is_none(), da2);
+            assert_eq!(size(&mut s, who), Some(Value::Int(2)));
+            assert_eq!(command_at(&mut s, who, 0).unwrap().seconds, 2.);
+            assert_eq!(command_at(&mut s, who, -1), None);
             assert_eq!(command_at(&mut s, who, i32::MAX), None);
-            assert_eq!(command_at(&mut s, who, 65536).is_some(), da2);
-            if da2 {
-                assert_eq!(command_at(&mut s, who, -65536).unwrap().seconds, 2.);
-            }
+            assert_eq!(command_at(&mut s, who, 65536).unwrap().seconds, 2.);
+            assert_eq!(command_at(&mut s, who, -65536).unwrap().seconds, 2.);
             // A ready animation still belongs to the executor. Reload keeps
             // the same queue boundary, including older records without readiness.
             s.world.get_mut(who).unwrap().commands[0].cancellable = true;
             s.world = serde_json::from_str(&serde_json::to_string(&s.world).unwrap()).unwrap();
-            assert_eq!(size(&mut s, who), Some(Value::Int(if da2 { 2 } else { 3 })));
+            assert_eq!(size(&mut s, who), Some(Value::Int(2)));
             s.world.get_mut(who).unwrap().commands[0].cancellable = false;
             s.world = serde_json::from_str(&serde_json::to_string(&s.world).unwrap()).unwrap();
             s.tick(900);
-            assert_eq!(
-                command_at(&mut s, who, 0).unwrap().seconds,
-                if da2 { 3. } else { 2. }
-            );
-            assert_eq!(size(&mut s, who), Some(Value::Int(if da2 { 1 } else { 2 })));
+            assert_eq!(command_at(&mut s, who, 0).unwrap().seconds, 3.);
+            assert_eq!(size(&mut s, who), Some(Value::Int(1)));
             s.world.get_mut(who).unwrap().commands.clear();
             assert_eq!(size(&mut s, who), Some(Value::Int(0)));
         }
