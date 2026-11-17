@@ -369,6 +369,12 @@ struct TextPopup {
 }
 
 impl TextPopup {
+    /// How many buttons the box shows: one per label, a trailing empty one left out (the
+    /// popup layer shows `NumButtons` of them, as a script's one-button `ShowPopup` does).
+    fn buttons(&self) -> usize {
+        if self.labels[1].is_empty() { 1 } else { 2 }
+    }
+
     /// Write immediately before showing: the previous dialog's answer and a script's
     /// bindings can change these shared values while this question waits.
     fn write_values(&self, b: &thedas_ui::protocol::GameBridge) {
@@ -378,7 +384,10 @@ impl TextPopup {
             &format!("{k}.DialogBoxText"),
             UiValue::String(self.prompt.clone()),
         );
-        b.set_value(&format!("{k}.NumButtons"), UiValue::Number(2.0));
+        b.set_value(
+            &format!("{k}.NumButtons"),
+            UiValue::Number(self.buttons() as f64),
+        );
         b.set_value(
             &format!("{k}.InputBox"),
             UiValue::Number(f64::from(u8::from(self.text.is_some()))),
@@ -1740,6 +1749,12 @@ impl UiLayer {
     /// is `a`, and its text is empty.
     pub fn ask_choice(&mut self, id: u32, prompt: &str, a: &str, b: &str) {
         self.ask(id, prompt, None, a, b);
+    }
+
+    /// Tells the player something with the game's own message box and a single button
+    /// (`ok`): the answer's `accepted` is true, and its text is empty.
+    pub fn ask_ok(&mut self, id: u32, prompt: &str, ok: &str) {
+        self.ask(id, prompt, None, ok, "");
     }
 
     fn ask(&mut self, id: u32, prompt: &str, text: Option<&str>, ok: &str, cancel: &str) {
@@ -3936,6 +3951,22 @@ fn gui_id(s: Screen, container: bool) -> Option<i32> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_message_with_one_button_shows_one_button() {
+        let popup = |cancel: &str| TextPopup {
+            id: 1,
+            prompt: "The start menu could not be opened".into(),
+            text: None,
+            labels: ["OK".into(), cancel.into()],
+            frames: 0,
+            free_text: false,
+            input_ready: false,
+            pending_keys: VecDeque::new(),
+        };
+        assert_eq!(popup("").buttons(), 1);
+        assert_eq!(popup("Cancel").buttons(), 2);
+    }
+
     use super::*;
 
     fn popup_property(ui: &mut UiLayer, path: &str) -> thedas_ui::UiValue {
