@@ -37,7 +37,9 @@ Its existing deadline distinguishes a started front from waiting entries.
 DA2's queue size and index getters now expose the slice after that started
 front. An unstarted front remains waiting. A ready animation remains active
 until completion or replacement. Index lookup retains the native 16-bit
-conversion. Origins uses its existing command-vector view.
+conversion. The later [Origins queue trace](origins-command-queue-failure.md)
+establishes the same waiting/executor boundary there and corrects its former
+command-vector view; DA2's behavior from this change is retained.
 
 The deadline already survives snapshots, so older in-flight records and reloads
 retain this boundary. Regression coverage exercises empty and invalid objects,

@@ -1208,7 +1208,8 @@ impl Ui {
                 ui.label("Graphics detail");
                 ui.horizontal(|ui| {
                     for d in ["low", "medium", "high"] {
-                        ui.radio_value(&mut play.detail, d.to_string(), capitalise(d));
+                        let label = if d == "high" { "Very High".into() } else { capitalise(d) };
+                        ui.radio_value(&mut play.detail, d.to_string(), label);
                     }
                 });
                 ui.end_row();
@@ -1223,9 +1224,18 @@ impl Ui {
                 ui.label("Renderer");
                 ui.horizontal(|ui| {
                     ui.radio_value(&mut play.renderer, "faithful".to_string(), "Original")
-                        .on_hover_text("The game's own shaders and lighting (the reference)");
+                        .on_hover_text("The game's material shaders; the sun-shadow choice below is independent");
                     ui.radio_value(&mut play.renderer, "deferred".to_string(), "Deferred")
                         .on_hover_text("OpenThedas's own per-pixel lighting; F11 switches in game");
+                });
+                ui.end_row();
+
+                ui.label("Sun shadows (OpenThedas)");
+                ui.horizontal(|ui| {
+                    ui.radio_value(&mut play.soft_shadows, true, "Soft (improved)")
+                        .on_hover_text("Origins: smoother edges and a blended partition boundary; a deliberate visual improvement");
+                    ui.radio_value(&mut play.soft_shadows, false, "Faithful")
+                        .on_hover_text("The original's filters and hard partition switch");
                 });
                 ui.end_row();
 

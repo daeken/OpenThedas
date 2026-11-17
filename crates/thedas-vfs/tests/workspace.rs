@@ -97,3 +97,43 @@ fn stacks_the_game_does_not_play_from_ignore_it() {
     Vfs::set_workspace(None);
     let _ = std::fs::remove_dir_all(&base);
 }
+
+#[test]
+fn clones_keep_the_live_workspace_slot_and_independent_level_mounts() {
+    let _turn = TURN.lock().unwrap_or_else(|p| p.into_inner());
+    let base = scratch("workspace-clone");
+    let vfs = play_stack(&base);
+    let mut level = vfs.clone();
+    let mut tool = Vfs::new();
+    tool.push_directory(base.join("game"), false, "tool")
+        .unwrap();
+    let tool = tool.clone();
+    let ws = base.join("ws");
+    std::fs::create_dir_all(&ws).unwrap();
+    std::fs::write(ws.join("a.dds"), b"live").unwrap();
+    std::fs::write(base.join("a.dds"), b"level").unwrap();
+    std::fs::write(base.join("level.arl"), b"level only").unwrap();
+    level.push_files(&[base.join("a.dds"), base.join("level.arl")], "level");
+    assert!(vfs.lookup("level.arl").is_none());
+    assert_eq!(level.read("a.dds").unwrap().0, b"mod");
+
+    // Clones made before mounting or rescanning see the same process-wide slot.
+    Vfs::set_workspace(Some(&ws));
+    for stack in [&vfs, &level] {
+        assert_eq!(stack.read("a.dds").unwrap().0, b"live");
+        assert_eq!(stack.read_beneath_workspace("a.dds").unwrap().0, b"mod");
+    }
+    assert_eq!(tool.read("a.dds").unwrap().0, b"game");
+    let late = level.clone();
+    std::fs::write(ws.join("b.gda"), b"new").unwrap();
+    Vfs::rescan_workspace();
+    for stack in [&vfs, &level, &late] {
+        assert_eq!(stack.read("b.gda").unwrap().0, b"new");
+    }
+    Vfs::set_workspace(None);
+    for stack in [&vfs, &level, &late] {
+        assert_eq!(stack.read("a.dds").unwrap().0, b"mod");
+        assert!(stack.read("b.gda").is_err());
+    }
+    let _ = std::fs::remove_dir_all(&base);
+}

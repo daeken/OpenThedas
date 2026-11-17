@@ -4,7 +4,8 @@
 //!
 //! - When a cutscene starts, each actor naming an object (field 5216, actor +0x44) takes
 //!   one (0x7e36b0): `OWNER` is the conversation's owner, `PLAYER` the player's creature,
-//!   `HENCH...` a follower, anything else the object with that tag (0x7cd0a0 -> 0x7f2d80).
+//!   `HENCH...` a follower, anything else the nearest object with that tag in the
+//!   context creature's area (0x7cd0a0 -> 0x7f2d80 -> 0x6973b0).
 //!   An object already playing another actor of the cutscene plays no second one. An actor
 //!   whose name finds nothing, or that names none, is the cutscene's own: a model (5202) or
 //!   a creature built from its template (5208) that only the presentation shows.
@@ -281,7 +282,10 @@ impl Sim {
         bound
     }
 
-    /// The object a cutscene actor names (see the module docs), in the current area.
+    /// The object a cutscene actor names (see the module docs). Origins resolves
+    /// ordinary tags by 3D distance from the conversation owner, or the player
+    /// for a scripted cutscene (0x7cd0a0 -> 0x7f2d80 -> 0x6973b0), in that
+    /// creature's area. A later equal-distance match wins (0x69761c).
     pub fn cutscene_actor_object(
         &self,
         name: &str,
@@ -303,13 +307,32 @@ impl Sim {
             Some(_) => return None,
             None => name,
         };
-        let area = self.world.area;
-        self.world
-            .by_tag(tag)
-            .find(|o| {
-                o.area.is_some()
-                    && o.area == area
-                    && matches!(o.kind, ObjectKind::Creature | ObjectKind::Placeable)
+        let context = owner
+            .and_then(|id| self.world.get(id))
+            .filter(|o| o.kind == ObjectKind::Creature)
+            .or_else(|| player.or(self.world.hero).and_then(|id| self.world.get(id)));
+        let origins = self.game == thedas_vfs::Game::Origins;
+        let area = if origins {
+            context.and_then(|o| o.area).or(self.world.area)
+        } else {
+            self.world.area
+        };
+        let mut candidates = self.world.by_tag(tag).filter(|o| {
+            o.area.is_some()
+                && o.area == area
+                && matches!(o.kind, ObjectKind::Creature | ObjectKind::Placeable)
+        });
+        if !origins {
+            return candidates.next().map(|o| o.id);
+        }
+        let at = context.map_or([0.0; 3], |o| o.position);
+        let distance =
+            |p: [f32; 3]| (p[0] - at[0]).powi(2) + (p[1] - at[1]).powi(2) + (p[2] - at[2]).powi(2);
+        candidates
+            .min_by(|a, b| {
+                distance(a.position)
+                    .total_cmp(&distance(b.position))
+                    .then(b.id.cmp(&a.id))
             })
             .map(|o| o.id)
     }
@@ -793,6 +816,69 @@ mod tests {
             s.end_conversation();
             assert_eq!(s.world.get(owner).unwrap().position, at);
         }
+    }
+
+    #[test]
+    fn origins_duplicate_actors_take_the_nearest_instance_and_release_it_on_its_mark() {
+        let (mut s, hero, waiting, _) = sim();
+        s.world.get_mut(waiting).unwrap().active = false;
+        s.world.get_mut(waiting).unwrap().position = [0.0, 60.0, 0.0];
+        let live = s.world.spawn(ObjectKind::Creature, "hunter");
+        let area = s.world.area;
+        let o = s.world.get_mut(live).unwrap();
+        o.area = area;
+        o.position = [16.0, 0.0, 0.0];
+        let tracks = Tracks {
+            actors: vec![actor("hunter", [7.0, 0.0, 0.0], 0.0)],
+            ..Tracks::default()
+        };
+        let bound = s.bind_cutscene_actors(
+            &tracks,
+            Some(LineContext {
+                owner: hero,
+                player: hero,
+                unstaged: false,
+                placement: Placement::NONE,
+            }),
+        );
+        assert_eq!(bound.len(), 1);
+        assert_eq!(bound[0].object, live);
+        s.release_cutscene_actors(bound);
+        assert_eq!(s.world.get(live).unwrap().position, [7.0, 0.0, 0.0]);
+        assert_eq!(s.world.get(waiting).unwrap().position, [0.0, 60.0, 0.0]);
+        // DA2 retains its existing first-instance resolver.
+        s.game = thedas_vfs::Game::DragonAge2;
+        assert_eq!(
+            s.cutscene_actor_object("hunter", Some(hero), Some(hero)),
+            Some(waiting)
+        );
+    }
+
+    #[test]
+    fn origins_actor_distance_uses_context_area_height_and_later_equal_match() {
+        let (mut s, hero, hunter, _) = sim();
+        s.world.get_mut(hunter).unwrap().position = [0.0, 0.0, 20.0];
+        let other = s.world.spawn(ObjectKind::Creature, "hunter");
+        let area = s.world.area;
+        let o = s.world.get_mut(other).unwrap();
+        o.area = area;
+        o.position = [5.0, 0.0, 0.0];
+        assert_eq!(
+            s.cutscene_actor_object("hunter", Some(hero), Some(hero)),
+            Some(other)
+        );
+        // At equal 3D distance the native loop replaces its previous candidate.
+        s.world.get_mut(hunter).unwrap().position = [-5.0, 0.0, 0.0];
+        assert_eq!(
+            s.cutscene_actor_object("hunter", Some(hero), Some(hero)),
+            Some(other)
+        );
+        let elsewhere = s.world.spawn(ObjectKind::Area, "elsewhere");
+        s.world.get_mut(other).unwrap().area = Some(elsewhere);
+        assert_eq!(
+            s.cutscene_actor_object("hunter", Some(hero), Some(hero)),
+            Some(hunter)
+        );
     }
 
     #[test]

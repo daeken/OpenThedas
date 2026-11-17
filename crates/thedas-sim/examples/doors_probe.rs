@@ -434,6 +434,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         install: std::env::var_os("THEDAS_INSTALL")
             .map(PathBuf::from)
             .ok_or("THEDAS_INSTALL")?,
+        base_vfs: None,
         module: saved.module.clone(),
         area,
         waypoint: None,

@@ -729,7 +729,7 @@ fn sun_sample(uv: vec2<f32>, near: bool) -> vec4<f32> {
 // four-tap far PCF, distance fade and grazing-angle floor. The faithful pass owns
 // both maps, their caster selection, quality, fitting and temporal smoothing.
 fn sun_visibility(p: vec3<f32>, n: vec3<f32>, grazing_floor: bool) -> f32 {
-    if (sun.enabled.x == 0u || sun.direction.w < 0.5) {
+    if ((sun.enabled.x & 1u) == 0u || sun.direction.w < 0.5) {
         return 1.0;
     }
     // The final grazing floor clamps to one on back faces, regardless of either
@@ -740,6 +740,10 @@ fn sun_visibility(p: vec3<f32>, n: vec3<f32>, grazing_floor: bool) -> f32 {
     let q = vec4<f32>(p, 1.0);
     let sd = sun.data;
     let plane = dot(sd[8], q);
+    if ((sun.enabled.x & 2u) != 0u) {
+        let shade = soft_shadow_visibility(q, sd, sun_near, sun_far);
+        return clamp(select(shade, max(shade, 1.0 - 10.0 * dot(n, -sun.direction.xyz)), grazing_floor), 0.0, 1.0);
+    }
     let offsets = array<vec2<f32>, 4>(
         vec2<f32>(-0.00141302, -0.000598593),
         vec2<f32>(0.00141838, -0.00115336),
@@ -842,7 +846,7 @@ fn reaches(l: Light, room: u32) -> bool {
 // Whether either sun cascade holds `p` (its map coordinates fall inside), so its runtime
 // visibility is known there.
 fn sun_covered(p: vec3<f32>) -> bool {
-    if (sun.enabled.x == 0u || sun.direction.w < 0.5) {
+    if ((sun.enabled.x & 1u) == 0u || sun.direction.w < 0.5) {
         return false;
     }
     let q = vec4<f32>(p, 1.0);

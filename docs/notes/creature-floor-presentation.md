@@ -1,4 +1,4 @@
-# Creature floor presentation (reports 1034, 984, 985)
+# Creature floor presentation (reports 1034, 984, 985, 1105)
 
 Static analysis of DAOrigins.exe; addresses are virtual addresses. Only prose is
 included here. The ground-height helper and the moving character controller are
@@ -161,3 +161,77 @@ positions are changed, so the simulation-semantics sweep gate is not applicable.
 Capture commands, images and numerical deltas are retained under the testdata
 job directory `codex-captures/stairs-feet-floor-window/`; labelled triptychs are
 staged for coordinator review, outside the repository and media queue.
+
+## Proving platform ownership (report 1105)
+
+The two visible creatures in the supplied report are the hero (118) and Leske
+(313). The platform is a static level draw in `orz500d`, room `orz500d_3046`,
+draw 1128, model `dni_livgroom_stair01_0`, mesh chunk
+`MshMain_DNI_LivgRoom_stair01_0`. Its `Default` material has render class
+`Opaque,Static1`, and its triangles enter `LiveLevel::collider`.
+
+| Creature | Saved X, Y | Sim Z | Report drawn feet-root Z | Platform top / floor query Z | Required rise |
+| --- | --- | --- | --- | --- | --- |
+| Hero | -8.832403, 56.420140 | -1.689837 | -1.689837 | -1.500004 | 0.189833 m |
+| Leske | -7.402170, 52.634762 | -1.664672 | -1.664672 | -1.500004 | 0.164668 m |
+
+Both rises fit the traced 0.5 m step allowance. At those points the underlying
+room floor is at -2.017186 and -2.018708 respectively, on model
+`dni_livgroom_flor01_0`, chunk `MshMain_DNI_LivgRoom_Flor01_0`, draws 1076
+and 1075. `floor_under` selects the raised platform from the static opaque
+render-triangle collider. The ARL walkmesh cells (76, 295) and (79, 287) also
+store -1.5 m, with walkability value 1. These grid observations describe the
+simulation input independently of the presentation ray.
+
+The report's presentation snapshot records retained `bdc140_everd.dlb` animation
+layers on both creatures after the conversation has closed. The hero retains
+`mh.dg_tn_90_l__0` at 1.150035 seconds, and Leske retains `mh.po_tw_a8__0`
+at 3.841973 seconds. `Live::sync` gives a retained cutscene layer ownership of
+the authored root, skipping ordinary floor presentation. Thus the report has
+both drawn feet-root transforms at their saved Z despite the reachable surface.
+The skeleton's animated `root` bone is higher, at -0.908879 for the hero and
+-0.871521 for Leske. The feet-root values in the table describe the object
+transform used by the model and selection ring.
+
+`CutsceneActors::switch` formerly returned immediately for an unchanged source
+key. A conversation can change from a staged line to an unstaged line while
+remaining open, retaining its previous layers with source `None`. Closing that
+conversation keeps source `None` and used to skip cleanup. Cleanup now runs
+on every closed-conversation update, including unchanged source keys. Open
+conversation layers retain their lifetime and presentation clock. Releasing
+ownership lets the existing floor query place both feet roots on the platform.
+
+The paired reproduction loads the unmodified `save_now.json` and restores the
+two transient layers from `presentation.json`, through the staged-to-unstaged
+source transition. Its baseline object transforms and animated root-bone
+positions reproduce the report's recorded values. This restoration is needed
+because retained presentation layers are absent from a simulation save. The
+fresh-load comparison independently exercises the simulation save alone.
+Captures use a fixed camera and shader time, 1600×900 output, and zero simulation
+advance. Temporary probes and local captures remain in the testdata job folder.
+
+The regression checks cover the staged-to-unstaged-to-closed lifecycle for both
+creatures, repeated open-line clocks and retained layers, and a synthetic
+platform over a lower room floor at the two saved creature heights. Existing
+step/drop bounds and scripted-root tests remain in place.
+
+Report 1034 already reaches the Commons stair on the baseline containing PR
+1048, with sim Z 13.323474 and drawn feet-root Z 13.682879. Its fresh-load
+comparison checks that stair contact alongside the Proving fix. Report 984
+checks Oskias's active seated cutscene pose.
+
+With cleanup applied, the hero's drawn feet-root Z is -1.5000038 and Leske's
+is -1.5000037. Their animated skeleton root-bone Z values are -0.7073853 and
+-0.7071489, respectively. The restored-state before/after comparison changes
+122,855 of 1,440,000 pixels (8.53160%) at a maximum-channel RGB threshold
+greater than 2/255. The fresh Proving save and Commons stair comparisons are
+pixel-identical. Oskias keeps his seated pose and feet-root Z 0.0118341, with
+maximum RGB delta 2/255 and zero pixels above the threshold. All comparisons
+include a saturating absolute RGB Delta ×4 panel.
+
+Validation on merged main `d6b15225` passes workspace formatting, all-target
+workspace clippy with warnings denied, and debug workspace tests with **1,481
+passed, 26 ignored, 0 failed**. The new lifecycle regression reproduces the
+baseline failure and passes after cleanup. Three added tests cover that
+lifecycle, open-line retention and clocks, and the synthetic platform. The
+simulation-semantics sweep gate is inapplicable to these presentation-only edits.

@@ -29,6 +29,8 @@
 //! - **Effects.** `ApplyEffectOnObject` runs the target's `EVENT_TYPE_APPLY_EFFECT` handler at
 //!   once, with `GetCurrentEffect` returning the effect. Unless the handler calls
 //!   `SetIsCurrentEffectValid(FALSE)`, an effect with a duration stays on the target.
+//!   Origins visual effects instead use the native type-4 handler without that event
+//!   (see `docs/notes/origins-visual-effect-dispatch.md`).
 //! - **Resurrection.** An accepted `EFFECT_TYPE_RESURRECTION` brings the target back; its
 //!   handler restores health.
 //! - **Death.** An `EFFECT_TYPE_DEATH` that its handler accepts kills the target (the rules
@@ -36,7 +38,7 @@
 //!   or below and is neither immortal nor plot dies and gets `EVENT_TYPE_DEATH`, with the
 //!   killer as creator and object 0.
 //!
-//! All of this is provisional: event layouts are read from how `rules_core` reads them, and
+//! Except where native addresses are cited, this is provisional: event layouts are read from how `rules_core` reads them, and
 //! the range and default attack time are guesses, not values taken from the executable.
 
 use serde::{Deserialize, Serialize};
@@ -961,8 +963,8 @@ impl Sim {
         self.world.get(seen).is_some_and(|o| o.combat.stealth) && self.hostile(who, seen)
     }
 
-    /// Runs a target's `APPLY_EFFECT` handler for an effect, keeps it if it lasts, and
-    /// checks for death afterwards.
+    /// Applies an effect, using the native Origins visual path or the target's
+    /// `APPLY_EFFECT` handler, and keeps it if it lasts.
     pub fn apply_effect(&mut self, target: ObjectId, mut effect: Effect) {
         if self.world.get(target).is_none() {
             return;
@@ -982,6 +984,16 @@ impl Sim {
                 effect.ty, creator, effect.floats
             ),
         });
+        // DAOrigins.exe 0x7a0ee8..0x7a0f1a dispatches type 4 to 0x7a00a0,
+        // which attaches the visual without raising APPLY_EFFECT (0x79fe90).
+        // Do not expose this visual as the current script effect, including when
+        // it is applied from inside another effect's handler. DA2 is untraced.
+        if self.game == thedas_vfs::Game::Origins && effect.ty == 4 {
+            if effect.duration_type != constant_of(self, "EFFECT_DURATION_TYPE_INSTANT") {
+                self.world.get_mut(target).unwrap().effects.push(effect);
+            }
+            return;
+        }
         let health = constant_of(self, "PROPERTY_DEPLETABLE_HEALTH");
         let health_of = |s: &Sim| {
             s.world
@@ -1116,6 +1128,11 @@ impl Sim {
             None => None,
         };
         let Some(effect) = removed else { return false };
+        // The paired native type-4 removal handler (0x7a0150) detaches the
+        // visual without REMOVE_EFFECT, just as application bypasses the hook.
+        if self.game == thedas_vfs::Game::Origins && effect.ty == 4 {
+            return true;
+        }
         // An area of effect goes with its effect (DAOrigins.exe 0x7a0520).
         let aoe = (effect.ty == crate::aoe::EFFECT_TYPE_AOE)
             .then(|| effect.objects.first().copied())
@@ -1523,14 +1540,19 @@ impl Sim {
             arrived: false,
             da2_target_prepared: false,
             da2_basic_attack_fallback: self.game == thedas_vfs::Game::DragonAge2,
+            da2_player_issued: false,
             path: Vec::new(),
             turned_at: None,
             is_static: false,
         };
         self.da2_default_attack_command(&mut cmd);
-        if let Some(o) = self.world.get_mut(attacker) {
+        if self.game == thedas_vfs::Game::DragonAge2 {
+            self.da2_player_command(attacker, cmd);
+        } else if let Some(o) = self.world.get_mut(attacker) {
             o.commands.clear();
             o.commands.push(cmd);
+        }
+        if let Some(o) = self.world.get_mut(attacker) {
             o.combat.in_combat = true;
         }
     }
@@ -1641,6 +1663,7 @@ impl Sim {
             arrived: false,
             da2_target_prepared: false,
             da2_basic_attack_fallback: false,
+            da2_player_issued: false,
             path: Vec::new(),
             turned_at: None,
             is_static: false,
@@ -2314,8 +2337,8 @@ const SPELL_CONJURING_SPEEDS: i32 = 0x87;
 /// The animation tables (M2DA 0, `anim_*.gda`): the tree action an animation id plays
 /// (0x5cb558 maps the actions to ids), and the animation that follows it (0x5ca6c3: a
 /// conjure's start is followed by its loop).
-const COL_ANIM_ACTION: u32 = 0x7a39_8af9;
-const COL_ANIM_NEXT: u32 = 0xffc3_72e7;
+pub(crate) const COL_ANIM_ACTION: u32 = 0x7a39_8af9;
+pub(crate) const COL_ANIM_NEXT: u32 = 0xffc3_72e7;
 /// Animation event kinds that deliver an ability: the creature's animation-event handler
 /// (0x6c0bf0, its switch at 0x6c0c37) sends `ABILITY_CAST_IMPACT` on kind 7 (0x6c0c5f,
 /// 0x6af430); kind 9 goes on (0x6c0d2e, 0x694ee0) to the creature's release (0x6b6f60),
@@ -2447,7 +2470,11 @@ impl Sim {
 
     /// An action's animation in the first of `trees` that has it (cached by tree and
     /// action).
-    fn ability_anim(&mut self, trees: &[String], action: &str) -> Option<AbilityAnimLen> {
+    pub(crate) fn ability_anim(
+        &mut self,
+        trees: &[String],
+        action: &str,
+    ) -> Option<AbilityAnimLen> {
         for tree in trees {
             let key = format!("{tree}|{action}");
             let found = match self.ability_anims.get(&key) {
@@ -2502,7 +2529,7 @@ pub(crate) struct AbilityAnimLen {
 /// as DAOrigins.exe's test (0x695390) reads it when the creature has no animation component
 /// to ask (0x6953ad -> 0x5ca610 with mask 1): set on the conjure loops (4097), clear on
 /// their starts (4096). With a component it asks the component (0xa5e940), not traced.
-fn anim_loops(anims: &crate::m2da::Table, anim: i64) -> bool {
+pub(crate) fn anim_loops(anims: &crate::m2da::Table, anim: i64) -> bool {
     matches!(anims.cell_by_hash(COL_ANIM_FLAGS, anim), Some(thedas_formats::gda::Cell::Int(v)) if v & 1 != 0)
 }
 
@@ -2707,6 +2734,7 @@ mod tests {
     use super::*;
 
     const LDF: &str = "int EVENT_TYPE_PERCEPTION_APPEAR = 25;\n\
+        int COMMAND_TYPE_USE_ABILITY = 25;\n\
         int EVENT_TYPE_MANA_STAM_DEPLETED = 64;\n\
         int EVENT_TYPE_PERCEPTION_DISAPPEAR = 26;\n\
         int EVENT_TYPE_DEATH = 4;\n\
@@ -3999,6 +4027,7 @@ mod tests {
                 arrived: false,
                 da2_target_prepared: false,
                 da2_basic_attack_fallback: false,
+                da2_player_issued: false,
                 path: Vec::new(),
                 turned_at: None,
                 is_static: false,

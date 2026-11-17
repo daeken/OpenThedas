@@ -432,13 +432,14 @@ pub enum SceneLight {
 /// draws with `Static1_Fast.psh`, characters vertex-lit, terrain with `Terrain3`, trees with
 /// their `_Low` shaders and bloom with the five-tap blur. No material in the data tests for
 /// High, so High's materials draw as Medium's; its sun shadows are sharper and reach further
-/// (see [`crate::shadow::partition_size`] and [`crate::shadow::partition_reach`]). Medium by default: the original's own default (chosen by
-/// its hardware detection) is not traced.
+/// (see [`crate::shadow::partition_size`] and [`crate::shadow::partition_reach`]). High
+/// corresponds to original index 3 (Very High) and is our deliberate default; the original's
+/// hardware-detected default is not traced.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Detail {
     Low,
-    #[default]
     Medium,
+    #[default]
     High,
 }
 
