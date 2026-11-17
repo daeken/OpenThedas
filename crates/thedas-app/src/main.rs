@@ -52,6 +52,7 @@ mod audio;
 mod camfade;
 mod chargen_stage;
 mod control;
+mod conversation_input;
 mod cursor;
 mod cutactors;
 mod cutcam;
@@ -882,6 +883,8 @@ struct App {
     swallow_release: bool,
     /// Where clients' requests arrive (`--control`).
     control: Option<control::Control>,
+    /// Bounded per-frame movement diagnostics, enabled only through the control port.
+    motion_trace: Option<Vec<J>>,
     /// Clients' input still playing, first come first played.
     remote: VecDeque<Remote>,
     /// Clients waiting for the next presented frame, and how much smaller they want it.
@@ -1568,22 +1571,9 @@ impl App {
         self.pad = pad;
     }
 
-    fn update(&mut self) {
-        let now = Instant::now();
-        let dt = (now - self.last).as_secs_f32().min(0.1);
-        self.last = now;
+    fn update_input(&mut self, dt: f32) {
         self.key_walk();
         let k = |c| self.keys.contains(&c);
-        // The camera waits for a load to finish: it resets as the world comes up.
-        let loading = self.live.as_ref().is_some_and(|l| l.loading());
-        if let (Some(f), Some(l), false) = (self.follow.as_mut(), self.live.as_mut(), loading) {
-            if let Some(heading) = l.camera_reset_due() {
-                f.reset(heading);
-            }
-            if let Some(level) = l.zoom_request_due() {
-                f.set_zoom_level(level);
-            }
-        }
         if let Some(f) = self.follow.as_mut() {
             // A and D turn the camera round the leader: keymap.gda's `MoveCameraLeft` and
             // `MoveCameraRight`. Provisional: the rate.
@@ -1603,6 +1593,45 @@ impl App {
                     thedas_sim::commands::SimCommand::PlayerZoomedIn,
                 );
             }
+            return;
+        }
+        let speed = if k(KeyCode::ShiftLeft) || k(KeyCode::ShiftRight) {
+            15.0
+        } else {
+            4.0
+        } * dt;
+        let axis = |pos: bool, neg: bool| (pos as i32 - neg as i32) as f32;
+        let fwd = axis(k(KeyCode::KeyW), k(KeyCode::KeyS));
+        let right = axis(k(KeyCode::KeyD), k(KeyCode::KeyA));
+        // E up, Q down. C, which also lowered it, opens the character record while playing.
+        let c_lowers = self.screens.is_none();
+        let up = axis(
+            k(KeyCode::KeyE),
+            k(KeyCode::KeyQ) || (c_lowers && k(KeyCode::KeyC)),
+        );
+        self.camera.fly(fwd * speed, right * speed, up * speed);
+        let turn = 1.5 * dt;
+        let yaw = axis(k(KeyCode::ArrowLeft), k(KeyCode::ArrowRight));
+        let pitch = axis(k(KeyCode::ArrowUp), k(KeyCode::ArrowDown));
+        self.camera.look(yaw * turn, pitch * turn);
+    }
+
+    /// Resolve the view after the simulation has reached this frame.
+    /// Frame scheduling is provisional relative to the executable. A pre-step target
+    /// leaves the moving hero ahead of its camera by speed * frame dt, which oscillates
+    /// with uneven frame times.
+    fn update_camera(&mut self, dt: f32) {
+        // The camera waits for a load to finish: it resets as the world comes up.
+        let loading = self.live.as_ref().is_some_and(|l| l.loading());
+        if let (Some(f), Some(l), false) = (self.follow.as_mut(), self.live.as_mut(), loading) {
+            if let Some(heading) = l.camera_reset_due() {
+                f.reset(heading);
+            }
+            if let Some(level) = l.zoom_request_due() {
+                f.set_zoom_level(level);
+            }
+        }
+        if let Some(f) = self.follow.as_mut() {
             let eye = self
                 .live
                 .as_ref()
@@ -1639,27 +1668,7 @@ impl App {
             {
                 self.camera = c;
             }
-            return;
         }
-        let speed = if k(KeyCode::ShiftLeft) || k(KeyCode::ShiftRight) {
-            15.0
-        } else {
-            4.0
-        } * dt;
-        let axis = |pos: bool, neg: bool| (pos as i32 - neg as i32) as f32;
-        let fwd = axis(k(KeyCode::KeyW), k(KeyCode::KeyS));
-        let right = axis(k(KeyCode::KeyD), k(KeyCode::KeyA));
-        // E up, Q down. C, which also lowered it, opens the character record while playing.
-        let c_lowers = self.screens.is_none();
-        let up = axis(
-            k(KeyCode::KeyE),
-            k(KeyCode::KeyQ) || (c_lowers && k(KeyCode::KeyC)),
-        );
-        self.camera.fly(fwd * speed, right * speed, up * speed);
-        let turn = 1.5 * dt;
-        let yaw = axis(k(KeyCode::ArrowLeft), k(KeyCode::ArrowRight));
-        let pitch = axis(k(KeyCode::ArrowUp), k(KeyCode::ArrowDown));
-        self.camera.look(yaw * turn, pitch * turn);
     }
 
     /// A frame of the boot movies: only the movie is drawn, and only a key, a click or the
@@ -1736,14 +1745,16 @@ impl App {
         if self.intro.is_some() {
             return self.intro_frame();
         }
-        let dt = self.last.elapsed().as_secs_f64() * 1000.0;
+        let now = Instant::now();
+        let dt = (now - self.last).as_secs_f64() * 1000.0;
+        self.last = now;
         self.serve_control(dt);
         self.pad_frame(dt);
         self.report_frame(dt);
         self.resume_frame();
         self.mod_mode_frame(dt);
         self.returning_frame();
-        self.update();
+        self.update_input((dt.min(live::MAX_STEP_MS) / 1000.0) as f32);
         let Some(g) = self.gfx.as_mut() else {
             return Ok(());
         };
@@ -1760,6 +1771,7 @@ impl App {
             g.surface.configure(&g.ctx.device, &g.config);
         }
         debug_assert_eq!(plan.draw, frame.is_some());
+        self.prepare_world(dt, plan.draw || plan.offscreen_frames)?;
         // No frame to draw into (the window hidden or occluded, the display asleep, a
         // resize): the game runs on all the same, only nothing is drawn, and clients waiting
         // for a presented frame get one drawn offscreen instead.
@@ -1770,6 +1782,7 @@ impl App {
             }
             return Ok(());
         };
+        let g = self.gfx.as_mut().expect("window is up");
         let view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
@@ -1779,30 +1792,6 @@ impl App {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("frame"),
             });
-        let stopped = self.screens.as_ref().is_some_and(|s| s.world_stopped());
-        if let Some(live) = self.live.as_mut() {
-            // A pending transition, or a world map journey, runs on behind its loading screen
-            // (which stops the world otherwise); a training lesson's events are delivered
-            // with a screen up too (its steps go on inside the inventory, the tactics), no
-            // time passing (see `Live::step`).
-            if !stopped || live.transition_pending() || live.journey() || live.training() {
-                live.step(dt);
-            }
-            // While a level loads the world holds still: its presentation too.
-            if !live.loading() {
-                live.advance_presentation(dt);
-            }
-            live.frame_size = (g.config.width, g.config.height);
-            live.set_chargen_pose(g.ui.paperdoll_pose());
-            live.sync(&g.ctx, g.config.format)?;
-            if self.screens.is_some() {
-                loading_screen(live, &mut g.ui, &mut self.load_screen_up);
-            }
-            // Portraits are drawn by the objects' renderers, whose constants this frame's
-            // draws use too: they are drawn (and submitted) before the frame is encoded, so
-            // the frame is not drawn from the portrait camera.
-            draw_likenesses(live, &mut g.ui, self.screens.as_ref(), &g.ctx, dt);
-        }
         let size = (g.config.width, g.config.height);
         let drawn = match (self.live.as_mut(), g.renderer.as_mut()) {
             (Some(live), _) => {
@@ -2016,36 +2005,53 @@ impl App {
         }
     }
 
-    /// A frame with nothing to draw into: the simulation, its presentation and the interface
-    /// run as on a drawn frame (see [`App::redraw`]); the drawing alone is skipped.
-    fn tick_unpresented(&mut self, dt: f64) -> Result<()> {
-        let Some(g) = self.gfx.as_mut() else {
-            return Ok(());
-        };
+    /// Step once for both surface and offscreen frames, then resolve the camera and
+    /// pose that same simulation state. Input has already been issued by update_input.
+    fn prepare_world(&mut self, dt: f64, rendered: bool) -> Result<()> {
         let stopped = self.screens.as_ref().is_some_and(|s| s.world_stopped());
+        let mut sim_ticks = 0;
         if let Some(live) = self.live.as_mut() {
-            // A pending transition, or a world map journey, runs on behind its loading screen
-            // (which stops the world otherwise); a training lesson's events are delivered
-            // with a screen up too (its steps go on inside the inventory, the tactics), no
-            // time passing (see `Live::step`).
+            // Transitions and journeys run behind their loading screens. Training can
+            // deliver script events while its lesson holds the simulation clock.
             if !stopped || live.transition_pending() || live.journey() || live.training() {
-                live.step(dt);
+                sim_ticks = live.step(dt);
             }
-            // While a level loads the world holds still: its presentation too.
             if !live.loading() {
                 live.advance_presentation(dt);
             }
+        }
+        // Resolve the camera from the stepped state before sync applies the camera's
+        // creature fades to the renderer. The target and drawn hero now share a time.
+        self.update_camera((dt.min(live::MAX_STEP_MS) / 1000.0) as f32);
+        if let (Some(g), Some(live)) = (self.gfx.as_mut(), self.live.as_mut()) {
             live.frame_size = (g.config.width, g.config.height);
             live.set_chargen_pose(g.ui.paperdoll_pose());
             live.sync(&g.ctx, g.config.format)?;
             if self.screens.is_some() {
                 loading_screen(live, &mut g.ui, &mut self.load_screen_up);
             }
-            // The party's portraits and the paperdoll are drawn into their own targets, so
-            // they are kept up with no frame to present too (a hidden window's portraits
-            // stayed empty, and a client's offscreen frame showed them so).
+            // Submit portraits before encoding the world's draws, which use the same
+            // renderer constants.
             draw_likenesses(live, &mut g.ui, self.screens.as_ref(), &g.ctx, dt);
+            control::record_motion(
+                &mut self.motion_trace,
+                live,
+                &self.camera,
+                self.follow.as_ref(),
+                dt,
+                sim_ticks,
+                rendered,
+            );
         }
+        Ok(())
+    }
+
+    /// A frame with nothing to draw into: the simulation, its presentation and the interface
+    /// run as on a drawn frame (see [`App::redraw`]); the drawing alone is skipped.
+    fn tick_unpresented(&mut self, dt: f64) -> Result<()> {
+        let Some(g) = self.gfx.as_mut() else {
+            return Ok(());
+        };
         if self.live.is_none() {
             if let Some(r) = g.renderer.as_mut() {
                 r.advance_time(dt / 1000.0);
@@ -3956,7 +3962,10 @@ impl App {
 
     /// The left button goes down or up at the cursor.
     fn left_button(&mut self, pressed: bool) {
-        self.left_down = pressed;
+        let was_down = std::mem::replace(&mut self.left_down, pressed);
+        if pressed && was_down {
+            return;
+        }
         let (x, y) = self.cursor;
         self.recorder.input(format!(
             "{} {x:.0},{y:.0}",
@@ -3997,7 +4006,9 @@ impl App {
         }
         if double {
             if let Some(g) = self.gfx.as_mut() {
-                if self.screens.as_ref().is_some_and(|s| !s.exploring()) {
+                if self.screens.as_ref().is_some_and(|s| {
+                    !s.exploring() && !s.shown().contains(&screens::Screen::Conversation)
+                }) {
                     g.ui.click_as(
                         thedas_ui::avm1::MOUSE_LEFT + thedas_ui::avm1::DOUBLE_CLICK,
                         x,
@@ -4017,8 +4028,8 @@ impl App {
                     .as_ref()
                     .is_none_or(|s| world_takes_click(&g.ui, s, x, y));
             }
-            g.ui.mouse_button(x, y, pressed);
-            if pressed && !to_world && self.live.is_some() && self.screens.is_some() {
+            let accepted = g.ui.mouse_button(x, y, pressed);
+            if accepted && pressed && !to_world && self.live.is_some() && self.screens.is_some() {
                 g.ui.clicked();
             }
         }
@@ -4647,6 +4658,12 @@ impl App {
             let cmd = r.body["cmd"].as_str().unwrap_or_default().to_string();
             let answer = match cmd.as_str() {
                 "status" => Some(self.status()),
+                "motion_trace" => Some(if r.body["enabled"].as_bool() == Some(true) {
+                    self.motion_trace = Some(Vec::new());
+                    json!({ "ok": true, "limit": control::MOTION_TRACE_LIMIT })
+                } else {
+                    json!({ "ok": true, "frames": self.motion_trace.take().unwrap_or_default() })
+                }),
                 // The frame as presented, read back as the next one is drawn; a surface that
                 // cannot be read back is drawn again offscreen instead.
                 "screenshot" => match self
@@ -5353,11 +5370,12 @@ fn line_is_voiced(audio: &audio::GameAudio, sim: &thedas_sim::Sim) -> bool {
             .is_some_and(|l| l.vo_mode != 0)
 }
 
-/// The voice-over the line on screen wants: the conversation's line, else a cutscene's line
+/// The voice-over the line on screen wants: the still-presented conversation line (including
+/// a terminal NPC line), else a cutscene's line
 /// that has its own voice. With [`audio::GameAudio::line_voice`] this says whether the line
 /// is voiced (and for how long) as soon as it is chosen, before its voice plays.
 pub(crate) fn voice_line(sim: &thedas_sim::Sim) -> Option<audio::VoiceLine> {
-    let line = sim.conversation_line().and_then(|l| {
+    let line = sim.presented_conversation_line().and_then(|l| {
         let female = sim
             .world
             .get(l.player)
@@ -5839,8 +5857,8 @@ impl padplay::Host for HeadlessHost<'_> {
                 layer.render_movies();
                 let w = world_takes_click(layer, s, x, y);
                 layer.mouse_move(x, y);
-                layer.mouse_button(x, y, down);
-                if down && !w {
+                let accepted = layer.mouse_button(x, y, down);
+                if accepted && down && !w {
                     layer.clicked();
                 }
                 w
@@ -7162,11 +7180,11 @@ fn main() -> Result<()> {
                                 layer.render_movies();
                                 let w = world_takes_click(layer, s, x, y);
                                 layer.mouse_move(x, y);
-                                layer.mouse_button(x, y, true);
-                                layer.mouse_button(x, y, false);
-                                if !w {
+                                let accepted = layer.mouse_button(x, y, true);
+                                if accepted && !w {
                                     layer.clicked();
                                 }
+                                layer.mouse_button(x, y, false);
                                 w
                             }
                             None => true,
@@ -7798,6 +7816,7 @@ fn main() -> Result<()> {
         last_press: None,
         swallow_release: false,
         control,
+        motion_trace: None,
         remote: VecDeque::new(),
         frame_requests: Vec::new(),
         pads: paddev::Pads::new(),

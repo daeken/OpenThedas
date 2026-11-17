@@ -344,7 +344,7 @@ pub struct Command {
     /// `COMMAND_TYPE_*`.
     pub ty: i32,
     pub name: String,
-    /// Origins' AddCommand bStatic: ordinary add behavior cannot clear this command.
+    /// AddCommand bStatic; native active-command clearing rules differ by game.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub is_static: bool,
     pub target: Option<ObjectId>,
