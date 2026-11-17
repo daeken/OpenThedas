@@ -52,6 +52,7 @@ mod audio;
 mod camfade;
 mod chargen_stage;
 mod control;
+mod conversation_input;
 mod cursor;
 mod cutactors;
 mod cutcam;
@@ -73,6 +74,7 @@ mod looks;
 mod modconv;
 mod modmode;
 mod modworld;
+mod mouse;
 mod occlusion;
 mod pad;
 mod paddev;
@@ -223,9 +225,9 @@ struct Args {
     /// video option: `on` or `off`.
     #[arg(long, default_value = "on", value_parser = ["on", "off"])]
     frame_effects: String,
-    /// How the level is drawn: `faithful` (every material through the original's own
-    /// shaders, the reference) or `deferred` (our renderer: the level's static geometry lit
-    /// per pixel by every light in reach; see docs/deferred.md). F11 flips between them.
+    /// How the level is drawn: `faithful` (the original's material shaders) or `deferred`
+    /// (our renderer: static geometry lit per pixel by every light in reach; see
+    /// docs/deferred.md). Sun-shadow sampling is chosen separately. F11 flips renderers.
     #[arg(long, default_value = "faithful", value_parser = ["faithful", "deferred"])]
     renderer: String,
     /// What the deferred renderer does with the baked lightmaps: `baked` (as the original),
@@ -234,6 +236,10 @@ struct Args {
     /// `THEDAS_DEFERRED_BAKED_LIGHTING`, else `baked`.
     #[arg(long, value_parser = ["baked", "hybrid", "realtime"])]
     lighting: Option<String>,
+    /// Improved sun-shadow PCF and a 2 m partition blend. `off` keeps the original's
+    /// hard switch and filters. Deliberate OpenThedas visual deviation; same shadow maps.
+    #[arg(long, default_value = "on", value_parser = ["on", "off"])]
+    soft_shadows: String,
     /// Viewer (`--area`): place visual effects in the level, `MODEL@X,Y,Z` separated by `;`
     /// (`fxa_fireball_impact_p@10,4,0;fxa_storm_area_p@14,2,0`), each a model of the
     /// game's VFX (`.mmh` without the extension) standing there, its emitters running from
@@ -242,9 +248,9 @@ struct Args {
     #[arg(long, default_value = "")]
     vfx: String,
     /// The original's "Graphics Detail" video option, which picks the materials' techniques
-    /// and the bloom's blur: `low`, `medium` or `high` (High's materials draw as Medium's; its
-    /// sun shadows are 1024 texels a side and reach further).
-    #[arg(long, default_value = "medium", value_parser = ["low", "medium", "high"])]
+    /// and the bloom's blur: `low`, `medium` or `high` (Very High, original index 3;
+    /// materials draw as Medium's, sun shadows are 1024 texels and reach further).
+    #[arg(long, default_value = "high", value_parser = ["low", "medium", "high"])]
     detail: String,
     /// Multisampled anti-aliasing for the world: samples a pixel (the original's
     /// `AntialiasingLevel`; 1 is off, which leaves the post-process smoothing on). Limited to
@@ -449,22 +455,23 @@ pub fn programs_cached(
 /// loads the scene.
 fn load(
     install: &Path,
+    base_vfs: Arc<Vfs>,
     area: &str,
     shaders: &str,
     props: &[thedas_render::Prop],
     detail: thedas_render::scene::Detail,
 ) -> Result<Loaded> {
-    let install = DaoInstall::open(install)?;
-    let mut vfs = install.play_vfs(TextureQuality::High)?;
     if area == "none" {
         return Ok(Loaded {
-            vfs: Arc::new(vfs),
+            vfs: base_vfs,
             scene: None,
             shaders: shaders.to_string(),
             frame_effects: true,
             render_path: Default::default(),
         });
     }
+    let install = DaoInstall::open(install)?;
+    let mut vfs = base_vfs.as_ref().clone();
     let level = match install.mount_level(&mut vfs, area) {
         Ok(mount) => mount.level,
         Err(_) => {
@@ -628,14 +635,15 @@ fn capture(
             let comparison = std::env::var("THEDAS_BENCH_SHADOW_COMPARE").ok();
             if comparison
                 .as_deref()
-                .is_some_and(|s| s != "reuse" && s != "faithful")
+                .is_some_and(|s| !matches!(s, "reuse" | "faithful" | "soft"))
             {
-                bail!("THEDAS_BENCH_SHADOW_COMPARE must be reuse or faithful");
+                bail!("THEDAS_BENCH_SHADOW_COMPARE must be reuse, faithful or soft");
             }
             if compare.is_some() && comparison.is_some() {
                 bail!("choose one deferred benchmark comparison");
             }
             let original_path = live.render_path;
+            let original_soft = thedas_render::soft_shadows();
             let mut modes = Vec::new();
             let mut shadow_modes = Vec::new();
             for frame in 0..n {
@@ -714,6 +722,7 @@ fn capture(
                 }
                 match comparison.as_deref() {
                     Some("reuse") => live.set_deferred_shadow_reuse(Some(test)),
+                    Some("soft") => thedas_render::set_soft_shadows(test),
                     Some("faithful") => {
                         live.render_path = if test {
                             thedas_render::RenderPath::Deferred
@@ -751,6 +760,9 @@ fn capture(
             }
             live.render_path = original_path;
             live.set_deferred_shadow_reuse(None);
+            if comparison.as_deref() == Some("soft") {
+                thedas_render::set_soft_shadows(original_soft);
+            }
             let avg = ms.iter().sum::<f64>() / ms.len() as f64;
             let worst = ms.iter().cloned().fold(0.0, f64::max);
             println!("bench: {n} frames, avg {avg:.1} ms, worst {worst:.1} ms");
@@ -843,6 +855,8 @@ struct App {
     /// A loading screen is up for the level being built (see `Live::loading`).
     load_screen_up: bool,
     loaded: Loaded,
+    /// The run's play stack, without viewer or per-level mounts.
+    base_vfs: Arc<Vfs>,
     /// The running game, when playing.
     live: Option<live::Live>,
     /// The game camera, when following the party leader (playing; F toggles free-fly).
@@ -868,6 +882,7 @@ struct App {
     gfx: Option<Gfx>,
     keys: HashSet<KeyCode>,
     looking: bool,
+    right_click: mouse::RightClick,
     /// The right button went down over the interface: its release is the interface's too (an
     /// item's radial menu opens on the press and acts on the release).
     ui_right: bool,
@@ -880,6 +895,8 @@ struct App {
     swallow_release: bool,
     /// Where clients' requests arrive (`--control`).
     control: Option<control::Control>,
+    /// Bounded per-frame movement diagnostics, enabled only through the control port.
+    motion_trace: Option<Vec<J>>,
     /// Clients' input still playing, first come first played.
     remote: VecDeque<Remote>,
     /// Clients waiting for the next presented frame, and how much smaller they want it.
@@ -924,6 +941,8 @@ struct App {
     /// A report under way: its screenshot and the player's note, to come, and the client
     /// that asked for it (`--control`'s `report`), waiting for where it went.
     report_wait: Option<ReportWait>,
+    /// A failed report's message, kept until dismissed, and frames since last asked.
+    report_failure: Option<(String, u32)>,
     /// The settings the game was started with, for reports.
     started_with: J,
     /// The way back from a report: a fix offered, fetched and checked (see [`update`]).
@@ -1522,6 +1541,7 @@ impl App {
         );
         if let (Some(live), Some(_)) = (&self.live, &self.screens) {
             ui.attach(&live.sim);
+            seed_client_options(live, &ui);
             ui.set_saves(saves::SaveStore::new(self.saves_dir.clone()));
         }
         let reticle = reticle::ReticlePass::new(&ctx.device, config.format, 1);
@@ -1566,22 +1586,9 @@ impl App {
         self.pad = pad;
     }
 
-    fn update(&mut self) {
-        let now = Instant::now();
-        let dt = (now - self.last).as_secs_f32().min(0.1);
-        self.last = now;
+    fn update_input(&mut self, dt: f32) {
         self.key_walk();
         let k = |c| self.keys.contains(&c);
-        // The camera waits for a load to finish: it resets as the world comes up.
-        let loading = self.live.as_ref().is_some_and(|l| l.loading());
-        if let (Some(f), Some(l), false) = (self.follow.as_mut(), self.live.as_mut(), loading) {
-            if let Some(heading) = l.camera_reset_due() {
-                f.reset(heading);
-            }
-            if let Some(level) = l.zoom_request_due() {
-                f.set_zoom_level(level);
-            }
-        }
         if let Some(f) = self.follow.as_mut() {
             // A and D turn the camera round the leader: keymap.gda's `MoveCameraLeft` and
             // `MoveCameraRight`. Provisional: the rate.
@@ -1601,6 +1608,45 @@ impl App {
                     thedas_sim::commands::SimCommand::PlayerZoomedIn,
                 );
             }
+            return;
+        }
+        let speed = if k(KeyCode::ShiftLeft) || k(KeyCode::ShiftRight) {
+            15.0
+        } else {
+            4.0
+        } * dt;
+        let axis = |pos: bool, neg: bool| (pos as i32 - neg as i32) as f32;
+        let fwd = axis(k(KeyCode::KeyW), k(KeyCode::KeyS));
+        let right = axis(k(KeyCode::KeyD), k(KeyCode::KeyA));
+        // E up, Q down. C, which also lowered it, opens the character record while playing.
+        let c_lowers = self.screens.is_none();
+        let up = axis(
+            k(KeyCode::KeyE),
+            k(KeyCode::KeyQ) || (c_lowers && k(KeyCode::KeyC)),
+        );
+        self.camera.fly(fwd * speed, right * speed, up * speed);
+        let turn = 1.5 * dt;
+        let yaw = axis(k(KeyCode::ArrowLeft), k(KeyCode::ArrowRight));
+        let pitch = axis(k(KeyCode::ArrowUp), k(KeyCode::ArrowDown));
+        self.camera.look(yaw * turn, pitch * turn);
+    }
+
+    /// Resolve the view after the simulation has reached this frame.
+    /// Frame scheduling is provisional relative to the executable. A pre-step target
+    /// leaves the moving hero ahead of its camera by speed * frame dt, which oscillates
+    /// with uneven frame times.
+    fn update_camera(&mut self, dt: f32) {
+        // The camera waits for a load to finish: it resets as the world comes up.
+        let loading = self.live.as_ref().is_some_and(|l| l.loading());
+        if let (Some(f), Some(l), false) = (self.follow.as_mut(), self.live.as_mut(), loading) {
+            if let Some(heading) = l.camera_reset_due() {
+                f.reset(heading);
+            }
+            if let Some(level) = l.zoom_request_due() {
+                f.set_zoom_level(level);
+            }
+        }
+        if let Some(f) = self.follow.as_mut() {
             let eye = self
                 .live
                 .as_ref()
@@ -1637,27 +1683,7 @@ impl App {
             {
                 self.camera = c;
             }
-            return;
         }
-        let speed = if k(KeyCode::ShiftLeft) || k(KeyCode::ShiftRight) {
-            15.0
-        } else {
-            4.0
-        } * dt;
-        let axis = |pos: bool, neg: bool| (pos as i32 - neg as i32) as f32;
-        let fwd = axis(k(KeyCode::KeyW), k(KeyCode::KeyS));
-        let right = axis(k(KeyCode::KeyD), k(KeyCode::KeyA));
-        // E up, Q down. C, which also lowered it, opens the character record while playing.
-        let c_lowers = self.screens.is_none();
-        let up = axis(
-            k(KeyCode::KeyE),
-            k(KeyCode::KeyQ) || (c_lowers && k(KeyCode::KeyC)),
-        );
-        self.camera.fly(fwd * speed, right * speed, up * speed);
-        let turn = 1.5 * dt;
-        let yaw = axis(k(KeyCode::ArrowLeft), k(KeyCode::ArrowRight));
-        let pitch = axis(k(KeyCode::ArrowUp), k(KeyCode::ArrowDown));
-        self.camera.look(yaw * turn, pitch * turn);
     }
 
     /// A frame of the boot movies: only the movie is drawn, and only a key, a click or the
@@ -1734,14 +1760,17 @@ impl App {
         if self.intro.is_some() {
             return self.intro_frame();
         }
-        let dt = self.last.elapsed().as_secs_f64() * 1000.0;
+        let now = Instant::now();
+        let dt = (now - self.last).as_secs_f64() * 1000.0;
+        self.last = now;
         self.serve_control(dt);
         self.pad_frame(dt);
         self.report_frame(dt);
+        self.report_failure_frame();
         self.resume_frame();
         self.mod_mode_frame(dt);
         self.returning_frame();
-        self.update();
+        self.update_input((dt.min(live::MAX_STEP_MS) / 1000.0) as f32);
         let Some(g) = self.gfx.as_mut() else {
             return Ok(());
         };
@@ -1758,6 +1787,7 @@ impl App {
             g.surface.configure(&g.ctx.device, &g.config);
         }
         debug_assert_eq!(plan.draw, frame.is_some());
+        self.prepare_world(dt, plan.draw || plan.offscreen_frames)?;
         // No frame to draw into (the window hidden or occluded, the display asleep, a
         // resize): the game runs on all the same, only nothing is drawn, and clients waiting
         // for a presented frame get one drawn offscreen instead.
@@ -1768,6 +1798,7 @@ impl App {
             }
             return Ok(());
         };
+        let g = self.gfx.as_mut().expect("window is up");
         let view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
@@ -1777,30 +1808,6 @@ impl App {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("frame"),
             });
-        let stopped = self.screens.as_ref().is_some_and(|s| s.world_stopped());
-        if let Some(live) = self.live.as_mut() {
-            // A pending transition, or a world map journey, runs on behind its loading screen
-            // (which stops the world otherwise); a training lesson's events are delivered
-            // with a screen up too (its steps go on inside the inventory, the tactics), no
-            // time passing (see `Live::step`).
-            if !stopped || live.transition_pending() || live.journey() || live.training() {
-                live.step(dt);
-            }
-            // While a level loads the world holds still: its presentation too.
-            if !live.loading() {
-                live.advance_presentation(dt);
-            }
-            live.frame_size = (g.config.width, g.config.height);
-            live.set_chargen_pose(g.ui.paperdoll_pose());
-            live.sync(&g.ctx, g.config.format)?;
-            if self.screens.is_some() {
-                loading_screen(live, &mut g.ui, &mut self.load_screen_up);
-            }
-            // Portraits are drawn by the objects' renderers, whose constants this frame's
-            // draws use too: they are drawn (and submitted) before the frame is encoded, so
-            // the frame is not drawn from the portrait camera.
-            draw_likenesses(live, &mut g.ui, self.screens.as_ref(), &g.ctx, dt);
-        }
         let size = (g.config.width, g.config.height);
         let drawn = match (self.live.as_mut(), g.renderer.as_mut()) {
             (Some(live), _) => {
@@ -1899,6 +1906,10 @@ impl App {
             }
         }
         for a in g.ui.take_text_answers() {
+            if a.id == report::FAILED_ID {
+                self.report_failure = None;
+                continue;
+            }
             // OK sends (or saves) the report with the note; the other button keeps it on
             // this computer only, unsent.
             if (UPDATE_ASK_ID..UPDATE_ASK_ID + 5).contains(&a.id) {
@@ -2014,36 +2025,53 @@ impl App {
         }
     }
 
-    /// A frame with nothing to draw into: the simulation, its presentation and the interface
-    /// run as on a drawn frame (see [`App::redraw`]); the drawing alone is skipped.
-    fn tick_unpresented(&mut self, dt: f64) -> Result<()> {
-        let Some(g) = self.gfx.as_mut() else {
-            return Ok(());
-        };
+    /// Step once for both surface and offscreen frames, then resolve the camera and
+    /// pose that same simulation state. Input has already been issued by update_input.
+    fn prepare_world(&mut self, dt: f64, rendered: bool) -> Result<()> {
         let stopped = self.screens.as_ref().is_some_and(|s| s.world_stopped());
+        let mut sim_ticks = 0;
         if let Some(live) = self.live.as_mut() {
-            // A pending transition, or a world map journey, runs on behind its loading screen
-            // (which stops the world otherwise); a training lesson's events are delivered
-            // with a screen up too (its steps go on inside the inventory, the tactics), no
-            // time passing (see `Live::step`).
+            // Transitions and journeys run behind their loading screens. Training can
+            // deliver script events while its lesson holds the simulation clock.
             if !stopped || live.transition_pending() || live.journey() || live.training() {
-                live.step(dt);
+                sim_ticks = live.step(dt);
             }
-            // While a level loads the world holds still: its presentation too.
             if !live.loading() {
                 live.advance_presentation(dt);
             }
+        }
+        // Resolve the camera from the stepped state before sync applies the camera's
+        // creature fades to the renderer. The target and drawn hero now share a time.
+        self.update_camera((dt.min(live::MAX_STEP_MS) / 1000.0) as f32);
+        if let (Some(g), Some(live)) = (self.gfx.as_mut(), self.live.as_mut()) {
             live.frame_size = (g.config.width, g.config.height);
             live.set_chargen_pose(g.ui.paperdoll_pose());
             live.sync(&g.ctx, g.config.format)?;
             if self.screens.is_some() {
                 loading_screen(live, &mut g.ui, &mut self.load_screen_up);
             }
-            // The party's portraits and the paperdoll are drawn into their own targets, so
-            // they are kept up with no frame to present too (a hidden window's portraits
-            // stayed empty, and a client's offscreen frame showed them so).
+            // Submit portraits before encoding the world's draws, which use the same
+            // renderer constants.
             draw_likenesses(live, &mut g.ui, self.screens.as_ref(), &g.ctx, dt);
+            control::record_motion(
+                &mut self.motion_trace,
+                live,
+                &self.camera,
+                self.follow.as_ref(),
+                dt,
+                sim_ticks,
+                rendered,
+            );
         }
+        Ok(())
+    }
+
+    /// A frame with nothing to draw into: the simulation, its presentation and the interface
+    /// run as on a drawn frame (see [`App::redraw`]); the drawing alone is skipped.
+    fn tick_unpresented(&mut self, dt: f64) -> Result<()> {
+        let Some(g) = self.gfx.as_mut() else {
+            return Ok(());
+        };
         if self.live.is_none() {
             if let Some(r) = g.renderer.as_mut() {
                 r.advance_time(dt / 1000.0);
@@ -2092,6 +2120,10 @@ impl App {
             }
         }
         for a in g.ui.take_text_answers() {
+            if a.id == report::FAILED_ID {
+                self.report_failure = None;
+                continue;
+            }
             // OK sends (or saves) the report with the note; the other button keeps it on
             // this computer only, unsent.
             if (UPDATE_ASK_ID..UPDATE_ASK_ID + 5).contains(&a.id) {
@@ -2842,7 +2874,7 @@ impl App {
     /// asked for. `note` answers the question instead (a client's); `reply` hears where the
     /// report went once it is written.
     fn report(&mut self, note: Option<String>, reply: Option<std::sync::mpsc::Sender<J>>) {
-        if self.recorder.busy() {
+        if self.recorder.busy() || self.report_failure.is_some() {
             if let Some(r) = reply {
                 let _ = r.send(control::failure("a report is already under way"));
             }
@@ -3207,7 +3239,7 @@ impl App {
                 }
             }
         }
-        let Some(dir) = self.recorder.finish() else {
+        let Some(result) = self.recorder.finish() else {
             return;
         };
         let Some(w) = self.report_wait.take() else {
@@ -3229,6 +3261,16 @@ impl App {
                 live.paused = false;
             }
         }
+        let dir = match result {
+            Ok(dir) => dir,
+            Err(message) => {
+                if let Some(r) = reply {
+                    let _ = r.send(control::failure(&message));
+                }
+                self.report_failure = Some((message, 0));
+                return;
+            }
+        };
         // Sent on when the player has set that up (see [`upload`]).
         if let (true, Some(d), Some(url)) = (w.send, dir.as_ref(), upload::webhook()) {
             upload::send_in_background(d.clone(), url);
@@ -3241,9 +3283,26 @@ impl App {
         }
     }
 
+    /// Retry if the popup layer is absent or a screen change loses the notice. Unlike
+    /// the optional report note, a failure notice waits until the player dismisses it.
+    fn report_failure_frame(&mut self) {
+        let (Some((message, frames)), Some(g)) = (self.report_failure.as_mut(), self.gfx.as_mut())
+        else {
+            return;
+        };
+        *frames = frames.saturating_add(1);
+        if !g.ui.stage.dialog_up() && (*frames == 1 || *frames > NOTE_REASK_FRAMES) {
+            g.ui.ask_ok(report::FAILED_ID, message, "OK");
+            *frames = 1;
+        }
+    }
+
     /// One frame of the way back from a report (see [`update`]): the check's result, the
     /// question up (asked again when lost, as the report's note), the answers, the fetch.
     fn returning_frame(&mut self) {
+        if self.report_failure.is_some() {
+            return;
+        }
         let answers = std::mem::take(&mut self.update_answers);
         for a in answers {
             self.update_answer(a);
@@ -3618,15 +3677,18 @@ impl App {
         }
     }
 
-    /// A left click at window pixel (`x`, `y`) while playing: the party leader is ordered to
-    /// whatever it lands on.
-    fn click(&mut self, x: f64, y: f64) {
+    /// A world click orders the party leader. Right clicks currently order ground only.
+    fn click(&mut self, x: f64, y: f64, ground_only: bool) {
         let (Some(live), Some(g)) = (self.live.as_mut(), self.gfx.as_ref()) else {
             return;
         };
         let (w, h) = (g.config.width as f32, g.config.height as f32);
         let (origin, dir) = self.camera.ray(x as f32, y as f32, w, h);
-        if let Some(order) = live.pick(origin, dir).and_then(|p| live.click(p)) {
+        if let Some(order) = live
+            .pick(origin, dir)
+            .filter(|p| !ground_only || matches!(p, live::Pick::Ground(_)))
+            .and_then(|p| live.click(p))
+        {
             log::info!("order: {order}");
         }
     }
@@ -3934,6 +3996,7 @@ impl App {
 
     /// The mouse moves to window pixel (`x`, `y`).
     fn cursor_to(&mut self, x: f64, y: f64) {
+        self.right_click.cursor_to((x, y));
         self.cursor = (x, y);
         self.pad_last = false;
         if let Some(Marking::On {
@@ -3950,7 +4013,10 @@ impl App {
 
     /// The left button goes down or up at the cursor.
     fn left_button(&mut self, pressed: bool) {
-        self.left_down = pressed;
+        let was_down = std::mem::replace(&mut self.left_down, pressed);
+        if pressed && was_down {
+            return;
+        }
         let (x, y) = self.cursor;
         self.recorder.input(format!(
             "{} {x:.0},{y:.0}",
@@ -3991,7 +4057,9 @@ impl App {
         }
         if double {
             if let Some(g) = self.gfx.as_mut() {
-                if self.screens.as_ref().is_some_and(|s| !s.exploring()) {
+                if self.screens.as_ref().is_some_and(|s| {
+                    !s.exploring() && !s.shown().contains(&screens::Screen::Conversation)
+                }) {
                     g.ui.click_as(
                         thedas_ui::avm1::MOUSE_LEFT + thedas_ui::avm1::DOUBLE_CLICK,
                         x,
@@ -4011,13 +4079,13 @@ impl App {
                     .as_ref()
                     .is_none_or(|s| world_takes_click(&g.ui, s, x, y));
             }
-            g.ui.mouse_button(x, y, pressed);
-            if pressed && !to_world && self.live.is_some() && self.screens.is_some() {
+            let accepted = g.ui.mouse_button(x, y, pressed);
+            if accepted && pressed && !to_world && self.live.is_some() && self.screens.is_some() {
                 g.ui.clicked();
             }
         }
         if to_world {
-            self.click(x, y);
+            self.click(x, y, false);
         }
     }
 
@@ -4033,8 +4101,9 @@ impl App {
             if pressed { "rpress" } else { "rrelease" }
         ));
         // Over the interface (or with a menu up) a right click is the interface's (an item's
-        // actions); elsewhere it turns the camera.
+        // actions); elsewhere a drag turns the camera and a tap orders a ground move.
         if pressed {
+            self.right_click = Default::default();
             if let (Some(g), Some(s)) = (self.gfx.as_mut(), self.screens.as_ref()) {
                 if !s.exploring() || g.ui.covers(x, y) {
                     g.ui.button_as(thedas_ui::avm1::MOUSE_RIGHT, x, y, true);
@@ -4054,10 +4123,28 @@ impl App {
                 log::info!("ability {} not aimed", aim.ability);
                 return;
             }
+            if self
+                .live
+                .as_ref()
+                .is_some_and(|l| l.sim().game == thedas_vfs::Game::Origins)
+                && self.ui.is_empty()
+            {
+                self.right_click.press((x, y));
+            }
         }
         self.looking = pressed;
         if let Some(g) = &self.gfx {
             g.window.set_cursor_visible(!self.looking);
+        }
+        if !pressed
+            && let Some((px, py)) = self.right_click.release()
+            && self.ui.is_empty()
+            && let (Some(g), Some(s)) = (self.gfx.as_ref(), self.screens.as_ref())
+            && s.exploring()
+            && world_takes_click(&g.ui, s, x, y)
+            && world_takes_click(&g.ui, s, px, py)
+        {
+            self.click(px, py, true);
         }
     }
 
@@ -4073,16 +4160,17 @@ impl App {
             }
             &Step::ClickAs(button, x, y) => {
                 self.cursor_to(x, y);
-                if let Some(g) = self.gfx.as_mut() {
+                if button == thedas_ui::avm1::MOUSE_RIGHT {
+                    self.right_button(true);
+                    self.right_button(false);
+                } else if let Some(g) = self.gfx.as_mut() {
                     g.ui.click_as(button, x, y);
                 }
                 log.push(format!("click {x},{y} as button {button}"));
             }
             &Step::RightAt(x, y, down) => {
                 self.cursor_to(x, y);
-                if let Some(g) = self.gfx.as_mut() {
-                    g.ui.button_as(thedas_ui::avm1::MOUSE_RIGHT, x, y, down);
-                }
+                self.right_button(down);
                 log.push(format!(
                     "right {} {x},{y}",
                     if down { "press" } else { "release" }
@@ -4621,6 +4709,12 @@ impl App {
             let cmd = r.body["cmd"].as_str().unwrap_or_default().to_string();
             let answer = match cmd.as_str() {
                 "status" => Some(self.status()),
+                "motion_trace" => Some(if r.body["enabled"].as_bool() == Some(true) {
+                    self.motion_trace = Some(Vec::new());
+                    json!({ "ok": true, "limit": control::MOTION_TRACE_LIMIT })
+                } else {
+                    json!({ "ok": true, "frames": self.motion_trace.take().unwrap_or_default() })
+                }),
                 // The frame as presented, read back as the next one is drawn; a surface that
                 // cannot be read back is drawn again offscreen instead.
                 "screenshot" => match self
@@ -4854,16 +4948,21 @@ impl App {
             // A game (new or loaded) opens on a worker while the window keeps presenting,
             // the running one held behind it (see `Live::hold`); the start menu opens at once.
             if matches!(r, ui::FrontEnd::StartMenu) {
-                match live::Live::open(&self.install, &self.module, start, &self.shaders) {
+                match live::Live::open(
+                    &self.install,
+                    self.base_vfs.clone(),
+                    &self.module,
+                    start,
+                    &self.shaders,
+                ) {
                     Ok(l) => self.install_live(l),
                     Err(e) => {
                         log::warn!("front end: {r:?} failed: {e:#}");
                         // Say so: the game just carries on, which looks like a dead button.
                         if let Some(g) = self.gfx.as_mut() {
-                            g.ui.ask_choice(
+                            g.ui.ask_ok(
                                 RETURN_FAILED_ID,
                                 &format!("The start menu could not be opened: {e:#}"),
-                                "OK",
                                 "OK",
                             );
                         }
@@ -4875,8 +4974,9 @@ impl App {
                 log::info!("front end: {r:?} ignored, a game is already opening");
                 continue;
             }
-            let (install, module, shaders) = (
+            let (install, base_vfs, module, shaders) = (
                 self.install.clone(),
+                self.base_vfs.clone(),
                 self.module.clone(),
                 self.shaders.clone(),
             );
@@ -4894,7 +4994,9 @@ impl App {
                         (None, Some(dir)) => live::Start::Resume(dir),
                         (None, None) => live::Start::NewGame,
                     };
-                    let _ = tx.send(live::Live::open(&install, &module, start, &shaders));
+                    let _ = tx.send(live::Live::open(
+                        &install, base_vfs, &module, start, &shaders,
+                    ));
                 });
             match spawned {
                 Ok(_) => {
@@ -4957,7 +5059,10 @@ impl App {
     /// game not quit normally, newer than the newest save (see [`journal::resumable`]).
     /// Ours: the original has no journal.
     fn resume_frame(&mut self) {
-        if self.resume_offer != ResumeOffer::Unchecked || self.opening.is_some() {
+        if self.resume_offer != ResumeOffer::Unchecked
+            || self.opening.is_some()
+            || self.report_failure.is_some()
+        {
             return;
         }
         let at_menu = self.live.as_ref().is_some_and(|l| l.front_end)
@@ -5252,6 +5357,7 @@ impl ApplicationHandler for App {
             WindowEvent::Focused(false) => {
                 self.keys.clear();
                 self.looking = false;
+                self.right_click = Default::default();
                 if let Some(g) = self.gfx.as_mut() {
                     g.ui.stage.set_shift(false);
                     g.ui.mouse_leave();
@@ -5269,6 +5375,7 @@ impl ApplicationHandler for App {
     fn device_event(&mut self, _: &ActiveEventLoop, _: DeviceId, event: DeviceEvent) {
         if let DeviceEvent::MouseMotion { delta } = event {
             if self.looking {
+                self.right_click.motion(delta);
                 // The player's control options: mouse sensitivity scales the turn (1, the
                 // default, is the old fixed 0.003 radians a pixel) and the axes may be
                 // inverted. Provisional: the exe's sensitivity curve is not traced.
@@ -5326,11 +5433,12 @@ fn line_is_voiced(audio: &audio::GameAudio, sim: &thedas_sim::Sim) -> bool {
             .is_some_and(|l| l.vo_mode != 0)
 }
 
-/// The voice-over the line on screen wants: the conversation's line, else a cutscene's line
+/// The voice-over the line on screen wants: the still-presented conversation line (including
+/// a terminal NPC line), else a cutscene's line
 /// that has its own voice. With [`audio::GameAudio::line_voice`] this says whether the line
 /// is voiced (and for how long) as soon as it is chosen, before its voice plays.
 pub(crate) fn voice_line(sim: &thedas_sim::Sim) -> Option<audio::VoiceLine> {
-    let line = sim.conversation_line().and_then(|l| {
+    let line = sim.presented_conversation_line().and_then(|l| {
         let female = sim
             .world
             .get(l.player)
@@ -5812,8 +5920,8 @@ impl padplay::Host for HeadlessHost<'_> {
                 layer.render_movies();
                 let w = world_takes_click(layer, s, x, y);
                 layer.mouse_move(x, y);
-                layer.mouse_button(x, y, down);
-                if down && !w {
+                let accepted = layer.mouse_button(x, y, down);
+                if accepted && down && !w {
                     layer.clicked();
                 }
                 w
@@ -5972,7 +6080,7 @@ fn draw_likenesses(
     let Some(screens) = screens else {
         return;
     };
-    let key = ui::portrait_key(&live.sim());
+    let key = live.portrait_key();
     if ui.wants_portraits(key, dt) {
         let shots = live.portraits(ctx, ui::PORTRAIT_SIZE);
         ui.set_portraits(shots);
@@ -6238,7 +6346,11 @@ fn pad_steps(arg: &str) -> Result<Vec<Step>> {
 /// options screen before New Game reaches it here (the tutorials, auto-pause in combat).
 fn seed_client_options(l: &live::Live, ui: &ui::UiLayer) {
     let mut sim = l.sim();
-    for name in ["GameOptions.ShowTutorials", "GameOptions.AutoPauseCombat"] {
+    for name in [
+        "GameOptions.ShowTutorials",
+        "GameOptions.AutoPauseCombat",
+        "GameOptions.ShowGore",
+    ] {
         if let Some(v) = ui.client_option(name) {
             sim.input(
                 thedas_sim::commands::CommandSource::Player,
@@ -6713,11 +6825,60 @@ fn parse_step(s: &str) -> Result<Step> {
 /// The viewer's level when `--area` is not given.
 const DEFAULT_AREA: &str = "lgt101d";
 
+/// The open-file limit the game asks for at start.
+const OPEN_FILES_WANTED: u64 = 10_240;
+
+/// The soft open-file limit to ask for: `wanted`, or the hard limit when that is lower;
+/// never lower than the current soft limit.
+#[cfg(unix)]
+fn open_files_target(soft: u64, hard: u64, wanted: u64) -> u64 {
+    wanted.min(hard).max(soft)
+}
+
+/// Raises the process's soft open-file limit (`RLIMIT_NOFILE`) to [`OPEN_FILES_WANTED`], or
+/// the hard limit when that is lower. Every archive of the install stays open for each
+/// mounted file system (several in a game, one more while the start menu opens), which
+/// passes the 2560 a Terminal-started process gets on macOS. Logged; a failure only warns.
+#[cfg(unix)]
+fn raise_open_file_limit() {
+    // SAFETY: getrlimit and setrlimit only read and write the `rlimit` passed to them.
+    unsafe {
+        let mut lim = std::mem::zeroed::<libc::rlimit>();
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) != 0 {
+            log::warn!(
+                "open-file limit: getrlimit failed: {}",
+                std::io::Error::last_os_error()
+            );
+            return;
+        }
+        let (soft, hard): (u64, u64) = (lim.rlim_cur, lim.rlim_max);
+        let target = open_files_target(soft, hard, OPEN_FILES_WANTED);
+        if target == soft {
+            log::info!("open-file limit: {soft} (hard {hard})");
+            return;
+        }
+        lim.rlim_cur = target;
+        if libc::setrlimit(libc::RLIMIT_NOFILE, &lim) == 0 {
+            log::info!("open-file limit: raised from {soft} to {target} (hard {hard})");
+        } else {
+            log::warn!(
+                "open-file limit: could not raise {soft} to {target}: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn raise_open_file_limit() {}
+
 fn main() -> Result<()> {
     report::init_logging(env_logger::Builder::from_env(
         env_logger::Env::default().default_filter_or("info,wgpu=warn,naga=warn"),
     ));
+    raise_open_file_limit();
     let mut args = Args::parse();
+    thedas_render::set_soft_shadows(args.soft_shadows == "on");
     if let Some(mode) = args
         .lighting
         .as_deref()
@@ -6845,9 +7006,13 @@ fn main() -> Result<()> {
         Some(live::Start::Menu)
     };
     let boot = matches!(start, Some(live::Start::Menu));
+    // One play stack for this run. Sessions and level builds share its archive handles;
+    // each mounts level resources on its own clone.
+    let base_vfs = Arc::new(DaoInstall::open(&install)?.play_vfs(TextureQuality::High)?);
     let mut live = match start {
         Some(start) => Some(live::Live::open(
             &install,
+            base_vfs.clone(),
             &args.module,
             start,
             &args.shaders,
@@ -6875,8 +7040,20 @@ fn main() -> Result<()> {
         args.area.as_deref().unwrap_or(DEFAULT_AREA)
     };
     let detail = thedas_render::scene::Detail::parse(&args.detail).unwrap_or_default();
+    log::info!(
+        "graphics: detail={}, soft-shadows={}",
+        detail.name(),
+        args.soft_shadows
+    );
     let vfx = parse_vfx(&args.vfx)?;
-    let mut loaded = load(&install, area, &args.shaders, &vfx, detail)?;
+    let mut loaded = load(
+        &install,
+        base_vfs.clone(),
+        area,
+        &args.shaders,
+        &vfx,
+        detail,
+    )?;
     loaded.frame_effects = args.frame_effects == "on";
     loaded.render_path = thedas_render::RenderPath::parse(&args.renderer).unwrap_or_default();
     if let Some(l) = live.as_mut() {
@@ -6934,6 +7111,7 @@ fn main() -> Result<()> {
                     layer.set_settings_file(path.clone());
                 }
                 layer.attach(&l.sim);
+                seed_client_options(l, &layer);
                 layer.set_saves(saves::SaveStore::new(saves_dir.clone()));
                 let mut s = screens::Screens::new(l.front_end);
                 l.aiming = layer.play(&mut s, &l.sim, 0.0).pop();
@@ -7083,11 +7261,11 @@ fn main() -> Result<()> {
                                 layer.render_movies();
                                 let w = world_takes_click(layer, s, x, y);
                                 layer.mouse_move(x, y);
-                                layer.mouse_button(x, y, true);
-                                layer.mouse_button(x, y, false);
-                                if !w {
+                                let accepted = layer.mouse_button(x, y, true);
+                                if accepted && !w {
                                     layer.clicked();
                                 }
+                                layer.mouse_button(x, y, false);
                                 w
                             }
                             None => true,
@@ -7163,7 +7341,7 @@ fn main() -> Result<()> {
                                     level.map(|x| x.layout.as_str()),
                                     level.map(|x| &x.vfs),
                                 );
-                                let key = ui::portrait_key(&l.sim());
+                                let key = l.portrait_key();
                                 if layer.wants_portraits(key, dt) {
                                     let shots = l.portraits(&ctx, ui::PORTRAIT_SIZE);
                                     layer.set_portraits(shots);
@@ -7524,7 +7702,13 @@ fn main() -> Result<()> {
                             ui::FrontEnd::Load(b) => live::Start::SaveBytes(b),
                             ui::FrontEnd::StartMenu => live::Start::Menu,
                         };
-                        let mut n = live::Live::open(&install, &args.module, start, &args.shaders)?;
+                        let mut n = live::Live::open(
+                            &install,
+                            base_vfs.clone(),
+                            &args.module,
+                            start,
+                            &args.shaders,
+                        )?;
                         n.shader_time = args.time;
                         n.movies_wait = true;
                         layer.close_all();
@@ -7691,6 +7875,7 @@ fn main() -> Result<()> {
         }
     }
     let mut app = App {
+        base_vfs,
         load_screen_up: false,
         loaded,
         live,
@@ -7711,6 +7896,7 @@ fn main() -> Result<()> {
         gfx: None,
         keys: HashSet::new(),
         looking: false,
+        right_click: Default::default(),
         ui_right: false,
         last: Instant::now(),
         error: None,
@@ -7718,6 +7904,7 @@ fn main() -> Result<()> {
         last_press: None,
         swallow_release: false,
         control,
+        motion_trace: None,
         remote: VecDeque::new(),
         frame_requests: Vec::new(),
         pads: paddev::Pads::new(),
@@ -7739,6 +7926,7 @@ fn main() -> Result<()> {
         intro_pad_held: false,
         zoom_key: 0.0,
         recorder: report::Recorder::new(report::Recorder::default_dir()),
+        report_failure: None,
         report_wait: None,
         returning: match &args.check_report {
             Some(dir) => Returning::Asking(Box::new(UpdatePrompt {
@@ -7761,6 +7949,7 @@ fn main() -> Result<()> {
             "frame_effects": args.frame_effects,
             "renderer": args.renderer,
             "lighting": args.lighting,
+            "soft_shadows": args.soft_shadows,
             "language": args.language,
             "module": args.module,
             "install": report::install_info(&install, &args.language),
@@ -7823,6 +8012,48 @@ fn pack_note(name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn new_graphics_defaults_and_shadow_override() {
+        use clap::Parser;
+        let args = super::Args::try_parse_from(["thedas-app"]).unwrap();
+        assert_eq!(args.detail, "high");
+        assert_eq!(args.soft_shadows, "on");
+        assert_eq!(
+            thedas_render::scene::Detail::default(),
+            thedas_render::scene::Detail::High
+        );
+        assert_eq!(
+            thedas_ui::options::DEFAULTS
+                .iter()
+                .find(|(key, _)| *key == "VideoOptions.GraphicsDetailLevel")
+                .unwrap()
+                .1,
+            3.0
+        );
+        let args = super::Args::try_parse_from([
+            "thedas-app",
+            "--detail",
+            "medium",
+            "--soft-shadows",
+            "off",
+        ])
+        .unwrap();
+        assert_eq!(args.detail, "medium");
+        assert_eq!(args.soft_shadows, "off");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_open_file_limit_is_raised_to_the_wanted_count_within_the_hard_limit() {
+        use super::open_files_target;
+        // A Terminal-started process on macOS: 2560 soft, no hard limit.
+        assert_eq!(open_files_target(2560, u64::MAX, 10_240), 10_240);
+        // A hard limit under the wanted count caps it.
+        assert_eq!(open_files_target(256, 4096, 10_240), 4096);
+        // Already higher: left as it is, never lowered.
+        assert_eq!(open_files_target(1_048_576, u64::MAX, 10_240), 1_048_576);
+    }
+
     #[test]
     fn vfx_specs_parse_into_effect_props() {
         let props = super::parse_vfx("fxa_fire_aoe_p@1,2,3; FXA_Ice_Cld_P.mmh @ -4.5,0,7").unwrap();

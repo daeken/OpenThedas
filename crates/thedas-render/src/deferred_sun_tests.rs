@@ -14,7 +14,8 @@ fn sun_early_exits_preserve_filtered_visibility() {
     };
     let device = &ctx.device;
     let sun_source = format!(
-        "struct Sun {{{}",
+        "{}\nstruct Sun {{{}",
+        include_str!("../../thedas-shader/src/soft_shadows.wgsl"),
         DEFERRED_WGSL
             .split_once("struct Sun {")
             .unwrap()
@@ -169,7 +170,10 @@ fn sun_early_exits_preserve_filtered_visibility() {
         mapped_at_creation: false,
     });
     let mut shadowed = false;
-    for plane in [1.0, 0.0, -1.0, -19.0, -21.0] {
+    for (flags, plane) in [1, 3].into_iter().flat_map(|flags| {
+        [2.0, 1.0, 0.001, 0.0, -0.001, -1.0, -19.0, -21.0].map(|plane| (flags, plane))
+    }) {
+        sun.enabled[0] = flags;
         sun.data[8][3] = plane;
         ctx.queue.write_buffer(&buffer, 0, bytemuck::bytes_of(&sun));
         let mut encoder = device.create_command_encoder(&Default::default());
@@ -225,4 +229,160 @@ fn sun_early_exits_preserve_filtered_visibility() {
         shadowed,
         "the fixture must exercise filtered shadow as well as lit pixels"
     );
+}
+
+#[test]
+fn soft_shadow_gpu_blend_filter_border_and_traced_fade() {
+    let Ok(ctx) = GpuContext::headless() else {
+        return;
+    };
+    let device = &ctx.device;
+    let source = format!(
+        r#"{}
+        @group(0) @binding(0) var near_map: texture_2d<f32>;
+        @group(0) @binding(1) var far_map: texture_2d<f32>;
+        @group(0) @binding(2) var edge_map: texture_2d<f32>;
+        @group(0) @binding(3) var<storage, read_write> result: array<f32>;
+        @compute @workgroup_size(1) fn test() {{
+            var sd: array<vec4<f32>, 9>;
+            sd[0].w = 0.5; sd[1].w = 0.5; sd[2].w = 0.5; sd[3].w = 1.0;
+            sd[4] = sd[0]; sd[5] = sd[1]; sd[6] = sd[2]; sd[7].w = -20.0;
+            let planes = array<f32, 8>(2.0, 1.5, 1.0, 0.5, 0.0, -15.0, -17.5, -20.0);
+            for (var i = 0u; i < 8u; i++) {{
+                sd[8].w = planes[i];
+                // Opposing maps prove the partition blend. Shadowed far proves fade.
+                if (i < 5u) {{ result[i] = soft_shadow_visibility(vec4<f32>(0.0, 0.0, 0.0, 1.0), sd, near_map, far_map); }}
+                else {{ result[i] = soft_shadow_visibility(vec4<f32>(0.0, 0.0, 0.0, 1.0), sd, near_map, near_map); }}
+            }}
+            result[8] = soft_shadow_filter(edge_map, vec3<f32>(0.49, 0.5, 0.5));
+            result[9] = soft_shadow_filter(edge_map, vec3<f32>(0.50, 0.5, 0.5));
+            result[10] = soft_shadow_filter(edge_map, vec3<f32>(0.51, 0.5, 0.5));
+            result[11] = soft_shadow_filter(near_map, vec3<f32>(-1.0, 0.5, 0.5));
+        }}"#,
+        include_str!("../../thedas-shader/src/soft_shadows.wgsl")
+    );
+    // The compute/readback fixture itself needs compute and storage buffers. The shared
+    // filter's fragment uses are checked against OpenGL 3.3 by the deferred shader test.
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: None,
+        source: wgpu::ShaderSource::Wgsl(source.into()),
+    });
+    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: None,
+        layout: None,
+        module: &shader,
+        entry_point: Some("test"),
+        compilation_options: Default::default(),
+        cache: None,
+    });
+    let map = |kind| {
+        let t = device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d {
+                width: 8,
+                height: 8,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let pixels: Vec<u8> = (0..64)
+            .flat_map(|i| {
+                [
+                    if kind == 1 || kind == 2 && i % 8 >= 4 {
+                        255
+                    } else {
+                        0
+                    },
+                    0,
+                    0,
+                    255,
+                ]
+            })
+            .collect();
+        ctx.queue.write_texture(
+            t.as_image_copy(),
+            &pixels,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(32),
+                rows_per_image: Some(8),
+            },
+            t.size(),
+        );
+        t.create_view(&Default::default())
+    };
+    let maps = [map(0), map(1), map(2)];
+    let result = device.create_buffer(&wgpu::BufferDescriptor {
+        label: None,
+        size: 48,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let readback = device.create_buffer(&wgpu::BufferDescriptor {
+        label: None,
+        size: 48,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout: &pipeline.get_bind_group_layout(0),
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&maps[0]),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(&maps[1]),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::TextureView(&maps[2]),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: result.as_entire_binding(),
+            },
+        ],
+    });
+    let mut encoder = device.create_command_encoder(&Default::default());
+    {
+        let mut pass = encoder.begin_compute_pass(&Default::default());
+        pass.set_pipeline(&pipeline);
+        pass.set_bind_group(0, &group, &[]);
+        pass.dispatch_workgroups(1, 1, 1);
+    }
+    encoder.copy_buffer_to_buffer(&result, 0, &readback, 0, 48);
+    ctx.queue.submit([encoder.finish()]);
+    let slice = readback.slice(..);
+    let (tx, rx) = std::sync::mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |r| tx.send(r).unwrap());
+    device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+    rx.recv().unwrap().unwrap();
+    let bytes = slice.get_mapped_range().unwrap();
+    let values: &[f32] = bytemuck::cast_slice(&bytes);
+    for (actual, expected) in values
+        .iter()
+        .zip([0.0, 0.15625, 0.5, 0.84375, 1.0, 0.0, 0.5, 1.0])
+    {
+        assert!((actual - expected).abs() < 0.00001, "{values:?}");
+    }
+    assert!(values[8] < values[9] && values[9] < values[10]);
+    assert!(
+        (values[8] - 0.46).abs() < 0.00001,
+        "tent weights: {values:?}"
+    );
+    assert!(
+        (values[10] - 0.54).abs() < 0.00001,
+        "tent weights: {values:?}"
+    );
+    assert!((values[9] - 0.5).abs() < 0.00001);
+    assert!(values[10] - values[8] < 0.1, "continuous PCF: {values:?}");
+    assert_eq!(values[11], 1.0, "white border");
 }
