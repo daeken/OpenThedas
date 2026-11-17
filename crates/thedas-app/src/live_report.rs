@@ -2,6 +2,75 @@
 use super::*;
 use serde_json::{Value, json};
 
+/// Opt-in per-sync animation evidence, enabled with `RUST_LOG=thedas_app::animation=trace`.
+#[derive(Default)]
+pub(crate) struct AnimationTrace {
+    frame: u64,
+    previous: Option<(u64, std::collections::HashMap<ObjectId, [f32; 3]>)>,
+}
+
+impl AnimationTrace {
+    pub(crate) fn record(
+        &mut self,
+        sim: &Sim,
+        models: &[ObjectModel],
+        posed: &[(Mat4, Option<Clip>)],
+        animator: &Animator,
+        renderer: &AreaRenderer,
+        scene: &AreaScene,
+    ) {
+        let now = sim.world.time_ms;
+        let dt = self
+            .previous
+            .as_ref()
+            .map(|(at, _)| now.saturating_sub(*at) as f32 / 1000.0);
+        let seen = renderer.seen_draws();
+        for (i, (model, (_, clip))) in models.iter().zip(posed).enumerate() {
+            if model.kind != thedas_sim::world::ObjectKind::Creature {
+                continue;
+            }
+            let velocity = self.previous.as_ref().and_then(|(_, positions)| {
+                let before = positions.get(&model.id)?;
+                dt.filter(|dt| *dt > 0.0).map(|dt| {
+                    std::array::from_fn::<_, 3, _>(|axis| {
+                        (model.position[axis] - before[axis]) / dt
+                    })
+                })
+            });
+            let object = sim.world.get(model.id);
+            let pose_hash = animator.last_pose(i).map(|poses| {
+                use std::hash::Hasher;
+                let mut hash = std::collections::hash_map::DefaultHasher::new();
+                let mut skeletons: Vec<_> = poses.iter().collect();
+                skeletons.sort_by_key(|(s, _)| **s);
+                for (_, (_, bones)) in skeletons {
+                    for bone in bones {
+                        for value in bone.to_cols_array() {
+                            hash.write_u32(value.to_bits());
+                        }
+                    }
+                }
+                hash.finish()
+            });
+            log::trace!(target: "thedas_app::animation", "{}", json!({
+                "frame": self.frame, "time_ms": now, "clock_dt_s": dt,
+                "id": model.id, "tag": model.tag, "position": model.position,
+                "velocity": velocity, "pose_evaluated": animator.pose_evaluated(i),
+                "pose_hash": pose_hash,
+                "seen_in_view_or_shadow": renderer.prop_seen(scene, i, &seen),
+                "dead": object.map(|o| o.dead), "died_at": object.and_then(|o| o.died_at),
+                "command": object.and_then(|o| o.commands.first()).map(|c| &c.name),
+                "command_due_ms": object.and_then(|o| o.commands.first()).and_then(|c| c.due),
+                "command_from_ms": object.and_then(|o| o.commands.first()).and_then(|c| c.from.map(|(_, at)| at)),
+                "command_ints": object.and_then(|o| o.commands.first()).map(|c| &c.ints),
+                "clip": clip.as_ref().map(|c| crate::report::clip_snapshot(animator, c)),
+            }));
+        }
+        self.previous = Some((now, models.iter().map(|m| (m.id, m.position)).collect()));
+        self.frame += 1;
+    }
+}
+
 impl Live {
     pub fn report_presentation(&self, eye: glam::Vec3) -> Value {
         let sim = self.sim();
@@ -23,6 +92,7 @@ impl Live {
                     "models": objects.key.get(i).map(|(_, models)| models),
                     "kind": object.map(|o| format!("{:?}", o.kind)),
                     "seen_in_view_or_shadow": prop.draws.clone().any(|d| seen.get(d).copied().unwrap_or(true)),
+                    "pose_evaluated": self.animator.pose_evaluated(i),
                     "sim_position": position.map(|p| p.to_array()), "sim_facing_degrees": object.map(|o| o.facing),
                     "world_position": world.w_axis.truncate().to_array(), "world_transform": world.to_cols_array(),
                     "offset_from_sim": position.map(|p| (world.w_axis.truncate() - p).to_array()),
