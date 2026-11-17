@@ -261,6 +261,7 @@ pub struct Live {
     /// Each drawn object's id, placement and motion at the last sync (in the objects' scene
     /// order).
     posed: Vec<(ObjectId, Mat4, Option<Clip>)>,
+    animation_trace: report_snapshot::AnimationTrace,
     /// Mod mode's scrubber: a creature drawn with its own animation held at this time, in
     /// seconds (its layers shifted with it). Drawing only; the simulation is not touched.
     scrub: Option<(ObjectId, f32)>,
@@ -750,6 +751,7 @@ impl Live {
             creature_shapes: Default::default(),
             aiming: None,
             posed: Vec::new(),
+            animation_trace: Default::default(),
             scrub: None,
             frozen: None,
             models: ModelCache::default(),
@@ -2194,6 +2196,16 @@ impl Live {
             &posed,
             0.0,
         );
+        if log::log_enabled!(target: "thedas_app::animation", log::Level::Trace) {
+            self.animation_trace.record(
+                &shared.lock().unwrap_or_else(|p| p.into_inner()),
+                &models,
+                &posed,
+                &self.animator,
+                &objects.renderer,
+                &objects.scene,
+            );
+        }
         objects.follow_poses();
         for (i, m) in models.iter().enumerate() {
             let o = if hidden.contains(&m.id) {
