@@ -21,6 +21,8 @@
 //!   (`x = 1 / width`, `y = 1 / height`), and `vPos` subtracts 0.5. Clip-space depth is 0..w in
 //!   both APIs and texture coordinates share the top-left origin, so neither needs changes.
 //! - Alpha test is render state in D3D9; it is appended to the pixel shader when requested.
+//! - The optional improved sun receiver uses fixup W (0: traced, 1: improved). This
+//!   renderer opt-in is independent of the faithful translation used by corpus checks.
 //!
 //! Instruction semantics follow Microsoft's public D3D9 shader reference. Where the reference
 //! leaves room (rounding in `mova`, `nrm` of a zero vector), the choice is marked provisional.
@@ -115,6 +117,10 @@ pub struct Interface {
 
 #[derive(Clone, Debug, Default)]
 pub struct Options {
+    /// Opt in to the recognized Origins sun receiver's improved PCF/blend branch.
+    /// The host selects it with fixup.w (0: traced, 1: improved). Unrecognized shaders
+    /// remain untouched. This is an explicit visual deviation, not D3D9 translation.
+    pub soft_shadows: bool,
     /// Vertex shaders: semantics the paired pixel shader reads that this shader must output
     /// even if it never writes them (they read as zero).
     pub extra_outputs: Vec<Semantic>,
@@ -1019,13 +1025,41 @@ pub fn translate(shader: &Shader, opts: &Options) -> Result<Translation> {
     for (reg, sem) in &vs3_outputs {
         g.outputs.insert(format!("o{reg}"), *sem);
     }
-    for ins in &shader.instructions {
+    let receiver = opts
+        .soft_shadows
+        .then(|| crate::shadow_receiver::recognize(shader))
+        .flatten();
+    for (index, ins) in shader.instructions.iter().enumerate() {
+        if let Some(r) = &receiver
+            && index == r.world_at
+        {
+            let world = g.src(&r.world, 0)?;
+            g.line(format!(
+                "let soft_shadow_world = vec4<f32>(({world}).xyz, 1.0);"
+            ));
+        }
         g.instruction(ins)?;
+        if let Some(r) = &receiver
+            && index == r.select_at
+        {
+            let data = (r.base..r.base + 9)
+                .map(|c| format!("cf.c[{c}]"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            g.line("if (d3d_fixup.w > 0.5) {");
+            g.indent += 1;
+            g.write(&Gen::dst(ins)?, &format!("vec4<f32>(soft_shadow_visibility(soft_shadow_world, array<vec4<f32>, 9>({data}), tex{}, tex{}))", r.near, r.far))?;
+            g.indent -= 1;
+            g.line("}");
+        }
     }
     if g.indent != 1 {
         return Err(TranslateError::Malformed("unbalanced control flow".into()));
     }
-    let wgsl = assemble(&mut g)?;
+    let mut wgsl = assemble(&mut g)?;
+    if receiver.is_some() {
+        wgsl.push_str(include_str!("soft_shadows.wgsl"));
+    }
     let interface = Interface {
         inputs: g.interface_inputs(),
         outputs: g.interface_outputs(),
@@ -1151,7 +1185,9 @@ fn assemble(g: &mut Gen) -> Result<String> {
         );
     }
     if !g.opts.instanced
-        && (stage == Stage::Vertex || (g.opts.alpha_ref_uniform && g.opts.alpha_test.is_some()))
+        && (stage == Stage::Vertex
+            || g.opts.soft_shadows
+            || (g.opts.alpha_ref_uniform && g.opts.alpha_test.is_some()))
     {
         let _ = writeln!(
             w,
