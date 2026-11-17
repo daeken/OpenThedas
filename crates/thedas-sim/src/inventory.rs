@@ -396,6 +396,28 @@ impl Sim {
 
     /// [`Sim::wear`], saying whether the player did it on the inventory screen.
     pub(crate) fn wear_as(&mut self, who: ObjectId, item: ObjectId, slot: i32, by_player: bool) {
+        if self.game == thedas_vfs::Game::Origins {
+            // Origins' active-container add hook (0x6c16e0) resolves hand conflicts
+            // before applying properties or sending EQUIP. Use the full unequip
+            // routine: unlike an ordinary slot swap, this also raises training 1070.
+            let conflict = if self.origins_main_hand_only(item) {
+                self.world
+                    .get(who)
+                    .and_then(|o| o.equipment.get(&1))
+                    .copied()
+            } else if slot == 1 {
+                self.world
+                    .get(who)
+                    .and_then(|o| o.equipment.get(&0))
+                    .copied()
+                    .filter(|&main| self.origins_main_hand_only(main))
+            } else {
+                None
+            };
+            if let Some(old) = conflict.filter(|&old| old != item) {
+                self.unequip(who, old);
+            }
+        }
         for e in self.property_effects(item) {
             self.apply_effect(who, e);
         }
@@ -504,7 +526,13 @@ impl Sim {
                 .get(who)
                 .map(|o| o.equipment.clone())
                 .unwrap_or_default();
-            match fits.iter().find(|s| !worn.contains_key(s)).or(fits.first()) {
+            match fits
+                .iter()
+                .find(|s| {
+                    !worn.contains_key(s) && (**s != 1 || !self.origins_off_hand_blocked(who))
+                })
+                .or(fits.first())
+            {
                 Some(&s) => s,
                 None => return false,
             }
@@ -519,6 +547,9 @@ impl Sim {
         }
         if self.game == thedas_vfs::Game::Origins
             && (self.equipment_slot_locked(who, item, slot, false)
+                || (slot == 1 && self.origins_off_hand_blocked(who))
+                || (self.origins_main_hand_only(item)
+                    && self.equipment_slot_locked(who, item, 1, false))
                 || self
                     .wearer(item)
                     .is_some_and(|m| self.item_irremovable(item) || !self.can_change_equipment(m)))
@@ -1341,6 +1372,21 @@ impl Sim {
         (0..32).filter(|b| mask & (1 << b) != 0).collect()
     }
 
+    /// Origins' two-handed predicate (0xa664c0 -> 0xa66440): the entire
+    /// EquippableSlots mask equals MAIN, including bows and crossbows.
+    fn origins_main_hand_only(&self, item: ObjectId) -> bool {
+        self.item_slots(item) == [0]
+    }
+
+    fn origins_off_hand_blocked(&self, who: ObjectId) -> bool {
+        self.game == thedas_vfs::Game::Origins
+            && self
+                .world
+                .get(who)
+                .and_then(|o| o.equipment.get(&0))
+                .is_some_and(|&main| self.origins_main_hand_only(main))
+    }
+
     /// Equips an item in its first free slot (or its first slot); returns the slot.
     pub fn equip_default(&mut self, who: ObjectId, item: ObjectId) -> Option<i32> {
         let slots = self.item_slots(item);
@@ -1348,7 +1394,7 @@ impl Sim {
         let slot = slots
             .iter()
             .copied()
-            .find(|s| !taken.contains_key(s))
+            .find(|s| !taken.contains_key(s) && (*s != 1 || !self.origins_off_hand_blocked(who)))
             .or_else(|| slots.first().copied())?;
         if self.equipment_slot_locked(who, item, slot, false) {
             return None;
@@ -1387,9 +1433,9 @@ impl Sim {
                     .get(who)
                     .map(|o| o.equipment.clone())
                     .unwrap_or_default();
-                self.item_slots(item)
-                    .into_iter()
-                    .find(|s| !taken.contains_key(s))
+                self.item_slots(item).into_iter().find(|s| {
+                    !taken.contains_key(s) && (*s != 1 || !self.origins_off_hand_blocked(who))
+                })
             };
             if let (Some(slot), Some(o)) = (free, self.world.get_mut(who)) {
                 o.equipment.insert(slot, item);
@@ -2003,6 +2049,140 @@ mod screen_tests {
         crate::engine::call(&mut h, OBJECT_INVALID, &f, args)
             .unwrap()
             .unwrap()
+    }
+
+    fn two_hander_party() -> (Sim, ObjectId, ObjectId, ObjectId) {
+        let (mut s, hero, _, items) = equipment_flags_sim();
+        s.table = Arc::new(
+            EngineTable::parse(
+                b"int INVENTORY_SLOT_INVALID = 255;\n\
+              int EVENT_TYPE_EQUIP = 11;\n\
+              int EVENT_TYPE_UNEQUIP = 12;\n\
+              int EVENT_TYPE_TRAINING_ITEM_UNEQUIPPED = 1070;\n\
+              int EquipItem(object o, object i, int s = 255, int w = -1) = 392;\n",
+            )
+            .unwrap(),
+        );
+        s.world.tables().insert(
+            "bitm_base",
+            &["EquippableSlots"],
+            vec![(2, vec![Cell::Int(3)]), (5, vec![Cell::Int(1)])],
+        );
+        let (dagger, greatsword) = (items[0], items[1]);
+        s.world
+            .get_mut(greatsword)
+            .unwrap()
+            .fields
+            .insert("BaseItem".into(), 5);
+        let h = s.world.get_mut(hero).unwrap();
+        h.equipment.clear();
+        h.equipment.insert(1, dagger);
+        h.script = Some("test".into());
+        h.effects.push(crate::world::Effect {
+            creator: Some(dagger),
+            ..Default::default()
+        });
+        s.world.trace.keep = true;
+        (s, hero, greatsword, dagger)
+    }
+
+    #[test]
+    fn two_hander_gui_equip_unequips_off_hand_before_equip_and_removes_its_effects() {
+        let (mut s, hero, greatsword, dagger) = two_hander_party();
+        s.world.training.mode = 1;
+        s.world.training.expected = 1070;
+        s.world.training.arg = 1;
+        assert!(s.gui_message(MSG_EQUIP, &[greatsword.to_string(), "0".into()]));
+        let h = s.world.get(hero).unwrap();
+        assert_eq!(h.equipment.get(&0), Some(&greatsword));
+        assert!(!h.equipment.contains_key(&1));
+        assert!(h.inventory.contains(&dagger));
+        assert!(!h.effects.iter().any(|e| e.creator == Some(dagger)));
+        assert_eq!(s.world.training.expected, 0);
+        let events: Vec<_> = s
+            .world
+            .trace
+            .entries
+            .iter()
+            .filter_map(|e| match e {
+                crate::trace::TraceEntry::EventDelivered { target, ty, .. }
+                    if *target == hero && matches!(ty, 11 | 12) =>
+                {
+                    Some(*ty)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(events, [12, 11]);
+    }
+
+    #[test]
+    fn two_hander_gui_refuses_off_hand_drop_without_mutating_equipment() {
+        let (mut s, hero, greatsword, dagger) = two_hander_party();
+        assert!(s.equip_item(hero, greatsword, 0));
+        assert!(s.equip_free_slots(hero).is_empty());
+        let before = s.world.get(hero).unwrap().clone();
+        assert!(!s.gui_message(MSG_EQUIP, &[dagger.to_string(), "1".into()]));
+        let after = s.world.get(hero).unwrap();
+        assert_eq!(after.equipment, before.equipment);
+        assert_eq!(after.inventory, before.inventory);
+        assert_eq!(after.effects, before.effects);
+        // The item can still be equipped in the main hand, freeing the off hand.
+        assert!(s.equip_item(hero, dagger, 255));
+        let spare = s.world.spawn(ObjectKind::Item, "second_dagger");
+        s.world
+            .get_mut(spare)
+            .unwrap()
+            .fields
+            .insert("BaseItem".into(), 2);
+        s.world.get_mut(hero).unwrap().inventory.push(spare);
+        assert!(s.equip_item(hero, spare, 1));
+        assert_eq!(s.world.get(hero).unwrap().equipment.get(&0), Some(&dagger));
+    }
+
+    #[test]
+    fn two_hander_script_explicit_and_default_slots_use_the_shared_hook() {
+        use thedas_script::vm::Value::{Int, Object};
+        for slot in [0, 255] {
+            let (mut s, hero, greatsword, dagger) = two_hander_party();
+            assert_eq!(
+                equipment_flags_call(
+                    &mut s,
+                    "EquipItem",
+                    &[Object(hero), Object(greatsword), Int(slot), Int(-1)]
+                ),
+                Some(Int(1))
+            );
+            assert!(!s.world.get(hero).unwrap().equipment.contains_key(&1));
+            // The native off-hand insertion takes off the main-only weapon.
+            // The inventory screen's drop refusal is a separate restriction.
+            assert_eq!(
+                equipment_flags_call(
+                    &mut s,
+                    "EquipItem",
+                    &[Object(hero), Object(dagger), Int(1), Int(-1)]
+                ),
+                Some(Int(1))
+            );
+            let h = s.world.get(hero).unwrap();
+            assert!(!h.equipment.contains_key(&0));
+            assert_eq!(h.equipment.get(&1), Some(&dagger));
+        }
+    }
+
+    #[test]
+    fn two_hander_player_preserves_locked_off_hand_and_da2_behavior() {
+        let (mut s, hero, greatsword, dagger) = two_hander_party();
+        s.world
+            .get_mut(dagger)
+            .unwrap()
+            .fields
+            .insert("Irremovable".into(), 1);
+        assert!(!s.equip_item(hero, greatsword, 0));
+        assert_eq!(s.world.get(hero).unwrap().equipment.get(&1), Some(&dagger));
+        s.game = thedas_vfs::Game::DragonAge2;
+        assert!(s.equip_item(hero, greatsword, 0));
+        assert_eq!(s.world.get(hero).unwrap().equipment.get(&1), Some(&dagger));
     }
 
     #[test]
