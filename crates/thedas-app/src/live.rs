@@ -261,6 +261,7 @@ pub struct Live {
     /// Each drawn object's id, placement and motion at the last sync (in the objects' scene
     /// order).
     posed: Vec<(ObjectId, Mat4, Option<Clip>)>,
+    animation_trace: report_snapshot::AnimationTrace,
     /// Mod mode's scrubber: a creature drawn with its own animation held at this time, in
     /// seconds (its layers shifted with it). Drawing only; the simulation is not touched.
     scrub: Option<(ObjectId, f32)>,
@@ -750,6 +751,7 @@ impl Live {
             creature_shapes: Default::default(),
             aiming: None,
             posed: Vec::new(),
+            animation_trace: Default::default(),
             scrub: None,
             frozen: None,
             models: ModelCache::default(),
@@ -835,16 +837,16 @@ impl Live {
     }
 
     /// Advances the simulation by `dt_ms` of real time (at most [`MAX_STEP_MS`]), unless
-    /// paused.
-    pub fn step(&mut self, dt_ms: f64) {
+    /// paused. Returns the number of simulation Tick commands consumed (zero or one).
+    pub fn step(&mut self, dt_ms: f64) -> usize {
         if self.front_end || self.loading() {
-            return;
+            return 0;
         }
         // What the player and the interface gave since the last step goes to the journal
         // first, in the order given.
         self.keep_journal();
         if self.paused {
-            return;
+            return 0;
         }
         // A training tutorial holds the game's time until its mode ends, but its script
         // still runs: the exe runs `genev_tutorial` for each training event while the game
@@ -857,11 +859,11 @@ impl Live {
                 thedas_sim::commands::CommandSource::App,
                 thedas_sim::commands::SimCommand::Tick { ms: 0 },
             );
-            return;
+            return 1;
         }
         // A tutorial that pauses the game holds it until its popup is dismissed.
         if self.sim().tutorial_paused() {
-            return;
+            return 0;
         }
         self.owed_ms += dt_ms.clamp(0.0, MAX_STEP_MS);
         let whole = self.owed_ms.floor();
@@ -881,7 +883,9 @@ impl Live {
                     started.elapsed().as_secs_f64() * 1000.0
                 );
             }
+            return 1;
         }
+        0
     }
 
     /// Whether a new level is being built (see [`Live::async_loads`]): the world does not
@@ -1961,6 +1965,18 @@ impl Live {
                 strref: l.strref,
                 female: l.female,
             });
+        let gore: Vec<Option<f32>> = models
+            .iter()
+            .map(|m| {
+                sim.world
+                    .get(m.id)
+                    .filter(|o| {
+                        sim.game == thedas_vfs::Game::Origins
+                            && o.kind == thedas_sim::world::ObjectKind::Creature
+                    })
+                    .map(|o| if sim.show_gore { o.gore_level } else { 0.0 })
+            })
+            .collect();
         let glancers: Vec<ObjectId> = match (exploring, hero, self.looks.glance_reach()) {
             (true, Some(hero), Some(_)) => models
                 .iter()
@@ -2194,14 +2210,47 @@ impl Live {
             &posed,
             0.0,
         );
+        if log::log_enabled!(target: "thedas_app::animation", log::Level::Trace) {
+            self.animation_trace.record(
+                &shared.lock().unwrap_or_else(|p| p.into_inner()),
+                &models,
+                &posed,
+                &self.animator,
+                &objects.renderer,
+                &objects.scene,
+            );
+        }
         objects.follow_poses();
         for (i, m) in models.iter().enumerate() {
+            if m.kind == thedas_sim::world::ObjectKind::Creature
+                && log::log_enabled!(target: "thedas_app::animation", log::Level::Trace)
+                && let Some(c) = &posed[i].1
+            {
+                let clips: Vec<_> = std::iter::once(c)
+                    .chain(&c.layers)
+                    .map(|c| {
+                        (
+                            &c.trees,
+                            &c.actions,
+                            c.time,
+                            c.weight,
+                            self.animator
+                                .cached_animation_resource(c)
+                                .map(|(name, _)| name),
+                        )
+                    })
+                    .collect();
+                log::trace!(target: "thedas_app::animation", "posed {} {}: {:?}", m.id, m.tag, clips);
+            }
             let o = if hidden.contains(&m.id) {
                 0.0
             } else {
                 self.opacity.get(&m.id).copied().unwrap_or(1.0)
             };
             objects.renderer.set_prop_opacity(ctx, &objects.scene, i, o);
+            if let Some(amount) = gore.get(i).copied().flatten() {
+                objects.renderer.set_prop_gore(&objects.scene, i, amount);
+            }
         }
         // A cutscene's lights join the level's, for the level and for the objects, and so
         // do the lights of the visual effects (as they stood last frame).
@@ -2674,6 +2723,13 @@ impl Live {
                 });
             }
         }
+        log::trace!(
+            target: "thedas_app::talkcam",
+            "conversation/cutscene frame effects: time_ms={}, dof={:?}, fades={:?}",
+            sim.world.time_ms,
+            out.depth_of_field,
+            out.fades
+        );
         out
     }
 
@@ -2845,6 +2901,26 @@ impl Live {
         let mut placeable_draws = Vec::new();
         let mut moving = std::collections::HashMap::new();
         for (i, (m, p)) in models.iter().zip(&scene.props).enumerate() {
+            if m.kind == thedas_sim::world::ObjectKind::Creature
+                && log::log_enabled!(log::Level::Trace)
+            {
+                let sim = self.sim();
+                let appearance = sim.world.get(m.id).map(|o| o.appearance);
+                let skeletons: Vec<_> = scene
+                    .prop_skeletons(i)
+                    .into_iter()
+                    .map(|s| (s, &scene.skeleton_models[s], scene.skeletons[s].bones.len()))
+                    .collect();
+                log::trace!(
+                    "animation binding {} {}: apr_base row {:?}, models {:?}, skeletons {:?}, motion {:?}",
+                    m.id,
+                    m.tag,
+                    appearance,
+                    m.models,
+                    skeletons,
+                    m.motion
+                );
+            }
             let (interactive, placeable) = {
                 let sim = self.sim();
                 let placeable = sim
@@ -2943,6 +3019,128 @@ const PAPERDOLL_LIGHT_PROBE: &str = "el_lp_outside_day";
 
 /// How much brighter portraits are than the scene they are drawn in. Provisional.
 const PORTRAIT_GAIN: f32 = 1.8;
+
+/// The face mesh's offset was measured in the scene's original world placement. Follow
+/// the placement actually used by the renderer (cutscene actors and floor snapping can
+/// differ from the simulation), then the animated head bone within that placement.
+fn portrait_head(
+    face: Option<glam::Vec3>,
+    bounds: (glam::Vec3, f32),
+    built: Mat4,
+    placed: Mat4,
+    bone: Option<(glam::Vec3, glam::Vec3)>,
+) -> glam::Vec3 {
+    let offset = face.unwrap_or_else(|| glam::Vec3::Z * (bounds.0.z + bounds.1 - 0.25).max(0.3));
+    let rest_face = placed.transform_point3(built.inverse().transform_vector3(offset));
+    match (face, bone) {
+        (Some(_), Some((now, rest))) => now + (rest_face - rest),
+        (None, Some((now, _))) => now,
+        (_, None) => rest_face,
+    }
+}
+
+#[cfg(test)]
+mod portrait_tests {
+    use super::*;
+    use glam::Vec3;
+
+    #[test]
+    fn portrait_follows_the_drawn_actor_instead_of_the_simulation_root() {
+        let built = Prop::placement([-39.86, -3.6, 0.0], 32.5);
+        let placed = Prop::placement([-42.68, -3.6, 0.4], 90.0);
+        let local_face = Vec3::new(0.0, 0.1, 1.7);
+        let face = built.transform_vector3(local_face);
+        let head = portrait_head(Some(face), (Vec3::ZERO, 1.0), built, placed, None);
+        assert!(head.abs_diff_eq(placed.transform_point3(local_face), 1e-5));
+        assert!(head.distance(built.transform_point3(local_face)) > 2.0);
+        // The head's animation still moves the face within that drawn placement.
+        let rest = placed.transform_point3(Vec3::Z * 1.6);
+        let now = rest + Vec3::new(0.1, 0.0, -0.2);
+        assert!(
+            portrait_head(
+                Some(face),
+                (Vec3::ZERO, 1.0),
+                built,
+                placed,
+                Some((now, rest))
+            )
+            .abs_diff_eq(head + now - rest, 1e-5)
+        );
+        // Creatures without face meshes use their animated head, or their bounds.
+        assert_eq!(
+            portrait_head(None, (Vec3::ZERO, 1.0), built, placed, Some((now, rest))),
+            now
+        );
+        assert!(
+            portrait_head(None, (Vec3::Z, 1.0), built, placed, None)
+                .abs_diff_eq(placed.transform_point3(Vec3::Z * 1.75), 1e-5)
+        );
+    }
+
+    #[test]
+    #[ignore = "requires THEDAS_INSTALL, THEDAS_PORTRAIT_SAVE and an offscreen GPU"]
+    fn portrait_draws_a_hidden_displaced_actor_and_preserves_world_visibility() {
+        let install = std::env::var_os("THEDAS_INSTALL").expect("THEDAS_INSTALL");
+        let save = std::env::var_os("THEDAS_PORTRAIT_SAVE").expect("THEDAS_PORTRAIT_SAVE");
+        let mut live = Live::open(
+            Path::new(&install),
+            "single player",
+            Start::Save(Path::new(&save)),
+            "original",
+        )
+        .unwrap();
+        live.async_loads = false;
+        let hero = live.sim().world.hero.unwrap();
+        let pending = live.portrait_key();
+        let ctx = GpuContext::headless().unwrap();
+        live.sync(&ctx, thedas_render::gpu::CAPTURE_FORMAT).unwrap();
+        assert_ne!(
+            pending,
+            live.portrait_key(),
+            "ready models must invalidate a pending portrait"
+        );
+        let ready = live.portrait_key();
+        let sim_position = live.sim().world.get(hero).unwrap().position;
+        let i = live.posed.iter().position(|p| p.0 == hero).unwrap();
+        let placed = Mat4::from_translation(Vec3::new(4.0, 0.0, 0.4)) * live.posed[i].1;
+        live.posed[i].1 = placed;
+        live.posed[i].2 = None;
+        let objects = live.objects.as_mut().unwrap();
+        objects
+            .renderer
+            .pose_prop(&ctx, &objects.scene, i, placed, &Default::default(), true);
+        objects
+            .renderer
+            .set_prop_opacity(&ctx, &objects.scene, i, 0.0);
+        let draws = objects.scene.props[i].draws.clone();
+        let pixels = live
+            .portraits(&ctx, 128)
+            .into_iter()
+            .find(|(id, _)| *id == hero)
+            .unwrap()
+            .1;
+        assert!(
+            pixels
+                .chunks_exact(4)
+                .filter(|p| p[..3].iter().any(|&v| v > 16))
+                .count()
+                > 128,
+            "a cutscene-hidden actor must still produce a visible portrait"
+        );
+        let objects = live.objects.as_ref().unwrap();
+        assert!(
+            draws
+                .into_iter()
+                .all(|d| objects.renderer.draw_opacity(d) == Some(0.0))
+        );
+        assert_eq!(sim_position, live.sim().world.get(hero).unwrap().position);
+        assert_eq!(
+            ready,
+            live.portrait_key(),
+            "movement and world visibility must not redraw every frame"
+        );
+    }
+}
 
 /// What a click lands on.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -3598,6 +3796,35 @@ impl Live {
         crate::reticle::project(camera, size, &lines)
     }
 
+    /// Portrait inputs in the simulation and in the scene actually ready to draw. A face
+    /// or equipment requested before its model arrives must be redrawn when it arrives,
+    /// even if the simulation's appearance has not changed in the meantime.
+    pub fn portrait_key(&self) -> Vec<(ObjectId, u64)> {
+        use std::hash::{Hash, Hasher};
+        crate::ui::portrait_key(&self.sim())
+            .into_iter()
+            .map(|(id, input)| {
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                input.hash(&mut h);
+                let models = self
+                    .objects
+                    .as_ref()
+                    .and_then(|o| o.key.iter().find(|(who, _)| *who == id).map(|(_, m)| m));
+                models.hash(&mut h);
+                self.objects
+                    .as_ref()
+                    .is_some_and(|o| o.bounds.contains_key(&id))
+                    .hash(&mut h);
+                self.objects
+                    .as_ref()
+                    .is_some_and(|o| o.faces.contains_key(&id))
+                    .hash(&mut h);
+                self.posed.iter().any(|p| p.0 == id).hash(&mut h);
+                (id, h.finish())
+            })
+            .collect()
+    }
+
     /// Each party member's portrait: its head drawn from the camera `portraits.gda` gives it
     /// (by tag, else the `default` row; the hero's from character creation's Portrait
     /// sliders: [`Sim::portrait`]), `size` pixels square, RGBA8. Members not drawn are left
@@ -3640,9 +3867,24 @@ impl Live {
             if o.area.is_none() || o.area != sim.world.area {
                 continue;
             }
-            let Some(&(offset, radius)) = objects.bounds.get(&id) else {
+            let Some(&bounds) = objects.bounds.get(&id) else {
                 continue;
             };
+            let Some(i) = posed.iter().position(|p| p.0 == id) else {
+                continue;
+            };
+            let Some(prop) = objects.scene.props.get(i).filter(|p| !p.draws.is_empty()) else {
+                continue;
+            };
+            let placed = posed[i].1;
+            let built = prop.transform;
+            let own: std::collections::HashSet<usize> = prop.draws.clone().collect();
+            let opacity = prop
+                .draws
+                .clone()
+                .next()
+                .and_then(|d| objects.renderer.draw_opacity(d))
+                .unwrap_or(1.0);
             let face = objects.faces.get(&id).copied();
             // portraits.gda's framing, with the face screen's Portrait choices over it.
             let framing = sim.portrait(id);
@@ -3651,21 +3893,12 @@ impl Live {
             let distance = framing.distance.max(0.2);
             // On character creation's stage the creature stands at the stage's mark.
             let on_stage = staged.filter(|s| s.0 == id);
-            let (position, facing) = on_stage.map_or((o.position, o.facing), |s| (s.1, s.2));
-            let feet = glam::Vec3::from_array(position);
-            let rest_face = match face {
-                Some(f) => feet + f,
-                None => feet + glam::Vec3::Z * (offset.z + radius - 0.25).max(0.3),
-            };
+            let feet = placed.w_axis.truncate();
             // The face follows the head bone as the creature moves (it crouches in combat). A
             // creature with no face mesh (the mabari) is looked at on its head bone: the top
             // of its bounds is its back, not its head.
-            let head = match (face, head_bone(id)) {
-                (Some(_), Some((now, rest))) => now + (rest_face - rest),
-                (None, Some((now, _))) => now,
-                (_, None) => rest_face,
-            };
-            let heading = thedas_sim::world::heading_of(facing).to_radians() + rotation;
+            let head = portrait_head(face, bounds, built, placed, head_bone(id));
+            let heading = placed.y_axis.y.atan2(placed.y_axis.x) + rotation;
             // From in front of the face, looking back at it.
             let eye = head
                 + glam::Vec3::new(
@@ -3687,13 +3920,12 @@ impl Live {
             camera.near = 0.05;
             // The member alone, as the original's portrait shows them: drawing the whole
             // scene put a companion standing beside them into their portrait.
-            let own: std::collections::HashSet<usize> = posed
-                .iter()
-                .position(|p| p.0 == id)
-                .and_then(|i| objects.scene.props.get(i))
-                .map(|p| p.draws.clone().collect())
-                .unwrap_or_default();
             objects.renderer.only_draws = Some(own);
+            // A portrait identifies its subject even while the world camera or cutscene
+            // hides it. Restore that world's opacity before returning to its frame.
+            objects
+                .renderer
+                .set_prop_opacity(ctx, &objects.scene, i, 1.0);
             // The creature on character creation's stage is lit by the portrait rig
             // (`portrait_lightrig` el_lr_new_day2 and `portrait_lightprobe`
             // el_lp_outside_day, 0x7f4037-0x7f40c0), turned to face the camera as the
@@ -3710,6 +3942,9 @@ impl Live {
             }
             // Captures come back RGBA whatever the renderer draws in.
             let shot = objects.renderer.capture(ctx, &camera, size, size);
+            objects
+                .renderer
+                .set_prop_opacity(ctx, &objects.scene, i, opacity);
             objects.renderer.only_draws = None;
             objects.renderer.set_light_rig(None);
             let Ok(mut pixels) = shot else {

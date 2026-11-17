@@ -21,6 +21,9 @@
 //!   smaller. The game keeps running while nothing is presented.
 //! - `state`: the simulation's save (the JSON `thedas-mcp`'s `save_state` writes) under
 //!   `"save"`, as a string.
+//! - `motion_trace` with `"enabled": true` starts a bounded per-frame trace of the
+//!   controlled creature's simulation/placement/skeletal roots, camera, target, dt and
+//!   simulation Tick command count. `"enabled": false` stops it and returns `"frames"`.
 //!
 //! Every reply has `"ok"`; failures carry `"error"`. Input reaches the simulation only as
 //! the player's own does (orders, interface clicks), so it stays deterministic.
@@ -42,6 +45,27 @@ const BIND_TRIES: u32 = 25;
 /// The longest request line taken (bytes); a longer one is answered with an error and the
 /// connection closed, so a stray client cannot grow the game's memory without bound.
 pub const MAX_REQUEST: usize = 4 << 20;
+
+pub const MOTION_TRACE_LIMIT: usize = 4096;
+
+pub fn record_motion(
+    trace: &mut Option<Vec<J>>,
+    live: &crate::live::Live,
+    camera: &thedas_render::Camera,
+    follow: Option<&crate::follow::Follow>,
+    dt_ms: f64,
+    sim_ticks: usize,
+    rendered: bool,
+) {
+    let Some(frames) = trace.as_mut().filter(|f| f.len() < MOTION_TRACE_LIMIT) else {
+        return;
+    };
+    frames.push(json!({
+        "frame": frames.len(), "dt_ms": dt_ms, "sim_ticks": sim_ticks, "rendered": rendered,
+        "hero": live.report_motion(), "camera": camera.position.to_array(),
+        "target": follow.and_then(|f| f.target()).map(|p| p.to_array()),
+    }));
+}
 
 /// A request from a client, with where its reply goes.
 pub struct Request {
