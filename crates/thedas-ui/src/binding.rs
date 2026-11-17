@@ -1040,7 +1040,9 @@ fn sim_values_with(
     }
     v.insert(
         "Tutorials.Enabled".into(),
-        num(u8::from(sim.show_tutorials)),
+        // Disabling new notifications must not hide an already queued pause's
+        // only release control (older saves can contain precisely that state).
+        num(u8::from(sim.show_tutorials || sim.tutorial_paused())),
     );
     // The training step shown (`trainingsteps.gda`'s row; 0 none), see `thedas_sim::training`.
     v.insert(
@@ -2307,6 +2309,17 @@ mod tests {
         );
         assert_eq!(v["Tutorials.TrainingStep"], num(7));
         assert_eq!(v["Client.Paused"], num(1));
+        sim.show_tutorials = false;
+        let v = sim_values_for(&sim, &shown);
+        assert_eq!(
+            v["Tutorials.Enabled"],
+            num(1),
+            "queued pause stays actionable"
+        );
+        assert_eq!(
+            v["Tutorials.TutorialList.0"],
+            UiValue::String("lesson".into())
+        );
     }
 
     #[test]

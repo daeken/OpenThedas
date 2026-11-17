@@ -5,6 +5,7 @@
 pub mod backends;
 pub mod bytecode;
 pub mod ctab;
+mod shadow_receiver;
 pub mod translate;
 
 pub use bytecode::{Shader, Stage};

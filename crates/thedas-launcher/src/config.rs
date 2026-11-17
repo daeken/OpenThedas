@@ -67,6 +67,8 @@ pub struct PlayOptions {
     pub renderer: String,
     /// The deferred renderer's lightmaps: `baked`, `hybrid` or `realtime` (`--lighting`).
     pub lighting: String,
+    /// Improved sun-shadow filtering and partition blending (`--soft-shadows`). Ours.
+    pub soft_shadows: bool,
     /// The logo and intro movies before the start menu (off: `--no-intro`).
     pub intro: bool,
     /// Voice-over language folder (`--language`).
@@ -79,10 +81,11 @@ impl Default for PlayOptions {
     fn default() -> Self {
         PlayOptions {
             size: "1280x720".into(),
-            detail: "medium".into(),
+            detail: "high".into(),
             frame_effects: true,
             renderer: "faithful".into(),
             lighting: "baked".into(),
+            soft_shadows: true,
             intro: true,
             language: "en-us".into(),
             audio: true,
@@ -104,6 +107,8 @@ impl PlayOptions {
             self.renderer.clone(),
             "--lighting".into(),
             self.lighting.clone(),
+            "--soft-shadows".into(),
+            if self.soft_shadows { "on" } else { "off" }.into(),
             "--language".into(),
             self.language.clone(),
         ];
@@ -291,5 +296,20 @@ mod tests {
         assert!(a.contains("--frame-effects off"));
         assert!(a.contains("--renderer faithful"));
         assert!(a.contains("--lighting baked"));
+        assert!(a.contains("--detail high"));
+        assert!(a.contains("--soft-shadows on"));
+    }
+
+    #[test]
+    fn saved_detail_is_never_promoted_even_when_it_was_the_old_default() {
+        for detail in ["low", "medium", "high"] {
+            let text = format!(r#"{{"play":{{"detail":"{detail}"}}}}"#);
+            let old: LauncherConfig = serde_json::from_str(&text).unwrap();
+            assert_eq!(old.play.detail, detail);
+            assert!(old.play.soft_shadows);
+        }
+        let saved: PlayOptions = serde_json::from_str(r#"{"soft_shadows":false}"#).unwrap();
+        assert!(!saved.soft_shadows);
+        assert!(saved.args().join(" ").contains("--soft-shadows off"));
     }
 }
