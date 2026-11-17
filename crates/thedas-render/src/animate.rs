@@ -94,6 +94,8 @@ pub struct Animator {
     /// Each prop's poses as last computed, and what they were posed with (see
     /// [`Animator::pose_props`]; none: not posed since the props changed).
     last_poses: Vec<Option<(u64, crate::skeleton::Poses)>>,
+    /// Props whose skeletons were sampled during the last posing call.
+    evaluated: Vec<bool>,
 }
 
 fn load<T>(
@@ -126,6 +128,12 @@ fn load<T>(
 }
 
 impl Animator {
+    /// Whether the last `pose_props` call sampled any skeleton of this prop. A clip
+    /// change can trigger sampling for a culled prop too.
+    pub fn pose_evaluated(&self, prop: usize) -> bool {
+        self.evaluated.get(prop).copied().unwrap_or(false)
+    }
+
     /// The pose last sent to the renderer, without sampling or loading any resources.
     pub fn last_pose(&self, prop: usize) -> Option<&crate::skeleton::Poses> {
         self.last_poses.get(prop)?.as_ref().map(|(_, poses)| poses)
@@ -513,6 +521,7 @@ impl Animator {
                     || renderer.prop_seen(scene, i, &seen)
             })
             .collect();
+        self.evaluated.resize(props.len(), false);
         let mut jobs: Vec<(usize, usize, Prepared)> = Vec::new();
         for (i, (_, clip)) in props.iter().enumerate() {
             if !posing[i] {
@@ -543,6 +552,7 @@ impl Animator {
         // An unseen prop is placed again with the pose it was last given, so that it moves
         // (and its attachments and effects with it) and is seen when it comes into view.
         for (i, ((transform, _), poses)) in props.iter().zip(by_prop).enumerate() {
+            self.evaluated[i] = posing[i] && !poses.is_empty();
             if posing[i] {
                 renderer.pose_prop(ctx, scene, i, *transform, &poses, true);
                 self.last_poses[i] = Some((shapes[i], poses));

@@ -1138,13 +1138,14 @@ impl Server {
     }
 
     #[tool(
-        description = "Everything about one object: locals, properties (each as [base, current]), effects, commands, inventory; for a creature, also its health (current and max)."
+        description = "Everything about one object: locals, properties (each as [base, current]), effects, commands, inventory, and floor_z (walkable navigation floor, null when unavailable); for a creature, also its health (current and max)."
     )]
     async fn inspect_object(&self, Parameters(a): Parameters<ObjectArg>) -> String {
         self.with_sim(|st| {
-            let sim = st.sim.as_ref().ok_or("no sim")?;
+            let sim = st.sim.as_mut().ok_or("no sim")?;
             let id = resolve(sim, &a.object).ok_or("no such object")?;
             let o = sim.world.get(id).ok_or("no such object")?;
+            let at = o.area.map(|area| (area, o.position));
             let mut v = serde_json::to_value(o).map_err(|e| e.to_string())?;
             v["name"] = json!(o.name_strref.and_then(|s| sim.string(s)));
             // `properties` holds each property's base and current value; health is also
@@ -1159,6 +1160,13 @@ impl Server {
                     });
                 }
             }
+            // Ground-placement diagnostics use a real walkable floor sample, not the
+            // object's own Z (which may be above the floor). Null when unavailable.
+            v["floor_z"] = json!(at.and_then(|(area, position)| {
+                let grid = sim.nav_grid(area)?;
+                let cell = grid.cell(position)?;
+                thedas_sim::nav::walkable(&grid, cell).then(|| thedas_sim::nav::height(&grid, cell))
+            }));
             Ok(v)
         })
     }
@@ -1986,6 +1994,7 @@ impl Server {
                 arrived: false,
                 da2_target_prepared: false,
                 da2_basic_attack_fallback: false,
+                da2_player_issued: false,
                 path: Vec::new(),
                 turned_at: None,
             };

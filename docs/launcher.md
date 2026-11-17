@@ -22,9 +22,17 @@ finds an existing Dragon Age: Origins install, or helps the player get one from 
 
 `launcher.json` in the player's data folder (`~/.openthedas`, `Documents\OpenThedas` on
 Windows): the installs the player kept, which one plays, a keys file per install, and the
-play options (window size, graphics detail, frame effects, intro movies, voice language,
-sound). "Skip the launcher" plays the chosen install at once when the game is started with no
-arguments; `--launcher` brings the launcher back.
+play options (window size, graphics detail, frame effects, renderer, sun shadows, deferred
+lighting, intro movies, voice language, sound). "Skip the launcher" plays the chosen install
+at once when the game is started with no arguments; `--launcher` brings the launcher back.
+
+New settings default to **Very High** (original index 3, CLI `--detail high`) and
+**Sun shadows (OpenThedas): Soft (improved)** (`--soft-shadows on`). Soft adds a 2 m
+partition blend and tent PCF on the existing sun maps, a deliberate deviation from the
+original; choose **Faithful** (`--soft-shadows off`) for the traced hard switch and filters.
+It applies independently of Original/Deferred material rendering. Explicit saved graphics
+detail values, including the old `medium` default, are preserved; a missing shadow choice
+defaults on. See [sampling, trace limits and verification](notes/veryhigh-default-soft-shadows.md).
 
 ## Finding installs
 

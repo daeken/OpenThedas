@@ -59,6 +59,14 @@ struct D3dPipeline {
     blended: bool,
 }
 
+#[derive(Clone, Copy)]
+struct WrittenConstants {
+    width: u32,
+    height: u32,
+    opacity: f32,
+    soft_shadows: bool,
+}
+
 pub(crate) struct D3dDraw {
     pub pipeline: usize,
     vertices: wgpu::Buffer,
@@ -187,6 +195,8 @@ pub(crate) struct D3dPass {
     samples: u32,
     /// Per scene draw, the opacity its object is drawn at (1: as its material says).
     opacity: Vec<f32>,
+    /// Per-instance appearance gore, independent of shared materials.
+    gore: Vec<Option<f32>>,
     pub draws: Vec<D3dDraw>,
     buffer: Option<wgpu::Buffer>,
     materials: Vec<SceneMaterial>,
@@ -255,10 +265,9 @@ pub(crate) struct D3dPass {
     /// is a moved object's lights, re-picked by [`D3dPass::repick_lights`], which clears
     /// the entry. A setter for any of the fixed inputs must clear the draw's entry here.
     statics: std::sync::Mutex<Vec<Option<Box<StaticConstants>>>>,
-    /// Per draw, what its whole constant slot was last written with (target size and
-    /// opacity), or `None` when it must be written whole: a draw whose slot is current
-    /// gets only its per-frame registers rewritten (the slot keeps the rest between frames).
-    written: std::sync::Mutex<Vec<Option<(u32, u32, f32)>>>,
+    /// Per draw, its last target size, opacity and shadow sampling, or `None` when it must
+    /// be written whole. Current slots only need their per-frame registers rewritten.
+    written: std::sync::Mutex<Vec<Option<WrittenConstants>>>,
     /// The scene's lights, then the lights added since ([`D3dPass::set_extra_lights`]), for
     /// re-picking the lights of objects that move.
     scene_lights: Vec<SceneLight>,
@@ -2058,6 +2067,7 @@ impl D3dPass {
             color_format,
             samples,
             opacity: vec![1.0; scene.draws.len()],
+            gore: vec![None; scene.draws.len()],
             draws,
             buffer,
             materials: scene.materials.clone(),
@@ -2220,6 +2230,7 @@ impl D3dPass {
                 world: glam::Mat4::IDENTITY,
                 camera: camera.position,
                 material: &self.materials[d.material],
+                gore: None,
                 lightmap: None,
                 lights: &lights,
                 ambient: Vec3::ZERO,
@@ -2459,6 +2470,17 @@ impl D3dPass {
             .for_each(|s| *s = None);
     }
 
+    /// Set the appearance amount read by all passes of a scene draw.
+    pub fn set_gore(&mut self, draw: usize, amount: f32) {
+        if let Some(gore) = self.gore.get_mut(draw) {
+            *gore = Some(if amount.is_finite() {
+                amount.clamp(0.0, 1.0)
+            } else {
+                0.0
+            });
+        }
+    }
+
     /// The last opacity multiplier given to a scene draw, for diagnostics.
     pub fn opacity(&self, draw: usize) -> Option<f32> {
         self.opacity.get(draw).copied()
@@ -2601,6 +2623,7 @@ impl D3dPass {
             world: *world,
             camera: camera.position,
             material: self.materials.get(*material)?,
+            gore: None,
             lightmap: lightmap.as_ref(),
             lights: &lights,
             ambient: Vec3::ZERO,
@@ -2922,6 +2945,7 @@ impl D3dPass {
         // The per-frame registers of slots that are otherwise current: (offset, bytes).
         let mut partial: Vec<u8> = Vec::new();
         let mut partial_spans: Vec<(u64, std::ops::Range<usize>)> = Vec::new();
+        let soft_shadows = crate::config::soft_shadows();
         for (i, (d, _)) in self
             .draws
             .iter()
@@ -2943,6 +2967,7 @@ impl D3dPass {
                 world: *world,
                 camera: camera.position,
                 material: &self.materials[*material],
+                gore: self.gore.get(d.draw).copied().flatten(),
                 lightmap: lightmap.as_ref(),
                 lights: match &rigged {
                     Some((_, l)) => l,
@@ -3006,8 +3031,17 @@ impl D3dPass {
                 }))
             });
             let opacity = self.opacity.get(d.draw).copied().unwrap_or(1.0);
-            let state = (width, height, opacity);
-            if !fresh && opacity >= 1.0 && written[i] == Some(state) {
+            let state = WrittenConstants {
+                width,
+                height,
+                opacity,
+                soft_shadows,
+            };
+            if !fresh
+                && opacity >= 1.0
+                && written[i]
+                    .is_some_and(|s| (s.width, s.height, s.opacity) == (width, height, opacity))
+            {
                 // Only the per-frame registers: filled over the kept constants (the fixed
                 // ones are untouched) and written as one span per register file.
                 for (stage, (table, base)) in tables.into_iter().zip([0, 3]).enumerate() {
@@ -3052,17 +3086,23 @@ impl D3dPass {
                     }
                 }
                 // A tree's alpha reference moves with its LOD.
-                if let Some(Some((_, _, alpha))) = tree_frame.get(d.draw) {
+                let tree_alpha = tree_frame
+                    .get(d.draw)
+                    .and_then(|f| f.map(|(_, _, alpha)| alpha));
+                if tree_alpha.is_some()
+                    || written[i].is_some_and(|s| s.soft_shadows != soft_shadows)
+                {
                     let fix = [
                         1.0 / width.max(1) as f32,
                         1.0 / height.max(1) as f32,
-                        *alpha,
-                        0.0,
+                        tree_alpha.unwrap_or(84.0),
+                        f32::from(soft_shadows),
                     ];
                     let at = partial.len();
                     partial.extend_from_slice(bytemuck::cast_slice(&fix));
                     partial_spans.push((d.slot + SLOT[6], at..partial.len()));
                 }
+                written[i] = Some(state);
                 statics[i] = Some(fixed);
                 continue;
             }
@@ -3099,7 +3139,7 @@ impl D3dPass {
                     Some(Some((_, _, alpha))) => *alpha,
                     _ => 84.0,
                 },
-                0.0,
+                f32::from(soft_shadows),
             ];
             data[SLOT[6] as usize..][..16].copy_from_slice(bytemuck::cast_slice(&fix));
         }
@@ -3234,6 +3274,7 @@ impl D3dPass {
                     world: *world,
                     camera: camera.position,
                     material,
+                    gore: None,
                     lightmap: None,
                     lights: &lights,
                     ambient: Vec3::ZERO,
@@ -3357,26 +3398,30 @@ impl D3dPass {
         }
     }
 
-    /// Which draws the last frame showed or cast a shadow from (in the view, or a sun
-    /// partition's caster): by index into `draws`. Empty before any update.
+    /// Which scene draws the last frame showed or cast a shadow from. Several shader
+    /// passes can share one scene draw, and some scene draws use the stand-in renderer.
+    /// Empty before any update.
     pub fn seen_draws(&self) -> Vec<bool> {
-        let mut seen = self
-            .in_view
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
+        let in_view = self.in_view.lock().unwrap_or_else(|e| e.into_inner());
+        if in_view.is_empty() {
+            return Vec::new();
+        }
         let casting = self
             .caster_visible
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        for (c, v) in self.casters.iter().zip(casting.iter()) {
-            if (v[0] || v[1])
-                && let Some(s) = seen.get_mut(c.draw)
-            {
-                *s = true;
-            }
-        }
-        seen
+        scene_draws_seen(
+            self.worlds.len(),
+            self.draws
+                .iter()
+                .zip(in_view.iter())
+                .map(|(d, &v)| (d.draw, v)),
+            self.casters
+                .iter()
+                .zip(casting.iter())
+                .filter(|(_, v)| v[0] || v[1])
+                .map(|(c, _)| c.draw),
+        )
     }
 
     /// Whether draw `i` (an index into `draws`) is in this frame's view (see
@@ -3487,9 +3532,57 @@ impl D3dPass {
     }
 }
 
+/// Collapse pass visibility into the scene indices used by props and shadow casters.
+/// A draw with no translated pass keeps posing because its stand-in visibility is unknown.
+fn scene_draws_seen(
+    count: usize,
+    passes: impl IntoIterator<Item = (usize, bool)>,
+    casters: impl IntoIterator<Item = usize>,
+) -> Vec<bool> {
+    let mut seen = vec![None; count];
+    for (draw, visible) in passes {
+        seen[draw] = Some(seen[draw].unwrap_or(false) || visible);
+    }
+    for draw in casters {
+        seen[draw] = Some(true);
+    }
+    seen.into_iter().map(|v| v.unwrap_or(true)).collect()
+}
+
 #[cfg(test)]
 mod tests {
+    use super::scene_draws_seen;
     use crate::scene::{DOMAIN_CHARACTERS, DOMAIN_LEVEL};
+
+    #[test]
+    fn pose_visibility_uses_scene_draw_indices_after_multipass_materials() {
+        // The first prop has two passes. The visible third prop must not inherit
+        // the second prop's hidden flag when the animator indexes its scene draws.
+        assert_eq!(
+            scene_draws_seen(3, [(0, false), (0, false), (1, false), (2, true)], []),
+            [false, false, true],
+        );
+        // Visibility from any pass of a draw counts, regardless of pass order.
+        assert_eq!(
+            scene_draws_seen(2, [(1, false), (0, true), (1, true)], []),
+            [true, true],
+        );
+    }
+
+    #[test]
+    fn pose_visibility_combines_shadow_casters_in_scene_draw_indices() {
+        assert_eq!(
+            scene_draws_seen(3, [(0, false), (0, false), (1, false), (2, false)], [2]),
+            [false, false, true],
+        );
+    }
+
+    #[test]
+    fn pose_visibility_keeps_draws_without_translated_passes_current() {
+        assert_eq!(scene_draws_seen(3, [(1, false)], []), [true, false, true]);
+        assert_eq!(scene_draws_seen(2, [], []), [true, true]);
+    }
+
     #[test]
     fn blended_draws_fall_in_the_submission_queues_groups() {
         use super::{TransparencyGroup as G, transparency_group as g};

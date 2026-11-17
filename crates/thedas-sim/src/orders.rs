@@ -35,6 +35,7 @@ fn command(sim: &Sim, ty: &str, name: &str) -> Command {
         arrived: false,
         da2_target_prepared: false,
         da2_basic_attack_fallback: false,
+        da2_player_issued: false,
         path: Vec::new(),
         turned_at: None,
         is_static: false,
@@ -49,6 +50,7 @@ impl Sim {
     /// Makes `who` the party member the player controls (the hero when `None`, or when `who`
     /// is not in the party): its AI stops and the rest follow it.
     pub fn set_controlled(&mut self, who: Option<ObjectId>) {
+        self.world.script_controlled = None;
         self.world.controlled = who.filter(|&w| crate::engine::party_of(self).contains(&w));
     }
 
@@ -230,7 +232,9 @@ impl Sim {
         c.target = Some(target);
         c.ints = vec![ability];
         c.strings = vec![item.to_string()];
-        if let Some(o) = self.world.get_mut(who) {
+        if self.game == thedas_vfs::Game::DragonAge2 {
+            self.da2_player_command(who, c);
+        } else if let Some(o) = self.world.get_mut(who) {
             o.commands.clear();
             o.commands.push(c);
         }
@@ -256,7 +260,9 @@ impl Sim {
         });
         c.ints = vec![ability];
         c.strings = vec![item.to_string()];
-        if let Some(o) = self.world.get_mut(who) {
+        if self.game == thedas_vfs::Game::DragonAge2 {
+            self.da2_player_command(who, c);
+        } else if let Some(o) = self.world.get_mut(who) {
             o.commands.clear();
             o.commands.push(c);
         }

@@ -425,6 +425,9 @@ impl Sim {
         let speaker = match self.line_speaker_tag(&node, c.owner == c.player).as_str() {
             "OWNER" | "" => c.owner,
             "PLAYER" => c.player,
+            tag if self.game == thedas_vfs::Game::Origins => self
+                .cutscene_actor_object(tag, Some(c.owner), Some(c.player))
+                .unwrap_or(c.owner),
             tag => self.world.by_tag(tag).next().map_or(c.owner, |o| o.id),
         };
         let t = self.world.time_ms;
@@ -1275,7 +1278,17 @@ impl Sim {
     }
 
     pub fn conversation_line(&self) -> Option<OpenLine<'_>> {
-        let c = self.talk.as_ref().filter(|c| !c.ended)?;
+        self.talk.as_ref().filter(|c| !c.ended)?;
+        self.presented_conversation_line()
+    }
+
+    /// The NPC line still being presented, including a terminal line whose graph has
+    /// ended. Audio must finish that line before the interface dismisses it.
+    pub fn presented_conversation_line(&self) -> Option<OpenLine<'_>> {
+        let c = self.talk.as_ref()?;
+        if c.ended && c.line.is_none() {
+            return None;
+        }
         let node = c.line.and_then(|l| c.dlg.nodes.get(l));
         Some(OpenLine {
             dialog: c.dlg.name.as_str(),
@@ -1963,6 +1976,27 @@ mod tests {
         sim.world.cutscene.as_mut().unwrap().name = "intro.cut".into();
         sim.world.cutscene.as_mut().unwrap().from_dialog = false;
         assert!(sim.conversation_line_cutscene().is_none());
+    }
+
+    #[test]
+    fn a_terminal_npc_line_remains_available_to_audio_until_dismissed() {
+        let (mut sim, hero, npc) = passers_by();
+        let mut dlg = remarks("terminal", &["The last line."], false);
+        dlg.nodes[0].ambient = false;
+        dlg.nodes[0].strref = Some(274106);
+        dlg.nodes[0].children.clear();
+        assert!(sim.open_conversation(hero, npc, dlg, None));
+        assert!(sim.dialog_state().unwrap().ended);
+        assert!(sim.conversation_line().is_none());
+        assert_eq!(
+            sim.presented_conversation_line().unwrap().strref,
+            Some(274106)
+        );
+        // An exhausted reply clears its answered line; it must not be voiced again.
+        sim.talk.as_mut().unwrap().line = None;
+        assert!(sim.presented_conversation_line().is_none());
+        sim.talk = None;
+        assert!(sim.presented_conversation_line().is_none());
     }
 
     #[test]
