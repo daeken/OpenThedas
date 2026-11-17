@@ -14496,6 +14496,162 @@ mod coverage_tests {
     }
 
     #[test]
+    fn remove_all_effects_death_filter_removes_stun_and_preserves_exemptions() {
+        let mut s = sim();
+        let tables = crate::m2da::Tables::empty();
+        tables.insert(
+            "effects",
+            &["IgnoreDeath"],
+            vec![
+                (1027, vec![Cell::Int(0)]), // stun
+                (1017, vec![Cell::Int(0)]), // damage over time
+                (1068, vec![Cell::Int(1)]), // mabari dominance
+            ],
+        );
+        s.world.tables = Arc::new(tables);
+        let c = s.world.spawn(ObjectKind::Creature, "fallen");
+        let effects: Vec<_> = [
+            (1027, 2, 0),
+            (1027, 3, 0), // permanent does not mean survives death
+            (1017, 2, 0),
+            (1068, 3, 0),
+            (1012, 3, 500_001),
+            (1012, 4, 0),
+            (1012, 5, 0),
+            (7, 6, 0),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(i, (ty, duration_type, ability))| Effect {
+            id: i as i32 + 1,
+            ty,
+            duration_type,
+            ability,
+            expires: (duration_type == 2).then_some(100_000),
+            ..Default::default()
+        })
+        .collect();
+        for keep_injuries in [true, false] {
+            s.world.get_mut(c).unwrap().effects = effects.clone();
+            s.kill(c, OBJECT_INVALID);
+            run(
+                &mut s,
+                c,
+                "RemoveAllEffects",
+                &[
+                    Value::Object(c),
+                    Value::Int(keep_injuries as i32),
+                    Value::Int(1),
+                ],
+            );
+            let remaining: Vec<_> = s
+                .world
+                .get(c)
+                .unwrap()
+                .effects
+                .iter()
+                .map(|e| e.id)
+                .collect();
+            assert_eq!(
+                remaining,
+                if keep_injuries {
+                    vec![4, 5, 6, 7, 8]
+                } else {
+                    vec![4, 6, 7, 8]
+                }
+            );
+            // Expiration must not blanket-clear a corpse's persistent effects.
+            s.expire_effects();
+            assert_eq!(s.world.get(c).unwrap().effects.len(), remaining.len());
+        }
+    }
+
+    #[test]
+    fn removing_stun_from_a_corpse_runs_its_callback_once_and_survives_save_reload() {
+        let table = EngineTable::parse(
+            b"\
+            int EVENT_TYPE_REMOVE_EFFECT = 32;\n\
+            int PROPERTY_DEPLETABLE_HEALTH = 7;\n\
+            int PROPERTY_VALUE_MODIFIER = 4;\n\
+            void UpdateCreatureProperty(object o, int p, float v, int t) = 1;\n\
+            void RemoveAllEffects(object o, int i, int d) = 2;\n",
+        )
+        .unwrap();
+        let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(table), 1);
+        let c = s.world.spawn(ObjectKind::Creature, "fallen");
+        // Our synthetic removal callback restores the stun's Dexterity modifier:
+        // UpdateCreatureProperty(OBJECT_SELF, 2, 1000.0, 4).
+        let mut code = vec![4, 3];
+        code.extend(4_i32.to_be_bytes());
+        code.extend([4, 4]);
+        code.extend(1000_f32.to_be_bytes());
+        code.extend([4, 3]);
+        code.extend(2_i32.to_be_bytes());
+        code.extend([4, 6]);
+        code.extend(0_u32.to_be_bytes());
+        code.extend([5, 0, 0, 1, 4, 0x20, 0]);
+        let mut bytes = b"NCS V1.0B".to_vec();
+        bytes.extend(((13 + code.len()) as u32).to_be_bytes());
+        bytes.extend(code);
+        s.add_script("restore_stun", thedas_script::Ncs::parse(&bytes).unwrap());
+        let stun = Effect {
+            id: 1,
+            ty: 1027,
+            duration_type: 2,
+            expires: Some(100_000),
+            ..Default::default()
+        };
+        let o = s.world.get_mut(c).unwrap();
+        o.script = Some("restore_stun".into());
+        o.modifiers.insert(2, -1000.0);
+        o.effects.push(stun.clone());
+        s.kill(c, OBJECT_INVALID);
+        s.current_effect = Some((
+            Effect {
+                ty: 7,
+                ..Default::default()
+            },
+            true,
+        ));
+        s.current_effect_target = Some(c);
+        run(
+            &mut s,
+            c,
+            "RemoveAllEffects",
+            &[Value::Object(c), Value::Int(1), Value::Int(1)],
+        );
+        let o = s.world.get(c).unwrap();
+        assert!(o.dead && o.effects.is_empty());
+        assert_eq!(o.modifiers.get(&2).copied().unwrap_or(0.0), 0.0);
+        assert_eq!(
+            s.current_effect.as_ref().unwrap().0.ty,
+            7,
+            "nested removal restores the killing effect"
+        );
+        assert_eq!(s.current_effect_target, Some(c));
+        assert!(
+            !s.remove_effect(c, &stun),
+            "already removed; callback must not run twice"
+        );
+        let saved = s.save_json().unwrap();
+        s.load_json(&saved).unwrap();
+        assert!(s.world.get(c).unwrap().dead);
+        assert!(s.world.get(c).unwrap().effects.is_empty());
+        s.world.time_ms = 100_000;
+        s.expire_effects();
+        assert_eq!(
+            s.world
+                .get(c)
+                .unwrap()
+                .modifiers
+                .get(&2)
+                .copied()
+                .unwrap_or(0.0),
+            0.0
+        );
+    }
+
+    #[test]
     fn ghost_and_quickbar_switches_are_kept_on_the_creature() {
         let mut s = sim();
         let c = s.world.spawn(ObjectKind::Creature, "c");
