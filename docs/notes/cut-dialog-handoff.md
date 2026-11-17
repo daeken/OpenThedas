@@ -106,6 +106,6 @@ each case, with no automatic `Conversation.SelectResponse` at handoff.
 
 | Path | Track 41526 | Conversation at handoff |
 | --- | --- | --- |
-| Skip at 10.427 s | Starts in the cut and retains its event across the skip | Subtitle cleared. Replies show after the voice finishes. |
+| Skip at 10.363 s | Starts in the cut and retains its event across the skip | Subtitle cleared. Replies show after the voice finishes. |
 | Full 16 s playback | Starts and finishes in the cut | Subtitle cleared. Replies are ready. |
-| Skip at 5.535 s | Starts once in the conversation | The unheard line is subtitled while it plays, followed by the replies. |
+| Skip at 5.485 s | Starts once in the conversation | The unheard line is subtitled while it plays, followed by the replies. |
