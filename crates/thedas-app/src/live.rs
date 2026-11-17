@@ -2708,6 +2708,13 @@ impl Live {
                 });
             }
         }
+        log::trace!(
+            target: "thedas_app::talkcam",
+            "conversation/cutscene frame effects: time_ms={}, dof={:?}, fades={:?}",
+            sim.world.time_ms,
+            out.depth_of_field,
+            out.fades
+        );
         out
     }
 
