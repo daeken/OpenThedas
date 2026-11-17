@@ -3289,7 +3289,7 @@ impl App {
         };
         *frames = frames.saturating_add(1);
         if !g.ui.stage.dialog_up() && (*frames == 1 || *frames > NOTE_REASK_FRAMES) {
-            g.ui.ask_ok(report::FAILED_ID, &message, "OK");
+            g.ui.ask_ok(report::FAILED_ID, message, "OK");
             *frames = 1;
         }
     }
