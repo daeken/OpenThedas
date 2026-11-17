@@ -369,6 +369,12 @@ struct TextPopup {
 }
 
 impl TextPopup {
+    /// How many buttons the box shows: one per label, a trailing empty one left out (the
+    /// popup layer shows `NumButtons` of them, as a script's one-button `ShowPopup` does).
+    fn buttons(&self) -> usize {
+        if self.labels[1].is_empty() { 1 } else { 2 }
+    }
+
     /// Write immediately before showing: the previous dialog's answer and a script's
     /// bindings can change these shared values while this question waits.
     fn write_values(&self, b: &thedas_ui::protocol::GameBridge) {
@@ -378,7 +384,10 @@ impl TextPopup {
             &format!("{k}.DialogBoxText"),
             UiValue::String(self.prompt.clone()),
         );
-        b.set_value(&format!("{k}.NumButtons"), UiValue::Number(2.0));
+        b.set_value(
+            &format!("{k}.NumButtons"),
+            UiValue::Number(self.buttons() as f64),
+        );
         b.set_value(
             &format!("{k}.InputBox"),
             UiValue::Number(f64::from(u8::from(self.text.is_some()))),
@@ -641,7 +650,8 @@ const PORTRAIT_RETRY_MS: f64 = 1000.0;
 
 /// What the portraits show, by member (the party, and the followers picked in an open party
 /// picker: see [`crate::live::portrait_subjects`]): who, in which slot, with which
-/// appearance, head morph and equipment. They are drawn again when it changes.
+/// appearance, head morph and equipment. [`crate::live::Live::portrait_key`] also tracks
+/// the models that have become available to render these inputs.
 pub fn portrait_key(sim: &thedas_sim::Sim) -> Vec<(u32, u64)> {
     use std::hash::{Hash, Hasher};
     crate::live::portrait_subjects(sim)
@@ -1739,6 +1749,12 @@ impl UiLayer {
     /// is `a`, and its text is empty.
     pub fn ask_choice(&mut self, id: u32, prompt: &str, a: &str, b: &str) {
         self.ask(id, prompt, None, a, b);
+    }
+
+    /// Tells the player something with the game's own message box and a single button
+    /// (`ok`): the answer's `accepted` is true, and its text is empty.
+    pub fn ask_ok(&mut self, id: u32, prompt: &str, ok: &str) {
+        self.ask(id, prompt, None, ok, "");
     }
 
     fn ask(&mut self, id: u32, prompt: &str, text: Option<&str>, ok: &str, cancel: &str) {
@@ -3935,6 +3951,22 @@ fn gui_id(s: Screen, container: bool) -> Option<i32> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_message_with_one_button_shows_one_button() {
+        let popup = |cancel: &str| TextPopup {
+            id: 1,
+            prompt: "The start menu could not be opened".into(),
+            text: None,
+            labels: ["OK".into(), cancel.into()],
+            frames: 0,
+            free_text: false,
+            input_ready: false,
+            pending_keys: VecDeque::new(),
+        };
+        assert_eq!(popup("").buttons(), 1);
+        assert_eq!(popup("Cancel").buttons(), 2);
+    }
+
     use super::*;
 
     fn popup_property(ui: &mut UiLayer, path: &str) -> thedas_ui::UiValue {
@@ -4547,5 +4579,36 @@ mod tests {
         assert!(!clock.due(vec![(1, 8), (2, 9)], PORTRAIT_RETRY_MS - 1.0));
         assert!(clock.due(vec![(1, 8), (2, 9)], 1.0));
         assert_ne!(PortraitClock::name(1, 1), PortraitClock::name(1, 2));
+    }
+
+    #[test]
+    fn portrait_inputs_invalidate_the_cached_drawing() {
+        use thedas_sim::world::ObjectKind;
+        let mut sim = Sim::new(
+            Arc::new(Vfs::new()),
+            Arc::new(thedas_script::EngineTable::default()),
+            1,
+        );
+        let hero = sim.world.spawn(ObjectKind::Creature, "hero");
+        sim.world.hero = Some(hero);
+        let mut clock = PortraitClock::default();
+        assert!(clock.due(portrait_key(&sim), 0.0));
+        clock.drew(&[hero]);
+        for change in [
+            |o: &mut thedas_sim::world::Object| o.head_morph = Some("hm_face".into()),
+            |o: &mut thedas_sim::world::Object| o.appearance += 1,
+            |o: &mut thedas_sim::world::Object| {
+                o.equipment.insert(1, 42);
+            },
+            |o: &mut thedas_sim::world::Object| {
+                o.face_choices
+                    .insert(thedas_sim::appearance::PORTRAIT_DISTANCE, 0.8);
+            },
+        ] {
+            assert!(!clock.due(portrait_key(&sim), 60_000.0));
+            change(sim.world.get_mut(hero).unwrap());
+            assert!(clock.due(portrait_key(&sim), 0.0));
+            clock.drew(&[hero]);
+        }
     }
 }

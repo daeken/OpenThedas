@@ -34,6 +34,8 @@ use crate::cutactors::{DrawnRoots, drawn_object, stage_place};
 pub struct CutsceneCamera {
     tracks: HashMap<String, Arc<Tracks>>,
     stages: HashMap<String, Option<Arc<Stage>>>,
+    /// Last source reported, so camera diagnostics run once per authored cut.
+    reported: Option<(String, i64)>,
 }
 
 impl CutsceneCamera {
@@ -86,6 +88,31 @@ impl CutsceneCamera {
             root: &root,
         };
         let pose = tracks.camera_at(t, placement, &find)?;
+        if let Some(actor) = tracks.camera_actor(t) {
+            let source = (c.name.clone(), actor.id);
+            if self.reported.as_ref() != Some(&source) {
+                let local = tracks.camera_at(
+                    t,
+                    Placement::NONE,
+                    &Finders {
+                        camera: &camera,
+                        place: &place,
+                        root: &|_| None,
+                    },
+                );
+                log::debug!(
+                    "camera source={} actor={} stage={:?} local={:?} placement={:?} from_dialog={} world={:?}",
+                    c.name,
+                    actor.name,
+                    tracks.stage_file,
+                    local,
+                    c.placement,
+                    c.from_dialog,
+                    pose
+                );
+                self.reported = Some(source);
+            }
+        }
         Some(pose_camera(&pose, base))
     }
 

@@ -73,6 +73,7 @@ mod looks;
 mod modconv;
 mod modmode;
 mod modworld;
+mod mouse;
 mod occlusion;
 mod pad;
 mod paddev;
@@ -868,6 +869,7 @@ struct App {
     gfx: Option<Gfx>,
     keys: HashSet<KeyCode>,
     looking: bool,
+    right_click: mouse::RightClick,
     /// The right button went down over the interface: its release is the interface's too (an
     /// item's radial menu opens on the press and acts on the release).
     ui_right: bool,
@@ -3618,15 +3620,18 @@ impl App {
         }
     }
 
-    /// A left click at window pixel (`x`, `y`) while playing: the party leader is ordered to
-    /// whatever it lands on.
-    fn click(&mut self, x: f64, y: f64) {
+    /// A world click orders the party leader. Right clicks currently order ground only.
+    fn click(&mut self, x: f64, y: f64, ground_only: bool) {
         let (Some(live), Some(g)) = (self.live.as_mut(), self.gfx.as_ref()) else {
             return;
         };
         let (w, h) = (g.config.width as f32, g.config.height as f32);
         let (origin, dir) = self.camera.ray(x as f32, y as f32, w, h);
-        if let Some(order) = live.pick(origin, dir).and_then(|p| live.click(p)) {
+        if let Some(order) = live
+            .pick(origin, dir)
+            .filter(|p| !ground_only || matches!(p, live::Pick::Ground(_)))
+            .and_then(|p| live.click(p))
+        {
             log::info!("order: {order}");
         }
     }
@@ -3934,6 +3939,7 @@ impl App {
 
     /// The mouse moves to window pixel (`x`, `y`).
     fn cursor_to(&mut self, x: f64, y: f64) {
+        self.right_click.cursor_to((x, y));
         self.cursor = (x, y);
         self.pad_last = false;
         if let Some(Marking::On {
@@ -4017,7 +4023,7 @@ impl App {
             }
         }
         if to_world {
-            self.click(x, y);
+            self.click(x, y, false);
         }
     }
 
@@ -4033,8 +4039,9 @@ impl App {
             if pressed { "rpress" } else { "rrelease" }
         ));
         // Over the interface (or with a menu up) a right click is the interface's (an item's
-        // actions); elsewhere it turns the camera.
+        // actions); elsewhere a drag turns the camera and a tap orders a ground move.
         if pressed {
+            self.right_click = Default::default();
             if let (Some(g), Some(s)) = (self.gfx.as_mut(), self.screens.as_ref()) {
                 if !s.exploring() || g.ui.covers(x, y) {
                     g.ui.button_as(thedas_ui::avm1::MOUSE_RIGHT, x, y, true);
@@ -4054,10 +4061,28 @@ impl App {
                 log::info!("ability {} not aimed", aim.ability);
                 return;
             }
+            if self
+                .live
+                .as_ref()
+                .is_some_and(|l| l.sim().game == thedas_vfs::Game::Origins)
+                && self.ui.is_empty()
+            {
+                self.right_click.press((x, y));
+            }
         }
         self.looking = pressed;
         if let Some(g) = &self.gfx {
             g.window.set_cursor_visible(!self.looking);
+        }
+        if !pressed
+            && let Some((px, py)) = self.right_click.release()
+            && self.ui.is_empty()
+            && let (Some(g), Some(s)) = (self.gfx.as_ref(), self.screens.as_ref())
+            && s.exploring()
+            && world_takes_click(&g.ui, s, x, y)
+            && world_takes_click(&g.ui, s, px, py)
+        {
+            self.click(px, py, true);
         }
     }
 
@@ -4073,16 +4098,17 @@ impl App {
             }
             &Step::ClickAs(button, x, y) => {
                 self.cursor_to(x, y);
-                if let Some(g) = self.gfx.as_mut() {
+                if button == thedas_ui::avm1::MOUSE_RIGHT {
+                    self.right_button(true);
+                    self.right_button(false);
+                } else if let Some(g) = self.gfx.as_mut() {
                     g.ui.click_as(button, x, y);
                 }
                 log.push(format!("click {x},{y} as button {button}"));
             }
             &Step::RightAt(x, y, down) => {
                 self.cursor_to(x, y);
-                if let Some(g) = self.gfx.as_mut() {
-                    g.ui.button_as(thedas_ui::avm1::MOUSE_RIGHT, x, y, down);
-                }
+                self.right_button(down);
                 log.push(format!(
                     "right {} {x},{y}",
                     if down { "press" } else { "release" }
@@ -4860,10 +4886,9 @@ impl App {
                         log::warn!("front end: {r:?} failed: {e:#}");
                         // Say so: the game just carries on, which looks like a dead button.
                         if let Some(g) = self.gfx.as_mut() {
-                            g.ui.ask_choice(
+                            g.ui.ask_ok(
                                 RETURN_FAILED_ID,
                                 &format!("The start menu could not be opened: {e:#}"),
-                                "OK",
                                 "OK",
                             );
                         }
@@ -5252,6 +5277,7 @@ impl ApplicationHandler for App {
             WindowEvent::Focused(false) => {
                 self.keys.clear();
                 self.looking = false;
+                self.right_click = Default::default();
                 if let Some(g) = self.gfx.as_mut() {
                     g.ui.stage.set_shift(false);
                     g.ui.mouse_leave();
@@ -5269,6 +5295,7 @@ impl ApplicationHandler for App {
     fn device_event(&mut self, _: &ActiveEventLoop, _: DeviceId, event: DeviceEvent) {
         if let DeviceEvent::MouseMotion { delta } = event {
             if self.looking {
+                self.right_click.motion(delta);
                 // The player's control options: mouse sensitivity scales the turn (1, the
                 // default, is the old fixed 0.003 radians a pixel) and the axes may be
                 // inverted. Provisional: the exe's sensitivity curve is not traced.
@@ -5972,7 +5999,7 @@ fn draw_likenesses(
     let Some(screens) = screens else {
         return;
     };
-    let key = ui::portrait_key(&live.sim());
+    let key = live.portrait_key();
     if ui.wants_portraits(key, dt) {
         let shots = live.portraits(ctx, ui::PORTRAIT_SIZE);
         ui.set_portraits(shots);
@@ -6713,10 +6740,58 @@ fn parse_step(s: &str) -> Result<Step> {
 /// The viewer's level when `--area` is not given.
 const DEFAULT_AREA: &str = "lgt101d";
 
+/// The open-file limit the game asks for at start.
+const OPEN_FILES_WANTED: u64 = 10_240;
+
+/// The soft open-file limit to ask for: `wanted`, or the hard limit when that is lower;
+/// never lower than the current soft limit.
+#[cfg(unix)]
+fn open_files_target(soft: u64, hard: u64, wanted: u64) -> u64 {
+    wanted.min(hard).max(soft)
+}
+
+/// Raises the process's soft open-file limit (`RLIMIT_NOFILE`) to [`OPEN_FILES_WANTED`], or
+/// the hard limit when that is lower. Every archive of the install stays open for each
+/// mounted file system (several in a game, one more while the start menu opens), which
+/// passes the 2560 a Terminal-started process gets on macOS. Logged; a failure only warns.
+#[cfg(unix)]
+fn raise_open_file_limit() {
+    // SAFETY: getrlimit and setrlimit only read and write the `rlimit` passed to them.
+    unsafe {
+        let mut lim = std::mem::zeroed::<libc::rlimit>();
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) != 0 {
+            log::warn!(
+                "open-file limit: getrlimit failed: {}",
+                std::io::Error::last_os_error()
+            );
+            return;
+        }
+        let (soft, hard): (u64, u64) = (lim.rlim_cur, lim.rlim_max);
+        let target = open_files_target(soft, hard, OPEN_FILES_WANTED);
+        if target == soft {
+            log::info!("open-file limit: {soft} (hard {hard})");
+            return;
+        }
+        lim.rlim_cur = target;
+        if libc::setrlimit(libc::RLIMIT_NOFILE, &lim) == 0 {
+            log::info!("open-file limit: raised from {soft} to {target} (hard {hard})");
+        } else {
+            log::warn!(
+                "open-file limit: could not raise {soft} to {target}: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn raise_open_file_limit() {}
+
 fn main() -> Result<()> {
     report::init_logging(env_logger::Builder::from_env(
         env_logger::Env::default().default_filter_or("info,wgpu=warn,naga=warn"),
     ));
+    raise_open_file_limit();
     let mut args = Args::parse();
     if let Some(mode) = args
         .lighting
@@ -7163,7 +7238,7 @@ fn main() -> Result<()> {
                                     level.map(|x| x.layout.as_str()),
                                     level.map(|x| &x.vfs),
                                 );
-                                let key = ui::portrait_key(&l.sim());
+                                let key = l.portrait_key();
                                 if layer.wants_portraits(key, dt) {
                                     let shots = l.portraits(&ctx, ui::PORTRAIT_SIZE);
                                     layer.set_portraits(shots);
@@ -7711,6 +7786,7 @@ fn main() -> Result<()> {
         gfx: None,
         keys: HashSet::new(),
         looking: false,
+        right_click: Default::default(),
         ui_right: false,
         last: Instant::now(),
         error: None,
@@ -7823,6 +7899,18 @@ fn pack_note(name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn the_open_file_limit_is_raised_to_the_wanted_count_within_the_hard_limit() {
+        use super::open_files_target;
+        // A Terminal-started process on macOS: 2560 soft, no hard limit.
+        assert_eq!(open_files_target(2560, u64::MAX, 10_240), 10_240);
+        // A hard limit under the wanted count caps it.
+        assert_eq!(open_files_target(256, 4096, 10_240), 4096);
+        // Already higher: left as it is, never lowered.
+        assert_eq!(open_files_target(1_048_576, u64::MAX, 10_240), 1_048_576);
+    }
+
     #[test]
     fn vfx_specs_parse_into_effect_props() {
         let props = super::parse_vfx("fxa_fire_aoe_p@1,2,3; FXA_Ice_Cld_P.mmh @ -4.5,0,7").unwrap();

@@ -687,7 +687,8 @@ const VFX_PERSISTENT_TABLE: i32 = 96;
 /// `bReturnFirstMatch` is read but unused. Provisional: the candidates are the
 /// simulation's perception list (the engine's perception query, which also drops creatures
 /// beyond a per-creature limit, is not traced). Origins excludes creatures whose integer
-/// current health is at most zero (0x6a3660). DA2's predicate still needs tracing.
+/// current health is at most zero (0x6a3660). DA2 drops dead creatures before
+/// indexing (0x51a670), using the death byte through 0x52e810.
 fn cluster_center(
     sim: &mut Sim,
     creator: ObjectId,
@@ -712,7 +713,12 @@ fn cluster_center(
                     .get(&7)
                     .is_some_and(|&(_, current)| (1.0..2147483648.0).contains(&current))
             } else {
-                o.dead
+                // DA2 0x51a670..0x51a69d: discard the dead before assigning
+                // candidate indexes, including the unselectable index zero.
+                if o.dead {
+                    return None;
+                }
+                false
             };
             Some((c, o.position, excluded))
         })
@@ -14525,6 +14531,17 @@ mod coverage_tests {
         let (got_area, p) = center(&mut s, vec![x2, a2, b2, c2], 1, 3, 0);
         assert_eq!(got_area, area);
         assert!((p[0] - 309.5 / 3.0).abs() < 1e-4 && (p[1] - 1.0).abs() < 1e-4);
+
+        // DA2 removes a corpse before indexing: the sole living hostile is
+        // then index zero and cannot win. A living first-candidate control can.
+        s.game = thedas_vfs::Game::DragonAge2;
+        s.world.get_mut(lone).unwrap().dead = true;
+        assert_eq!(center(&mut s, vec![lone, a], 1, 1, 0).0, OBJECT_INVALID);
+        s.world.get_mut(lone).unwrap().dead = false;
+        assert_eq!(
+            center(&mut s, vec![lone, a], 1, 1, 0),
+            (area, [20.0, 0.0, 0.0])
+        );
 
         for game in [thedas_vfs::Game::Origins, thedas_vfs::Game::DragonAge2] {
             s.game = game;
