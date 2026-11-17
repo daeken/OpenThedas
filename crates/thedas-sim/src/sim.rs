@@ -115,6 +115,9 @@ pub struct Sim {
     /// The player's "show tutorials" option: off, no tutorial popup is queued. On, as the
     /// game's options start.
     pub show_tutorials: bool,
+    /// Origins ShowGore client option. The native getter masks the stored amount
+    /// when disabled (0x748520 -> 0x838210). Kept with the client, outside saves.
+    pub show_gore: bool,
     /// The training modes done (bit `mode - 1`), which do not start again (see
     /// [`crate::training`]). The player's, not the game's: not saved.
     pub training_done: u32,
@@ -675,6 +678,7 @@ impl Sim {
             item_usable: Default::default(),
             auto_pause_combat: false,
             show_tutorials: true,
+            show_gore: true,
             training_done: 0,
             watch_calls: Default::default(),
             following: Default::default(),
@@ -6024,22 +6028,29 @@ mod tests {
     }
 
     #[test]
-    fn da2_add_command_keeps_its_existing_front_insertion() {
+    fn da2_add_command_inserts_in_the_waiting_list_after_the_active_executor() {
         let mut s = add_command_sim();
         s.game = thedas_vfs::Game::DragonAge2;
         let who = s.world.spawn(ObjectKind::Creature, "actor");
         let active = Command {
+            ty: 13,
             name: "CommandWait".into(),
             due: Some(2000),
             ..Default::default()
         };
         s.world.get_mut(who).unwrap().commands.push(active.clone());
         let incoming = Command {
-            name: "CommandTurn".into(),
+            ty: 13,
+            name: "CommandWait".into(),
+            seconds: 1.,
+            is_static: true,
             ..Default::default()
         };
-        add_command(&mut s, who, incoming.clone(), 1, 1, 2);
-        assert_eq!(s.world.get(who).unwrap().commands, vec![incoming, active]);
+        // No clear: front selects the first waiting slot, leaving the executor
+        // active rather than pausing it behind the new request (0x5cd556).
+        add_command(&mut s, who, incoming.clone(), 1, 1, 0);
+        assert_eq!(s.world.get(who).unwrap().commands, vec![active, incoming]);
+        assert_eq!(s.next_command(), Some((2000, who)));
         assert!(s.world.queue.is_empty());
     }
 

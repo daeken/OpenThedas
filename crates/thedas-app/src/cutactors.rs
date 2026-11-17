@@ -167,17 +167,26 @@ impl CutsceneActors {
     /// What is playing now changed to `key` (none: nothing): what the last left running is
     /// kept, while the conversation stays open.
     fn switch(&mut self, key: Option<String>, open: bool) {
-        if self.source.as_ref().map(|(k, _)| k) != key.as_ref() {
-            for (id, anims) in self.ending.drain() {
-                self.kept.insert(id, anims);
-            }
-            self.source = key.map(|k| (k, self.clock_ms));
-        }
-        // An unstaged line can leave the source at None while the conversation
-        // stays open. Its retained layers still expire when the conversation closes.
+        // A reply without staging has already switched the source to None. Closing
+        // the conversation after that must still release its retained poses.
         if !open {
+            if !self.kept.is_empty() || !self.ending.is_empty() {
+                log::trace!(
+                    "conversation poses released: kept {:?}, ending {:?}",
+                    self.kept,
+                    self.ending
+                );
+            }
             self.kept.clear();
+            self.ending.clear();
         }
+        if self.source.as_ref().map(|(k, _)| k) == key.as_ref() {
+            return;
+        }
+        for (id, anims) in self.ending.drain() {
+            self.kept.insert(id, anims);
+        }
+        self.source = key.map(|k| (k, self.clock_ms));
     }
 
     /// What the playing cutscene (`tracks`, its tracks) or the shown conversation line's own
@@ -479,53 +488,106 @@ fn own_creatures(sim: &Sim, tracks: &Tracks, bound: &[Bound]) -> Vec<(usize, Obj
 mod tests {
     use super::*;
 
-    fn animation() -> CutAnimation {
+    fn turn() -> CutAnimation {
         CutAnimation {
-            tree: "conversation.dlb".into(),
-            node: "standing".into(),
-            time: 1.0,
+            tree: "bdc140_everd.dlb".into(),
+            node: "mh.dg_tn_90_l__0".into(),
+            time: 1.15,
             unbounded: false,
         }
     }
 
     #[test]
-    fn closing_an_unstaged_conversation_releases_both_creatures() {
-        let sim = Sim::new(
-            Arc::new(thedas_vfs::Vfs::new()),
-            Arc::new(thedas_script::EngineTable::default()),
-            1,
-        );
+    fn closing_after_an_unstaged_reply_releases_the_everd_turn_pose() {
         let mut actors = CutsceneActors::default();
-        actors.switch(Some("line:conversation:1".into()), true);
-        for id in [118, 313] {
-            actors.ending.insert(id, vec![animation()]);
-        }
-        // A line without staging leaves the previous layers playing while the
-        // conversation remains open. Its presentation source is already None.
+        actors.switch(Some("line:bdc140_everd:0".into()), true);
+        actors.ending.insert(118, vec![turn()]);
+        actors.advance(1200.0);
+        // The reply has no staging: retain the pose while choosing a response.
         actors.switch(None, true);
+        assert_eq!(actors.kept.get(&118), Some(&vec![turn()]));
         actors.switch(None, true);
-        assert_eq!(actors.kept.len(), 2);
-        // Closing the conversation keeps that source key and releases each
-        // creature to ordinary floor presentation.
-        let shown = actors.shown(&sim, None, &|_| None);
-        assert!(shown.kept.is_empty());
+        assert!(actors.kept.contains_key(&118));
+        // Exploration also has no source. It must not keep the conversation's pose
+        // over the hero's movement, including after rebuilding equipment models.
+        actors.switch(None, false);
+        assert!(actors.kept.is_empty());
         assert!(actors.ending.is_empty());
     }
 
     #[test]
-    fn repeated_open_lines_keep_their_clock_and_retained_layers() {
+    fn closing_directly_discards_pending_poses_before_the_next_conversation() {
         let mut actors = CutsceneActors::default();
-        actors.kept.insert(1, vec![animation()]);
-        let key = Some("line:conversation:1".to_string());
-        actors.switch(key.clone(), true);
-        actors.advance(500.0);
-        actors.ending.insert(2, vec![animation()]);
-        actors.switch(key, true);
-        assert_eq!(actors.source.as_ref().unwrap().1, 0.0);
-        assert_eq!(actors.kept[&1], vec![animation()]);
-        assert!(!actors.kept.contains_key(&2));
+        actors.switch(Some("line:duncan:0".into()), true);
+        actors.ending.insert(468, vec![turn()]);
         actors.switch(None, false);
         assert!(actors.kept.is_empty());
         assert!(actors.ending.is_empty());
+        actors.switch(Some("line:next:0".into()), true);
+        assert!(actors.kept.is_empty());
+    }
+
+    #[test]
+    #[ignore = "requires THEDAS_INSTALL and THEDAS_ARMOR_REPORT (copied #1101 report directory)"]
+    fn report_armor_and_duncan_bind_to_working_locomotion_clips() {
+        use thedas_render::{
+            animate::{Animator, Clip},
+            skeleton::Skeleton,
+        };
+        let install = std::env::var_os("THEDAS_INSTALL").unwrap();
+        let report = std::path::PathBuf::from(std::env::var_os("THEDAS_ARMOR_REPORT").unwrap());
+        // Both sides of the recorded equipment change, then a fresh reload already worn.
+        for save in ["save_before.json", "save_now.json", "save_now.json"] {
+            let live = crate::live::Live::open(
+                std::path::Path::new(&install),
+                "single player",
+                crate::live::Start::Save(&report.join(save)),
+                "original",
+            )
+            .unwrap();
+            let sim = live.sim();
+            for id in [sim.world.hero.unwrap(), 838] {
+                let o = sim.world.get(id).unwrap();
+                let models = thedas_ui::models::object_models(&sim, o);
+                let trees = thedas_ui::models::movement_trees(&sim, o);
+                println!(
+                    "{save}: {} row {} equipment {:?} style {:?} movement {:?} models {:?}",
+                    o.tag,
+                    o.appearance,
+                    o.equipment,
+                    thedas_ui::models::weapon_style(&sim, o),
+                    trees,
+                    models.models
+                );
+                let mut animator = Animator::default();
+                for action in ["walkf", "runf"] {
+                    let clip = Clip {
+                        trees: trees.clone(),
+                        actions: vec![action.into()],
+                        ..Default::default()
+                    };
+                    let (resource, animation) =
+                        animator.animation_resource(&sim.vfs, &clip).unwrap();
+                    // The first model is the torso. Test the actual rebuilt armor's
+                    // skeleton, rather than assuming the human clips map to it.
+                    let model = &models.models[0];
+                    let (bytes, _) = sim.vfs.read(&format!("{model}.mmh")).unwrap();
+                    let mmh = thedas_formats::model::Mmh::parse(&bytes).unwrap();
+                    let skeleton = Skeleton::from_mmh(&mmh);
+                    let matched = skeleton.track_nodes(&animation).iter().flatten().count();
+                    println!(
+                        "  {action} -> {resource}; {model}: {} bones, {matched}/{} tracks matched",
+                        skeleton.bones.len(),
+                        animation.tracks.len()
+                    );
+                    assert!(matched > 20);
+                    assert_ne!(
+                        skeleton.pose(&animation, 0.1),
+                        skeleton.pose(&animation, 0.5),
+                        "{model} must have an advancing {action} pose"
+                    );
+                }
+            }
+        }
     }
 }

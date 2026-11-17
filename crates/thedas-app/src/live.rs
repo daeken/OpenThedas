@@ -261,6 +261,7 @@ pub struct Live {
     /// Each drawn object's id, placement and motion at the last sync (in the objects' scene
     /// order).
     posed: Vec<(ObjectId, Mat4, Option<Clip>)>,
+    animation_trace: report_snapshot::AnimationTrace,
     /// Mod mode's scrubber: a creature drawn with its own animation held at this time, in
     /// seconds (its layers shifted with it). Drawing only; the simulation is not touched.
     scrub: Option<(ObjectId, f32)>,
@@ -750,6 +751,7 @@ impl Live {
             creature_shapes: Default::default(),
             aiming: None,
             posed: Vec::new(),
+            animation_trace: Default::default(),
             scrub: None,
             frozen: None,
             models: ModelCache::default(),
@@ -835,16 +837,16 @@ impl Live {
     }
 
     /// Advances the simulation by `dt_ms` of real time (at most [`MAX_STEP_MS`]), unless
-    /// paused.
-    pub fn step(&mut self, dt_ms: f64) {
+    /// paused. Returns the number of simulation Tick commands consumed (zero or one).
+    pub fn step(&mut self, dt_ms: f64) -> usize {
         if self.front_end || self.loading() {
-            return;
+            return 0;
         }
         // What the player and the interface gave since the last step goes to the journal
         // first, in the order given.
         self.keep_journal();
         if self.paused {
-            return;
+            return 0;
         }
         // A training tutorial holds the game's time until its mode ends, but its script
         // still runs: the exe runs `genev_tutorial` for each training event while the game
@@ -857,11 +859,11 @@ impl Live {
                 thedas_sim::commands::CommandSource::App,
                 thedas_sim::commands::SimCommand::Tick { ms: 0 },
             );
-            return;
+            return 1;
         }
         // A tutorial that pauses the game holds it until its popup is dismissed.
         if self.sim().tutorial_paused() {
-            return;
+            return 0;
         }
         self.owed_ms += dt_ms.clamp(0.0, MAX_STEP_MS);
         let whole = self.owed_ms.floor();
@@ -881,7 +883,9 @@ impl Live {
                     started.elapsed().as_secs_f64() * 1000.0
                 );
             }
+            return 1;
         }
+        0
     }
 
     /// Whether a new level is being built (see [`Live::async_loads`]): the world does not
@@ -1961,6 +1965,18 @@ impl Live {
                 strref: l.strref,
                 female: l.female,
             });
+        let gore: Vec<Option<f32>> = models
+            .iter()
+            .map(|m| {
+                sim.world
+                    .get(m.id)
+                    .filter(|o| {
+                        sim.game == thedas_vfs::Game::Origins
+                            && o.kind == thedas_sim::world::ObjectKind::Creature
+                    })
+                    .map(|o| if sim.show_gore { o.gore_level } else { 0.0 })
+            })
+            .collect();
         let glancers: Vec<ObjectId> = match (exploring, hero, self.looks.glance_reach()) {
             (true, Some(hero), Some(_)) => models
                 .iter()
@@ -2194,14 +2210,47 @@ impl Live {
             &posed,
             0.0,
         );
+        if log::log_enabled!(target: "thedas_app::animation", log::Level::Trace) {
+            self.animation_trace.record(
+                &shared.lock().unwrap_or_else(|p| p.into_inner()),
+                &models,
+                &posed,
+                &self.animator,
+                &objects.renderer,
+                &objects.scene,
+            );
+        }
         objects.follow_poses();
         for (i, m) in models.iter().enumerate() {
+            if m.kind == thedas_sim::world::ObjectKind::Creature
+                && log::log_enabled!(target: "thedas_app::animation", log::Level::Trace)
+                && let Some(c) = &posed[i].1
+            {
+                let clips: Vec<_> = std::iter::once(c)
+                    .chain(&c.layers)
+                    .map(|c| {
+                        (
+                            &c.trees,
+                            &c.actions,
+                            c.time,
+                            c.weight,
+                            self.animator
+                                .cached_animation_resource(c)
+                                .map(|(name, _)| name),
+                        )
+                    })
+                    .collect();
+                log::trace!(target: "thedas_app::animation", "posed {} {}: {:?}", m.id, m.tag, clips);
+            }
             let o = if hidden.contains(&m.id) {
                 0.0
             } else {
                 self.opacity.get(&m.id).copied().unwrap_or(1.0)
             };
             objects.renderer.set_prop_opacity(ctx, &objects.scene, i, o);
+            if let Some(amount) = gore.get(i).copied().flatten() {
+                objects.renderer.set_prop_gore(&objects.scene, i, amount);
+            }
         }
         // A cutscene's lights join the level's, for the level and for the objects, and so
         // do the lights of the visual effects (as they stood last frame).
@@ -2674,6 +2723,13 @@ impl Live {
                 });
             }
         }
+        log::trace!(
+            target: "thedas_app::talkcam",
+            "conversation/cutscene frame effects: time_ms={}, dof={:?}, fades={:?}",
+            sim.world.time_ms,
+            out.depth_of_field,
+            out.fades
+        );
         out
     }
 
@@ -2845,6 +2901,26 @@ impl Live {
         let mut placeable_draws = Vec::new();
         let mut moving = std::collections::HashMap::new();
         for (i, (m, p)) in models.iter().zip(&scene.props).enumerate() {
+            if m.kind == thedas_sim::world::ObjectKind::Creature
+                && log::log_enabled!(log::Level::Trace)
+            {
+                let sim = self.sim();
+                let appearance = sim.world.get(m.id).map(|o| o.appearance);
+                let skeletons: Vec<_> = scene
+                    .prop_skeletons(i)
+                    .into_iter()
+                    .map(|s| (s, &scene.skeleton_models[s], scene.skeletons[s].bones.len()))
+                    .collect();
+                log::trace!(
+                    "animation binding {} {}: apr_base row {:?}, models {:?}, skeletons {:?}, motion {:?}",
+                    m.id,
+                    m.tag,
+                    appearance,
+                    m.models,
+                    skeletons,
+                    m.motion
+                );
+            }
             let (interactive, placeable) = {
                 let sim = self.sim();
                 let placeable = sim

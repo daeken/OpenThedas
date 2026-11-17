@@ -601,7 +601,6 @@ const PRESENTATION: &[&str] = &[
     "PlayMusic",
     "SetMusicIntensity",
     "SendToRunDatabase",
-    "SetCreatureGoreLevel",
     // Only the indicator on the quickbar; the modal effect itself is the scripts'.
     "Engine_SetModalAbilityGUI",
     // An icon over a creature's head (DAOrigins.exe 0x662db0): interface only.
@@ -3358,6 +3357,16 @@ pub fn call(
                 return ok(Value::Int(0));
             };
             let target = obj(a, 0);
+            if h.sim.game == thedas_vfs::Game::DragonAge2 {
+                let admitted = h.sim.da2_add_command(
+                    target,
+                    c,
+                    int(a, 2),
+                    int(a, 3) != 0,
+                    a.get(4).map_or(-1, |_| int(a, 4)),
+                );
+                return ok(Value::Int(i32::from(admitted)));
+            }
             let origins = h.sim.game == thedas_vfs::Game::Origins;
             let front = if origins {
                 int(a, 2) == 1
@@ -3435,30 +3444,12 @@ pub fn call(
                     }
                 }
             }
-            if front
-                && h.sim.game == thedas_vfs::Game::DragonAge2
-                && h.sim.world.get(target).is_some_and(|o| {
-                    o.commands
-                        .first()
-                        .is_some_and(|c| c.cancellable && c.name == "CommandUseAbility")
-                })
-            {
-                h.sim.finish_chained_ability(target);
-            }
             h.sim.world.trace.push(TraceEntry::Command {
                 t,
                 object: target,
                 command: c.name.clone(),
                 status: "queued".into(),
             });
-            if front
-                && h.sim
-                    .world
-                    .get(target)
-                    .is_some_and(|o| o.commands.first().is_some_and(|c| c.from.is_some()))
-            {
-                h.sim.da2_stop_locomotion(target);
-            }
             match h.sim.world.get_mut(target) {
                 Some(o) => {
                     if front {
@@ -4669,7 +4660,43 @@ pub fn call(
         // area ahead of the scripts' CreateObject calls, and returns TRUE: a loading
         // optimisation the simulation does without (it creates objects when asked).
         "CreatePool" => ok(Value::Int(1)),
-        "GetCreatureGoreLevel" => ok(Value::Float(0.0)),
+        // Origins keeps gore on the creature appearance. Scripts own accumulation,
+        // healing and resets. DA2's native appearance path remains untraced.
+        "GetCreatureGoreLevel" => ok(Value::Float(
+            if h.sim.game == thedas_vfs::Game::Origins && h.sim.show_gore {
+                h.object(obj(a, 0))
+                    .filter(|o| o.kind == ObjectKind::Creature)
+                    .map_or(0.0, |o| o.gore_level)
+            } else {
+                0.0
+            },
+        )),
+        "SetCreatureGoreLevel" => {
+            if h.sim.game == thedas_vfs::Game::Origins {
+                // 0x747c40 clamps before writing every body/equipment slot.
+                let value = float(a, 1);
+                if let Some(o) = h
+                    .sim
+                    .world
+                    .get_mut(obj(a, 0))
+                    .filter(|o| o.kind == ObjectKind::Creature)
+                {
+                    o.gore_level = if value.is_finite() {
+                        value.clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    };
+                }
+            } else {
+                *h.sim
+                    .world
+                    .trace
+                    .presentation
+                    .entry(name.to_string())
+                    .or_default() += 1;
+            }
+            void()
+        }
         "GetCreaturePropertyType" => {
             ok(Value::Int(if h.sim.game == thedas_vfs::Game::DragonAge2 {
                 property_bounds(h.sim, int(a, 1)).map_or(0, |b| b.0)
@@ -5924,6 +5951,17 @@ pub fn call(
             ev.strings = vec![script.clone()];
             let delay = h.sim.world.rng.below(150).max(0) as u64 + int(a, 4).max(0) as u64;
             h.sim.world.queue_event(delay, caller, ev, Some(script));
+            void()
+        }
+        // DA2 0x4ebfd0 pushes the desktop platform constant, independent of
+        // the replacement engine's host OS.
+        "GetPlatform" if h.sim.game == thedas_vfs::Game::DragonAge2 => ok(Value::Int(1)),
+        // DA2 0x4f08f0 stops a model's additive channel; 0x4ecfc0 invokes a
+        // player-screen hit effect. Neither returns a script value or changes
+        // combat state. Their presentation systems are not simulated here.
+        "StopAdditiveAnimation" | "DoPlayerHitEffect"
+            if h.sim.game == thedas_vfs::Game::DragonAge2 =>
+        {
             void()
         }
         // Presentation only.
@@ -12626,6 +12664,77 @@ mod tests {
     }
 
     #[test]
+    fn origins_gore_is_saved_clamped_and_masked_by_the_client_option() {
+        let table = Arc::new(
+            EngineTable::parse(
+                br#"
+            float GetCreatureGoreLevel(object o) = 719;
+            void SetCreatureGoreLevel(object o, float f) = 720;
+        "#,
+            )
+            .unwrap(),
+        );
+        let mut sim = Sim::new(Arc::new(Vfs::new()), table, 1);
+        let creature = sim.world.spawn(ObjectKind::Creature, "creature");
+        let item = sim.world.spawn(ObjectKind::Item, "item");
+        let who = [Value::Object(creature)];
+        assert_eq!(
+            run(&mut sim, creature, "GetCreatureGoreLevel", &who),
+            Some(Value::Float(0.0))
+        );
+        for (value, expected) in [(-1.0, 0.0), (2.0, 1.0), (0.42, 0.42)] {
+            run(
+                &mut sim,
+                creature,
+                "SetCreatureGoreLevel",
+                &[Value::Object(creature), Value::Float(value)],
+            );
+            assert_eq!(
+                run(&mut sim, creature, "GetCreatureGoreLevel", &who),
+                Some(Value::Float(expected))
+            );
+        }
+        for id in [item, OBJECT_INVALID] {
+            run(
+                &mut sim,
+                creature,
+                "SetCreatureGoreLevel",
+                &[Value::Object(id), Value::Float(1.0)],
+            );
+            assert_eq!(
+                run(
+                    &mut sim,
+                    creature,
+                    "GetCreatureGoreLevel",
+                    &[Value::Object(id)]
+                ),
+                Some(Value::Float(0.0))
+            );
+        }
+        sim.client_option_message(
+            crate::chargen::MSG_CLIENT_OPTION,
+            &["GameOptions.ShowGore".into(), "0".into()],
+        );
+        assert_eq!(
+            run(&mut sim, creature, "GetCreatureGoreLevel", &who),
+            Some(Value::Float(0.0))
+        );
+        assert_eq!(sim.world.get(creature).unwrap().gore_level, 0.42);
+        sim.client_option_message("ClientOptions.RestoreDefaults", &[]);
+        assert_eq!(
+            run(&mut sim, creature, "GetCreatureGoreLevel", &who),
+            Some(Value::Float(0.42))
+        );
+        let object = sim.world.get(creature).unwrap();
+        let mut saved = serde_json::to_value(object).unwrap();
+        let restored: crate::world::Object = serde_json::from_value(saved.clone()).unwrap();
+        assert_eq!(restored.gore_level, 0.42);
+        saved.as_object_mut().unwrap().remove("gore_level");
+        let old: crate::world::Object = serde_json::from_value(saved).unwrap();
+        assert_eq!(old.gore_level, 0.0);
+    }
+
+    #[test]
     fn dispatch_cleanup_preserves_hero_defaults_and_presentation_routing() {
         let table = Arc::new(
             EngineTable::parse(
@@ -12704,14 +12813,24 @@ mod tests {
                     &mut s,
                     hero,
                     "SetCreatureGoreLevel",
-                    &[Value::Object(hero), Value::Float(1.0)]
+                    &[Value::Object(hero), Value::Float(1.0)],
                 ),
                 None
             );
-            assert_eq!(
-                s.world.trace.presentation.get("SetCreatureGoreLevel"),
-                Some(&1)
-            );
+            if game == thedas_vfs::Game::Origins {
+                assert_eq!(s.world.get(hero).unwrap().gore_level, 1.0);
+                assert!(
+                    !s.world
+                        .trace
+                        .presentation
+                        .contains_key("SetCreatureGoreLevel")
+                );
+            } else {
+                assert_eq!(
+                    s.world.trace.presentation.get("SetCreatureGoreLevel"),
+                    Some(&1)
+                );
+            }
             assert!(
                 s.world.trace.entries.is_empty(),
                 "the later log arm is unreachable"
@@ -15363,5 +15482,40 @@ mod coverage_tests {
                     .contains_key("IsDestroyable")
             );
         }
+    }
+    #[test]
+    fn da2_desktop_platform_and_presentation_stubs_leave_simulation_unchanged() {
+        let table = Arc::new(EngineTable::parse(
+            b"int GetPlatform() = 694;\nvoid StopAdditiveAnimation(object o, int n) = 932;\nvoid DoPlayerHitEffect(int n, int step) = 936;\n"
+        ).unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        s.game = thedas_vfs::Game::DragonAge2;
+        let who = s.world.spawn(ObjectKind::Creature, "actor");
+        let before = s.save_json().unwrap();
+        assert_eq!(run(&mut s, who, "GetPlatform", &[]), Some(Value::Int(1)));
+        for target in [who, OBJECT_INVALID] {
+            assert_eq!(
+                run(
+                    &mut s,
+                    who,
+                    "StopAdditiveAnimation",
+                    &[Value::Object(target), Value::Int(3)]
+                ),
+                None
+            );
+        }
+        for effect in [-1, 0, 1, 5] {
+            assert_eq!(
+                run(
+                    &mut s,
+                    who,
+                    "DoPlayerHitEffect",
+                    &[Value::Int(effect), Value::Int(2)]
+                ),
+                None
+            );
+        }
+        assert_eq!(s.save_json().unwrap(), before);
+        assert!(s.world.trace.unimplemented.is_empty());
     }
 }
