@@ -58,22 +58,23 @@ static analysis. The cut update and the dialog graph have separate state.
   counts active voices. OpenThedas's `cut_lines_left` counts extra graph
   entries inferred from textless references, a different quantity.
 - The dialog skip callback at 0x68dc10 checks its guard and current cut state
-  before calling 0x7cf2e0 at 0x68dca8. If a skip point after the current
-  time exists, 0x7cf2e0 stores it at cut +0x1b0 and returns success. The cut
-  update seeks there and resets actor tracks and +0xe8 at
-  0x7e430c–0x7e4380. If there is no point, the callback sets cut +0x1b4
-  at 0x68dcce, prepares pending replies if needed, and can take an empty
-  first reply at 0x68dd89. The normal update also takes a lone empty response
-  through 0x68ded1–0x68df57 once the cut completes. Both transitions call
-  0x68d8f0, which advances the selected reply via 0x7f1910 at 0x68dbca.
-  This graph path reaches node 18 from reply 97.
+  before calling 0x7cf2e0 at 0x68dca8. The track factory maps kind 47 to
+  `ActionSkipMarker` (constructor 0x7dcc60, vtable 0xb2355c). Its constructor
+  inserts the track's time into cut +0x190. If a marker after the current time
+  exists, 0x7cf2e0 stores it at +0x1b0 and the cut update seeks there, resetting
+  actor tracks and +0xe8 at 0x7e430c–0x7e4380. This CUTR has zero kind-47 tracks.
+  The no-marker branch sets cut +0x1b4 at 0x68dcce, prepares pending replies
+  if needed, and takes the empty reply at 0x68dd89. The normal update also
+  takes a lone empty response through 0x68ded1–0x68df57 once the cut completes.
+  Both transitions call 0x68d8f0, which advances reply 97 to node 18 via
+  0x7f1910 at 0x68dbca.
 - The voiced/entered latches are local to the ASLN instance. The graph has
   separate show-once state written by 0x7f1640 (node history) and 0x7f1700
   (global TLK history). Both read field 12206, which is zero on nodes 17 and
   18. The traced paths allow node 18 to install its own ASLN instance after
-  the external cut. The exact skip-point population and whether the original
-  audio system suppresses a new voice there remain unverified. The skip and
-  completion policy below is the OpenThedas behavior chosen for #1111.
+  the external cut. Whether the original audio system suppresses a new
+  voice there remains unverified. The skip and completion policy below is
+  the OpenThedas behavior chosen for #1111.
 
 ## OpenThedas behavior
 
