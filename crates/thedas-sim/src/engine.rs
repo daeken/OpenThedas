@@ -16158,10 +16158,7 @@ mod coverage_tests {
                 ..Default::default()
             };
             s.world.get_mut(who).unwrap().commands = vec![waiting.clone()];
-            assert_eq!(
-                current(&mut s, who),
-                (game == thedas_vfs::Game::Origins).then_some(waiting.clone())
-            );
+            assert_eq!(current(&mut s, who), None);
             let active = Command {
                 due: Some(1000),
                 cancellable: true,
@@ -16172,10 +16169,7 @@ mod coverage_tests {
             s.world = serde_json::from_str(&serde_json::to_string(&s.world).unwrap()).unwrap();
             assert_eq!(current(&mut s, who), Some(active.clone()));
             s.world.get_mut(who).unwrap().commands = vec![waiting.clone(), active];
-            assert_eq!(
-                current(&mut s, who),
-                (game == thedas_vfs::Game::Origins).then_some(waiting)
-            );
+            assert_eq!(current(&mut s, who), None);
         }
     }
 }
