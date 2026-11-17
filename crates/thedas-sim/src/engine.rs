@@ -3358,6 +3358,16 @@ pub fn call(
                 return ok(Value::Int(0));
             };
             let target = obj(a, 0);
+            if h.sim.game == thedas_vfs::Game::DragonAge2 {
+                let admitted = h.sim.da2_add_command(
+                    target,
+                    c,
+                    int(a, 2),
+                    int(a, 3) != 0,
+                    a.get(4).map_or(-1, |_| int(a, 4)),
+                );
+                return ok(Value::Int(i32::from(admitted)));
+            }
             let origins = h.sim.game == thedas_vfs::Game::Origins;
             let front = if origins {
                 int(a, 2) == 1
@@ -3435,30 +3445,12 @@ pub fn call(
                     }
                 }
             }
-            if front
-                && h.sim.game == thedas_vfs::Game::DragonAge2
-                && h.sim.world.get(target).is_some_and(|o| {
-                    o.commands
-                        .first()
-                        .is_some_and(|c| c.cancellable && c.name == "CommandUseAbility")
-                })
-            {
-                h.sim.finish_chained_ability(target);
-            }
             h.sim.world.trace.push(TraceEntry::Command {
                 t,
                 object: target,
                 command: c.name.clone(),
                 status: "queued".into(),
             });
-            if front
-                && h.sim
-                    .world
-                    .get(target)
-                    .is_some_and(|o| o.commands.first().is_some_and(|c| c.from.is_some()))
-            {
-                h.sim.da2_stop_locomotion(target);
-            }
             match h.sim.world.get_mut(target) {
                 Some(o) => {
                     if front {
@@ -5924,6 +5916,17 @@ pub fn call(
             ev.strings = vec![script.clone()];
             let delay = h.sim.world.rng.below(150).max(0) as u64 + int(a, 4).max(0) as u64;
             h.sim.world.queue_event(delay, caller, ev, Some(script));
+            void()
+        }
+        // DA2 0x4ebfd0 pushes the desktop platform constant, independent of
+        // the replacement engine's host OS.
+        "GetPlatform" if h.sim.game == thedas_vfs::Game::DragonAge2 => ok(Value::Int(1)),
+        // DA2 0x4f08f0 stops a model's additive channel; 0x4ecfc0 invokes a
+        // player-screen hit effect. Neither returns a script value or changes
+        // combat state. Their presentation systems are not simulated here.
+        "StopAdditiveAnimation" | "DoPlayerHitEffect"
+            if h.sim.game == thedas_vfs::Game::DragonAge2 =>
+        {
             void()
         }
         // Presentation only.
@@ -15363,5 +15366,40 @@ mod coverage_tests {
                     .contains_key("IsDestroyable")
             );
         }
+    }
+    #[test]
+    fn da2_desktop_platform_and_presentation_stubs_leave_simulation_unchanged() {
+        let table = Arc::new(EngineTable::parse(
+            b"int GetPlatform() = 694;\nvoid StopAdditiveAnimation(object o, int n) = 932;\nvoid DoPlayerHitEffect(int n, int step) = 936;\n"
+        ).unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        s.game = thedas_vfs::Game::DragonAge2;
+        let who = s.world.spawn(ObjectKind::Creature, "actor");
+        let before = s.save_json().unwrap();
+        assert_eq!(run(&mut s, who, "GetPlatform", &[]), Some(Value::Int(1)));
+        for target in [who, OBJECT_INVALID] {
+            assert_eq!(
+                run(
+                    &mut s,
+                    who,
+                    "StopAdditiveAnimation",
+                    &[Value::Object(target), Value::Int(3)]
+                ),
+                None
+            );
+        }
+        for effect in [-1, 0, 1, 5] {
+            assert_eq!(
+                run(
+                    &mut s,
+                    who,
+                    "DoPlayerHitEffect",
+                    &[Value::Int(effect), Value::Int(2)]
+                ),
+                None
+            );
+        }
+        assert_eq!(s.save_json().unwrap(), before);
+        assert!(s.world.trace.unimplemented.is_empty());
     }
 }
