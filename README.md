@@ -8,6 +8,12 @@ parity.
 You need your own copy of the game. Nothing from the original game is, or will ever be, in this
 repository.
 
+## North star
+
+Provide a facility for faithfully playing the Dragon Age games on modern platforms with your own
+game data, while giving modders the tools they need to do their amazing work. Anything under that
+umbrella is in scope; anything outside it isn't.
+
 ## Getting it
 
 - **Test builds** (Windows x64, Windows on ARM, macOS on Apple silicon) are shared with the test
