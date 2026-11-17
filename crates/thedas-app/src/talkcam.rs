@@ -131,6 +131,11 @@ impl TalkCamera {
         let now = self.clock_ms;
         let staging = self.staging(sim, base).cloned();
         if let Some(view) = self.line_cut_camera(sim, &line, now, base, roots) {
+            log::trace!(
+                "conversation camera {} line {:?}: source=line cutscene, camera={view:?}",
+                line.0.0,
+                line.1
+            );
             return Some(view);
         }
         let held_here = self.held.as_ref().is_some_and(|(held, _)| *held == line);
@@ -264,6 +269,22 @@ impl TalkCamera {
             self.stage(sim, &f)
         });
         let view = line_cut_view(&tracks, t, placement, stage.as_deref(), bound, roots, base);
+        if log::log_enabled!(log::Level::Trace) {
+            let active = tracks.cuts.iter().rev().find(|(start, _)| *start <= t);
+            let source = active.and_then(|(_, id)| {
+                let actor = tracks.actors.iter().find(|a| a.id == *id)?;
+                let jump = actor
+                    .camera_jumps
+                    .iter()
+                    .rev()
+                    .find(|j| (j.start..=j.end).contains(&t));
+                Some((&actor.name, jump))
+            });
+            log::trace!(
+                "conversation camera {dlg} line {at}: t={t:.4}s, stage={:?}, placement={placement:?}, active={active:?}, source={source:?}",
+                tracks.stage_file,
+            );
+        }
         if view.is_none() {
             log::debug!(
                 "line {at} of {dlg}: its cutscene gives no camera {t:.2}s in (stage {:?})",
