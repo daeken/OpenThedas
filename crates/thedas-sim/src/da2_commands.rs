@@ -25,6 +25,26 @@ fn same_payload(a: &Command, b: &Command) -> bool {
         && (a.name != "CommandMoveToMultiLocations" || a.path == b.path)
 }
 
+/// Native task protection is independent of static state and readiness.
+/// Movement tasks release it after setup; wait task 36 does likewise.
+fn task_protected(c: &Command) -> bool {
+    c.from.is_none()
+        // Placeholder selection precedes task construction.
+        && !(c.name == "CommandUseAbility" && c.ints.first() == Some(&1))
+        && matches!(
+            c.name.as_str(),
+            "CommandUseAbility"
+                | "CommandAttack"
+                | "CommandPlayAnimation"
+                | "CommandStartConversation"
+                | "CommandUseObject"
+                | "CommandJumpToObject"
+                | "CommandJumpToLocation"
+                | "CommandTurn"
+                | "CommandSwitchWeaponSet"
+        )
+}
+
 fn fresh(c: &mut Command) {
     c.due = None;
     c.from = None;
@@ -135,9 +155,9 @@ impl Sim {
                 .first()
                 .is_some_and(|old| {
                     old.due.is_some() && !equal && (!old.is_static || behavior == 2)
-                    // Task 37 is enqueued protected (0x6d861e..0x6d8629).
-                    // Ready handoff succeeds through the dispatcher instead.
-                    && (old.name != "CommandUseAbility" || old.from.is_some() || old.ints.first() == Some(&1))
+                    // 0x5c6274: soft and hard clears respect the running task.
+                    // Successful ready handoff uses a separate override.
+                    && !task_protected(old)
                 });
             if clear {
                 let old = self.world.get_mut(who).unwrap().commands.remove(0);
@@ -610,5 +630,106 @@ mod tests {
                 .unwrap()
                 .da2_player_issued
         );
+    }
+    #[test]
+    fn traced_running_tasks_survive_admission_and_waiting_copies_do_not() {
+        for (ty, name) in [
+            (1, "CommandAttack"),
+            (14, "CommandPlayAnimation"),
+            (18, "CommandStartConversation"),
+            (31, "CommandUseObject"),
+            (9, "CommandJumpToObject"),
+            (10, "CommandJumpToLocation"),
+            (41, "CommandTurn"),
+            (40, "CommandSwitchWeaponSet"),
+        ] {
+            for behavior in [1, 2] {
+                let (mut s, who) = sim();
+                let current = Command {
+                    ty,
+                    name: name.into(),
+                    due: Some(100),
+                    cancellable: true,
+                    ..Default::default()
+                };
+                let waiting_copy = Command {
+                    due: None,
+                    ..current.clone()
+                };
+                s.world.get_mut(who).unwrap().commands = vec![current.clone(), waiting_copy];
+                let incoming = wait(20.);
+                assert!(add(&mut s, who, incoming.clone(), 1, false, behavior));
+                assert_eq!(
+                    s.world.get(who).unwrap().commands,
+                    vec![current.clone(), incoming]
+                );
+                assert!(s.world.queue.is_empty());
+                let saved = s.save_json().unwrap();
+                s.load_json(&saved).unwrap();
+                assert!(add(&mut s, who, wait(30.), 1, false, behavior));
+                assert_eq!(s.world.get(who).unwrap().commands, vec![current, wait(30.)]);
+            }
+        }
+    }
+
+    #[test]
+    fn selection_without_a_task_waits_and_locomotion_are_unprotected() {
+        for behavior in [1, 2] {
+            for mut current in [
+                Command {
+                    due: Some(1000),
+                    ..wait(1.)
+                },
+                Command {
+                    name: "CommandMoveToLocation".into(),
+                    ty: 20,
+                    due: Some(1000),
+                    from: Some(([0.; 3], 0)),
+                    ..Default::default()
+                },
+                Command {
+                    name: "CommandUseAbility".into(),
+                    ty: 25,
+                    due: Some(1000),
+                    from: Some(([0.; 3], 0)),
+                    ..Default::default()
+                },
+                Command {
+                    name: "CommandUseAbility".into(),
+                    ty: 25,
+                    ints: vec![1],
+                    due: Some(1000),
+                    ..Default::default()
+                },
+            ] {
+                let (mut s, who) = sim();
+                current.is_static = false;
+                s.world.get_mut(who).unwrap().commands = vec![current.clone()];
+                assert!(add(&mut s, who, wait(20.), 1, false, behavior));
+                assert_eq!(s.world.get(who).unwrap().commands, vec![wait(20.)]);
+                assert_eq!(
+                    s.world.get(who).unwrap().combat.previous_command,
+                    Some(current)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn protected_animation_still_completes_at_its_endpoint() {
+        let (mut s, who) = sim();
+        s.world.get_mut(who).unwrap().commands = vec![Command {
+            name: "CommandPlayAnimation".into(),
+            ty: 14,
+            due: Some(100),
+            ..Default::default()
+        }];
+        assert!(add(&mut s, who, wait(20.), 1, false, 2));
+        assert_eq!(s.world.get(who).unwrap().commands.len(), 2);
+        s.tick(100);
+        let o = s.world.get(who).unwrap();
+        assert_eq!(o.commands.len(), 1);
+        assert_eq!(o.commands[0].name, "CommandWait");
+        assert_eq!(o.combat.previous_command.as_ref().unwrap().ty, 14);
     }
 }
