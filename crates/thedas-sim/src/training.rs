@@ -150,6 +150,18 @@ impl Sim {
         self.world.tutorial_paused && !self.tutorials_held()
     }
 
+    /// The player's unpause request. A popup's pause belongs to its Next/Close
+    /// action, as captured in Combat Basics; Space cannot dismiss that pause.
+    pub fn unpause(&mut self) -> bool {
+        if self.tutorial_paused() {
+            return false;
+        }
+        if self.training_paused() && !self.training_event("UNPAUSE", 0) {
+            return false;
+        }
+        true
+    }
+
     /// Why the game cannot be saved now, if it cannot: training mode disables saving
     /// (script.ldf, SetTrainingMode: "Unpausing, Saving, Item Destruction"), so no save
     /// holds a training step. The player's save screen and the MCP's save tool refuse;
@@ -190,7 +202,9 @@ mod tests {
     fn sim() -> Sim {
         let ldf = "int EVENT_TYPE_TRAINING_BEGIN = 1059;\n\
                    int EVENT_TYPE_TRAINING_GUI_INVENTORY_OPENED = 1063;\n\
-                   int EVENT_TYPE_TRAINING_MAXIMUM_ZOOM_IN = 1065;\n";
+                   int EVENT_TYPE_TRAINING_MAXIMUM_ZOOM_IN = 1065;\n\
+                   int EVENT_TYPE_TRAINING_UNPAUSE = 1069;\n\
+                   int EVENT_TYPE_TRAINING_MOVEMENT_COMMAND_ISSUED = 1073;\n";
         let table = thedas_script::EngineTable::parse(ldf.as_bytes()).unwrap_or_default();
         let mut s = Sim::new(Arc::new(thedas_vfs::Vfs::new()), Arc::new(table), 1);
         s.world.trace.keep = true;
@@ -219,6 +233,85 @@ mod tests {
             .collect();
         s.world.trace.entries.clear();
         out
+    }
+
+    #[test]
+    fn ordinary_tutorial_next_releases_pause_and_replays() {
+        use crate::commands::{CommandSource, SimCommand};
+        use crate::replay::{JournalWriter, replay};
+
+        let mut s = sim();
+        s.world.tutorials.push(crate::journal::Tutorial {
+            resref: "tut_combat_basic".into(),
+            title: Some(264859),
+            text: Some(264857),
+            pauses: true,
+        });
+        s.world.tutorial_paused = true;
+        let checkpoint = s.world.clone();
+        let mut journal = JournalWriter::start(&mut s, "test", Vec::new()).unwrap();
+        assert!(!s.input(CommandSource::Player, SimCommand::Unpause));
+        assert!(s.tutorial_paused());
+        assert_eq!(s.world.tutorials.len(), 1);
+        assert!(s.input(
+            CommandSource::Player,
+            SimCommand::ConsumeTutorial { all: false }
+        ));
+        journal.take(&mut s).unwrap();
+        assert!(!s.tutorial_paused());
+        assert!(s.world.tutorials.is_empty());
+        assert_eq!(s.world.time_ms, checkpoint.time_ms);
+
+        let mut again = sim();
+        again.world = checkpoint;
+        let log = journal.into_inner();
+        let report = replay(&mut again, &log[..], "test", false);
+        assert_eq!(
+            (report.applied, report.mismatch, report.refused),
+            (2, None, None)
+        );
+        assert!(!again.tutorial_paused());
+        assert!(again.world.tutorials.is_empty());
+    }
+
+    #[test]
+    fn unpause_cannot_bypass_the_movement_lesson() {
+        use crate::commands::{CommandSource, SimCommand};
+
+        let mut s = sim();
+        s.set_training_mode(2);
+        s.begin_training_step(2, 1073, 0);
+        delivered(&mut s);
+        assert!(!s.input(CommandSource::Player, SimCommand::Unpause));
+        assert!(s.training_paused());
+        assert_eq!(s.world.training.expected, 1073);
+        assert!(delivered(&mut s).is_empty());
+
+        assert!(s.training_event("MOVEMENT_COMMAND_ISSUED", 0));
+        assert_eq!(delivered(&mut s), vec![1073]);
+        // The shipped movement handler arms step 9 with this expected event.
+        s.begin_training_step(9, 1069, 0);
+        assert!(s.input(CommandSource::Player, SimCommand::Unpause));
+        assert_eq!(delivered(&mut s), vec![1069]);
+        assert!(!s.tutorial_paused());
+        assert!(
+            !s.input(CommandSource::Player, SimCommand::Unpause),
+            "heard once"
+        );
+        // The shipped UNPAUSE handler ends the mode with SetTrainingMode(0).
+        s.set_training_mode(0);
+        assert!(!s.training_paused());
+    }
+
+    #[test]
+    fn unpause_during_a_cinematic_keeps_the_deferred_tutorial_pause() {
+        let mut s = sim();
+        s.world.tutorial_paused = true;
+        s.world.cutscenes.push("intro.cut".into());
+        assert!(s.unpause());
+        assert!(!s.tutorial_paused());
+        s.world.cutscenes.clear();
+        assert!(s.tutorial_paused());
     }
 
     #[test]
