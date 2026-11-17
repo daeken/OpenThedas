@@ -31,7 +31,7 @@ use crate::crypto::DaoKey;
 use crate::erf::Erf;
 use crate::{Error, Result, name_hash, normalize_name};
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum LayerSource {
     Archive {
         erf: Arc<Erf>,
@@ -49,9 +49,10 @@ pub enum LayerSource {
 
 /// An open zip archive serving a layer. Entries are inflated into memory on each read; nothing
 /// is ever written to disk.
+#[derive(Clone)]
 pub struct ZipSource {
     path: PathBuf,
-    archive: Mutex<zip::ZipArchive<std::fs::File>>,
+    archive: Arc<Mutex<zip::ZipArchive<std::fs::File>>>,
 }
 
 impl ZipSource {
@@ -71,7 +72,7 @@ impl std::fmt::Debug for ZipSource {
 /// The largest zip entry a layer will inflate, so a hostile archive cannot exhaust memory.
 const MAX_ZIP_ENTRY: u64 = 1 << 30;
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Layer {
     /// A short human-readable description, such as the archive path relative to the install.
     pub label: String,
@@ -133,7 +134,10 @@ pub struct Provenance {
     pub entry: Option<String>,
 }
 
-#[derive(Debug, Default)]
+/// Cloning copies the stack and its lookup index, sharing open archive handles. Mounting
+/// or removing layers on a clone does not change the original; the live workspace slot
+/// remains process-wide for stacks marked with [`Vfs::play_from`].
+#[derive(Clone, Debug, Default)]
 pub struct Vfs {
     layers: Vec<Layer>,
     /// Loose files per directory layer: (name, path).
@@ -419,7 +423,7 @@ impl Vfs {
             label: label.into(),
             source: LayerSource::Zip(ZipSource {
                 path,
-                archive: Mutex::new(archive),
+                archive: Arc::new(Mutex::new(archive)),
             }),
         });
         self.dir_files.push(named);
@@ -983,6 +987,78 @@ mod tests {
             out.extend_from_slice(data);
         }
         out
+    }
+
+    #[test]
+    fn cloned_stacks_share_archive_handles_and_keep_mounts_independent() {
+        use std::io::Write;
+
+        let base = std::env::temp_dir().join(format!("thedas-vfs-clone-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let archive = base.join("core.erf");
+        std::fs::write(
+            &archive,
+            erf_v30(&[(true, "a.txt", b"core"), (true, "core.txt", b"core only")]),
+        )
+        .unwrap();
+        let zip = base.join("mod.zip");
+        let mut writer = zip::ZipWriter::new(std::fs::File::create(&zip).unwrap());
+        writer
+            .start_file("a.txt", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(b"mod").unwrap();
+        writer.finish().unwrap();
+        let mut vfs = Vfs::new();
+        vfs.push_archive(&archive, "core").unwrap();
+        let mut overlay = Vfs::new();
+        overlay.push_zip(&zip, None, "mod").unwrap();
+        vfs.set_overlay(overlay);
+        vfs.set_addins(vec!["test-addin".into()]);
+        vfs.play_from();
+
+        let mut level = vfs.clone();
+        let LayerSource::Archive { erf: original, .. } = &vfs.layers()[0].source else {
+            panic!("core must be an archive");
+        };
+        let LayerSource::Archive { erf: cloned, .. } = &level.layers()[0].source else {
+            panic!("clone must keep the archive");
+        };
+        assert!(Arc::ptr_eq(original, cloned));
+        let LayerSource::Zip(original) = &vfs.overlay().unwrap().layers()[0].source else {
+            panic!("mod must be a zip");
+        };
+        let LayerSource::Zip(cloned) = &level.overlay().unwrap().layers()[0].source else {
+            panic!("clone must keep the zip");
+        };
+        assert!(Arc::ptr_eq(&original.archive, &cloned.archive));
+        assert_eq!(vfs.names(), level.names());
+        assert!(level.plays());
+        assert!(level.addin_enabled("TEST-ADDIN"));
+
+        // A level's mounts stay local, and its archives still sit below the mods.
+        std::fs::write(base.join("a.txt"), b"level").unwrap();
+        std::fs::write(base.join("level.txt"), b"level only").unwrap();
+        let mark = level.mark();
+        level.push_files(&[base.join("a.txt"), base.join("level.txt")], "level");
+        assert!(vfs.lookup("level.txt").is_none());
+        assert_eq!(level.read("level.txt").unwrap().0, b"level only");
+        assert_eq!(level.read("a.txt").unwrap().0, b"mod");
+        assert_eq!(level.hits("a.txt").len(), 3);
+        assert_eq!(vfs.hits("a.txt").len(), 2);
+        level.truncate(mark);
+        assert!(level.lookup("level.txt").is_none());
+        level.take_overlay();
+        assert_eq!(level.read("a.txt").unwrap().0, b"core");
+        assert_eq!(vfs.read("a.txt").unwrap().0, b"mod");
+
+        // Dropping the owner leaves both kinds of shared archive readable.
+        let survivor = vfs.clone();
+        drop(vfs);
+        assert_eq!(survivor.read("core.txt").unwrap().0, b"core only");
+        assert_eq!(survivor.read("a.txt").unwrap().0, b"mod");
+        drop(survivor);
+        drop(level);
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     #[test]

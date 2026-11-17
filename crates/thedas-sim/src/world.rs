@@ -177,6 +177,10 @@ pub struct Object {
     #[serde(default)]
     pub quick_placed: std::collections::BTreeSet<String>,
     pub dead: bool,
+    /// Origins' inverse of the creature's controllable flag. Script primary
+    /// selection clears this even when insufficient health prevents selection.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) uncontrollable: bool,
     /// When the creature last died (simulation milliseconds); `None` while alive. For
     /// presentation (the death animation plays from it) and saves.
     #[serde(default)]
@@ -198,6 +202,10 @@ pub struct Object {
     /// template's `Appearance Data`. Saved.
     #[serde(default)]
     pub head_morph: Option<String>,
+    /// Origins appearance gore, set by scripts (0x65d650 -> 0x747c40). The original
+    /// saves appearance field 0x3fc4. Older replacement-engine saves start clean.
+    #[serde(default)]
+    pub gore_level: f32,
     /// Character creation's appearance sliders as the player left them (slider id, see
     /// [`crate::appearance`], to value). Saved, as the face they make is the player's.
     #[serde(default)]
@@ -222,6 +230,9 @@ pub struct Object {
     pub geometry: Vec<[f32; 3]>,
     /// Pending commands (front first).
     pub commands: Vec<Command>,
+    /// Origins' animation left playing after COMMAND_LOOPING releases its command.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub looping_animation: Option<Command>,
     pub followers: Vec<ObjectId>,
     /// Non-party followers (`AddNonPartyFollower`): they follow but are not in the party.
     #[serde(default)]
@@ -296,11 +307,13 @@ impl Object {
             quickslots: BTreeMap::new(),
             quick_placed: Default::default(),
             dead: false,
+            uncontrollable: false,
             died_at: None,
             decay_ms: 0,
             decay_forced: false,
             ambient_ms: 0.0,
             head_morph: None,
+            gore_level: 0.0,
             face_choices: BTreeMap::new(),
             immortal: false,
             health_floor_one: false,
@@ -313,6 +326,7 @@ impl Object {
             interactive: true,
             geometry: Vec::new(),
             commands: Vec::new(),
+            looping_animation: None,
             followers: Vec::new(),
             escorts: Vec::new(),
             stored: BTreeMap::new(),
@@ -370,12 +384,14 @@ pub struct Command {
     /// `COMMAND_TYPE_*`.
     pub ty: i32,
     pub name: String,
-    /// Origins' AddCommand bStatic: ordinary add behavior cannot clear this command.
+    /// AddCommand bStatic; native active-command clearing rules differ by game.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub is_static: bool,
     pub target: Option<ObjectId>,
     pub location: Option<Location>,
-    /// Command-specific float. Player Initiate Dialog uses it for stalled-approach milliseconds.
+    /// The constructor's first float (wait time, move range, etc.); for Origins'
+    /// PlayAnimation, the optional speed override stored in native float 3.
+    /// Player Initiate Dialog uses it for stalled-approach milliseconds.
     pub seconds: f32,
     /// `CommandMoveToObject`'s fMaxRange, raised to fMinRange by its builder
     /// (DAOrigins.exe 0x66f260). Older saves used only `seconds` (fMinRange).
@@ -387,7 +403,8 @@ pub struct Command {
     #[serde(default)]
     pub due: Option<u64>,
     /// For a move: where the mover was and the time when it set off. Its position in
-    /// between is interpolated (see `Sim::advance_movers`).
+    /// between is interpolated (see `Sim::advance_movers`). For Origins' PlayAnimation,
+    /// records its start so presentation does not infer it from a fixed duration.
     #[serde(default)]
     pub from: Option<([f32; 3], u64)>,
     /// For a move: when its mover's body last turned toward the way it goes (see
@@ -431,6 +448,9 @@ pub struct Command {
     /// Ordinary player attack input enables the script's range fallback (0x47fc51).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub da2_basic_attack_fallback: bool,
+    /// Native DA2 command +0x10. Distinct from the selector's boolean 2.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub da2_player_issued: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -762,6 +782,18 @@ pub struct World {
     /// [`World::controlled`]). Saved.
     #[serde(default)]
     pub controlled: Option<ObjectId>,
+    /// Origins' explicit party leader, independent of the selected character.
+    /// Older snapshots use the hero until a script assigns a leader.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) party_leader: Option<ObjectId>,
+    /// Origins' member order after a leader is moved to the front. Membership
+    /// still comes from the hero/follower registry; new members append to this.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) party_order: Vec<ObjectId>,
+    /// The Origins native can select a living creature outside the party too.
+    /// Player selection clears this override and resumes the membership check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) script_controlled: Option<ObjectId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_request: Option<crate::target_request::TargetRequest>,
     pub party: Option<ObjectId>,
@@ -791,7 +823,7 @@ pub struct World {
     /// [`crate::journal::Tutorial`]).
     #[serde(default)]
     pub tutorials: Vec<crate::journal::Tutorial>,
-    /// Whether a tutorial paused the game: it stays paused until the queue is empty.
+    /// Whether a tutorial paused the game: its Next/Close action releases it.
     #[serde(default)]
     pub tutorial_paused: bool,
     /// The training tutorial under way, if any (see [`crate::training`]).
@@ -1068,6 +1100,9 @@ impl World {
             da2_encounter_order: Vec::new(),
             hero: None,
             controlled: None,
+            party_leader: None,
+            party_order: Vec::new(),
+            script_controlled: None,
             target_request: None,
             party: None,
             plots: BTreeMap::new(),
@@ -1140,6 +1175,12 @@ impl World {
     /// The party member the player controls (`GetMainControlled`): the one chosen, while it
     /// is still in the party and alive enough to exist, else the hero.
     pub fn controlled(&self) -> Option<ObjectId> {
+        if let Some(c) = self
+            .script_controlled
+            .filter(|&c| self.get(c).is_some_and(|o| o.kind == ObjectKind::Creature))
+        {
+            return Some(c);
+        }
         let hero = self.hero;
         let chosen = self.controlled.filter(|&c| {
             Some(c) == hero
@@ -1280,10 +1321,9 @@ impl World {
     }
 
     pub fn by_tag(&self, tag: &str) -> impl Iterator<Item = &Object> {
-        let tag = tag.to_ascii_lowercase();
         self.objects
             .values()
-            .filter(move |o| o.tag.to_ascii_lowercase() == tag)
+            .filter(move |o| o.tag.eq_ignore_ascii_case(tag))
     }
 
     /// Removes an object `delay_ms` from now.
@@ -1331,6 +1371,7 @@ impl World {
                 self.objects.remove(&id);
                 self.da2_projectiles.remove(&id);
                 self.da2_encounter_order.retain(|&c| c != id);
+                self.party_order.retain(|&c| c != id);
                 // A destroyed follower leaves the party (the list holds no dead ids).
                 if let Some(h) = self.hero.and_then(|h| self.objects.get_mut(&h)) {
                     h.followers.retain(|&f| f != id);

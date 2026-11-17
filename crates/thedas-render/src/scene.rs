@@ -125,8 +125,8 @@ pub struct DrawItem {
     /// Model to world.
     pub transform: Mat4,
     pub lightmap: Option<LightmapRef>,
-    /// World-space bounding sphere of the placed model (from the room layout, or the mesh
-    /// chunk's bounds), used to pick lights.
+    /// World-space placement/LOD sphere from the room layout, or the mesh chunk's bounds.
+    /// Level light selection uses the owning node's [`Self::light_sphere`] instead.
     pub sphere: (Vec3, f32),
     /// The placed model and room, for diagnostics.
     pub model: String,
@@ -143,6 +143,21 @@ pub struct DrawItem {
     pub cast_shadow: Option<bool>,
     /// For a SpeedTree part: the camera distances it is drawn at (see [`DrawLod`]).
     pub lod: Option<DrawLod>,
+}
+
+impl DrawItem {
+    /// The owning mesh node's world light bound (DAOrigins.exe 0x462520 -> 0x559ea0).
+    /// Mesh maintenance 0x55ad80/0x55a450 transforms MSH 8019's centre and copies its
+    /// radius unchanged; RML 3321/3322 instead describe placement/LOD bounds.
+    /// Missing 8019 falls back to our existing placement bound (provisional).
+    pub fn light_sphere(&self, mesh: &SceneMesh) -> (Vec3, f32) {
+        mesh.chunk.sphere.map_or(self.sphere, |s| {
+            (
+                self.transform.transform_point3(Vec3::new(s[0], s[1], s[2])),
+                s[3],
+            )
+        })
+    }
 }
 
 /// The distances a SpeedTree instance's part is drawn at, by DAOrigins.exe's per-instance LOD
@@ -417,13 +432,14 @@ pub enum SceneLight {
 /// draws with `Static1_Fast.psh`, characters vertex-lit, terrain with `Terrain3`, trees with
 /// their `_Low` shaders and bloom with the five-tap blur. No material in the data tests for
 /// High, so High's materials draw as Medium's; its sun shadows are sharper and reach further
-/// (see [`crate::shadow::partition_size`] and [`crate::shadow::partition_reach`]). Medium by default: the original's own default (chosen by
-/// its hardware detection) is not traced.
+/// (see [`crate::shadow::partition_size`] and [`crate::shadow::partition_reach`]). High
+/// corresponds to original index 3 (Very High) and is our deliberate default; the original's
+/// hardware-detected default is not traced.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Detail {
     Low,
-    #[default]
     Medium,
+    #[default]
     High,
 }
 
@@ -1763,6 +1779,7 @@ impl<'a> Loader<'a> {
                     element(48, DeclUsage::TexCoord, 2),
                     element(64, DeclUsage::TexCoord, 3),
                 ],
+                sphere: None,
                 bounds: None,
             },
             vertices,
@@ -1850,6 +1867,7 @@ impl<'a> Loader<'a> {
                     element(64, DeclUsage::TexCoord, 2),
                     element(80, DeclUsage::TexCoord, 3),
                 ],
+                sphere: None,
                 bounds: None,
             },
             vertices,
@@ -1979,6 +1997,7 @@ impl<'a> Loader<'a> {
                     element(64, DeclUsage::TexCoord, 0),
                     element(80, DeclUsage::TexCoord, 1),
                 ],
+                sphere: None,
                 bounds: None,
             },
             vertices,
@@ -2077,6 +2096,7 @@ impl<'a> Loader<'a> {
                     element(96, DeclUsage::TexCoord, 4),
                     element(112, DeclUsage::TexCoord, 5),
                 ],
+                sphere: None,
                 bounds: None,
             },
             vertices,
@@ -2150,6 +2170,7 @@ impl<'a> Loader<'a> {
                 vertex_offset: 0,
                 start_index: 0,
                 elements: Vec::new(),
+                sphere: None,
                 bounds: None,
             },
             vertices,
@@ -2634,8 +2655,8 @@ impl<'a> Loader<'a> {
     /// draw's ([`crate::d3d::reaches`]), the nearest to its bounds' centre (DAOrigins.exe's
     /// probe influence is `1 / d`, 0x53d3e0, one slot). Draws no placed probe reaches keep
     /// the room's (provisional). Only the placed objects' character and placeable draws
-    /// ([`crate::d3d::LightClass`]): the level's own draws and level-class draws keep their room's probe (see
-    /// [`crate::d3d::pick_level_lights`] for why the traced rule is not applied to them yet).
+    /// ([`crate::d3d::LightClass`]): the level's own draws and level-class draws keep their
+    /// room's probe (provisional; point-light selection is independent).
     fn assign_probes(&mut self) {
         let scene = &mut self.scene;
         if scene.probes.iter().all(|p| p.position.is_none()) {
@@ -4215,6 +4236,54 @@ mod tests {
     }
 
     #[test]
+    fn level_light_bounds_belong_to_each_chunk_and_preserve_the_stored_radius() {
+        let mut scene = AreaScene::default();
+        let mut loader = Loader {
+            vfs: &Vfs::new(),
+            scene: AreaScene::default(),
+            mmh: HashMap::new(),
+            msh: HashMap::new(),
+            mesh_index: HashMap::new(),
+            mat_defs: HashMap::new(),
+            material_index: HashMap::new(),
+            morphs: HashMap::new(),
+            tints: HashMap::new(),
+            skeleton_index: HashMap::new(),
+        };
+        let k = loader.push_mesh("generated".into(), vec![], vec![]);
+        scene.meshes.push(loader.scene.meshes[k].clone());
+        let draw = DrawItem {
+            mesh: 0,
+            material: 0,
+            transform: Mat4::from_scale_rotation_translation(
+                Vec3::splat(2.0),
+                glam::Quat::from_rotation_z(std::f32::consts::FRAC_PI_2),
+                Vec3::new(10.0, 20.0, 30.0),
+            ),
+            lightmap: None,
+            sphere: (Vec3::ZERO, 100.0),
+            model: String::new(),
+            room: String::new(),
+            room_id: Some(4),
+            probe: None,
+            skin: None,
+            cast_shadow: None,
+            lod: None,
+        };
+        let mesh = &mut scene.meshes[0];
+        assert_eq!(draw.light_sphere(mesh), draw.sphere); // missing authored sphere: provisional fallback
+        mesh.chunk.sphere = Some([1.0, 0.0, 0.0, 3.0]);
+        let first = draw.light_sphere(mesh);
+        assert!(first.0.distance(Vec3::new(10.0, 22.0, 30.0)) < 0.0001);
+        assert_eq!(first.1, 3.0); // the traced node path copies radius; it does not scale it
+        mesh.chunk.sphere = Some([0.0, 2.0, 0.0, 1.0]);
+        let second = draw.light_sphere(mesh);
+        assert!(second.0.distance(Vec3::new(6.0, 20.0, 30.0)) < 0.0001);
+        assert_eq!(second.1, 1.0);
+        assert_eq!(draw.sphere, (Vec3::ZERO, 100.0));
+    }
+
+    #[test]
     fn head_morphs_reshape_meshes_and_override_materials() {
         let vfs = Vfs::new();
         let mut l = Loader {
@@ -4250,6 +4319,7 @@ mod tests {
                 vertex_offset: 0,
                 start_index: 0,
                 elements: vec![],
+                sphere: None,
                 bounds: None,
             },
             raw_vertices: vec![],
