@@ -22,7 +22,12 @@ impl Camera {
             yaw,
             pitch,
             fov_y: 60f32.to_radians(),
-            near: 0.05,
+            // The area's scene-camera setup (DAOrigins.exe 0x6892a7 -> 0x40ae60,
+            // 0x40af65-0x40af82) supplies 0.15 m to the near/far setter (0x537780 ->
+            // 0x465670). A smaller near plane exposes surfaces the authored shots clip,
+            // e.g. the fireplace 8 cm in front of Everd's conversation camera (#1100).
+            // Provisional for DA2; its scene-camera setup has not been traced.
+            near: 0.15,
             far: 2000.0,
         }
     }
@@ -105,6 +110,18 @@ impl Camera {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn authored_shots_clip_surfaces_inside_the_scene_cameras_near_plane() {
+        let c = Camera::new(Vec3::ZERO, 0.0, 0.0);
+        let vp = c.view_proj(16.0 / 9.0);
+        let clip = |distance| vp * Vec3::new(distance, 0.0, 0.0).extend(1.0);
+        // Close masonry must be clipped, not magnified across the conversation frame.
+        assert!(clip(0.082).z < 0.0);
+        assert!((clip(0.15).z / clip(0.15).w).abs() < 1e-5);
+        let speaker = clip(2.0);
+        assert!(speaker.z > 0.0 && speaker.z < speaker.w);
+    }
 
     #[test]
     fn the_centre_ray_looks_along_the_view() {

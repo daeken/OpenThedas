@@ -115,6 +115,9 @@ pub struct Sim {
     /// The player's "show tutorials" option: off, no tutorial popup is queued. On, as the
     /// game's options start.
     pub show_tutorials: bool,
+    /// Origins ShowGore client option. The native getter masks the stored amount
+    /// when disabled (0x748520 -> 0x838210). Kept with the client, outside saves.
+    pub show_gore: bool,
     /// The training modes done (bit `mode - 1`), which do not start again (see
     /// [`crate::training`]). The player's, not the game's: not saved.
     pub training_done: u32,
@@ -675,6 +678,7 @@ impl Sim {
             item_usable: Default::default(),
             auto_pause_combat: false,
             show_tutorials: true,
+            show_gore: true,
             training_done: 0,
             watch_calls: Default::default(),
             following: Default::default(),
@@ -1241,7 +1245,18 @@ impl Sim {
             // Then the earliest of the next event and the next finishing command; events
             // first on a tie. Both run at their own time, so delays chain correctly.
             let event = self.world.queue.keys().next().map(|k| k.0);
-            let command = self.next_command();
+            // Origins pumps due messages without running the command updater between
+            // them (0x64ae30). Starting a waiting command here lets a cleared-command
+            // callback clear that newly started replacement and send itself another
+            // same-time failure forever. Admission still sends the zero-delay failure;
+            // drain those messages before starting the next executor (0x73d320).
+            let command = if self.game == thedas_vfs::Game::Origins
+                && event.is_some_and(|due| due <= self.world.time_ms)
+            {
+                None
+            } else {
+                self.next_command()
+            };
             // A pending transition comes before anything else due at or after its time.
             if let (Some(_), Some(at)) = (&self.world.transition, self.world.transition_at) {
                 let first = event.into_iter().chain(command.map(|c| c.0)).min();
@@ -1633,7 +1648,13 @@ impl Sim {
         }
         if !speaker.is_empty() {
             let hero = self.world.hero.unwrap_or(OBJECT_INVALID);
-            let target = self.world.by_tag(&speaker).next().map(|o| o.id);
+            // gen00cs_cutscene_end uses GetNearestObjectByTag from the hero.
+            // A global first-tag lookup can select a parked copy in another area.
+            let target = if self.game == thedas_vfs::Game::Origins {
+                self.cutscene_actor_object(&speaker, Some(hero), Some(hero))
+            } else {
+                self.world.by_tag(&speaker).next().map(|o| o.id)
+            };
             if let Some(target) = target {
                 self.start_conversation(hero, target, "");
             }
@@ -1789,6 +1810,9 @@ impl Sim {
     /// available DROPPED at 0x637168; also the picker GUI, 0x766c10), never from
     /// `SetFollowerState`.
     pub(crate) fn party_membership_changed(&mut self, who: ObjectId, joined: bool) {
+        if !joined {
+            self.world.party_order.retain(|&m| m != who);
+        }
         let Some(module) = self.world.module else {
             return;
         };
@@ -2216,13 +2240,16 @@ impl Sim {
     /// How long a command takes once it reaches the front of its queue. Waits take their time,
     /// weapon switches and jumps are done at once, and a move is timed by the straight-line
     /// distance at its owner's walk or run speed ([`Sim::command_speed`]); the walk itself
-    /// follows the pathing grid ([`crate::nav`]). Provisional: anything else takes half a
-    /// second, not its animation's length. Every command takes at least a
+    /// follows the pathing grid ([`crate::nav`]). Origins' PlayAnimation waits for its
+    /// animation chain and requested loops. Provisional: other commands take half a
+    /// second. Every command takes at least a
     /// millisecond, so scripts that queue a new command when one completes cannot loop
     /// forever within one instant.
-    fn command_duration(&self, id: ObjectId, cmd: &Command) -> u64 {
+    fn command_duration(&mut self, id: ObjectId, cmd: &Command) -> u64 {
         let ms = if cmd.name == "CommandWait" {
             (cmd.seconds.max(0.0) * 1000.0) as u64
+        } else if cmd.name == "CommandPlayAnimation" && self.game == thedas_vfs::Game::Origins {
+            self.play_animation_duration(id, cmd).unwrap_or(0)
         } else if cmd.name == "CommandSwitchWeaponSet" {
             // Done as soon as it runs (its executor, 0x7a1ed0, returns complete).
             0
@@ -2626,6 +2653,7 @@ impl Sim {
                 arrived: false,
                 da2_target_prepared: false,
                 da2_basic_attack_fallback: false,
+                da2_player_issued: false,
                 path: Vec::new(),
                 turned_at: None,
                 is_static: false,
@@ -3071,6 +3099,9 @@ impl Sim {
             .filter_map(|&id| self.world.get(id))
             .filter_map(|o| {
                 let c = o.commands.first()?;
+                if c.name == "CommandPlayAnimation" {
+                    return None;
+                }
                 let (from, t0) = c.from?;
                 let due = c.due?;
                 let points =
@@ -3781,8 +3812,16 @@ impl Sim {
         });
         let mut ev = self.new_event("COMMAND_COMPLETE", Some(id));
         ev.ints = vec![c.ty, result];
+        if self.game == thedas_vfs::Game::Origins {
+            // 0x743dd0 retains owner/target for failures as well as success.
+            ev.objects = vec![id, c.target.unwrap_or(OBJECT_INVALID)];
+        }
         if let Some(b) = blocker {
-            ev.objects = vec![OBJECT_INVALID, OBJECT_INVALID, b];
+            if self.game == thedas_vfs::Game::Origins {
+                ev.objects.push(b);
+            } else {
+                ev.objects = vec![OBJECT_INVALID, OBJECT_INVALID, b];
+            }
         }
         if let Some(o) = self.world.get_mut(id) {
             o.combat.previous_command = Some(c);
@@ -3858,6 +3897,12 @@ impl Sim {
                     }
                 }
                 None => {
+                    if !da2
+                        && cmd.name != "CommandWait"
+                        && let Some(o) = self.world.get_mut(id)
+                    {
+                        o.looping_animation = None;
+                    }
                     if self.game == thedas_vfs::Game::DragonAge2
                         && cmd.name == "CommandUseAbility"
                         && cmd.ints.first() == Some(&1)
@@ -4166,11 +4211,14 @@ impl Sim {
                             }
                         }
                     }
-                    let d = now + ms.max(1);
+                    let d = now.saturating_add(ms.max(1));
+                    let play_animation = cmd.name == "CommandPlayAnimation"
+                        && self.game == thedas_vfs::Game::Origins;
                     if let Some(c) = self.world.get_mut(id).and_then(|o| o.commands.first_mut()) {
                         c.due = Some(d);
                         if c.name.starts_with("CommandMoveTo")
                             || c.name == "CommandMoveAwayFromObject"
+                            || play_animation
                         {
                             c.from = pos.map(|p| (p, now));
                             c.path = path;
@@ -4497,7 +4545,16 @@ impl Sim {
         if cmd.name == "CommandUseAbility" {
             self.complete_da2_combat_target(id);
         }
+        let continuing = if self.game == thedas_vfs::Game::Origins {
+            self.continuing_animation(&cmd)
+        } else {
+            None
+        };
+        let result = if continuing.is_some() { 2 } else { 1 };
         if let Some(o) = self.world.get_mut(id) {
+            if continuing.is_some() {
+                o.looping_animation = continuing;
+            }
             o.combat.previous_command = Some(cmd.clone());
         }
         self.update_perception();
@@ -4505,10 +4562,13 @@ impl Sim {
             t: self.world.time_ms,
             object: id,
             command: cmd.name.clone(),
-            status: "complete".into(),
+            status: if result == 2 { "looping" } else { "complete" }.into(),
         });
         let mut ev = self.new_event("COMMAND_COMPLETE", Some(id));
-        ev.ints = vec![cmd.ty, 1];
+        ev.ints = vec![cmd.ty, result];
+        if self.game == thedas_vfs::Game::Origins {
+            ev.objects = vec![id, cmd.target.unwrap_or(OBJECT_INVALID)];
+        }
         self.world.queue_event(0, id, ev, None);
     }
 
@@ -5880,6 +5940,8 @@ mod tests {
             command CommandWait(float seconds) = 1;\n\
             int AddCommand(object who, command cmd, int front, int fixed, int behavior) = 2;\n\
             command CommandAttack(object target) = 3;\n\
+            int GetLocalInt(object who, string name) = 63;\n\
+            void SetLocalInt(object who, string name, int value) = 64;\n\
             int COMMAND_TYPE_ATTACK = 1;\n\
             int COMMAND_TYPE_WAIT = 13;\n\
             int EVENT_TYPE_COMMAND_COMPLETE = 1004;\n\
@@ -5924,6 +5986,151 @@ mod tests {
                 .unwrap(),
             Some(Value::Int(1))
         );
+    }
+
+    #[test]
+    fn origins_cleared_wait_retries_drain_before_restarting_commands() {
+        let mut s = add_command_sim();
+        s.world.trace.keep = true;
+        s.world.time_ms = 100;
+        let area = s.world.spawn(ObjectKind::Area, "hall");
+        let actors = [
+            s.world.spawn(ObjectKind::Creature, "dog"),
+            s.world.spawn(ObjectKind::Creature, "mother"),
+        ];
+
+        // Own callback: count deliveries, then AddCommand(SELF, Wait(2), 0, 0, 1).
+        // The counter's guard makes the old same-time retry cycle fail an assertion
+        // instead of hanging the test process. No production event budget is involved.
+        let mut code = Vec::new();
+        let name = |b: &mut Vec<u8>| b.extend([0x04, 0x05, 0, 1, b'n']);
+        let self_ = |b: &mut Vec<u8>| b.extend([0x04, 0x06, 0, 0, 0, 0]);
+        name(&mut code);
+        self_(&mut code);
+        code.extend([0x05, 0, 0, 63, 2, 0x04, 0x03, 0, 0, 0, 1, 0x14, 0x20]);
+        name(&mut code);
+        self_(&mut code);
+        code.extend([0x05, 0, 0, 64, 3]);
+        name(&mut code);
+        self_(&mut code);
+        code.extend([0x05, 0, 0, 63, 2, 0x04, 0x03, 0, 0, 0, 64, 0x0f, 0x20]);
+        let branch = code.len();
+        code.extend([0x1f, 0, 0, 0, 0, 0]);
+        for value in [1_i32, 0, 0] {
+            code.extend([0x04, 0x03]);
+            code.extend(value.to_be_bytes());
+        }
+        code.extend([0x04, 0x04]);
+        code.extend(2_f32.to_be_bytes());
+        code.extend([0x05, 0, 0, 1, 1]);
+        self_(&mut code);
+        code.extend([0x05, 0, 0, 2, 5, 0x1b, 0]);
+        code.extend((-4_i32).to_be_bytes());
+        let offset = (code.len() - branch) as i32;
+        code[branch + 2..branch + 6].copy_from_slice(&offset.to_be_bytes());
+        code.extend([0x20, 0]);
+        let mut bytes = b"NCS V1.0B".to_vec();
+        bytes.extend(((13 + code.len()) as u32).to_be_bytes());
+        bytes.extend(code);
+        s.add_script("retry", Ncs::parse(&bytes).unwrap());
+
+        for actor in actors {
+            let o = s.world.get_mut(actor).unwrap();
+            o.area = Some(area);
+            o.script = Some("retry".into());
+            // More than ten commands, with an active executor and a waiting tail.
+            for i in 0..16 {
+                o.commands.push(Command {
+                    ty: 13,
+                    name: "CommandWait".into(),
+                    seconds: 2.,
+                    due: (i == 0).then_some(2100),
+                    strings: vec![i.to_string()],
+                    ..Default::default()
+                });
+            }
+            for _ in 0..3 {
+                let mut event = s.new_event("COMMAND_COMPLETE", Some(actor));
+                event.ints = vec![13, -2];
+                s.world.queue_event(0, actor, event, None);
+            }
+        }
+        let saved = s.save_json().unwrap();
+        for _ in 0..2 {
+            s.load_json(&saved).unwrap();
+            s.tick(0);
+            assert_eq!(s.world.time_ms, 100);
+            assert!(s.world.trace.script_errors.is_empty());
+            assert!(s.world.queue.is_empty());
+            for actor in actors {
+                let o = s.world.get(actor).unwrap();
+                assert_eq!(o.locals.ints.get("n"), Some(&4));
+                assert_eq!(o.commands.len(), 19);
+                assert_eq!(o.commands[0].due, Some(2100));
+                assert_eq!(o.commands[0].strings, ["1"]);
+                assert!(o.commands[1..].iter().all(|c| c.due.is_none()));
+                let previous = o.combat.previous_command.as_ref().unwrap();
+                assert_eq!(previous.strings, ["0"]);
+            }
+            let failures: Vec<_> = s
+                .world
+                .trace
+                .entries
+                .iter()
+                .filter_map(|e| match e {
+                    TraceEntry::Command { object, status, .. } if status == "failed -2" => {
+                        Some(*object)
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(failures, actors);
+            s.tick(1);
+            assert_eq!(s.world.time_ms, 101);
+            assert!(s.world.queue.is_empty());
+        }
+    }
+
+    #[test]
+    fn origins_command_admission_has_no_ten_entry_limit() {
+        for front in [0, 1] {
+            let mut s = add_command_sim();
+            let actor = s.world.spawn(ObjectKind::Creature, "actor");
+            let active = Command {
+                ty: 13,
+                name: "CommandWait".into(),
+                due: Some(2000),
+                ..Default::default()
+            };
+            s.world
+                .get_mut(actor)
+                .unwrap()
+                .commands
+                .push(active.clone());
+            for i in 0..64 {
+                add_command(
+                    &mut s,
+                    actor,
+                    Command {
+                        ty: 13,
+                        name: "CommandWait".into(),
+                        seconds: i as f32,
+                        ..Default::default()
+                    },
+                    front,
+                    0,
+                    0,
+                );
+            }
+            let o = s.world.get(actor).unwrap();
+            assert_eq!(o.commands.len(), 65);
+            assert_eq!(o.commands[0], active);
+            for (i, c) in o.commands[1..].iter().enumerate() {
+                assert_eq!(c.seconds, if front == 1 { 63 - i } else { i } as f32);
+            }
+            assert!(s.world.queue.is_empty());
+            assert!(o.combat.previous_command.is_none());
+        }
     }
 
     #[test]
@@ -5996,6 +6203,11 @@ mod tests {
             assert_eq!(events.len(), usize::from(cleared));
             if cleared {
                 assert_eq!(events[0].event.ints, vec![1, -2]);
+                assert_eq!(events[0].event.creator, Some(who));
+                assert_eq!(
+                    events[0].event.objects,
+                    vec![who, if same_target { 123 } else { OBJECT_INVALID }]
+                );
                 assert_eq!(
                     s.world
                         .get(who)
@@ -6042,22 +6254,29 @@ mod tests {
     }
 
     #[test]
-    fn da2_add_command_keeps_its_existing_front_insertion() {
+    fn da2_add_command_inserts_in_the_waiting_list_after_the_active_executor() {
         let mut s = add_command_sim();
         s.game = thedas_vfs::Game::DragonAge2;
         let who = s.world.spawn(ObjectKind::Creature, "actor");
         let active = Command {
+            ty: 13,
             name: "CommandWait".into(),
             due: Some(2000),
             ..Default::default()
         };
         s.world.get_mut(who).unwrap().commands.push(active.clone());
         let incoming = Command {
-            name: "CommandTurn".into(),
+            ty: 13,
+            name: "CommandWait".into(),
+            seconds: 1.,
+            is_static: true,
             ..Default::default()
         };
-        add_command(&mut s, who, incoming.clone(), 1, 1, 2);
-        assert_eq!(s.world.get(who).unwrap().commands, vec![incoming, active]);
+        // No clear: front selects the first waiting slot, leaving the executor
+        // active rather than pausing it behind the new request (0x5cd556).
+        add_command(&mut s, who, incoming.clone(), 1, 1, 0);
+        assert_eq!(s.world.get(who).unwrap().commands, vec![active, incoming]);
+        assert_eq!(s.next_command(), Some((2000, who)));
         assert!(s.world.queue.is_empty());
     }
 
@@ -7084,6 +7303,78 @@ mod tests {
     }
 
     #[test]
+    fn origins_completion_events_retain_owner_target_and_blocker() {
+        for game in [thedas_vfs::Game::Origins, thedas_vfs::Game::DragonAge2] {
+            for failure in [
+                None,
+                Some(("COMMAND_FAILED_INVALID_PATH", -4, None)),
+                Some(("COMMAND_FAILED_PATH_ACTION_REQUIRED", -9, Some(99))),
+            ] {
+                let table = EngineTable::parse(
+                    b"int EVENT_TYPE_COMMAND_COMPLETE = 1004;\n\
+                    int COMMAND_TYPE_ATTACK = 1;\n\
+                    int COMMAND_FAILED_INVALID_PATH = -4;\n\
+                    int COMMAND_FAILED_PATH_ACTION_REQUIRED = -9;\n",
+                )
+                .unwrap();
+                let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(table), 1);
+                s.game = game;
+                let who = s.world.spawn(ObjectKind::Creature, "actor");
+                let target = s.world.spawn(ObjectKind::Creature, "target");
+                s.world.get_mut(who).unwrap().commands.push(Command {
+                    ty: 1,
+                    name: "CommandAttack".into(),
+                    target: Some(target),
+                    due: Some(100),
+                    ..Default::default()
+                });
+                let (result, blocker) = match failure {
+                    Some((name, result, blocker)) => {
+                        s.fail_front_command_with(who, name, blocker);
+                        (result, blocker)
+                    }
+                    None => {
+                        s.finish_command(who);
+                        (1, None)
+                    }
+                };
+                let events: Vec<_> = s
+                    .world
+                    .queue
+                    .values()
+                    .filter(|q| q.event.ty == 1004)
+                    .collect();
+                assert_eq!(events.len(), 1);
+                let event = events[0];
+                assert_eq!(event.target, who);
+                assert_eq!(event.event.creator, Some(who));
+                assert_eq!(event.event.ints, [1, result]);
+                let mut objects = if game == thedas_vfs::Game::Origins {
+                    vec![who, target]
+                } else if blocker.is_some() {
+                    vec![OBJECT_INVALID, OBJECT_INVALID]
+                } else {
+                    Vec::new()
+                };
+                objects.extend(blocker);
+                assert_eq!(event.event.objects, objects);
+                assert!(s.world.get(who).unwrap().commands.is_empty());
+                assert_eq!(
+                    s.world
+                        .get(who)
+                        .unwrap()
+                        .combat
+                        .previous_command
+                        .as_ref()
+                        .unwrap()
+                        .target,
+                    Some(target)
+                );
+            }
+        }
+    }
+
+    #[test]
     fn a_command_failing_as_it_starts_is_reported_an_update_later() {
         let mut s = sim();
         let c = s.world.spawn(ObjectKind::Creature, "follower");
@@ -7108,6 +7399,7 @@ mod tests {
             arrived: false,
             da2_target_prepared: false,
             da2_basic_attack_fallback: false,
+            da2_player_issued: false,
             path: Vec::new(),
             turned_at: None,
             is_static: false,
@@ -7991,6 +8283,7 @@ mod tests {
             arrived: false,
             da2_target_prepared: false,
             da2_basic_attack_fallback: false,
+            da2_player_issued: false,
             path: Vec::new(),
             turned_at: None,
             is_static: false,
@@ -8192,12 +8485,13 @@ mod tests {
             arrived: false,
             da2_target_prepared: false,
             da2_basic_attack_fallback: false,
+            da2_player_issued: false,
             path: Vec::new(),
             turned_at: None,
             is_static: false,
         };
         let o = s.world.get_mut(id).unwrap();
-        o.commands.push(cmd("CommandPlayAnimation", 0.0));
+        o.commands.push(cmd("CommandSheatheWeapons", 0.0));
         o.commands.push(cmd("CommandWait", 2.0));
         s.tick(100);
         assert_eq!(s.world.get(id).unwrap().commands.len(), 2);
@@ -8239,6 +8533,7 @@ mod tests {
             arrived: false,
             da2_target_prepared: false,
             da2_basic_attack_fallback: false,
+            da2_player_issued: false,
             path: Vec::new(),
             turned_at: None,
             is_static: false,
@@ -8360,6 +8655,7 @@ mod tests {
             arrived: false,
             da2_target_prepared: false,
             da2_basic_attack_fallback: false,
+            da2_player_issued: false,
             path: Vec::new(),
             turned_at: None,
             is_static: false,
@@ -8567,6 +8863,7 @@ mod tests {
                 arrived: false,
                 da2_target_prepared: false,
                 da2_basic_attack_fallback: false,
+                da2_player_issued: false,
                 path: Vec::new(),
                 turned_at: None,
                 is_static: false,
@@ -8622,6 +8919,7 @@ mod tests {
             arrived: false,
             da2_target_prepared: false,
             da2_basic_attack_fallback: false,
+            da2_player_issued: false,
             path: Vec::new(),
             turned_at: None,
             is_static: false,
@@ -8771,6 +9069,7 @@ mod tests {
             arrived: false,
             da2_target_prepared: false,
             da2_basic_attack_fallback: false,
+            da2_player_issued: false,
             path: Vec::new(),
             turned_at: None,
             is_static: false,
@@ -8842,6 +9141,7 @@ mod tests {
             arrived: false,
             da2_target_prepared: false,
             da2_basic_attack_fallback: false,
+            da2_player_issued: false,
             path: Vec::new(),
             turned_at: None,
             is_static: false,
@@ -8897,6 +9197,7 @@ mod tests {
             arrived: false,
             da2_target_prepared: false,
             da2_basic_attack_fallback: false,
+            da2_player_issued: false,
             path: Vec::new(),
             turned_at: None,
             is_static: false,
@@ -9128,6 +9429,7 @@ mod tests {
                 arrived: false,
                 da2_target_prepared: false,
                 da2_basic_attack_fallback: false,
+                da2_player_issued: false,
                 path: Vec::new(),
                 turned_at: None,
                 is_static: false,
@@ -9159,6 +9461,7 @@ mod tests {
             arrived: false,
             da2_target_prepared: false,
             da2_basic_attack_fallback: false,
+            da2_player_issued: false,
             path: Vec::new(),
             turned_at: None,
             is_static: false,
@@ -9244,6 +9547,7 @@ mod tests {
             arrived: false,
             da2_target_prepared: false,
             da2_basic_attack_fallback: false,
+            da2_player_issued: false,
             path: Vec::new(),
             turned_at: None,
             is_static: false,
@@ -9313,6 +9617,7 @@ mod tests {
             arrived: false,
             da2_target_prepared: false,
             da2_basic_attack_fallback: false,
+            da2_player_issued: false,
             path: Vec::new(),
             turned_at: None,
             is_static: false,
@@ -9543,6 +9848,7 @@ mod tests {
             arrived: false,
             da2_target_prepared: false,
             da2_basic_attack_fallback: false,
+            da2_player_issued: false,
             path: Vec::new(),
             turned_at: None,
             is_static: false,
