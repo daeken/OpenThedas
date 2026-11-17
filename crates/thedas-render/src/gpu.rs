@@ -2932,6 +2932,7 @@ mod tests {
             vertex_offset: 0,
             start_index: 0,
             elements: vec![],
+            sphere: None,
             bounds: None,
         };
         let xml = br#"<MaterialObject Name="t"><Material Name="static.mat"/></MaterialObject>"#;
