@@ -1648,7 +1648,13 @@ impl Sim {
         }
         if !speaker.is_empty() {
             let hero = self.world.hero.unwrap_or(OBJECT_INVALID);
-            let target = self.world.by_tag(&speaker).next().map(|o| o.id);
+            // gen00cs_cutscene_end uses GetNearestObjectByTag from the hero.
+            // A global first-tag lookup can select a parked copy in another area.
+            let target = if self.game == thedas_vfs::Game::Origins {
+                self.cutscene_actor_object(&speaker, Some(hero), Some(hero))
+            } else {
+                self.world.by_tag(&speaker).next().map(|o| o.id)
+            };
             if let Some(target) = target {
                 self.start_conversation(hero, target, "");
             }
