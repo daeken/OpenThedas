@@ -47,8 +47,11 @@ static analysis. The cut update and the dialog graph have separate state.
   the track can remember a running sound at +0x62 and later clears +0x61 and
   decrements +0xe8 at 0x7cfc07–0x7cfc11. The callback at 0x7cfc69 calls
   `Conversation.OnNPCLineFinished` in the movie (0x68cc60). The native ASLN
-  path writes subtitle text and signals the movie. It does not install a new
-  dialog graph node.
+  path writes subtitle text and signals the movie. In `conversation.gfx`,
+  `OnNPCLineFinished` can schedule a delayed subtitle update when responses
+  exist. It has no reply-selection call. `UpdateMainText` takes the text and
+  consults subtitles and VO settings. Neither callback records a consumed
+  dialog node.
 - Cut completion (0x7cd290) tests terminal state 6 or timeline-end +0x18.
   If CUT field 5018 is enabled (loaded into +0x11c at 0x7e210a), timeline-end
   also requires +0xe8 to be zero. That field is enabled in this CUTR. +0xe8
@@ -68,9 +71,9 @@ static analysis. The cut update and the dialog graph have separate state.
   separate show-once state written by 0x7f1640 (node history) and 0x7f1700
   (global TLK history). Both read field 12206, which is zero on nodes 17 and
   18. The traced paths allow node 18 to install its own ASLN instance after
-  the external cut. The exact skip-point population and any movie or audio
-  suppression of that inline ASLN remain unverified. The skip and completion
-  policy below is the OpenThedas behavior chosen for #1111.
+  the external cut. The exact skip-point population and whether the original
+  audio system suppresses a new voice there remain unverified. The skip and
+  completion policy below is the OpenThedas behavior chosen for #1111.
 
 ## OpenThedas behavior
 
