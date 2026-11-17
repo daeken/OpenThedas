@@ -13,6 +13,7 @@ use thedas_render::{
 use thedas_script::vm::ObjectId;
 use thedas_sim::Sim;
 use thedas_ui::models::{ModelCache, ObjectModel};
+#[cfg(test)]
 use thedas_vfs::install::TextureQuality;
 use thedas_vfs::{DaoInstall, Vfs};
 
@@ -228,6 +229,8 @@ pub struct Live {
     pub front_end: bool,
     pub paused: bool,
     install: PathBuf,
+    /// The run's play stack, before any per-level mounts.
+    base_vfs: Arc<Vfs>,
     shaders: String,
     pub level: Option<LiveLevel>,
     pub objects: Option<LiveObjects>,
@@ -463,6 +466,7 @@ fn supported_samples(ctx: &GpuContext, format: wgpu::TextureFormat, wanted: u32)
 #[derive(Clone)]
 struct BuildSpec {
     install: PathBuf,
+    base_vfs: Arc<Vfs>,
     shaders: String,
     detail: thedas_render::scene::Detail,
     frame_effects: bool,
@@ -527,7 +531,7 @@ fn build_level_with(
     let started = std::time::Instant::now();
     cache.samples = supported_samples(ctx, spec.format, spec.samples);
     let install = DaoInstall::open(&spec.install)?;
-    let mut vfs = install.play_vfs(TextureQuality::High)?;
+    let mut vfs = spec.base_vfs.as_ref().clone();
     install.mount_level(&mut vfs, layout)?;
     let scene = AreaScene::load_with_props_at(&vfs, layout, &[], spec.detail)?;
     let programs = crate::programs_cached(&vfs, &scene, &spec.shaders, cache)?;
@@ -648,9 +652,16 @@ pub fn portrait_subjects(sim: &Sim) -> Vec<ObjectId> {
 }
 
 impl Live {
-    pub fn open(install: &Path, module: &str, start: Start, shaders: &str) -> Result<Self> {
+    pub fn open(
+        install: &Path,
+        base_vfs: Arc<Vfs>,
+        module: &str,
+        start: Start,
+        shaders: &str,
+    ) -> Result<Self> {
         let opts = thedas_sim::session::SessionOptions {
             install: install.to_path_buf(),
+            base_vfs: Some(base_vfs.clone()),
             module: module.to_string(),
             area: match start {
                 Start::Area(a) => Some(a.to_string()),
@@ -732,6 +743,7 @@ impl Live {
             front_end: matches!(start, Start::Menu),
             paused: false,
             install: install.to_path_buf(),
+            base_vfs,
             module: module.to_string(),
             shaders: shaders.to_string(),
             level: None,
@@ -2787,6 +2799,7 @@ impl Live {
     fn spec(&self, format: wgpu::TextureFormat) -> BuildSpec {
         BuildSpec {
             install: self.install.clone(),
+            base_vfs: self.base_vfs.clone(),
             shaders: self.shaders.clone(),
             detail: self.detail,
             frame_effects: self.frame_effects,
@@ -3008,6 +3021,12 @@ mod portrait_tests {
         let save = std::env::var_os("THEDAS_PORTRAIT_SAVE").expect("THEDAS_PORTRAIT_SAVE");
         let mut live = Live::open(
             Path::new(&install),
+            Arc::new(
+                DaoInstall::open(&install)
+                    .unwrap()
+                    .play_vfs(TextureQuality::High)
+                    .unwrap(),
+            ),
             "single player",
             Start::Save(Path::new(&save)),
             "original",
