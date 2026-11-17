@@ -619,6 +619,22 @@ mod tests {
     }
 
     #[test]
+    fn restores_explicit_speech_from_the_resource_for_a_legacy_cut() {
+        let authored = Cutscene::from_gff4(&cut(b"CUT ", 10.0), "x").unwrap();
+        assert!(authored.lines.iter().all(|line| line.explicit_text));
+        let mut saved = authored.clone();
+        for line in &mut saved.lines {
+            line.explicit_text = false;
+        }
+        saved.lines[1].strref = 300;
+        saved.elapsed_ms = 500;
+        saved.restore_explicit_lines(&authored);
+        assert_eq!(saved.elapsed_ms, 500);
+        assert!(saved.lines[0].explicit_text);
+        assert!(!saved.lines[1].explicit_text);
+    }
+
+    #[test]
     fn reads_the_movies_played() {
         let m = movies_of(&cut(b"CUT ", 10.0));
         let got: Vec<(&str, f32, f32)> = m

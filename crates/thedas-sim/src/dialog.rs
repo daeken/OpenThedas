@@ -2198,6 +2198,20 @@ mod tests {
     }
 
     #[test]
+    fn cut_handoff_never_takes_a_player_choice() {
+        let mut sim = explicit_dialog_cut();
+        sim.talk.as_mut().unwrap().dlg.nodes[1].text = Some("My reply.".into());
+        sim.tick(8000);
+        assert_eq!(sim.talk.as_ref().unwrap().line, Some(0));
+        assert_eq!(sim.cut_line_speech(), CutLineSpeech::Complete);
+        assert_eq!(
+            sim.dialog_state().unwrap().replies,
+            [(1, "My reply.".into())]
+        );
+        assert_eq!(sim.choose_reply(0).unwrap().line, "Second.");
+    }
+
+    #[test]
     fn a_terminal_npc_line_remains_available_to_audio_until_dismissed() {
         let (mut sim, hero, npc) = passers_by();
         let mut dlg = remarks("terminal", &["The last line."], false);

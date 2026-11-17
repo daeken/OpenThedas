@@ -31,8 +31,9 @@ empty reply have no action scripts.
 
 ## DAOrigins.exe trace
 
-Addresses are virtual addresses in the GOG executable, from static analysis.
-The cut update and the dialog graph have separate state.
+Addresses are virtual addresses in the GOG 1.05a executable (SHA-256
+`2346caee611002d4dff6ecef68eb315b63a37004dd98b39c11a9c26c0b45bfb3`), from
+static analysis. The cut update and the dialog graph have separate state.
 
 - GameModeDialog installs the current node and replaces its old cinematic at
   0x68e3d9–0x68e43d. It obtains the new cut at 0x68e53c (`0x7f0960`) and
@@ -63,12 +64,13 @@ The cut update and the dialog graph have separate state.
   through 0x68ded1–0x68df57 once the cut completes. Both transitions call
   0x68d8f0, which advances the selected reply via 0x7f1910 at 0x68dbca.
   This graph path reaches node 18 from reply 97.
-- The voiced/entered latches are local to the ASLN instance. The traced
-  paths provide no evidence of a persistent TLK-ID history that would
-  consume node 18 merely because the external cut said 41526. The precise
-  skip-point population and whether the original movie or audio system
-  suppresses the later inline ASLN instance remain unverified. The skip
-  and completion policy below is the OpenThedas behavior chosen for #1111.
+- The voiced/entered latches are local to the ASLN instance. The graph has
+  separate show-once state written by 0x7f1640 (node history) and 0x7f1700
+  (global TLK history). Both read field 12206, which is zero on nodes 17 and
+  18. The traced paths allow node 18 to install its own ASLN instance after
+  the external cut. The exact skip-point population and any movie or audio
+  suppression of that inline ASLN remain unverified. The skip and completion
+  policy below is the OpenThedas behavior chosen for #1111.
 
 ## OpenThedas behavior
 
@@ -87,6 +89,6 @@ matching inline cinematic supplies its final shot and actor poses for the
 reply wait. After natural completion both tracks have voiced in the cut and
 the conversation opens on the replies.
 
-The match is local to the cut and current graph walk. The treatment of
-textless ASLNs follows the existing reference path. No DLC or game files are
-needed in the synthetic fixtures.
+The match is local to the cut and current graph walk. Textless ASLNs follow
+the existing reference path. The tests build synthetic graphs and cut
+timelines.
