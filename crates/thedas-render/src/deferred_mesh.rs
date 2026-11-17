@@ -146,6 +146,7 @@ mod tests {
                 base_vertex: 0,
                 vertex_offset: 0,
                 start_index: 0,
+                sphere: None,
                 bounds: None,
                 elements: vec![
                     VertexElement {
@@ -204,6 +205,7 @@ mod tests {
                 base_vertex: 0,
                 vertex_offset: 0,
                 start_index: 0,
+                sphere: None,
                 bounds: None,
                 elements: vec![
                     VertexElement {

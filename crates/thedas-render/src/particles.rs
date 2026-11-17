@@ -27,6 +27,8 @@
 //!   axis (the key's X size) and `B` along its second (its Y size); texture coordinates (0,0), (0,1),
 //!   (1,1), (1,0) for `P−B−A`, `P−B+A`, `P+B+A`, `P+B−A`, and the flipbook phase in the
 //!   third.
+//! - **Linked sprites** (0x5850e0): a ribbon through particles in birth order, ending at
+//!   the emitter, with a shared flipbook clock. See [`EmitterState::linked_quads`].
 //!
 //! `u` is uniform in [−1, 1], `f` in [0, 1], from the MSVC `rand` recurrence the exe runs on
 //! two global seeds (0xc31a6c births, 0xc31994 directions).
@@ -150,6 +152,8 @@ pub struct EmitterState {
     directions: Rand,
     accumulator: f32,
     burst_done: bool,
+    /// Linked sprites share the emitter's flipbook clock (0x5851bf-0x585203).
+    linked_phase: f32,
     /// Multiplies the particles' alpha; at 0 none are drawn (a cut-away model's emitters,
     /// DAOrigins.exe 0x466f40 setting emitter +0x360). Provisional: what +0x360 scales is
     /// not traced.
@@ -174,6 +178,7 @@ impl EmitterState {
             directions: Rand::new(seed ^ 0x5bd1_e995),
             accumulator: 0.0,
             burst_done: false,
+            linked_phase: 0.0,
             opacity: 1.0,
             rate: None,
             color: None,
@@ -189,6 +194,7 @@ impl EmitterState {
         self.directions = old.directions;
         self.accumulator = old.accumulator;
         self.burst_done = old.burst_done;
+        self.linked_phase = old.linked_phase;
     }
 
     /// Advances by `seconds`, in steps of at most [`MAX_STEP`].
@@ -222,6 +228,7 @@ impl EmitterState {
         } else {
             0.0
         };
+        self.linked_phase += frame_step;
         let accel = {
             let w = Vec3::from_array(e.world_axis_acceleration);
             if e.object_space_acceleration {
@@ -237,8 +244,13 @@ impl EmitterState {
                 p.age += dt;
             }
             if p.age * p.inv_life >= 1.0 {
-                // 0x552a04: the last particle takes its place.
-                self.particles.swap_remove(i);
+                if e.link_particles {
+                    // A linked emitter keeps birth order (0x584c7d-0x584cab).
+                    self.particles.remove(i);
+                } else {
+                    // 0x552a04: the last particle takes its place.
+                    self.particles.swap_remove(i);
+                }
                 continue;
             }
             let a = e.acceleration * dt;
@@ -356,6 +368,10 @@ impl EmitterState {
             return;
         }
         let e = &self.blueprint;
+        if e.link_particles {
+            self.linked_quads(right, forward, out);
+            return;
+        }
         let (scale, rotation, _) = self.world.to_scale_rotation_translation();
         let k2 = 0.5 * scale.max_element().powi(2);
         for p in &self.particles {
@@ -402,6 +418,53 @@ impl EmitterState {
                     texcoord: [uv[0], uv[1], p.phase, 0.0],
                 });
             }
+        }
+    }
+
+    /// A linked sprite is a ribbon through particles in birth order, ending at the
+    /// emitter's current origin (DAOrigins.exe 0x5850e0, especially 0x585704-0x58574e).
+    /// It has transverse width, not the ordinary sprite's longitudinal half-size:
+    /// applying `P ± A` here extends a newborn flame below its source (#1097).
+    /// The side at a joint averages its two particles' side axes (0x58559b-0x585625).
+    /// The Y age-map size of the first particle supplies the half-width; this path does
+    /// not apply the ordinary sprite's owner-scale-squared factor (0x5852c9-0x585302).
+    ///
+    /// Provisional: UV subdivision/chain breaks and spinning side axes are not mirrored;
+    /// the existing spawn/random approximations still apply to linked particles too.
+    fn linked_quads(&self, right: Vec3, forward: Vec3, out: &mut Vec<ParticleVertex>) {
+        let Some(first) = self.particles.first() else {
+            return;
+        };
+        let side = |p: &Particle| forward.cross(p.velocity).normalize_or(right);
+        let width = self.look(first).size[1];
+        let vertex = |position: Vec3, uv: [f32; 2], p: &Particle| {
+            let mut color = self.look(p).color.clamp(Vec4::ZERO, Vec4::ONE).to_array();
+            color[3] *= self.opacity.min(1.0);
+            ParticleVertex {
+                position: position.to_array(),
+                color,
+                texcoord: [uv[0], uv[1], self.linked_phase, 0.0],
+            }
+        };
+        let count = self.particles.len();
+        let mut from = first.position;
+        let mut across = side(first) * width;
+        for (i, p) in self.particles.iter().enumerate() {
+            let next = self.particles.get(i + 1);
+            let (to, to_across) = match next {
+                Some(n) => (n.position, (side(p) + side(n)).normalize_or(right) * width),
+                None => (self.world.w_axis.truncate(), side(p) * width),
+            };
+            let v0 = i as f32 / count as f32;
+            let v1 = (i + 1) as f32 / count as f32;
+            out.extend([
+                vertex(from + across, [1.0, v0], p),
+                vertex(from - across, [0.0, v0], p),
+                vertex(to - to_across, [0.0, v1], next.unwrap_or(p)),
+                vertex(to + to_across, [1.0, v1], next.unwrap_or(p)),
+            ]);
+            from = to;
+            across = to_across;
         }
     }
 }
@@ -601,6 +664,62 @@ mod tests {
         let mut v = Vec::new();
         s.quads(Vec3::X, Vec3::Z, Vec3::Y, &mut v);
         assert!(v.is_empty());
+    }
+
+    #[test]
+    fn linked_flames_end_at_the_transformed_source_without_a_longitudinal_half_size() {
+        let mut e = fire();
+        e.link_particles = true;
+        e.orientation = 3;
+        e.age_map = vec![AgeKey {
+            time: 0.0,
+            scale: [10.0, 0.25],
+            color: [1.0; 4],
+        }];
+        // A scaled, translated model and its emitter's local offset are already in world.
+        let world = Mat4::from_scale_rotation_translation(
+            Vec3::splat(1.5),
+            Quat::IDENTITY,
+            Vec3::new(4.0, 5.0, 2.4),
+        ) * Mat4::from_translation(Vec3::new(0.0, 0.0, -0.03));
+        let mut s = EmitterState::new(Arc::new(e), world, 3);
+        let origin = world.w_axis.truncate();
+        for height in [0.8, 0.4] {
+            s.particles.push(Particle {
+                position: origin + Vec3::Z * height,
+                velocity: Vec3::Z,
+                age: height,
+                inv_life: 1.0,
+                scale: 1.0,
+                spin: 0.0,
+                angle: 0.0,
+                phase: height,
+            });
+        }
+        let mut v = Vec::new();
+        s.quads(Vec3::X, Vec3::Z, Vec3::Y, &mut v);
+        assert_eq!(v.len(), 8);
+        for p in &v {
+            let p = Vec3::from_array(p.position);
+            assert!(p.z >= origin.z && p.z <= origin.z + 0.8);
+            assert!(((p.x - origin.x).abs() - 0.25).abs() < 1e-5);
+        }
+        assert_eq!(v[6].position[2], origin.z);
+        assert_eq!(v[7].position[2], origin.z);
+        assert_eq!(v[2].position, v[5].position);
+        assert_eq!(v[3].position, v[4].position);
+        assert_eq!(v[0].texcoord[1], 0.0);
+        assert_eq!(v[7].texcoord[1], 1.0);
+        assert!(v.iter().all(|v| v.texcoord[2] == 0.0));
+        // Expiring the oldest particle must not reorder the remaining chain.
+        s.particles[0].age = 1.0;
+        s.particles.push(Particle {
+            age: 0.0,
+            ..s.particles[1]
+        });
+        s.update(0.01);
+        assert_eq!(s.particles.len(), 2);
+        assert!(s.particles[0].age > s.particles[1].age);
     }
 
     #[test]

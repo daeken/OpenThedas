@@ -17,8 +17,9 @@
 //! a guess from the data, not traced; the executable frames a line that plays no cinematics
 //! with its default framing.
 //!
-//! A line's cut also gives how long its cinematics run (5000, seconds); a stage's `decision`
-//! camera frames the player choosing a reply.
+//! A line's cut also gives how long its cinematics run (5000, seconds). Camera names,
+//! including `decision`, have no implicit role when replies become available: the line's
+//! authored camera jumps select them (see [`Stage::jump_camera`]).
 //!
 //! Provisional. Field names are xoreos's (read for the format only): 11000 places, 11001
 //! cameras, 11003 camera field of view, 11004 a place's default camera; 1 a name, 4 a
@@ -117,27 +118,6 @@ impl Stage {
             });
         }
         Ok(Stage { places, cameras })
-    }
-
-    /// The camera named `name`, ignoring case (`decision` frames the player choosing).
-    pub fn camera(&self, name: &str) -> Option<&StageCamera> {
-        self.cameras
-            .iter()
-            .find(|c| c.name.eq_ignore_ascii_case(name))
-    }
-
-    /// The camera a line's `AJSC` track names: a place's default camera, or else the camera
-    /// of that name (lines put the player's choice under the `decision` camera this way).
-    /// Names ignore case.
-    pub fn camera_for(&self, name: &str) -> Option<&StageCamera> {
-        match self
-            .places
-            .iter()
-            .find(|p| p.name.eq_ignore_ascii_case(name))
-        {
-            Some(p) => self.camera(p.default_camera.as_deref()?),
-            None => self.camera(name),
-        }
     }
 
     /// The camera an `ActionJumpToCamera` track (`AJSC`) puts its actor on (0x7d1ea0 ->
@@ -322,13 +302,11 @@ mod tests {
             ],
         );
         let st = Stage::from_gff4(&b.finish(root)).unwrap();
-        let c = st.camera_for("NODE1_MOTHER").unwrap();
+        let c = st.jump_camera("node1_mother", true).unwrap();
         assert_eq!(c.position, [0.0, 1.5, 1.6]);
         assert_eq!(c.fov, 25.0);
         assert_eq!(st.cameras[1].fov, 45.0);
-        assert!(st.camera_for("nobody").is_none());
-        // A name that is no place's is a camera's.
-        assert_eq!(st.camera_for("Group").unwrap().name, "group");
+        assert!(st.jump_camera("nobody", false).is_none());
         // A jump finds a camera by its exact name, or a place's default camera.
         assert_eq!(st.jump_camera("group", false).unwrap().name, "group");
         assert!(st.jump_camera("Group", false).is_none());

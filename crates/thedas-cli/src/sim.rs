@@ -21,6 +21,7 @@ pub struct Options<'a> {
 /// Opens the install, loads the module and area.
 pub fn start(o: &Options) -> Result<Sim> {
     thedas_sim::session::open(&thedas_sim::session::SessionOptions {
+        base_vfs: None,
         install: o.install.to_path_buf(),
         module: o.module.to_string(),
         area: o.area.map(str::to_string),

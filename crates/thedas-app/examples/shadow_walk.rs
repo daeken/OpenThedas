@@ -89,6 +89,7 @@ fn main() -> Result<()> {
     renderer.set_time(3.0);
     let mut objects = if let Some(save) = &args.save {
         let options = thedas_sim::session::SessionOptions {
+            base_vfs: None,
             install: args.install.clone(),
             module: thedas_vfs::install::campaign_module(&args.install).to_string(),
             area: Some(args.area.clone()),

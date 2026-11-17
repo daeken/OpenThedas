@@ -154,6 +154,8 @@ pub enum SimCommand {
     SetTrainingMode {
         mode: i32,
     },
+    /// The player's unpause request: guided training or a pausing popup may refuse it.
+    Unpause,
     ConsumeTutorial {
         all: bool,
     },
@@ -568,6 +570,7 @@ impl Sim {
                 self.set_training_mode(*mode);
                 true
             }
+            C::Unpause => self.unpause(),
             C::ConsumeTutorial { all } => {
                 self.consume_tutorial(*all);
                 true

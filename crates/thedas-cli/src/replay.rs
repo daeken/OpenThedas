@@ -378,6 +378,7 @@ pub fn run(
         .and_then(|id| checkpoint.world.get(id))
         .map(|o| o.template.clone());
     let mut sim = thedas_sim::session::open(&thedas_sim::session::SessionOptions {
+        base_vfs: None,
         install,
         module: checkpoint.module.clone(),
         area,
