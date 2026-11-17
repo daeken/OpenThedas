@@ -158,6 +158,7 @@ impl Sim {
             MSG_CLEAR => self.world.chanter_board.take().is_some(),
             crate::inventory::MSG_EQUIP
             | crate::inventory::MSG_UNEQUIP
+            | crate::inventory::MSG_DROP
             | crate::inventory::MSG_NEXT_CHARACTER
             | crate::inventory::MSG_PREVIOUS_CHARACTER
             | crate::inventory::MSG_SWITCH_WEAPON_SET => self.inventory_message(name, args),
