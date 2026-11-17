@@ -719,12 +719,18 @@ struct Line {
     cut_done: bool,
     /// Its own referenced cutscene has started. Automatic continuation waits for it.
     owns_cut: bool,
+    /// The cut showed this node's subtitle and began its voice.
+    resume_voice: bool,
 }
 
 impl Line {
-    fn set_voice_ms(&mut self, ms: Option<f64>) {
+    fn set_voice_ms(&mut self, ms: Option<f64>, voice_elapsed_ms: impl FnOnce() -> f64) {
         if self.voice_ms.is_none() && ms.is_some() {
-            self.voice_at = self.t;
+            self.voice_at = if self.resume_voice {
+                self.t - voice_elapsed_ms()
+            } else {
+                self.t
+            };
         }
         self.voice_ms = ms;
     }
@@ -845,9 +851,9 @@ impl UiLayer {
 
     /// The conversation line on screen speaks for this long (milliseconds; see
     /// [`crate::audio`]), or has no voice-over.
-    pub fn set_line_voice_ms(&mut self, ms: Option<f64>) {
+    pub fn set_line_voice_ms(&mut self, ms: Option<f64>, voice_elapsed_ms: impl FnOnce() -> f64) {
         if let Some(l) = self.line.as_mut() {
-            l.set_voice_ms(ms);
+            l.set_voice_ms(ms, voice_elapsed_ms);
         }
     }
 
@@ -2455,10 +2461,14 @@ impl UiLayer {
             let cutscene = sim.world.cutscene.is_some();
             let owns_cut =
                 sim.game == thedas_vfs::Game::Origins && sim.conversation_line_cutscene().is_some();
-            let line = thedas_ui::binding::conversation(&sim).map(|d| {
-                let key: LineKey = (d.dialog, d.line, d.replies.iter().map(|r| r.0).collect());
-                (key, waits, cutscene, owns_cut)
-            });
+            // An authored track owns the subtitle and voice while this cut plays. Start
+            // dialog timing at the handoff so a skip can still play an unfinished node.
+            let line = thedas_ui::binding::conversation(&sim)
+                .filter(|_| !sim.cutscene_controls_dialog_speech())
+                .map(|d| {
+                    let key: LineKey = (d.dialog, d.line, d.replies.iter().map(|r| r.0).collect());
+                    (key, waits, cutscene, owns_cut, sim.cut_line_speech())
+                });
             // Before a game, the start menu, or the screen it opened (options, the load
             // screen).
             let want = match (self.loading, screens.front_end, screens.menu) {
@@ -2488,7 +2498,7 @@ impl UiLayer {
             self.continue_pending = None;
         }
         self.line = match (line, self.line.take()) {
-            (Some((key, _, cutscene, owns_cut)), Some(mut l)) if l.key == key => {
+            (Some((key, _, cutscene, owns_cut, _)), Some(mut l)) if l.key == key => {
                 l.t += dt_ms;
                 l.cut_done |= l.cut_seen && !cutscene;
                 l.cut_done |= l.owns_cut && !owns_cut;
@@ -2496,14 +2506,19 @@ impl UiLayer {
                 l.owns_cut |= owns_cut;
                 Some(l)
             }
-            (Some((key, waits, cutscene, owns_cut)), _) => {
+            (Some((key, waits, cutscene, owns_cut, speech)), _) => {
+                use thedas_sim::dialog::CutLineSpeech;
                 log::debug!(
                     "conversation new line: {key:?} waits={waits} voiced={} cut={cutscene} owns_cut={owns_cut}",
                     self.line_voiced
                 );
                 Some(Line {
                     key,
-                    t: 0.0,
+                    t: if speech == CutLineSpeech::Complete {
+                        f64::INFINITY
+                    } else {
+                        0.0
+                    },
                     voice_ms: None,
                     voice_at: 0.0,
                     voiced: self.line_voiced,
@@ -2512,6 +2527,7 @@ impl UiLayer {
                     cut_seen: cutscene,
                     cut_done: false,
                     owns_cut,
+                    resume_voice: speech == CutLineSpeech::InProgress,
                 })
             }
             (None, _) => None,
@@ -4755,6 +4771,7 @@ mod tests {
             cut_seen: false,
             cut_done: false,
             owns_cut: false,
+            resume_voice: false,
         }
     }
 
@@ -4776,10 +4793,10 @@ mod tests {
     fn a_delayed_voice_plays_from_its_start_not_the_dialogs_start() {
         let mut line = timing_line("A line chosen behind a loading screen.", true);
         line.t = 5000.0;
-        line.set_voice_ms(Some(2000.0));
+        line.set_voice_ms(Some(2000.0), || 0.0);
         assert!(!line.played());
         line.t = 6000.0;
-        line.set_voice_ms(Some(2000.0));
+        line.set_voice_ms(Some(2000.0), || 0.0);
         assert_eq!(
             line.voice_at, 5000.0,
             "later frames must not restart the clock"
@@ -4787,6 +4804,17 @@ mod tests {
         line.t = 6999.0;
         assert!(!line.played());
         line.t = 7000.0;
+        assert!(line.played());
+    }
+
+    #[test]
+    fn an_interrupted_cut_voice_keeps_its_playback_position() {
+        let mut line = timing_line("", true);
+        line.resume_voice = true;
+        line.set_voice_ms(Some(2000.0), || 1400.0);
+        line.t = 599.0;
+        assert!(!line.played());
+        line.t = 600.0;
         assert!(line.played());
     }
 
@@ -4827,6 +4855,7 @@ mod tests {
             cut_seen: true,
             cut_done: false,
             owns_cut: true,
+            resume_voice: false,
         };
         // Oskias node 17 has a 2.976 s voice and a 3.217 s cut. Presentation time
         // can also run ahead of the cut's capped simulation clock on slow frames.

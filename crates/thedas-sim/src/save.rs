@@ -327,6 +327,16 @@ impl Sim {
         // not traced.
         world.alerts.clear();
         world.uber_alerts.clear();
+        if self.game == thedas_vfs::Game::Origins
+            && let Some(cut) = world.cutscene.as_mut()
+            && cut.from_dialog
+            && !cut.lines.is_empty()
+            && cut.lines.iter().all(|line| !line.explicit_text)
+            && let Ok((data, _)) = self.vfs.read(&cut.name)
+            && let Some(authored) = crate::cutscene::Cutscene::parse(&data, &cut.name)
+        {
+            cut.restore_explicit_lines(&authored);
+        }
         self.world = world;
         self.restore_da2_encounters();
         self.restore_script_heartbeats();
@@ -768,6 +778,7 @@ mod tests {
             chain: Vec::new(),
             cut_from: None,
             cut_lines_left: 0,
+            cut_line_speech: crate::dialog::CutLineSpeech::Dialog,
             staged: Vec::new(),
             staged_at: None,
             ambient_run: false,

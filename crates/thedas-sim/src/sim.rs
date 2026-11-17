@@ -1465,6 +1465,7 @@ impl Sim {
             self.release_cutscene_actors(bound);
             if c.from_dialog {
                 self.close_dialog_cutscene(&c.name, true);
+                self.finish_explicit_dialog_speech(&c);
             } else {
                 self.close_cutscene(&c.name, true);
             }
@@ -1548,6 +1549,7 @@ impl Sim {
                     actor: r.actor,
                     conversation: Some(r.dialog),
                     vo_mode: r.vo_mode,
+                    explicit_text: false,
                 });
             }
             *next += 1;
@@ -7465,6 +7467,7 @@ mod tests {
                 actor: "duncan".into(),
                 conversation: None,
                 vo_mode: 0,
+                explicit_text: true,
             }],
             elapsed_ms: 0,
             from_dialog: false,
