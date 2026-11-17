@@ -837,16 +837,16 @@ impl Live {
     }
 
     /// Advances the simulation by `dt_ms` of real time (at most [`MAX_STEP_MS`]), unless
-    /// paused.
-    pub fn step(&mut self, dt_ms: f64) {
+    /// paused. Returns the number of simulation Tick commands consumed (zero or one).
+    pub fn step(&mut self, dt_ms: f64) -> usize {
         if self.front_end || self.loading() {
-            return;
+            return 0;
         }
         // What the player and the interface gave since the last step goes to the journal
         // first, in the order given.
         self.keep_journal();
         if self.paused {
-            return;
+            return 0;
         }
         // A training tutorial holds the game's time until its mode ends, but its script
         // still runs: the exe runs `genev_tutorial` for each training event while the game
@@ -859,11 +859,11 @@ impl Live {
                 thedas_sim::commands::CommandSource::App,
                 thedas_sim::commands::SimCommand::Tick { ms: 0 },
             );
-            return;
+            return 1;
         }
         // A tutorial that pauses the game holds it until its popup is dismissed.
         if self.sim().tutorial_paused() {
-            return;
+            return 0;
         }
         self.owed_ms += dt_ms.clamp(0.0, MAX_STEP_MS);
         let whole = self.owed_ms.floor();
@@ -883,7 +883,9 @@ impl Live {
                     started.elapsed().as_secs_f64() * 1000.0
                 );
             }
+            return 1;
         }
+        0
     }
 
     /// Whether a new level is being built (see [`Live::async_loads`]): the world does not
