@@ -149,6 +149,10 @@ pub struct Object {
     #[serde(default)]
     pub quick_placed: std::collections::BTreeSet<String>,
     pub dead: bool,
+    /// Origins' inverse of the creature's controllable flag. Script primary
+    /// selection clears this even when insufficient health prevents selection.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) uncontrollable: bool,
     /// When the creature last died (simulation milliseconds); `None` while alive. For
     /// presentation (the death animation plays from it) and saves.
     #[serde(default)]
@@ -272,6 +276,7 @@ impl Object {
             quickslots: BTreeMap::new(),
             quick_placed: Default::default(),
             dead: false,
+            uncontrollable: false,
             died_at: None,
             decay_ms: 0,
             decay_forced: false,
@@ -743,6 +748,18 @@ pub struct World {
     /// [`World::controlled`]). Saved.
     #[serde(default)]
     pub controlled: Option<ObjectId>,
+    /// Origins' explicit party leader, independent of the selected character.
+    /// Older snapshots use the hero until a script assigns a leader.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) party_leader: Option<ObjectId>,
+    /// Origins' member order after a leader is moved to the front. Membership
+    /// still comes from the hero/follower registry; new members append to this.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) party_order: Vec<ObjectId>,
+    /// The Origins native can select a living creature outside the party too.
+    /// Player selection clears this override and resumes the membership check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) script_controlled: Option<ObjectId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_request: Option<crate::target_request::TargetRequest>,
     pub party: Option<ObjectId>,
@@ -1046,6 +1063,9 @@ impl World {
             da2_encounter_order: Vec::new(),
             hero: None,
             controlled: None,
+            party_leader: None,
+            party_order: Vec::new(),
+            script_controlled: None,
             target_request: None,
             party: None,
             plots: BTreeMap::new(),
@@ -1117,6 +1137,12 @@ impl World {
     /// The party member the player controls (`GetMainControlled`): the one chosen, while it
     /// is still in the party and alive enough to exist, else the hero.
     pub fn controlled(&self) -> Option<ObjectId> {
+        if let Some(c) = self
+            .script_controlled
+            .filter(|&c| self.get(c).is_some_and(|o| o.kind == ObjectKind::Creature))
+        {
+            return Some(c);
+        }
         let hero = self.hero;
         let chosen = self.controlled.filter(|&c| {
             Some(c) == hero
@@ -1280,6 +1306,7 @@ impl World {
                 self.objects.remove(&id);
                 self.da2_projectiles.remove(&id);
                 self.da2_encounter_order.retain(|&c| c != id);
+                self.party_order.retain(|&c| c != id);
                 // A destroyed follower leaves the party (the list holds no dead ids).
                 if let Some(h) = self.hero.and_then(|h| self.objects.get_mut(&h)) {
                     h.followers.retain(|&f| f != id);

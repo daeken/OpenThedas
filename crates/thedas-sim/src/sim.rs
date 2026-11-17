@@ -1804,6 +1804,9 @@ impl Sim {
     /// available DROPPED at 0x637168; also the picker GUI, 0x766c10), never from
     /// `SetFollowerState`.
     pub(crate) fn party_membership_changed(&mut self, who: ObjectId, joined: bool) {
+        if !joined {
+            self.world.party_order.retain(|&m| m != who);
+        }
         let Some(module) = self.world.module else {
             return;
         };

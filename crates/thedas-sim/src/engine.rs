@@ -1250,6 +1250,49 @@ pub fn call(
         "GetPCSpeaker" if h.sim.game == thedas_vfs::Game::Origins => ok(Value::Object(
             h.sim.world.controlled().unwrap_or(OBJECT_INVALID),
         )),
+        "GetPartyLeader" if h.sim.game == thedas_vfs::Game::Origins => ok(Value::Object(
+            h.sim
+                .world
+                .party_leader
+                .or(h.sim.world.hero)
+                .unwrap_or(OBJECT_INVALID),
+        )),
+        "SetPartyLeader" if h.sim.game == thedas_vfs::Game::Origins => {
+            let who = obj(a, 0);
+            // 0x661320 -> 0x636180: any resolved creature may be the leader.
+            // Party enumeration puts it first only if it is already a member.
+            if h.object(who)
+                .is_some_and(|o| o.kind == ObjectKind::Creature)
+            {
+                h.sim.world.party_leader = Some(who);
+                let mut members = party_of(h.sim);
+                if let Some(i) = members.iter().position(|&m| m == who) {
+                    members.remove(i);
+                    members.insert(0, who);
+                    h.sim.world.party_order = members;
+                }
+            }
+            void()
+        }
+        "SetPrimaryControlled" if h.sim.game == thedas_vfs::Game::Origins => {
+            let who = obj(a, 0);
+            // 0x661050 -> 0x6a5f40(true), then virtual +0x1d0 (0x6a3660).
+            // The predicate uses integer current health, not the saved dead bit.
+            let eligible = h.sim.world.get_mut(who).is_some_and(|o| {
+                if o.kind != ObjectKind::Creature {
+                    return false;
+                }
+                o.uncontrollable = false;
+                o.properties
+                    .get(&7)
+                    .is_some_and(|&(_, current)| (1.0..2147483648.0).contains(&current))
+            });
+            if eligible {
+                h.sim.world.controlled = Some(who);
+                h.sim.world.script_controlled = (!party_of(h.sim).contains(&who)).then_some(who);
+            }
+            void()
+        }
         "GetPartyLeader" | "GetMainControlled" => ok(Value::Object(
             h.sim.world.controlled().unwrap_or(OBJECT_INVALID),
         )),
@@ -4026,6 +4069,12 @@ pub fn call(
                         ho.followers.push(who);
                     }
                 }
+                if !h.sim.world.party_order.is_empty() {
+                    h.sim.world.party_order.retain(|&m| m != who);
+                    if active {
+                        h.sim.world.party_order.push(who);
+                    }
+                }
                 // Joining the active party puts a follower on the player's side
                 // (GROUP_PC), whatever group it had as an NPC, and at the leader's side if
                 // it was elsewhere. Provisional.
@@ -6222,6 +6271,20 @@ pub fn party_of(sim: &Sim) -> Vec<ObjectId> {
     if let Some(h) = hero.and_then(|h| sim.world.get(h)) {
         v.extend(h.followers.iter().copied());
     }
+    if sim.game == thedas_vfs::Game::Origins && !sim.world.party_order.is_empty() {
+        let mut ordered = Vec::with_capacity(v.len());
+        for &id in &sim.world.party_order {
+            if v.contains(&id) && !ordered.contains(&id) {
+                ordered.push(id);
+            }
+        }
+        for id in v {
+            if !ordered.contains(&id) {
+                ordered.push(id);
+            }
+        }
+        return ordered;
+    }
     v
 }
 
@@ -6568,6 +6631,192 @@ mod tests {
     use thedas_vfs::Vfs;
 
     use super::*;
+
+    fn party_control_sim() -> (Sim, [ObjectId; 4]) {
+        let table = EngineTable::parse(
+            b"\
+            void SetPartyLeader(object o) = 625;\n\
+            void SetPrimaryControlled(object o) = 815;\n\
+            object GetPartyLeader() = 624;\n\
+            object GetMainControlled() = 115;\n\
+            void SetFollowerState(object o, int n) = 4;\n\
+            int FOLLOWER_STATE_ACTIVE = 1;\n\
+            int FOLLOWER_STATE_LOCKEDACTIVE = 5;\n\
+            object[] GetPartyList() = 255;\n",
+        )
+        .unwrap();
+        let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(table), 1);
+        let members = std::array::from_fn(|i| {
+            let id = s.world.spawn(ObjectKind::Creature, &format!("member_{i}"));
+            s.world
+                .get_mut(id)
+                .unwrap()
+                .properties
+                .insert(7, (10.0, 10.0));
+            id
+        });
+        s.world.hero = Some(members[0]);
+        s.world.get_mut(members[0]).unwrap().followers = members[1..].to_vec();
+        (s, members)
+    }
+
+    #[test]
+    fn party_control_leader_and_primary_selection_are_independent() {
+        let (mut s, m) = party_control_sim();
+        run(&mut s, m[0], "SetPartyLeader", &[Value::Object(m[2])]);
+        assert_eq!(
+            run(&mut s, m[0], "GetPartyLeader", &[]),
+            Some(Value::Object(m[2]))
+        );
+        assert_eq!(
+            run(&mut s, m[0], "GetMainControlled", &[]),
+            Some(Value::Object(m[0]))
+        );
+        assert_eq!(party_of(&s), vec![m[2], m[0], m[1], m[3]]);
+        run(&mut s, m[0], "SetPartyLeader", &[Value::Object(m[1])]);
+        assert_eq!(party_of(&s), vec![m[1], m[2], m[0], m[3]]);
+        run(&mut s, m[0], "SetPrimaryControlled", &[Value::Object(m[3])]);
+        assert_eq!(s.world.controlled(), Some(m[3]));
+        assert_eq!(s.world.party_leader, Some(m[1]));
+        assert_eq!(
+            run(&mut s, m[0], "GetPartyList", &[]),
+            Some(objects(vec![m[1], m[2], m[0], m[3]]))
+        );
+        assert_eq!(s.world.hero, Some(m[0]));
+        assert!(
+            s.world.queue.is_empty(),
+            "script selection does not synthesize player training events"
+        );
+    }
+
+    #[test]
+    fn party_control_primary_uses_integer_health_and_restores_controllability_first() {
+        for (health, eligible) in [
+            (None, false),
+            (Some(0.0), false),
+            (Some(-1.0), false),
+            (Some(0.9), false),
+            (Some(1.0), true),
+            (Some(f32::NAN), false),
+            (Some(f32::INFINITY), false),
+            (Some(2147483648.0), false),
+        ] {
+            let (mut s, m) = party_control_sim();
+            let target = s.world.get_mut(m[1]).unwrap();
+            target.uncontrollable = true;
+            target.dead = true;
+            target.active = false;
+            target.properties.remove(&7);
+            if let Some(h) = health {
+                target.properties.insert(7, (h, h));
+            }
+            run(&mut s, m[0], "SetPrimaryControlled", &[Value::Object(m[1])]);
+            assert!(!s.world.get(m[1]).unwrap().uncontrollable);
+            assert_eq!(
+                s.world.controlled(),
+                Some(if eligible { m[1] } else { m[0] }),
+                "health={health:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn party_control_native_selection_can_resolve_a_nonmember_and_player_selection_clears_it() {
+        let (mut s, m) = party_control_sim();
+        let other = s.world.spawn(ObjectKind::Creature, "other");
+        s.world
+            .get_mut(other)
+            .unwrap()
+            .properties
+            .insert(7, (10.0, 10.0));
+        run(&mut s, m[0], "SetPartyLeader", &[Value::Object(other)]);
+        assert_eq!(party_of(&s), m.to_vec());
+        assert_eq!(s.world.party_leader, Some(other));
+        run(
+            &mut s,
+            m[0],
+            "SetPrimaryControlled",
+            &[Value::Object(other)],
+        );
+        assert_eq!(s.world.controlled(), Some(other));
+        assert!(!party_of(&s).contains(&other));
+        s.player_selects(m[1]);
+        assert_eq!(s.world.controlled(), Some(m[1]));
+        assert!(s.world.script_controlled.is_none());
+    }
+
+    #[test]
+    fn party_control_invalid_objects_do_not_replace_current_state() {
+        let (mut s, m) = party_control_sim();
+        run(&mut s, m[0], "SetPartyLeader", &[Value::Object(m[1])]);
+        run(&mut s, m[0], "SetPrimaryControlled", &[Value::Object(m[2])]);
+        let item = s.world.spawn(ObjectKind::Item, "item");
+        for id in [item, OBJECT_INVALID, 123456789] {
+            for name in ["SetPartyLeader", "SetPrimaryControlled"] {
+                run(&mut s, m[0], name, &[Value::Object(id)]);
+            }
+        }
+        assert_eq!(s.world.party_leader, Some(m[1]));
+        assert_eq!(s.world.controlled(), Some(m[2]));
+    }
+
+    #[test]
+    fn party_control_member_removal_drops_its_order_slot_and_primary_falls_back() {
+        let (mut s, m) = party_control_sim();
+        run(&mut s, m[0], "SetPartyLeader", &[Value::Object(m[2])]);
+        run(&mut s, m[0], "SetPrimaryControlled", &[Value::Object(m[2])]);
+        run(
+            &mut s,
+            m[0],
+            "SetFollowerState",
+            &[Value::Object(m[2]), Value::Int(0)],
+        );
+        assert_eq!(s.world.controlled(), Some(m[0]));
+        assert_eq!(party_of(&s), vec![m[0], m[1], m[3]]);
+        run(
+            &mut s,
+            m[0],
+            "SetFollowerState",
+            &[Value::Object(m[2]), Value::Int(1)],
+        );
+        assert_eq!(party_of(&s), vec![m[0], m[1], m[3], m[2]]);
+    }
+
+    #[test]
+    fn party_control_json_retains_explicit_state_and_old_worlds_use_hero_defaults() {
+        let (mut s, m) = party_control_sim();
+        run(&mut s, m[0], "SetPartyLeader", &[Value::Object(m[2])]);
+        run(&mut s, m[0], "SetPrimaryControlled", &[Value::Object(m[1])]);
+        let mut restored = party_control_sim().0;
+        restored.world = serde_json::from_slice(&serde_json::to_vec(&s.world).unwrap()).unwrap();
+        assert_eq!(restored.world.controlled(), Some(m[1]));
+        assert_eq!(party_of(&restored), party_of(&s));
+        assert_eq!(restored.world.party_leader, Some(m[2]));
+        let mut value = serde_json::to_value(&s.world).unwrap();
+        for name in ["party_leader", "party_order", "script_controlled"] {
+            value.as_object_mut().unwrap().remove(name);
+        }
+        let old: crate::World = serde_json::from_value(value).unwrap();
+        assert!(old.party_leader.is_none() && old.party_order.is_empty());
+        assert!(old.script_controlled.is_none());
+    }
+
+    #[test]
+    fn party_control_da2_dispatch_remains_unchanged() {
+        let (mut s, m) = party_control_sim();
+        s.game = thedas_vfs::Game::DragonAge2;
+        for name in ["SetPartyLeader", "SetPrimaryControlled"] {
+            let f = s.table.function_by_name(name).unwrap().clone();
+            let mut h = ScriptHost {
+                sim: &mut s,
+                event: None,
+                script: "test".into(),
+            };
+            assert!(call(&mut h, m[0], &f, &[Value::Object(m[1])]).is_none());
+        }
+        assert!(s.world.party_leader.is_none());
+        assert_eq!(s.world.controlled(), Some(m[0]));
+    }
 
     #[test]
     fn ring_weapon_queries_dispatch_and_play_time_units() {
