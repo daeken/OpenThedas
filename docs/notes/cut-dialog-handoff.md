@@ -58,7 +58,7 @@ static analysis. The cut update and the dialog graph have separate state.
   counts active voices. OpenThedas's `cut_lines_left` counts extra graph
   entries inferred from textless references, a different quantity.
 - The dialog skip callback at 0x68dc10 checks its guard and current cut state
-  before calling 0x7cf2e0 at 0x68dca8. If a skip point at or after the current
+  before calling 0x7cf2e0 at 0x68dca8. If a skip point after the current
   time exists, 0x7cf2e0 stores it at cut +0x1b0 and returns success. The cut
   update seeks there and resets actor tracks and +0xe8 at
   0x7e430c–0x7e4380. If there is no point, the callback sets cut +0x1b4
