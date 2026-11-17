@@ -3537,8 +3537,8 @@ pub fn call(
             let c = h
                 .object(obj(a, 0))
                 .and_then(|o| o.commands.first())
-                // Origins 0x73c5f0 reads only the separate active executor.
-                .filter(|c| h.sim.game != thedas_vfs::Game::Origins || c.due.is_some())
+                // Origins 0x73c5f0 and DA2 0x5a8d40 read the separate active executor.
+                .filter(|c| c.due.is_some())
                 .cloned();
             let hd = c.map(|c| h.sim.world.store(EngineData::Command(c)));
             ok(Value::Engine {

@@ -106,7 +106,7 @@ impl Sim {
                     old.due.is_some() && !equal && (!old.is_static || behavior == 2)
                     // Task 37 is enqueued protected (0x6d861e..0x6d8629).
                     // Ready handoff succeeds through the dispatcher instead.
-                    && (old.name != "CommandUseAbility" || old.from.is_some())
+                    && (old.name != "CommandUseAbility" || old.from.is_some() || old.ints.first() == Some(&1))
                 });
             if clear {
                 let old = self.world.get_mut(who).unwrap().commands.remove(0);

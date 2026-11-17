@@ -1718,6 +1718,11 @@ impl Sim {
         let ability = cmd.ints.first().copied().unwrap_or(0);
         self.prepare_da2_combat_target(id, cmd);
         let item = self.ability_item(id, cmd);
+        let pending_command = if self.game == thedas_vfs::Game::DragonAge2 {
+            self.world.get(id).and_then(|o| o.commands.first()).cloned()
+        } else {
+            None
+        };
         let mut ev = self.new_event("COMMAND_PENDING", Some(id));
         ev.objects = vec![id, target, item];
         ev.ints = vec![cmd.ty, ability];
@@ -1733,7 +1738,7 @@ impl Sim {
                 if self.game == thedas_vfs::Game::Origins {
                     c == cmd
                 } else {
-                    c.name == cmd.name && c.ints == cmd.ints && c.target == cmd.target
+                    Some(c) == pending_command.as_ref()
                 }
             });
         if !still {
