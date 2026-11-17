@@ -15,6 +15,7 @@ use std::sync::Arc;
 use thedas_formats::level::NavGrid;
 use thedas_script::vm::ObjectId;
 
+use crate::fmath::DetMath;
 use crate::sim::Sim;
 
 /// The largest height change between neighbouring cells a walker can take, in metres.
@@ -188,11 +189,32 @@ pub fn route_avoiding(
     blocked: &std::collections::HashSet<usize>,
 ) -> Option<Vec<[f32; 3]>> {
     let start = nearest_walkable(g, from)?;
+    if g.cell(from) != Some(start) {
+        let m = g.center(start);
+        // A path must join the mover, rather than start in another room/floor.
+        // Provisional recovery for a saved position just outside a cell.
+        if ((m[0] - from[0]).powi(2) + (m[1] - from[1]).powi(2)).sqrt() > 1.5 * g.cell_size
+            || (height(g, start) - from[2]).abs() > MAX_STEP
+        {
+            return None;
+        }
+    }
     let goal = nearest_walkable(g, to)?;
     let idx = |c: (u32, u32)| (c.1 * g.columns + c.0) as usize;
     // The cells a route may use: the search and the straightening of its route
     // ([`straighten`]) both go by this, and step between cells by [`passable`].
     let free = |c: (u32, u32)| walkable(g, c) && !blocked.contains(&idx(c));
+    if !free(start) || !free(goal) {
+        return None;
+    }
+    // Keep the route's actual repaired endpoint. Appending the original off-grid
+    // point would undo the search and cross a wall or change floors at arrival.
+    let to = if g.cell(to) == Some(goal) {
+        to
+    } else {
+        let m = g.center(goal);
+        [m[0], m[1], height(g, goal)]
+    };
     // A straight line that is clear needs no search (DAOrigins.exe 0xa4e1b0 tries
     // 0xa4bb80 from start to goal first, 0xa4e20a-0xa4e26a).
     if straight_clear(g, from, to, &free) {
@@ -404,10 +426,6 @@ fn straight_clear(
 /// `StateCnt_AreaTransition`, ...). The column's name is not known.
 const COL_STATE_CONTROLLER: u32 = 0x9a32_0a51;
 
-/// `placeable_types.gda`: a placeable appearance's animation set (`PRB_door.anb`), empty
-/// for one that never moves. The column's name is not known.
-const COL_ANIMATION_SET: u32 = 0x70f4_63fa;
-
 /// How far a closed door's doorway reaches from the door, in metres. Provisional: the gaps
 /// the pathing grid leaves in walls where doors stand are about 2.5 m wide.
 pub const DOORWAY_RADIUS: f32 = 1.25;
@@ -416,21 +434,19 @@ pub const DOORWAY_RADIUS: f32 = 1.25;
 /// widest doors are under 6 m).
 const LEAF_REACH: f32 = 6.0;
 
-/// The pathing-grid cells of a door's doorway: the walkable cells within
-/// [`DOORWAY_RADIUS`] of the door, and those its shut leaf lies across (`leaf`: the door
-/// model's collision at rest). A door stands at its hinge, so a wide one reaches further
+/// The pathing-grid cells its shut leaf lies across (`leaf`: the door
+/// model's collision at rest), falling back to [`DOORWAY_RADIUS`] without a model.
+/// A door stands at its hinge, so a wide one reaches further
 /// from it than the radius: the Dalish ruins' mirror room door (`bed110ip_mirror_door`, a
 /// 2.7 m leaf) left the far half of its doorway open, and a walker went through the shut
 /// door without using it (using it is what wakes the bereskarn). A cell is under the leaf
-/// when one of its edges crosses it, 0.5 or 1.5 m above the floor. A door that never moves
-/// (`swings` false: a gate model without an animation set, such as Ostagar's open Tower
-/// gate, `Gate, Large, Open`) takes only the cells under its model, not the radius: the
-/// way between its open leaves stays free.
+/// when one of its edges crosses it, 0.5 or 1.5 m above the floor. The model's
+/// footprint also keeps an open gate's middle free. Adding a hinge radius when
+/// there is real collision can prevent reaching the native use point.
 pub(crate) fn doorway_cells(
     g: &NavGrid,
     door: [f32; 3],
     leaf: Option<&crate::collision::Collision>,
-    swings: bool,
 ) -> Vec<usize> {
     let Some((cx, cy)) = g.cell(door) else {
         return Vec::new();
@@ -450,11 +466,11 @@ pub(crate) fn doorway_cells(
                 continue;
             }
             let c = (x as u32, y as u32);
-            if !walkable(g, c) {
+            if !walkable(g, c) && g.value(c) & 0xf != 8 {
                 continue;
             }
             let m = g.center(c);
-            let near = (swings || leaf.is_none())
+            let near = leaf.is_none()
                 && crate::engine::dist(m, [door[0], door[1], m[2]]) <= DOORWAY_RADIUS;
             let under = || {
                 leaf.is_some_and(|l| {
@@ -518,6 +534,42 @@ impl DoorSight {
 
 /// A door and the grid cells of its doorway (row-major indices).
 pub type Doorway = (thedas_script::vm::ObjectId, Vec<usize>);
+
+/// First blocked doorway crossed by any part of a route, and the continuous prefix
+/// before it. Retained route points can be farther apart than a door is thick.
+pub(crate) fn first_door_on_path(
+    grid: &NavGrid,
+    from: [f32; 3],
+    path: &[[f32; 3]],
+    doors: &[Doorway],
+) -> Option<(ObjectId, Vec<[f32; 3]>)> {
+    let mut prefix = Vec::new();
+    let mut at = from;
+    for &to in path {
+        let dx = to[0] - at[0];
+        let dy = to[1] - at[1];
+        let steps = (((dx * dx + dy * dy).sqrt() / (grid.cell_size * 0.5)).ceil() as usize).max(1);
+        let mut last = at;
+        for k in 1..=steps {
+            let t = k as f32 / steps as f32;
+            let p = [at[0] + dx * t, at[1] + dy * t, at[2] + (to[2] - at[2]) * t];
+            let cell = grid.cell(p).map(|(x, y)| (y * grid.columns + x) as usize);
+            if let Some((id, _)) = doors
+                .iter()
+                .find(|d| cell.is_some_and(|i| d.1.contains(&i)))
+            {
+                if last != at {
+                    prefix.push(last);
+                }
+                return Some((*id, prefix));
+            }
+            last = p;
+        }
+        prefix.push(to);
+        at = to;
+    }
+    None
+}
 
 /// How a mover gets somewhere (see `Sim::route_to`).
 #[derive(Clone, Debug, PartialEq)]
@@ -587,12 +639,67 @@ pub fn wall_between(g: &NavGrid, a: [f32; 3], b: [f32; 3]) -> bool {
 }
 
 impl Sim {
+    /// A body already inside a doorway can leave on its own side of the leaf.
+    /// Shared by planning and locomotion. Provisional: a saved overlap is resolved
+    /// toward the nearest free sample; without a model the doorway is released.
+    pub(crate) fn doors_from(
+        &mut self,
+        area: ObjectId,
+        g: &NavGrid,
+        from: [f32; 3],
+        mut doors: Vec<Doorway>,
+    ) -> Vec<Doorway> {
+        let Some(own) = g.cell(from).map(|c| (c.1 * g.columns + c.0) as usize) else {
+            return doors;
+        };
+        if !doors.iter().any(|d| d.1.contains(&own)) {
+            return doors;
+        }
+        let leaves = self.door_sight(area);
+        let mut eye = [from[0], from[1], from[2] + 1.0];
+        let inside = |q: [f32; 3]| {
+            leaves
+                .solid
+                .iter()
+                .any(|l| l.blocked(q, [q[0], q[1], q[2] + 0.01]))
+        };
+        if inside(eye) {
+            'out: for k in 1..=16 {
+                let r = k as f32 * 0.05;
+                for a in 0..16 {
+                    let t = a as f32 * std::f32::consts::TAU / 16.0;
+                    let q = [eye[0] + r * t.dcos(), eye[1] + r * t.dsin(), eye[2]];
+                    if !inside(q) {
+                        eye = q;
+                        break 'out;
+                    }
+                }
+            }
+        }
+        let near = |i: usize| {
+            let c = ((i as u32) % g.columns, (i as u32) / g.columns);
+            let m = g.center(c);
+            let m = [m[0], m[1], height(g, c) + 1.0];
+            !leaves.solid.iter().any(|l| l.blocked(eye, m))
+        };
+        for d in doors.iter_mut().filter(|d| d.1.contains(&own)) {
+            let far: Vec<_> = d.1.iter().copied().filter(|&i| !near(i)).collect();
+            // Deep overlaps still need an exit, as the existing path rule allows.
+            d.1 = if far.len() == d.1.len() {
+                Vec::new()
+            } else {
+                far
+            };
+        }
+        doors
+    }
+
     /// The closed doors of an area with the pathing-grid cells of their doorways: doors are
     /// the placeables whose appearance's state controller (`placeable_types.gda`) is
     /// `StateCnt_Door`; a door is closed in states 0 and 1 (`statecnt_door.gda`:
     /// Closed_Unlocked, Closed_Locked), its state being field `State` (initially `InitialState`)
-    /// or else the template's `AnimContState`. The doorway is the walkable cells within
-    /// [`DOORWAY_RADIUS`] of the door.
+    /// or else the template's `AnimContState`. Its rest PHY covers the doorway,
+    /// with [`DOORWAY_RADIUS`] as a fallback when the model has no collision.
     pub fn closed_doors(
         &mut self,
         area: thedas_script::vm::ObjectId,
@@ -618,7 +725,7 @@ impl Sim {
                     o.active
                         && (state == 0 || state == 1)
                         && o.placeable_group
-                            .is_none_or(|g| g & thedas_formats::phy::mask::NON_WALKABLE != 0)
+                            .is_none_or(|g| g & thedas_formats::phy::mask::MOVEMENT != 0)
                 })
             })
             .cloned()
@@ -702,18 +809,14 @@ impl Sim {
                     _ => None,
                 })
                 .filter(|m| !m.is_empty())
-                .map(|m| crate::collision::load_placeables(&self.vfs, &[(m, o.position, o.facing)]))
+                .map(|m| {
+                    crate::collision::load_movement_placeables(
+                        &self.vfs,
+                        &[(m, o.position, o.facing)],
+                    )
+                })
                 .filter(|c| !c.is_empty());
-            // A door without an animation set never opens or shuts: what blocks is its
-            // model as it stands. Provisional: how DAOrigins.exe keeps walkers out of a
-            // door's way is not traced (its collision is a PhysX shape, see SIM-013).
-            let swings = types.as_ref().is_none_or(|t| {
-                matches!(
-                    t.cell_by_hash(COL_ANIMATION_SET, o.appearance as i64),
-                    Some(thedas_formats::gda::Cell::String(a)) if !crate::engine::clean(a).is_empty()
-                )
-            });
-            out.push((o.id, doorway_cells(&g, o.position, leaf.as_ref(), swings)));
+            out.push((o.id, doorway_cells(&g, o.position, leaf.as_ref())));
         }
         out
     }
@@ -2106,7 +2209,7 @@ mod tests {
         let door = [5.25, 4.75, 0.0];
         let gap: Vec<usize> = (4..10).map(|y| (y * w + 10) as usize).collect();
         // By the radius alone the far half of the gap is left open (rows 4 to 6).
-        let by_radius = doorway_cells(&g, door, None, true);
+        let by_radius = doorway_cells(&g, door, None);
         assert!(gap[3..].iter().all(|c| by_radius.contains(c)));
         assert!(gap[..3].iter().all(|c| !by_radius.contains(c)));
         // With the leaf (a wall 2.7 m wide and 3.9 m tall from the hinge) all of it shuts.
@@ -2115,7 +2218,7 @@ mod tests {
             [[5.25, bottom, 0.0], [5.25, top, 0.0], [5.25, top, 3.9]],
             [[5.25, bottom, 0.0], [5.25, top, 3.9], [5.25, bottom, 3.9]],
         ]);
-        let with_leaf = doorway_cells(&g, door, Some(&leaf), true);
+        let with_leaf = doorway_cells(&g, door, Some(&leaf));
         assert!(gap.iter().all(|c| with_leaf.contains(c)), "{with_leaf:?}");
         // Nothing beyond the wall's line is taken that the radius did not take.
         assert!(
@@ -2159,12 +2262,37 @@ mod tests {
         let tris: Vec<[[f32; 3]; 3]> = wall(4.25).into_iter().chain(wall(10.75)).collect();
         let leaves = crate::collision::Collision::from_triangles(&tris);
         let middle = (gate[1] / 0.5) as u32 * w + 10;
-        let fixed = doorway_cells(&g, gate, Some(&leaves), false);
+        let fixed = doorway_cells(&g, gate, Some(&leaves));
         assert!(!fixed.contains(&(middle as usize)), "{fixed:?}");
         assert!(!fixed.is_empty(), "the leaves' own cells are taken");
-        // A door that swings shuts its middle whatever its model at rest.
-        let swinging = doorway_cells(&g, gate, Some(&leaves), true);
-        assert!(swinging.contains(&(middle as usize)));
+        // A model-free approximation still needs a fallback doorway.
+        let fallback = doorway_cells(&g, gate, None);
+        assert!(fallback.contains(&(middle as usize)));
+    }
+
+    #[test]
+    fn doors_regression_c_real_leaves_do_not_block_the_use_clearance() {
+        let grid = NavGrid {
+            columns: 20,
+            rows: 20,
+            cell_size: 0.5,
+            clearance: 2.0,
+            base: [0.0; 3],
+            normal: [0.0, 0.0, 1.0],
+            data: vec![1; 400],
+            heights: vec![0.0; 400],
+            surfaces: Vec::new(),
+        };
+        let leaf = crate::collision::Collision::from_triangles(&[
+            [[5.1, 4.0, 0.0], [5.1, 6.0, 0.0], [5.1, 6.0, 3.0]],
+            [[5.1, 4.0, 0.0], [5.1, 6.0, 3.0], [5.1, 4.0, 3.0]],
+        ]);
+        let cells = doorway_cells(&grid, [5.0, 5.0, 0.0], Some(&leaf));
+        let c = grid.cell([4.25, 5.25, 0.0]).unwrap();
+        assert!(
+            !cells.contains(&((c.1 * grid.columns + c.0) as usize)),
+            "a radius blocks the physical use point"
+        );
     }
 
     /// The grid of [`grid`] with a closed door in the wall's gap, and a walker.
@@ -2228,7 +2356,12 @@ mod tests {
         let (mut s, walker, _, _) = door_in_the_gap([0.5, 0.5, 0.0]);
         s.world.trace.keep = true;
         s.order_move(walker, [4.5, 2.5, 0.0]);
-        s.tick(0);
+        for _ in 0..100 {
+            s.tick(33);
+            if s.world.get(walker).unwrap().combat.path_action_at.is_some() {
+                break;
+            }
+        }
         assert!(s.world.get(walker).unwrap().combat.path_action_at.is_some());
         // Let go: a stop where it stands, before the failure is told.
         let here = s.world.get(walker).unwrap().position;
@@ -2239,7 +2372,12 @@ mod tests {
         let (mut s, walker, _, _) = door_in_the_gap([0.5, 0.5, 0.0]);
         s.world.trace.keep = true;
         s.order_move(walker, [4.5, 2.5, 0.0]);
-        s.tick(0);
+        for _ in 0..100 {
+            s.tick(33);
+            if s.world.get(walker).unwrap().combat.path_action_at.is_some() {
+                break;
+            }
+        }
         s.order_move(walker, [4.6, 2.4, 0.0]);
         s.tick(300);
         assert!(!dropped(&s));
@@ -2296,6 +2434,162 @@ mod tests {
             s.route_to(walker, [4.5, 0.5, 0.0]),
             Routed::Door(_)
         ));
+    }
+
+    #[test]
+    fn doors_regression_a_checks_the_whole_leg_between_waypoints() {
+        let (mut s, walker, area, _) = door_in_the_gap([0.5, 2.5, 0.0]);
+        let door = s.closed_doors(area)[0].0;
+        // A narrow leaf between two retained points of a straightened route.
+        s.door_cells.insert(area, Arc::new(vec![(door, vec![12])]));
+        assert_eq!(s.route_to(walker, [4.5, 2.5, 0.0]), Routed::Door(door));
+    }
+
+    #[test]
+    fn doors_regression_a_locked_footprints_do_not_take_the_flat_fallback() {
+        let (mut s, walker, area, g) = door_in_the_gap([0.5, 2.5, 0.0]);
+        let door = s.closed_doors(area)[0].0;
+        let o = s.world.get_mut(door).unwrap();
+        o.fields.insert("State".into(), 1);
+        o.placeable_group = Some(thedas_formats::phy::mask::PLACEABLES);
+        let mut g = (*g).clone();
+        g.data[12] = 8;
+        s.changed_nav_grids.insert(area, Arc::new(g));
+        s.door_cells.remove(&area);
+        assert_eq!(s.route_to(walker, [4.5, 2.5, 0.0]), Routed::Door(door));
+    }
+
+    #[test]
+    fn doors_regression_a_a_door_shut_after_planning_still_blocks_the_body() {
+        let (mut s, walker, area, _) = door_in_the_gap([0.5, 2.5, 0.0]);
+        let door = s.closed_doors(area)[0].0;
+        s.world
+            .get_mut(door)
+            .unwrap()
+            .fields
+            .insert("State".into(), 2);
+        s.order_move(walker, [4.5, 2.5, 0.0]);
+        s.tick(50);
+        s.world
+            .get_mut(door)
+            .unwrap()
+            .fields
+            .insert("State".into(), 0);
+        s.tick(2_000);
+        let p = s.world.get(walker).unwrap().position;
+        assert!(p[0] < 2.0, "walked through a newly closed door: {p:?}");
+        assert!(!s.world.get(walker).unwrap().commands.is_empty());
+    }
+
+    #[test]
+    fn doors_regression_a_a_stale_route_cannot_cross_a_carved_door_cell() {
+        use std::hash::{Hash, Hasher};
+        let (mut s, walker, area, _) = door_in_the_gap([2.25, 2.5, 0.0]);
+        let door = s.closed_doors(area)[0].0;
+        s.door_cells.insert(area, Arc::new(vec![(door, vec![12])]));
+        let leaf = crate::collision::Collision::from_triangles(&[
+            [[2.6, 2.0, 0.0], [2.6, 3.0, 0.0], [2.6, 3.0, 3.0]],
+            [[2.6, 2.0, 0.0], [2.6, 3.0, 3.0], [2.6, 2.0, 3.0]],
+        ]);
+        let o = s.world.get(door).unwrap();
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        (
+            None::<String>,
+            o.position.map(f32::to_bits),
+            o.facing.to_bits(),
+        )
+            .hash(&mut hash);
+        s.door_collisions
+            .insert(door, (hash.finish(), Some(Arc::new(leaf))));
+        s.world
+            .get_mut(door)
+            .unwrap()
+            .fields
+            .insert("State".into(), 2);
+        s.order_move(walker, [4.5, 2.5, 0.0]);
+        s.tick(0);
+        s.world
+            .get_mut(door)
+            .unwrap()
+            .fields
+            .insert("State".into(), 0);
+        s.tick(1_500);
+        let p = s.world.get(walker).unwrap().position;
+        assert!(p[0] < 2.6, "crossed the leaf from a released cell: {p:?}");
+        s.world
+            .get_mut(door)
+            .unwrap()
+            .fields
+            .insert("State".into(), 2);
+        s.tick(1_000);
+        assert!(s.world.get(walker).unwrap().position[0] > 4.4);
+    }
+
+    #[test]
+    fn doors_regression_b_an_opened_door_releases_an_existing_follow_move() {
+        let (mut s, follower, area, _) = door_in_the_gap([0.5, 2.5, 0.0]);
+        let door = s.closed_doors(area)[0].0;
+        s.world
+            .get_mut(door)
+            .unwrap()
+            .fields
+            .insert("State".into(), 2);
+        s.order_move(follower, [4.5, 2.5, 0.0]);
+        s.world.following.insert(follower);
+        s.tick(50);
+        s.world
+            .get_mut(door)
+            .unwrap()
+            .fields
+            .insert("State".into(), 0);
+        s.tick(1_000);
+        let at_door = s.world.get(follower).unwrap().position;
+        s.world
+            .get_mut(door)
+            .unwrap()
+            .fields
+            .insert("State".into(), 2);
+        s.world.get_mut(door).unwrap().placeable_group = Some(1);
+        s.tick(2_000);
+        let p = s.world.get(follower).unwrap().position;
+        assert!(
+            at_door[0] < 2.0 && p[0] > 4.4,
+            "stuck after opening: {at_door:?} -> {p:?}"
+        );
+    }
+
+    #[test]
+    fn doors_regression_e_finishing_a_repaired_route_keeps_its_actual_end() {
+        let (mut s, hero) = walled(|x, _| match x {
+            4 => Some((9, 0.0)),
+            5 | 6 => Some((1, 5.0)),
+            _ => None,
+        });
+        // A script move retains its requested location while route_to repairs it.
+        s.order_move(hero, [3.5, 1.5, 0.0]);
+        s.tick(0);
+        s.world.get_mut(hero).unwrap().commands[0]
+            .location
+            .as_mut()
+            .unwrap()
+            .position = [4.5, 1.5, 5.0];
+        s.tick(3_000);
+        let p = s.world.get(hero).unwrap().position;
+        assert!(
+            crate::engine::dist(p, [3.5, 1.5, 0.0]) < 0.05,
+            "snapped back to requested goal: {p:?}"
+        );
+    }
+
+    #[test]
+    fn doors_regression_e_a_distant_start_cell_is_not_a_route_origin() {
+        let mut g = floor(10, 3);
+        for y in 0..g.rows {
+            for x in 0..5 {
+                g.data[(y * g.columns + x) as usize] = 9;
+            }
+        }
+        assert!(route(&g, [0.5, 1.5, 0.0], [7.5, 1.5, 0.0]).is_none());
     }
 
     #[test]

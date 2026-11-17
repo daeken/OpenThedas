@@ -13,6 +13,71 @@ use crate::sim::Sim;
 use crate::world::ObjectKind;
 
 impl Sim {
+    /// Point on the current footprint nearest the user. Native slot resolution uses
+    /// the transformed PWK rectangle (0x74f240 -> 0x74dfb0), independently of
+    /// creature appearance radii. Provisional fallback: the rest PHY's bounds when
+    /// there is no PWK, then the object's origin when there is no collision model.
+    pub(crate) fn placeable_use_point(
+        &mut self,
+        user: ObjectId,
+        target: ObjectId,
+    ) -> Option<[f32; 3]> {
+        let me = self.world.get(user)?.position;
+        let o = self.world.get(target)?;
+        let (position, facing, area, appearance) = (o.position, o.facing, o.area?, o.appearance);
+        let state = o
+            .fields
+            .get("State")
+            .or_else(|| o.fields.get("AnimContState"))
+            .copied()
+            .unwrap_or(0);
+        let model = self.world.tables().get(93, "").and_then(|t| {
+            match t.cell_by_hash(0xfd84_03d5, i64::from(appearance as u16))? {
+                Cell::String(m) => Some(crate::engine::clean(m).to_string()),
+                _ => None,
+            }
+        });
+        let bounds = model.and_then(|model| {
+            let grid = self
+                .vfs
+                .read(&format!("{model}_{appearance}.pwk"))
+                .ok()
+                .and_then(|(d, _)| thedas_formats::pwk::Pwk::parse(&d).ok())
+                .and_then(|p| p.states.get(state as u16 as usize).cloned().flatten());
+            if let Some(g) = grid {
+                return Some((
+                    g.base,
+                    [
+                        g.base[0] + g.columns as f32 * g.cell_size,
+                        g.base[1] + g.rows as f32 * g.cell_size,
+                        g.base[2],
+                    ],
+                ));
+            }
+            crate::collision::load_movement_placeables(&self.vfs, &[(model, [0.0; 3], 0.0)])
+                .bounds()
+        });
+        let mut point = position;
+        if let Some((lo, hi)) = bounds {
+            let (sin, cos) = facing.to_radians().dsin_cos();
+            let (dx, dy) = (me[0] - position[0], me[1] - position[1]);
+            let local = [dx * cos + dy * sin, -dx * sin + dy * cos];
+            let x = local[0].clamp(lo[0], hi[0]);
+            let y = local[1].clamp(lo[1], hi[1]);
+            point = [
+                position[0] + x * cos - y * sin,
+                position[1] + x * sin + y * cos,
+                me[2],
+            ];
+        }
+        if let Some(g) = self.nav_grid(area)
+            && let Some(c) = g.cell(point)
+        {
+            point[2] = crate::nav::height(&g, c);
+        }
+        Some(point)
+    }
+
     /// The ASCII instance reader writes InitialState directly to the state word
     /// (0x7506ba..0x7506df); model setup then forces that state (0x752a88).
     /// Saved/script-assigned State takes precedence, including on legacy saves.
