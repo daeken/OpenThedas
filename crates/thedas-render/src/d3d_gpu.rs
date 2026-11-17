@@ -59,6 +59,14 @@ struct D3dPipeline {
     blended: bool,
 }
 
+#[derive(Clone, Copy)]
+struct WrittenConstants {
+    width: u32,
+    height: u32,
+    opacity: f32,
+    soft_shadows: bool,
+}
+
 pub(crate) struct D3dDraw {
     pub pipeline: usize,
     vertices: wgpu::Buffer,
@@ -255,10 +263,9 @@ pub(crate) struct D3dPass {
     /// is a moved object's lights, re-picked by [`D3dPass::repick_lights`], which clears
     /// the entry. A setter for any of the fixed inputs must clear the draw's entry here.
     statics: std::sync::Mutex<Vec<Option<Box<StaticConstants>>>>,
-    /// Per draw, what its whole constant slot was last written with (target size and
-    /// opacity), or `None` when it must be written whole: a draw whose slot is current
-    /// gets only its per-frame registers rewritten (the slot keeps the rest between frames).
-    written: std::sync::Mutex<Vec<Option<(u32, u32, f32)>>>,
+    /// Per draw, its last target size, opacity and shadow sampling, or `None` when it must
+    /// be written whole. Current slots only need their per-frame registers rewritten.
+    written: std::sync::Mutex<Vec<Option<WrittenConstants>>>,
     /// The scene's lights, then the lights added since ([`D3dPass::set_extra_lights`]), for
     /// re-picking the lights of objects that move.
     scene_lights: Vec<SceneLight>,
@@ -2922,6 +2929,7 @@ impl D3dPass {
         // The per-frame registers of slots that are otherwise current: (offset, bytes).
         let mut partial: Vec<u8> = Vec::new();
         let mut partial_spans: Vec<(u64, std::ops::Range<usize>)> = Vec::new();
+        let soft_shadows = crate::config::soft_shadows();
         for (i, (d, _)) in self
             .draws
             .iter()
@@ -3006,8 +3014,17 @@ impl D3dPass {
                 }))
             });
             let opacity = self.opacity.get(d.draw).copied().unwrap_or(1.0);
-            let state = (width, height, opacity);
-            if !fresh && opacity >= 1.0 && written[i] == Some(state) {
+            let state = WrittenConstants {
+                width,
+                height,
+                opacity,
+                soft_shadows,
+            };
+            if !fresh
+                && opacity >= 1.0
+                && written[i]
+                    .is_some_and(|s| (s.width, s.height, s.opacity) == (width, height, opacity))
+            {
                 // Only the per-frame registers: filled over the kept constants (the fixed
                 // ones are untouched) and written as one span per register file.
                 for (stage, (table, base)) in tables.into_iter().zip([0, 3]).enumerate() {
@@ -3052,17 +3069,23 @@ impl D3dPass {
                     }
                 }
                 // A tree's alpha reference moves with its LOD.
-                if let Some(Some((_, _, alpha))) = tree_frame.get(d.draw) {
+                let tree_alpha = tree_frame
+                    .get(d.draw)
+                    .and_then(|f| f.map(|(_, _, alpha)| alpha));
+                if tree_alpha.is_some()
+                    || written[i].is_some_and(|s| s.soft_shadows != soft_shadows)
+                {
                     let fix = [
                         1.0 / width.max(1) as f32,
                         1.0 / height.max(1) as f32,
-                        *alpha,
-                        0.0,
+                        tree_alpha.unwrap_or(84.0),
+                        f32::from(soft_shadows),
                     ];
                     let at = partial.len();
                     partial.extend_from_slice(bytemuck::cast_slice(&fix));
                     partial_spans.push((d.slot + SLOT[6], at..partial.len()));
                 }
+                written[i] = Some(state);
                 statics[i] = Some(fixed);
                 continue;
             }
@@ -3099,7 +3122,7 @@ impl D3dPass {
                     Some(Some((_, _, alpha))) => *alpha,
                     _ => 84.0,
                 },
-                0.0,
+                f32::from(soft_shadows),
             ];
             data[SLOT[6] as usize..][..16].copy_from_slice(bytemuck::cast_slice(&fix));
         }

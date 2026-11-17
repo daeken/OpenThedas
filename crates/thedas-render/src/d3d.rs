@@ -174,6 +174,7 @@ fn build(vfs: &Vfs, vs_name: &str, ps_name: &str, state_name: &str) -> Result<D3
     let ps_t = translate::translate(
         &ps,
         &Options {
+            soft_shadows: true,
             color_targets: Some(1),
             alpha_test,
             // The game sets the trees' alpha reference per draw (their LOD fades).
@@ -190,6 +191,7 @@ fn build(vfs: &Vfs, vs_name: &str, ps_name: &str, state_name: &str) -> Result<D3
             translate::translate(
                 &ps,
                 &Options {
+                    soft_shadows: true,
                     color_targets: Some(1),
                     alpha_test,
                     alpha_ref_uniform: spt,
