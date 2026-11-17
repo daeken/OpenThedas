@@ -73,6 +73,7 @@ mod looks;
 mod modconv;
 mod modmode;
 mod modworld;
+mod mouse;
 mod occlusion;
 mod pad;
 mod paddev;
@@ -868,6 +869,7 @@ struct App {
     gfx: Option<Gfx>,
     keys: HashSet<KeyCode>,
     looking: bool,
+    right_click: mouse::RightClick,
     /// The right button went down over the interface: its release is the interface's too (an
     /// item's radial menu opens on the press and acts on the release).
     ui_right: bool,
@@ -3618,15 +3620,18 @@ impl App {
         }
     }
 
-    /// A left click at window pixel (`x`, `y`) while playing: the party leader is ordered to
-    /// whatever it lands on.
-    fn click(&mut self, x: f64, y: f64) {
+    /// A world click orders the party leader. Right clicks currently order ground only.
+    fn click(&mut self, x: f64, y: f64, ground_only: bool) {
         let (Some(live), Some(g)) = (self.live.as_mut(), self.gfx.as_ref()) else {
             return;
         };
         let (w, h) = (g.config.width as f32, g.config.height as f32);
         let (origin, dir) = self.camera.ray(x as f32, y as f32, w, h);
-        if let Some(order) = live.pick(origin, dir).and_then(|p| live.click(p)) {
+        if let Some(order) = live
+            .pick(origin, dir)
+            .filter(|p| !ground_only || matches!(p, live::Pick::Ground(_)))
+            .and_then(|p| live.click(p))
+        {
             log::info!("order: {order}");
         }
     }
@@ -3934,6 +3939,7 @@ impl App {
 
     /// The mouse moves to window pixel (`x`, `y`).
     fn cursor_to(&mut self, x: f64, y: f64) {
+        self.right_click.cursor_to((x, y));
         self.cursor = (x, y);
         self.pad_last = false;
         if let Some(Marking::On {
@@ -4017,7 +4023,7 @@ impl App {
             }
         }
         if to_world {
-            self.click(x, y);
+            self.click(x, y, false);
         }
     }
 
@@ -4033,8 +4039,9 @@ impl App {
             if pressed { "rpress" } else { "rrelease" }
         ));
         // Over the interface (or with a menu up) a right click is the interface's (an item's
-        // actions); elsewhere it turns the camera.
+        // actions); elsewhere a drag turns the camera and a tap orders a ground move.
         if pressed {
+            self.right_click = Default::default();
             if let (Some(g), Some(s)) = (self.gfx.as_mut(), self.screens.as_ref()) {
                 if !s.exploring() || g.ui.covers(x, y) {
                     g.ui.button_as(thedas_ui::avm1::MOUSE_RIGHT, x, y, true);
@@ -4054,10 +4061,28 @@ impl App {
                 log::info!("ability {} not aimed", aim.ability);
                 return;
             }
+            if self
+                .live
+                .as_ref()
+                .is_some_and(|l| l.sim().game == thedas_vfs::Game::Origins)
+                && self.ui.is_empty()
+            {
+                self.right_click.press((x, y));
+            }
         }
         self.looking = pressed;
         if let Some(g) = &self.gfx {
             g.window.set_cursor_visible(!self.looking);
+        }
+        if !pressed
+            && let Some((px, py)) = self.right_click.release()
+            && self.ui.is_empty()
+            && let (Some(g), Some(s)) = (self.gfx.as_ref(), self.screens.as_ref())
+            && s.exploring()
+            && world_takes_click(&g.ui, s, x, y)
+            && world_takes_click(&g.ui, s, px, py)
+        {
+            self.click(px, py, true);
         }
     }
 
@@ -4073,16 +4098,17 @@ impl App {
             }
             &Step::ClickAs(button, x, y) => {
                 self.cursor_to(x, y);
-                if let Some(g) = self.gfx.as_mut() {
+                if button == thedas_ui::avm1::MOUSE_RIGHT {
+                    self.right_button(true);
+                    self.right_button(false);
+                } else if let Some(g) = self.gfx.as_mut() {
                     g.ui.click_as(button, x, y);
                 }
                 log.push(format!("click {x},{y} as button {button}"));
             }
             &Step::RightAt(x, y, down) => {
                 self.cursor_to(x, y);
-                if let Some(g) = self.gfx.as_mut() {
-                    g.ui.button_as(thedas_ui::avm1::MOUSE_RIGHT, x, y, down);
-                }
+                self.right_button(down);
                 log.push(format!(
                     "right {} {x},{y}",
                     if down { "press" } else { "release" }
@@ -5252,6 +5278,7 @@ impl ApplicationHandler for App {
             WindowEvent::Focused(false) => {
                 self.keys.clear();
                 self.looking = false;
+                self.right_click = Default::default();
                 if let Some(g) = self.gfx.as_mut() {
                     g.ui.stage.set_shift(false);
                     g.ui.mouse_leave();
@@ -5269,6 +5296,7 @@ impl ApplicationHandler for App {
     fn device_event(&mut self, _: &ActiveEventLoop, _: DeviceId, event: DeviceEvent) {
         if let DeviceEvent::MouseMotion { delta } = event {
             if self.looking {
+                self.right_click.motion(delta);
                 // The player's control options: mouse sensitivity scales the turn (1, the
                 // default, is the old fixed 0.003 radians a pixel) and the axes may be
                 // inverted. Provisional: the exe's sensitivity curve is not traced.
@@ -5972,7 +6000,7 @@ fn draw_likenesses(
     let Some(screens) = screens else {
         return;
     };
-    let key = ui::portrait_key(&live.sim());
+    let key = live.portrait_key();
     if ui.wants_portraits(key, dt) {
         let shots = live.portraits(ctx, ui::PORTRAIT_SIZE);
         ui.set_portraits(shots);
@@ -7163,7 +7191,7 @@ fn main() -> Result<()> {
                                     level.map(|x| x.layout.as_str()),
                                     level.map(|x| &x.vfs),
                                 );
-                                let key = ui::portrait_key(&l.sim());
+                                let key = l.portrait_key();
                                 if layer.wants_portraits(key, dt) {
                                     let shots = l.portraits(&ctx, ui::PORTRAIT_SIZE);
                                     layer.set_portraits(shots);
@@ -7711,6 +7739,7 @@ fn main() -> Result<()> {
         gfx: None,
         keys: HashSet::new(),
         looking: false,
+        right_click: Default::default(),
         ui_right: false,
         last: Instant::now(),
         error: None,
