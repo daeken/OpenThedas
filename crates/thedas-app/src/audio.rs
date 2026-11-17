@@ -2414,6 +2414,7 @@ impl GameAudio {
                 ..Default::default()
             },
         );
+        log::debug!("audio: voice timing {line:?}: {ms:?} ms, event={h:?}");
         (line, h, ms)
     }
 }
