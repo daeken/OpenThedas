@@ -2210,6 +2210,26 @@ impl Live {
         }
         objects.follow_poses();
         for (i, m) in models.iter().enumerate() {
+            if m.kind == thedas_sim::world::ObjectKind::Creature
+                && log::log_enabled!(target: "thedas_app::animation", log::Level::Trace)
+                && let Some(c) = &posed[i].1
+            {
+                let clips: Vec<_> = std::iter::once(c)
+                    .chain(&c.layers)
+                    .map(|c| {
+                        (
+                            &c.trees,
+                            &c.actions,
+                            c.time,
+                            c.weight,
+                            self.animator
+                                .cached_animation_resource(c)
+                                .map(|(name, _)| name),
+                        )
+                    })
+                    .collect();
+                log::trace!(target: "thedas_app::animation", "posed {} {}: {:?}", m.id, m.tag, clips);
+            }
             let o = if hidden.contains(&m.id) {
                 0.0
             } else {
@@ -2859,6 +2879,26 @@ impl Live {
         let mut placeable_draws = Vec::new();
         let mut moving = std::collections::HashMap::new();
         for (i, (m, p)) in models.iter().zip(&scene.props).enumerate() {
+            if m.kind == thedas_sim::world::ObjectKind::Creature
+                && log::log_enabled!(log::Level::Trace)
+            {
+                let sim = self.sim();
+                let appearance = sim.world.get(m.id).map(|o| o.appearance);
+                let skeletons: Vec<_> = scene
+                    .prop_skeletons(i)
+                    .into_iter()
+                    .map(|s| (s, &scene.skeleton_models[s], scene.skeletons[s].bones.len()))
+                    .collect();
+                log::trace!(
+                    "animation binding {} {}: apr_base row {:?}, models {:?}, skeletons {:?}, motion {:?}",
+                    m.id,
+                    m.tag,
+                    appearance,
+                    m.models,
+                    skeletons,
+                    m.motion
+                );
+            }
             let (interactive, placeable) = {
                 let sim = self.sim();
                 let placeable = sim
