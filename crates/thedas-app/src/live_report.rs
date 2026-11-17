@@ -16,20 +16,7 @@ impl Live {
                 }
                 let object = sim.world.get(*id);
                 let position = object.map(|o| glam::Vec3::from_array(o.position));
-                let roots: Vec<_> = self.animator.last_pose(i).into_iter().flat_map(|poses| {
-                    let mut skeletons: Vec<_> = poses.iter().collect();
-                    skeletons.sort_by_key(|(s, _)| **s);
-                    skeletons.into_iter().filter_map(|(s, (rest, pose))| {
-                        let skeleton = objects.scene.skeletons.get(*s)?;
-                        let node = skeleton.node("root").or_else(|| skeleton.bones.iter().position(|b| b.parent.is_none()))?;
-                        let rest = rest.get(node)?.w_axis.truncate();
-                        let posed = pose.get(node)?.w_axis.truncate();
-                        let mut root = root_snapshot(*world, position, rest, posed);
-                        root["model"] = json!(objects.scene.skeleton_models.get(*s));
-                        root["node"] = json!(skeleton.bones[node].name);
-                        Some(root)
-                    })
-                }).collect();
+                let roots = self.report_roots(i, *world, position);
                 let forward = world.transform_vector3(glam::Vec3::Y);
                 Some(json!({
                     "id": id, "tag": object.map(|o| o.tag.as_str()).unwrap_or(&prop.label),
@@ -102,6 +89,52 @@ impl Live {
                     "duration_ms": v.ms, "lasting": v.lasting })).collect::<Vec<_>>(),
             "cutaway_opacity": self.cutaway.0.shown(),
         })
+    }
+
+    /// The controlled creature after placement and skeletal posing, without loading resources.
+    pub fn report_motion(&self) -> Value {
+        let sim = self.sim();
+        let id = sim.world.controlled();
+        let object = id.and_then(|id| sim.world.get(id));
+        let position = object.map(|o| glam::Vec3::from_array(o.position));
+        let placed = self.posed.iter().enumerate().find(|(_, p)| Some(p.0) == id);
+        json!({
+            "time_ms": sim.world.time_ms, "id": id,
+            "sim_position": position.map(|p| p.to_array()),
+            "sim_facing_degrees": object.map(|o| o.facing),
+            "placement": placed.map(|(_, p)| p.1.w_axis.truncate().to_array()),
+            "roots": placed.map(|(i, p)| self.report_roots(i, p.1, position)),
+            "animations": placed.and_then(|(_, p)| p.2.as_ref())
+                .map(|c| crate::report::clip_snapshot(&self.animator, c)),
+            "floor_z": object.and_then(|o| self.level.as_ref()
+                .and_then(|l| floor_under(&l.collider, o.position, sim.game))),
+        })
+    }
+
+    fn report_roots(&self, i: usize, world: Mat4, position: Option<glam::Vec3>) -> Vec<Value> {
+        let Some(objects) = self.objects.as_ref() else {
+            return Vec::new();
+        };
+        self.animator
+            .last_pose(i)
+            .into_iter()
+            .flat_map(|poses| {
+                let mut skeletons: Vec<_> = poses.iter().collect();
+                skeletons.sort_by_key(|(s, _)| **s);
+                skeletons.into_iter().filter_map(|(s, (rest, pose))| {
+                    let skeleton = objects.scene.skeletons.get(*s)?;
+                    let node = skeleton
+                        .node("root")
+                        .or_else(|| skeleton.bones.iter().position(|b| b.parent.is_none()))?;
+                    let rest = rest.get(node)?.w_axis.truncate();
+                    let posed = pose.get(node)?.w_axis.truncate();
+                    let mut root = root_snapshot(world, position, rest, posed);
+                    root["model"] = json!(objects.scene.skeleton_models.get(*s));
+                    root["node"] = json!(skeleton.bones[node].name);
+                    Some(root)
+                })
+            })
+            .collect()
     }
 
     /// Counts of submitted scene draws (loading statistics, not GPU visibility queries).
