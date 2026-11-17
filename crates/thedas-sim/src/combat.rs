@@ -86,7 +86,7 @@ pub const DEFAULT_ATTACK_MS: u64 = 1500;
 pub struct CombatData {
     /// `GetCombatState`.
     pub in_combat: bool,
-    /// DA2's `GetAttackTarget`: prepared combat target, independent of the command queue.
+    /// `GetAttackTarget`: prepared combat target, independent of the command queue.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<ObjectId>,
     /// Origins attack-side paired death animation, independent of the victim's death event.
@@ -227,20 +227,13 @@ fn same_arc<T>(a: &Option<std::sync::Arc<T>>, b: &Option<std::sync::Arc<T>>) -> 
 }
 
 impl Sim {
-    /// DA2 0x4dd1a0 reads the creature's combat record, including a stale/dead target;
-    /// scripts validate the returned id themselves. Origins retains its queue-based view.
+    /// Origins 0x655000 and DA2 0x4dd1a0 read the creature's combat record,
+    /// including a stale/dead target; scripts validate the returned id themselves.
     pub(crate) fn script_attack_target(&self, id: ObjectId) -> Option<ObjectId> {
         let o = self.world.get(id)?;
-        if self.game == thedas_vfs::Game::DragonAge2 {
-            (o.kind == ObjectKind::Creature)
-                .then_some(o.combat.target)
-                .flatten()
-        } else {
-            o.commands
-                .first()
-                .filter(|c| c.name == "CommandAttack")
-                .and_then(|c| c.target)
-        }
+        (o.kind == ObjectKind::Creature)
+            .then_some(o.combat.target)
+            .flatten()
     }
 
     /// Native modern preparation (0x640fd1..0x641016) preserves self casts and casts
@@ -284,13 +277,45 @@ impl Sim {
         }
     }
 
+    /// Origins attack preparation (0x743038) stores the target before approach.
+    /// Ability preparation (0x7441f8..0x744204) preserves self casts; unlike DA2,
+    /// it also replaces the target for casts on another party member.
+    fn prepare_origins_combat_target(&mut self, id: ObjectId, cmd: &crate::world::Command) {
+        let target = cmd.target.unwrap_or(OBJECT_INVALID);
+        let attack = cmd.name == "CommandAttack";
+        if !attack && cmd.name != "CommandUseAbility" {
+            return;
+        }
+        if (target == OBJECT_INVALID && attack)
+            || (target != OBJECT_INVALID && self.world.get(target).is_none())
+            || (!attack
+                && !self
+                    .world
+                    .tables()
+                    .get(1, "")
+                    .is_some_and(|t| t.has_row(i64::from(cmd.ints.first().copied().unwrap_or(0)))))
+        {
+            return;
+        }
+        if let Some(o) = self
+            .world
+            .get_mut(id)
+            .filter(|o| o.kind == ObjectKind::Creature)
+        {
+            if let Some(c) = o.commands.first_mut() {
+                c.da2_target_prepared = true;
+            }
+            if attack || id != target {
+                o.combat.target = (target != OBJECT_INVALID).then_some(target);
+            }
+        }
+    }
+
     /// Prepare the persistent target once, before approach and COMMAND_PENDING.
     /// The marker belongs to the command: arriving/reloading must not restore a
     /// target that a combat-exit transition cleared while the caster walked.
-    pub(crate) fn prepare_da2_combat_target(&mut self, id: ObjectId, cmd: &crate::world::Command) {
-        if self.game != thedas_vfs::Game::DragonAge2
-            || cmd.name != "CommandUseAbility"
-            || cmd.da2_target_prepared
+    pub(crate) fn prepare_combat_target(&mut self, id: ObjectId, cmd: &crate::world::Command) {
+        if cmd.da2_target_prepared
             || self
                 .world
                 .get(id)
@@ -302,6 +327,13 @@ impl Sim {
                         && c.target == cmd.target
                 })
         {
+            return;
+        }
+        if self.game == thedas_vfs::Game::Origins {
+            self.prepare_origins_combat_target(id, cmd);
+            return;
+        }
+        if cmd.name != "CommandUseAbility" {
             return;
         }
         let ability = cmd.ints.first().copied().unwrap_or(0);
@@ -327,14 +359,14 @@ impl Sim {
         self.remember_da2_combat_target(id, target);
     }
 
-    /// Modern completion 0x676288..0x6762a2 clears outside combat for active
-    /// party members and non-party followers. The cached native membership flag
-    /// (0x5a00b8 / 0x5a05bc) uses the active list, unlike preparation's pool test.
-    pub(crate) fn complete_da2_combat_target(&mut self, id: ObjectId) {
-        if self.game != thedas_vfs::Game::DragonAge2 {
-            return;
-        }
-        if let Some(o) = self.world.get_mut(id) {
+    /// Ability completion (Origins 0x746d16..0x746d32, DA2 0x676288..0x6762a2)
+    /// clears outside combat for active party members and non-party followers.
+    /// DA2's cached native membership flag (0x5a00b8 / 0x5a05bc) uses the active
+    /// list, unlike its preparation's pool test.
+    pub(crate) fn complete_combat_target(&mut self, id: ObjectId) {
+        if self.game == thedas_vfs::Game::DragonAge2
+            && let Some(o) = self.world.get_mut(id)
+        {
             o.combat.animation_motion = None;
         }
         let member = crate::engine::party_of(self).contains(&id)
@@ -348,15 +380,16 @@ impl Sim {
         }
     }
 
-    /// Native SetCombatState (0x583c70 -> 0x579dd0) clears the target on leaving
-    /// combat. Repeating the current state does not run the transition again.
+    /// Native SetCombatState (Origins 0x6ae0a0 -> 0x6abbf0, DA2 0x583c70 ->
+    /// 0x579dd0) clears the target on leaving combat. Repeating the current state
+    /// does not run the transition again.
     pub(crate) fn set_combat_state(&mut self, id: ObjectId, on: bool) {
         if let Some(o) = self.world.get_mut(id) {
             if self.game == thedas_vfs::Game::Origins && o.combat.in_combat != on {
                 o.fields.remove("WeaponMainDrawn");
                 o.fields.remove("WeaponOffDrawn");
             }
-            if self.game == thedas_vfs::Game::DragonAge2 && o.combat.in_combat && !on {
+            if o.combat.in_combat && !on {
                 o.combat.target = None;
             }
             o.combat.in_combat = on;
@@ -1365,7 +1398,7 @@ impl Sim {
             o.commands.clear();
             o.combat.attack = None;
             o.combat.death_blow = None;
-            if self.game == thedas_vfs::Game::DragonAge2 && o.combat.in_combat {
+            if o.combat.in_combat {
                 o.combat.target = None;
             }
             o.combat.in_combat = false;
@@ -1699,7 +1732,7 @@ impl Sim {
         }
         let target = cmd.target.unwrap_or(OBJECT_INVALID);
         let ability = cmd.ints.first().copied().unwrap_or(0);
-        self.prepare_da2_combat_target(id, cmd);
+        self.prepare_combat_target(id, cmd);
         let item = self.ability_item(id, cmd);
         let mut ev = self.new_event("COMMAND_PENDING", Some(id));
         ev.objects = vec![id, target, item];
@@ -2946,7 +2979,7 @@ mod tests {
     }
 
     #[test]
-    fn target_storage_is_absent_from_old_saves_and_does_not_change_origins_getter() {
+    fn target_storage_is_absent_from_old_saves_and_getters_ignore_the_queue() {
         let old = serde_json::to_string(&CombatData::default()).unwrap();
         assert!(!old.contains("\"target\""));
         assert_eq!(
@@ -2963,8 +2996,6 @@ mod tests {
                 (game == thedas_vfs::Game::DragonAge2).then_some(target)
             );
             s.order_attack(who, target);
-            assert_eq!(stored_target(&mut s, who), target);
-            s.world.get_mut(who).unwrap().commands.clear();
             assert_eq!(
                 stored_target(&mut s, who),
                 if game == thedas_vfs::Game::DragonAge2 {
@@ -2973,10 +3004,125 @@ mod tests {
                     OBJECT_INVALID
                 }
             );
+            let cmd = s.world.get(who).unwrap().commands[0].clone();
+            if game == thedas_vfs::Game::Origins {
+                s.prepare_combat_target(who, &cmd);
+            }
+            assert_eq!(stored_target(&mut s, who), target);
+            s.world.get_mut(who).unwrap().commands.clear();
+            assert_eq!(stored_target(&mut s, who), target);
             let prop = s.world.spawn(ObjectKind::Placeable, "prop");
             s.world.get_mut(prop).unwrap().combat.target = Some(target);
             assert_eq!(stored_target(&mut s, prop), OBJECT_INVALID);
         }
+    }
+
+    #[test]
+    fn origins_attack_target_survives_a_completed_swing_wait_and_queue_clear() {
+        let mut s = target_sim(thedas_vfs::Game::Origins);
+        let area = s.world.spawn(ObjectKind::Area, "arena");
+        let who = s.world.spawn(ObjectKind::Creature, "attacker");
+        let target = s.world.spawn(ObjectKind::Creature, "target");
+        for id in [who, target] {
+            s.world.get_mut(id).unwrap().area = Some(area);
+        }
+        s.world.get_mut(target).unwrap().position = [1., 0., 0.];
+        s.order_attack(who, target);
+        // Admission does not prepare; the executor does, before pending.
+        assert_eq!(stored_target(&mut s, who), OBJECT_INVALID);
+        s.tick(1);
+        assert_eq!(stored_target(&mut s, who), target);
+        s.tick(5000);
+        assert!(s.world.get(who).unwrap().commands.is_empty());
+        assert_eq!(
+            s.world
+                .get(who)
+                .unwrap()
+                .combat
+                .previous_command
+                .as_ref()
+                .unwrap()
+                .name,
+            "CommandAttack"
+        );
+        assert_eq!(stored_target(&mut s, who), target);
+        assert_eq!(s.attack_target(who), None);
+        s.order_wait(who, 2.);
+        assert_eq!(stored_target(&mut s, who), target);
+        target_call(&mut s, who, "ClearAllCommands", &[Value::Object(who)]);
+        assert_eq!(stored_target(&mut s, who), target);
+        // Scripts, not the native getter, reject dead and stale ids.
+        s.world.get_mut(target).unwrap().dead = true;
+        assert_eq!(stored_target(&mut s, who), target);
+        s.world.get_mut(who).unwrap().combat.target = Some(123456);
+        assert_eq!(stored_target(&mut s, who), 123456);
+        s.set_combat_state(who, false);
+        assert_eq!(stored_target(&mut s, who), OBJECT_INVALID);
+    }
+
+    #[test]
+    fn origins_approach_failure_keeps_target_and_reload_does_not_undo_combat_exit() {
+        let mut s = target_sim(thedas_vfs::Game::Origins);
+        let area = s.world.spawn(ObjectKind::Area, "arena");
+        let who = s.world.spawn(ObjectKind::Creature, "attacker");
+        let target = s.world.spawn(ObjectKind::Creature, "target");
+        for id in [who, target] {
+            s.world.get_mut(id).unwrap().area = Some(area);
+        }
+        s.world.get_mut(target).unwrap().position = [30., 0., 0.];
+        s.order_attack(who, target);
+        s.tick(1);
+        assert!(s.world.get(who).unwrap().commands[0].approach.is_some());
+        assert_eq!(stored_target(&mut s, who), target);
+        s.fail_front_command(who, "COMMAND_FAILED_INVALID_PATH");
+        assert!(s.world.get(who).unwrap().commands.is_empty());
+        s.order_wait(who, 2.);
+        s.tick(2100);
+        assert_eq!(stored_target(&mut s, who), target);
+        let json = serde_json::to_string(&s.world).unwrap();
+        s.world = serde_json::from_str(&json).unwrap();
+        assert_eq!(stored_target(&mut s, who), target);
+        s.order_attack(who, target);
+        s.tick(1);
+        s.set_combat_state(who, false);
+        let json = serde_json::to_string(&s.world).unwrap();
+        s.world = serde_json::from_str(&json).unwrap();
+        let cmd = s.world.get(who).unwrap().commands[0].clone();
+        assert!(cmd.da2_target_prepared);
+        s.prepare_combat_target(who, &cmd);
+        s.tick(7000);
+        assert_eq!(stored_target(&mut s, who), OBJECT_INVALID);
+    }
+
+    #[test]
+    fn origins_ability_target_preserves_self_but_updates_party_and_ground_casts() {
+        let mut s = target_sim(thedas_vfs::Game::Origins);
+        let hero = s.world.spawn(ObjectKind::Creature, "hero");
+        let friend = s.world.spawn(ObjectKind::Creature, "friend");
+        let enemy = s.world.spawn(ObjectKind::Creature, "enemy");
+        s.world.hero = Some(hero);
+        s.world.get_mut(hero).unwrap().followers.push(friend);
+        s.set_combat_state(hero, true);
+        prepare_target(&mut s, hero, enemy, 3110);
+        assert_eq!(stored_target(&mut s, hero), enemy);
+        prepare_target(&mut s, hero, hero, 3110);
+        assert_eq!(stored_target(&mut s, hero), enemy);
+        prepare_target(&mut s, hero, friend, 3110);
+        assert_eq!(stored_target(&mut s, hero), friend);
+        for (target, ability) in [(enemy, 9999), (123456, 3110)] {
+            prepare_target(&mut s, hero, target, ability);
+            assert_eq!(stored_target(&mut s, hero), friend);
+        }
+        prepare_target(&mut s, hero, OBJECT_INVALID, 3110);
+        assert_eq!(stored_target(&mut s, hero), OBJECT_INVALID);
+        prepare_target(&mut s, hero, enemy, 3110);
+        s.complete_combat_target(hero);
+        assert_eq!(stored_target(&mut s, hero), enemy);
+        s.set_combat_state(hero, false);
+        prepare_target(&mut s, hero, enemy, 3110);
+        assert_eq!(stored_target(&mut s, hero), enemy);
+        s.complete_combat_target(hero);
+        assert_eq!(stored_target(&mut s, hero), OBJECT_INVALID);
     }
 
     #[test]

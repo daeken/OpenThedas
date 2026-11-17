@@ -1324,6 +1324,26 @@ mod tests {
         (s, hero)
     }
 
+    #[test]
+    fn failed_attack_approach_retains_the_prepared_combat_target() {
+        let (mut s, hero) = disconnected_levels(4.0);
+        let enemy = s.world.spawn(crate::world::ObjectKind::Creature, "enemy");
+        let area = s.world.get(hero).unwrap().area;
+        let target = s.world.get_mut(enemy).unwrap();
+        target.area = area;
+        target.position = [4.5, 1.5, 0.0];
+        s.order_attack(hero, enemy);
+        s.tick(1);
+        assert!(s.world.get(hero).unwrap().commands.is_empty());
+        assert_eq!(s.script_attack_target(hero), Some(enemy));
+        assert!(
+            s.world
+                .queue
+                .values()
+                .any(|event| { event.target == hero && event.event.ints.get(1) == Some(&-4) })
+        );
+    }
+
     /// A sim whose area has a 7x3 grid of 1 m cells, walkable at height 0 except where
     /// `cell` says otherwise (value, height), with the hero at (0.5, 1.5).
     fn walled(cell: impl Fn(u32, u32) -> Option<(u8, f32)>) -> (Sim, thedas_script::vm::ObjectId) {
