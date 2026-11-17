@@ -1207,8 +1207,9 @@ impl ConstantContext<'_> {
     }
 
     fn value(&self, c: &Constant) -> Option<Value> {
-        let usage = find_param(self.material, &c.name).and_then(|p| p.usage.clone());
-        let usage = usage.as_deref().unwrap_or("");
+        let usage = find_param(self.material, &c.name)
+            .and_then(|p| p.usage.as_deref())
+            .unwrap_or("");
         let world_view = self.view * self.world;
         // Matrices: a usage ending in `Trans` (`ModelViewProjectionTrans`, `PartTrans`) is
         // the layout the shaders bound to it read as rows (`mad` by the vertex's
