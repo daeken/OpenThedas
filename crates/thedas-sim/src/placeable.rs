@@ -13,6 +13,30 @@ use crate::sim::Sim;
 use crate::world::ObjectKind;
 
 impl Sim {
+    /// Origins 356 (0x65f2e0): resolve the placeable's localized popup string.
+    pub fn placeable_popup_text(&self, id: ObjectId) -> String {
+        let Some(o) = self
+            .world
+            .get(id)
+            .filter(|o| o.kind == ObjectKind::Placeable)
+        else {
+            return String::new();
+        };
+        o.fields
+            .get("LocPopupText")
+            .and_then(|&r| self.string(r as u32))
+            .or_else(|| o.text_fields.get("LocPopupText").cloned())
+            .unwrap_or_default()
+    }
+
+    /// The independent creature flag written by Origins 364 (0x6665c0).
+    pub fn show_as_ally_on_map(&self, id: ObjectId) -> bool {
+        self.world.get(id).is_some_and(|o| {
+            o.kind == ObjectKind::Creature
+                && o.fields.get("ShowAsAllyOnMap").copied().unwrap_or(0) != 0
+        })
+    }
+
     /// The ASCII instance reader writes InitialState directly to the state word
     /// (0x7506ba..0x7506df); model setup then forces that state (0x752a88).
     /// Saved/script-assigned State takes precedence, including on legacy saves.
