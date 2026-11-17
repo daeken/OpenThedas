@@ -577,6 +577,42 @@ impl Sim {
         self.release_cutscene_actors(staged);
     }
 
+    /// A reply or dialog cleanup ends the presented cinematic too. Internal `speak`
+    /// recursion can walk several nodes said by one CUTR, so it only ends inline staging.
+    fn end_presented_line(&mut self, c: &mut Conversation) {
+        // CUTR resources belong to the line just as inline CUT data does. Origins
+        // destroys the old cinematic before installing a new line (0x68e3f8-0x68e43d)
+        // and when closing/resetting dialog (0x68f4a7-0x68f4c3, 0x691115-0x691131).
+        // Leaving one queued until after `talk` disappears loses its stage context in
+        // bind_cutscene_file and presents its local camera at the world's origin.
+        if self.game == thedas_vfs::Game::Origins
+            && let Some(line) = c.cut_from.take()
+            && let Some(name) = c.dlg.nodes.get(line).and_then(|n| n.cutscene.as_deref())
+        {
+            let res = crate::cutscene::Cutscene::resource(name);
+            if let Some(i) = self.world.dialog_cutscenes.iter().position(|n| *n == res) {
+                self.world.dialog_cutscenes.remove(i);
+                if let Some(i) = self
+                    .world
+                    .cutscenes
+                    .iter()
+                    .position(|n| crate::cutscene::Cutscene::resource(n) == res)
+                {
+                    self.world.cutscenes.remove(i);
+                }
+            }
+            if self
+                .world
+                .cutscene
+                .as_ref()
+                .is_some_and(|cut| cut.from_dialog && cut.name == res)
+            {
+                self.skip_cutscene();
+            }
+        }
+        self.end_line_staging(c);
+    }
+
     /// How many lines of conversation `dlg` cutscene `cut` says (its `ASLN` tracks naming
     /// that conversation, 5562). Provisional: a cutscene's spoken lines are taken to be
     /// the conversation's lines in the order it walks them, from the line that plays it.
@@ -918,7 +954,7 @@ impl Sim {
         }
         // A conversation begun over another ends the other's line.
         if let Some(mut old) = self.talk.take() {
-            self.end_line_staging(&mut old);
+            self.end_presented_line(&mut old);
         }
         let live = !c.ended;
         self.talk = Some(c);
@@ -1177,7 +1213,7 @@ impl Sim {
             return self.dialog_state();
         };
         // The line answered ends. Provisional: before the reply's action runs.
-        self.end_line_staging(&mut c);
+        self.end_presented_line(&mut c);
         let node = c.dlg.nodes[reply].clone();
         self.mark_shown(&mut c, reply);
         self.node_action(&node, &c);
@@ -1286,7 +1322,7 @@ impl Sim {
 
     pub fn end_conversation(&mut self) {
         if let Some(mut c) = self.talk.take() {
-            self.end_line_staging(&mut c);
+            self.end_presented_line(&mut c);
         }
     }
 }
@@ -1927,6 +1963,126 @@ mod tests {
         sim.world.cutscene.as_mut().unwrap().name = "intro.cut".into();
         sim.world.cutscene.as_mut().unwrap().from_dialog = false;
         assert!(sim.conversation_line_cutscene().is_none());
+    }
+
+    #[test]
+    fn referenced_cinematics_end_with_the_line_that_placed_them() {
+        use crate::cutactors::Bound;
+        use crate::cuttracks::Placement;
+
+        // Exercise queued and playing CUTR resources through every foreground cleanup
+        // path. These used to survive the dialog and play with placement=None.
+        for playing in [false, true] {
+            for exit in 0..3 {
+                let (mut sim, hero, npc) = passers_by();
+                let mut dlg = remarks("cinematic", &["First.", "Last."], false);
+                for node in &mut dlg.nodes {
+                    node.ambient = false;
+                }
+                dlg.nodes[0].cutscene = Some("INTRO.CUT".into());
+                sim.world.get_mut(npc).unwrap().position = [160.0, 100.0, 28.0];
+                assert!(sim.open_conversation(hero, npc, dlg, None));
+                if playing {
+                    sim.world.cutscenes.clear();
+                    sim.world.dialog_cutscenes.clear();
+                    sim.world.cutscene = Some(crate::cutscene::Cutscene {
+                        name: "intro.cut".into(),
+                        seconds: 10.0,
+                        lines: Vec::new(),
+                        elapsed_ms: 100,
+                        from_dialog: true,
+                        bound: vec![Bound {
+                            object: npc,
+                            actor: 0,
+                            position: [160.0, 100.0, 28.0],
+                            facing: 0.0,
+                            end: Some(([161.0, 101.0, 28.0], 45.0)),
+                            restore: false,
+                            snaps: false,
+                            da2_stage: false,
+                        }],
+                        placement: Some(Placement::facing([160.0, 100.0, 28.0], 285.0)),
+                    });
+                    // Making replies available does not release the cinematic.
+                    assert!(sim.conversation_line_cutscene().is_some());
+                    sim.dialog_state();
+                    assert!(sim.world.cutscene.is_some());
+                }
+                sim.world.cutscenes.push("script_scene".into());
+                match exit {
+                    0 => {
+                        sim.choose_reply(0).unwrap();
+                    }
+                    1 => sim.end_conversation(),
+                    _ => {
+                        sim.talk.as_mut().unwrap().ended = true;
+                        let mut replacement = remarks("replacement", &["Hello."], false);
+                        replacement.nodes[0].ambient = false;
+                        assert!(sim.open_conversation(hero, npc, replacement, None));
+                    }
+                }
+                assert!(
+                    sim.world.cutscene.is_none(),
+                    "playing={playing}, exit={exit}"
+                );
+                assert!(sim.world.dialog_cutscenes.is_empty());
+                assert_eq!(sim.world.cutscenes, ["script_scene"]);
+                if playing {
+                    assert_eq!(sim.world.get(npc).unwrap().position, [161.0, 101.0, 28.0]);
+                    assert_eq!(sim.world.get(npc).unwrap().facing, 45.0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn walking_nodes_inside_one_cinematic_keeps_its_owner_until_dialog_cleanup() {
+        let (mut sim, hero, npc) = passers_by();
+        let mut dlg = remarks("cinematic", &["First.", "Last."], true);
+        for node in &mut dlg.nodes {
+            node.ambient = false;
+        }
+        dlg.nodes[0].cutscene = Some("intro".into());
+        assert!(sim.open_conversation(hero, npc, dlg, None));
+        let c = sim.talk.as_ref().unwrap();
+        assert_eq!(c.line, Some(1));
+        assert_eq!(c.cut_from, Some(0));
+        assert_eq!(sim.world.cutscenes, ["intro"]);
+        assert_eq!(sim.world.dialog_cutscenes, ["intro.cut"]);
+        sim.end_conversation();
+        assert!(sim.world.cutscenes.is_empty());
+        assert!(sim.world.dialog_cutscenes.is_empty());
+    }
+
+    #[test]
+    fn closing_a_dialog_leaves_script_cutscenes_and_da2_playback_alone() {
+        for game in [thedas_vfs::Game::Origins, thedas_vfs::Game::DragonAge2] {
+            let (mut sim, hero, npc) = passers_by();
+            sim.game = game;
+            let mut dlg = remarks("cinematic", &["Hello."], false);
+            dlg.nodes[0].ambient = false;
+            dlg.nodes[0].cutscene = Some("intro".into());
+            assert!(sim.open_conversation(hero, npc, dlg, None));
+            sim.world.cutscene = Some(crate::cutscene::Cutscene {
+                name: "intro.cut".into(),
+                seconds: 10.0,
+                lines: Vec::new(),
+                elapsed_ms: 100,
+                from_dialog: game == thedas_vfs::Game::DragonAge2,
+                bound: Vec::new(),
+                placement: None,
+            });
+            sim.end_conversation();
+            assert!(sim.world.cutscene.is_some());
+            assert_eq!(
+                sim.world.dialog_cutscenes.is_empty(),
+                game == thedas_vfs::Game::Origins
+            );
+            assert_eq!(
+                sim.world.cutscenes.is_empty(),
+                game == thedas_vfs::Game::Origins
+            );
+        }
     }
 
     #[test]
