@@ -1031,6 +1031,7 @@ impl Server {
             None => return err("no install: pass install or set THEDAS_INSTALL"),
         };
         let opts = SessionOptions {
+            base_vfs: None,
             module: a
                 .module
                 .unwrap_or_else(|| thedas_vfs::install::campaign_module(&install).to_string()),
@@ -2295,6 +2296,7 @@ impl Server {
                 let install = install_from_env()
                     .ok_or("no install: set THEDAS_INSTALL (or call load first)")?;
                 let sim = open(&SessionOptions {
+                    base_vfs: None,
                     module: thedas_vfs::install::campaign_module(&install).to_string(),
                     install,
                     area: None,
