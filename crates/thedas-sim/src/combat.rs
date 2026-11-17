@@ -1733,6 +1733,19 @@ impl Sim {
         let target = cmd.target.unwrap_or(OBJECT_INVALID);
         let ability = cmd.ints.first().copied().unwrap_or(0);
         self.prepare_combat_target(id, cmd);
+        // Preparation precedes the callback. Its marker is not a script-side
+        // replacement, including when a caller starts an unprepared payload.
+        let prepared = self
+            .world
+            .get(id)
+            .and_then(|o| o.commands.first())
+            .filter(|c| c.da2_target_prepared != cmd.da2_target_prepared)
+            .map(|c| {
+                let mut prepared = cmd.clone();
+                prepared.da2_target_prepared = c.da2_target_prepared;
+                prepared
+            });
+        let cmd = prepared.as_ref().unwrap_or(cmd);
         let item = self.ability_item(id, cmd);
         let mut ev = self.new_event("COMMAND_PENDING", Some(id));
         ev.objects = vec![id, target, item];
@@ -3097,6 +3110,7 @@ mod tests {
     #[test]
     fn origins_ability_target_preserves_self_but_updates_party_and_ground_casts() {
         let mut s = target_sim(thedas_vfs::Game::Origins);
+        s.world.trace.keep = true;
         let hero = s.world.spawn(ObjectKind::Creature, "hero");
         let friend = s.world.spawn(ObjectKind::Creature, "friend");
         let enemy = s.world.spawn(ObjectKind::Creature, "enemy");
@@ -3105,6 +3119,10 @@ mod tests {
         s.set_combat_state(hero, true);
         prepare_target(&mut s, hero, enemy, 3110);
         assert_eq!(stored_target(&mut s, hero), enemy);
+        assert!(
+            s.world.trace.entries.iter().any(|e| matches!(e,
+            crate::trace::TraceEntry::Log { text, .. } if text.starts_with("ABILITY_CAST_START ")))
+        );
         prepare_target(&mut s, hero, hero, 3110);
         assert_eq!(stored_target(&mut s, hero), enemy);
         prepare_target(&mut s, hero, friend, 3110);
@@ -3123,6 +3141,49 @@ mod tests {
         assert_eq!(stored_target(&mut s, hero), enemy);
         s.complete_combat_target(hero);
         assert_eq!(stored_target(&mut s, hero), OBJECT_INVALID);
+    }
+
+    #[test]
+    fn old_origins_saves_recover_only_active_attacks_in_combat() {
+        for game in [thedas_vfs::Game::Origins, thedas_vfs::Game::DragonAge2] {
+            for (active, combat, wait) in [
+                (true, true, false),
+                (false, true, false),
+                (true, false, false),
+                (true, true, true),
+            ] {
+                let mut s = target_sim(game);
+                let who = s.world.spawn(ObjectKind::Creature, "attacker");
+                let target = s.world.spawn(ObjectKind::Creature, "target");
+                let actor = s.world.get_mut(who).unwrap();
+                actor.combat.in_combat = combat;
+                actor.commands.push(crate::world::Command {
+                    name: if wait { "CommandWait" } else { "CommandAttack" }.into(),
+                    target: Some(target),
+                    due: active.then_some(2000),
+                    ..Default::default()
+                });
+                let mut old = s.save_game();
+                old.revision = 11;
+                s.load_game(old).unwrap();
+                let recovered = game == thedas_vfs::Game::Origins && active && combat && !wait;
+                assert_eq!(
+                    stored_target(&mut s, who),
+                    if recovered { target } else { OBJECT_INVALID }
+                );
+                // New snapshots keep the register and marker exactly, including
+                // a combat exit during an approach that must not be undone.
+                if recovered {
+                    s.set_combat_state(who, false);
+                }
+                let saved = s.save_game();
+                s.load_game(saved).unwrap();
+                assert_eq!(stored_target(&mut s, who), OBJECT_INVALID);
+                if game == thedas_vfs::Game::Origins && active && !wait {
+                    assert!(s.world.get(who).unwrap().commands[0].da2_target_prepared);
+                }
+            }
+        }
     }
 
     #[test]

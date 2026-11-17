@@ -6083,7 +6083,10 @@ mod tests {
             s.world.tables.insert(
                 "#114",
                 &["Script"],
-                vec![(1004, vec![thedas_formats::gda::Cell::String("recover".into())])],
+                vec![(
+                    1004,
+                    vec![thedas_formats::gda::Cell::String("recover".into())],
+                )],
             );
             let mut code = Vec::new();
             for value in [0_i32, 0, 0] {

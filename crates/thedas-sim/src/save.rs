@@ -52,7 +52,9 @@ pub const SAVE_FORMAT: u32 = 1;
 ///   An older no-op setter that left no State field cannot be distinguished.
 /// - 11: Origins death blows retain paired animation deadlines. Earlier opaque active
 ///   death-blow commands restart preparation when loaded.
-pub const SAVE_REVISION: u32 = 11;
+/// - 12: Origins retains its prepared combat target between commands. Earlier active
+///   attacks in combat recover their explicit target; idle queues have no history to recover.
+pub const SAVE_REVISION: u32 = 12;
 
 /// The trace channel loading reports save damage on.
 pub const SAVE_CHANNEL: i32 = -7;
@@ -278,6 +280,25 @@ impl Sim {
         world.alerts.clear();
         world.uber_alerts.clear();
         self.world = world;
+        if self.game == thedas_vfs::Game::Origins && save_revision < 12 {
+            for object in self.world.objects.values_mut() {
+                if object.kind == crate::world::ObjectKind::Creature
+                    && let Some(command) = object.commands.first_mut()
+                    && command.name == "CommandAttack"
+                    && command.due.is_some()
+                {
+                    // An active attack has already prepared its explicit target.
+                    // Preserve an existing register and combat-exit clears. Older
+                    // idle/wait queues cannot tell us what was attacked before them.
+                    if object.combat.in_combat && object.combat.target.is_none() {
+                        object.combat.target = command
+                            .target
+                            .filter(|&target| target != thedas_script::vm::OBJECT_INVALID);
+                    }
+                    command.da2_target_prepared = true;
+                }
+            }
+        }
         self.restore_da2_encounters();
         self.restore_script_heartbeats();
         self.repair_body_bags();
