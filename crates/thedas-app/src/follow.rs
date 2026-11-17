@@ -237,22 +237,22 @@ impl Follow {
             && self.zoom < ZOOM_SPLIT
         {
             let (eye, _) = self.uncorrected_shot(feet, height, before);
-            self.tactical_pending = exterior && sweep(eye, eye, SWEEP_RADIUS).is_some();
-            self.zoom = if self.tactical_pending {
+            self.zoom = if exterior && sweep(eye, eye, SWEEP_RADIUS).is_some() {
                 ZOOM_SPLIT
             } else {
                 ZOOM_MIN
             };
         }
+        let pending_from_previous_frame = self.tactical_pending;
         if exterior
-            && self.zoom <= ZOOM_MIN
+            && self.zoom < ZOOM_SPLIT
             && self.tactical_eye_blocked
             && self.zoom_target.is_none()
         {
             self.zoom = ZOOM_SPLIT;
             self.tactical_pending = true;
         }
-        if self.tactical_pending {
+        if pending_from_previous_frame {
             let (eye, pivot) = self.uncorrected_shot(feet, height, self.zoom);
             if !exterior
                 || (sweep(eye, eye, 10.0 * SWEEP_RADIUS).is_none() && sight_clear(eye, pivot))
@@ -668,7 +668,7 @@ mod tests {
     }
 
     #[test]
-    fn outdoor_tactical_entry_waits_for_both_clearance_and_sight() {
+    fn outdoor_tactical_entry_rejects_outward_input_while_the_eye_overlaps() {
         let mut f = Follow::behind(0.0);
         f.zoom(-8.0);
         f.resolve_tactical(
@@ -677,13 +677,41 @@ mod tests {
             true,
             &|a, b, r| {
                 assert_eq!(a, b);
-                assert!(r == 0.25 || r == 2.5);
+                assert_eq!(r, 0.25);
                 Some(0.0)
             },
             &|_, _| panic!("sight is tested after clearance"),
         );
         assert_eq!(f.zoom, ZOOM_SPLIT);
-        assert!(f.tactical_pending);
+        assert!(!f.tactical_pending);
+        f.resolve_tactical(FEET, DEFAULT_LOOK_HEIGHT, true, &|_, _, _| None, &|_, _| {
+            true
+        });
+        assert_eq!(f.zoom, ZOOM_SPLIT);
+        f.zoom(-1.0);
+        f.resolve_tactical(FEET, DEFAULT_LOOK_HEIGHT, true, &|_, _, _| None, &|_, _| {
+            true
+        });
+        assert_eq!(f.zoom, ZOOM_MIN);
+    }
+
+    #[test]
+    fn deferred_tactical_entry_waits_for_both_clearance_and_sight() {
+        let mut f = Follow::behind(0.0);
+        f.zoom = ZOOM_SPLIT;
+        f.tactical_pending = true;
+        f.resolve_tactical(
+            FEET,
+            DEFAULT_LOOK_HEIGHT,
+            true,
+            &|a, b, r| {
+                assert_eq!(a, b);
+                assert_eq!(r, 2.5);
+                Some(0.0)
+            },
+            &|_, _| panic!("sight is tested after clearance"),
+        );
+        assert_eq!(f.zoom, ZOOM_SPLIT);
         f.resolve_tactical(FEET, DEFAULT_LOOK_HEIGHT, true, &|_, _, _| None, &|_, _| {
             false
         });
