@@ -47,14 +47,14 @@ fn obj(a: &[Value], i: usize) -> ObjectId {
     }
 }
 
-/// DA2's waiting queue is separate from its active executor (0x4fd460,
-/// 0x5a8d40). Our started front carries that executor's deadline.
+/// Both games expose the waiting queue separately from the active executor:
+/// Origins 0x66d1c0 / 0x73c6d0, DA2 0x4fd460 / 0x5c2400. Our started front
+/// carries that executor's deadline.
 fn script_command_queue(sim: &Sim, who: ObjectId) -> &[Command] {
     let Some(o) = sim.world.get(who) else {
         return &[];
     };
-    let active = sim.game == thedas_vfs::Game::DragonAge2
-        && o.commands.first().is_some_and(|c| c.due.is_some());
+    let active = o.commands.first().is_some_and(|c| c.due.is_some());
     &o.commands[usize::from(active)..]
 }
 
@@ -1250,6 +1250,49 @@ pub fn call(
         "GetPCSpeaker" if h.sim.game == thedas_vfs::Game::Origins => ok(Value::Object(
             h.sim.world.controlled().unwrap_or(OBJECT_INVALID),
         )),
+        "GetPartyLeader" if h.sim.game == thedas_vfs::Game::Origins => ok(Value::Object(
+            h.sim
+                .world
+                .party_leader
+                .or(h.sim.world.hero)
+                .unwrap_or(OBJECT_INVALID),
+        )),
+        "SetPartyLeader" if h.sim.game == thedas_vfs::Game::Origins => {
+            let who = obj(a, 0);
+            // 0x661320 -> 0x636180: any resolved creature may be the leader.
+            // Party enumeration puts it first only if it is already a member.
+            if h.object(who)
+                .is_some_and(|o| o.kind == ObjectKind::Creature)
+            {
+                h.sim.world.party_leader = Some(who);
+                let mut members = party_of(h.sim);
+                if let Some(i) = members.iter().position(|&m| m == who) {
+                    members.remove(i);
+                    members.insert(0, who);
+                    h.sim.world.party_order = members;
+                }
+            }
+            void()
+        }
+        "SetPrimaryControlled" if h.sim.game == thedas_vfs::Game::Origins => {
+            let who = obj(a, 0);
+            // 0x661050 -> 0x6a5f40(true), then virtual +0x1d0 (0x6a3660).
+            // The predicate uses integer current health, not the saved dead bit.
+            let eligible = h.sim.world.get_mut(who).is_some_and(|o| {
+                if o.kind != ObjectKind::Creature {
+                    return false;
+                }
+                o.uncontrollable = false;
+                o.properties
+                    .get(&7)
+                    .is_some_and(|&(_, current)| (1.0..2147483648.0).contains(&current))
+            });
+            if eligible {
+                h.sim.world.controlled = Some(who);
+                h.sim.world.script_controlled = (!party_of(h.sim).contains(&who)).then_some(who);
+            }
+            void()
+        }
         "GetPartyLeader" | "GetMainControlled" => ok(Value::Object(
             h.sim.world.controlled().unwrap_or(OBJECT_INVALID),
         )),
@@ -3284,6 +3327,7 @@ pub fn call(
         "SetCommandFloat" => {
             // 0x66ee60 writes the indexed native float directly. MoveToObject's
             // builder stores maximum in slot 0 and minimum in slot 1 (0x66f39a).
+            // PlayAnimation reads its speed override from float 3 (0x7a4480).
             // Other command layouts remain provisional.
             let mut c = match h.sim.world.handle(handle(a, 0)) {
                 Some(EngineData::Command(c)) => c.clone(),
@@ -3300,6 +3344,10 @@ pub fn call(
                     0 => c.max_range = Some(float(a, 1)),
                     1 => c.seconds = float(a, 1),
                     _ => {}
+                }
+            } else if c.name == "CommandPlayAnimation" && h.sim.game == thedas_vfs::Game::Origins {
+                if index == 3 {
+                    c.seconds = float(a, 1);
                 }
             } else if index == 0 {
                 c.seconds = float(a, 1);
@@ -3339,6 +3387,10 @@ pub fn call(
                             1 => c.seconds,
                             _ => 0.0,
                         }
+                    } else if c.name == "CommandPlayAnimation"
+                        && h.sim.game == thedas_vfs::Game::Origins
+                    {
+                        if i == 3 { c.seconds } else { 0.0 }
                     } else if i == 0 {
                         c.seconds
                     } else {
@@ -3433,6 +3485,7 @@ pub fn call(
                         let result = constant(&h.sim.table, "COMMAND_FAILED_COMMAND_CLEARED");
                         let mut ev = h.sim.new_event("COMMAND_COMPLETE", Some(target));
                         ev.ints = vec![cleared.ty, result];
+                        ev.objects = vec![target, cleared.target.unwrap_or(OBJECT_INVALID)];
                         h.sim.world.trace.push(TraceEntry::Command {
                             t,
                             object: target,
@@ -3453,6 +3506,9 @@ pub fn call(
             });
             match h.sim.world.get_mut(target) {
                 Some(o) => {
+                    // Origins uses a growing list, not a ten-command capacity.
+                    // 0x73ccd0 / 0x698c30 only enforce the container's allocation
+                    // limit; -2 is an active command being cleared, not a full queue.
                     if front {
                         // The native active executor is separate from the waiting queue.
                         // Keep its simulation front in place if add behavior left it alive.
@@ -3481,7 +3537,10 @@ pub fn call(
         "GetCurrentCommand" => {
             let c = h
                 .object(obj(a, 0))
-                .and_then(|o| o.commands.first().cloned());
+                .and_then(|o| o.commands.first())
+                // Origins 0x73c5f0 reads only the separate active executor.
+                .filter(|c| h.sim.game != thedas_vfs::Game::Origins || c.due.is_some())
+                .cloned();
             let hd = c.map(|c| h.sim.world.store(EngineData::Command(c)));
             ok(Value::Engine {
                 ty: ty.command,
@@ -3796,12 +3855,8 @@ pub fn call(
             void()
         }
         "GetCommandByIndex" => {
-            let index = if h.sim.game == thedas_vfs::Game::DragonAge2 {
-                // 0x5c2400 consumes the index as an unsigned 16-bit value.
-                int(a, 1) as u16 as usize
-            } else {
-                int(a, 1).max(0) as usize
-            };
+            // Origins 0x73c6d0 and DA2 0x5c2400 consume unsigned 16-bit indices.
+            let index = int(a, 1) as u16 as usize;
             let c = script_command_queue(h.sim, obj(a, 0)).get(index).cloned();
             let hd = c.map(|c| h.sim.world.store(EngineData::Command(c)));
             ok(Value::Engine {
@@ -4013,6 +4068,12 @@ pub fn call(
                     ho.followers.retain(|&f| f != who);
                     if active {
                         ho.followers.push(who);
+                    }
+                }
+                if !h.sim.world.party_order.is_empty() {
+                    h.sim.world.party_order.retain(|&m| m != who);
+                    if active {
+                        h.sim.world.party_order.push(who);
                     }
                 }
                 // Joining the active party puts a follower on the player's side
@@ -5523,8 +5584,14 @@ pub fn call(
                 o.fields.insert("CommandResult".into(), result);
                 if failed && !o.commands.is_empty() {
                     let c = o.commands.remove(0);
+                    if h.sim.game == thedas_vfs::Game::Origins {
+                        o.combat.previous_command = Some(c.clone());
+                    }
                     let mut ev = h.sim.new_event("COMMAND_COMPLETE", Some(who));
                     ev.ints = vec![c.ty, result];
+                    if h.sim.game == thedas_vfs::Game::Origins {
+                        ev.objects = vec![who, c.target.unwrap_or(OBJECT_INVALID)];
+                    }
                     h.sim.world.queue_event(0, who, ev, None);
                 }
             }
@@ -6205,6 +6272,20 @@ pub fn party_of(sim: &Sim) -> Vec<ObjectId> {
     if let Some(h) = hero.and_then(|h| sim.world.get(h)) {
         v.extend(h.followers.iter().copied());
     }
+    if sim.game == thedas_vfs::Game::Origins && !sim.world.party_order.is_empty() {
+        let mut ordered = Vec::with_capacity(v.len());
+        for &id in &sim.world.party_order {
+            if v.contains(&id) && !ordered.contains(&id) {
+                ordered.push(id);
+            }
+        }
+        for id in v {
+            if !ordered.contains(&id) {
+                ordered.push(id);
+            }
+        }
+        return ordered;
+    }
     v
 }
 
@@ -6551,6 +6632,192 @@ mod tests {
     use thedas_vfs::Vfs;
 
     use super::*;
+
+    fn party_control_sim() -> (Sim, [ObjectId; 4]) {
+        let table = EngineTable::parse(
+            b"\
+            void SetPartyLeader(object o) = 625;\n\
+            void SetPrimaryControlled(object o) = 815;\n\
+            object GetPartyLeader() = 624;\n\
+            object GetMainControlled() = 115;\n\
+            void SetFollowerState(object o, int n) = 4;\n\
+            int FOLLOWER_STATE_ACTIVE = 1;\n\
+            int FOLLOWER_STATE_LOCKEDACTIVE = 5;\n\
+            object[] GetPartyList() = 255;\n",
+        )
+        .unwrap();
+        let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(table), 1);
+        let members = std::array::from_fn(|i| {
+            let id = s.world.spawn(ObjectKind::Creature, &format!("member_{i}"));
+            s.world
+                .get_mut(id)
+                .unwrap()
+                .properties
+                .insert(7, (10.0, 10.0));
+            id
+        });
+        s.world.hero = Some(members[0]);
+        s.world.get_mut(members[0]).unwrap().followers = members[1..].to_vec();
+        (s, members)
+    }
+
+    #[test]
+    fn party_control_leader_and_primary_selection_are_independent() {
+        let (mut s, m) = party_control_sim();
+        run(&mut s, m[0], "SetPartyLeader", &[Value::Object(m[2])]);
+        assert_eq!(
+            run(&mut s, m[0], "GetPartyLeader", &[]),
+            Some(Value::Object(m[2]))
+        );
+        assert_eq!(
+            run(&mut s, m[0], "GetMainControlled", &[]),
+            Some(Value::Object(m[0]))
+        );
+        assert_eq!(party_of(&s), vec![m[2], m[0], m[1], m[3]]);
+        run(&mut s, m[0], "SetPartyLeader", &[Value::Object(m[1])]);
+        assert_eq!(party_of(&s), vec![m[1], m[2], m[0], m[3]]);
+        run(&mut s, m[0], "SetPrimaryControlled", &[Value::Object(m[3])]);
+        assert_eq!(s.world.controlled(), Some(m[3]));
+        assert_eq!(s.world.party_leader, Some(m[1]));
+        assert_eq!(
+            run(&mut s, m[0], "GetPartyList", &[]),
+            Some(objects(vec![m[1], m[2], m[0], m[3]]))
+        );
+        assert_eq!(s.world.hero, Some(m[0]));
+        assert!(
+            s.world.queue.is_empty(),
+            "script selection does not synthesize player training events"
+        );
+    }
+
+    #[test]
+    fn party_control_primary_uses_integer_health_and_restores_controllability_first() {
+        for (health, eligible) in [
+            (None, false),
+            (Some(0.0), false),
+            (Some(-1.0), false),
+            (Some(0.9), false),
+            (Some(1.0), true),
+            (Some(f32::NAN), false),
+            (Some(f32::INFINITY), false),
+            (Some(2147483648.0), false),
+        ] {
+            let (mut s, m) = party_control_sim();
+            let target = s.world.get_mut(m[1]).unwrap();
+            target.uncontrollable = true;
+            target.dead = true;
+            target.active = false;
+            target.properties.remove(&7);
+            if let Some(h) = health {
+                target.properties.insert(7, (h, h));
+            }
+            run(&mut s, m[0], "SetPrimaryControlled", &[Value::Object(m[1])]);
+            assert!(!s.world.get(m[1]).unwrap().uncontrollable);
+            assert_eq!(
+                s.world.controlled(),
+                Some(if eligible { m[1] } else { m[0] }),
+                "health={health:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn party_control_native_selection_can_resolve_a_nonmember_and_player_selection_clears_it() {
+        let (mut s, m) = party_control_sim();
+        let other = s.world.spawn(ObjectKind::Creature, "other");
+        s.world
+            .get_mut(other)
+            .unwrap()
+            .properties
+            .insert(7, (10.0, 10.0));
+        run(&mut s, m[0], "SetPartyLeader", &[Value::Object(other)]);
+        assert_eq!(party_of(&s), m.to_vec());
+        assert_eq!(s.world.party_leader, Some(other));
+        run(
+            &mut s,
+            m[0],
+            "SetPrimaryControlled",
+            &[Value::Object(other)],
+        );
+        assert_eq!(s.world.controlled(), Some(other));
+        assert!(!party_of(&s).contains(&other));
+        s.player_selects(m[1]);
+        assert_eq!(s.world.controlled(), Some(m[1]));
+        assert!(s.world.script_controlled.is_none());
+    }
+
+    #[test]
+    fn party_control_invalid_objects_do_not_replace_current_state() {
+        let (mut s, m) = party_control_sim();
+        run(&mut s, m[0], "SetPartyLeader", &[Value::Object(m[1])]);
+        run(&mut s, m[0], "SetPrimaryControlled", &[Value::Object(m[2])]);
+        let item = s.world.spawn(ObjectKind::Item, "item");
+        for id in [item, OBJECT_INVALID, 123456789] {
+            for name in ["SetPartyLeader", "SetPrimaryControlled"] {
+                run(&mut s, m[0], name, &[Value::Object(id)]);
+            }
+        }
+        assert_eq!(s.world.party_leader, Some(m[1]));
+        assert_eq!(s.world.controlled(), Some(m[2]));
+    }
+
+    #[test]
+    fn party_control_member_removal_drops_its_order_slot_and_primary_falls_back() {
+        let (mut s, m) = party_control_sim();
+        run(&mut s, m[0], "SetPartyLeader", &[Value::Object(m[2])]);
+        run(&mut s, m[0], "SetPrimaryControlled", &[Value::Object(m[2])]);
+        run(
+            &mut s,
+            m[0],
+            "SetFollowerState",
+            &[Value::Object(m[2]), Value::Int(0)],
+        );
+        assert_eq!(s.world.controlled(), Some(m[0]));
+        assert_eq!(party_of(&s), vec![m[0], m[1], m[3]]);
+        run(
+            &mut s,
+            m[0],
+            "SetFollowerState",
+            &[Value::Object(m[2]), Value::Int(1)],
+        );
+        assert_eq!(party_of(&s), vec![m[0], m[1], m[3], m[2]]);
+    }
+
+    #[test]
+    fn party_control_json_retains_explicit_state_and_old_worlds_use_hero_defaults() {
+        let (mut s, m) = party_control_sim();
+        run(&mut s, m[0], "SetPartyLeader", &[Value::Object(m[2])]);
+        run(&mut s, m[0], "SetPrimaryControlled", &[Value::Object(m[1])]);
+        let mut restored = party_control_sim().0;
+        restored.world = serde_json::from_slice(&serde_json::to_vec(&s.world).unwrap()).unwrap();
+        assert_eq!(restored.world.controlled(), Some(m[1]));
+        assert_eq!(party_of(&restored), party_of(&s));
+        assert_eq!(restored.world.party_leader, Some(m[2]));
+        let mut value = serde_json::to_value(&s.world).unwrap();
+        for name in ["party_leader", "party_order", "script_controlled"] {
+            value.as_object_mut().unwrap().remove(name);
+        }
+        let old: crate::World = serde_json::from_value(value).unwrap();
+        assert!(old.party_leader.is_none() && old.party_order.is_empty());
+        assert!(old.script_controlled.is_none());
+    }
+
+    #[test]
+    fn party_control_da2_dispatch_remains_unchanged() {
+        let (mut s, m) = party_control_sim();
+        s.game = thedas_vfs::Game::DragonAge2;
+        for name in ["SetPartyLeader", "SetPrimaryControlled"] {
+            let f = s.table.function_by_name(name).unwrap().clone();
+            let mut h = ScriptHost {
+                sim: &mut s,
+                event: None,
+                script: "test".into(),
+            };
+            assert!(call(&mut h, m[0], &f, &[Value::Object(m[1])]).is_none());
+        }
+        assert!(s.world.party_leader.is_none());
+        assert_eq!(s.world.controlled(), Some(m[0]));
+    }
 
     #[test]
     fn ring_weapon_queries_dispatch_and_play_time_units() {
@@ -9011,7 +9278,55 @@ mod tests {
     }
 
     #[test]
-    fn da2_command_queue_omits_the_active_executor_and_keeps_waiting_indexes() {
+    fn origins_rejected_commands_keep_completion_arguments_and_previous_command() {
+        for game in [thedas_vfs::Game::Origins, thedas_vfs::Game::DragonAge2] {
+            let table = EngineTable::parse(
+                b"void SetCommandResult(object who, int result) = 716;\n\
+                int COMMAND_RESULT_FAILED = 0;\n\
+                int EVENT_TYPE_COMMAND_COMPLETE = 1004;\n",
+            )
+            .unwrap();
+            let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(table), 1);
+            s.game = game;
+            let who = s.world.spawn(ObjectKind::Creature, "actor");
+            let target = s.world.spawn(ObjectKind::Creature, "target");
+            let command = Command {
+                ty: 1,
+                name: "CommandAttack".into(),
+                target: Some(target),
+                due: Some(100),
+                ..Default::default()
+            };
+            s.world.get_mut(who).unwrap().commands.push(command.clone());
+            run(
+                &mut s,
+                who,
+                "SetCommandResult",
+                &[Value::Object(who), Value::Int(0)],
+            );
+            let event = s.world.queue.values().next().unwrap();
+            assert_eq!(event.target, who);
+            assert_eq!(event.event.creator, Some(who));
+            assert_eq!(event.event.ints, [1, 0]);
+            assert_eq!(
+                event.event.objects,
+                if game == thedas_vfs::Game::Origins {
+                    vec![who, target]
+                } else {
+                    Vec::new()
+                }
+            );
+            let actor = s.world.get(who).unwrap();
+            assert!(actor.commands.is_empty());
+            assert_eq!(
+                actor.combat.previous_command.as_ref(),
+                (game == thedas_vfs::Game::Origins).then_some(&command)
+            );
+        }
+    }
+
+    #[test]
+    fn command_queue_omits_the_active_executor_and_keeps_waiting_indexes() {
         fn command_at(s: &mut Sim, who: ObjectId, index: i32) -> Option<Command> {
             let Some(Value::Engine { handle, .. }) = run(
                 s,
@@ -9032,6 +9347,7 @@ mod tests {
                 b"#define ENGINE_STRUCTURE_2 command\n\
                 int GetCommandQueueSize(object o) = 724;\n\
                 command GetCommandByIndex(object o, int i) = 536;\n\
+                command GetCurrentCommand(object o) = 539;\n\
                 int COMMAND_TYPE_WAIT = 13;\n",
             )
             .unwrap();
@@ -9039,47 +9355,55 @@ mod tests {
             s.game = game;
             let who = s.world.spawn(ObjectKind::Creature, "actor");
             let size = |s: &mut Sim, id| run(s, who, "GetCommandQueueSize", &[Value::Object(id)]);
+            let current = |s: &mut Sim| {
+                let Some(Value::Engine { handle, .. }) =
+                    run(s, who, "GetCurrentCommand", &[Value::Object(who)])
+                else {
+                    panic!("expected command handle");
+                };
+                match s.world.handle(handle) {
+                    Some(EngineData::Command(c)) => Some(c.seconds),
+                    _ => None,
+                }
+            };
             assert_eq!(size(&mut s, who), Some(Value::Int(0)));
+            assert_eq!(current(&mut s), None);
             assert_eq!(size(&mut s, OBJECT_INVALID), Some(Value::Int(0)));
             assert_eq!(command_at(&mut s, OBJECT_INVALID, 0), None);
             s.order_wait(who, 1.);
             // Before the scheduler starts it, the front is still waiting.
             assert_eq!(size(&mut s, who), Some(Value::Int(1)));
             assert_eq!(command_at(&mut s, who, 0).unwrap().seconds, 1.);
+            assert_eq!(
+                current(&mut s),
+                (game == thedas_vfs::Game::DragonAge2).then_some(1.)
+            );
             s.tick(100);
-            let da2 = game == thedas_vfs::Game::DragonAge2;
-            assert_eq!(size(&mut s, who), Some(Value::Int(i32::from(!da2))));
-            assert_eq!(command_at(&mut s, who, 0).is_none(), da2);
+            assert_eq!(current(&mut s), Some(1.));
+            assert_eq!(size(&mut s, who), Some(Value::Int(0)));
+            assert_eq!(command_at(&mut s, who, 0), None);
             let mut next = s.world.get(who).unwrap().commands[0].clone();
             next.due = None;
             next.seconds = 2.;
             s.world.get_mut(who).unwrap().commands.push(next.clone());
             next.seconds = 3.;
             s.world.get_mut(who).unwrap().commands.push(next);
-            assert_eq!(size(&mut s, who), Some(Value::Int(if da2 { 2 } else { 3 })));
-            assert_eq!(
-                command_at(&mut s, who, 0).unwrap().seconds,
-                if da2 { 2. } else { 1. }
-            );
-            assert_eq!(command_at(&mut s, who, -1).is_none(), da2);
+            assert_eq!(size(&mut s, who), Some(Value::Int(2)));
+            assert_eq!(command_at(&mut s, who, 0).unwrap().seconds, 2.);
+            assert_eq!(command_at(&mut s, who, -1), None);
             assert_eq!(command_at(&mut s, who, i32::MAX), None);
-            assert_eq!(command_at(&mut s, who, 65536).is_some(), da2);
-            if da2 {
-                assert_eq!(command_at(&mut s, who, -65536).unwrap().seconds, 2.);
-            }
+            assert_eq!(command_at(&mut s, who, 65536).unwrap().seconds, 2.);
+            assert_eq!(command_at(&mut s, who, -65536).unwrap().seconds, 2.);
             // A ready animation still belongs to the executor. Reload keeps
             // the same queue boundary, including older records without readiness.
             s.world.get_mut(who).unwrap().commands[0].cancellable = true;
             s.world = serde_json::from_str(&serde_json::to_string(&s.world).unwrap()).unwrap();
-            assert_eq!(size(&mut s, who), Some(Value::Int(if da2 { 2 } else { 3 })));
+            assert_eq!(size(&mut s, who), Some(Value::Int(2)));
             s.world.get_mut(who).unwrap().commands[0].cancellable = false;
             s.world = serde_json::from_str(&serde_json::to_string(&s.world).unwrap()).unwrap();
             s.tick(900);
-            assert_eq!(
-                command_at(&mut s, who, 0).unwrap().seconds,
-                if da2 { 3. } else { 2. }
-            );
-            assert_eq!(size(&mut s, who), Some(Value::Int(if da2 { 1 } else { 2 })));
+            assert_eq!(command_at(&mut s, who, 0).unwrap().seconds, 3.);
+            assert_eq!(size(&mut s, who), Some(Value::Int(1)));
             s.world.get_mut(who).unwrap().commands.clear();
             assert_eq!(size(&mut s, who), Some(Value::Int(0)));
         }

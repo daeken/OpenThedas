@@ -13,6 +13,7 @@
 //! [`Sim::tick`], and randomness comes from a seeded generator.
 
 pub mod ambient;
+mod animation;
 pub mod aoe;
 pub mod appearance;
 pub mod chanters;

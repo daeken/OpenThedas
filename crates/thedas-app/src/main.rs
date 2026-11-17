@@ -225,9 +225,9 @@ struct Args {
     /// video option: `on` or `off`.
     #[arg(long, default_value = "on", value_parser = ["on", "off"])]
     frame_effects: String,
-    /// How the level is drawn: `faithful` (every material through the original's own
-    /// shaders, the reference) or `deferred` (our renderer: the level's static geometry lit
-    /// per pixel by every light in reach; see docs/deferred.md). F11 flips between them.
+    /// How the level is drawn: `faithful` (the original's material shaders) or `deferred`
+    /// (our renderer: static geometry lit per pixel by every light in reach; see
+    /// docs/deferred.md). Sun-shadow sampling is chosen separately. F11 flips renderers.
     #[arg(long, default_value = "faithful", value_parser = ["faithful", "deferred"])]
     renderer: String,
     /// What the deferred renderer does with the baked lightmaps: `baked` (as the original),
@@ -236,6 +236,10 @@ struct Args {
     /// `THEDAS_DEFERRED_BAKED_LIGHTING`, else `baked`.
     #[arg(long, value_parser = ["baked", "hybrid", "realtime"])]
     lighting: Option<String>,
+    /// Improved sun-shadow PCF and a 2 m partition blend. `off` keeps the original's
+    /// hard switch and filters. Deliberate OpenThedas visual deviation; same shadow maps.
+    #[arg(long, default_value = "on", value_parser = ["on", "off"])]
+    soft_shadows: String,
     /// Viewer (`--area`): place visual effects in the level, `MODEL@X,Y,Z` separated by `;`
     /// (`fxa_fireball_impact_p@10,4,0;fxa_storm_area_p@14,2,0`), each a model of the
     /// game's VFX (`.mmh` without the extension) standing there, its emitters running from
@@ -244,9 +248,9 @@ struct Args {
     #[arg(long, default_value = "")]
     vfx: String,
     /// The original's "Graphics Detail" video option, which picks the materials' techniques
-    /// and the bloom's blur: `low`, `medium` or `high` (High's materials draw as Medium's; its
-    /// sun shadows are 1024 texels a side and reach further).
-    #[arg(long, default_value = "medium", value_parser = ["low", "medium", "high"])]
+    /// and the bloom's blur: `low`, `medium` or `high` (Very High, original index 3;
+    /// materials draw as Medium's, sun shadows are 1024 texels and reach further).
+    #[arg(long, default_value = "high", value_parser = ["low", "medium", "high"])]
     detail: String,
     /// Multisampled anti-aliasing for the world: samples a pixel (the original's
     /// `AntialiasingLevel`; 1 is off, which leaves the post-process smoothing on). Limited to
@@ -630,14 +634,15 @@ fn capture(
             let comparison = std::env::var("THEDAS_BENCH_SHADOW_COMPARE").ok();
             if comparison
                 .as_deref()
-                .is_some_and(|s| s != "reuse" && s != "faithful")
+                .is_some_and(|s| !matches!(s, "reuse" | "faithful" | "soft"))
             {
-                bail!("THEDAS_BENCH_SHADOW_COMPARE must be reuse or faithful");
+                bail!("THEDAS_BENCH_SHADOW_COMPARE must be reuse, faithful or soft");
             }
             if compare.is_some() && comparison.is_some() {
                 bail!("choose one deferred benchmark comparison");
             }
             let original_path = live.render_path;
+            let original_soft = thedas_render::soft_shadows();
             let mut modes = Vec::new();
             let mut shadow_modes = Vec::new();
             for frame in 0..n {
@@ -716,6 +721,7 @@ fn capture(
                 }
                 match comparison.as_deref() {
                     Some("reuse") => live.set_deferred_shadow_reuse(Some(test)),
+                    Some("soft") => thedas_render::set_soft_shadows(test),
                     Some("faithful") => {
                         live.render_path = if test {
                             thedas_render::RenderPath::Deferred
@@ -753,6 +759,9 @@ fn capture(
             }
             live.render_path = original_path;
             live.set_deferred_shadow_reuse(None);
+            if comparison.as_deref() == Some("soft") {
+                thedas_render::set_soft_shadows(original_soft);
+            }
             let avg = ms.iter().sum::<f64>() / ms.len() as f64;
             let worst = ms.iter().cloned().fold(0.0, f64::max);
             println!("bench: {n} frames, avg {avg:.1} ms, worst {worst:.1} ms");
@@ -1527,6 +1536,7 @@ impl App {
         );
         if let (Some(live), Some(_)) = (&self.live, &self.screens) {
             ui.attach(&live.sim);
+            seed_client_options(live, &ui);
             ui.set_saves(saves::SaveStore::new(self.saves_dir.clone()));
         }
         let reticle = reticle::ReticlePass::new(&ctx.device, config.format, 1);
@@ -6815,6 +6825,7 @@ fn main() -> Result<()> {
     ));
     raise_open_file_limit();
     let mut args = Args::parse();
+    thedas_render::set_soft_shadows(args.soft_shadows == "on");
     if let Some(mode) = args
         .lighting
         .as_deref()
@@ -6972,6 +6983,11 @@ fn main() -> Result<()> {
         args.area.as_deref().unwrap_or(DEFAULT_AREA)
     };
     let detail = thedas_render::scene::Detail::parse(&args.detail).unwrap_or_default();
+    log::info!(
+        "graphics: detail={}, soft-shadows={}",
+        detail.name(),
+        args.soft_shadows
+    );
     let vfx = parse_vfx(&args.vfx)?;
     let mut loaded = load(&install, area, &args.shaders, &vfx, detail)?;
     loaded.frame_effects = args.frame_effects == "on";
@@ -7031,6 +7047,7 @@ fn main() -> Result<()> {
                     layer.set_settings_file(path.clone());
                 }
                 layer.attach(&l.sim);
+                seed_client_options(l, &layer);
                 layer.set_saves(saves::SaveStore::new(saves_dir.clone()));
                 let mut s = screens::Screens::new(l.front_end);
                 l.aiming = layer.play(&mut s, &l.sim, 0.0).pop();
@@ -7860,6 +7877,7 @@ fn main() -> Result<()> {
             "frame_effects": args.frame_effects,
             "renderer": args.renderer,
             "lighting": args.lighting,
+            "soft_shadows": args.soft_shadows,
             "language": args.language,
             "module": args.module,
             "install": report::install_info(&install, &args.language),
@@ -7922,6 +7940,36 @@ fn pack_note(name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn new_graphics_defaults_and_shadow_override() {
+        use clap::Parser;
+        let args = super::Args::try_parse_from(["thedas-app"]).unwrap();
+        assert_eq!(args.detail, "high");
+        assert_eq!(args.soft_shadows, "on");
+        assert_eq!(
+            thedas_render::scene::Detail::default(),
+            thedas_render::scene::Detail::High
+        );
+        assert_eq!(
+            thedas_ui::options::DEFAULTS
+                .iter()
+                .find(|(key, _)| *key == "VideoOptions.GraphicsDetailLevel")
+                .unwrap()
+                .1,
+            3.0
+        );
+        let args = super::Args::try_parse_from([
+            "thedas-app",
+            "--detail",
+            "medium",
+            "--soft-shadows",
+            "off",
+        ])
+        .unwrap();
+        assert_eq!(args.detail, "medium");
+        assert_eq!(args.soft_shadows, "off");
+    }
+
     #[cfg(unix)]
     #[test]
     fn the_open_file_limit_is_raised_to_the_wanted_count_within_the_hard_limit() {
