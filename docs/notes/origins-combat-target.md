@@ -39,9 +39,9 @@ observe the missing input, though their other selection paths can mask it.
 The simulator's presentation accessor remains separate: it reports the
 currently drawn swing. Script GetAttackTarget must report the persistent
 prepared id, including stale or dead ids, until a native lifecycle clear.
-Revision 12 migrates an older active attack's explicit target while its owner
+Revision 13 migrates an older active attack's explicit target while its owner
 is in combat, and marks that command prepared. An explicit saved register is
-preserved, and an active attack outside combat keeps its cleared register.
+preserved, and a saved prepared command keeps its register even if it was cleared.
 Old idle/wait snapshots cannot reconstruct historical preparation; no
 last-enemy or nearest-hostile heuristic belongs in the getter. Ability-only
 history (especially a self cast's previous enemy) is likewise not invented.

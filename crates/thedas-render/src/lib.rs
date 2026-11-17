@@ -18,7 +18,7 @@ mod backend_check;
 pub mod camera;
 pub mod collide;
 mod config;
-pub use config::{BakedLighting, set_baked_lighting};
+pub use config::{BakedLighting, set_baked_lighting, set_soft_shadows, soft_shadows};
 pub mod cut_effects;
 pub mod d3d;
 mod d3d_gpu;

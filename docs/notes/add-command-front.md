@@ -48,8 +48,9 @@ The scheduler also checks cached fronts/deadlines when a preparation callback
 changes another actor's queue, including a deadline already selected that pass.
 
 Scope: Origins admission and start semantics; DA2 keeps its existing path.
-Conditional behavior 3 uses the persistent native combat-target register
-(see [Origins target lifetime](origins-combat-target.md)). Adjacent duplicate
-coalescing and the wider clear/remove APIs are separate
+The [queue/failure follow-up](origins-command-queue-failure.md) establishes
+the growing waiting list, script-visible boundary and event-pump ordering.
+Conditional behavior 3 uses the [persistent native combat-target register](origins-combat-target.md).
+Adjacent duplicate coalescing and the wider clear/remove APIs are separate
 command-queue work, not claims of this fix. Synthetic tests exercise the real
 engine dispatch and COMMAND_PENDING script callback, not native execution.

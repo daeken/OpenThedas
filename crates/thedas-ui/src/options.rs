@@ -58,6 +58,7 @@ pub const DEFAULTS: &[(&str, f64)] = &[
     ("VideoOptions.Gamma", 0.5),
     ("VideoOptions.TexturePack", 1.0),
     ("VideoOptions.EnableFrameBufferEffects", 1.0),
+    // Very High (original index 3), also the app and launcher's new-settings default.
     ("VideoOptions.GraphicsDetailLevel", 3.0),
     ("VideoOptions.ForceLowSettings", 0.0),
     // Off: there are no online features here (the bridge seeds it 0 and nobody is logged
@@ -270,6 +271,23 @@ pub fn values(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn graphics_detail_displays_very_high_by_default_and_preserves_saved_medium() {
+        let mut shown = BTreeMap::new();
+        values(&BTreeMap::new(), (1280, 720), (&[1], false), &mut shown);
+        assert_eq!(
+            shown["ClientOptions.VideoOptions.GraphicsDetailLevel"],
+            UiValue::Number(3.0)
+        );
+        let saved = from_text("[VideoOptions]\nGraphicsDetailLevel=2\n");
+        values(&saved, (1280, 720), (&[1], false), &mut shown);
+        assert_eq!(
+            shown["ClientOptions.VideoOptions.GraphicsDetailLevel"],
+            UiValue::Number(2.0)
+        );
+        assert_eq!(from_text(&to_text(&saved)), saved);
+    }
 
     #[test]
     fn the_settings_file_keeps_known_settings_and_skips_the_rest() {
