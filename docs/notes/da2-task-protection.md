@@ -43,3 +43,41 @@ the already protected ability animation. Regressions exercise soft and hard
 clear, readiness independent of protection, waiting-copy pruning, endpoint
 completion, movement/wait release and snapshot persistence. Origins admission
 is independent and unchanged.
+
+## Matched validation
+
+Compared baseline `8860ebb8` with candidate `1af2c303`.
+Formatting and strict workspace/all-target clippy pass. Workspace tests: 1540 passed, 28 ignored, zero failures. Debug assertions are enabled; debug symbols are disabled for workspace checks.
+
+All seven paired Origins scenarios pass (14 executions): identical logs and plot sequences, eight identical checkpoint JSONs, no game over; Tower reaches Flemeth's hut. Four 600-tick fixtures pass repeated-run and save/reload determinism. Both full corpus runs pass with identical statistics. Diagnostic examples are also identical.
+
+The matched `da2-story-check --aid none` runs use seed 1, complete counters, zero script errors, zero developer heals and zero kill aids.
+
+- `main-8860ebb8`: fake_prologue 33 ms, real_prologue 208566 ms; first game over 294330 ms in encounter [10008].
+- `task5`: fake_prologue 33 ms, real_prologue 208566 ms; first game over 294330 ms in encounter [10008].
+
+| Fight | Baseline ms / result | Candidate ms / result |
+| --- | --- | --- |
+| pro000ar_blightlands_fake, encounters [187, 10000, 10001, 10002] (fight 1 / 1) | 206800 / area_transition | 206800 / area_transition |
+| pro000ar_blightlands_real, encounters [187] (fight 2 / 2) | 1100 / combat_ended | 1100 / combat_ended |
+| pro000ar_blightlands_real, encounters [10003] (fight 3 / 3) | 22600 / combat_ended | 22600 / combat_ended |
+| pro000ar_blightlands_real, encounters [10008] (fight 4 / 4) | 36500 / game_over | 36500 / game_over |
+
+Party totals below are damage / impact count; observed differences are reported without changing HP, damage, equipment or difficulty.
+
+| Fight | Actor | Baseline | Candidate |
+| --- | --- | --- | --- |
+| 1 / 1; encounters [187, 10000, 10001, 10002] | player | 3763.897029 / 365 | 3763.897029 / 365 |
+| 2 / 2; encounters [187] | player | 0.000000 / 0 | 0.000000 / 0 |
+| 2 / 2; encounters [187] | gen00fl_carver | 0.000000 / 0 | 0.000000 / 0 |
+| 2 / 2; encounters [187] | gen00fl_bethany | 0.000000 / 0 | 0.000000 / 0 |
+| 3 / 3; encounters [10003] | player | 254.303524 / 37 | 254.303524 / 37 |
+| 3 / 3; encounters [10003] | gen00fl_carver | 185.153630 / 25 | 185.153630 / 25 |
+| 3 / 3; encounters [10003] | gen00fl_bethany | 160.542845 / 13 | 160.542845 / 13 |
+| 4 / 4; encounters [10008] | player | 443.900789 / 66 | 443.900789 / 66 |
+| 4 / 4; encounters [10008] | gen00fl_carver | 214.514928 / 24 | 214.514928 / 24 |
+| 4 / 4; encounters [10008] | gen00fl_bethany | 158.832486 / 10 | 158.832486 / 10 |
+
+Fight numbers above are baseline / candidate. Different encounter groupings appear as separate rows. Full-story durations reflect carried party health and progression, not equal-start isolated fights.
+
+Full verdicts retain per-combatant ability totals, impact spacing, health, encounter teams and unimplemented-call counts in this job's local evidence.
