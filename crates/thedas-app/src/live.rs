@@ -3305,6 +3305,17 @@ mod floor_tests {
     }
 
     #[test]
+    fn proving_platform_top_is_in_reach_of_both_saved_creature_roots() {
+        // A raised platform over the room floor, matching report 1105. Both
+        // creatures can reach its top once conversation layers release the root.
+        let platform = floors(&[-2.02, -1.5]);
+        for z in [-1.6898366, -1.6646719] {
+            let top = floor_under(&platform, [0.0, 0.0, z], Game::Origins).unwrap();
+            assert!((top + 1.5).abs() < 1e-5, "{top}");
+        }
+    }
+
+    #[test]
     fn soles_still_clear_small_grid_errors_and_the_downward_reach_is_bounded() {
         let collider = floors(&[0.02]);
         for game in [Game::Origins, Game::DragonAge2] {
