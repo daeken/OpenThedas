@@ -84,6 +84,15 @@ pub fn rows(
                         }
                         (to / d, 1.0 - d / radius, d, d / radius)
                     }
+                    LightKind::Spot { radius, .. } => {
+                        let Some((direction, distance, attenuation)) = l.kind.incident(sp) else {
+                            continue;
+                        };
+                        if attenuation <= 0.0 {
+                            continue;
+                        }
+                        (direction, attenuation, distance, distance / radius)
+                    }
                     LightKind::Directional { toward } => {
                         (toward.normalize_or_zero(), 1.0, f32::INFINITY, 0.0)
                     }

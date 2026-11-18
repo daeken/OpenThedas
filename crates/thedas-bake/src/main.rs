@@ -1316,6 +1316,9 @@ fn lightset(
         .map(|(i, l)| {
             let (kind, position, radius) = match l.kind {
                 LightKind::Point { position, radius } => ("point", position.to_array(), radius),
+                LightKind::Spot {
+                    position, radius, ..
+                } => ("spot", position.to_array(), radius),
                 LightKind::Directional { toward } => ("sun", toward.to_array(), 0.0),
                 LightKind::Ambient => ("ambient", [0.0; 3], 0.0),
             };

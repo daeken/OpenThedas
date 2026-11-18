@@ -18,5 +18,7 @@ fn main() {
             .file("src/unrar_windows.cpp")
             .compile("thedas_unrar_windows");
         println!("cargo:rustc-link-lib=powrprof");
+        println!("cargo:rustc-link-lib=shell32");
+        println!("cargo:rustc-link-lib=advapi32");
     }
 }

@@ -6,6 +6,8 @@
 
 use glam::Vec3;
 
+mod kd;
+
 /// One world-space triangle and what it belongs to.
 #[derive(Clone, Copy, Debug)]
 pub struct Tri {
@@ -23,6 +25,18 @@ impl Tri {
     pub fn normal(&self) -> Vec3 {
         (self.b - self.a).cross(self.c - self.a).normalize_or_zero()
     }
+}
+
+// yafraycore.dll recNormal (RVA 0x14180) stores the edges, cross product
+// and squared length as floats. The products in the cross and dot
+// calculations stay in x87 registers until the result is stored.
+pub(crate) fn toolset_normal([a, b, c]: [Vec3; 3]) -> Vec3 {
+    let n = (b - a).as_dvec3().cross((c - a).as_dvec3()).as_vec3();
+    let length_squared = n.as_dvec3().length_squared() as f32;
+    if length_squared == 0.0 {
+        return n;
+    }
+    n * (1.0 / length_squared.sqrt())
 }
 
 /// A ray hit: distance and triangle index.
@@ -50,6 +64,7 @@ pub struct Bvh {
     pub tris: Vec<Tri>,
     order: Vec<u32>,
     nodes: Vec<Node>,
+    toolset: Option<kd::Tree>,
 }
 
 const LEAF: usize = 4;
@@ -68,7 +83,31 @@ impl Bvh {
         if !tris.is_empty() {
             build(&tris, &centres, &mut order, &mut nodes, 0, 0, tris.len());
         }
-        Bvh { tris, order, nodes }
+        Bvh {
+            tris,
+            order,
+            nodes,
+            toolset: None,
+        }
+    }
+
+    pub(crate) fn new_toolset(tris: Vec<Tri>) -> Self {
+        let toolset = kd::Tree::new(&tris);
+        Self {
+            tris,
+            order: Vec::new(),
+            nodes: Vec::new(),
+            toolset,
+        }
+    }
+
+    pub(crate) fn normal(&self, triangle: u32) -> Vec3 {
+        let tri = &self.tris[triangle as usize];
+        if self.toolset.is_some() {
+            toolset_normal([tri.a, tri.b, tri.c])
+        } else {
+            tri.normal()
+        }
     }
 
     /// The nearest hit with `tmin < t < tmax`.
@@ -115,6 +154,10 @@ impl Bvh {
         casters_only: bool,
         on_hit: &mut dyn FnMut(Hit, &mut f32) -> bool,
     ) {
+        if let Some(tree) = &self.toolset {
+            tree.walk(&self.tris, (from, dir), tmin, limit, casters_only, on_hit);
+            return;
+        }
         if self.tris.is_empty() {
             return;
         }
@@ -234,9 +277,67 @@ fn intersect(t: &Tri, from: Vec3, dir: Vec3) -> Option<(f32, f32, f32)> {
     Some((e2.dot(q) * inv, u, v))
 }
 
+// yafraycore.dll RVA 0x13ce0 rounds each cross product and dot product to
+// binary32. The distance dot product spills in the helper at RVA 0x3590.
+// The final u + v comparison stays in x87 registers.
+fn intersect_toolset(t: &Tri, from: Vec3, dir: Vec3) -> Option<(f32, f32, f32)> {
+    let e1 = (t.b - t.a).as_dvec3();
+    let e2 = (t.c - t.a).as_dvec3();
+    let direction = dir.as_dvec3();
+    let p = direction.cross(e2).as_vec3().as_dvec3();
+    let det = e1.dot(p) as f32;
+    if det == 0.0 {
+        return None;
+    }
+    let inv = 1.0 / det;
+    let from_vertex = (from - t.a).as_dvec3();
+    let u = from_vertex.dot(p) as f32 * inv;
+    if !(0.0..=1.0).contains(&u) {
+        return None;
+    }
+    let q = from_vertex.cross(e1).as_vec3().as_dvec3();
+    let v = direction.dot(q) as f32 * inv;
+    if v < 0.0 || f64::from(u) + f64::from(v) > 1.0 {
+        return None;
+    }
+    Some((e2.dot(q) as f32 * inv, u, v))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn toolset_intersection_rounds_the_dot_product_before_scaling_distance() {
+        let triangle = Tri {
+            a: Vec3::new(1.75, 0.25, -1.0),
+            b: Vec3::new(2.5, -2.25, 1.75),
+            c: Vec3::new(-2.0, -0.75, -2.0),
+            draw: 0,
+            casts: true,
+        };
+        let from = Vec3::new(0.85, -0.81666666, -0.31666666);
+        let (t, u, v) = intersect_toolset(&triangle, from, -Vec3::ONE).unwrap();
+        // Distance and barycentrics from the pinned yafraycore.dll at RVA 0x13ce0.
+        assert_eq!(
+            [t, u, v].map(f32::to_bits),
+            [0x3dccccd4, 0x3eaaaaab, 0x3eaaaaab]
+        );
+    }
+
+    #[test]
+    fn toolset_normal_rounds_after_the_cross_product() {
+        let normal = toolset_normal([
+            Vec3::new(1.25, 2.5, 3.75),
+            Vec3::new(1.89, 1.43, 3.21),
+            Vec3::new(1.89, 1.43, 3.2),
+        ]);
+        // The pinned yafraycore.dll produces these bits for the thin triangle.
+        assert_eq!(
+            normal.to_array().map(f32::to_bits),
+            [0x3f5bb2fb, 0x3f0368a9, 0]
+        );
+    }
 
     fn quad(z: f32, draw: u32) -> [Tri; 2] {
         let (a, b, c, d) = (

@@ -6,6 +6,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+default-run = "thedas-bake"
 
 [dependencies]
 thedas-vfs.workspace = true
@@ -18,3 +19,5 @@ png.workspace = true
 serde_json.workspace = true
 log.workspace = true
 env_logger.workspace = true
+thedas-python25 = { path = "../thedas-python25" }
+roxmltree.workspace = true
