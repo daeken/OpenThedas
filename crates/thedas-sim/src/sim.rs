@@ -3998,6 +3998,23 @@ impl Sim {
         self.world.queue_event(APPROACH_CHECK_MS, id, ev, None);
     }
 
+    /// An active DA2 animation can wake for readiness before its endpoint.
+    fn command_deadline(&self, id: ObjectId, cmd: &Command) -> Option<u64> {
+        let due = cmd.due?;
+        Some(if self.game == thedas_vfs::Game::DragonAge2 {
+            if cmd.cancellable
+                && cmd.name == "CommandUseAbility"
+                && self.world.get(id).is_some_and(|o| o.commands.len() > 1)
+            {
+                self.world.time_ms
+            } else {
+                cmd.cancellable_at.map_or(due, |ready| ready.min(due))
+            }
+        } else {
+            due
+        })
+    }
+
     /// The earliest-finishing front command, starting the clock on fronts that have none.
     fn next_command(&mut self) -> Option<(u64, ObjectId)> {
         let now = self.world.time_ms;
@@ -4025,12 +4042,12 @@ impl Sim {
             })
             .collect();
         let mut best: Option<(u64, ObjectId)> = None;
-        let mut origins_prepared = false;
+        let mut commands_prepared = false;
         for (id, under_way, cmd) in fronts {
             if let Some(due) = under_way {
                 // An earlier actor's preparation script may have cleared this front.
                 // Its cached deadline must not complete the replacement command.
-                if origins_prepared
+                if commands_prepared
                     && self
                         .world
                         .get(id)
@@ -4046,26 +4063,25 @@ impl Sim {
                 continue;
             }
             let Some(mut cmd) = cmd else { continue };
-            if origins_prepared && self.world.get(id).and_then(|o| o.commands.first()) != Some(&cmd)
+            if commands_prepared
+                && self.world.get(id).and_then(|o| o.commands.first()) != Some(&cmd)
             {
                 continue;
             }
             let due = match cmd.due {
-                Some(d) => {
-                    if self.game == thedas_vfs::Game::DragonAge2 {
-                        if cmd.cancellable
-                            && cmd.name == "CommandUseAbility"
-                            && self.world.get(id).is_some_and(|o| o.commands.len() > 1)
-                        {
-                            now
-                        } else {
-                            cmd.cancellable_at.map_or(d, |ready| ready.min(d))
-                        }
-                    } else {
-                        d
-                    }
-                }
+                Some(_) => self.command_deadline(id, &cmd).unwrap(),
                 None => {
+                    if da2 && matches!(cmd.name.as_str(), "CommandUseAbility" | "CommandAttack") {
+                        // 0x60ff5d installs the active command before its preparer.
+                        // Selection has no task yet; COMMAND_PENDING later runs in
+                        // protected callback task 50, after any required approach.
+                        commands_prepared = true;
+                        cmd.due = Some(now);
+                        if let Some(c) = self.world.get_mut(id).and_then(|o| o.commands.first_mut())
+                        {
+                            c.due = cmd.due;
+                        }
+                    }
                     if !da2
                         && cmd.name != "CommandWait"
                         && let Some(o) = self.world.get_mut(id)
@@ -4115,9 +4131,18 @@ impl Sim {
                         }
                     }
                     self.prepare_combat_target(id, &cmd);
-                    // Origins checks the complete payload after COMMAND_PENDING;
-                    // include preparation's execution marker in that comparison.
-                    if let Some(front) = self.world.get(id).and_then(|o| o.commands.first()) {
+                    if da2 {
+                        // Target preparation records executor state on the active copy.
+                        // Retain it in the snapshot used to detect callback replacement.
+                        let Some(current) = self.world.get(id).and_then(|o| o.commands.first())
+                        else {
+                            continue;
+                        };
+                        cmd = current.clone();
+                    } else if let Some(front) = self.world.get(id).and_then(|o| o.commands.first())
+                    {
+                        // Origins checks the complete payload after COMMAND_PENDING;
+                        // include preparation's execution marker in that comparison.
                         cmd.da2_target_prepared = front.da2_target_prepared;
                     }
                     // An attack asks its owner's script for the result first, which may
@@ -4234,7 +4259,7 @@ impl Sim {
                             continue;
                         }
                         if !da2 {
-                            origins_prepared = true;
+                            commands_prepared = true;
                             // Native preparation already owns an active command when
                             // COMMAND_PENDING runs. Its script may AddCommand or clear
                             // it; do not mistake it for an unstarted waiting command.
@@ -4258,11 +4283,7 @@ impl Sim {
                             self.start_ability(id, &cmd);
                         }
                         let still = self.world.get(id).and_then(|o| o.commands.first()).cloned();
-                        if (!da2 && still.as_ref() != Some(&cmd))
-                            || (da2
-                                && still.as_ref().map(|c| (&c.name, c.target))
-                                    != Some((&cmd.name, cmd.target)))
-                        {
+                        if still.as_ref() != Some(&cmd) {
                             continue;
                         }
                         // A ranged attack draws (the attack duration), aims
@@ -4359,7 +4380,7 @@ impl Sim {
                         }
                     }
                     let death_blow_ms = if !da2 && cmd.name == "CommandDeathBlow" {
-                        origins_prepared = true;
+                        commands_prepared = true;
                         self.start_death_blow(id, &cmd)
                     } else {
                         None
@@ -4436,12 +4457,12 @@ impl Sim {
         }
         // A later actor's script can also invalidate the best deadline already chosen.
         // Rescan active deadlines only in that case; fresh replacements still need start.
-        if origins_prepared
+        if commands_prepared
             && best.is_some_and(|(due, id)| {
                 self.world
                     .get(id)
                     .and_then(|o| o.commands.first())
-                    .and_then(|c| c.due)
+                    .and_then(|c| self.command_deadline(id, c))
                     != Some(due)
             })
         {
@@ -4449,7 +4470,7 @@ impl Sim {
                 .world
                 .objects
                 .values()
-                .filter_map(|o| Some((o.commands.first()?.due?, o.id)))
+                .filter_map(|o| Some((self.command_deadline(o.id, o.commands.first()?)?, o.id)))
                 .min();
         }
         best
@@ -6150,6 +6171,217 @@ mod tests {
         g.templates[0].fields.clear();
         g.structs[0].values.clear();
         assert!(parse_cif(&g).packages.is_empty());
+    }
+
+    fn da2_preparation_sim() -> Sim {
+        let ldf = b"#define ENGINE_STRUCTURE_2 command\n#define ENGINE_STRUCTURE_0 event\nevent GetCurrentEvent()=1;\nint GetEventType(event e)=2;\nint GetCommandQueueSize(object o)=3;\nvoid SetLocalInt(object o,int key,int value)=4;\ncommand GetCurrentCommand(object o)=5;\nint GetCommandType(command c)=6;\nvoid SetCommandResult(object o,int value)=7;\ncommand CommandWait(float seconds)=8;\nint AddCommand(object o, command c,int front,int fixed,int behavior)=9;\nvoid ClearAllCommands(object o)=10;\nint COMMAND_TYPE_USE_ABILITY=25;\nint COMMAND_TYPE_WAIT=13;\nint EVENT_TYPE_CHOOSE_BASIC_ATTACK=111;\nint EVENT_TYPE_COMMAND_PENDING=35;\nint EVENT_TYPE_COMMAND_COMPLETE=36;\nint COMMAND_FAILED_COMMAND_CLEARED=-2;\n";
+        let mut s = Sim::new(
+            Arc::new(Vfs::new()),
+            Arc::new(EngineTable::parse(ldf).unwrap()),
+            1,
+        );
+        s.game = thedas_vfs::Game::DragonAge2;
+        s.world.trace.keep = true;
+        s
+    }
+
+    fn prep_int(code: &mut Vec<u8>, value: i32) {
+        code.extend([4, 3]);
+        code.extend(value.to_be_bytes());
+    }
+    fn prep_obj(code: &mut Vec<u8>, id: ObjectId) {
+        code.extend([4, 6]);
+        code.extend(id.to_be_bytes());
+    }
+    fn prep_action(code: &mut Vec<u8>, id: u8, argc: u8) {
+        code.extend([5, 0, 0, id, argc]);
+    }
+    fn prep_drop(code: &mut Vec<u8>) {
+        code.extend([0x1b, 0]);
+        code.extend((-4_i32).to_be_bytes());
+    }
+    fn prep_script(s: &mut Sim, who: ObjectId, mut code: Vec<u8>) {
+        code.extend([0x20, 0]);
+        let mut bytes = b"NCS V1.0B".to_vec();
+        bytes.extend(((13 + code.len()) as u32).to_be_bytes());
+        bytes.extend(code);
+        s.add_script("preparation.ncs", Ncs::parse(&bytes).unwrap());
+        s.world.get_mut(who).unwrap().script = Some("preparation.ncs".into());
+    }
+
+    #[test]
+    fn da2_preparation_callbacks_see_active_command_and_only_waiting_entries() {
+        let mut s = da2_preparation_sim();
+        let area = s.world.spawn(ObjectKind::Area, "arena");
+        let who = s.world.spawn(ObjectKind::Creature, "actor");
+        s.world.get_mut(who).unwrap().area = Some(area);
+        let mut code = Vec::new();
+        // Record waiting count under the current callback event's numeric key.
+        prep_obj(&mut code, who);
+        prep_action(&mut code, 3, 1);
+        prep_action(&mut code, 1, 0);
+        prep_action(&mut code, 2, 1);
+        prep_obj(&mut code, who);
+        prep_action(&mut code, 4, 3);
+        prep_obj(&mut code, who);
+        prep_action(&mut code, 5, 1);
+        prep_action(&mut code, 6, 1);
+        prep_int(&mut code, 999);
+        prep_obj(&mut code, who);
+        prep_action(&mut code, 4, 3);
+        for value in [0, 0, 1] {
+            prep_int(&mut code, value);
+        }
+        code.extend([4, 4]);
+        code.extend(20_f32.to_be_bytes());
+        prep_action(&mut code, 8, 1);
+        prep_obj(&mut code, who);
+        prep_action(&mut code, 9, 5);
+        prep_drop(&mut code);
+        prep_int(&mut code, 3001);
+        prep_obj(&mut code, who);
+        prep_action(&mut code, 7, 2);
+        prep_script(&mut s, who, code);
+        s.order_ability(who, 1, who, "");
+        let next = s.next_command();
+        assert!(
+            s.world.trace.script_errors.is_empty(),
+            "{:?}",
+            s.world.trace.entries
+        );
+        assert_eq!(next.unwrap().1, who);
+        let o = s.world.get(who).unwrap();
+        assert_eq!(o.locals.ints["111"], 0);
+        assert_eq!(o.locals.ints["35"], 1);
+        assert_eq!(o.locals.ints["999"], 25);
+        assert_eq!(o.commands.len(), 3);
+        assert_eq!(o.commands[0].ints, vec![3001]);
+        assert!(o.commands[0].due.is_some());
+        assert!(o.commands[1..].iter().all(|c| c.due.is_none()));
+    }
+
+    #[test]
+    fn da2_pending_replacement_with_equal_payload_does_not_receive_old_cast_or_deadline() {
+        let mut s = da2_preparation_sim();
+        let area = s.world.spawn(ObjectKind::Area, "arena");
+        let who = s.world.spawn(ObjectKind::Creature, "actor");
+        s.world.get_mut(who).unwrap().area = Some(area);
+        let mut code = Vec::new();
+        for value in [0, 0, 0] {
+            prep_int(&mut code, value);
+        }
+        prep_obj(&mut code, who);
+        prep_action(&mut code, 5, 1);
+        prep_obj(&mut code, who);
+        prep_action(&mut code, 10, 1);
+        prep_obj(&mut code, who);
+        prep_action(&mut code, 9, 5);
+        prep_drop(&mut code);
+        prep_int(&mut code, 1);
+        prep_obj(&mut code, who);
+        prep_action(&mut code, 7, 2);
+        prep_script(&mut s, who, code);
+        s.order_ability(who, 3001, who, "");
+        assert_eq!(s.next_command(), None);
+        assert!(
+            s.world.trace.script_errors.is_empty(),
+            "{:?}",
+            s.world.trace.entries
+        );
+        let commands = &s.world.get(who).unwrap().commands;
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].ints, vec![3001]);
+        assert!(commands[0].due.is_none());
+        assert!(!s.world.trace.entries.iter().any(|entry|matches!(entry,TraceEntry::Log{text,..} if text.starts_with("ABILITY_CAST_START"))));
+    }
+
+    #[test]
+    fn da2_pending_invalidates_other_actors_cached_fronts_and_keeps_ready_deadlines() {
+        for earlier in [false, true] {
+            let mut s = da2_preparation_sim();
+            let area = s.world.spawn(ObjectKind::Area, "arena");
+            let recipient = earlier.then(|| s.world.spawn(ObjectKind::Creature, "other"));
+            let who = s.world.spawn(ObjectKind::Creature, "actor");
+            let recipient =
+                recipient.unwrap_or_else(|| s.world.spawn(ObjectKind::Creature, "other"));
+            let ready = s.world.spawn(ObjectKind::Creature, "ready");
+            for id in [who, recipient] {
+                s.world.get_mut(id).unwrap().area = Some(area);
+            }
+            s.world.get_mut(recipient).unwrap().commands = vec![Command {
+                name: "CommandWait".into(),
+                ty: 13,
+                due: Some(1),
+                ..Default::default()
+            }];
+            s.world.get_mut(ready).unwrap().commands = vec![Command {
+                name: "CommandUseAbility".into(),
+                ty: 25,
+                ints: vec![3002],
+                due: Some(1000),
+                cancellable_at: Some(50),
+                ..Default::default()
+            }];
+            let mut code = Vec::new();
+            prep_obj(&mut code, recipient);
+            prep_action(&mut code, 10, 1);
+            for value in [0, 0, 0] {
+                prep_int(&mut code, value);
+            }
+            code.extend([4, 4]);
+            code.extend(20_f32.to_be_bytes());
+            prep_action(&mut code, 8, 1);
+            prep_obj(&mut code, recipient);
+            prep_action(&mut code, 9, 5);
+            prep_drop(&mut code);
+            prep_int(&mut code, 1);
+            prep_obj(&mut code, who);
+            prep_action(&mut code, 7, 2);
+            prep_script(&mut s, who, code);
+            s.order_ability(who, 3001, who, "");
+            let next = s.next_command().unwrap();
+            assert_eq!(next, (50, ready));
+            assert!(s.world.get(recipient).unwrap().commands[0].due.is_none());
+            assert!(s.world.trace.script_errors.is_empty());
+        }
+    }
+
+    #[test]
+    fn da2_selection_can_clear_the_active_command_before_tasks_exist() {
+        let mut s = da2_preparation_sim();
+        let area = s.world.spawn(ObjectKind::Area, "arena");
+        let who = s.world.spawn(ObjectKind::Creature, "actor");
+        s.world.get_mut(who).unwrap().area = Some(area);
+        let mut code = Vec::new();
+        for value in [1, 0, 1] {
+            prep_int(&mut code, value);
+        }
+        code.extend([4, 4]);
+        code.extend(5_f32.to_be_bytes());
+        prep_action(&mut code, 8, 1);
+        prep_obj(&mut code, who);
+        prep_action(&mut code, 9, 5);
+        prep_drop(&mut code);
+        prep_int(&mut code, 1);
+        prep_obj(&mut code, who);
+        prep_action(&mut code, 7, 2);
+        prep_script(&mut s, who, code);
+        s.order_ability(who, 1, who, "");
+        assert_eq!(s.next_command(), None);
+        assert!(s.world.trace.script_errors.is_empty());
+        let o = s.world.get(who).unwrap();
+        assert_eq!(o.commands.len(), 1);
+        assert_eq!(o.commands[0].name, "CommandWait");
+        assert!(o.commands[0].due.is_none());
+        assert_eq!(o.combat.previous_command.as_ref().unwrap().ty, 25);
+        assert_eq!(
+            s.world
+                .queue
+                .values()
+                .map(|q| q.event.ints.clone())
+                .collect::<Vec<_>>(),
+            vec![vec![25, -2]]
+        );
     }
 
     fn add_command_sim() -> Sim {
