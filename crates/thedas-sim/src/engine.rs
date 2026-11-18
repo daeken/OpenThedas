@@ -4258,13 +4258,14 @@ pub fn call(
                 // (GROUP_PC), whatever group it had as an NPC, and at the leader's side if
                 // it was elsewhere. Provisional.
                 let at = h.object(hero).map(|o| (o.area, o.position));
+                let now = h.sim.world.time_ms;
                 if let (true, Some(g), Some(o)) = (active, hero_group, h.sim.world.get_mut(who)) {
                     o.group = g;
                     if let Some((area, pos)) = at {
                         if o.area != area {
                             o.area = area;
                             o.position = pos;
-                            o.parked = None;
+                            o.unpark(now);
                             o.active = true;
                         }
                     }

@@ -1341,6 +1341,12 @@ impl Sim {
                     }
                 }
                 (_, Some((due, id))) if due <= until => {
+                    // Preparing another command may have unloaded this one's area.
+                    if self.game == thedas_vfs::Game::Origins
+                        && self.world.get(id).is_some_and(|o| o.parked.is_some())
+                    {
+                        continue;
+                    }
                     self.world.time_ms = self.world.time_ms.max(due);
                     let moving = self
                         .world
@@ -2117,9 +2123,15 @@ impl Sim {
                 self.clear_ambient(OBJECT_INVALID);
                 self.world.ambient_lines.clear();
             }
+            let now = self.world.time_ms;
             for o in self.world.objects.values_mut() {
                 if o.area == Some(old) && !party.contains(&o.id) || o.id == old {
                     o.parked = Some(o.active);
+                    if self.game == thedas_vfs::Game::Origins
+                        && o.commands.first().is_some_and(|c| c.due.is_some())
+                    {
+                        o.command_parked_at = Some(now);
+                    }
                     o.active = false;
                 }
             }
@@ -2151,9 +2163,7 @@ impl Sim {
                 if let Some(old) = old {
                     for o in self.world.objects.values_mut() {
                         if o.area == Some(old) || o.id == old {
-                            if let Some(a) = o.parked.take() {
-                                o.active = a;
-                            }
+                            o.unpark(self.world.time_ms);
                         }
                     }
                 }
@@ -3182,12 +3192,13 @@ impl Sim {
         type Move = (ObjectId, [f32; 3], u64, u64, Vec<[f32; 3]>);
         // Only creatures and placeables carry commands that move (see `World::actor_ids`).
         let actors = self.world.actor_ids();
+        let origins = self.game == thedas_vfs::Game::Origins;
         let moving: Vec<Move> = actors
             .iter()
             .filter_map(|&id| self.world.get(id))
             .filter_map(|o| {
                 let c = o.commands.first()?;
-                if c.name == "CommandPlayAnimation" {
+                if c.name == "CommandPlayAnimation" || (origins && o.parked.is_some()) {
                     return None;
                 }
                 let (from, t0) = c.from?;
@@ -3285,9 +3296,19 @@ impl Sim {
                         rest = path;
                     }
                 }
-                // At the speed the move was set going at (a walk stays a walk).
-                let speed = (path_length(from, &points) * 1000.0 / (due - t0) as f32).max(0.01);
-                let left = path_length(p, &rest);
+                // An identical route from an unchanged origin still takes exactly as long.
+                // Recovering speed from the old duration and truncating the new float
+                // duration can shave a millisecond at each retry. Eventually a stationary
+                // walker can force every mover and route search to update every millisecond.
+                let remaining_ms =
+                    if self.game == thedas_vfs::Game::Origins && p == from && rest == points {
+                        due - t0
+                    } else {
+                        // At the speed the move was set going at (a walk stays a walk).
+                        let speed =
+                            (path_length(from, &points) * 1000.0 / (due - t0) as f32).max(0.01);
+                        ((path_length(p, &rest) / speed) * 1000.0).max(1.0) as u64
+                    };
                 let progressed = crate::engine::dist(was, p) > 0.01;
                 if let Some(c) = self.world.get_mut(id).and_then(|o| o.commands.first_mut()) {
                     if c.name == "CommandInitiateDialog" {
@@ -3301,7 +3322,7 @@ impl Sim {
                         };
                     }
                     c.from = Some((p, now));
-                    c.due = Some(now + ((left / speed) * 1000.0).max(1.0) as u64);
+                    c.due = Some(now + remaining_ms);
                     c.path = rest;
                 }
                 self.note_blocked(id, progressed);
@@ -3548,19 +3569,21 @@ impl Sim {
     /// When walkers closing in on a creature next look again (see [`APPROACH_CHECK_MS`]):
     /// `None` when nobody is.
     fn approach_check_due(&self) -> Option<u64> {
+        let origins = self.game == thedas_vfs::Game::Origins;
         self.world
             .objects
             .values()
             .any(|o| {
-                o.commands.first().is_some_and(|c| {
-                    c.approach.is_some()
-                        && c.from.is_some()
-                        && c.target.is_some_and(|t| t != o.id)
-                        && matches!(
-                            c.name.as_str(),
-                            "CommandAttack" | "CommandUseAbility" | "CommandInitiateDialog"
-                        )
-                })
+                (!origins || o.parked.is_none())
+                    && o.commands.first().is_some_and(|c| {
+                        c.approach.is_some()
+                            && c.from.is_some()
+                            && c.target.is_some_and(|t| t != o.id)
+                            && matches!(
+                                c.name.as_str(),
+                                "CommandAttack" | "CommandUseAbility" | "CommandInitiateDialog"
+                            )
+                    })
             })
             // On a fixed grid of world time, so that ticks shorter than the period (the app's
             // 30 fps steps of 33 ms) still reach a check: one counted from "now" would always
@@ -3575,13 +3598,15 @@ impl Sim {
     /// attacker is in reach at once; when the rest of the walk is re-planned is provisional
     /// ([`APPROACH_REPLAN`]).
     fn close_approaches(&mut self) {
+        let origins = self.game == thedas_vfs::Game::Origins;
         let walkers: Vec<(ObjectId, Command)> = self
             .world
             .objects
             .values()
             .filter_map(|o| {
                 let c = o.commands.first()?;
-                (c.approach.is_some()
+                ((!origins || o.parked.is_none())
+                    && c.approach.is_some()
                     && c.from.is_some()
                     && c.target.is_some_and(|t| t != o.id)
                     && (c.name == "CommandAttack" || c.name == "CommandUseAbility"))
@@ -4028,6 +4053,12 @@ impl Sim {
             .objects
             .values_mut()
             .filter_map(|o| {
+                // Origins unload stops locomotion (0x6c5e94 -> 0x6ff8e0).
+                // Keep parked queues as well as paths out of the executor: a due
+                // command could otherwise finish and move an actor without a sweep.
+                if !da2 && o.parked.is_some() {
+                    return None;
+                }
                 if o.combat.death_blow.is_some()
                     && o.commands
                         .first()
@@ -4045,6 +4076,9 @@ impl Sim {
         let mut best: Option<(u64, ObjectId)> = None;
         let mut commands_prepared = false;
         for (id, under_way, cmd) in fronts {
+            if !da2 && commands_prepared && self.world.get(id).is_some_and(|o| o.parked.is_some()) {
+                continue;
+            }
             if let Some(due) = under_way {
                 // An earlier actor's preparation script may have cleared this front.
                 // Its cached deadline must not complete the replacement command.
@@ -5056,9 +5090,7 @@ impl Sim {
             }
             for o in self.world.objects.values_mut() {
                 if o.area == Some(area) || o.id == area {
-                    if let Some(a) = o.parked.take() {
-                        o.active = a;
-                    }
+                    o.unpark(self.world.time_ms);
                 }
             }
             // Events that waited while the area was unloaded run now.
@@ -9468,6 +9500,138 @@ mod tests {
                 Some(r) => assert!((d - r).abs() < 0.06, "at its range: {d}"),
             }
         }
+    }
+
+    #[test]
+    fn a_stationary_blocked_walk_does_not_shorten_its_retry_interval() {
+        let mut s = sim();
+        let area = s.world.spawn(ObjectKind::Area, "a");
+        s.area_layouts.insert(area, "split".into());
+        let mut grid = thedas_formats::level::NavGrid {
+            columns: 12,
+            rows: 4,
+            cell_size: 0.5,
+            clearance: 2.0,
+            base: [0.0; 3],
+            normal: [0.0, 0.0, 1.0],
+            data: [1u8, 1, 1, 1, 0, 0, 0, 0, 1, 1, 1, 1].repeat(4),
+            heights: vec![0.0; 48],
+            surfaces: Vec::new(),
+        };
+        s.nav_grids
+            .insert("split".into(), Some(Arc::new(grid.clone())));
+        let walker = s.world.spawn(ObjectKind::Creature, "walker");
+        let from = [1.999, 1.25, 0.0];
+        let goal = [4.5, 1.25, 0.0];
+        let duration = 1500;
+        let o = s.world.get_mut(walker).unwrap();
+        o.area = Some(area);
+        o.position = from;
+        o.commands.push(Command {
+            name: "CommandMoveToLocation".into(),
+            location: Some(crate::world::Location {
+                area,
+                position: goal,
+                facing: 0.0,
+            }),
+            from: Some((from, 0)),
+            due: Some(duration),
+            path: vec![goal],
+            ..Default::default()
+        });
+        for _ in 0..10 {
+            s.tick(100);
+            let o = s.world.get(walker).unwrap();
+            assert_eq!(o.position, from);
+            let c = &o.commands[0];
+            assert_eq!(c.from, Some((from, s.world.time_ms)));
+            assert_eq!(c.due, Some(s.world.time_ms + duration));
+        }
+        // A changed obstacle is still seen; retries weren't disabled.
+        grid.data.fill(1);
+        s.changed_nav_grids.insert(area, Arc::new(grid));
+        s.tick(duration);
+        let o = s.world.get(walker).unwrap();
+        assert_eq!(o.position, goal);
+        assert!(o.commands.is_empty());
+    }
+
+    #[test]
+    fn parked_origins_walks_and_approaches_pause_until_area_return() {
+        let mut s = sim();
+        let old = s.world.spawn(ObjectKind::Area, "old");
+        let away = s.world.spawn(ObjectKind::Area, "away");
+        s.world.get_mut(old).unwrap().template = "old".into();
+        s.world.get_mut(away).unwrap().template = "away".into();
+        s.world.area = Some(old);
+        let walker = s.world.spawn(ObjectKind::Creature, "walker");
+        let closing = s.world.spawn(ObjectKind::Creature, "closing");
+        let target = s.world.spawn(ObjectKind::Creature, "target");
+        let goal = [10.0, 0.0, 0.0];
+        let approach = [10.0, 10.0, 0.0];
+        for (id, position) in [
+            (walker, [0.0; 3]),
+            (closing, [0.0, 10.0, 0.0]),
+            (target, [0.0, 11.0, 0.0]),
+        ] {
+            let o = s.world.get_mut(id).unwrap();
+            o.area = Some(old);
+            o.position = position;
+        }
+        s.world.get_mut(walker).unwrap().commands.push(Command {
+            name: "CommandMoveToLocation".into(),
+            location: Some(crate::world::Location {
+                area: old,
+                position: goal,
+                facing: 0.0,
+            }),
+            from: Some(([0.0; 3], 0)),
+            turned_at: Some(0),
+            due: Some(1000),
+            path: vec![goal],
+            ..Default::default()
+        });
+        s.tick(200);
+        let closing_o = s.world.get_mut(closing).unwrap();
+        closing_o.commands.push(Command {
+            name: "CommandAttack".into(),
+            target: Some(target),
+            approach: Some(approach),
+            from: Some((closing_o.position, 200)),
+            due: Some(1200),
+            path: vec![approach],
+            ..Default::default()
+        });
+        let before = [walker, closing].map(|id| {
+            let o = s.world.get(id).unwrap();
+            (o.position, o.commands.clone())
+        });
+        assert!(s.approach_check_due().is_some());
+        s.area_transition("away", "");
+        assert_eq!(s.world.area, Some(away));
+        assert!(s.approach_check_due().is_none());
+        assert!(s.next_command().is_none());
+        s.tick(5000);
+        // Even if another approach makes this pass run, it must not replan this one.
+        s.close_approaches();
+        for (id, (position, commands)) in [walker, closing].into_iter().zip(before) {
+            let o = s.world.get(id).unwrap();
+            assert_eq!(o.parked, Some(true));
+            assert_eq!(o.position, position);
+            assert_eq!(o.commands, commands);
+        }
+        s.area_transition("old", "");
+        assert_eq!(s.world.area, Some(old));
+        assert!(s.approach_check_due().is_some());
+        let o = s.world.get(walker).unwrap();
+        assert_eq!(o.parked, None);
+        assert_eq!(o.commands[0].due, Some(6000));
+        assert_eq!(o.commands[0].turned_at, Some(5200));
+        s.tick(200);
+        assert_eq!(s.world.get(walker).unwrap().position, [4.0, 0.0, 0.0]);
+        s.tick(600);
+        assert_eq!(s.world.get(walker).unwrap().position, goal);
+        assert!(s.world.get(walker).unwrap().commands.is_empty());
     }
 
     #[test]

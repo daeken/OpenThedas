@@ -245,6 +245,9 @@ pub struct Object {
     /// loaded meanwhile); restored when the party comes back.
     #[serde(default)]
     pub parked: Option<bool>,
+    /// When Origins stopped this object's front command clock on area unload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) command_parked_at: Option<u64>,
     /// Origins' scripted heartbeat interval and elapsed seconds. Our deterministic
     /// snapshots retain elapsed too; the original save format only retains interval.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -331,6 +334,7 @@ impl Object {
             escorts: Vec::new(),
             stored: BTreeMap::new(),
             parked: None,
+            command_parked_at: None,
             heartbeat: None,
             effects: Vec::new(),
             combat: Default::default(),
@@ -343,6 +347,23 @@ impl Object {
             text_fields: BTreeMap::new(),
             aoe: None,
             item_properties: None,
+        }
+    }
+
+    pub(crate) fn unpark(&mut self, now: u64) {
+        if let Some(active) = self.parked.take() {
+            self.active = active;
+        }
+        if let Some(at) = self.command_parked_at.take()
+            && let Some(c) = self.commands.first_mut()
+        {
+            let paused = now.saturating_sub(at);
+            for stamp in [&mut c.due, &mut c.turned_at].into_iter().flatten() {
+                *stamp = stamp.saturating_add(paused);
+            }
+            if let Some((_, start)) = &mut c.from {
+                *start = start.saturating_add(paused);
+            }
         }
     }
 }
