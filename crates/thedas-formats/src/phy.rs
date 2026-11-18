@@ -62,6 +62,8 @@ pub mod mask {
     pub const WALKABLE: u32 = 0x200_0000;
     /// The sight ray's mask (perception, 0x67c530): placeables and static geometry.
     pub const SIGHT: u32 = PLACEABLES | STATIC;
+    /// Creature controller movement/placement (DAOrigins.exe 0x6b6880).
+    pub const MOVEMENT: u32 = 0x0201_1134;
 }
 
 #[derive(Clone, Debug, PartialEq)]

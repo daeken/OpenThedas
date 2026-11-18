@@ -47,6 +47,17 @@ fn obj(a: &[Value], i: usize) -> ObjectId {
     }
 }
 
+/// Both games expose the waiting queue separately from the active executor:
+/// Origins 0x66d1c0 / 0x73c6d0, DA2 0x4fd460 / 0x5c2400. Our started front
+/// carries that executor's deadline.
+fn script_command_queue(sim: &Sim, who: ObjectId) -> &[Command] {
+    let Some(o) = sim.world.get(who) else {
+        return &[];
+    };
+    let active = o.commands.first().is_some_and(|c| c.due.is_some());
+    &o.commands[usize::from(active)..]
+}
+
 /// The independent placeable current, retaining explicit currents from older saves.
 pub(crate) fn origins_placeable_health(o: &Object) -> i32 {
     o.properties.get(&7).map_or_else(
@@ -224,6 +235,36 @@ fn da2_ability_list(sim: &Sim, who: ObjectId, ty: i32, cooling: bool) -> Vec<i32
             .filter(|&id| matches_type(id as i64))
             .collect()
     }
+}
+
+/// Origins native 859: concatenate owned skill/talent/spell lists (types 1..3),
+/// optionally retaining only entries with a positive remaining cooldown.
+fn origins_ability_list(sim: &Sim, who: ObjectId, ty: i32, cooling: bool) -> Vec<i32> {
+    let Some(o) = sim
+        .world
+        .get(who)
+        .filter(|o| o.kind == ObjectKind::Creature)
+    else {
+        return Vec::new();
+    };
+    if !(0..=3).contains(&ty) {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for kind in 1..=3 {
+        if ty != 0 && ty != kind {
+            continue;
+        }
+        out.extend(o.abilities.iter().copied().filter(|&id| {
+            sim.abi_int(id, "AbilityType") == kind
+                && (!cooling
+                    || o.combat
+                        .cooldowns
+                        .get(&cooldown_key(id, ""))
+                        .is_some_and(|&until| until > sim.world.time_ms))
+        }));
+    }
+    out
 }
 
 /// The party's inventory slots before any backpack (provisional).
@@ -552,7 +593,6 @@ const PRESENTATION: &[&str] = &[
     "PlaySoundObject",
     "LinkAreaMiniMaps",
     "SendGameEventRunDatabase",
-    "SetMapPinState",
     "SetCameraTarget",
     "ApplyEffectVisualEffectOnLocation",
     "SetLookAtEnabled",
@@ -560,7 +600,6 @@ const PRESENTATION: &[&str] = &[
     "PlayMusic",
     "SetMusicIntensity",
     "SendToRunDatabase",
-    "SetCreatureGoreLevel",
     // Only the indicator on the quickbar; the modal effect itself is the scripts'.
     "Engine_SetModalAbilityGUI",
     // An icon over a creature's head (DAOrigins.exe 0x662db0): interface only.
@@ -626,10 +665,13 @@ const ABI_PERSISTENT_AREA: u32 = 0x5d3e_0787;
 /// The M2DA id of `VFX Persistent`.
 const VFX_PERSISTENT_TABLE: i32 = 96;
 
-/// `GetClusterCenter`, as DAOrigins.exe works it out (0x671980):
-/// - The cluster's span is the ability's `aoe_param1` in `ABI_base` (or, for an ability with
-///   a lasting area, its `VFX Persistent` row's `Radius`), doubled for a sphere
-///   (`aoe_type` 1).
+/// `GetClusterCenter` (DAOrigins.exe 0x671980, DragonAge2.exe 0x51a4b0):
+/// - In Origins, the cluster's span is the ability's `aoe_param1` in `ABI_base`
+///   (or, for an ability with a lasting area, its `VFX Persistent` row's `Radius`),
+///   doubled for a sphere (`aoe_type` 1).
+/// - DA2 reads the persistent row through the upgradable ability column 0x53a8a258,
+///   then its radius and shape from table 96. A sphere doubles the radius. Ability
+///   302030 instead doubles its upgradable 0x15bdf19c parameter (0x51a588-0x51a5ff).
 /// - The candidates are the creatures the creator perceives. Each hostile one in turn is a
 ///   cluster's center; the others join it, in candidate order, when within the span of the
 ///   center and of every member already in (a quirk kept: distances are read from a table
@@ -643,7 +685,8 @@ const VFX_PERSISTENT_TABLE: i32 = 96;
 /// `bReturnFirstMatch` is read but unused. Provisional: the candidates are the
 /// simulation's perception list (the engine's perception query, which also drops creatures
 /// beyond a per-creature limit, is not traced). Origins excludes creatures whose integer
-/// current health is at most zero (0x6a3660). DA2's predicate still needs tracing.
+/// current health is at most zero (0x6a3660). DA2 drops dead creatures before
+/// indexing (0x51a670), using the death byte through 0x52e810.
 fn cluster_center(
     sim: &mut Sim,
     creator: ObjectId,
@@ -668,30 +711,56 @@ fn cluster_center(
                     .get(&7)
                     .is_some_and(|&(_, current)| (1.0..2147483648.0).contains(&current))
             } else {
-                o.dead
+                // DA2 0x51a670..0x51a69d: discard the dead before assigning
+                // candidate indexes, including the unselectable index zero.
+                if o.dead {
+                    return None;
+                }
+                false
             };
             Some((c, o.position, excluded))
         })
         .collect();
     let tables = sim.world.tables.clone();
-    let abi = tables.get(0, "ABI_base");
-    let abi_cell = |col: &str| {
-        abi.as_ref()
-            .and_then(|t| t.cell(col, ability as i64).cloned())
-    };
-    let persistent = abi.as_ref().map_or(0, |t| {
-        cell_int(t.cell_by_hash(ABI_PERSISTENT_AREA, ability as i64))
-    });
-    let mut span = if persistent == 0 {
-        cell_float(abi_cell("aoe_param1").as_ref())
+    let span = if sim.game == thedas_vfs::Game::DragonAge2 {
+        if ability == 302030 {
+            2.0 * upgradable_ability_float(sim, creator, 0x15bd_f19c, ability)
+        } else {
+            let persistent = upgradable_ability_int(sim, creator, 0x53a8_a258, ability);
+            let area = tables.get(VFX_PERSISTENT_TABLE, "");
+            let cell = |column| {
+                area.as_ref()
+                    .filter(|_| persistent != 0)
+                    .and_then(|t| t.cell_by_hash(column, i64::from(persistent)))
+            };
+            let radius = cell_float(cell(0xad5f_b9f8));
+            if cell_int(cell(0x4de7_0e62)) == 1 {
+                2.0 * radius
+            } else {
+                radius
+            }
+        }
     } else {
-        tables
-            .get(VFX_PERSISTENT_TABLE, "")
-            .map_or(0.0, |t| cell_float(t.cell("Radius", persistent as i64)))
+        let abi = tables.get(0, "ABI_base");
+        let abi_cell = |col: &str| {
+            abi.as_ref()
+                .and_then(|t| t.cell(col, ability as i64).cloned())
+        };
+        let persistent = abi.as_ref().map_or(0, |t| {
+            cell_int(t.cell_by_hash(ABI_PERSISTENT_AREA, ability as i64))
+        });
+        let mut span = if persistent == 0 {
+            cell_float(abi_cell("aoe_param1").as_ref())
+        } else {
+            tables
+                .get(VFX_PERSISTENT_TABLE, "")
+                .map_or(0.0, |t| cell_float(t.cell("Radius", persistent as i64)))
+        };
+        if cell_int(abi_cell("aoe_type").as_ref()) == 1 {
+            span *= 2.0;
+        }
+        span
     };
-    if cell_int(abi_cell("aoe_type").as_ref()) == 1 {
-        span *= 2.0;
-    }
     let n = candidates.len();
     let hostile: Vec<bool> = candidates
         .iter()
@@ -812,7 +881,7 @@ fn applied_effect(
     Some(e)
 }
 
-/// Applies a visual effect (type 4) to an object as any effect is applied; an instant one,
+/// Applies a visual effect (type 4) through the game's effect dispatcher; an instant one,
 /// which leaves nothing on the object, is noted for presentation ([`crate::world::InstantVfx`]).
 fn apply_visual_or_effect(h: &mut ScriptHost, target: ObjectId, e: Effect) {
     let instant = constant(&h.sim.table, "EFFECT_DURATION_TYPE_INSTANT");
@@ -940,7 +1009,9 @@ pub fn call(
         }
         h.sim.world.sounds.push(req);
     }
-    if PRESENTATION.contains(&name) {
+    if PRESENTATION.contains(&name)
+        || (name == "SetMapPinState" && h.sim.game != thedas_vfs::Game::Origins)
+    {
         *h.sim
             .world
             .trace
@@ -1076,6 +1147,30 @@ pub fn call(
         "Random" => ok(Value::Int(h.sim.world.rng.below(int(a, 0)))),
         "RandomFloat" => ok(Value::Float(h.sim.world.rng.unit())),
         "Vector" => ok(Value::Vector([float(a, 0), float(a, 1), float(a, 2)])),
+        "GetVectorMagnitude" | "GetVectorNormalize" if h.sim.game == thedas_vfs::Game::Origins => {
+            let v = vector(a, 0);
+            // x87 sums extended products, then stores the squared length as f32.
+            let squared = v.iter().map(|&x| f64::from(x) * f64::from(x)).sum::<f64>() as f32;
+            if name == "GetVectorMagnitude" {
+                ok(Value::Float(squared.sqrt()))
+            } else {
+                let out = if !v.iter().any(|x| !x.is_nan() && *x != 0.0) {
+                    [0.0; 3]
+                } else if squared < 1.0e-6 {
+                    [1.0, 0.0, 0.0]
+                } else {
+                    let inverse = 1.0 / squared.sqrt();
+                    v.map(|x| x * inverse)
+                };
+                ok(Value::Vector(out))
+            }
+        }
+        "GetDebugHelpersEnabled" | "IsPRC" if h.sim.game == thedas_vfs::Game::Origins => {
+            ok(Value::Int(0))
+        }
+        "GetTlkTableString" if h.sim.game == thedas_vfs::Game::Origins => ok(Value::String(
+            h.sim.string(int(a, 0) as u32).unwrap_or_default(),
+        )),
         // Whether x, y and z each compare equal to 0.0 (DAOrigins.exe's handler for function
         // 40, 0x64f010): -0.0 counts as empty, NaN does not, as float comparison gives.
         "IsVectorEmpty" => ok(b(vector(a, 0) == [0.0; 3])),
@@ -1161,6 +1256,18 @@ pub fn call(
 
         // --- Objects ----------------------------------------------------------------------
         "GetModule" => ok(Value::Object(h.sim.world.module.unwrap_or(OBJECT_INVALID))),
+        "RequestTarget" if f.id == 860 && h.sim.game == thedas_vfs::Game::Origins => {
+            let script = string(a, 5);
+            h.sim.request_target(crate::target_request::TargetRequest {
+                mask: int(a, 0),
+                radius: float(a, 1),
+                event_type: int(a, 3),
+                caller,
+                recipient: obj(a, 4),
+                script: (!script.is_empty()).then_some(script),
+            });
+            void()
+        }
         "GetHero" => ok(Value::Object(h.sim.world.hero.unwrap_or(OBJECT_INVALID))),
         // Origins command 438 (0x661870 -> 0x5d5ca0) reads the player's controlled
         // object id at +0x5c, also used by GetMainControlled (0x660ae0). It does
@@ -1168,6 +1275,49 @@ pub fn call(
         "GetPCSpeaker" if h.sim.game == thedas_vfs::Game::Origins => ok(Value::Object(
             h.sim.world.controlled().unwrap_or(OBJECT_INVALID),
         )),
+        "GetPartyLeader" if h.sim.game == thedas_vfs::Game::Origins => ok(Value::Object(
+            h.sim
+                .world
+                .party_leader
+                .or(h.sim.world.hero)
+                .unwrap_or(OBJECT_INVALID),
+        )),
+        "SetPartyLeader" if h.sim.game == thedas_vfs::Game::Origins => {
+            let who = obj(a, 0);
+            // 0x661320 -> 0x636180: any resolved creature may be the leader.
+            // Party enumeration puts it first only if it is already a member.
+            if h.object(who)
+                .is_some_and(|o| o.kind == ObjectKind::Creature)
+            {
+                h.sim.world.party_leader = Some(who);
+                let mut members = party_of(h.sim);
+                if let Some(i) = members.iter().position(|&m| m == who) {
+                    members.remove(i);
+                    members.insert(0, who);
+                    h.sim.world.party_order = members;
+                }
+            }
+            void()
+        }
+        "SetPrimaryControlled" if h.sim.game == thedas_vfs::Game::Origins => {
+            let who = obj(a, 0);
+            // 0x661050 -> 0x6a5f40(true), then virtual +0x1d0 (0x6a3660).
+            // The predicate uses integer current health, not the saved dead bit.
+            let eligible = h.sim.world.get_mut(who).is_some_and(|o| {
+                if o.kind != ObjectKind::Creature {
+                    return false;
+                }
+                o.uncontrollable = false;
+                o.properties
+                    .get(&7)
+                    .is_some_and(|&(_, current)| (1.0..2147483648.0).contains(&current))
+            });
+            if eligible {
+                h.sim.world.controlled = Some(who);
+                h.sim.world.script_controlled = (!party_of(h.sim).contains(&who)).then_some(who);
+            }
+            void()
+        }
         "GetPartyLeader" | "GetMainControlled" => ok(Value::Object(
             h.sim.world.controlled().unwrap_or(OBJECT_INVALID),
         )),
@@ -1347,9 +1497,7 @@ pub fn call(
         }
         "GetObjectActive" => ok(b(h.object(obj(a, 0)).is_some_and(|o| o.active))),
         "SetObjectActive" => {
-            if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
-                o.active = int(a, 1) != 0;
-            }
+            h.sim.set_object_active(obj(a, 0), int(a, 1) != 0);
             void()
         }
         "IsDead" => ok(b(h.object(obj(a, 0)).is_some_and(|o| {
@@ -1488,7 +1636,19 @@ pub fn call(
             void()
         }
         "GetFacing" => ok(Value::Float(h.object(obj(a, 0)).map_or(0.0, |o| o.facing))),
+        "IsMoving" if h.sim.game == thedas_vfs::Game::DragonAge2 => ok(b(h
+            .object(obj(a, 0))
+            .filter(|o| o.kind == ObjectKind::Creature)
+            .and_then(|o| o.da2_locomotion.as_ref())
+            .is_some_and(crate::da2_locomotion::Locomotion::is_moving))),
         "SetFacing" => {
+            if h.sim.game == thedas_vfs::Game::DragonAge2
+                && h.object(obj(a, 0))
+                    .is_some_and(|o| o.kind == ObjectKind::Creature)
+            {
+                h.sim.da2_turn_to(obj(a, 0), float(a, 1));
+                return void();
+            }
             if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
                 o.facing = float(a, 1);
             }
@@ -1623,13 +1783,25 @@ pub fn call(
             void()
         }
         "CreateObject" => {
-            let kind = match int(a, 0) {
-                32 => ObjectKind::Creature,
-                512 => ObjectKind::Placeable,
-                64 => ObjectKind::Item,
-                4096 => ObjectKind::Waypoint,
-                128 => ObjectKind::Trigger,
-                _ => ObjectKind::Placeable,
+            let kind = if h.sim.game == thedas_vfs::Game::Origins {
+                // 0x669550 converts the type bit to log2(type) + 1; the non-pooled
+                // factory at 0x6861f0 accepts only kinds 6 and 10. Preserve the
+                // ordinary SSE2 path's positive conversion ranges, including
+                // noncanonical type bits (see script-created-object-types.md).
+                match int(a, 0) {
+                    32..=63 => ObjectKind::Creature,
+                    512..=1023 => ObjectKind::Placeable,
+                    _ => return ok(Value::Object(OBJECT_INVALID)),
+                }
+            } else {
+                match int(a, 0) {
+                    32 => ObjectKind::Creature,
+                    512 => ObjectKind::Placeable,
+                    64 => ObjectKind::Item,
+                    4096 => ObjectKind::Waypoint,
+                    128 => ObjectKind::Trigger,
+                    _ => ObjectKind::Placeable,
+                }
             };
             let template = string(a, 1)
                 .trim_end_matches(".utc")
@@ -2042,8 +2214,18 @@ pub fn call(
         //   within its total when the base or modifiers change.
         // - UpdateCreatureProperty adds to the current value or the modifiers in the same
         //   way; for TOTAL and BASE it does nothing.
-        "GetCreatureProperty" => {
+        "GetCreatureProperty" | "GetCreatureAttribute"
+            if name == "GetCreatureProperty" || h.sim.game == thedas_vfs::Game::Origins =>
+        {
             let (id, p, vt) = (obj(a, 0), int(a, 1), int(a, 2));
+            if name == "GetCreatureAttribute"
+                && (!h.object(id).is_some_and(|o| o.kind == ObjectKind::Creature)
+                    || !(1..=4).contains(&vt)
+                    || (property_bounds(h.sim, p).is_none()
+                        && !h.object(id).is_some_and(|o| o.properties.contains_key(&p))))
+            {
+                return ok(Value::Int(-1));
+            }
             let kind = property_kind(h.sim, p);
             let v = if vt == constant(&h.sim.table, "PROPERTY_VALUE_BASE") {
                 h.object(id)
@@ -2066,7 +2248,11 @@ pub fn call(
             } else {
                 h.sim.property_total(id, p)
             };
-            ok(Value::Float(v))
+            if name == "GetCreatureAttribute" {
+                ok(Value::Int(v as i32))
+            } else {
+                ok(Value::Float(v))
+            }
         }
         // Mana (or stamina): DAOrigins.exe reads and writes the creature's depletable
         // property 8 (PROPERTY_DEPLETABLE_MANA_STAMINA) directly: GetCreatureMana its current
@@ -2179,6 +2365,14 @@ pub fn call(
             );
             void()
         }
+        "CloseQuestGroup" if h.sim.game == thedas_vfs::Game::Origins => {
+            h.sim.close_quest_group(&string(a, 0));
+            void()
+        }
+        "RemoveQuest" if h.sim.game == thedas_vfs::Game::Origins => {
+            h.sim.remove_quest(&string(a, 0));
+            void()
+        }
         "GetPlotFlagRewardId" => {
             let p = h.sim.plot_info(&string(a, 0));
             ok(Value::Int(
@@ -2231,6 +2425,19 @@ pub fn call(
             20
         })),
         "GetTime" => ok(Value::Int((h.sim.world.time_ms / 1000) as i32)),
+        "GetPlayTime" if h.sim.game == thedas_vfs::Game::Origins => {
+            ok(Value::Int(if h.sim.world.module.is_some() {
+                (h.sim.world.time_ms / 1000) as i32
+            } else {
+                -1
+            }))
+        }
+        "GetMeleeRingPosition" if h.sim.game == thedas_vfs::Game::Origins => ok(Value::Vector(
+            h.sim.melee_ring_position(obj(a, 0), int(a, 1)),
+        )),
+        "GetWeaponsUnsheathedStatus" if h.sim.game == thedas_vfs::Game::Origins => {
+            ok(b(h.sim.weapons_unsheathed(obj(a, 0))))
+        }
         "ReadIniEntry" => ok(Value::String(String::new())),
         // Achievements belong to the player's profile, not the game: the simulation's profile has
         // none (by id or, the older form, by name).
@@ -2241,6 +2448,15 @@ pub fn call(
         // such record gives 0. Ours: whether the stack mounts that add-in, which applies the
         // registry's own gates and not the authorization (FMT-011).
         "GetPRCEnabled" => ok(b(h.sim.vfs.addin_enabled(&string(a, 0)))),
+        "IsPackageLoaded" if h.sim.game == thedas_vfs::Game::Origins => {
+            // 0x6657b0 -> 0x5fbc10: case-folded equality against the module
+            // manager's package list, populated from CIF field 17124. Installed
+            // add-ins, aliases and resource layer labels do not answer this query.
+            let package = string(a, 0);
+            ok(b(h.sim.module_info.packages.iter().any(|name| {
+                name.eq_ignore_ascii_case(package.trim_end_matches('\0'))
+            })))
+        }
         "IsPackageLoaded" => {
             // Inferred (#862): whether a package's archives are in our resource stack.
             let pkg = format!("packages/{}/", string(a, 0).to_ascii_lowercase());
@@ -2381,6 +2597,17 @@ pub fn call(
                 return ok(b(done));
             }
             let set = a.get(3).map_or(-1, |_| int(a, 3));
+            let active = h
+                .object(who)
+                .and_then(|o| o.fields.get("ActiveWeaponSet"))
+                .copied()
+                .unwrap_or(0);
+            let inactive = matches!(set, 0 | 1)
+                && set != active
+                && crate::world::WEAPON_SET_SLOTS.contains(&slot);
+            if h.sim.equipment_slot_locked(who, item, slot, inactive) {
+                return ok(b(false));
+            }
             let ok_ = h.object(item).is_some();
             if ok_ && h.sim.world.get(who).is_some() {
                 // Off wherever it was, and what the slot held comes off (the engine's side
@@ -2934,6 +3161,33 @@ pub fn call(
         // integer 0, and gives it to the item. It stays on the item for presentation.
         // DAOrigins.exe (0x665510) sets the item's indestructible flag (0x752c30); kept
         // in the item's fields.
+        "SetItemIrremovable" if h.sim.game == thedas_vfs::Game::Origins => {
+            if let Some(o) = h
+                .sim
+                .world
+                .get_mut(obj(a, 0))
+                .filter(|o| o.kind == ObjectKind::Item)
+            {
+                o.fields
+                    .insert("Irremovable".into(), i32::from(int(a, 1) != 0));
+            }
+            void()
+        }
+        "IsItemIrremovable" if h.sim.game == thedas_vfs::Game::Origins => {
+            ok(b(h.sim.item_irremovable(obj(a, 0))))
+        }
+        "SetCanChangeEquipment" if h.sim.game == thedas_vfs::Game::Origins => {
+            if let Some(o) = h
+                .sim
+                .world
+                .get_mut(obj(a, 0))
+                .filter(|o| o.kind == ObjectKind::Creature)
+            {
+                o.fields
+                    .insert("CanChangeEquipment".into(), i32::from(int(a, 1) != 0));
+            }
+            void()
+        }
         "SetItemIndestructible" => {
             if let Some(o) = h
                 .sim
@@ -3041,6 +3295,9 @@ pub fn call(
                 impacted: false,
                 arrived: false,
                 da2_target_prepared: false,
+                interaction: None,
+                da2_basic_attack_fallback: false,
+                da2_player_issued: false,
                 path: Vec::new(),
                 turned_at: None,
                 is_static: false,
@@ -3110,6 +3367,7 @@ pub fn call(
         "SetCommandFloat" => {
             // 0x66ee60 writes the indexed native float directly. MoveToObject's
             // builder stores maximum in slot 0 and minimum in slot 1 (0x66f39a).
+            // PlayAnimation reads its speed override from float 3 (0x7a4480).
             // Other command layouts remain provisional.
             let mut c = match h.sim.world.handle(handle(a, 0)) {
                 Some(EngineData::Command(c)) => c.clone(),
@@ -3126,6 +3384,10 @@ pub fn call(
                     0 => c.max_range = Some(float(a, 1)),
                     1 => c.seconds = float(a, 1),
                     _ => {}
+                }
+            } else if c.name == "CommandPlayAnimation" && h.sim.game == thedas_vfs::Game::Origins {
+                if index == 3 {
+                    c.seconds = float(a, 1);
                 }
             } else if index == 0 {
                 c.seconds = float(a, 1);
@@ -3165,6 +3427,10 @@ pub fn call(
                             1 => c.seconds,
                             _ => 0.0,
                         }
+                    } else if c.name == "CommandPlayAnimation"
+                        && h.sim.game == thedas_vfs::Game::Origins
+                    {
+                        if i == 3 { c.seconds } else { 0.0 }
                     } else if i == 0 {
                         c.seconds
                     } else {
@@ -3184,6 +3450,16 @@ pub fn call(
                 return ok(Value::Int(0));
             };
             let target = obj(a, 0);
+            if h.sim.game == thedas_vfs::Game::DragonAge2 {
+                let admitted = h.sim.da2_add_command(
+                    target,
+                    c,
+                    int(a, 2),
+                    int(a, 3) != 0,
+                    a.get(4).map_or(-1, |_| int(a, 4)),
+                );
+                return ok(Value::Int(i32::from(admitted)));
+            }
             let origins = h.sim.game == thedas_vfs::Game::Origins;
             let front = if origins {
                 int(a, 2) == 1
@@ -3213,6 +3489,9 @@ pub fn call(
                 c.cancellable_at = None;
                 c.cancellable = false;
                 c.da2_target_prepared = false;
+                if let Some(interaction) = c.interaction.as_mut() {
+                    interaction.stage = 0;
+                }
                 if c.name != "CommandMoveToMultiLocations" {
                     c.path.clear();
                 }
@@ -3246,9 +3525,11 @@ pub fn call(
                         .is_some_and(|c| c.due.is_some() && !c.is_static)
                         .then(|| o.commands.remove(0));
                     if let Some(cleared) = cleared {
+                        h.sim.world.following.remove(&target);
                         let result = constant(&h.sim.table, "COMMAND_FAILED_COMMAND_CLEARED");
                         let mut ev = h.sim.new_event("COMMAND_COMPLETE", Some(target));
                         ev.ints = vec![cleared.ty, result];
+                        ev.objects = vec![target, cleared.target.unwrap_or(OBJECT_INVALID)];
                         h.sim.world.trace.push(TraceEntry::Command {
                             t,
                             object: target,
@@ -3261,24 +3542,23 @@ pub fn call(
                     }
                 }
             }
-            if front
-                && h.sim.game == thedas_vfs::Game::DragonAge2
-                && h.sim.world.get(target).is_some_and(|o| {
-                    o.commands
-                        .first()
-                        .is_some_and(|c| c.cancellable && c.name == "CommandUseAbility")
-                })
-            {
-                h.sim.finish_chained_ability(target);
-            }
             h.sim.world.trace.push(TraceEntry::Command {
                 t,
                 object: target,
                 command: c.name.clone(),
                 status: "queued".into(),
             });
+            if h.sim.world.get(target).is_some_and(|o| {
+                o.commands.is_empty()
+                    || (front && !(origins && o.commands.first().is_some_and(|c| c.due.is_some())))
+            }) {
+                h.sim.world.following.remove(&target);
+            }
             match h.sim.world.get_mut(target) {
                 Some(o) => {
+                    // Origins uses a growing list, not a ten-command capacity.
+                    // 0x73ccd0 / 0x698c30 only enforce the container's allocation
+                    // limit; -2 is an active command being cleared, not a full queue.
                     if front {
                         // The native active executor is separate from the waiting queue.
                         // Keep its simulation front in place if add behavior left it alive.
@@ -3307,7 +3587,10 @@ pub fn call(
         "GetCurrentCommand" => {
             let c = h
                 .object(obj(a, 0))
-                .and_then(|o| o.commands.first().cloned());
+                .and_then(|o| o.commands.first())
+                // Origins 0x73c5f0 and DA2 0x5a8d40 read the separate active executor.
+                .filter(|c| c.due.is_some())
+                .cloned();
             let hd = c.map(|c| h.sim.world.store(EngineData::Command(c)));
             ok(Value::Engine {
                 ty: ty.command,
@@ -3435,6 +3718,23 @@ pub fn call(
                 handle: Some(hd),
             })
         }
+        "GetTrapDetectionDifficulty" | "GetTrapDisarmDifficulty"
+            if h.sim.game == thedas_vfs::Game::Origins =>
+        {
+            // Native 411/413 share 0x668a20. Its placeable branch reads the
+            // signed members +0x644/+0x648 (GFF fields 0x3f84/0x3f85).
+            let field = if name == "GetTrapDetectionDifficulty" {
+                "TrapDetection"
+            } else {
+                "TrapDisarm"
+            };
+            ok(Value::Int(
+                h.object(obj(a, 0))
+                    .filter(|o| o.kind == ObjectKind::Placeable)
+                    .and_then(|o| o.fields.get(field).copied())
+                    .unwrap_or(0),
+            ))
+        }
         "SetTrapDetected" => {
             if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
                 o.fields.insert("TrapDetected".into(), int(a, 1));
@@ -3457,6 +3757,106 @@ pub fn call(
             }
             void()
         }
+        "GetRoamLocation" if h.sim.game == thedas_vfs::Game::Origins => {
+            let l = h
+                .object(obj(a, 0))
+                .filter(|o| o.kind == ObjectKind::Creature)
+                .map(|o| Location {
+                    area: o.area.unwrap_or(OBJECT_INVALID),
+                    position: o
+                        .locals
+                        .locations
+                        .get("__roam_location")
+                        .map_or([0.0; 3], |l| l.position),
+                    facing: 0.0,
+                })
+                .unwrap_or(Location {
+                    area: OBJECT_INVALID,
+                    position: [0.0; 3],
+                    facing: 0.0,
+                });
+            let hd = h.sim.world.store(EngineData::Location(l));
+            ok(Value::Engine {
+                ty: ty.location,
+                handle: Some(hd),
+            })
+        }
+        "IsMoving" if h.sim.game == thedas_vfs::Game::Origins => {
+            ok(b(h.object(obj(a, 0)).is_some_and(|o| {
+                o.kind == ObjectKind::Creature
+                    && o.commands.first().is_some_and(|c| c.from.is_some())
+            })))
+        }
+        "GetAILevel" if h.sim.game == thedas_vfs::Game::Origins => ok(Value::Int(
+            h.object(obj(a, 0))
+                .filter(|o| {
+                    !matches!(
+                        o.kind,
+                        ObjectKind::Module
+                            | ObjectKind::Area
+                            | ObjectKind::Stage
+                            | ObjectKind::Party
+                            | ObjectKind::Map
+                            | ObjectKind::MapPin
+                    )
+                })
+                .map_or(-1, |o| o.fields.get("AILevel").copied().unwrap_or(-1)),
+        )),
+        "IsItemStealable" if h.sim.game == thedas_vfs::Game::Origins => {
+            ok(b(h.object(obj(a, 0)).is_some_and(|o| {
+                o.kind == ObjectKind::Item && o.fields.get("Stealable").copied().unwrap_or(0) != 0
+            })))
+        }
+        "GetAOEFlags" if h.sim.game == thedas_vfs::Game::Origins => ok(Value::Int(
+            h.object(obj(a, 0))
+                .filter(|o| o.kind == ObjectKind::AreaOfEffect)
+                .and_then(|o| o.fields.get("AOEFlags").copied())
+                .unwrap_or(0),
+        )),
+        "SetAOEFlags" if h.sim.game == thedas_vfs::Game::Origins => {
+            if let Some(o) = h
+                .sim
+                .world
+                .get_mut(obj(a, 0))
+                .filter(|o| o.kind == ObjectKind::AreaOfEffect)
+            {
+                o.fields.insert("AOEFlags".into(), int(a, 1));
+            }
+            void()
+        }
+        "GetMapPinState" if h.sim.game == thedas_vfs::Game::Origins => ok(Value::Int(
+            h.object(obj(a, 0))
+                .filter(|o| o.kind == ObjectKind::MapPin)
+                .map_or(-1, |o| o.fields.get("MapPinState").copied().unwrap_or(0)),
+        )),
+        "SetMapPinState" if h.sim.game == thedas_vfs::Game::Origins => {
+            if let Some(o) = h
+                .sim
+                .world
+                .get_mut(obj(a, 0))
+                .filter(|o| o.kind == ObjectKind::MapPin)
+            {
+                o.fields
+                    .insert("MapPinState".into(), i32::from(int(a, 1) != 0));
+            }
+            void()
+        }
+        "IsFollowerLocked" if h.sim.game == thedas_vfs::Game::Origins => {
+            ok(b(h.sim.party_pool().contains(&obj(a, 0))
+                && h.object(obj(a, 0)).is_some_and(|o| {
+                    o.fields.get("FollowerLocked").copied().unwrap_or(0) != 0
+                })))
+        }
+        "SetFollowerLocked" if h.sim.game == thedas_vfs::Game::Origins => {
+            let id = obj(a, 0);
+            if h.sim.party_pool().contains(&id)
+                && let Some(o) = h.sim.world.get_mut(id)
+            {
+                o.fields
+                    .insert("FollowerLocked".into(), i32::from(int(a, 1) != 0));
+            }
+            void()
+        }
         "SetPlaceableHealth" => {
             // 0x65a250 -> 0x74e8e0: signed-short current, independent of
             // maximum and object flags. The scripts send their own DEATH event.
@@ -3472,6 +3872,10 @@ pub fn call(
                     o.properties.get(&health).map_or(0, |p| p.1.round() as i32)
                 }
             })))
+        }
+        "MoveAllItems" if h.sim.game == thedas_vfs::Game::Origins => {
+            h.sim.move_all_items(obj(a, 0), obj(a, 1));
+            void()
         }
         "MoveItem" => {
             let (from, to, item) = (obj(a, 0), obj(a, 1), obj(a, 2));
@@ -3601,9 +4005,9 @@ pub fn call(
             void()
         }
         "GetCommandByIndex" => {
-            let c = h
-                .object(obj(a, 0))
-                .and_then(|o| o.commands.get(int(a, 1).max(0) as usize).cloned());
+            // Origins 0x73c6d0 and DA2 0x5c2400 consume unsigned 16-bit indices.
+            let index = int(a, 1) as u16 as usize;
+            let c = script_command_queue(h.sim, obj(a, 0)).get(index).cloned();
             let hd = c.map(|c| h.sim.world.store(EngineData::Command(c)));
             ok(Value::Engine {
                 ty: ty.command,
@@ -3613,12 +4017,18 @@ pub fn call(
         // Where a follower would stand behind the party leader (see `Sim::follow_leader`).
         "GetFollowerWouldBeLocation" => {
             let who = obj(a, 0);
-            let hero = h.sim.world.hero.and_then(|x| h.object(x));
-            let l = match (hero, h.object(who)) {
-                // DAOrigins.exe's handler (0x666650) gives the follower's slot of the default
-                // formation table around the leader (see `crate::sim::behind`).
-                (Some(leader), Some(me)) => {
-                    let i = leader.followers.iter().position(|&f| f == who).unwrap_or(0);
+            let leader = h.sim.world.controlled().and_then(|x| h.object(x));
+            let l = match (leader, h.object(who)) {
+                // Origins 0x666650 -> 0x632bb0 and DA2 0x4ec6f0 -> 0x4df260
+                // use the controlled leader and the same slot selector as following.
+                (Some(leader), Some(me)) if leader.id != who => {
+                    let i = h
+                        .sim
+                        .follower_formation(leader.id)
+                        .into_iter()
+                        .find_map(|(id, slot)| (id == who).then_some(slot))
+                        // Provisional: retain the old slot-zero fallback for non-members.
+                        .unwrap_or(0);
                     Location {
                         area: leader.area.or(me.area).unwrap_or(OBJECT_INVALID),
                         position: crate::sim::behind(leader.position, leader.facing, i),
@@ -3650,7 +4060,7 @@ pub fn call(
             ok(Value::Int(exists as i32))
         }
         "GetCommandQueueSize" => ok(Value::Int(
-            h.object(obj(a, 0)).map_or(0, |o| o.commands.len() as i32),
+            script_command_queue(h.sim, obj(a, 0)).len() as i32
         )),
         // Cancelling a command in progress completes it (COMMAND_RESULT_INVALID), which is
         // how the AI notices it has nothing to do. Provisional.
@@ -3670,8 +4080,11 @@ pub fn call(
                 }
             });
             if let Some(cmd) = running {
+                if cmd.from.is_some() {
+                    h.sim.da2_stop_locomotion(who);
+                }
                 if cmd.name == "CommandUseAbility" {
-                    h.sim.complete_da2_combat_target(who);
+                    h.sim.complete_combat_target(who);
                 }
                 let mut ev = h.sim.new_event("COMMAND_COMPLETE", Some(who));
                 ev.ints = vec![
@@ -3684,6 +4097,8 @@ pub fn call(
         }
         "ClearAllCommands" => {
             let who = obj(a, 0);
+            h.sim.world.following.remove(&who);
+            h.sim.da2_stop_locomotion(who);
             let running = h.sim.world.get_mut(who).and_then(|o| {
                 let first = o
                     .commands
@@ -3694,7 +4109,7 @@ pub fn call(
             });
             if let Some((ty, ability)) = running {
                 if ability {
-                    h.sim.complete_da2_combat_target(who);
+                    h.sim.complete_combat_target(who);
                 }
                 let mut ev = h.sim.new_event("COMMAND_COMPLETE", Some(who));
                 ev.ints = vec![ty, constant(&h.sim.table, "COMMAND_RESULT_INVALID")];
@@ -3719,9 +4134,28 @@ pub fn call(
                 .unwrap_or(0),
         )),
         "SetEventScript" => {
-            let script = string(a, 1).trim_end_matches(".ncs").to_string();
+            let resource = string(a, 1);
+            let origins = h.sim.game == thedas_vfs::Game::Origins;
+            // Origins 0x658aa0 takes the prefix before the first period and assigns
+            // CCObjects, areas and modules. See notes/script-set-event-script.md.
+            let script = if origins {
+                resource.split('.').next().unwrap_or_default()
+            } else {
+                resource.trim_end_matches(".ncs")
+            };
             if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
-                o.script = (!script.is_empty()).then_some(script);
+                if origins
+                    && matches!(
+                        o.kind,
+                        ObjectKind::Stage
+                            | ObjectKind::Party
+                            | ObjectKind::Map
+                            | ObjectKind::MapPin
+                    )
+                {
+                    return void();
+                }
+                o.script = (!script.is_empty()).then(|| script.to_string());
             }
             void()
         }
@@ -3763,13 +4197,44 @@ pub fn call(
                     .unwrap_or(hero_default),
             ))
         }
-        "SetFollowerState" => {
-            let (who, state) = (obj(a, 0), int(a, 1));
+        "SetFollowerState" | "AddToParty" | "RemoveFromParty" => {
+            let legacy = name != "SetFollowerState";
+            if legacy
+                && (h.sim.game != thedas_vfs::Game::Origins
+                    || !matches!((name, f.id), ("AddToParty", 396) | ("RemoveFromParty", 397)))
+            {
+                return None;
+            }
+            let who = obj(a, 0);
+            if legacy
+                && (!h
+                    .object(who)
+                    .is_some_and(|o| o.kind == ObjectKind::Creature)
+                    || !h
+                        .sim
+                        .world
+                        .party
+                        .and_then(|p| h.object(p))
+                        .is_some_and(|p| p.kind == ObjectKind::Party))
+            {
+                return void();
+            }
+            // 0x65e560/0x65e5c0 call the same 0x63b9a0 state setter as
+            // SetFollowerState, with literal 1/0. AddToParty's player is unused.
+            let state = match name {
+                "AddToParty" => 1,
+                "RemoveFromParty" => 0,
+                _ => int(a, 1),
+            };
             if h.object(who).is_none() {
                 return void();
             }
-            let active = state == constant(&h.sim.table, "FOLLOWER_STATE_ACTIVE")
-                || state == constant(&h.sim.table, "FOLLOWER_STATE_LOCKEDACTIVE");
+            let active = if legacy {
+                name == "AddToParty"
+            } else {
+                state == constant(&h.sim.table, "FOLLOWER_STATE_ACTIVE")
+                    || state == constant(&h.sim.table, "FOLLOWER_STATE_LOCKEDACTIVE")
+            };
             if let Some(o) = h.sim.world.get_mut(who) {
                 o.fields.insert("FollowerState".into(), state);
             }
@@ -3787,17 +4252,24 @@ pub fn call(
                         ho.followers.push(who);
                     }
                 }
+                if !h.sim.world.party_order.is_empty() {
+                    h.sim.world.party_order.retain(|&m| m != who);
+                    if active {
+                        h.sim.world.party_order.push(who);
+                    }
+                }
                 // Joining the active party puts a follower on the player's side
                 // (GROUP_PC), whatever group it had as an NPC, and at the leader's side if
                 // it was elsewhere. Provisional.
                 let at = h.object(hero).map(|o| (o.area, o.position));
+                let now = h.sim.world.time_ms;
                 if let (true, Some(g), Some(o)) = (active, hero_group, h.sim.world.get_mut(who)) {
                     o.group = g;
                     if let Some((area, pos)) = at {
                         if o.area != area {
                             o.area = area;
                             o.position = pos;
-                            o.parked = None;
+                            o.unpark(now);
                             o.active = true;
                         }
                     }
@@ -4168,6 +4640,21 @@ pub fn call(
                     .unwrap_or(0),
             ))
         }
+        "ShowAsAllyOnMap" if h.sim.game == thedas_vfs::Game::Origins => {
+            if let Some(o) = h
+                .sim
+                .world
+                .get_mut(obj(a, 0))
+                .filter(|o| o.kind == ObjectKind::Creature)
+            {
+                o.fields
+                    .insert("ShowAsAllyOnMap".into(), i32::from(int(a, 1) != 0));
+            }
+            void()
+        }
+        "GetPlaceablePopupText" if h.sim.game == thedas_vfs::Game::Origins => {
+            ok(Value::String(h.sim.placeable_popup_text(obj(a, 0))))
+        }
         "GetPlaceableKeyTag" => ok(Value::String(
             h.object(obj(a, 0))
                 .and_then(|o| o.text_fields.get("KeyName").cloned())
@@ -4278,6 +4765,18 @@ pub fn call(
             }
             void()
         }
+        "GetAbilityList" if f.id == 859 => {
+            if h.sim.game != thedas_vfs::Game::Origins {
+                return None;
+            }
+            ok(Value::Array {
+                elem: Type::Int,
+                items: origins_ability_list(h.sim, obj(a, 0), int(a, 1), int(a, 2) != 0)
+                    .into_iter()
+                    .map(Value::Int)
+                    .collect(),
+            })
+        }
         "GetAbilityList" => ok(Value::Array {
             elem: Type::Int,
             items: da2_ability_list(h.sim, obj(a, 0), int(a, 1), int(a, 2) != 0)
@@ -4363,6 +4862,7 @@ pub fn call(
         }
         // The plot actions control (world state the interface shows).
         "SetPlotActionSet" => {
+            h.sim.advance_plot_action_cooldowns();
             h.sim.world.plot_actions.set = int(a, 0);
             void()
         }
@@ -4371,7 +4871,26 @@ pub fn call(
             void()
         }
         "SetPlotActionState" => {
+            h.sim.advance_plot_action_cooldowns();
             h.sim.world.plot_actions.states.insert(int(a, 0), int(a, 1));
+            void()
+        }
+        "SetPlotActionCooldown" if f.id == 861 && h.sim.game == thedas_vfs::Game::Origins => {
+            let script = string(a, 4);
+            h.sim.set_plot_action_cooldown(
+                int(a, 0),
+                float(a, 1),
+                crate::plot_cooldown::PlotCooldown {
+                    total_bits: 0,
+                    remaining_bits: 0,
+                    percent_bits: 0,
+                    last_ms: 0,
+                    event_type: int(a, 2),
+                    caller,
+                    recipient: obj(a, 3),
+                    script: (!script.is_empty()).then_some(script),
+                },
+            );
             void()
         }
         "GetPlotActionState" => ok(Value::Int(
@@ -4401,7 +4920,43 @@ pub fn call(
         // area ahead of the scripts' CreateObject calls, and returns TRUE: a loading
         // optimisation the simulation does without (it creates objects when asked).
         "CreatePool" => ok(Value::Int(1)),
-        "GetCreatureGoreLevel" => ok(Value::Float(0.0)),
+        // Origins keeps gore on the creature appearance. Scripts own accumulation,
+        // healing and resets. DA2's native appearance path remains untraced.
+        "GetCreatureGoreLevel" => ok(Value::Float(
+            if h.sim.game == thedas_vfs::Game::Origins && h.sim.show_gore {
+                h.object(obj(a, 0))
+                    .filter(|o| o.kind == ObjectKind::Creature)
+                    .map_or(0.0, |o| o.gore_level)
+            } else {
+                0.0
+            },
+        )),
+        "SetCreatureGoreLevel" => {
+            if h.sim.game == thedas_vfs::Game::Origins {
+                // 0x747c40 clamps before writing every body/equipment slot.
+                let value = float(a, 1);
+                if let Some(o) = h
+                    .sim
+                    .world
+                    .get_mut(obj(a, 0))
+                    .filter(|o| o.kind == ObjectKind::Creature)
+                {
+                    o.gore_level = if value.is_finite() {
+                        value.clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    };
+                }
+            } else {
+                *h.sim
+                    .world
+                    .trace
+                    .presentation
+                    .entry(name.to_string())
+                    .or_default() += 1;
+            }
+            void()
+        }
         "GetCreaturePropertyType" => {
             ok(Value::Int(if h.sim.game == thedas_vfs::Game::DragonAge2 {
                 property_bounds(h.sim, int(a, 1)).map_or(0, |b| b.0)
@@ -4699,6 +5254,53 @@ pub fn call(
             h.sim.open_chanter_board(int(a, 0));
             void()
         }
+        "InteractWithObject" if h.sim.game == thedas_vfs::Game::Origins => {
+            let (who, target) = (obj(a, 0), obj(a, 1));
+            // 0x65c1e8: a failed first creature lookup stops the entire request.
+            if !h
+                .object(who)
+                .is_some_and(|o| o.kind == ObjectKind::Creature)
+            {
+                return void();
+            }
+            let settings = crate::interaction::Settings {
+                id: int(a, 2),
+                pose: a.get(3).map_or(1, |_| int(a, 3)),
+                loops: int(a, 4),
+                play_exit: a.get(5).is_none_or(|_| int(a, 5) != 0),
+            };
+            let Some(add) = h.sim.table.function_by_name("AddCommand").cloned() else {
+                return void();
+            };
+            for (actor, other, primary) in [(who, target, true), (target, who, false)] {
+                if let Some(command) =
+                    h.sim
+                        .request_interaction(actor, other, settings, primary, int(a, 6) != 0)
+                {
+                    let handle = h.sim.world.store(EngineData::Command(command));
+                    // 0x6a3a14: front insertion with table-selected add behavior.
+                    // Reuse the ordinary handler to preserve cancellation and statics.
+                    if let Err(error) = call(
+                        h,
+                        caller,
+                        &add,
+                        &[
+                            Value::Object(actor),
+                            Value::Engine {
+                                ty: ty.command,
+                                handle: Some(handle),
+                            },
+                            Value::Int(1),
+                            Value::Int(0),
+                            Value::Int(-1),
+                        ],
+                    )? {
+                        return Some(Err(error));
+                    }
+                }
+            }
+            void()
+        }
         "SetObjectInteractive" => {
             if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
                 o.interactive = int(a, 1) != 0;
@@ -4725,6 +5327,10 @@ pub fn call(
         }
         "BeginTrainingStep" => {
             h.sim.begin_training_step(int(a, 0), int(a, 1), int(a, 2));
+            void()
+        }
+        "HighlightGuiElement" => {
+            h.sim.highlight_gui_element(int(a, 0), int(a, 1));
             void()
         }
         "ShowPopup" => {
@@ -4797,7 +5403,7 @@ pub fn call(
             void()
         }
         "HasConversation" => ok(b(h.object(obj(a, 0)).is_some_and(|o| o.dialog.is_some()))),
-        // The state set by SetPlaceableState or an action's result, else the template's
+        // The current instance/script state, else the template's
         // starting state (`AnimContState`).
         "GetPlaceableState" => ok(Value::Int(
             h.object(obj(a, 0))
@@ -5080,6 +5686,13 @@ pub fn call(
             }
             void()
         }
+        "GetAILevel" if h.sim.game == thedas_vfs::Game::DragonAge2 => {
+            ok(Value::Int(h.sim.da2_ai_level(obj(a, 0))))
+        }
+        "SetAILevel" if h.sim.game == thedas_vfs::Game::DragonAge2 => {
+            h.sim.da2_set_ai_level(obj(a, 0), int(a, 1));
+            void()
+        }
         "SetAILevel" => {
             if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
                 o.fields.insert("AILevel".into(), int(a, 1));
@@ -5216,8 +5829,14 @@ pub fn call(
                 o.fields.insert("CommandResult".into(), result);
                 if failed && !o.commands.is_empty() {
                     let c = o.commands.remove(0);
+                    if h.sim.game == thedas_vfs::Game::Origins {
+                        o.combat.previous_command = Some(c.clone());
+                    }
                     let mut ev = h.sim.new_event("COMMAND_COMPLETE", Some(who));
                     ev.ints = vec![c.ty, result];
+                    if h.sim.game == thedas_vfs::Game::Origins {
+                        ev.objects = vec![who, c.target.unwrap_or(OBJECT_INVALID)];
+                    }
                     h.sim.world.queue_event(0, who, ev, None);
                 }
             }
@@ -5647,6 +6266,17 @@ pub fn call(
             h.sim.world.queue_event(delay, caller, ev, Some(script));
             void()
         }
+        // DA2 0x4ebfd0 pushes the desktop platform constant, independent of
+        // the replacement engine's host OS.
+        "GetPlatform" if h.sim.game == thedas_vfs::Game::DragonAge2 => ok(Value::Int(1)),
+        // DA2 0x4f08f0 stops a model's additive channel; 0x4ecfc0 invokes a
+        // player-screen hit effect. Neither returns a script value or changes
+        // combat state. Their presentation systems are not simulated here.
+        "StopAdditiveAnimation" | "DoPlayerHitEffect"
+            if h.sim.game == thedas_vfs::Game::DragonAge2 =>
+        {
+            void()
+        }
         // Presentation only.
         "PlayAdditiveAnimation" | "SignalDamage" => void(),
         // Creature switches that DAOrigins.exe sets in one handler (0x66be50), kept on the
@@ -5699,6 +6329,25 @@ pub fn call(
         }
         "SetFacingObject" => {
             let target = h.object(obj(a, 1)).map(|o| o.position);
+            if h.sim.game == thedas_vfs::Game::DragonAge2 {
+                if let (Some(t), Some(o)) = (target, h.object(obj(a, 0))) {
+                    let (dx, dy) = (t[0] - o.position[0], t[1] - o.position[1]);
+                    if dx * dx + dy * dy > 1e-6 {
+                        let facing = crate::world::facing_toward(dx, dy)
+                            + if a.get(2).is_some_and(|_| int(a, 2) == 0) {
+                                180.
+                            } else {
+                                0.
+                            };
+                        if int(a, 3) == 0 && o.kind == ObjectKind::Creature {
+                            h.sim.da2_turn_to(obj(a, 0), facing);
+                        } else if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
+                            o.facing = facing.rem_euclid(360.);
+                        }
+                    }
+                }
+                return void();
+            }
             if let (Some(t), Some(o)) = (target, h.sim.world.get_mut(obj(a, 0))) {
                 o.facing = crate::world::facing_toward(t[0] - o.position[0], t[1] - o.position[1]);
             }
@@ -5867,6 +6516,20 @@ pub fn party_of(sim: &Sim) -> Vec<ObjectId> {
     let mut v: Vec<ObjectId> = hero.into_iter().collect();
     if let Some(h) = hero.and_then(|h| sim.world.get(h)) {
         v.extend(h.followers.iter().copied());
+    }
+    if sim.game == thedas_vfs::Game::Origins && !sim.world.party_order.is_empty() {
+        let mut ordered = Vec::with_capacity(v.len());
+        for &id in &sim.world.party_order {
+            if v.contains(&id) && !ordered.contains(&id) {
+                ordered.push(id);
+            }
+        }
+        for id in v {
+            if !ordered.contains(&id) {
+                ordered.push(id);
+            }
+        }
+        return ordered;
     }
     v
 }
@@ -6102,6 +6765,15 @@ impl Sim {
         }
         // Scripts bring the dead back by giving them health (module_core's
         // HandleEvent_Resurrection applies no effect). Provisional.
+        if p == health
+            && vt == current
+            && self
+                .world
+                .get(id)
+                .is_some_and(|o| o.dead && o.properties.get(&health).is_some_and(|v| v.1 > 0.0))
+        {
+            self.cancel_death_blow_reaction(id);
+        }
         if let Some(o) = self.world.get_mut(id) {
             if p == health
                 && vt == current
@@ -6205,6 +6877,852 @@ mod tests {
     use thedas_vfs::Vfs;
 
     use super::*;
+
+    fn legacy_party_sim() -> (Sim, ObjectId, ObjectId) {
+        let table = EngineTable::parse(b"void SetFollowerState(object o, int s) = 706;\nint FOLLOWER_STATE_ACTIVE = 1;\nint FOLLOWER_STATE_LOCKEDACTIVE = 5;\n").unwrap().with_inferred();
+        let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(table), 1);
+        let module = s.world.spawn(ObjectKind::Module, "module");
+        s.world.module = Some(module);
+        let hero = s.world.spawn(ObjectKind::Creature, "hero");
+        s.world.hero = Some(hero);
+        s.world.party_order = vec![hero];
+        let party = s.world.spawn(ObjectKind::Party, "party");
+        s.world.party = Some(party);
+        let other = s.world.spawn(ObjectKind::Creature, "other");
+        let h = s.world.get_mut(hero).unwrap();
+        h.position = [1.0, 2.0, 3.0];
+        h.group = 8;
+        let o = s.world.get_mut(other).unwrap();
+        o.active = false;
+        o.area = Some(module);
+        (s, hero, other)
+    }
+
+    #[test]
+    fn legacy_party_natives_match_literal_follower_states_and_ignore_the_old_player_argument() {
+        let (mut legacy, hero, other) = legacy_party_sim();
+        let (mut modern, _, _) = legacy_party_sim();
+        assert_eq!(
+            legacy.table.function_for_call(396, 2).unwrap().name,
+            "AddToParty"
+        );
+        assert_eq!(
+            legacy.table.function_for_call(397, 1).unwrap().name,
+            "RemoveFromParty"
+        );
+        for player in [OBJECT_INVALID, hero, other] {
+            run(
+                &mut legacy,
+                hero,
+                "AddToParty",
+                &[Value::Object(other), Value::Object(player)],
+            );
+            run(
+                &mut modern,
+                hero,
+                "SetFollowerState",
+                &[Value::Object(other), Value::Int(1)],
+            );
+            assert_eq!(
+                serde_json::to_value(&legacy.world).unwrap(),
+                serde_json::to_value(&modern.world).unwrap()
+            );
+            assert_eq!(legacy.world.get(hero).unwrap().followers, vec![other]);
+            assert_eq!(legacy.world.party_order, vec![hero, other]);
+            let o = legacy.world.get(other).unwrap();
+            assert_eq!(o.fields.get("FollowerState"), Some(&1));
+            assert_eq!(o.group, 8);
+            assert_eq!(o.position, [1.0, 2.0, 3.0]);
+            assert!(o.active);
+        }
+        legacy.world.controlled = Some(other);
+        modern.world.controlled = Some(other);
+        for _ in 0..2 {
+            run(
+                &mut legacy,
+                hero,
+                "RemoveFromParty",
+                &[Value::Object(other)],
+            );
+            run(
+                &mut modern,
+                hero,
+                "SetFollowerState",
+                &[Value::Object(other), Value::Int(0)],
+            );
+            assert_eq!(
+                serde_json::to_value(&legacy.world).unwrap(),
+                serde_json::to_value(&modern.world).unwrap()
+            );
+            assert!(legacy.world.get(hero).unwrap().followers.is_empty());
+            assert_eq!(legacy.world.party_order, vec![hero]);
+            assert_eq!(legacy.world.controlled(), Some(hero));
+            assert_eq!(
+                legacy.world.get(other).unwrap().fields.get("FollowerState"),
+                Some(&0)
+            );
+            assert!(
+                legacy.world.queue.is_empty(),
+                "these handlers do not synthesize party-picker notifications"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_party_natives_require_the_player_party_and_a_creature() {
+        let (mut s, hero, other) = legacy_party_sim();
+        let item = s.world.spawn(ObjectKind::Item, "item");
+        for id in [item, OBJECT_INVALID, 123456789] {
+            run(
+                &mut s,
+                hero,
+                "AddToParty",
+                &[Value::Object(id), Value::Object(hero)],
+            );
+            run(&mut s, hero, "RemoveFromParty", &[Value::Object(id)]);
+        }
+        assert!(s.world.get(hero).unwrap().followers.is_empty());
+        assert!(
+            !s.world
+                .get(item)
+                .unwrap()
+                .fields
+                .contains_key("FollowerState")
+        );
+        s.world.party = None;
+        run(
+            &mut s,
+            hero,
+            "AddToParty",
+            &[Value::Object(other), Value::Object(hero)],
+        );
+        run(&mut s, hero, "RemoveFromParty", &[Value::Object(other)]);
+        assert!(
+            !s.world
+                .get(other)
+                .unwrap()
+                .fields
+                .contains_key("FollowerState")
+        );
+    }
+
+    #[test]
+    fn legacy_party_natives_leave_da2_dispatch_unchanged() {
+        let (mut s, hero, other) = legacy_party_sim();
+        s.game = thedas_vfs::Game::DragonAge2;
+        for name in ["AddToParty", "RemoveFromParty"] {
+            let f = s.table.function_by_name(name).unwrap().clone();
+            let mut h = ScriptHost {
+                sim: &mut s,
+                event: None,
+                script: "test".into(),
+            };
+            assert!(
+                call(
+                    &mut h,
+                    hero,
+                    &f,
+                    &[Value::Object(other), Value::Object(hero)]
+                )
+                .is_none()
+            );
+        }
+        assert!(s.world.get(hero).unwrap().followers.is_empty());
+    }
+
+    fn party_control_sim() -> (Sim, [ObjectId; 4]) {
+        let table = EngineTable::parse(
+            b"\
+            void SetPartyLeader(object o) = 625;\n\
+            void SetPrimaryControlled(object o) = 815;\n\
+            object GetPartyLeader() = 624;\n\
+            object GetMainControlled() = 115;\n\
+            void SetFollowerState(object o, int n) = 4;\n\
+            int FOLLOWER_STATE_ACTIVE = 1;\n\
+            int FOLLOWER_STATE_LOCKEDACTIVE = 5;\n\
+            object[] GetPartyList() = 255;\n",
+        )
+        .unwrap();
+        let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(table), 1);
+        let members = std::array::from_fn(|i| {
+            let id = s.world.spawn(ObjectKind::Creature, &format!("member_{i}"));
+            s.world
+                .get_mut(id)
+                .unwrap()
+                .properties
+                .insert(7, (10.0, 10.0));
+            id
+        });
+        s.world.hero = Some(members[0]);
+        s.world.get_mut(members[0]).unwrap().followers = members[1..].to_vec();
+        (s, members)
+    }
+
+    #[test]
+    fn party_control_leader_and_primary_selection_are_independent() {
+        let (mut s, m) = party_control_sim();
+        run(&mut s, m[0], "SetPartyLeader", &[Value::Object(m[2])]);
+        assert_eq!(
+            run(&mut s, m[0], "GetPartyLeader", &[]),
+            Some(Value::Object(m[2]))
+        );
+        assert_eq!(
+            run(&mut s, m[0], "GetMainControlled", &[]),
+            Some(Value::Object(m[0]))
+        );
+        assert_eq!(party_of(&s), vec![m[2], m[0], m[1], m[3]]);
+        run(&mut s, m[0], "SetPartyLeader", &[Value::Object(m[1])]);
+        assert_eq!(party_of(&s), vec![m[1], m[2], m[0], m[3]]);
+        run(&mut s, m[0], "SetPrimaryControlled", &[Value::Object(m[3])]);
+        assert_eq!(s.world.controlled(), Some(m[3]));
+        assert_eq!(s.world.party_leader, Some(m[1]));
+        assert_eq!(
+            run(&mut s, m[0], "GetPartyList", &[]),
+            Some(objects(vec![m[1], m[2], m[0], m[3]]))
+        );
+        assert_eq!(s.world.hero, Some(m[0]));
+        assert!(
+            s.world.queue.is_empty(),
+            "script selection does not synthesize player training events"
+        );
+    }
+
+    #[test]
+    fn party_control_primary_uses_integer_health_and_restores_controllability_first() {
+        for (health, eligible) in [
+            (None, false),
+            (Some(0.0), false),
+            (Some(-1.0), false),
+            (Some(0.9), false),
+            (Some(1.0), true),
+            (Some(f32::NAN), false),
+            (Some(f32::INFINITY), false),
+            (Some(2147483648.0), false),
+        ] {
+            let (mut s, m) = party_control_sim();
+            let target = s.world.get_mut(m[1]).unwrap();
+            target.uncontrollable = true;
+            target.dead = true;
+            target.active = false;
+            target.properties.remove(&7);
+            if let Some(h) = health {
+                target.properties.insert(7, (h, h));
+            }
+            run(&mut s, m[0], "SetPrimaryControlled", &[Value::Object(m[1])]);
+            assert!(!s.world.get(m[1]).unwrap().uncontrollable);
+            assert_eq!(
+                s.world.controlled(),
+                Some(if eligible { m[1] } else { m[0] }),
+                "health={health:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn party_control_native_selection_can_resolve_a_nonmember_and_player_selection_clears_it() {
+        let (mut s, m) = party_control_sim();
+        let other = s.world.spawn(ObjectKind::Creature, "other");
+        s.world
+            .get_mut(other)
+            .unwrap()
+            .properties
+            .insert(7, (10.0, 10.0));
+        run(&mut s, m[0], "SetPartyLeader", &[Value::Object(other)]);
+        assert_eq!(party_of(&s), m.to_vec());
+        assert_eq!(s.world.party_leader, Some(other));
+        run(
+            &mut s,
+            m[0],
+            "SetPrimaryControlled",
+            &[Value::Object(other)],
+        );
+        assert_eq!(s.world.controlled(), Some(other));
+        assert!(!party_of(&s).contains(&other));
+        s.player_selects(m[1]);
+        assert_eq!(s.world.controlled(), Some(m[1]));
+        assert!(s.world.script_controlled.is_none());
+    }
+
+    #[test]
+    fn party_control_invalid_objects_do_not_replace_current_state() {
+        let (mut s, m) = party_control_sim();
+        run(&mut s, m[0], "SetPartyLeader", &[Value::Object(m[1])]);
+        run(&mut s, m[0], "SetPrimaryControlled", &[Value::Object(m[2])]);
+        let item = s.world.spawn(ObjectKind::Item, "item");
+        for id in [item, OBJECT_INVALID, 123456789] {
+            for name in ["SetPartyLeader", "SetPrimaryControlled"] {
+                run(&mut s, m[0], name, &[Value::Object(id)]);
+            }
+        }
+        assert_eq!(s.world.party_leader, Some(m[1]));
+        assert_eq!(s.world.controlled(), Some(m[2]));
+    }
+
+    #[test]
+    fn party_control_member_removal_drops_its_order_slot_and_primary_falls_back() {
+        let (mut s, m) = party_control_sim();
+        run(&mut s, m[0], "SetPartyLeader", &[Value::Object(m[2])]);
+        run(&mut s, m[0], "SetPrimaryControlled", &[Value::Object(m[2])]);
+        run(
+            &mut s,
+            m[0],
+            "SetFollowerState",
+            &[Value::Object(m[2]), Value::Int(0)],
+        );
+        assert_eq!(s.world.controlled(), Some(m[0]));
+        assert_eq!(party_of(&s), vec![m[0], m[1], m[3]]);
+        run(
+            &mut s,
+            m[0],
+            "SetFollowerState",
+            &[Value::Object(m[2]), Value::Int(1)],
+        );
+        assert_eq!(party_of(&s), vec![m[0], m[1], m[3], m[2]]);
+    }
+
+    #[test]
+    fn party_control_json_retains_explicit_state_and_old_worlds_use_hero_defaults() {
+        let (mut s, m) = party_control_sim();
+        run(&mut s, m[0], "SetPartyLeader", &[Value::Object(m[2])]);
+        run(&mut s, m[0], "SetPrimaryControlled", &[Value::Object(m[1])]);
+        let mut restored = party_control_sim().0;
+        restored.world = serde_json::from_slice(&serde_json::to_vec(&s.world).unwrap()).unwrap();
+        assert_eq!(restored.world.controlled(), Some(m[1]));
+        assert_eq!(party_of(&restored), party_of(&s));
+        assert_eq!(restored.world.party_leader, Some(m[2]));
+        let mut value = serde_json::to_value(&s.world).unwrap();
+        for name in ["party_leader", "party_order", "script_controlled"] {
+            value.as_object_mut().unwrap().remove(name);
+        }
+        let old: crate::World = serde_json::from_value(value).unwrap();
+        assert!(old.party_leader.is_none() && old.party_order.is_empty());
+        assert!(old.script_controlled.is_none());
+    }
+
+    #[test]
+    fn party_control_da2_dispatch_remains_unchanged() {
+        let (mut s, m) = party_control_sim();
+        s.game = thedas_vfs::Game::DragonAge2;
+        for name in ["SetPartyLeader", "SetPrimaryControlled"] {
+            let f = s.table.function_by_name(name).unwrap().clone();
+            let mut h = ScriptHost {
+                sim: &mut s,
+                event: None,
+                script: "test".into(),
+            };
+            assert!(call(&mut h, m[0], &f, &[Value::Object(m[1])]).is_none());
+        }
+        assert!(s.world.party_leader.is_none());
+        assert_eq!(s.world.controlled(), Some(m[0]));
+    }
+
+    #[test]
+    fn map_popup_natives_keep_ally_flag_separate_from_hostility() {
+        let table = Arc::new(EngineTable::parse(b"void ShowAsAllyOnMap(object o, int b) = 364;\nstring GetPlaceablePopupText(object o) = 356;").unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        let creature = s.world.spawn(ObjectKind::Creature, "creature");
+        let door = s.world.spawn(ObjectKind::Placeable, "door");
+        s.world.get_mut(creature).unwrap().team = 9;
+        assert!(!s.show_as_ally_on_map(creature));
+        for flag in [-2, 0, 1] {
+            for id in [creature, door, OBJECT_INVALID] {
+                assert_eq!(
+                    run(
+                        &mut s,
+                        creature,
+                        "ShowAsAllyOnMap",
+                        &[Value::Object(id), Value::Int(flag)]
+                    ),
+                    None
+                );
+            }
+            assert_eq!(s.show_as_ally_on_map(creature), flag != 0);
+            assert!(!s.show_as_ally_on_map(door));
+            assert_eq!(s.world.get(creature).unwrap().team, 9);
+        }
+        s.world
+            .get_mut(door)
+            .unwrap()
+            .text_fields
+            .insert("LocPopupText".into(), "Open the gate".into());
+        s.world
+            .get_mut(creature)
+            .unwrap()
+            .text_fields
+            .insert("LocPopupText".into(), "ignored".into());
+        for (id, text) in [
+            (door, "Open the gate"),
+            (creature, ""),
+            (OBJECT_INVALID, ""),
+        ] {
+            assert_eq!(
+                run(
+                    &mut s,
+                    creature,
+                    "GetPlaceablePopupText",
+                    &[Value::Object(id)]
+                ),
+                Some(Value::String(text.into()))
+            );
+        }
+        s.game = thedas_vfs::Game::DragonAge2;
+        let function = s
+            .table
+            .function_by_name("GetPlaceablePopupText")
+            .unwrap()
+            .clone();
+        let mut host = crate::sim::ScriptHost {
+            sim: &mut s,
+            event: None,
+            script: "test".into(),
+        };
+        assert!(super::call(&mut host, creature, &function, &[Value::Object(door)]).is_none());
+    }
+
+    fn small_native_sim() -> Sim {
+        let ldf = b"#define ENGINE_STRUCTURE_1 location\n\
+            float GetVectorMagnitude(vector v) = 42;\n\
+            vector GetVectorNormalize(vector v) = 43;\n\
+            int GetDebugHelpersEnabled() = 331;\n\
+            int IsPRC(string s, int n) = 857;\n\
+            string GetTlkTableString(int r, int g = 0) = 14;\n\
+            int GetCreatureAttribute(object o, int p, int v = 1) = 248;\n\
+            int GetAILevel(object o) = 221;\n\
+            void SetAILevel(object o, int n) = 222;\n\
+            int IsItemStealable(object o) = 641;\n\
+            int GetAOEFlags(object o) = 334;\n\
+            void SetAOEFlags(object o, int n) = 335;\n\
+            int GetMapPinState(object o) = 653;\n\
+            void SetMapPinState(object o, int n) = 652;\n\
+            location GetRoamLocation(object o) = 826;\n\
+            int IsMoving(object o) = 388;\n\
+            int IsFollowerLocked(object o) = 146;\n\
+            void SetFollowerLocked(object o, int b) = 147;\n\
+            int FOLLOWER_STATE_ACTIVE = 1;\n\
+            int FOLLOWER_STATE_AVAILABLE = 2;\n\
+            int PROPERTY_VALUE_TOTAL = 1;\n\
+            int PROPERTY_VALUE_BASE = 2;\n\
+            int PROPERTY_VALUE_CURRENT = 3;\n\
+            int PROPERTY_VALUE_MODIFIER = 4;";
+        Sim::new(
+            Arc::new(Vfs::new()),
+            Arc::new(EngineTable::parse(ldf).unwrap()),
+            1,
+        )
+    }
+
+    #[test]
+    fn small_native_vector_length_and_normalization_include_z() {
+        let mut s = small_native_sim();
+        let v = [Value::Vector([2.0, -3.0, 6.0])];
+        assert_eq!(
+            run(&mut s, 1, "GetVectorMagnitude", &v),
+            Some(Value::Float(7.0))
+        );
+        let Some(Value::Vector(unit)) = run(&mut s, 1, "GetVectorNormalize", &v) else {
+            panic!("vector")
+        };
+        for (actual, expected) in unit.into_iter().zip([2.0 / 7.0, -3.0 / 7.0, 6.0 / 7.0]) {
+            assert!((actual - expected).abs() < 1.0e-6);
+        }
+        assert_eq!(
+            run(&mut s, 1, "GetVectorNormalize", &[Value::Vector([0.0; 3])]),
+            Some(Value::Vector([0.0; 3]))
+        );
+        assert_eq!(
+            run(
+                &mut s,
+                1,
+                "GetVectorNormalize",
+                &[Value::Vector([0.0, -0.0001, 0.0])]
+            ),
+            Some(Value::Vector([1.0, 0.0, 0.0]))
+        );
+    }
+
+    #[test]
+    fn small_native_release_flags_and_missing_tlk_string() {
+        let mut s = small_native_sim();
+        assert_eq!(
+            run(&mut s, 1, "GetDebugHelpersEnabled", &[]),
+            Some(Value::Int(0))
+        );
+        assert_eq!(
+            run(
+                &mut s,
+                1,
+                "IsPRC",
+                &[Value::String("ignored".into()), Value::Int(-7)]
+            ),
+            Some(Value::Int(0))
+        );
+        assert_eq!(
+            run(
+                &mut s,
+                1,
+                "GetTlkTableString",
+                &[Value::Int(-1), Value::Int(17)]
+            ),
+            Some(Value::String(String::new()))
+        );
+    }
+
+    #[test]
+    fn small_native_attribute_truncates_and_rejects_invalid_requests() {
+        let mut s = small_native_sim();
+        let id = s.world.spawn(ObjectKind::Creature, "c");
+        let door = s.world.spawn(ObjectKind::Placeable, "door");
+        s.world
+            .get_mut(id)
+            .unwrap()
+            .properties
+            .insert(1, (13.75, 9.0));
+        s.world.get_mut(id).unwrap().modifiers.insert(1, -1.5);
+        for (vt, expected) in [(1, 12), (2, 13), (3, -1), (4, -1), (5, -1), (0, -1)] {
+            assert_eq!(
+                run(
+                    &mut s,
+                    id,
+                    "GetCreatureAttribute",
+                    &[Value::Object(id), Value::Int(1), Value::Int(vt)]
+                ),
+                Some(Value::Int(expected))
+            );
+        }
+        for (o, p) in [(door, 1), (OBJECT_INVALID, 1), (id, -999)] {
+            assert_eq!(
+                run(
+                    &mut s,
+                    id,
+                    "GetCreatureAttribute",
+                    &[Value::Object(o), Value::Int(p), Value::Int(1)]
+                ),
+                Some(Value::Int(-1))
+            );
+        }
+    }
+
+    #[test]
+    fn small_native_ai_item_and_aoe_reads_are_kind_checked() {
+        let mut s = small_native_sim();
+        let c = s.world.spawn(ObjectKind::Creature, "c");
+        let item = s.world.spawn(ObjectKind::Item, "item");
+        let aoe = s.world.spawn(ObjectKind::AreaOfEffect, "aoe");
+        let module = s.world.spawn(ObjectKind::Module, "module");
+        assert_eq!(
+            run(&mut s, c, "GetAILevel", &[Value::Object(c)]),
+            Some(Value::Int(-1))
+        );
+        run(&mut s, c, "SetAILevel", &[Value::Object(c), Value::Int(3)]);
+        assert_eq!(
+            run(&mut s, c, "GetAILevel", &[Value::Object(c)]),
+            Some(Value::Int(3))
+        );
+        s.world
+            .get_mut(module)
+            .unwrap()
+            .fields
+            .insert("AILevel".into(), 99);
+        assert_eq!(
+            run(&mut s, c, "GetAILevel", &[Value::Object(module)]),
+            Some(Value::Int(-1))
+        );
+        for id in [item, c] {
+            s.world
+                .get_mut(id)
+                .unwrap()
+                .fields
+                .insert("Stealable".into(), -5);
+        }
+        assert_eq!(
+            run(&mut s, c, "IsItemStealable", &[Value::Object(item)]),
+            Some(Value::Int(1))
+        );
+        assert_eq!(
+            run(&mut s, c, "IsItemStealable", &[Value::Object(c)]),
+            Some(Value::Int(0))
+        );
+        for id in [aoe, c, OBJECT_INVALID] {
+            run(
+                &mut s,
+                c,
+                "SetAOEFlags",
+                &[Value::Object(id), Value::Int(i32::MIN)],
+            );
+        }
+        assert_eq!(
+            run(&mut s, c, "GetAOEFlags", &[Value::Object(aoe)]),
+            Some(Value::Int(i32::MIN))
+        );
+        assert_eq!(
+            run(&mut s, c, "GetAOEFlags", &[Value::Object(c)]),
+            Some(Value::Int(0))
+        );
+    }
+
+    #[test]
+    fn small_native_pin_and_follower_flags_round_trip_without_changing_status() {
+        let mut s = small_native_sim();
+        let pin = s.world.spawn(ObjectKind::MapPin, "pin");
+        let wp = s.world.spawn(ObjectKind::Waypoint, "waypoint");
+        let follower = s.world.spawn(ObjectKind::Creature, "follower");
+        let outsider = s.world.spawn(ObjectKind::Creature, "outsider");
+        s.world
+            .get_mut(follower)
+            .unwrap()
+            .fields
+            .insert("FollowerState".into(), 2);
+        assert_eq!(
+            run(&mut s, follower, "GetMapPinState", &[Value::Object(wp)]),
+            Some(Value::Int(-1))
+        );
+        for flag in [-7, 0, 1] {
+            run(
+                &mut s,
+                follower,
+                "SetMapPinState",
+                &[Value::Object(pin), Value::Int(flag)],
+            );
+            assert_eq!(
+                run(&mut s, follower, "GetMapPinState", &[Value::Object(pin)]),
+                Some(Value::Int(i32::from(flag != 0)))
+            );
+            for id in [follower, outsider] {
+                run(
+                    &mut s,
+                    follower,
+                    "SetFollowerLocked",
+                    &[Value::Object(id), Value::Int(flag)],
+                );
+            }
+            assert_eq!(
+                run(
+                    &mut s,
+                    follower,
+                    "IsFollowerLocked",
+                    &[Value::Object(follower)]
+                ),
+                Some(Value::Int(i32::from(flag != 0)))
+            );
+            assert_eq!(
+                run(
+                    &mut s,
+                    follower,
+                    "IsFollowerLocked",
+                    &[Value::Object(outsider)]
+                ),
+                Some(Value::Int(0))
+            );
+        }
+        assert_eq!(
+            s.world.get(follower).unwrap().fields.get("FollowerState"),
+            Some(&2)
+        );
+    }
+
+    #[test]
+    fn small_native_roam_location_uses_current_area_and_zero_orientation() {
+        let mut s = small_native_sim();
+        let c = s.world.spawn(ObjectKind::Creature, "c");
+        let o = s.world.get_mut(c).unwrap();
+        o.area = Some(99);
+        o.locals.locations.insert(
+            "__roam_location".into(),
+            Location {
+                area: 42,
+                position: [2.0, 3.0, 4.0],
+                facing: 70.0,
+            },
+        );
+        for (id, area, position) in [
+            (c, 99, [2.0, 3.0, 4.0]),
+            (OBJECT_INVALID, OBJECT_INVALID, [0.0; 3]),
+        ] {
+            let v = run(&mut s, c, "GetRoamLocation", &[Value::Object(id)]).unwrap();
+            let Some(EngineData::Location(l)) = s.world.handle(handle(&[v], 0)) else {
+                panic!("location")
+            };
+            assert_eq!(
+                *l,
+                Location {
+                    area,
+                    position,
+                    facing: 0.0
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn small_native_moving_excludes_queued_commands_and_noncreatures() {
+        let mut s = small_native_sim();
+        let c = s.world.spawn(ObjectKind::Creature, "c");
+        let door = s.world.spawn(ObjectKind::Placeable, "door");
+        for id in [c, door] {
+            s.world.get_mut(id).unwrap().commands.push(Command {
+                name: "CommandMoveToLocation".into(),
+                ..Default::default()
+            });
+        }
+        assert_eq!(
+            run(&mut s, c, "IsMoving", &[Value::Object(c)]),
+            Some(Value::Int(0))
+        );
+        for id in [c, door] {
+            s.world.get_mut(id).unwrap().commands[0].from = Some(([0.0; 3], 0));
+        }
+        assert_eq!(
+            run(&mut s, c, "IsMoving", &[Value::Object(c)]),
+            Some(Value::Int(1))
+        );
+        assert_eq!(
+            run(&mut s, c, "IsMoving", &[Value::Object(door)]),
+            Some(Value::Int(0))
+        );
+        assert_eq!(
+            run(&mut s, c, "IsMoving", &[Value::Object(OBJECT_INVALID)]),
+            Some(Value::Int(0))
+        );
+        s.world.get_mut(c).unwrap().commands.clear();
+        assert_eq!(
+            run(&mut s, c, "IsMoving", &[Value::Object(c)]),
+            Some(Value::Int(0))
+        );
+    }
+
+    #[test]
+    fn small_native_da2_dispatch_preserves_implemented_queries() {
+        let mut s = small_native_sim();
+        s.game = thedas_vfs::Game::DragonAge2;
+        let pin = s.world.spawn(ObjectKind::MapPin, "pin");
+        assert_eq!(
+            run(
+                &mut s,
+                pin,
+                "SetMapPinState",
+                &[Value::Object(pin), Value::Int(1)]
+            ),
+            None
+        );
+        assert!(!s.world.get(pin).unwrap().fields.contains_key("MapPinState"));
+        assert_eq!(s.world.trace.presentation.get("SetMapPinState"), Some(&1));
+        for name in [
+            "GetVectorMagnitude",
+            "GetVectorNormalize",
+            "GetCreatureAttribute",
+            "GetAOEFlags",
+            "GetMapPinState",
+            "GetRoamLocation",
+            "IsPRC",
+            "IsItemStealable",
+            "IsFollowerLocked",
+            "GetTlkTableString",
+            "GetDebugHelpersEnabled",
+        ] {
+            let function = s.table.function_by_name(name).cloned().unwrap();
+            let mut host = ScriptHost {
+                sim: &mut s,
+                event: None,
+                script: "test".into(),
+            };
+            assert!(call(&mut host, 1, &function, &[]).is_none(), "{name}");
+        }
+        // DA2 locomotion merged independently of these Origins getters.
+        // Keep the unsupported-native checks above and exercise both results.
+        let creature = s.world.spawn(ObjectKind::Creature, "walker");
+        for id in [creature, OBJECT_INVALID] {
+            assert_eq!(
+                run(&mut s, creature, "IsMoving", &[Value::Object(id)]),
+                Some(Value::Int(0))
+            );
+        }
+        s.da2_begin_locomotion(creature, false);
+        assert_eq!(
+            run(&mut s, creature, "IsMoving", &[Value::Object(creature)]),
+            Some(Value::Int(1))
+        );
+        s.da2_reset_locomotion(creature);
+        assert_eq!(
+            run(&mut s, creature, "IsMoving", &[Value::Object(creature)]),
+            Some(Value::Int(0))
+        );
+        // Main also implements DA2's automatic priority and manual lock.
+        // Check its invalid-object result and both priority modes here.
+        assert_eq!(
+            run(
+                &mut s,
+                creature,
+                "GetAILevel",
+                &[Value::Object(OBJECT_INVALID)]
+            ),
+            Some(Value::Int(-1))
+        );
+        s.world.hero = Some(creature);
+        assert_eq!(
+            run(&mut s, creature, "GetAILevel", &[Value::Object(creature)]),
+            Some(Value::Int(4))
+        );
+        run(
+            &mut s,
+            creature,
+            "SetAILevel",
+            &[Value::Object(creature), Value::Int(2)],
+        );
+        assert_eq!(
+            run(&mut s, creature, "GetAILevel", &[Value::Object(creature)]),
+            Some(Value::Int(2))
+        );
+        run(
+            &mut s,
+            creature,
+            "SetAILevel",
+            &[Value::Object(creature), Value::Int(-1)],
+        );
+        assert_eq!(
+            run(&mut s, creature, "GetAILevel", &[Value::Object(creature)]),
+            Some(Value::Int(4))
+        );
+    }
+
+    #[test]
+    fn ring_weapon_queries_dispatch_and_play_time_units() {
+        let table = Arc::new(EngineTable::parse(b"int GetPlayTime() = 830;\nvector GetMeleeRingPosition(object o, int i = 0) = 606;\nint GetWeaponsUnsheathedStatus(object o) = 160;").unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        assert_eq!(run(&mut s, 1, "GetPlayTime", &[]), Some(Value::Int(-1)));
+        s.world.module = Some(s.world.spawn(ObjectKind::Module, "module"));
+        s.world.time_ms = 123_999;
+        assert_eq!(run(&mut s, 1, "GetPlayTime", &[]), Some(Value::Int(123)));
+        let c = s.world.spawn(ObjectKind::Creature, "c");
+        s.world.get_mut(c).unwrap().position = [3.0, 2.0, 1.0];
+        assert_eq!(
+            run(
+                &mut s,
+                1,
+                "GetMeleeRingPosition",
+                &[Value::Object(c), Value::Int(0)]
+            ),
+            Some(Value::Vector([3.0, 2.0, 1.0]))
+        );
+        s.set_weapons_drawn(c, true);
+        assert_eq!(
+            run(&mut s, 1, "GetWeaponsUnsheathedStatus", &[Value::Object(c)]),
+            Some(Value::Int(1))
+        );
+        s.game = thedas_vfs::Game::DragonAge2;
+        for name in [
+            "GetPlayTime",
+            "GetMeleeRingPosition",
+            "GetWeaponsUnsheathedStatus",
+        ] {
+            let function = s.table.function_by_name(name).cloned().unwrap();
+            let mut host = ScriptHost {
+                sim: &mut s,
+                event: None,
+                script: "test".into(),
+            };
+            assert!(call(&mut host, 1, &function, &[]).is_none(), "{name}");
+        }
+    }
 
     const LDF: &str = "void SetCooldown(object o, int n, float f, string s) = 1;\n\
         void DoAutoSave() = 9001;\n\
@@ -6317,6 +7835,119 @@ mod tests {
         object[] GetItemsInInventory(object o, int n = 1, int b = 0, string s = \"\", int p = 0) = 180;\n\
         int GetUpgradableAbilityHashedM2DAInt(object o, int nColumnHash, int nAbilityId) = 875;\n\
         float GetUpgradableAbilityHashedM2DAFloat(object o, int nColumnHash, int nAbilityId) = 876;\n";
+
+    #[test]
+    fn origins_create_object_only_uses_its_creature_and_placeable_factories() {
+        use thedas_formats::gff3::{Field, Gff3, Struct, Value as G};
+
+        let dir = std::env::temp_dir().join(format!("thedas-create-types-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut vfs = Vfs::new();
+        for (ext, file_type) in [("utc", *b"UTC "), ("utp", *b"UTP ")] {
+            let template = Gff3 {
+                file_type,
+                file_version: *b"V3.2",
+                structs: vec![Struct {
+                    id: u32::MAX,
+                    fields: vec![Field {
+                        label: "Tag".into(),
+                        value: G::ExoString(b"from_template".to_vec()),
+                    }],
+                }],
+            };
+            let file = dir.join(format!("created.{ext}"));
+            std::fs::write(&file, template.write().unwrap()).unwrap();
+            vfs.push_files(&[file], "synthetic creation templates");
+        }
+        let table = EngineTable::parse(
+            b"#define ENGINE_STRUCTURE_1 location\n\
+              int EVENT_TYPE_SPAWN = 1000;\n\
+              object CreateObject(int kind, resource template, location position, string script, int active, int no_perm) = 306;",
+        )
+        .unwrap();
+        let mut s = Sim::new(Arc::new(vfs), Arc::new(table), 1);
+        let area = s.world.spawn(ObjectKind::Area, "area");
+        s.world.area = Some(area);
+        let location = s.world.store(EngineData::Location(Location {
+            area,
+            position: [1.0, 2.0, 3.0],
+            facing: 90.0,
+        }));
+        let args = |kind| {
+            vec![
+                Value::Int(kind),
+                Value::Resource("created".into()),
+                Value::Engine {
+                    ty: 1,
+                    handle: Some(location),
+                },
+                Value::String("override_script".into()),
+                Value::Int(0),
+                Value::Int(0),
+            ]
+        };
+        let before = serde_json::to_value(&s.world).unwrap();
+        for kind in [
+            i32::MIN,
+            -1,
+            0,
+            1,
+            16,
+            31,
+            64,
+            128,
+            256,
+            511,
+            1024,
+            4096,
+            i32::MAX,
+        ] {
+            assert_eq!(
+                run(&mut s, area, "CreateObject", &args(kind)),
+                Some(Value::Object(OBJECT_INVALID)),
+                "type {kind}"
+            );
+            assert_eq!(
+                serde_json::to_value(&s.world).unwrap(),
+                before,
+                "no object, event or id allocation for type {kind}"
+            );
+        }
+        for (kind, expected) in [
+            (32, ObjectKind::Creature),
+            (33, ObjectKind::Creature),
+            (63, ObjectKind::Creature),
+            (512, ObjectKind::Placeable),
+            (700, ObjectKind::Placeable),
+            (1023, ObjectKind::Placeable),
+        ] {
+            let Some(Value::Object(id)) = run(&mut s, area, "CreateObject", &args(kind)) else {
+                panic!("no object for {kind}")
+            };
+            let object = s.world.get(id).unwrap();
+            assert_eq!(object.kind, expected);
+            assert_eq!(object.tag, "from_template");
+            assert_eq!(
+                (object.area, object.position, object.facing),
+                (Some(area), [1.0, 2.0, 3.0], 90.0)
+            );
+            assert!(!object.active);
+            assert_eq!(object.script.as_deref(), Some("override_script"));
+        }
+        s.game = thedas_vfs::Game::DragonAge2;
+        for (kind, expected) in [
+            (64, ObjectKind::Item),
+            (128, ObjectKind::Trigger),
+            (4096, ObjectKind::Waypoint),
+            (0, ObjectKind::Placeable),
+        ] {
+            let Some(Value::Object(id)) = run(&mut s, area, "CreateObject", &args(kind)) else {
+                panic!("DA2 type {kind}")
+            };
+            assert_eq!(s.world.get(id).unwrap().kind, expected, "DA2 type {kind}");
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn da2_encounter_commands_read_template_case_and_update_membership() {
@@ -6561,6 +8192,257 @@ mod tests {
             script: "test".into(),
         };
         assert!(call(&mut h, owner, &f, &[]).is_none());
+    }
+
+    fn trap_difficulty_sim() -> Sim {
+        let table = EngineTable::parse(b"int GetTrapDetectionDifficulty(object o) = 411;\nint GetTrapDisarmDifficulty(object o) = 413;\n").unwrap();
+        Sim::new(Arc::new(Vfs::new()), Arc::new(table), 1)
+    }
+
+    #[test]
+    fn trap_difficulty_getters_read_distinct_signed_placeable_fields_without_state_checks() {
+        let mut s = trap_difficulty_sim();
+        let trap = s.world.spawn(ObjectKind::Placeable, "trap");
+        assert_eq!(
+            run(
+                &mut s,
+                trap,
+                "GetTrapDetectionDifficulty",
+                &[Value::Object(trap)]
+            ),
+            Some(Value::Int(0))
+        );
+        for (detection, disarm) in [(17, 31), (-8, 0), (i32::MIN, i32::MAX)] {
+            let o = s.world.get_mut(trap).unwrap();
+            o.fields.insert("TrapDetection".into(), detection);
+            o.fields.insert("TrapDisarm".into(), disarm);
+            o.active = false;
+            o.dead = true;
+            o.fields.insert("Health".into(), 0);
+            assert_eq!(
+                run(
+                    &mut s,
+                    trap,
+                    "GetTrapDetectionDifficulty",
+                    &[Value::Object(trap)]
+                ),
+                Some(Value::Int(detection))
+            );
+            assert_eq!(
+                run(
+                    &mut s,
+                    trap,
+                    "GetTrapDisarmDifficulty",
+                    &[Value::Object(trap)]
+                ),
+                Some(Value::Int(disarm))
+            );
+        }
+    }
+
+    #[test]
+    fn trap_difficulty_getters_reject_other_kinds_even_with_matching_fields() {
+        let mut s = trap_difficulty_sim();
+        for kind in [
+            ObjectKind::Creature,
+            ObjectKind::Item,
+            ObjectKind::Trigger,
+            ObjectKind::Area,
+            ObjectKind::Module,
+            ObjectKind::Store,
+        ] {
+            let id = s.world.spawn(kind, "not_a_trap_placeable");
+            for field in ["TrapDetection", "TrapDisarm"] {
+                s.world.get_mut(id).unwrap().fields.insert(field.into(), 42);
+            }
+            for name in ["GetTrapDetectionDifficulty", "GetTrapDisarmDifficulty"] {
+                assert_eq!(
+                    run(&mut s, id, name, &[Value::Object(id)]),
+                    Some(Value::Int(0))
+                );
+                assert_eq!(
+                    run(&mut s, id, name, &[Value::Object(OBJECT_INVALID)]),
+                    Some(Value::Int(0))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn trap_difficulty_getters_leave_da2_dispatch_unchanged() {
+        let mut s = trap_difficulty_sim();
+        s.game = thedas_vfs::Game::DragonAge2;
+        let id = s.world.spawn(ObjectKind::Placeable, "trap");
+        for name in ["GetTrapDetectionDifficulty", "GetTrapDisarmDifficulty"] {
+            let f = s.table.function_by_name(name).unwrap().clone();
+            let mut h = ScriptHost {
+                sim: &mut s,
+                event: None,
+                script: "test".into(),
+            };
+            assert!(call(&mut h, id, &f, &[Value::Object(id)]).is_none());
+        }
+    }
+
+    #[test]
+    fn native_859_returns_owned_abilities_in_type_groups_and_filters_their_cooldowns() {
+        let table = EngineTable::default().with_inferred();
+        let f = table.function_for_call(859, 3).unwrap();
+        assert_eq!(f.name, "GetAbilityList");
+        assert_eq!(f.ret, Type::Array(Box::new(Type::Int)));
+        let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(table), 1);
+        s.world.tables().insert(
+            "ABI_base",
+            &["AbilityType"],
+            vec![
+                (10, vec![Cell::Int(3)]),
+                (20, vec![Cell::Int(2)]),
+                (30, vec![Cell::Int(1)]),
+                (40, vec![Cell::Int(4)]),
+                (50, vec![Cell::Int(1)]),
+                (60, vec![Cell::Int(0)]),
+            ],
+        );
+        let who = s.world.spawn(ObjectKind::Creature, "creature");
+        s.world.time_ms = 1000;
+        let o = s.world.get_mut(who).unwrap();
+        o.abilities = [10, 20, 30, 40, 60, 999].into_iter().collect();
+        o.combat.cooldowns = [
+            ("10:".into(), 3000),
+            ("20:".into(), 1000),
+            ("30:item".into(), 4000),
+            ("50:".into(), 4000),
+        ]
+        .into_iter()
+        .collect();
+        let query = |s: &mut Sim, ty, cooling, expected: &[i32]| {
+            assert_eq!(
+                run(
+                    s,
+                    who,
+                    "GetAbilityList",
+                    &[Value::Object(who), Value::Int(ty), Value::Int(cooling)]
+                ),
+                Some(Value::Array {
+                    elem: Type::Int,
+                    items: expected.iter().copied().map(Value::Int).collect(),
+                })
+            );
+        };
+        query(&mut s, 0, 0, &[30, 20, 10]);
+        query(&mut s, 1, 0, &[30]);
+        query(&mut s, 2, 0, &[20]);
+        query(&mut s, 3, 0, &[10]);
+        query(&mut s, 0, 1, &[10]);
+        query(&mut s, 0, -1, &[10]);
+        for ty in [-1, 4, 5] {
+            query(&mut s, ty, 0, &[]);
+        }
+        s.world.time_ms = 3000;
+        query(&mut s, 0, 1, &[]);
+        assert_eq!(s.world.get(who).unwrap().combat.cooldowns.len(), 4);
+    }
+
+    #[test]
+    fn native_859_invalid_creatures_return_an_empty_integer_array_and_da2_is_unchanged() {
+        let mut s = Sim::new(
+            Arc::new(Vfs::new()),
+            Arc::new(EngineTable::default().with_inferred()),
+            1,
+        );
+        let item = s.world.spawn(ObjectKind::Item, "item");
+        for who in [item, OBJECT_INVALID] {
+            assert_eq!(
+                run(
+                    &mut s,
+                    who,
+                    "GetAbilityList",
+                    &[Value::Object(who), Value::Int(0), Value::Int(0)]
+                ),
+                Some(Value::Array {
+                    elem: Type::Int,
+                    items: Vec::new()
+                })
+            );
+        }
+        s.game = thedas_vfs::Game::DragonAge2;
+        let f = s.table.function(859).unwrap().clone();
+        let mut h = ScriptHost {
+            sim: &mut s,
+            event: None,
+            script: "test".into(),
+        };
+        assert!(
+            call(
+                &mut h,
+                item,
+                &f,
+                &[Value::Object(item), Value::Int(0), Value::Int(0)]
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn package_loaded_native_862_reads_campaign_dependencies_not_installed_addins_or_layer_names() {
+        let mut vfs = Vfs::new();
+        vfs.set_addins(vec!["dao_prc_ep_1".into()]);
+        vfs.push_files(&[], "packages/core_ep1/data/installed-only.erf");
+        let table = EngineTable::default().with_inferred();
+        assert_eq!(table.function(862).unwrap().name, "IsPackageLoaded");
+        let mut s = Sim::new(Arc::new(vfs), Arc::new(table), 1);
+        let query = |s: &mut Sim, name: &str| {
+            run(
+                s,
+                OBJECT_INVALID,
+                "IsPackageLoaded",
+                &[Value::String(name.into())],
+            )
+        };
+        assert_eq!(query(&mut s, "core_ep1"), Some(Value::Int(0)));
+        assert_eq!(query(&mut s, "dao_prc_ep_1"), Some(Value::Int(0)));
+        s.module_info.packages = vec!["core_ep1".into()];
+        for name in ["core_ep1", "CORE_EP1", "core_ep1\0"] {
+            assert_eq!(query(&mut s, name), Some(Value::Int(1)));
+        }
+        for name in [
+            "core",
+            "core_ep",
+            "core_ep1/",
+            " core_ep1",
+            "core_ep1 ",
+            "dao_prc_ep_1",
+            "",
+        ] {
+            assert_eq!(query(&mut s, name), Some(Value::Int(0)));
+        }
+        // Save restoration retains the already-loaded campaign's dependencies.
+        let save = s.save_game();
+        s.load_game(save).unwrap();
+        assert_eq!(query(&mut s, "core_ep1"), Some(Value::Int(1)));
+        s.module_info.packages.clear();
+        assert_eq!(query(&mut s, "core_ep1"), Some(Value::Int(0)));
+    }
+
+    #[test]
+    fn package_loaded_da2_retains_the_previous_resource_layer_query() {
+        let mut vfs = Vfs::new();
+        vfs.push_files(&[], "packages/core_ep1/data/installed-only.erf");
+        let mut s = Sim::new(
+            Arc::new(vfs),
+            Arc::new(EngineTable::default().with_inferred()),
+            1,
+        );
+        s.game = thedas_vfs::Game::DragonAge2;
+        assert_eq!(
+            run(
+                &mut s,
+                OBJECT_INVALID,
+                "IsPackageLoaded",
+                &[Value::String("core_ep1".into())]
+            ),
+            Some(Value::Int(1))
+        );
     }
 
     #[test]
@@ -7275,6 +9157,130 @@ mod tests {
             ],
         );
         assert!(s.world.trace.entries.is_empty());
+    }
+
+    #[test]
+    fn event_script_assignment_uses_the_origins_prefix_and_object_interfaces() {
+        let table = Arc::new(
+            EngineTable::parse(b"void SetEventScript(object o, string s) = 122;").unwrap(),
+        );
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        let caller = s.world.spawn(ObjectKind::Creature, "caller");
+        s.world.get_mut(caller).unwrap().script = Some("caller_script".into());
+        let recipient = s.world.spawn(ObjectKind::Placeable, "recipient");
+        // Hand-written bytecode calls action 122 with a separate explicit recipient.
+        let script_name = b"replacement.part.NCS";
+        let mut code = vec![0x04, 0x05];
+        code.extend_from_slice(&(script_name.len() as u16).to_be_bytes());
+        code.extend_from_slice(script_name);
+        code.extend_from_slice(&[0x04, 0x06]);
+        code.extend_from_slice(&recipient.to_be_bytes());
+        code.extend_from_slice(&[0x05, 0x00, 0x00, 122, 2, 0x20, 0x00]);
+        let mut bytes = b"NCS V1.0B".to_vec();
+        bytes.extend_from_slice(&((13 + code.len()) as u32).to_be_bytes());
+        bytes.extend_from_slice(&code);
+        s.add_script("setter", thedas_script::Ncs::parse(&bytes).unwrap());
+        s.run_script("setter", caller, None);
+        assert!(s.world.trace.script_errors.is_empty());
+        assert_eq!(
+            s.world.get(recipient).unwrap().script.as_deref(),
+            Some("replacement")
+        );
+        for game in [thedas_vfs::Game::Origins, thedas_vfs::Game::DragonAge2] {
+            s.game = game;
+            for kind in [
+                ObjectKind::Module,
+                ObjectKind::Area,
+                ObjectKind::Creature,
+                ObjectKind::Placeable,
+                ObjectKind::Item,
+                ObjectKind::Trigger,
+                ObjectKind::Sound,
+                ObjectKind::Waypoint,
+                ObjectKind::Projectile,
+                ObjectKind::Store,
+                ObjectKind::AreaOfEffect,
+                ObjectKind::Stage,
+                ObjectKind::Party,
+                ObjectKind::Map,
+                ObjectKind::MapPin,
+            ] {
+                let target = s.world.spawn(kind, "target");
+                let supported = game != thedas_vfs::Game::Origins
+                    || !matches!(
+                        kind,
+                        ObjectKind::Stage
+                            | ObjectKind::Party
+                            | ObjectKind::Map
+                            | ObjectKind::MapPin
+                    );
+                for (input, origins, da2) in [
+                    ("script", "script", "script"),
+                    ("MiXeD.NCS", "MiXeD", "MiXeD.NCS"),
+                    ("script.ncs", "script", "script"),
+                    ("script.ncs.ncs", "script", "script"),
+                    ("script.part.ncs", "script", "script.part"),
+                    ("script.nss", "script", "script.nss"),
+                    ("script.", "script", "script."),
+                    (".script", "", ".script"),
+                    ("", "", ""),
+                    ("  script .ncs", "  script ", "  script "),
+                    ("dir.name/script", "dir", "dir.name/script"),
+                    ("é漢🙂.NCS", "é漢🙂", "é漢🙂.NCS"),
+                ] {
+                    s.world.get_mut(target).unwrap().script = Some("previous".into());
+                    let before = s.save_json().unwrap();
+                    assert_eq!(
+                        run(
+                            &mut s,
+                            caller,
+                            "SetEventScript",
+                            &[Value::Object(target), Value::String(input.into())],
+                        ),
+                        None
+                    );
+                    let expected = if !supported {
+                        "previous"
+                    } else if game == thedas_vfs::Game::Origins {
+                        origins
+                    } else {
+                        da2
+                    };
+                    assert_eq!(
+                        s.world.get(target).unwrap().script.as_deref(),
+                        (!expected.is_empty()).then_some(expected),
+                        "{game:?} {kind:?} {input:?}"
+                    );
+                    assert_eq!(
+                        s.world.get(caller).unwrap().script.as_deref(),
+                        Some("caller_script")
+                    );
+                    if !supported {
+                        assert_eq!(s.save_json().unwrap(), before);
+                    }
+                    let saved = s.save_json().unwrap();
+                    s.load_json(&saved).unwrap();
+                    assert_eq!(
+                        s.world.get(target).unwrap().script.as_deref(),
+                        (!expected.is_empty()).then_some(expected)
+                    );
+                    assert!(s.world.queue.is_empty());
+                }
+            }
+            let before = s.save_json().unwrap();
+            for target in [OBJECT_INVALID, 0x12345678] {
+                run(
+                    &mut s,
+                    caller,
+                    "SetEventScript",
+                    &[
+                        Value::Object(target),
+                        Value::String("replacement.part".into()),
+                    ],
+                );
+            }
+            assert_eq!(s.save_json().unwrap(), before);
+        }
     }
 
     #[test]
@@ -8041,6 +10047,228 @@ mod tests {
             script: "test".into(),
         };
         call(&mut h, caller, &f, a).unwrap().unwrap()
+    }
+
+    #[test]
+    fn da2_locomotion_getter_tracks_start_stop_turn_and_reload() {
+        let table = EngineTable::parse(
+            b"int IsMoving(object o) = 388;\n\
+              void SetFacingObject(object o, object t, int invert = 1, int instant = 0) = 24;\n\
+              void ClearCurrentCommand(object o) = 1;\n\
+              int COMMAND_TYPE_MOVE_TO_LOCATION = 2;\n",
+        )
+        .unwrap();
+        let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(table.clone()), 1);
+        s.game = thedas_vfs::Game::DragonAge2;
+        let area = s.world.spawn(ObjectKind::Area, "area");
+        let who = s.world.spawn(ObjectKind::Creature, "walker");
+        let target = s.world.spawn(ObjectKind::Creature, "target");
+        s.world.area = Some(area);
+        s.world.get_mut(who).unwrap().area = Some(area);
+        s.world.get_mut(target).unwrap().area = Some(area);
+        s.world.get_mut(target).unwrap().position = [0., -10., 0.];
+        let moving = |s: &mut Sim, id| run(s, who, "IsMoving", &[Value::Object(id)]);
+        assert_eq!(moving(&mut s, who), Some(Value::Int(0)));
+        assert_eq!(moving(&mut s, OBJECT_INVALID), Some(Value::Int(0)));
+        assert_eq!(moving(&mut s, area), Some(Value::Int(0)));
+
+        s.order_move(who, [10., 0., 0.]);
+        assert_eq!(
+            moving(&mut s, who),
+            Some(Value::Int(0)),
+            "queued is not moving"
+        );
+        s.tick(1);
+        assert_eq!(moving(&mut s, who), Some(Value::Int(1)));
+        run(&mut s, who, "ClearCurrentCommand", &[Value::Object(who)]);
+        let stopped_at = s.world.get(who).unwrap().position;
+        assert_eq!(
+            moving(&mut s, who),
+            Some(Value::Int(1)),
+            "soft stop retains a mode"
+        );
+        s.tick(1);
+        assert_eq!(
+            moving(&mut s, who),
+            Some(Value::Int(1)),
+            "residual facing enters mode 4"
+        );
+        assert_eq!(s.world.get(who).unwrap().position, stopped_at);
+
+        let saved = serde_json::to_string(&s.world).unwrap();
+        let mut restored = Sim::new(Arc::new(Vfs::new()), Arc::new(table), 1);
+        restored.game = s.game;
+        restored.world = serde_json::from_str(&saved).unwrap();
+        assert_eq!(moving(&mut restored, who), Some(Value::Int(1)));
+        s.tick(500);
+        restored.tick(500);
+        assert_eq!(s.world.get(who), restored.world.get(who));
+        assert_eq!(moving(&mut s, who), Some(Value::Int(0)));
+
+        run(
+            &mut s,
+            who,
+            "SetFacingObject",
+            &[
+                Value::Object(who),
+                Value::Object(target),
+                Value::Int(1),
+                Value::Int(0),
+            ],
+        );
+        assert!(s.world.get(who).unwrap().commands.is_empty());
+        assert_eq!(
+            moving(&mut s, who),
+            Some(Value::Int(1)),
+            "a stationary turn counts"
+        );
+        s.tick(500);
+        assert_eq!(moving(&mut s, who), Some(Value::Int(0)));
+        s.da2_turn_to(who, 45.);
+        s.da2_reset_locomotion(who);
+        assert_eq!(
+            moving(&mut s, who),
+            Some(Value::Int(0)),
+            "performance reset clears motion"
+        );
+
+        s.game = thedas_vfs::Game::Origins;
+        s.order_move(who, [20., 0., 0.]);
+        s.tick(1);
+        assert!(
+            !serde_json::to_string(s.world.get(who).unwrap())
+                .unwrap()
+                .contains("da2_locomotion")
+        );
+    }
+
+    #[test]
+    fn origins_rejected_commands_keep_completion_arguments_and_previous_command() {
+        for game in [thedas_vfs::Game::Origins, thedas_vfs::Game::DragonAge2] {
+            let table = EngineTable::parse(
+                b"void SetCommandResult(object who, int result) = 716;\n\
+                int COMMAND_RESULT_FAILED = 0;\n\
+                int EVENT_TYPE_COMMAND_COMPLETE = 1004;\n",
+            )
+            .unwrap();
+            let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(table), 1);
+            s.game = game;
+            let who = s.world.spawn(ObjectKind::Creature, "actor");
+            let target = s.world.spawn(ObjectKind::Creature, "target");
+            let command = Command {
+                ty: 1,
+                name: "CommandAttack".into(),
+                target: Some(target),
+                due: Some(100),
+                ..Default::default()
+            };
+            s.world.get_mut(who).unwrap().commands.push(command.clone());
+            run(
+                &mut s,
+                who,
+                "SetCommandResult",
+                &[Value::Object(who), Value::Int(0)],
+            );
+            let event = s.world.queue.values().next().unwrap();
+            assert_eq!(event.target, who);
+            assert_eq!(event.event.creator, Some(who));
+            assert_eq!(event.event.ints, [1, 0]);
+            assert_eq!(
+                event.event.objects,
+                if game == thedas_vfs::Game::Origins {
+                    vec![who, target]
+                } else {
+                    Vec::new()
+                }
+            );
+            let actor = s.world.get(who).unwrap();
+            assert!(actor.commands.is_empty());
+            assert_eq!(
+                actor.combat.previous_command.as_ref(),
+                (game == thedas_vfs::Game::Origins).then_some(&command)
+            );
+        }
+    }
+
+    #[test]
+    fn command_queue_omits_the_active_executor_and_keeps_waiting_indexes() {
+        fn command_at(s: &mut Sim, who: ObjectId, index: i32) -> Option<Command> {
+            let Some(Value::Engine { handle, .. }) = run(
+                s,
+                who,
+                "GetCommandByIndex",
+                &[Value::Object(who), Value::Int(index)],
+            ) else {
+                panic!("expected command handle");
+            };
+            match s.world.handle(handle) {
+                Some(EngineData::Command(command)) => Some(command.clone()),
+                _ => None,
+            }
+        }
+
+        for game in [thedas_vfs::Game::DragonAge2, thedas_vfs::Game::Origins] {
+            let table = EngineTable::parse(
+                b"#define ENGINE_STRUCTURE_2 command\n\
+                int GetCommandQueueSize(object o) = 724;\n\
+                command GetCommandByIndex(object o, int i) = 536;\n\
+                command GetCurrentCommand(object o) = 539;\n\
+                int COMMAND_TYPE_WAIT = 13;\n",
+            )
+            .unwrap();
+            let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(table), 1);
+            s.game = game;
+            let who = s.world.spawn(ObjectKind::Creature, "actor");
+            let size = |s: &mut Sim, id| run(s, who, "GetCommandQueueSize", &[Value::Object(id)]);
+            let current = |s: &mut Sim| {
+                let Some(Value::Engine { handle, .. }) =
+                    run(s, who, "GetCurrentCommand", &[Value::Object(who)])
+                else {
+                    panic!("expected command handle");
+                };
+                match s.world.handle(handle) {
+                    Some(EngineData::Command(c)) => Some(c.seconds),
+                    _ => None,
+                }
+            };
+            assert_eq!(size(&mut s, who), Some(Value::Int(0)));
+            assert_eq!(current(&mut s), None);
+            assert_eq!(size(&mut s, OBJECT_INVALID), Some(Value::Int(0)));
+            assert_eq!(command_at(&mut s, OBJECT_INVALID, 0), None);
+            s.order_wait(who, 1.);
+            // Before the scheduler starts it, the front is still waiting.
+            assert_eq!(size(&mut s, who), Some(Value::Int(1)));
+            assert_eq!(command_at(&mut s, who, 0).unwrap().seconds, 1.);
+            assert_eq!(current(&mut s), None);
+            s.tick(100);
+            assert_eq!(current(&mut s), Some(1.));
+            assert_eq!(size(&mut s, who), Some(Value::Int(0)));
+            assert_eq!(command_at(&mut s, who, 0), None);
+            let mut next = s.world.get(who).unwrap().commands[0].clone();
+            next.due = None;
+            next.seconds = 2.;
+            s.world.get_mut(who).unwrap().commands.push(next.clone());
+            next.seconds = 3.;
+            s.world.get_mut(who).unwrap().commands.push(next);
+            assert_eq!(size(&mut s, who), Some(Value::Int(2)));
+            assert_eq!(command_at(&mut s, who, 0).unwrap().seconds, 2.);
+            assert_eq!(command_at(&mut s, who, -1), None);
+            assert_eq!(command_at(&mut s, who, i32::MAX), None);
+            assert_eq!(command_at(&mut s, who, 65536).unwrap().seconds, 2.);
+            assert_eq!(command_at(&mut s, who, -65536).unwrap().seconds, 2.);
+            // A ready animation still belongs to the executor. Reload keeps
+            // the same queue boundary, including older records without readiness.
+            s.world.get_mut(who).unwrap().commands[0].cancellable = true;
+            s.world = serde_json::from_str(&serde_json::to_string(&s.world).unwrap()).unwrap();
+            assert_eq!(size(&mut s, who), Some(Value::Int(2)));
+            s.world.get_mut(who).unwrap().commands[0].cancellable = false;
+            s.world = serde_json::from_str(&serde_json::to_string(&s.world).unwrap()).unwrap();
+            s.tick(900);
+            assert_eq!(command_at(&mut s, who, 0).unwrap().seconds, 3.);
+            assert_eq!(size(&mut s, who), Some(Value::Int(1)));
+            s.world.get_mut(who).unwrap().commands.clear();
+            assert_eq!(size(&mut s, who), Some(Value::Int(0)));
+        }
     }
 
     #[test]
@@ -11623,6 +13851,77 @@ mod tests {
     }
 
     #[test]
+    fn origins_gore_is_saved_clamped_and_masked_by_the_client_option() {
+        let table = Arc::new(
+            EngineTable::parse(
+                br#"
+            float GetCreatureGoreLevel(object o) = 719;
+            void SetCreatureGoreLevel(object o, float f) = 720;
+        "#,
+            )
+            .unwrap(),
+        );
+        let mut sim = Sim::new(Arc::new(Vfs::new()), table, 1);
+        let creature = sim.world.spawn(ObjectKind::Creature, "creature");
+        let item = sim.world.spawn(ObjectKind::Item, "item");
+        let who = [Value::Object(creature)];
+        assert_eq!(
+            run(&mut sim, creature, "GetCreatureGoreLevel", &who),
+            Some(Value::Float(0.0))
+        );
+        for (value, expected) in [(-1.0, 0.0), (2.0, 1.0), (0.42, 0.42)] {
+            run(
+                &mut sim,
+                creature,
+                "SetCreatureGoreLevel",
+                &[Value::Object(creature), Value::Float(value)],
+            );
+            assert_eq!(
+                run(&mut sim, creature, "GetCreatureGoreLevel", &who),
+                Some(Value::Float(expected))
+            );
+        }
+        for id in [item, OBJECT_INVALID] {
+            run(
+                &mut sim,
+                creature,
+                "SetCreatureGoreLevel",
+                &[Value::Object(id), Value::Float(1.0)],
+            );
+            assert_eq!(
+                run(
+                    &mut sim,
+                    creature,
+                    "GetCreatureGoreLevel",
+                    &[Value::Object(id)]
+                ),
+                Some(Value::Float(0.0))
+            );
+        }
+        sim.client_option_message(
+            crate::chargen::MSG_CLIENT_OPTION,
+            &["GameOptions.ShowGore".into(), "0".into()],
+        );
+        assert_eq!(
+            run(&mut sim, creature, "GetCreatureGoreLevel", &who),
+            Some(Value::Float(0.0))
+        );
+        assert_eq!(sim.world.get(creature).unwrap().gore_level, 0.42);
+        sim.client_option_message("ClientOptions.RestoreDefaults", &[]);
+        assert_eq!(
+            run(&mut sim, creature, "GetCreatureGoreLevel", &who),
+            Some(Value::Float(0.42))
+        );
+        let object = sim.world.get(creature).unwrap();
+        let mut saved = serde_json::to_value(object).unwrap();
+        let restored: crate::world::Object = serde_json::from_value(saved.clone()).unwrap();
+        assert_eq!(restored.gore_level, 0.42);
+        saved.as_object_mut().unwrap().remove("gore_level");
+        let old: crate::world::Object = serde_json::from_value(saved).unwrap();
+        assert_eq!(old.gore_level, 0.0);
+    }
+
+    #[test]
     fn dispatch_cleanup_preserves_hero_defaults_and_presentation_routing() {
         let table = Arc::new(
             EngineTable::parse(
@@ -11701,14 +14000,24 @@ mod tests {
                     &mut s,
                     hero,
                     "SetCreatureGoreLevel",
-                    &[Value::Object(hero), Value::Float(1.0)]
+                    &[Value::Object(hero), Value::Float(1.0)],
                 ),
                 None
             );
-            assert_eq!(
-                s.world.trace.presentation.get("SetCreatureGoreLevel"),
-                Some(&1)
-            );
+            if game == thedas_vfs::Game::Origins {
+                assert_eq!(s.world.get(hero).unwrap().gore_level, 1.0);
+                assert!(
+                    !s.world
+                        .trace
+                        .presentation
+                        .contains_key("SetCreatureGoreLevel")
+                );
+            } else {
+                assert_eq!(
+                    s.world.trace.presentation.get("SetCreatureGoreLevel"),
+                    Some(&1)
+                );
+            }
             assert!(
                 s.world.trace.entries.is_empty(),
                 "the later log arm is unreachable"
@@ -11798,6 +14107,9 @@ mod tests {
                 impacted: false,
                 arrived: false,
                 da2_target_prepared: false,
+                interaction: None,
+                da2_basic_attack_fallback: false,
+                da2_player_issued: false,
                 path: vec![],
                 turned_at: None,
                 is_static: false,
@@ -12516,6 +14828,135 @@ mod coverage_tests {
     }
 
     #[test]
+    fn origins_visual_effects_bypass_validation_without_disturbing_current_effect() {
+        for game in [thedas_vfs::Game::Origins, thedas_vfs::Game::DragonAge2] {
+            let table = EngineTable::parse(
+                format!(
+                    "{LDF}\nvoid SetIsCurrentEffectValid(int valid) = 201;\n\
+                     void Engine_ApplyEffectOnObject(int d, effect e, object o, float f, object c, int a) = 202;\n"
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+            let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(table), 7);
+            s.game = game;
+            s.world.trace.keep = true;
+            let target = s.world.spawn(ObjectKind::Creature, "visual_target");
+            s.world.hero = Some(target);
+            s.world.get_mut(target).unwrap().script = Some("reject".into());
+            // Synthetic hook: SetIsCurrentEffectValid(0); return.
+            let code = [4, 3, 0, 0, 0, 0, 5, 0, 0, 201, 1, 0x20, 0];
+            let mut bytes = b"NCS V1.0B".to_vec();
+            bytes.extend(((13 + code.len()) as u32).to_be_bytes());
+            bytes.extend(code);
+            s.add_script("reject", thedas_script::Ncs::parse(&bytes).unwrap());
+            let outer = Effect {
+                ty: 1012,
+                ints: vec![42],
+                ..Default::default()
+            };
+            s.current_effect = Some((outer.clone(), false));
+            s.current_effect_target = Some(target);
+            for entry in 0..4 {
+                let effect = Effect {
+                    ty: 4,
+                    ints: vec![3006],
+                    creator: Some(target),
+                    duration_type: 5,
+                    ..Default::default()
+                };
+                let handle = s.world.store_new_effect(effect.clone());
+                let effect_value = Value::Engine {
+                    ty: 3,
+                    handle: Some(handle),
+                };
+                match entry {
+                    0 => {
+                        run(
+                            &mut s,
+                            target,
+                            "ApplyEffectVisualEffect",
+                            &[
+                                Value::Object(target),
+                                Value::Object(target),
+                                Value::Int(3006),
+                                Value::Int(5),
+                                Value::Float(0.0),
+                                Value::Int(0),
+                            ],
+                        );
+                    }
+                    1 => {
+                        run(
+                            &mut s,
+                            target,
+                            "Engine_ApplyEffectOnObject",
+                            &[
+                                Value::Int(5),
+                                effect_value,
+                                Value::Object(target),
+                                Value::Float(0.0),
+                                Value::Object(target),
+                                Value::Int(0),
+                            ],
+                        );
+                    }
+                    2 => {
+                        run(
+                            &mut s,
+                            target,
+                            "Engine_ApplyEffectOnParty",
+                            &[
+                                Value::Int(5),
+                                effect_value,
+                                Value::Float(0.0),
+                                Value::Object(target),
+                                Value::Int(0),
+                                Value::Int(0),
+                            ],
+                        );
+                    }
+                    _ => s.apply_effect(target, effect),
+                }
+                assert_eq!(s.current_effect, Some((outer.clone(), false)));
+                assert_eq!(s.current_effect_target, Some(target));
+            }
+            let native = game == thedas_vfs::Game::Origins;
+            let effects = s.world.get(target).unwrap().effects.clone();
+            assert_eq!(effects.len(), if native { 4 } else { 0 });
+            for effect in &effects {
+                assert!(effect.id > 0);
+                assert_eq!(effect.visual_target, Some(target));
+                assert_eq!(effect.creator, Some(target));
+                assert_eq!(effect.expires, None);
+                assert!(s.remove_effect(target, effect));
+            }
+            assert_eq!(
+                s.world
+                    .trace
+                    .entries
+                    .iter()
+                    .filter(|e| matches!(e,
+                        crate::trace::TraceEntry::ScriptStart { script, .. } if script == "reject"
+                    ))
+                    .count(),
+                if native { 0 } else { 4 },
+            );
+            // Script-defined effects still execute and obey the rejecting hook.
+            s.apply_effect(
+                target,
+                Effect {
+                    ty: 1001,
+                    duration_type: 3,
+                    ..Default::default()
+                },
+            );
+            assert!(s.world.get(target).unwrap().effects.is_empty());
+            assert_eq!(s.current_effect, Some((outer, false)));
+        }
+    }
+
+    #[test]
     fn visual_effects_on_objects_are_applied_as_effects() {
         let mut s = sim();
         let area = s.world.spawn(ObjectKind::Area, "a");
@@ -12731,6 +15172,63 @@ mod coverage_tests {
             script: "test".into(),
         };
         call(&mut h, caller, &f, a).unwrap().unwrap()
+    }
+
+    #[test]
+    fn follower_locations_use_the_controlled_leaders_party_slots() {
+        for game in [thedas_vfs::Game::Origins, thedas_vfs::Game::DragonAge2] {
+            let table = EngineTable::parse(
+                b"#define ENGINE_STRUCTURE_0 location\nlocation GetFollowerWouldBeLocation(object o) = 0;",
+            ).unwrap();
+            let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(table), 7);
+            s.game = game;
+            let area = s.world.spawn(ObjectKind::Area, "a");
+            let members: Vec<_> = (0..4)
+                .map(|i| s.world.spawn(ObjectKind::Creature, &format!("member{i}")))
+                .collect();
+            let escort = s.world.spawn(ObjectKind::Creature, "escort");
+            s.world.hero = Some(members[0]);
+            s.world.get_mut(members[0]).unwrap().followers = members[1..].to_vec();
+            s.world.get_mut(members[0]).unwrap().escorts = vec![escort];
+            for (i, id) in members.iter().copied().chain([escort]).enumerate() {
+                let o = s.world.get_mut(id).unwrap();
+                o.area = Some(area);
+                o.position = [20.0 * i as f32, 30.0, 0.0];
+                o.facing = 270.0;
+            }
+            for (leader_index, &leader) in members.iter().enumerate() {
+                s.world.controlled = Some(leader);
+                let pos = s.world.get(leader).unwrap().position;
+                for (i, who) in members.iter().copied().chain([escort]).enumerate() {
+                    if who == leader {
+                        continue;
+                    }
+                    let Value::Engine {
+                        handle: Some(h), ..
+                    } = run(
+                        &mut s,
+                        leader,
+                        "GetFollowerWouldBeLocation",
+                        &[Value::Object(who)],
+                    )
+                    .unwrap()
+                    else {
+                        panic!("location handle");
+                    };
+                    let Some(EngineData::Location(l)) = s.world.handle(Some(h)) else {
+                        panic!("location");
+                    };
+                    let slot = if i == 0 { leader_index - 1 } else { i - 1 };
+                    assert_eq!(l.area, area);
+                    assert_eq!(
+                        l.position,
+                        crate::sim::behind(pos, 270.0, slot),
+                        "{game:?}, leader={leader_index}, member={i}"
+                    );
+                    assert_eq!(l.facing, 270.0);
+                }
+            }
+        }
     }
 
     #[test]
@@ -13316,6 +15814,162 @@ mod coverage_tests {
     }
 
     #[test]
+    fn remove_all_effects_death_filter_removes_stun_and_preserves_exemptions() {
+        let mut s = sim();
+        let tables = crate::m2da::Tables::empty();
+        tables.insert(
+            "effects",
+            &["IgnoreDeath"],
+            vec![
+                (1027, vec![Cell::Int(0)]), // stun
+                (1017, vec![Cell::Int(0)]), // damage over time
+                (1068, vec![Cell::Int(1)]), // mabari dominance
+            ],
+        );
+        s.world.tables = Arc::new(tables);
+        let c = s.world.spawn(ObjectKind::Creature, "fallen");
+        let effects: Vec<_> = [
+            (1027, 2, 0),
+            (1027, 3, 0), // permanent does not mean survives death
+            (1017, 2, 0),
+            (1068, 3, 0),
+            (1012, 3, 500_001),
+            (1012, 4, 0),
+            (1012, 5, 0),
+            (7, 6, 0),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(i, (ty, duration_type, ability))| Effect {
+            id: i as i32 + 1,
+            ty,
+            duration_type,
+            ability,
+            expires: (duration_type == 2).then_some(100_000),
+            ..Default::default()
+        })
+        .collect();
+        for keep_injuries in [true, false] {
+            s.world.get_mut(c).unwrap().effects = effects.clone();
+            s.kill(c, OBJECT_INVALID);
+            run(
+                &mut s,
+                c,
+                "RemoveAllEffects",
+                &[
+                    Value::Object(c),
+                    Value::Int(keep_injuries as i32),
+                    Value::Int(1),
+                ],
+            );
+            let remaining: Vec<_> = s
+                .world
+                .get(c)
+                .unwrap()
+                .effects
+                .iter()
+                .map(|e| e.id)
+                .collect();
+            assert_eq!(
+                remaining,
+                if keep_injuries {
+                    vec![4, 5, 6, 7, 8]
+                } else {
+                    vec![4, 6, 7, 8]
+                }
+            );
+            // Expiration must not blanket-clear a corpse's persistent effects.
+            s.expire_effects();
+            assert_eq!(s.world.get(c).unwrap().effects.len(), remaining.len());
+        }
+    }
+
+    #[test]
+    fn removing_stun_from_a_corpse_runs_its_callback_once_and_survives_save_reload() {
+        let table = EngineTable::parse(
+            b"\
+            int EVENT_TYPE_REMOVE_EFFECT = 32;\n\
+            int PROPERTY_DEPLETABLE_HEALTH = 7;\n\
+            int PROPERTY_VALUE_MODIFIER = 4;\n\
+            void UpdateCreatureProperty(object o, int p, float v, int t) = 1;\n\
+            void RemoveAllEffects(object o, int i, int d) = 2;\n",
+        )
+        .unwrap();
+        let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(table), 1);
+        let c = s.world.spawn(ObjectKind::Creature, "fallen");
+        // Our synthetic removal callback restores the stun's Dexterity modifier:
+        // UpdateCreatureProperty(OBJECT_SELF, 2, 1000.0, 4).
+        let mut code = vec![4, 3];
+        code.extend(4_i32.to_be_bytes());
+        code.extend([4, 4]);
+        code.extend(1000_f32.to_be_bytes());
+        code.extend([4, 3]);
+        code.extend(2_i32.to_be_bytes());
+        code.extend([4, 6]);
+        code.extend(0_u32.to_be_bytes());
+        code.extend([5, 0, 0, 1, 4, 0x20, 0]);
+        let mut bytes = b"NCS V1.0B".to_vec();
+        bytes.extend(((13 + code.len()) as u32).to_be_bytes());
+        bytes.extend(code);
+        s.add_script("restore_stun", thedas_script::Ncs::parse(&bytes).unwrap());
+        let stun = Effect {
+            id: 1,
+            ty: 1027,
+            duration_type: 2,
+            expires: Some(100_000),
+            ..Default::default()
+        };
+        let o = s.world.get_mut(c).unwrap();
+        o.script = Some("restore_stun".into());
+        o.modifiers.insert(2, -1000.0);
+        o.effects.push(stun.clone());
+        s.kill(c, OBJECT_INVALID);
+        s.current_effect = Some((
+            Effect {
+                ty: 7,
+                ..Default::default()
+            },
+            true,
+        ));
+        s.current_effect_target = Some(c);
+        run(
+            &mut s,
+            c,
+            "RemoveAllEffects",
+            &[Value::Object(c), Value::Int(1), Value::Int(1)],
+        );
+        let o = s.world.get(c).unwrap();
+        assert!(o.dead && o.effects.is_empty());
+        assert_eq!(o.modifiers.get(&2).copied().unwrap_or(0.0), 0.0);
+        assert_eq!(
+            s.current_effect.as_ref().unwrap().0.ty,
+            7,
+            "nested removal restores the killing effect"
+        );
+        assert_eq!(s.current_effect_target, Some(c));
+        assert!(
+            !s.remove_effect(c, &stun),
+            "already removed; callback must not run twice"
+        );
+        let saved = s.save_json().unwrap();
+        s.load_json(&saved).unwrap();
+        assert!(s.world.get(c).unwrap().dead);
+        assert!(s.world.get(c).unwrap().effects.is_empty());
+        s.world.time_ms = 100_000;
+        s.expire_effects();
+        assert_eq!(
+            s.world
+                .get(c)
+                .unwrap()
+                .modifiers
+                .get(&2)
+                .copied()
+                .unwrap_or(0.0),
+            0.0
+        );
+    }
+
+    #[test]
     fn ghost_and_quickbar_switches_are_kept_on_the_creature() {
         let mut s = sim();
         let c = s.world.spawn(ObjectKind::Creature, "c");
@@ -13401,9 +16055,18 @@ mod coverage_tests {
         );
         t.insert(
             "#96",
-            &["ID", "Radius"],
-            vec![(7, vec![Cell::Int(7), Cell::Float(3.0)])],
+            &["ID", "Radius", "#ad5fb9f8", "#4de70e62"],
+            vec![(
+                7,
+                vec![
+                    Cell::Int(7),
+                    Cell::Float(3.0),
+                    Cell::Float(3.0),
+                    Cell::Int(0),
+                ],
+            )],
         );
+        t.insert("#1", &["#53a8a258"], vec![(2, vec![Cell::Int(7)])]);
         s.world.tables = Arc::new(t);
         let area = s.world.spawn(ObjectKind::Area, "area");
         s.world.hostility.insert((1, 2), true);
@@ -13470,6 +16133,17 @@ mod coverage_tests {
         assert_eq!(got_area, area);
         assert!((p[0] - 309.5 / 3.0).abs() < 1e-4 && (p[1] - 1.0).abs() < 1e-4);
 
+        // DA2 removes a corpse before indexing: the sole living hostile is
+        // then index zero and cannot win. A living first-candidate control can.
+        s.game = thedas_vfs::Game::DragonAge2;
+        s.world.get_mut(lone).unwrap().dead = true;
+        assert_eq!(center(&mut s, vec![lone, a], 1, 1, 0).0, OBJECT_INVALID);
+        s.world.get_mut(lone).unwrap().dead = false;
+        assert_eq!(
+            center(&mut s, vec![lone, a], 1, 1, 0),
+            (area, [20.0, 0.0, 0.0])
+        );
+
         for game in [thedas_vfs::Game::Origins, thedas_vfs::Game::DragonAge2] {
             s.game = game;
             for dead in [false, true] {
@@ -13511,6 +16185,113 @@ mod coverage_tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn da2_clusters_use_persistent_shapes_and_upgradable_ability_parameters() {
+        let mut s = sim();
+        s.game = thedas_vfs::Game::DragonAge2;
+        let tables = crate::m2da::Tables::empty();
+        tables.insert(
+            "ABI_base",
+            &["aoe_type", "aoe_param1"],
+            vec![(301030, vec![Cell::Int(1), Cell::Float(100.0)])],
+        );
+        tables.insert(
+            "#1",
+            &["#53a8a258", "#15bdf19c", "#d300f4d9"],
+            vec![
+                (0, vec![Cell::Int(1), Cell::Float(1.0)]),
+                (
+                    301030,
+                    vec![Cell::Int(301030), Cell::Float(0.0), Cell::Int(301031)],
+                ),
+                (301031, vec![Cell::Int(1)]),
+                (301040, vec![Cell::Int(301040)]),
+                (301050, vec![Cell::Int(0)]),
+                (301060, vec![Cell::Int(999999)]),
+                (
+                    302030,
+                    vec![Cell::Int(301040), Cell::Float(2.5), Cell::Int(302031)],
+                ),
+                (302031, vec![Cell::Int(0), Cell::Float(1.0)]),
+            ],
+        );
+        tables.insert(
+            "#96",
+            &["#ad5fb9f8", "#4de70e62"],
+            vec![
+                (0, vec![Cell::Float(100.0), Cell::Int(1)]),
+                (301030, vec![Cell::Float(2.5), Cell::Int(1)]),
+                (301031, vec![Cell::Float(3.5), Cell::Int(1)]),
+                (301040, vec![Cell::Float(2.5), Cell::Int(2)]),
+            ],
+        );
+        let tables = Arc::new(tables);
+        s.world.tables = tables.clone();
+        let area = s.world.spawn(ObjectKind::Area, "area");
+        s.world.hostility.insert((1, 2), true);
+        let put = |s: &mut Sim, group, x| {
+            let id = s.world.spawn(ObjectKind::Creature, "creature");
+            let o = s.world.get_mut(id).unwrap();
+            (o.area, o.group, o.position) = (Some(area), group, [x, 0.0, 0.0]);
+            o.properties.insert(7, (100.0, 100.0));
+            id
+        };
+        let mage = put(&mut s, 1, 0.0);
+        let lone = put(&mut s, 2, 100.0);
+        let a = put(&mut s, 2, 10.0);
+        let b = put(&mut s, 2, 14.0);
+        let far = put(&mut s, 2, 30.0);
+        s.world.get_mut(mage).unwrap().combat.perceived = vec![lone, a, b, far];
+        let center = |s: &mut Sim, ability| {
+            let result = run(
+                s,
+                mage,
+                "GetClusterCenter",
+                &[
+                    Value::Object(mage),
+                    Value::Int(ability),
+                    Value::Int(2),
+                    Value::Int(0),
+                    Value::Int(0),
+                ],
+            );
+            match result {
+                Some(Value::Engine { handle, .. }) => match s.world.handle(handle) {
+                    Some(EngineData::Location(l)) => (l.area, l.position),
+                    _ => panic!("no location"),
+                },
+                _ => panic!("no location"),
+            }
+        };
+        // Fireball's sphere spans 5 m, with Origins metadata giving a different answer.
+        assert_eq!(center(&mut s, 301030), (area, [12.0, 0.0, 0.0]));
+        s.game = thedas_vfs::Game::Origins;
+        assert_eq!(center(&mut s, 301030), (area, [38.5, 0.0, 0.0]));
+        s.game = thedas_vfs::Game::DragonAge2;
+        // Other shapes keep their radius. Zero, missing and unknown persistent rows
+        // have zero span, including a zero row containing otherwise valid metadata.
+        for ability in [301040, 301050, 301060, 301070] {
+            assert_eq!(center(&mut s, ability).0, OBJECT_INVALID, "{ability}");
+        }
+        s.world.get_mut(b).unwrap().position[0] = 16.0;
+        assert_eq!(center(&mut s, 301030).0, OBJECT_INVALID);
+        assert_eq!(center(&mut s, 302030).0, OBJECT_INVALID);
+        // A learned direct upgrade can change the persistent row itself.
+        s.world.get_mut(mage).unwrap().abilities.insert(301031);
+        assert_eq!(center(&mut s, 301030), (area, [13.0, 0.0, 0.0]));
+        // 302030 doubles its upgradable float even with a different persistent shape.
+        s.world.get_mut(mage).unwrap().abilities.insert(302031);
+        assert_eq!(center(&mut s, 302030), (area, [13.0, 0.0, 0.0]));
+        let saved = s.save_json().unwrap();
+        s.load_json(&saved).unwrap();
+        s.world.tables = tables;
+        assert_eq!(center(&mut s, 301030), (area, [13.0, 0.0, 0.0]));
+        assert_eq!(center(&mut s, 302030), (area, [13.0, 0.0, 0.0]));
+        s.world.tables = Arc::new(crate::m2da::Tables::empty());
+        assert_eq!(center(&mut s, 301030).0, OBJECT_INVALID);
+        assert_eq!(center(&mut s, 302030).0, OBJECT_INVALID);
     }
 
     #[test]
@@ -14174,6 +16955,86 @@ mod coverage_tests {
                     .fields
                     .contains_key("IsDestroyable")
             );
+        }
+    }
+    #[test]
+    fn da2_desktop_platform_and_presentation_stubs_leave_simulation_unchanged() {
+        let table = Arc::new(EngineTable::parse(
+            b"int GetPlatform() = 694;\nvoid StopAdditiveAnimation(object o, int n) = 932;\nvoid DoPlayerHitEffect(int n, int step) = 936;\n"
+        ).unwrap());
+        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
+        s.game = thedas_vfs::Game::DragonAge2;
+        let who = s.world.spawn(ObjectKind::Creature, "actor");
+        let before = s.save_json().unwrap();
+        assert_eq!(run(&mut s, who, "GetPlatform", &[]), Some(Value::Int(1)));
+        for target in [who, OBJECT_INVALID] {
+            assert_eq!(
+                run(
+                    &mut s,
+                    who,
+                    "StopAdditiveAnimation",
+                    &[Value::Object(target), Value::Int(3)]
+                ),
+                None
+            );
+        }
+        for effect in [-1, 0, 1, 5] {
+            assert_eq!(
+                run(
+                    &mut s,
+                    who,
+                    "DoPlayerHitEffect",
+                    &[Value::Int(effect), Value::Int(2)]
+                ),
+                None
+            );
+        }
+        assert_eq!(s.save_json().unwrap(), before);
+        assert!(s.world.trace.unimplemented.is_empty());
+    }
+
+    #[test]
+    fn da2_current_command_excludes_unstarted_front_and_preserves_ready_executor() {
+        fn current(s: &mut Sim, who: ObjectId) -> Option<Command> {
+            let Some(Value::Engine { handle, .. }) =
+                run(s, who, "GetCurrentCommand", &[Value::Object(who)])
+            else {
+                panic!("expected command");
+            };
+            match s.world.handle(handle) {
+                Some(EngineData::Command(c)) => Some(c.clone()),
+                _ => None,
+            }
+        }
+        for game in [thedas_vfs::Game::Origins, thedas_vfs::Game::DragonAge2] {
+            let table = EngineTable::parse(
+                b"#define ENGINE_STRUCTURE_2 command\ncommand GetCurrentCommand(object o)=539;\n",
+            )
+            .unwrap();
+            let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(table), 1);
+            s.game = game;
+            let who = s.world.spawn(ObjectKind::Creature, "actor");
+            assert!(current(&mut s, who).is_none());
+            assert!(current(&mut s, OBJECT_INVALID).is_none());
+            let waiting = Command {
+                name: "CommandWait".into(),
+                ty: 13,
+                seconds: 1.,
+                ..Default::default()
+            };
+            s.world.get_mut(who).unwrap().commands = vec![waiting.clone()];
+            assert_eq!(current(&mut s, who), None);
+            let active = Command {
+                due: Some(1000),
+                cancellable: true,
+                ..waiting.clone()
+            };
+            s.world.get_mut(who).unwrap().commands = vec![active.clone(), waiting.clone()];
+            assert_eq!(current(&mut s, who), Some(active.clone()));
+            s.world = serde_json::from_str(&serde_json::to_string(&s.world).unwrap()).unwrap();
+            assert_eq!(current(&mut s, who), Some(active.clone()));
+            s.world.get_mut(who).unwrap().commands = vec![waiting.clone(), active];
+            assert_eq!(current(&mut s, who), None);
         }
     }
 }

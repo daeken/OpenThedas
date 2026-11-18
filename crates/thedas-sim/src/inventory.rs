@@ -16,6 +16,8 @@ use crate::world::ObjectKind;
 pub const MSG_EQUIP: &str = "GUI.SelectedChar.EquipItem";
 /// The inventory screen's unequip action: the item.
 pub const MSG_UNEQUIP: &str = "GUI.SelectedChar.UnequipItem";
+/// The inventory movie's confirmed discard action, carrying the item's object id.
+pub const MSG_DROP: &str = "GUI.SelectedChar.DropItem";
 /// The party screens' arrows: the next or previous party member becomes the selected one
 /// (the one the player controls).
 pub const MSG_NEXT_CHARACTER: &str = "GUI.SelectNextCharacterMessage";
@@ -46,6 +48,11 @@ pub const BODY_BAG_FIELD: &str = "BodyBag";
 /// The template body bags are made from (see [`Sim::spawn_body_bag`]).
 pub const BODY_BAG_TEMPLATE: &str = "gen_ip_bodybag";
 
+/// Origins `placeable_types.gda`: Sack, Small (Container), `PLC_SackSmall_01_0`.
+/// Provisional presentation for recoverable player drops; the native discard destroys
+/// the item instead (see `docs/notes/drop-equipped-item.md`).
+const DROPPED_ITEM_APPEARANCE: i32 = 126;
+
 /// `BITM_base.gda`'s `Money - Copper`.
 const BASE_ITEM_COPPER: i32 = 17;
 /// `Crafting Recipe` in `bitm_base`.
@@ -63,6 +70,43 @@ const STACK_FIELDS: [&str; 6] = [
     "StoreFlag",
 ];
 impl Sim {
+    /// Origins' item flag, independent of the plot-item flag.
+    pub fn item_irremovable(&self, item: ObjectId) -> bool {
+        self.world.get(item).is_some_and(|o| {
+            o.kind == ObjectKind::Item && o.fields.get("Irremovable").copied().unwrap_or(0) != 0
+        })
+    }
+
+    /// Equipment access exposed to the Origins inventory screen.
+    pub fn can_change_equipment(&self, who: ObjectId) -> bool {
+        self.game != thedas_vfs::Game::Origins
+            || self.world.get(who).is_some_and(|o| {
+                o.kind == ObjectKind::Creature
+                    && o.fields.get("CanChangeEquipment").copied().unwrap_or(1) != 0
+            })
+    }
+
+    pub(crate) fn equipment_slot_locked(
+        &self,
+        who: ObjectId,
+        item: ObjectId,
+        slot: i32,
+        inactive: bool,
+    ) -> bool {
+        self.game == thedas_vfs::Game::Origins
+            && self
+                .world
+                .get(who)
+                .and_then(|o| {
+                    if inactive {
+                        o.other_set.get(&slot)
+                    } else {
+                        o.equipment.get(&slot)
+                    }
+                })
+                .is_some_and(|&old| old != item && self.item_irremovable(old))
+    }
+
     /// The effects an item's properties put on whoever wears it. DA2 uses its native
     /// item_properties schema and parameter builder in da2_items. For Origins, each template
     /// property of the worn kind gives `itemprps.gda`'s effect with its `Int0`/`Int1`,
@@ -352,6 +396,28 @@ impl Sim {
 
     /// [`Sim::wear`], saying whether the player did it on the inventory screen.
     pub(crate) fn wear_as(&mut self, who: ObjectId, item: ObjectId, slot: i32, by_player: bool) {
+        if self.game == thedas_vfs::Game::Origins {
+            // Origins' active-container add hook (0x6c16e0) resolves hand conflicts
+            // before applying properties or sending EQUIP. Use the full unequip
+            // routine: unlike an ordinary slot swap, this also raises training 1070.
+            let conflict = if self.origins_main_hand_only(item) {
+                self.world
+                    .get(who)
+                    .and_then(|o| o.equipment.get(&1))
+                    .copied()
+            } else if slot == 1 {
+                self.world
+                    .get(who)
+                    .and_then(|o| o.equipment.get(&0))
+                    .copied()
+                    .filter(|&main| self.origins_main_hand_only(main))
+            } else {
+                None
+            };
+            if let Some(old) = conflict.filter(|&old| old != item) {
+                self.unequip(who, old);
+            }
+        }
         for e in self.property_effects(item) {
             self.apply_effect(who, e);
         }
@@ -445,6 +511,9 @@ impl Sim {
     /// `INVENTORY_SLOT_INVALID` for wherever it fits. What `who` wore there goes to the
     /// backpack. Returns whether it was equipped.
     pub fn equip_item(&mut self, who: ObjectId, item: ObjectId, slot: i32) -> bool {
+        if !self.can_change_equipment(who) {
+            return false;
+        }
         let party = crate::engine::party_of(self);
         let fits = self.item_slots(item);
         // No slot given (INVENTORY_SLOT_INVALID, as a double click sends): the first the item
@@ -457,7 +526,13 @@ impl Sim {
                 .get(who)
                 .map(|o| o.equipment.clone())
                 .unwrap_or_default();
-            match fits.iter().find(|s| !worn.contains_key(s)).or(fits.first()) {
+            match fits
+                .iter()
+                .find(|s| {
+                    !worn.contains_key(s) && (**s != 1 || !self.origins_off_hand_blocked(who))
+                })
+                .or(fits.first())
+            {
                 Some(&s) => s,
                 None => return false,
             }
@@ -468,6 +543,17 @@ impl Sim {
             return false;
         }
         if !self.party_backpack().contains(&item) && self.wearer(item).is_none() {
+            return false;
+        }
+        if self.game == thedas_vfs::Game::Origins
+            && (self.equipment_slot_locked(who, item, slot, false)
+                || (slot == 1 && self.origins_off_hand_blocked(who))
+                || (self.origins_main_hand_only(item)
+                    && self.equipment_slot_locked(who, item, 1, false))
+                || self
+                    .wearer(item)
+                    .is_some_and(|m| self.item_irremovable(item) || !self.can_change_equipment(m)))
+        {
             return false;
         }
         // Whoever wore it gives it up, and what `who` wore in the slot comes off: both hear
@@ -543,10 +629,114 @@ impl Sim {
     /// The player takes `item` off party member `who`; it stays in the backpack. Returns
     /// whether `who` wore it.
     pub fn unequip_item(&mut self, who: ObjectId, item: ObjectId) -> bool {
+        if !self.can_change_equipment(who)
+            || (self.game == thedas_vfs::Game::Origins && self.item_irremovable(item))
+        {
+            return false;
+        }
         if !crate::engine::party_of(self).contains(&who) {
             return false;
         }
         self.unequip(who, item)
+    }
+
+    /// Discard an item from the party into a recoverable sack at `who`'s feet.
+    ///
+    /// The native `DropItemMessage` handler (0x6a72e0) removes the original item through
+    /// its container (0x762100), which calls the equipment removal hook (0x797e20,
+    /// 0x6c19f0) before inventory removal (0x763240). Those events are UNEQUIP (12)
+    /// on the wearer and INVENTORY_REMOVED (7) on the possessor, with the same item id.
+    /// The player-drop flag 0x400 supplies removal integer 0 = 1.
+    ///
+    /// Intentional departure from the native discard: keep the item in a new bag rather
+    /// than destroy it. Provisional: the navigation floor stands in for the physical
+    /// walk surface; without a floor sample, keep the creature's feet height.
+    pub fn drop_item(&mut self, who: ObjectId, item: ObjectId) -> bool {
+        if self.game != thedas_vfs::Game::Origins
+            || !self
+                .world
+                .get(item)
+                .is_some_and(|o| o.kind == ObjectKind::Item && !o.plot)
+        {
+            return false;
+        }
+        let party = crate::engine::party_of(self);
+        if !party.contains(&who) {
+            return false;
+        }
+        let Some(owner) = party.into_iter().find(|&m| {
+            self.world.get(m).is_some_and(|o| {
+                o.inventory.contains(&item)
+                    || o.equipment
+                        .values()
+                        .chain(o.other_set.values())
+                        .any(|&i| i == item)
+            })
+        }) else {
+            return false;
+        };
+        let worn = self.world.get(owner).is_some_and(|o| {
+            o.equipment
+                .values()
+                .chain(o.other_set.values())
+                .any(|&i| i == item)
+        });
+        if worn && (self.item_irremovable(item) || !self.can_change_equipment(owner)) {
+            return false;
+        }
+        let Some(c) = self
+            .world
+            .get(who)
+            .filter(|o| o.kind == ObjectKind::Creature && o.active && !o.dead)
+        else {
+            return false;
+        };
+        let Some(area) = c.area else { return false };
+        let (mut pos, facing) = (c.position, c.facing);
+        if let Some(z) = self.floor_at(area, pos) {
+            pos[2] = z;
+        }
+        // This also removes item-created effects and delivers UNEQUIP synchronously.
+        // Do not just clear the equipment map: rules_core observes this boundary.
+        self.displace(owner, item);
+        // An unequip script may destroy or transfer the item. Do not resurrect it or
+        // steal it back from the script's recipient.
+        if self.world.get(item).is_none()
+            || self.world.objects.values().any(|o| {
+                (o.id != owner && o.inventory.contains(&item))
+                    || o.equipment
+                        .values()
+                        .chain(o.other_set.values())
+                        .any(|&i| i == item)
+            })
+        {
+            return false;
+        }
+        let bag = self.create_from_template(
+            ObjectKind::Placeable,
+            BODY_BAG_TEMPLATE,
+            Some(area),
+            pos,
+            facing,
+        );
+        if let Some(b) = self.world.get_mut(bag) {
+            b.appearance = DROPPED_ITEM_APPEARANCE;
+            b.fields
+                .insert("Appearance".into(), DROPPED_ITEM_APPEARANCE);
+            b.inventory.push(item);
+        }
+        if let Some(o) = self.world.get_mut(owner) {
+            o.inventory.retain(|&i| i != item);
+        }
+        if let Some(i) = self.world.get_mut(item) {
+            i.area = Some(area);
+            i.position = pos;
+        }
+        let mut removed = self.new_event("INVENTORY_REMOVED", Some(owner));
+        removed.objects = vec![item];
+        removed.ints = vec![1];
+        self.world.queue_event(0, owner, removed, None);
+        true
     }
 
     /// The inventory screen's messages ([`MSG_EQUIP`], [`MSG_UNEQUIP`]), for the party member
@@ -593,6 +783,7 @@ impl Sim {
                 None => false,
             },
             MSG_UNEQUIP => self.unequip_item(who, item),
+            MSG_DROP => self.drop_item(who, item),
             _ => false,
         }
     }
@@ -904,6 +1095,79 @@ impl Sim {
         true
     }
 
+    /// Origins native 350: snapshot the source's default inventory, then perform
+    /// ordinary per-item transfers. Both weapon sets remain in equipment.
+    pub(crate) fn move_all_items(&mut self, from: ObjectId, to: ObjectId) {
+        let inventory_kind = |k| {
+            matches!(
+                k,
+                ObjectKind::Creature | ObjectKind::Placeable | ObjectKind::Store
+            )
+        };
+        if from == to || !self.world.get(to).is_some_and(|o| inventory_kind(o.kind)) {
+            return;
+        }
+        let Some(src) = self.world.get(from).filter(|o| inventory_kind(o.kind)) else {
+            return;
+        };
+        let worn: Vec<_> = src
+            .equipment
+            .values()
+            .chain(src.other_set.values())
+            .copied()
+            .collect();
+        let items: Vec<_> = src
+            .inventory
+            .iter()
+            .copied()
+            .filter(|id| !worn.contains(id))
+            .collect();
+        for item in items {
+            let Some(it) = self.world.get(item).filter(|o| o.kind == ObjectKind::Item) else {
+                continue;
+            };
+            let target = self.world.get(to).unwrap();
+            // Creature default inventories route plot items and coin outside the
+            // ordinary backpack capacity (0x73f600). Backpack removal itself is
+            // unconditional (0x722ae0); Irremovable restricts equipment removal.
+            let special = target.kind == ObjectKind::Creature
+                && (it.plot || it.fields.get("BaseItem") == Some(&BASE_ITEM_COPPER));
+            let max = target
+                .fields
+                .get("MaxInventorySize")
+                .copied()
+                .unwrap_or_else(|| {
+                    if target.kind == ObjectKind::Creature {
+                        crate::engine::DEFAULT_INVENTORY_SIZE
+                    } else {
+                        -1
+                    }
+                });
+            let ordinary: Vec<_> = target
+                .inventory
+                .iter()
+                .copied()
+                .filter(|id| {
+                    !target
+                        .equipment
+                        .values()
+                        .chain(target.other_set.values())
+                        .any(|i| i == id)
+                        && self
+                            .world
+                            .get(*id)
+                            .is_some_and(|o| target.kind != ObjectKind::Creature || !o.plot)
+                })
+                .collect();
+            let merges = ordinary
+                .iter()
+                .any(|&id| self.stacks_with(item, id) && self.stack_count(id) < self.max_stack(id));
+            if special || max == -1 || ordinary.len() < max.max(0) as usize || merges {
+                self.give_item(item, to);
+            }
+        }
+    }
+
     /// Whether `id` is the hero or one of the hero's followers.
     pub(crate) fn in_party(&self, id: ObjectId) -> bool {
         let Some(hero) = self.world.hero else {
@@ -1108,6 +1372,21 @@ impl Sim {
         (0..32).filter(|b| mask & (1 << b) != 0).collect()
     }
 
+    /// Origins' two-handed predicate (0xa664c0 -> 0xa66440): the entire
+    /// EquippableSlots mask equals MAIN, including bows and crossbows.
+    fn origins_main_hand_only(&self, item: ObjectId) -> bool {
+        self.item_slots(item) == [0]
+    }
+
+    fn origins_off_hand_blocked(&self, who: ObjectId) -> bool {
+        self.game == thedas_vfs::Game::Origins
+            && self
+                .world
+                .get(who)
+                .and_then(|o| o.equipment.get(&0))
+                .is_some_and(|&main| self.origins_main_hand_only(main))
+    }
+
     /// Equips an item in its first free slot (or its first slot); returns the slot.
     pub fn equip_default(&mut self, who: ObjectId, item: ObjectId) -> Option<i32> {
         let slots = self.item_slots(item);
@@ -1115,8 +1394,11 @@ impl Sim {
         let slot = slots
             .iter()
             .copied()
-            .find(|s| !taken.contains_key(s))
+            .find(|s| !taken.contains_key(s) && (*s != 1 || !self.origins_off_hand_blocked(who)))
             .or_else(|| slots.first().copied())?;
+        if self.equipment_slot_locked(who, item, slot, false) {
+            return None;
+        }
         self.unequip(who, item);
         if let Some(old) = self.world.get(who)?.equipment.get(&slot).copied() {
             self.unequip(who, old);
@@ -1151,9 +1433,9 @@ impl Sim {
                     .get(who)
                     .map(|o| o.equipment.clone())
                     .unwrap_or_default();
-                self.item_slots(item)
-                    .into_iter()
-                    .find(|s| !taken.contains_key(s))
+                self.item_slots(item).into_iter().find(|s| {
+                    !taken.contains_key(s) && (*s != 1 || !self.origins_off_hand_blocked(who))
+                })
             };
             if let (Some(slot), Some(o)) = (free, self.world.get_mut(who)) {
                 o.equipment.insert(slot, item);
@@ -1199,6 +1481,18 @@ impl Sim {
             }
         }
         items
+    }
+
+    /// The body bag a dead creature left (`GetCreatureBodyBag`), when it is still in the
+    /// world and active: what a click on the corpse opens. In the original the player loots a
+    /// corpse by clicking the body; the bag itself has no model to click (appearance 16).
+    pub fn corpse_body_bag(&self, creature: ObjectId) -> Option<ObjectId> {
+        let c = self.world.get(creature).filter(|c| c.dead)?;
+        let bag = *c.fields.get(BODY_BAG_FIELD)? as ObjectId;
+        self.world
+            .get(bag)
+            .filter(|b| b.kind == ObjectKind::Placeable && b.active && b.area == c.area)
+            .map(|b| b.id)
     }
 
     /// `SpawnBodyBag`: leaves a container where a creature fell holding its droppable items
@@ -1275,7 +1569,14 @@ mod body_bag_tests {
 
     /// A `gen_ip_bodybag.utp` with the fields that matter here, in a resource stack.
     fn sim_with_bag_template() -> Sim {
-        let dir = std::env::temp_dir().join(format!("thedas-bodybag-{}", std::process::id()));
+        // Each test writes its own template: truncating a shared file can make the
+        // other test read an empty GFF while it builds its body bag.
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "thedas-bodybag-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("gen_ip_bodybag.utp");
         let field = |label: &str, value: G3| Field {
@@ -1315,6 +1616,22 @@ mod body_bag_tests {
     }
 
     #[test]
+    fn a_click_on_a_corpse_finds_the_bag_it_left() {
+        let mut s = sim_with_bag_template();
+        let foe = s.world.spawn(ObjectKind::Creature, "foe");
+        s.world.get_mut(foe).unwrap().money = 5;
+        // Alive, or dead without a bag: nothing to open.
+        assert_eq!(s.corpse_body_bag(foe), None);
+        s.world.get_mut(foe).unwrap().dead = true;
+        assert_eq!(s.corpse_body_bag(foe), None);
+        let bag = s.spawn_body_bag(foe, false).unwrap();
+        assert_eq!(s.corpse_body_bag(foe), Some(bag));
+        // A bag that is gone (taken away, inactive) is not offered.
+        s.world.get_mut(bag).unwrap().active = false;
+        assert_eq!(s.corpse_body_bag(foe), None);
+    }
+
+    #[test]
     fn a_saved_bag_without_its_template_takes_it_on_load_and_keeps_its_items() {
         let mut s = sim_with_bag_template();
         // As bags were made before: a bare object holding the items.
@@ -1332,6 +1649,242 @@ mod body_bag_tests {
         assert_eq!(b.appearance, 16);
         assert_eq!(b.inventory, vec![nugget]);
         assert_eq!(b.position, [1.0, 2.0, 0.0]);
+    }
+
+    fn equipped_helm() -> (Sim, ObjectId, ObjectId, ObjectId) {
+        let mut s = sim_with_bag_template();
+        s.table = Arc::new(
+            EngineTable::parse(
+                b"int INVENTORY_SLOT_HEAD = 5;\nint EVENT_TYPE_EQUIP = 11;\n\
+              int EVENT_TYPE_UNEQUIP = 12;\nint EVENT_TYPE_INVENTORY_REMOVED = 7;\n",
+            )
+            .unwrap(),
+        );
+        s.world.tables().insert(
+            "bitm_base",
+            &["EquippableSlots"],
+            vec![(7, vec![thedas_formats::gda::Cell::Int(1 << 5)])],
+        );
+        let area = s.world.spawn(ObjectKind::Area, "floor");
+        s.world.area = Some(area);
+        s.area_layouts.insert(area, "floor".into());
+        s.nav_grids.insert(
+            "floor".into(),
+            Some(Arc::new(thedas_formats::level::NavGrid {
+                columns: 2,
+                rows: 2,
+                cell_size: 1.0,
+                clearance: 2.0,
+                base: [0.0; 3],
+                normal: [0.0, 0.0, 1.0],
+                data: vec![1; 4],
+                heights: vec![40.0; 4],
+                surfaces: Vec::new(),
+            })),
+        );
+        let hero = s.world.spawn(ObjectKind::Creature, "hero");
+        s.world.hero = Some(hero);
+        let c = s.world.get_mut(hero).unwrap();
+        c.area = Some(area);
+        c.position = [0.75, 1.25, 3.75];
+        c.facing = 43.0;
+        c.script = Some("synthetic_wearer".into());
+        let helm = s.world.spawn(ObjectKind::Item, "helm");
+        s.world
+            .get_mut(helm)
+            .unwrap()
+            .fields
+            .insert("BaseItem".into(), 7);
+        s.world.get_mut(hero).unwrap().inventory.push(helm);
+        assert!(s.equip_item(hero, helm, 5));
+        s.world.trace.keep = true;
+        (s, area, hero, helm)
+    }
+
+    fn drop_from_screen(s: &mut Sim, item: ObjectId) -> bool {
+        s.input(
+            crate::commands::CommandSource::Player,
+            crate::commands::SimCommand::GuiMessage {
+                name: MSG_DROP.into(),
+                args: vec![item.to_string()],
+            },
+        )
+    }
+
+    #[test]
+    fn dropping_equipped_helm_moves_one_id_and_sends_unequip_before_loss() {
+        let (mut s, _, hero, helm) = equipped_helm();
+        s.world
+            .get_mut(hero)
+            .unwrap()
+            .effects
+            .push(crate::world::Effect {
+                creator: Some(helm),
+                ty: 1012,
+                ..Default::default()
+            });
+        let before = s.world.objects.len();
+        assert!(drop_from_screen(&mut s, helm));
+        let h = s.world.get(hero).unwrap();
+        assert!(h.equipment.is_empty() && h.other_set.is_empty() && h.inventory.is_empty());
+        assert!(h.effects.iter().all(|e| e.creator != Some(helm)));
+        assert_eq!(s.world.objects.len(), before + 1, "only the bag is new");
+        assert_eq!(
+            s.world
+                .objects
+                .values()
+                .filter(|o| o.kind == ObjectKind::Item)
+                .count(),
+            1
+        );
+        let bags: Vec<_> = s
+            .world
+            .objects
+            .values()
+            .filter(|o| o.inventory.contains(&helm))
+            .collect();
+        assert_eq!(bags.len(), 1);
+        let bag = bags[0];
+        assert_eq!(bag.kind, ObjectKind::Placeable);
+        assert_eq!(bag.script.as_deref(), Some("placeable_core"));
+        assert!(bag.interactive);
+        assert_eq!(bag.inventory, vec![helm]);
+        let bag = bag.id;
+        let events: Vec<_> = s
+            .world
+            .trace
+            .entries
+            .iter()
+            .filter_map(|e| match e {
+                crate::trace::TraceEntry::EventDelivered { target, ty, .. } => Some((*target, *ty)),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            events.contains(&(hero, 12)),
+            "UNEQUIP is synchronous on the wearer"
+        );
+        let unequipped = s.world.trace.entries.iter().position(|e| matches!(
+            e, crate::trace::TraceEntry::EventDelivered { target, ty: 12, .. } if *target == hero
+        )).unwrap();
+        let lost = s.world.trace.entries.iter().position(|e| matches!(
+            e, crate::trace::TraceEntry::EventQueued { target, ty: 7, .. } if *target == hero
+        )).unwrap();
+        assert!(
+            unequipped < lost,
+            "the wearer hears UNEQUIP before inventory loss is queued"
+        );
+        let removed = s
+            .world
+            .queue
+            .values()
+            .find(|q| q.target == hero && q.event.ty == 7)
+            .unwrap();
+        assert_eq!(removed.event.creator, Some(hero));
+        assert_eq!(removed.event.objects, vec![helm]);
+        assert_eq!(removed.event.ints, vec![1]);
+        assert!(
+            !drop_from_screen(&mut s, helm),
+            "cannot drop the bag's item twice"
+        );
+        s.open_container(bag);
+        assert!(s.take_from_container(helm));
+        assert_eq!(s.world.get(hero).unwrap().inventory, vec![helm]);
+        assert!(s.world.get(hero).unwrap().equipment.is_empty());
+    }
+
+    #[test]
+    fn dropping_equipped_helm_places_bag_on_nonzero_floor_above_or_below_feet() {
+        for feet_z in [3.75, 1.25] {
+            let (mut s, area, hero, helm) = equipped_helm();
+            s.world.get_mut(hero).unwrap().position[2] = feet_z;
+            assert!(drop_from_screen(&mut s, helm));
+            let bag = s
+                .world
+                .objects
+                .values()
+                .find(|o| o.inventory.contains(&helm))
+                .unwrap();
+            assert_eq!(bag.position, [0.75, 1.25, 2.5]);
+            assert_eq!(bag.area, Some(area));
+            assert_eq!(bag.facing, 43.0);
+            assert_eq!(bag.appearance, DROPPED_ITEM_APPEARANCE);
+            assert_eq!(bag.fields.get("Appearance"), Some(&DROPPED_ITEM_APPEARANCE));
+            assert_eq!(s.world.get(helm).unwrap().position, bag.position);
+            assert!(
+                !s.world
+                    .get(hero)
+                    .unwrap()
+                    .fields
+                    .contains_key(BODY_BAG_FIELD)
+            );
+        }
+    }
+
+    #[test]
+    fn dropping_equipped_helm_refuses_locked_plot_foreign_and_da2_items() {
+        for refusal in ["plot", "locked", "disabled", "foreign", "no_area", "da2"] {
+            let (mut s, _, hero, helm) = equipped_helm();
+            match refusal {
+                "plot" => s.world.get_mut(helm).unwrap().plot = true,
+                "locked" => {
+                    s.world
+                        .get_mut(helm)
+                        .unwrap()
+                        .fields
+                        .insert("Irremovable".into(), 1);
+                }
+                "disabled" => {
+                    s.world
+                        .get_mut(hero)
+                        .unwrap()
+                        .fields
+                        .insert("CanChangeEquipment".into(), 0);
+                }
+                "foreign" => s.world.hero = None,
+                "no_area" => s.world.get_mut(hero).unwrap().area = None,
+                "da2" => s.game = thedas_vfs::Game::DragonAge2,
+                _ => unreachable!(),
+            }
+            let before = serde_json::to_value(&s.world).unwrap();
+            assert!(!drop_from_screen(&mut s, helm), "{refusal}");
+            // The apply journal records rejected input; ownership and objects do not change.
+            assert_eq!(
+                serde_json::to_value(&s.world.objects).unwrap(),
+                before["objects"],
+                "{refusal}"
+            );
+        }
+    }
+
+    #[test]
+    fn dropping_equipped_helm_from_another_member_clears_inactive_equipment_too() {
+        let (mut s, area, hero, helm) = equipped_helm();
+        let ally = s.world.spawn(ObjectKind::Creature, "ally");
+        let h = s.world.get_mut(hero).unwrap();
+        h.followers.push(ally);
+        h.equipment.clear();
+        h.inventory.clear();
+        let a = s.world.get_mut(ally).unwrap();
+        a.area = Some(area);
+        a.inventory.push(helm);
+        a.other_set.insert(5, helm);
+        assert!(drop_from_screen(&mut s, helm));
+        let a = s.world.get(ally).unwrap();
+        assert!(a.inventory.is_empty() && a.equipment.is_empty() && a.other_set.is_empty());
+        assert!(
+            s.world
+                .queue
+                .values()
+                .any(|q| q.target == ally && q.event.ty == 7 && q.event.objects == vec![helm])
+        );
+        let bag = s
+            .world
+            .objects
+            .values()
+            .find(|o| o.inventory.contains(&helm))
+            .unwrap();
+        assert_eq!(bag.position, [0.75, 1.25, 2.5]);
     }
 }
 
@@ -1463,6 +2016,318 @@ mod screen_tests {
         h.inventory = items.to_vec();
         h.equipment.insert(0, items[0]);
         (s, hero, ally, items)
+    }
+
+    fn equipment_flags_sim() -> (Sim, ObjectId, ObjectId, [ObjectId; 3]) {
+        let (mut s, hero, ally, items) = party();
+        s.table = Arc::new(
+            EngineTable::parse(
+                b"\
+            int INVENTORY_SLOT_INVALID = 255;\n\
+            void SetItemIrremovable(object o, int b) = 375;\n\
+            int IsItemIrremovable(object o) = 376;\n\
+            void SetCanChangeEquipment(object o, int b) = 391;\n\
+            int EquipItem(object o, object i, int s = 255, int w = -1) = 392;\n\
+            int UnequipItem(object o, object i) = 393;\n",
+            )
+            .unwrap(),
+        );
+        (s, hero, ally, items)
+    }
+
+    fn equipment_flags_call(
+        s: &mut Sim,
+        name: &str,
+        args: &[thedas_script::vm::Value],
+    ) -> Option<thedas_script::vm::Value> {
+        let f = s.table.function_by_name(name).unwrap().clone();
+        let mut h = crate::sim::ScriptHost {
+            sim: s,
+            event: None,
+            script: "test".into(),
+        };
+        crate::engine::call(&mut h, OBJECT_INVALID, &f, args)
+            .unwrap()
+            .unwrap()
+    }
+
+    fn two_hander_party() -> (Sim, ObjectId, ObjectId, ObjectId) {
+        let (mut s, hero, _, items) = equipment_flags_sim();
+        s.table = Arc::new(
+            EngineTable::parse(
+                b"int INVENTORY_SLOT_INVALID = 255;\n\
+              int EVENT_TYPE_EQUIP = 11;\n\
+              int EVENT_TYPE_UNEQUIP = 12;\n\
+              int EVENT_TYPE_TRAINING_ITEM_UNEQUIPPED = 1070;\n\
+              int EquipItem(object o, object i, int s = 255, int w = -1) = 392;\n",
+            )
+            .unwrap(),
+        );
+        s.world.tables().insert(
+            "bitm_base",
+            &["EquippableSlots"],
+            vec![(2, vec![Cell::Int(3)]), (5, vec![Cell::Int(1)])],
+        );
+        let (dagger, greatsword) = (items[0], items[1]);
+        s.world
+            .get_mut(greatsword)
+            .unwrap()
+            .fields
+            .insert("BaseItem".into(), 5);
+        let h = s.world.get_mut(hero).unwrap();
+        h.equipment.clear();
+        h.equipment.insert(1, dagger);
+        h.script = Some("test".into());
+        h.effects.push(crate::world::Effect {
+            creator: Some(dagger),
+            ..Default::default()
+        });
+        s.world.trace.keep = true;
+        (s, hero, greatsword, dagger)
+    }
+
+    #[test]
+    fn two_hander_gui_equip_unequips_off_hand_before_equip_and_removes_its_effects() {
+        let (mut s, hero, greatsword, dagger) = two_hander_party();
+        s.world.training.mode = 1;
+        s.world.training.expected = 1070;
+        s.world.training.arg = 1;
+        assert!(s.gui_message(MSG_EQUIP, &[greatsword.to_string(), "0".into()]));
+        let h = s.world.get(hero).unwrap();
+        assert_eq!(h.equipment.get(&0), Some(&greatsword));
+        assert!(!h.equipment.contains_key(&1));
+        assert!(h.inventory.contains(&dagger));
+        assert!(!h.effects.iter().any(|e| e.creator == Some(dagger)));
+        assert_eq!(s.world.training.expected, 0);
+        let events: Vec<_> = s
+            .world
+            .trace
+            .entries
+            .iter()
+            .filter_map(|e| match e {
+                crate::trace::TraceEntry::EventDelivered { target, ty, .. }
+                    if *target == hero && matches!(ty, 11 | 12) =>
+                {
+                    Some(*ty)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(events, [12, 11]);
+    }
+
+    #[test]
+    fn two_hander_gui_refuses_off_hand_drop_without_mutating_equipment() {
+        let (mut s, hero, greatsword, dagger) = two_hander_party();
+        assert!(s.equip_item(hero, greatsword, 0));
+        assert!(s.equip_free_slots(hero).is_empty());
+        let before = s.world.get(hero).unwrap().clone();
+        assert!(!s.gui_message(MSG_EQUIP, &[dagger.to_string(), "1".into()]));
+        let after = s.world.get(hero).unwrap();
+        assert_eq!(after.equipment, before.equipment);
+        assert_eq!(after.inventory, before.inventory);
+        assert_eq!(after.effects, before.effects);
+        // The item can still be equipped in the main hand, freeing the off hand.
+        assert!(s.equip_item(hero, dagger, 255));
+        let spare = s.world.spawn(ObjectKind::Item, "second_dagger");
+        s.world
+            .get_mut(spare)
+            .unwrap()
+            .fields
+            .insert("BaseItem".into(), 2);
+        s.world.get_mut(hero).unwrap().inventory.push(spare);
+        assert!(s.equip_item(hero, spare, 1));
+        assert_eq!(s.world.get(hero).unwrap().equipment.get(&0), Some(&dagger));
+    }
+
+    #[test]
+    fn two_hander_script_explicit_and_default_slots_use_the_shared_hook() {
+        use thedas_script::vm::Value::{Int, Object};
+        for slot in [0, 255] {
+            let (mut s, hero, greatsword, dagger) = two_hander_party();
+            assert_eq!(
+                equipment_flags_call(
+                    &mut s,
+                    "EquipItem",
+                    &[Object(hero), Object(greatsword), Int(slot), Int(-1)]
+                ),
+                Some(Int(1))
+            );
+            assert!(!s.world.get(hero).unwrap().equipment.contains_key(&1));
+            // The native off-hand insertion takes off the main-only weapon.
+            // The inventory screen's drop refusal is a separate restriction.
+            assert_eq!(
+                equipment_flags_call(
+                    &mut s,
+                    "EquipItem",
+                    &[Object(hero), Object(dagger), Int(1), Int(-1)]
+                ),
+                Some(Int(1))
+            );
+            let h = s.world.get(hero).unwrap();
+            assert!(!h.equipment.contains_key(&0));
+            assert_eq!(h.equipment.get(&1), Some(&dagger));
+        }
+    }
+
+    #[test]
+    fn two_hander_player_preserves_locked_off_hand_and_da2_behavior() {
+        let (mut s, hero, greatsword, dagger) = two_hander_party();
+        s.world
+            .get_mut(dagger)
+            .unwrap()
+            .fields
+            .insert("Irremovable".into(), 1);
+        assert!(!s.equip_item(hero, greatsword, 0));
+        assert_eq!(s.world.get(hero).unwrap().equipment.get(&1), Some(&dagger));
+        s.game = thedas_vfs::Game::DragonAge2;
+        assert!(s.equip_item(hero, greatsword, 0));
+        assert_eq!(s.world.get(hero).unwrap().equipment.get(&1), Some(&dagger));
+    }
+
+    #[test]
+    fn equipment_flags_native_round_trip_is_independent_of_plot_and_normalizes_booleans() {
+        use thedas_script::vm::Value::{Int, Object};
+        let (mut s, hero, _, items) = equipment_flags_sim();
+        s.world.get_mut(items[0]).unwrap().plot = true;
+        assert_eq!(
+            equipment_flags_call(&mut s, "IsItemIrremovable", &[Object(items[0])]),
+            Some(Int(0))
+        );
+        for (value, expected) in [(-3, 1), (0, 0), (19, 1)] {
+            equipment_flags_call(
+                &mut s,
+                "SetItemIrremovable",
+                &[Object(items[0]), Int(value)],
+            );
+            assert_eq!(
+                equipment_flags_call(&mut s, "IsItemIrremovable", &[Object(items[0])]),
+                Some(Int(expected))
+            );
+            assert!(s.world.get(items[0]).unwrap().plot);
+        }
+        equipment_flags_call(&mut s, "SetCanChangeEquipment", &[Object(hero), Int(0)]);
+        assert!(!s.can_change_equipment(hero));
+        equipment_flags_call(&mut s, "SetCanChangeEquipment", &[Object(hero), Int(-1)]);
+        assert!(s.can_change_equipment(hero));
+        let saved: crate::World =
+            serde_json::from_slice(&serde_json::to_vec(&s.world).unwrap()).unwrap();
+        assert_eq!(
+            saved.get(items[0]).unwrap().fields.get("Irremovable"),
+            Some(&1)
+        );
+        assert_eq!(
+            saved.get(hero).unwrap().fields.get("CanChangeEquipment"),
+            Some(&1)
+        );
+    }
+
+    #[test]
+    fn equipment_flags_locked_occupant_blocks_script_and_player_replacement() {
+        use thedas_script::vm::Value::{Int, Object};
+        let (mut s, hero, _, items) = equipment_flags_sim();
+        equipment_flags_call(&mut s, "SetItemIrremovable", &[Object(items[0]), Int(1)]);
+        assert!(!s.equip_item(hero, items[1], 0));
+        assert!(!s.unequip_item(hero, items[0]));
+        assert_eq!(
+            equipment_flags_call(
+                &mut s,
+                "EquipItem",
+                &[Object(hero), Object(items[1]), Int(0), Int(-1)]
+            ),
+            Some(Int(0))
+        );
+        assert_eq!(
+            s.world.get(hero).unwrap().equipment.get(&0),
+            Some(&items[0])
+        );
+        equipment_flags_call(&mut s, "SetItemIrremovable", &[Object(items[0]), Int(0)]);
+        assert!(s.equip_item(hero, items[1], 0));
+    }
+
+    #[test]
+    fn equipment_flags_player_cannot_take_locked_gear_from_another_member_or_change_disabled_gear()
+    {
+        use thedas_script::vm::Value::{Int, Object};
+        let (mut s, hero, ally, items) = equipment_flags_sim();
+        equipment_flags_call(&mut s, "SetItemIrremovable", &[Object(items[0]), Int(1)]);
+        assert!(!s.equip_item(ally, items[0], 0));
+        equipment_flags_call(&mut s, "SetItemIrremovable", &[Object(items[0]), Int(0)]);
+        equipment_flags_call(&mut s, "SetCanChangeEquipment", &[Object(hero), Int(0)]);
+        assert!(!s.equip_item(ally, items[0], 0));
+        assert!(!s.equip_item(hero, items[1], 0));
+        assert!(!s.unequip_item(hero, items[0]));
+        // The native unequip path performs the transfer directly, independently
+        // of the inventory screen's access and item-removal controls.
+        equipment_flags_call(&mut s, "SetItemIrremovable", &[Object(items[0]), Int(1)]);
+        assert_eq!(
+            equipment_flags_call(&mut s, "UnequipItem", &[Object(hero), Object(items[0])]),
+            Some(Int(1))
+        );
+    }
+
+    #[test]
+    fn equipment_flags_cover_inactive_equipment_and_leave_invalid_kinds_alone() {
+        use thedas_script::vm::Value::{Int, Object};
+        let (mut s, hero, _, items) = equipment_flags_sim();
+        let h = s.world.get_mut(hero).unwrap();
+        h.equipment.clear();
+        h.other_set.insert(0, items[0]);
+        equipment_flags_call(&mut s, "SetItemIrremovable", &[Object(items[0]), Int(1)]);
+        assert_eq!(
+            equipment_flags_call(
+                &mut s,
+                "EquipItem",
+                &[Object(hero), Object(items[1]), Int(0), Int(1)]
+            ),
+            Some(Int(0))
+        );
+        for id in [hero, OBJECT_INVALID] {
+            equipment_flags_call(&mut s, "SetItemIrremovable", &[Object(id), Int(1)]);
+            assert_eq!(
+                equipment_flags_call(&mut s, "IsItemIrremovable", &[Object(id)]),
+                Some(Int(0))
+            );
+        }
+        equipment_flags_call(&mut s, "SetCanChangeEquipment", &[Object(items[0]), Int(0)]);
+        assert!(
+            !s.world
+                .get(items[0])
+                .unwrap()
+                .fields
+                .contains_key("CanChangeEquipment")
+        );
+    }
+
+    #[test]
+    fn equipment_flags_da2_dispatch_and_equipment_access_are_unchanged() {
+        use thedas_script::vm::Value::{Int, Object};
+        let (mut s, hero, _, items) = equipment_flags_sim();
+        s.game = thedas_vfs::Game::DragonAge2;
+        for name in [
+            "SetItemIrremovable",
+            "IsItemIrremovable",
+            "SetCanChangeEquipment",
+        ] {
+            let f = s.table.function_by_name(name).unwrap().clone();
+            let mut h = crate::sim::ScriptHost {
+                sim: &mut s,
+                event: None,
+                script: "test".into(),
+            };
+            assert!(crate::engine::call(&mut h, hero, &f, &[Object(items[0]), Int(1)]).is_none());
+        }
+        s.world
+            .get_mut(hero)
+            .unwrap()
+            .fields
+            .insert("CanChangeEquipment".into(), 0);
+        s.world
+            .get_mut(items[0])
+            .unwrap()
+            .fields
+            .insert("Irremovable".into(), 1);
+        assert!(s.equip_item(hero, items[1], 0));
     }
 
     #[test]
@@ -1755,6 +2620,171 @@ mod tests {
 
     const LDF: &str = "int EVENT_TYPE_INVENTORY_ADDED = 6;\n\
         int EVENT_TYPE_INVENTORY_REMOVED = 7;\n";
+
+    fn bulk_sim() -> (Sim, ObjectId, ObjectId) {
+        let table = EngineTable::parse(
+            format!("{LDF}void MoveAllItems(object a, object b) = 350;\n").as_bytes(),
+        )
+        .unwrap();
+        let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(table), 1);
+        let from = s.world.spawn(ObjectKind::Creature, "from");
+        let to = s.world.spawn(ObjectKind::Placeable, "to");
+        (s, from, to)
+    }
+
+    fn bulk_call(s: &mut Sim, from: ObjectId, to: ObjectId) {
+        let f = s.table.function_by_name("MoveAllItems").unwrap().clone();
+        let mut h = crate::sim::ScriptHost {
+            sim: s,
+            event: None,
+            script: "test".into(),
+        };
+        assert!(
+            crate::engine::call(
+                &mut h,
+                from,
+                &f,
+                &[
+                    thedas_script::vm::Value::Object(from),
+                    thedas_script::vm::Value::Object(to)
+                ]
+            )
+            .unwrap()
+            .unwrap()
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn bulk_transfer_moves_backpack_items_in_order_and_keeps_both_equipment_sets_and_money() {
+        let (mut s, from, to) = bulk_sim();
+        let items: [_; 4] = std::array::from_fn(|_| s.world.spawn(ObjectKind::Item, "item"));
+        let source = s.world.get_mut(from).unwrap();
+        source.inventory = items.to_vec();
+        source.equipment.insert(0, items[0]);
+        source.other_set.insert(0, items[2]);
+        source.money = 27;
+        let f = &mut s.world.get_mut(items[1]).unwrap().fields;
+        f.insert("Irremovable".into(), 1);
+        f.insert("Droppable".into(), 0);
+        s.world.get_mut(items[3]).unwrap().plot = true;
+        bulk_call(&mut s, from, to);
+        assert_eq!(
+            s.world.get(from).unwrap().inventory,
+            vec![items[0], items[2]]
+        );
+        assert_eq!(s.world.get(to).unwrap().inventory, vec![items[1], items[3]]);
+        let source = s.world.get(from).unwrap();
+        assert_eq!(source.equipment.get(&0), Some(&items[0]));
+        assert_eq!(source.other_set.get(&0), Some(&items[2]));
+        assert_eq!(source.money, 27);
+        assert_eq!(s.world.get(to).unwrap().money, 0);
+        assert_eq!(
+            s.world.queue.len(),
+            4,
+            "each transfer tells both inventories"
+        );
+    }
+
+    #[test]
+    fn bulk_transfer_merges_stacks_and_leaves_items_that_exceed_capacity() {
+        use thedas_formats::gda::Cell;
+        let (mut s, from, _) = bulk_sim();
+        let to = s.world.spawn(ObjectKind::Creature, "to");
+        s.world
+            .get_mut(to)
+            .unwrap()
+            .fields
+            .insert("MaxInventorySize".into(), 1);
+        s.world
+            .tables()
+            .insert("bitm_base", &["#39974122"], vec![(25, vec![Cell::Int(3)])]);
+        let existing = s.world.spawn(ObjectKind::Item, "stack");
+        let incoming = s.world.spawn(ObjectKind::Item, "stack");
+        let blocked = s.world.spawn(ObjectKind::Item, "blocked");
+        for id in [existing, incoming] {
+            let f = &mut s.world.get_mut(id).unwrap().fields;
+            f.insert("BaseItem".into(), 25);
+            f.insert("StackSize".into(), 1);
+        }
+        s.world.get_mut(from).unwrap().inventory = vec![blocked, incoming];
+        s.world.get_mut(to).unwrap().inventory = vec![existing];
+        bulk_call(&mut s, from, to);
+        assert_eq!(s.world.get(from).unwrap().inventory, vec![blocked]);
+        assert_eq!(s.world.get(to).unwrap().inventory, vec![existing]);
+        assert!(s.world.get(incoming).is_none());
+        assert_eq!(s.stack_count(existing), 2);
+        assert_eq!(s.world.queue.len(), 2);
+    }
+
+    #[test]
+    fn bulk_transfer_routes_plot_items_and_coin_past_creature_backpack_capacity() {
+        let (mut s, from, _) = bulk_sim();
+        let hero = s.world.spawn(ObjectKind::Creature, "hero");
+        s.world.hero = Some(hero);
+        s.world
+            .get_mut(hero)
+            .unwrap()
+            .fields
+            .insert("MaxInventorySize".into(), 0);
+        let plot = s.world.spawn(ObjectKind::Item, "plot");
+        s.world.get_mut(plot).unwrap().plot = true;
+        let coin = s.world.spawn(ObjectKind::Item, "coin");
+        let f = &mut s.world.get_mut(coin).unwrap().fields;
+        f.insert("BaseItem".into(), BASE_ITEM_COPPER);
+        f.insert("StackSize".into(), 19);
+        let blocked = s.world.spawn(ObjectKind::Item, "ordinary");
+        s.world.get_mut(from).unwrap().inventory = vec![plot, coin, blocked];
+        bulk_call(&mut s, from, hero);
+        assert_eq!(s.world.get(from).unwrap().inventory, vec![blocked]);
+        assert_eq!(s.world.get(hero).unwrap().inventory, vec![plot]);
+        assert_eq!(s.world.get(hero).unwrap().money, 19);
+        assert!(s.world.get(coin).is_none());
+    }
+
+    #[test]
+    fn bulk_transfer_rejects_invalid_possessors_and_self_transfer_without_events() {
+        let (mut s, from, to) = bulk_sim();
+        let item = s.world.spawn(ObjectKind::Item, "item");
+        s.world.get_mut(from).unwrap().inventory = vec![item];
+        let invalid = s.world.spawn(ObjectKind::Trigger, "not_an_inventory");
+        for (source, target) in [
+            (from, from),
+            (from, invalid),
+            (invalid, to),
+            (from, OBJECT_INVALID),
+            (OBJECT_INVALID, to),
+        ] {
+            bulk_call(&mut s, source, target);
+        }
+        assert_eq!(s.world.get(from).unwrap().inventory, vec![item]);
+        assert!(s.world.get(to).unwrap().inventory.is_empty());
+        assert!(s.world.queue.is_empty());
+    }
+
+    #[test]
+    fn bulk_transfer_da2_dispatch_remains_unchanged() {
+        let (mut s, from, to) = bulk_sim();
+        s.game = thedas_vfs::Game::DragonAge2;
+        let f = s.table.function_by_name("MoveAllItems").unwrap().clone();
+        let mut h = crate::sim::ScriptHost {
+            sim: &mut s,
+            event: None,
+            script: "test".into(),
+        };
+        assert!(
+            crate::engine::call(
+                &mut h,
+                from,
+                &f,
+                &[
+                    thedas_script::vm::Value::Object(from),
+                    thedas_script::vm::Value::Object(to)
+                ]
+            )
+            .is_none()
+        );
+    }
 
     #[test]
     fn looting_moves_droppable_items_and_tells_both_sides() {

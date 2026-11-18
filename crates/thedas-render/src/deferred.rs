@@ -41,6 +41,7 @@ pub(crate) mod tree_shadow;
 
 pub const DEFERRED_WGSL: &str = concat!(
     include_str!("deferred_skin.wgsl"),
+    include_str!("../../thedas-shader/src/soft_shadows.wgsl"),
     include_str!("deferred.wgsl")
 );
 
@@ -187,7 +188,7 @@ struct TileUniforms {
 struct SunUniforms {
     data: [[f32; 4]; 9],
     direction: [f32; 4],
-    /// x: shadow maps enabled, y: skip filter samples with a known result.
+    /// x: bit 0 shadow maps enabled, bit 1 improved sampling; y: skip known results.
     enabled: [u32; 4],
 }
 
@@ -2476,7 +2477,8 @@ impl DeferredPass {
                 .map_or(crate::d3d::NO_SHADOW_DATA, |(data, _)| data),
             direction: sun_dir.to_array(),
             enabled: [
-                u32::from(d3d.sun_shadows().is_some() && crate::config::CONFIG.sun_shadows),
+                u32::from(d3d.sun_shadows().is_some() && crate::config::CONFIG.sun_shadows)
+                    | (u32::from(crate::config::soft_shadows()) << 1),
                 u32::from(
                     self.sun_early_exit
                         .unwrap_or(crate::config::CONFIG.sun_early_exit),

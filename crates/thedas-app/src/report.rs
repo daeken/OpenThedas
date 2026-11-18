@@ -15,6 +15,10 @@
 //!   up to the press exactly (`thedas-app --resume` with them as the data folder's
 //!   `journal/checkpoint.json` and `checkpoint.journal`);
 //! - `log.txt`: the last [`LOG_LINES`] log lines;
+//! - `log.full.txt`: the session's last 20,000 lines (8 MiB maximum);
+//! - `presentation.json`: the camera, drawn objects' poses, VFX, sounds and interface;
+//! - `frames.json`: the last 600 raw frame times with area/screen/load context;
+//! - `options.ini`, `launcher.json`: sanitized config copies, when present;
 //! - `trace.json`: the simulation's last [`TRACE_RECENT`] orders, script log lines,
 //!   conversation lines, plot flags, failed scripts and missing functions and resources
 //!   (`Trace::recent`), oldest first;
@@ -34,11 +38,17 @@
 use std::collections::VecDeque;
 use std::io::Write as _;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use serde_json::{Value as J, json};
+
+#[path = "report_presentation.rs"]
+mod presentation;
+pub use presentation::{clip_snapshot, frame_context, snapshot as presentation_snapshot};
+#[path = "report_config.rs"]
+mod config;
 
 /// How often a snapshot of the game is kept while playing.
 pub const SNAPSHOT_EVERY: Duration = Duration::from_secs(20);
@@ -50,6 +60,9 @@ pub const SNAPSHOTS_KEPT: usize = 4;
 pub const BEFORE_AGE: Duration = Duration::from_secs(50);
 /// The log lines kept for a report.
 pub const LOG_LINES: usize = 400;
+pub const FULL_LOG_LINES: usize = 20_000;
+const FULL_LOG_BYTES: usize = 8 * 1024 * 1024;
+const MAX_LOG_LINE_BYTES: usize = 16 * 1024;
 /// The input kept for a report.
 pub const INPUT_WINDOW: Duration = Duration::from_secs(120);
 /// The simulation's recent trace entries kept for a report (`Trace::recent`).
@@ -68,9 +81,44 @@ pub struct Snapshot {
 }
 
 /// The last lines logged, for reports (see [`init_logging`]).
-static LOG: Mutex<VecDeque<String>> = Mutex::new(VecDeque::new());
+static LOG: Mutex<LogRing> = Mutex::new(LogRing {
+    lines: VecDeque::new(),
+    bytes: 0,
+    dropped: 0,
+});
 
-/// Logs as `builder` would, keeping the last [`LOG_LINES`] lines it prints for reports.
+struct LogRing {
+    lines: VecDeque<Arc<str>>,
+    bytes: usize,
+    dropped: u64,
+}
+
+impl LogRing {
+    fn push(&mut self, mut line: String) {
+        if line.len() > MAX_LOG_LINE_BYTES {
+            let mut end = MAX_LOG_LINE_BYTES;
+            while !line.is_char_boundary(end) {
+                end -= 1;
+            }
+            line.truncate(end);
+            line.push_str(" [truncated]");
+        }
+        // A logged message can itself contain newlines; count physical lines as well.
+        for line in line.lines() {
+            while self.lines.len() >= FULL_LOG_LINES || self.bytes + line.len() + 1 > FULL_LOG_BYTES
+            {
+                if let Some(old) = self.lines.pop_front() {
+                    self.bytes -= old.len() + 1;
+                    self.dropped += 1;
+                }
+            }
+            self.bytes += line.len() + 1;
+            self.lines.push_back(Arc::from(line));
+        }
+    }
+}
+
+/// Logs as `builder` would, retaining a bounded session log for reports.
 pub fn init_logging(mut builder: env_logger::Builder) {
     let inner = builder.build();
     let max = inner.filter();
@@ -131,27 +179,21 @@ impl log::Log for Tee {
 /// Keeps a line for reports (the log's, or one printed to the console).
 pub fn keep_line(line: String) {
     let mut log = LOG.lock().unwrap_or_else(|p| p.into_inner());
-    if log.len() >= LOG_LINES {
-        log.pop_front();
-    }
-    log.push_back(line);
+    log.push(line);
 }
 
-fn log_lines() -> Vec<String> {
-    LOG.lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .iter()
-        .cloned()
-        .collect()
+fn log_lines() -> (Vec<Arc<str>>, u64) {
+    let log = LOG.lock().unwrap_or_else(|p| p.into_inner());
+    (log.lines.iter().cloned().collect(), log.dropped)
 }
 
 /// What a report keeps between presses: the snapshots, the input and the frame times.
 pub struct Recorder {
-    snapshots: VecDeque<Snapshot>,
+    snapshots: VecDeque<Arc<Snapshot>>,
     /// When the next snapshot is due (now, when none is).
     next_snapshot: Option<Instant>,
     input: VecDeque<(Instant, String)>,
-    frames: VecDeque<f32>,
+    frames: VecDeque<Frame>,
     /// Where reports are written.
     pub dir: PathBuf,
     /// A report waiting for its screenshot and the player's note.
@@ -176,11 +218,14 @@ impl Recorder {
     }
 
     /// One frame took `dt_ms`.
-    pub fn frame(&mut self, dt_ms: f64) {
+    pub fn frame(&mut self, dt_ms: f64, context: FrameContext) {
         if self.frames.len() >= FRAMES_KEPT {
             self.frames.pop_front();
         }
-        self.frames.push_back(dt_ms as f32);
+        self.frames.push_back(Frame {
+            dt_ms: dt_ms as f32,
+            context,
+        });
     }
 
     /// The player did something (`--steps` syntax where there is one).
@@ -212,7 +257,7 @@ impl Recorder {
         if self.snapshots.len() >= SNAPSHOTS_KEPT {
             self.snapshots.pop_front();
         }
-        self.snapshots.push_back(s);
+        self.snapshots.push_back(Arc::new(s));
     }
 
     /// A snapshot could not be taken (saving refused, nothing playing): try again in
@@ -229,7 +274,7 @@ impl Recorder {
 
     /// The snapshot a report made `now` calls "before": the youngest at least
     /// [`BEFORE_AGE`] old, else the oldest there is.
-    pub fn before(&self, now: Instant) -> Option<&Snapshot> {
+    pub fn before(&self, now: Instant) -> Option<&Arc<Snapshot>> {
         self.snapshots
             .iter()
             .rev()
@@ -243,13 +288,14 @@ impl Recorder {
     }
 
     /// Starts a report made now: everything but the screenshot and the note, which come
-    /// later (`screenshot`, `note`). Writes what it has at once.
+    /// later (`screenshot`, `note`). Only captures memory here; a worker writes files.
     pub fn start(
         &mut self,
-        now_save: Option<Vec<u8>>,
+        now_save: Option<ReportSave>,
         trace: Option<J>,
-        journal: Option<(Vec<u8>, Vec<u8>)>,
+        journal: Option<crate::journal::ReportJournal>,
         mut info: J,
+        capture: Capture,
     ) -> PathBuf {
         let now = Instant::now();
         let written = crate::saves::now_secs();
@@ -283,6 +329,9 @@ impl Recorder {
             })),
         });
         info["frames"] = frame_stats(&self.frames);
+        let (log, dropped) = log_lines();
+        info["log"] = json!({ "retained_lines": log.len(), "dropped_lines": dropped,
+            "line_limit": FULL_LOG_LINES, "byte_limit": FULL_LOG_BYTES, "line_byte_limit": MAX_LOG_LINE_BYTES });
         let since = before
             .as_ref()
             .map_or_else(|| self.input.front().map_or(now, |(t, _)| *t), |s| s.taken);
@@ -298,24 +347,46 @@ impl Recorder {
                 format!("{at:8.3} {what}")
             })
             .collect();
-        let files = Files {
+        let mut files = Files {
             dir: path.clone(),
             info,
             now_save,
-            before: before.map(|s| s.save),
-            log: log_lines(),
+            before,
+            log,
             input,
             trace,
             journal,
+            frames: self.frames.clone(),
+            capture,
         };
-        if let Err(e) = files.write() {
-            log::warn!("report: writing {}: {e:#}", path.display());
+        let (tx, rx) = mpsc::channel();
+        let (done_tx, mut done) = mpsc::channel();
+        let writer = std::thread::Builder::new()
+            .name("report writer".into())
+            .spawn(move || {
+                let dir = files.dir.clone();
+                let written = files.write();
+                // The frozen world and presentation can be large. Release them after
+                // writing, rather than retaining them while the player types a note.
+                drop(files);
+                let result = written.and_then(|()| write_pending(&dir, rx));
+                let _ = done_tx.send(result);
+            });
+        if let Err(e) = writer {
+            log::warn!("report: starting writer: {e}");
+            // Keep the OS reason even when no worker could be started.
+            let (failed_tx, failed_rx) = mpsc::channel();
+            let _ = failed_tx.send(Err(e.into()));
+            done = failed_rx;
         }
         self.pending = Some(Pending {
             dir: path.clone(),
             shot: None,
             note: None,
             regions: Vec::new(),
+            tx,
+            done,
+            finishing: false,
         });
         path
     }
@@ -326,7 +397,8 @@ impl Recorder {
             return;
         };
         let wrote = png.and_then(|png| {
-            std::fs::write(p.dir.join("screenshot.png"), png).context("writing the screenshot")
+            p.tx.send(WriteRequest::Screenshot(png))
+                .context("queueing the screenshot")
         });
         if let Err(e) = &wrote {
             log::warn!("report: no screenshot: {e:#}");
@@ -354,33 +426,60 @@ impl Recorder {
     }
 
     /// Finishes the report once its screenshot and note are in. Returns its folder (`None`
-    /// when cancelled) once done.
-    pub fn finish(&mut self) -> Option<Option<PathBuf>> {
-        let p = self.pending.as_ref()?;
-        if p.shot.is_none() || p.note.is_none() {
-            return None;
+    /// when cancelled), or a path-free message for the player on failure. A worker failure
+    /// is returned even if the screenshot or note has not arrived yet.
+    pub fn finish(&mut self) -> Option<Result<Option<PathBuf>, String>> {
+        let p = self.pending.as_mut()?;
+        if !p.finishing && p.shot.is_some() && p.note.is_some() {
+            let _ = p.tx.send(WriteRequest::Finish(
+                p.note.take().flatten(),
+                std::mem::take(&mut p.regions),
+            ));
+            p.finishing = true;
         }
+        let result = match p.done.try_recv() {
+            Ok(result) => result,
+            Err(mpsc::TryRecvError::Empty) => return None,
+            Err(mpsc::TryRecvError::Disconnected) => Err(anyhow::anyhow!("report writer stopped")),
+        };
         let p = self.pending.take()?;
-        match p.note.flatten() {
-            None => {
-                let _ = std::fs::remove_dir_all(&p.dir);
-                log::info!("report: cancelled");
-                Some(None)
-            }
-            Some(text) => {
-                if let Err(e) = std::fs::write(p.dir.join("note.txt"), text.as_bytes()) {
-                    log::warn!("report: writing the note: {e}");
-                }
-                if !p.regions.is_empty() {
-                    if let Err(e) = write_regions(&p.dir, &p.regions) {
-                        log::warn!("report: the marked spots: {e:#}");
-                    }
-                }
+        match result {
+            Ok(true) => {
                 log::info!("report: written to {}", p.dir.display());
-                Some(Some(p.dir))
+                Some(Ok(Some(p.dir)))
+            }
+            Ok(false) => {
+                log::info!("report: cancelled");
+                Some(Ok(None))
+            }
+            Err(e) => {
+                log::warn!("report: writing {}: {e:#}", p.dir.display());
+                Some(Err(failure_message(&e)))
             }
         }
     }
+}
+
+/// Only OS-generated descriptions go on screen. The error chain can contain paths,
+/// config contents or a custom I/O message; the full chain stays in the log instead.
+fn failure_message(error: &anyhow::Error) -> String {
+    let mut message = "Report not saved. The game is fine.".to_string();
+    if let Some(error) = error
+        .chain()
+        .find_map(|e| e.downcast_ref::<std::io::Error>())
+    {
+        let reason = match error.raw_os_error() {
+            Some(code) => std::io::Error::from_raw_os_error(code),
+            None if error.kind() != std::io::ErrorKind::Other => std::io::Error::from(error.kind()),
+            None => return message,
+        };
+        let reason = reason.to_string();
+        let reason = reason.split(" (os error ").next().unwrap_or(&reason);
+        message.push(' ');
+        message.push_str(reason);
+        message.push('.');
+    }
+    message
 }
 
 struct Pending {
@@ -391,6 +490,69 @@ struct Pending {
     note: Option<Option<String>>,
     /// The spots the player marked on the screenshot, in order.
     regions: Vec<Region>,
+    tx: mpsc::Sender<WriteRequest>,
+    done: mpsc::Receiver<Result<bool>>,
+    finishing: bool,
+}
+
+enum WriteRequest {
+    Screenshot(Vec<u8>),
+    Finish(Option<String>, Vec<Region>),
+}
+
+fn write_pending(dir: &std::path::Path, rx: mpsc::Receiver<WriteRequest>) -> Result<bool> {
+    for request in rx {
+        match request {
+            WriteRequest::Screenshot(png) => {
+                if let Err(e) = std::fs::write(dir.join("screenshot.png"), png) {
+                    log::warn!("report: writing screenshot: {e}");
+                }
+            }
+            WriteRequest::Finish(None, _) => {
+                std::fs::remove_dir_all(dir)?;
+                return Ok(false);
+            }
+            WriteRequest::Finish(Some(note), regions) => {
+                std::fs::write(dir.join("note.txt"), note).context("writing the note")?;
+                if !regions.is_empty() {
+                    write_regions(dir, &regions).context("writing the marked spots")?;
+                }
+                return Ok(true);
+            }
+        }
+    }
+    anyhow::bail!("report writer lost its owner")
+}
+
+pub enum ReportSave {
+    Game(Box<thedas_sim::save::SaveGame>),
+    #[cfg(test)]
+    Bytes(Vec<u8>),
+}
+
+#[derive(Default)]
+pub struct Capture {
+    pub presentation: J,
+    pub settings: Option<PathBuf>,
+    pub data_dir: PathBuf,
+}
+
+#[derive(Clone, Debug, Default, serde::Serialize)]
+pub struct FrameContext {
+    pub area: Option<String>,
+    pub time_ms: Option<u64>,
+    pub loading: bool,
+    pub cutscene: bool,
+    pub conversation: bool,
+    pub screens: Vec<crate::screens::Screen>,
+    pub draw_counts: Option<[usize; 3]>,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+struct Frame {
+    dt_ms: f32,
+    #[serde(flatten)]
+    context: FrameContext,
 }
 
 /// A spot the player marked on the screenshot (a box dragged over it) and what they said
@@ -553,17 +715,19 @@ fn write_regions(dir: &std::path::Path, regions: &[Region]) -> Result<()> {
 struct Files {
     dir: PathBuf,
     info: J,
-    now_save: Option<Vec<u8>>,
-    before: Option<Vec<u8>>,
-    log: Vec<String>,
+    now_save: Option<ReportSave>,
+    before: Option<Arc<Snapshot>>,
+    log: Vec<Arc<str>>,
     input: Vec<String>,
     trace: Option<J>,
     /// The journal's checkpoint and log.
-    journal: Option<(Vec<u8>, Vec<u8>)>,
+    journal: Option<crate::journal::ReportJournal>,
+    frames: VecDeque<Frame>,
+    capture: Capture,
 }
 
 impl Files {
-    fn write(&self) -> Result<()> {
+    fn write(&mut self) -> Result<()> {
         std::fs::create_dir_all(&self.dir)
             .with_context(|| format!("creating {}", self.dir.display()))?;
         let put = |name: &str, bytes: &[u8]| {
@@ -571,16 +735,53 @@ impl Files {
         };
         put("report.json", &serde_json::to_vec_pretty(&self.info)?)?;
         if let Some(s) = &self.now_save {
-            put("save_now.json", s)?;
+            match s {
+                ReportSave::Game(save) => put("save_now.json", &serde_json::to_vec(save)?)?,
+                #[cfg(test)]
+                ReportSave::Bytes(bytes) => put("save_now.json", bytes)?,
+            }
         }
         if let Some(s) = &self.before {
-            put("save_before.json", s)?;
+            put("save_before.json", &s.save)?;
         }
         let mut log = Vec::new();
-        for l in &self.log {
+        for l in self
+            .log
+            .iter()
+            .skip(self.log.len().saturating_sub(LOG_LINES))
+        {
             writeln!(log, "{l}")?;
         }
         put("log.txt", &log)?;
+        let home = crate::upload::home();
+        let put_redacted = |name, bytes| put(name, &crate::upload::redact(bytes, home.as_deref()));
+        let full_log = self
+            .log
+            .iter()
+            .map(|l| l.as_ref())
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        put_redacted("log.full.txt", full_log.into_bytes())?;
+        put_redacted(
+            "presentation.json",
+            serde_json::to_vec_pretty(&self.capture.presentation)?,
+        )?;
+        put_redacted(
+            "frames.json",
+            serde_json::to_vec_pretty(&json!({
+                "order": "oldest_first", "limit": FRAMES_KEPT,
+                "draw_count_fields": ["scene_draws", "skipped_draws", "particle_draws"],
+                "draw_count_source": "loaded renderer statistics; not GPU visibility counts",
+                "frames": self.frames,
+            }))?,
+        )?;
+        config::copy_configs(
+            &self.dir,
+            &self.capture.data_dir,
+            self.capture.settings.as_deref(),
+            home.as_deref(),
+        )?;
         let mut input = Vec::new();
         writeln!(
             input,
@@ -593,20 +794,19 @@ impl Files {
         if let Some(t) = &self.trace {
             put("trace.json", &serde_json::to_vec_pretty(t)?)?;
         }
-        if let Some((checkpoint, log)) = &self.journal {
-            put("journal_checkpoint.json", checkpoint)?;
-            put("journal.jsonl", log)?;
+        if let Some(journal) = self.journal.take() {
+            journal.write(&self.dir)?;
         }
         Ok(())
     }
 }
 
 /// Mean, 95th percentile and worst of the frame times kept (milliseconds).
-fn frame_stats(frames: &VecDeque<f32>) -> J {
+fn frame_stats(frames: &VecDeque<Frame>) -> J {
     if frames.is_empty() {
         return J::Null;
     }
-    let mut v: Vec<f32> = frames.iter().copied().collect();
+    let mut v: Vec<f32> = frames.iter().map(|f| f.dt_ms).collect();
     v.sort_by(f32::total_cmp);
     let mean = v.iter().sum::<f32>() / v.len() as f32;
     let p95 = v[((v.len() - 1) as f32 * 0.95) as usize];
@@ -702,6 +902,8 @@ pub const NOTE_PROMPT_SEND: &str = "What went wrong? Say what you expected and w
 pub const MARK_ID: u32 = NOTE_ID + 1;
 pub const REGION_ID: u32 = NOTE_ID + 2;
 pub const MORE_MARKS_ID: u32 = NOTE_ID + 3;
+/// The dismissible notice when the writer could not save a report.
+pub const FAILED_ID: u32 = NOTE_ID + 4;
 
 /// What the question whether to mark spots says.
 pub const MARK_PROMPT: &str = "Want to point at something? Choose Mark spots, then drag a box \
@@ -741,6 +943,152 @@ mod tests {
     }
 
     use super::*;
+
+    fn wait_written(path: &std::path::Path) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !path.join("input.txt").is_file() {
+            assert!(Instant::now() < deadline, "writer did not start");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn finish(r: &mut Recorder) -> Option<PathBuf> {
+        finish_result(r).expect("report failed")
+    }
+
+    fn finish_result(r: &mut Recorder) -> Result<Option<PathBuf>, String> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(done) = r.finish() {
+                return done;
+            }
+            assert!(Instant::now() < deadline, "writer did not finish");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn writer_failure_without_a_note_or_screenshot_produces_a_notice() {
+        let dir = std::env::temp_dir().join(format!("thedas-report-failed-{}", std::process::id()));
+        // A file where the reports folder should be makes the real worker fail without
+        // changing permissions, exhausting descriptors or needing any game data.
+        std::fs::write(&dir, b"not a folder").unwrap();
+        let mut r = Recorder::new(&dir);
+        r.start(None, None, None, json!({}), Capture::default());
+        let message = finish_result(&mut r).unwrap_err();
+        assert!(message.starts_with("Report not saved. The game is fine."));
+        assert!(!message.contains(&dir.to_string_lossy().to_string()));
+        assert!(!r.busy());
+        std::fs::remove_file(dir).unwrap();
+    }
+
+    #[test]
+    fn note_and_region_write_failures_produce_a_notice() {
+        for marked in [false, true] {
+            let dir = std::env::temp_dir().join(format!(
+                "thedas-report-finish-failed-{}-{marked}",
+                std::process::id()
+            ));
+            let mut r = Recorder::new(&dir);
+            let path = r.start(None, None, None, json!({}), Capture::default());
+            wait_written(&path);
+            if marked {
+                r.add_region(Region {
+                    rect: [0.0, 0.0, 10.0, 10.0],
+                    note: "spot".into(),
+                });
+            } else {
+                std::fs::create_dir(path.join("note.txt")).unwrap();
+            }
+            // A note-less, screenshot-less report still has to report a write error.
+            // For marks, metadata writes succeed, then the missing image fails.
+            r.screenshot(Err(anyhow::anyhow!("no frame")));
+            r.note(Some(String::new()));
+            let message = finish_result(&mut r).unwrap_err();
+            assert!(message.starts_with("Report not saved. The game is fine."));
+            assert!(!r.busy());
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_missing_screenshot_is_only_a_warning_when_the_report_saves() {
+        for capture_failed in [false, true] {
+            let dir = std::env::temp_dir().join(format!(
+                "thedas-report-no-shot-{}-{capture_failed}",
+                std::process::id()
+            ));
+            let mut r = Recorder::new(&dir);
+            let path = r.start(None, None, None, json!({}), Capture::default());
+            wait_written(&path);
+            if capture_failed {
+                r.screenshot(Err(anyhow::anyhow!("no frame")));
+            } else {
+                std::fs::create_dir(path.join("screenshot.png")).unwrap();
+                r.screenshot(Ok(b"png".to_vec()));
+            }
+            r.note(Some(String::new()));
+            // An Ok completion never supplies a failure message to the app, whether
+            // capturing or writing the screenshot failed.
+            assert_eq!(finish_result(&mut r), Ok(Some(path.clone())));
+            assert_eq!(std::fs::read(path.join("note.txt")).unwrap(), b"");
+            assert!(!path.join("screenshot.png").is_file());
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn failure_messages_never_display_error_context_or_custom_io_text() {
+        let private = "/private/home/reports/note.txt";
+        let error = anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            private,
+        ))
+        .context(format!("writing {private}"));
+        let reason = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            failure_message(&error),
+            format!("Report not saved. The game is fine. {reason}.")
+        );
+        assert_eq!(
+            failure_message(&anyhow::anyhow!(private)),
+            "Report not saved. The game is fine."
+        );
+    }
+
+    #[test]
+    fn a_stopped_writer_produces_a_notice() {
+        let mut r = Recorder::new("unused");
+        let (tx, _rx) = mpsc::channel();
+        let (done_tx, done) = mpsc::channel();
+        drop(done_tx);
+        r.pending = Some(Pending {
+            dir: PathBuf::from("unused"),
+            shot: None,
+            note: None,
+            regions: Vec::new(),
+            tx,
+            done,
+            finishing: false,
+        });
+        assert_eq!(
+            finish_result(&mut r),
+            Err("Report not saved. The game is fine.".into())
+        );
+        assert!(!r.busy());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn too_many_open_files_keeps_the_known_reason_without_paths() {
+        // EMFILE on the Unix platforms supported by the game; no descriptor limit change.
+        let error = anyhow::Error::new(std::io::Error::from_raw_os_error(24))
+            .context("writing /private/home/reports/note.txt");
+        assert_eq!(
+            failure_message(&error),
+            "Report not saved. The game is fine. Too many open files."
+        );
+    }
 
     fn snap(taken: Instant, time_ms: u64) -> Snapshot {
         Snapshot {
@@ -784,12 +1132,22 @@ mod tests {
         let t0 = Instant::now();
         r.keep(snap(t0, 1234));
         r.input("key i");
-        r.frame(16.0);
-        r.frame(33.0);
+        r.frame(16.0, FrameContext::default());
+        r.frame(33.0, FrameContext::default());
         keep_line("a line for the report".into());
         let info = json!({ "game": { "area": "lot100ar/Lothering" } });
         let trace = json!([{ "kind": "log", "t": 5, "channel": 0, "text": "hello" }]);
-        let path = r.start(Some(b"{\"now\":1}".to_vec()), Some(trace), None, info);
+        let path = r.start(
+            Some(ReportSave::Bytes(b"{\"now\":1}".to_vec())),
+            Some(trace),
+            None,
+            info,
+            Capture::default(),
+        );
+        // The worker retains the immutable before-save even when a new game clears
+        // the recorder's ring; starting a report does not copy its large byte buffer.
+        r.forget();
+        wait_written(&path);
         assert!(r.busy());
         assert!(
             path.file_name()
@@ -823,7 +1181,7 @@ mod tests {
         r.note(Some("the door would not open".into()));
         assert!(r.finish().is_none());
         r.screenshot(Ok(b"png".to_vec()));
-        let done = r.finish().unwrap();
+        let done = finish(&mut r);
         assert_eq!(done.as_deref(), Some(path.as_path()));
         assert!(!r.busy());
         assert_eq!(
@@ -832,11 +1190,11 @@ mod tests {
         );
         // A second report the same minute gets a folder of its own; cancelling deletes it.
         let info = json!({ "game": { "area": "lot100ar/Lothering" } });
-        let second = r.start(None, None, None, info);
+        let second = r.start(None, None, None, info, Capture::default());
         assert_ne!(second, path);
         r.screenshot(Err(anyhow::anyhow!("no frame")));
         r.note(None);
-        assert_eq!(r.finish(), Some(None));
+        assert_eq!(finish(&mut r), None);
         assert!(!second.exists());
         assert!(path.exists());
         let _ = std::fs::remove_dir_all(&dir);
@@ -860,7 +1218,13 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("thedas-report-marks-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let mut r = Recorder::new(&dir);
-        let path = r.start(None, None, None, json!({ "game": { "area": "x" } }));
+        let path = r.start(
+            None,
+            None,
+            None,
+            json!({ "game": { "area": "x" } }),
+            Capture::default(),
+        );
         let shot = thedas_ui::Rgba {
             width: 64,
             height: 48,
@@ -873,7 +1237,7 @@ mod tests {
             note: "fire missing here".into(),
         });
         r.note(Some("overall".into()));
-        assert_eq!(r.finish(), Some(Some(path.clone())));
+        assert_eq!(finish(&mut r), Some(path.clone()));
         let info: J =
             serde_json::from_slice(&std::fs::read(path.join("report.json")).unwrap()).unwrap();
         assert_eq!(info["regions"][0]["n"], 1);
@@ -900,5 +1264,134 @@ mod tests {
         );
         assert_eq!(sanitize(""), "none");
         assert_eq!(sanitize(&"x".repeat(100)).len(), 40);
+    }
+
+    #[test]
+    fn raw_frames_keep_context_and_only_the_last_600() {
+        let mut r = Recorder::new("unused");
+        for i in 0..650 {
+            r.frame(
+                i as f64,
+                FrameContext {
+                    area: Some(if i < 600 { "first" } else { "second" }.into()),
+                    time_ms: Some(i),
+                    loading: i == 600,
+                    cutscene: i == 601,
+                    conversation: i == 602,
+                    screens: vec![crate::screens::Screen::Inventory],
+                    draw_counts: Some([8, 2, 3]),
+                },
+            );
+        }
+        assert_eq!(r.frames.len(), 600);
+        assert_eq!(r.frames.front().unwrap().dt_ms, 50.0);
+        assert_eq!(
+            r.frames.back().unwrap().context.area.as_deref(),
+            Some("second")
+        );
+        let raw = serde_json::to_value(&r.frames).unwrap();
+        assert_eq!(raw[550]["loading"], true);
+        assert_eq!(raw[551]["cutscene"], true);
+        assert_eq!(raw[552]["conversation"], true);
+        assert_eq!(raw[552]["screens"][0], "Inventory");
+        assert_eq!(raw[552]["draw_counts"], json!([8, 2, 3]));
+        assert_eq!(frame_stats(&r.frames)["max_ms"], 649.0);
+    }
+
+    #[test]
+    fn session_log_is_bounded_by_lines_and_bytes_and_truncates_utf8_safely() {
+        let mut ring = LogRing {
+            lines: VecDeque::new(),
+            bytes: 0,
+            dropped: 0,
+        };
+        for i in 0..FULL_LOG_LINES + 50 {
+            ring.push(format!("line {i}"));
+        }
+        assert_eq!(ring.lines.len(), FULL_LOG_LINES);
+        assert_eq!(ring.lines.front().unwrap().as_ref(), "line 50");
+        ring.push("a\nb\nc".into());
+        assert_eq!(ring.lines.len(), FULL_LOG_LINES);
+        assert_eq!(ring.lines.back().unwrap().as_ref(), "c");
+        for _ in 0..600 {
+            ring.push("é".repeat(MAX_LOG_LINE_BYTES));
+        }
+        assert!(ring.bytes <= FULL_LOG_BYTES);
+        assert!(ring.lines.len() < 600);
+        assert!(ring.lines.back().unwrap().ends_with(" [truncated]"));
+    }
+
+    #[test]
+    fn writer_completion_covers_new_files_and_press_time_state() {
+        let dir = std::env::temp_dir().join(format!("thedas-report-worker-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut r = Recorder::new(&dir);
+        r.frame(
+            24.0,
+            FrameContext {
+                area: Some("before".into()),
+                ..Default::default()
+            },
+        );
+        let path = r.start(
+            None,
+            None,
+            None,
+            json!({ "game": { "area": "before" } }),
+            Capture {
+                presentation: json!({ "object": { "id": 42, "offset": [0, 0, -0.02] } }),
+                ..Default::default()
+            },
+        );
+        r.frame(
+            88.0,
+            FrameContext {
+                area: Some("after".into()),
+                ..Default::default()
+            },
+        );
+        r.screenshot(Ok(b"png".to_vec()));
+        r.note(Some("fixture".into()));
+        assert_eq!(finish(&mut r), Some(path.clone()));
+        let frames: J =
+            serde_json::from_slice(&std::fs::read(path.join("frames.json")).unwrap()).unwrap();
+        assert_eq!(frames["frames"].as_array().unwrap().len(), 1);
+        assert_eq!(frames["frames"][0]["area"], "before");
+        assert_eq!(frames["frames"][0]["dt_ms"], 24.0);
+        let presentation: J =
+            serde_json::from_slice(&std::fs::read(path.join("presentation.json")).unwrap())
+                .unwrap();
+        assert_eq!(presentation["object"]["id"], 42);
+        assert!(path.join("log.full.txt").is_file());
+        assert_eq!(std::fs::read(path.join("screenshot.png")).unwrap(), b"png");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn full_log_keeps_earlier_session_lines_and_short_log_stays_at_400() {
+        let dir = std::env::temp_dir().join(format!("thedas-log-report-{}", std::process::id()));
+        let mut files = Files {
+            dir: dir.clone(),
+            info: json!({}),
+            now_save: None,
+            before: None,
+            log: (0..1200)
+                .map(|i| Arc::<str>::from(format!("line {i}")))
+                .collect(),
+            input: vec![],
+            trace: None,
+            journal: None,
+            frames: VecDeque::new(),
+            capture: Capture::default(),
+        };
+        files.write().unwrap();
+        let short = std::fs::read_to_string(dir.join("log.txt")).unwrap();
+        let full = std::fs::read_to_string(dir.join("log.full.txt")).unwrap();
+        assert_eq!(short.lines().count(), 400);
+        assert!(short.starts_with("line 800\n"));
+        assert_eq!(full.lines().count(), 1200);
+        assert!(full.starts_with("line 0\n"));
+        assert!(full.ends_with("line 1199\n"));
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

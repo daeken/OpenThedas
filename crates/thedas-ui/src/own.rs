@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use thedas_gfx::avm1::display_api::local_bounds;
 use thedas_gfx::render::{Images, Renderer};
 use thedas_gfx::swf::{Character, Font};
 use thedas_gfx::{Host, HostValue, Player};
@@ -314,9 +315,80 @@ impl OwnMovie {
     pub fn tick(&mut self, dt_ms: f64) {
         let started = std::time::Instant::now();
         self.player.tick(dt_ms);
+        if self.player.vm.name == "conversation.gfx" {
+            self.fit_reply_intro();
+        }
         self.profile.script_us += started.elapsed().as_micros() as u64;
         self.profile.ticks += 1;
         self.profile.report(&self.player.vm.name);
+    }
+
+    /// ShowResponses bottom-aligns the settled slots. The intro then fades the replies
+    /// in while sliding them up from 50 stage pixels below that position. Keep the text
+    /// and its click targets inside the viewport as soon as the buttons appear.
+    fn fit_reply_intro(&mut self) {
+        let viewport_bottom = self.to_stage(0.0, f64::from(self.size.1)).1 * 20.0;
+        let vm = &mut self.player.vm;
+        let display = &vm.display;
+        let Some(container) = display.child_named(vm.root, "ButtonContainer_mc") else {
+            return;
+        };
+        let Some(clip) = display
+            .get(container)
+            .filter(|o| o.visible)
+            .and_then(|o| o.clip())
+        else {
+            return;
+        };
+        let (Some(frame), Some(intro), Some(outro)) = (
+            clip.frame,
+            clip.timeline.label("intro"),
+            clip.timeline.label("lineoutro"),
+        ) else {
+            return;
+        };
+        if !(intro..outro).contains(&frame) {
+            return;
+        }
+        let Some(buttons) = display.child_named(container, "Buttons_mc") else {
+            return;
+        };
+        let Some(group) = display
+            .get(buttons)
+            .filter(|o| o.visible && o.matrix.ty > 0.0)
+        else {
+            return;
+        };
+        let mut overflow = 0.0_f64;
+        for &reply in group.children.values() {
+            if !display.get(reply).is_some_and(|o| o.visible) {
+                continue;
+            }
+            let hit = display.child_named(reply, "HitArea_mc");
+            let labels = ["RollOver_mc", "Down_mc"].into_iter().filter_map(|name| {
+                let clip = display.child_named(reply, name)?;
+                display.get(clip).filter(|o| o.visible)?;
+                display.child_named(clip, "Text_mc")
+            });
+            for target in hit.into_iter().chain(labels) {
+                if let Some(bounds) = local_bounds(vm, target) {
+                    let bottom = display.world_matrix(target).transform_rect(&bounds).y_max;
+                    overflow = overflow.max(f64::from(bottom) - viewport_bottom);
+                }
+            }
+        }
+        let scale_y = f64::from(display.world_matrix(container).d);
+        if overflow > 0.0 && scale_y > 0.0 {
+            let shift = (overflow / scale_y).ceil() as f32;
+            let background = display.child_named(container, "ResponseBackgroundContainer_mc");
+            for child in Some(buttons).into_iter().chain(background) {
+                if let Some(object) = vm.display.get_mut(child) {
+                    object.matrix.ty -= shift;
+                }
+            }
+            vm.dirty = true;
+            vm.pick_dirty = true;
+        }
     }
 
     pub fn run_frame(&mut self) {
@@ -410,6 +482,12 @@ impl OwnMovie {
         let (x, y) = self.to_stage(x, y);
         self.player
             .mouse_button(x, y, button as u8 & 3, down, button >= 5.0);
+    }
+
+    /// Whether any clip is under window pixel (`x`, `y`).
+    pub fn has_clip_at(&self, x: f64, y: f64) -> bool {
+        let (x, y) = self.to_stage(x, y);
+        self.player.topmost_at(x, y).is_some()
     }
 
     pub fn focused_text_at(&self, x: f64, y: f64) -> bool {

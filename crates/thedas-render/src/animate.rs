@@ -94,6 +94,8 @@ pub struct Animator {
     /// Each prop's poses as last computed, and what they were posed with (see
     /// [`Animator::pose_props`]; none: not posed since the props changed).
     last_poses: Vec<Option<(u64, crate::skeleton::Poses)>>,
+    /// Props whose skeletons were sampled during the last posing call.
+    evaluated: Vec<bool>,
 }
 
 fn load<T>(
@@ -126,6 +128,46 @@ fn load<T>(
 }
 
 impl Animator {
+    /// Whether the last `pose_props` call sampled any skeleton of this prop. A clip
+    /// change can trigger sampling for a culled prop too.
+    pub fn pose_evaluated(&self, prop: usize) -> bool {
+        self.evaluated.get(prop).copied().unwrap_or(false)
+    }
+
+    /// The pose last sent to the renderer, without sampling or loading any resources.
+    pub fn last_pose(&self, prop: usize) -> Option<&crate::skeleton::Poses> {
+        self.last_poses.get(prop)?.as_ref().map(|(_, poses)| poses)
+    }
+
+    /// A clip's already loaded animation, for diagnostics on the frame thread. Never
+    /// reads the VFS (including when a resource was missing).
+    pub fn cached_animation_resource(&self, clip: &Clip) -> Option<(String, Arc<Animation>)> {
+        if let Some(animation) = &clip.inline {
+            return Some((animation.name.clone(), animation.clone()));
+        }
+        for tree in &clip.trees {
+            let Some(tree) = self
+                .trees
+                .get(&tree_resource(tree).to_ascii_lowercase())
+                .and_then(Option::as_ref)
+            else {
+                continue;
+            };
+            if let Some(name) = clip
+                .actions
+                .iter()
+                .find_map(|a| tree.action(a)?.animation.as_ref())
+            {
+                return self
+                    .animations
+                    .get(&name.to_ascii_lowercase())?
+                    .as_ref()
+                    .map(|animation| (name.clone(), animation.clone()));
+            }
+        }
+        None
+    }
+
     /// Forgets the skeletons posed so far (they are kept by their index in a scene), for
     /// posing another scene's; the animations read stay.
     pub fn forget_skeletons(&mut self) {
@@ -479,6 +521,7 @@ impl Animator {
                     || renderer.prop_seen(scene, i, &seen)
             })
             .collect();
+        self.evaluated.resize(props.len(), false);
         let mut jobs: Vec<(usize, usize, Prepared)> = Vec::new();
         for (i, (_, clip)) in props.iter().enumerate() {
             if !posing[i] {
@@ -509,6 +552,7 @@ impl Animator {
         // An unseen prop is placed again with the pose it was last given, so that it moves
         // (and its attachments and effects with it) and is seen when it comes into view.
         for (i, ((transform, _), poses)) in props.iter().zip(by_prop).enumerate() {
+            self.evaluated[i] = posing[i] && !poses.is_empty();
             if posing[i] {
                 renderer.pose_prop(ctx, scene, i, *transform, &poses, true);
                 self.last_poses[i] = Some((shapes[i], poses));
@@ -540,6 +584,47 @@ mod tests {
     use thedas_formats::anim::{Channel, Key, Track};
     use thedas_formats::level::Transform;
     use thedas_formats::model::{Mmh, Node};
+
+    #[test]
+    fn diagnostics_resolve_only_cached_resources_and_try_fallback_trees() {
+        let mut animator = Animator::default();
+        animator.trees.insert("missing.anb".into(), None);
+        animator.trees.insert(
+            "loaded.anb".into(),
+            Some(Arc::new(AnimTree {
+                name: "loaded".into(),
+                nodes: vec![thedas_formats::anim::AnimNode {
+                    action: "idle".into(),
+                    animation: Some("fixture.ani".into()),
+                    speed: 1.0,
+                    once: false,
+                }],
+            })),
+        );
+        let animation = Arc::new(Animation {
+            name: "fixture".into(),
+            length: 2.0,
+            additive: false,
+            unscaled: false,
+            tracks: vec![],
+            scalars: vec![],
+            colors: vec![],
+        });
+        animator
+            .animations
+            .insert("fixture.ani".into(), Some(animation.clone()));
+        let mut clip = Clip {
+            trees: vec!["missing".into(), "LOADED".into()],
+            actions: vec!["idle".into()],
+            ..Default::default()
+        };
+        let (name, resolved) = animator.cached_animation_resource(&clip).unwrap();
+        assert_eq!(name, "fixture.ani");
+        assert!(Arc::ptr_eq(&resolved, &animation));
+        clip.actions = vec!["unloaded".into()];
+        assert!(animator.cached_animation_resource(&clip).is_none());
+        assert_eq!(animator.animations.len(), 1);
+    }
 
     fn node(name: &str, bone: u32, children: Vec<Node>) -> Node {
         Node {
