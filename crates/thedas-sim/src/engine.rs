@@ -3482,6 +3482,7 @@ pub fn call(
                         .is_some_and(|c| c.due.is_some() && !c.is_static)
                         .then(|| o.commands.remove(0));
                     if let Some(cleared) = cleared {
+                        h.sim.world.following.remove(&target);
                         let result = constant(&h.sim.table, "COMMAND_FAILED_COMMAND_CLEARED");
                         let mut ev = h.sim.new_event("COMMAND_COMPLETE", Some(target));
                         ev.ints = vec![cleared.ty, result];
@@ -3504,6 +3505,12 @@ pub fn call(
                 command: c.name.clone(),
                 status: "queued".into(),
             });
+            if h.sim.world.get(target).is_some_and(|o| {
+                o.commands.is_empty()
+                    || (front && !(origins && o.commands.first().is_some_and(|c| c.due.is_some())))
+            }) {
+                h.sim.world.following.remove(&target);
+            }
             match h.sim.world.get_mut(target) {
                 Some(o) => {
                     // Origins uses a growing list, not a ten-command capacity.
@@ -3947,6 +3954,7 @@ pub fn call(
         }
         "ClearAllCommands" => {
             let who = obj(a, 0);
+            h.sim.world.following.remove(&who);
             h.sim.da2_stop_locomotion(who);
             let running = h.sim.world.get_mut(who).and_then(|o| {
                 let first = o
