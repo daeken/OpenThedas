@@ -182,6 +182,8 @@ pub struct Arl {
     pub grid: Option<NavGrid>,
     /// The level's sun, when it has one (exteriors).
     pub sun: Option<Sun>,
+    /// The layout declares its own sun (3122), even if its light is disabled.
+    pub layout_sun: bool,
     /// The sunlight direction (3150) as stored, whatever [`Arl::sun`] makes of it: the
     /// direction the sky's celestial body is placed against (DAOrigins.exe's layout loader
     /// keeps it at 0x5d14e4 whether or not the sun lights anything).
@@ -569,6 +571,7 @@ impl Arl {
             rooms,
             grid,
             sun,
+            layout_sun,
             sunlight_direction: d
                 .opt_vec3(root, field::ARL_SUN_DIRECTION)?
                 .filter(|v| v.iter().all(|x| x.is_finite())),

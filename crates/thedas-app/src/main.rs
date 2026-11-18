@@ -1664,7 +1664,7 @@ impl App {
             }
             // Creatures the game camera is inside fade (see `camfade`).
             if let Some(l) = self.live.as_mut() {
-                l.fade_near_camera(eye.map(|c| c.position), dt);
+                l.fade_near_camera(eye.map(|c| c.position), f.target_ground_z(), dt);
             }
             // A staged conversation line frames itself.
             if let Some(c) = self
@@ -7647,7 +7647,11 @@ fn main() -> Result<()> {
                             if let Some(c) = eye {
                                 camera = c;
                             }
-                            l.fade_near_camera(eye.map(|c| c.position), dt as f32 / 1000.0);
+                            l.fade_near_camera(
+                                eye.map(|c| c.position),
+                                follow.as_ref().and_then(follow::Follow::target_ground_z),
+                                dt as f32 / 1000.0,
+                            );
                         }
                         if let Some((_, s)) = played.as_ref() {
                             println!(
@@ -7993,7 +7997,11 @@ fn main() -> Result<()> {
             }
             // The capture's camera is the settled one, so its fade is settled too (a fade
             // reaches its opacity within a second).
-            l.fade_near_camera(eye.map(|c| c.position), 1.0);
+            l.fade_near_camera(
+                eye.map(|c| c.position),
+                follow.as_ref().and_then(follow::Follow::target_ground_z),
+                1.0,
+            );
             if follow.is_some()
                 && let Some(c) = l.conversation_camera(&camera)
             {

@@ -21,7 +21,8 @@ use std::sync::Arc;
 use thedas_formats::Rml;
 use thedas_formats::level::Transform;
 use thedas_formats::model::Mmh;
-use thedas_formats::phy::{Geometry, Phy, mask};
+use thedas_formats::phy::{Geometry, Phy, Shape, mask};
+use thedas_formats::speedtree::{self, CollisionShape};
 use thedas_vfs::Vfs;
 
 type V = [f32; 3];
@@ -302,6 +303,74 @@ impl Prim {
             }
         }
     }
+
+    /// Sphere cast against a convex primitive. Each closest point defines a separating
+    /// plane, so advancing to that plane cannot step past the first contact.
+    fn sweep(&self, origin: V, d: V, radius: f32) -> Option<f32> {
+        let mut t = 0.0;
+        for _ in 0..32 {
+            let p = add(origin, scale(d, t));
+            let (offset, reach) = match self {
+                Prim::Tri(tri) => (sub(p, closest_on_triangle(p, tri)), radius),
+                Prim::Sphere { c, r } => (sub(p, *c), radius + r),
+                Prim::Capsule { a, b, r } => (sub(p, closest_on_segment(p, *a, *b)), radius + r),
+                Prim::Obb { c, axes, half } => {
+                    let local = sub(p, *c);
+                    let mut offset = [0.0; 3];
+                    for (axis, h) in axes.iter().zip(half) {
+                        let x = dot(local, *axis);
+                        offset = add(offset, scale(*axis, x - x.clamp(-h, *h)));
+                    }
+                    (offset, radius)
+                }
+            };
+            let distance = dot(offset, offset).sqrt();
+            let gap = distance - reach;
+            if gap <= 1e-5 {
+                return Some(t);
+            }
+            let approach = -dot(offset, d) / distance;
+            if approach <= 0.0 {
+                return None;
+            }
+            t += gap / approach;
+            if t > 1.0 {
+                return None;
+            }
+        }
+        None
+    }
+}
+
+fn closest_on_segment(p: V, a: V, b: V) -> V {
+    let e = sub(b, a);
+    let len = dot(e, e);
+    if len > 0.0 {
+        add(a, scale(e, (dot(sub(p, a), e) / len).clamp(0.0, 1.0)))
+    } else {
+        a
+    }
+}
+
+fn closest_on_triangle(p: V, &[a, b, c]: &[V; 3]) -> V {
+    let n = cross(sub(b, a), sub(c, a));
+    let len = dot(n, n);
+    let edges = [(a, b), (b, c), (c, a)];
+    if len > 0.0
+        && edges
+            .iter()
+            .all(|&(a, b)| dot(cross(sub(b, a), sub(p, a)), n) >= 0.0)
+    {
+        return sub(p, scale(n, dot(sub(p, a), n) / len));
+    }
+    edges
+        .into_iter()
+        .map(|(a, b)| closest_on_segment(p, a, b))
+        .min_by(|&a, &b| {
+            let (da, db) = (sub(p, a), sub(p, b));
+            dot(da, da).total_cmp(&dot(db, db))
+        })
+        .unwrap_or(a)
 }
 
 fn segment_triangle(p: V, d: V, t: &[V; 3]) -> bool {
@@ -603,6 +672,59 @@ impl Collision {
     /// A shape a [`RayHit`] names.
     pub fn shape(&self, i: usize) -> Option<&ShapeInfo> {
         self.shapes.get(i)
+    }
+
+    /// First contact fraction for a swept sphere, an overlap when its endpoints coincide,
+    /// or a segment when the radius is zero. The caller selects the participating shapes.
+    /// Mesh sidedness and the contact tolerance are provisional relative to PhysX.
+    pub fn sweep(
+        &self,
+        from: V,
+        to: V,
+        radius: f32,
+        includes: impl Fn(&ShapeInfo) -> bool,
+    ) -> Option<f32> {
+        if self.nodes.is_empty()
+            || self.tags.len() != self.prims.len()
+            || !radius.is_finite()
+            || !from.into_iter().chain(to).all(f32::is_finite)
+        {
+            return None;
+        }
+        let r = [radius.max(0.0); 3];
+        let d = sub(to, from);
+        let mut nearest: Option<f32> = None;
+        let mut stack = vec![0usize];
+        while let Some(n) = stack.pop() {
+            let node = &self.nodes[n];
+            let travel = scale(d, nearest.unwrap_or(1.0));
+            if !segment_aabb(from, travel, sub(node.lo, r), add(node.hi, r)) {
+                continue;
+            }
+            if node.count == 0 {
+                stack.extend([node.first as usize, node.first as usize + 1]);
+                continue;
+            }
+            let start = node.first as usize;
+            for i in start..start + node.count as usize {
+                if !includes(&self.shapes[self.tags[i] as usize]) {
+                    continue;
+                }
+                let p = &self.prims[i];
+                let hit = if radius > 0.0 {
+                    p.sweep(from, d, radius)
+                } else {
+                    p.hit_at(from, d)
+                };
+                if let Some(t) = hit {
+                    if t == 0.0 {
+                        return Some(t);
+                    }
+                    nearest = Some(nearest.map_or(t, |n| n.min(t)));
+                }
+            }
+        }
+        nearest
     }
 
     /// Every shape the segment from `a` to `b` meets, each once at its first meeting,
@@ -999,6 +1121,21 @@ fn add_model(
 /// detailed), reading each placed model's `.phy` and `.mmh` from `level` (the level's own
 /// archives) or else `global`. Models without collision are skipped.
 pub fn load_layout(level: &Vfs, global: &Vfs, arl: &thedas_formats::Arl) -> Collision {
+    load_layout_with(level, global, arl, false)
+}
+
+/// The camera's additional tree actors come from SPT primitives, with mask 0x1001020
+/// (0x531400, 0x53167b). Keep the existing simulation collision set independent.
+pub fn load_camera_layout(level: &Vfs, arl: &thedas_formats::Arl) -> Collision {
+    load_layout_with(level, level, arl, true)
+}
+
+fn load_layout_with(
+    level: &Vfs,
+    global: &Vfs,
+    arl: &thedas_formats::Arl,
+    speedtrees: bool,
+) -> Collision {
     let read = |name: &str| -> Option<Vec<u8>> {
         level
             .read(name)
@@ -1008,6 +1145,12 @@ pub fn load_layout(level: &Vfs, global: &Vfs, arl: &thedas_formats::Arl) -> Coll
     };
     let mut models: std::collections::HashMap<String, Option<LoadedModel>> =
         std::collections::HashMap::new();
+    let filter = if speedtrees {
+        mask::CAMERA
+    } else {
+        mask::SIGHT
+    };
+    let mut trees = std::collections::HashMap::new();
     let mut prims = Parts::default();
     for room in &arl.rooms {
         let rml = [format!("{}.rml", room.name), format!("{}_0.rml", room.name)]
@@ -1032,10 +1175,77 @@ pub fn load_layout(level: &Vfs, global: &Vfs, arl: &thedas_formats::Arl) -> Coll
                 1.0
             };
             let at = room_xf.then(&Xf::from_transform(&p.transform, scale));
-            add_model(&phy, mmh.as_deref(), &at, None, mask::SIGHT, &mut prims);
+            add_model(&phy, mmh.as_deref(), &at, None, filter, &mut prims);
+        }
+        if speedtrees {
+            for tree in &rml.trees {
+                let Some(stem) = arl.trees.get(tree.tree) else {
+                    continue;
+                };
+                let physics = trees.entry(tree.tree).or_insert_with(|| {
+                    read(&format!("{stem}.spt")).and_then(|d| speedtree_phy(&d))
+                });
+                if let Some(phy) = physics
+                    && tree.scale.is_finite()
+                    && tree.scale > 0.0
+                {
+                    let at = room_xf.then(&Xf::from_transform(&tree.transform, tree.scale));
+                    add_model(phy, None, &at, None, filter, &mut prims);
+                }
+            }
         }
     }
     prims.build()
+}
+
+fn speedtree_phy(data: &[u8]) -> Option<Phy> {
+    let shapes = speedtree::parse(data)
+        .ok()?
+        .collision
+        .into_iter()
+        .filter_map(|shape| {
+            let dimension = |value: f32| value.is_finite() && value > 0.0;
+            let geometry = match shape.shape {
+                CollisionShape::Sphere { radius } if dimension(radius) => {
+                    Geometry::Sphere { radius }
+                }
+                CollisionShape::Capsule { radius, height }
+                    if dimension(radius) && height.is_finite() && height >= 0.0 =>
+                {
+                    Geometry::Capsule { radius, height }
+                }
+                CollisionShape::Box { size } if size.into_iter().all(dimension) => {
+                    Geometry::Box { half: size }
+                }
+                _ => return None,
+            };
+            if !shape
+                .position
+                .into_iter()
+                .chain(shape.rotation)
+                .all(f32::is_finite)
+            {
+                return None;
+            }
+            let [x, y, z] = shape.rotation.map(|angle| 0.5 * angle.to_radians());
+            let x = [x.dsin(), 0.0, 0.0, x.dcos()];
+            let y = [0.0, y.dsin(), 0.0, y.dcos()];
+            let z = [0.0, 0.0, z.dsin(), z.dcos()];
+            Some(Shape {
+                parent: None,
+                mask: mask::STATIC | mask::SPEEDTREE | mask::NON_WALKABLE,
+                pose: Transform {
+                    position: shape.position,
+                    rotation: qmul(qmul(x, y), z),
+                },
+                geometry,
+            })
+        })
+        .collect();
+    Some(Phy {
+        shapes,
+        ..Phy::default()
+    })
 }
 
 /// Builds the collision of an area's placeables: each one's model (`placeable_types.gda`
@@ -1043,6 +1253,11 @@ pub fn load_layout(level: &Vfs, global: &Vfs, arl: &thedas_formats::Arl) -> Coll
 /// about +Z, as the renderer places it).
 pub fn load_placeables(global: &Vfs, placed: &[(String, V, f32)]) -> Collision {
     load_placeables_mask(global, placed, mask::SIGHT)
+}
+
+/// Active placeable shapes queried by the exploration camera.
+pub fn load_camera_placeables(global: &Vfs, placed: &[(String, V, f32)]) -> Collision {
+    load_placeables_mask(global, placed, mask::CAMERA)
 }
 
 /// Placeable shapes queried by the creature controller; its mask includes more
@@ -1087,6 +1302,45 @@ fn load_placeables_mask(global: &Vfs, placed: &[(String, V, f32)], filter: u32) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sphere_sweep_honours_shape_masks_and_tests_stationary_overlap() {
+        let c = Collision::build_shapes(
+            vec![
+                Prim::Sphere {
+                    c: [2.0, 0.0, 0.0],
+                    r: 0.5,
+                },
+                Prim::Tri([[4.0, -2.0, -2.0], [4.0, 2.0, -2.0], [4.0, 0.0, 2.0]]),
+                Prim::Obb {
+                    c: [6.0, 0.0, 0.0],
+                    axes: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                    half: [0.5; 3],
+                },
+            ],
+            vec![0, 1, 2],
+            [mask::CREATURES, mask::STATIC, mask::PLACEABLES]
+                .into_iter()
+                .map(|mask| ShapeInfo {
+                    mask,
+                    material: 0,
+                    object: None,
+                    outline: Outline::Mesh,
+                })
+                .collect(),
+        );
+        let camera = |s: &ShapeInfo| s.mask & mask::CAMERA != 0;
+        let wall = c.sweep([0.0; 3], [8.0, 0.0, 0.0], 0.25, camera).unwrap();
+        assert!((wall - 3.75 / 8.0).abs() < 1e-5);
+        assert_eq!(
+            c.sweep([6.0, 0.0, 0.0], [6.0, 0.0, 0.0], 0.25, camera),
+            Some(0.0)
+        );
+        assert_eq!(
+            c.sweep([2.0, 0.0, 0.0], [2.0, 0.0, 0.0], 0.25, camera),
+            None
+        );
+    }
 
     #[test]
     fn doors_regression_f_movement_shapes_are_independent_of_sight_shapes() {

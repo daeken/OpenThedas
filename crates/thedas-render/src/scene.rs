@@ -1331,6 +1331,7 @@ impl<'a> Loader<'a> {
             /// Mesh, material, part and the part's level ranges.
             parts: Vec<SptPart>,
             leaf_angle_scalars: [f32; 2],
+            has_collision: bool,
             counts: [usize; 3],
             transition: thedas_formats::speedtree_gen::mesh::Transition,
         }
@@ -1427,6 +1428,7 @@ impl<'a> Loader<'a> {
                         SptTree {
                             parts: spt,
                             leaf_angle_scalars: mesh.leaf_angle_scalars,
+                            has_collision: !tree_file.collision.is_empty(),
                             counts: [
                                 mesh.branches.lods.len(),
                                 mesh.fronds.lods.len(),
@@ -1562,6 +1564,8 @@ impl<'a> Loader<'a> {
                     // placement's order, so they repeat from load to load.
                     wind_offset: (placed_trees.wrapping_mul(37) % 100) as f32,
                     wind: placed_trees % 5,
+                    has_collision: spt.has_collision,
+                    alpha_multiplier: 1.0,
                     billboard_images: std::sync::Arc::from([]),
                 };
                 placed_trees += 1;
@@ -1799,6 +1803,8 @@ impl<'a> Loader<'a> {
                 leaf_angle_scalars: [0.0; 2],
                 wind_offset: 0.0,
                 wind: 0,
+                has_collision: false,
+                alpha_multiplier: 1.0,
                 billboard_images: images,
             },
         );

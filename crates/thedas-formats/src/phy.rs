@@ -55,6 +55,8 @@ pub mod mask {
     pub const TRIGGERS: u32 = 0x8;
     pub const STATIC: u32 = 0x20;
     pub const WATER: u32 = 0x100;
+    /// Added to the static, non-walkable shapes made from SPT collision objects (0x53167b).
+    pub const SPEEDTREE: u32 = 0x1000;
     /// Static geometry that does not fade (`Fadeable` 0).
     pub const STATIC_SOLID: u32 = 0x2000;
     pub const TERRAIN_WALL: u32 = 0x1_0000;
@@ -62,6 +64,8 @@ pub mod mask {
     pub const WALKABLE: u32 = 0x200_0000;
     /// The sight ray's mask (perception, 0x67c530): placeables and static geometry.
     pub const SIGHT: u32 = PLACEABLES | STATIC;
+    /// The exploration camera's PhysX sweeps and eye overlaps (0x6c3758, 0x6c28fb).
+    pub const CAMERA: u32 = PLACEABLES | STATIC | SPEEDTREE;
     /// Creature controller movement/placement (DAOrigins.exe 0x6b6880).
     pub const MOVEMENT: u32 = 0x0201_1134;
 }
