@@ -384,8 +384,6 @@ pub struct SceneEmitter {
     /// Whether its model has a `CutAway` mesh: its particles fade with the cutaway
     /// (DAOrigins.exe 0x466f40).
     pub cut_away: bool,
-    /// The layout room that owns the emitting model.
-    pub room_id: Option<i64>,
     /// For a prop's visual effect: the prop, the effect ([`PropEffect::key`]) and which of
     /// the effect's emitters it is, the same from one scene to the next, so its particles
     /// can carry over when the scene is rebuilt.
@@ -464,12 +462,6 @@ impl Detail {
 }
 
 #[derive(Clone, Debug, Default)]
-pub struct RoomVisibility {
-    pub adjacent: Vec<i64>,
-    pub portals: Vec<i64>,
-}
-
-#[derive(Clone, Debug, Default)]
 pub struct AreaScene {
     pub level: String,
     /// The level's sun (direction its light travels, colour), when it has one.
@@ -490,8 +482,6 @@ pub struct AreaScene {
     /// Each room's light reach (RML 3164, by room id): the other rooms its lights and probes
     /// reach (see [`crate::d3d::reaches`]).
     pub light_rooms: HashMap<i64, Vec<i64>>,
-    /// The two visibility lists authored for each room (RML 3047 and 3099).
-    pub room_visibility: HashMap<i64, RoomVisibility>,
     /// The layout's rooms' boxes (id, min, max), to find the room an object stands in.
     pub room_boxes: Vec<(i64, Vec3, Vec3)>,
     /// The skeletons of the skinned models, one per model.
@@ -2776,11 +2766,7 @@ impl<'a> Loader<'a> {
             return rigid;
         }
         let cut_away = model.mesh_pieces().iter().any(|p| p.mesh.cut_away);
-        let first_emitter = self.scene.emitters.len();
         self.place_emitters(model_name, &model, placement, user_params, cut_away);
-        for emitter in &mut self.scene.emitters[first_emitter..] {
-            emitter.room_id = layout_room;
-        }
         let pieces = model.mesh_pieces();
         if pieces.is_empty() {
             return rigid;
@@ -3172,7 +3158,6 @@ impl<'a> Loader<'a> {
                 model: model_name.to_string(),
                 node: name.unwrap_or("").to_string(),
                 cut_away,
-                room_id: None,
                 owner: None,
             });
             Some(self.scene.emitters.len() - 1)
@@ -3544,13 +3529,6 @@ impl AreaScene {
                     }
                 };
                 l.scene.light_rooms.insert(room.id, rml.light_rooms.clone());
-                l.scene.room_visibility.insert(
-                    room.id,
-                    RoomVisibility {
-                        adjacent: rml.adjacent_rooms,
-                        portals: rml.visibility_rooms,
-                    },
-                );
                 let room_m = transform_matrix(&rml.transform);
                 tree_spots.extend(rml.trees.iter().map(|t| {
                     (

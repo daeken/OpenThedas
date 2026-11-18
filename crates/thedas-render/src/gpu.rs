@@ -1287,7 +1287,6 @@ impl AreaRenderer {
         self.d3d
             .glowing_emitters()
             .into_iter()
-            .filter(|&i| self.d3d.emitter_room_shown(i))
             .filter_map(|i| {
                 let tint = self
                     .emitter_tints
@@ -1512,12 +1511,6 @@ impl AreaRenderer {
     /// The Origins SpeedTree models that fade with the architecture (0x52cc94).
     pub fn set_tree_cutaway(&mut self, ctx: &GpuContext, value: f32) {
         self.d3d.set_tree_cutaway(ctx, value);
-    }
-
-    /// Enables the environment models of the visible layout rooms. Unassigned draws
-    /// (sky and level-wide models) stay visible.
-    pub fn set_visible_rooms(&mut self, rooms: Option<std::collections::HashSet<i64>>) {
-        self.d3d.set_visible_rooms(rooms);
     }
 
     /// Set a creature appearance's gore threshold on its body and attachments

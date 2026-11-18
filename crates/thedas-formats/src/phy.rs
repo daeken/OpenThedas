@@ -66,6 +66,8 @@ pub mod mask {
     pub const SIGHT: u32 = PLACEABLES | STATIC;
     /// The exploration camera's PhysX sweeps and eye overlaps (0x6c3758, 0x6c28fb).
     pub const CAMERA: u32 = PLACEABLES | STATIC | SPEEDTREE;
+    /// Creature controller movement/placement (DAOrigins.exe 0x6b6880).
+    pub const MOVEMENT: u32 = 0x0201_1134;
 }
 
 #[derive(Clone, Debug, PartialEq)]

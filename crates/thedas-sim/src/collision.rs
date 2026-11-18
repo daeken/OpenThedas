@@ -521,8 +521,6 @@ pub struct ShapeInfo {
     /// Which of [`load_placeables`]'s models it belongs to (its index in the list); `None`
     /// for a layout's models.
     pub object: Option<u32>,
-    /// The authored ARL room whose RML placed this shape.
-    pub room: Option<i64>,
     pub outline: Outline,
 }
 
@@ -658,7 +656,6 @@ impl Collision {
                     mask: thedas_formats::phy::mask::STATIC,
                     material,
                     object: None,
-                    room: None,
                     outline: Outline::Mesh,
                 })
                 .collect(),
@@ -782,6 +779,70 @@ impl Collision {
 
     pub fn len(&self) -> usize {
         self.prims.len()
+    }
+
+    /// Bounds of the loaded shapes, in their placed coordinate system.
+    pub fn bounds(&self) -> Option<(V, V)> {
+        self.nodes.first().map(|n| (n.lo, n.hi))
+    }
+
+    /// Grid stand-in for controller sweeps against scenery. A body's horizontal
+    /// cross sections at 0.5 and 1 m must not meet a solid shape. Provisional: this
+    /// samples the capsule rather than implementing PhysX's continuous sweep.
+    pub(crate) fn movement_cells(
+        &self,
+        grid: &thedas_formats::level::NavGrid,
+        radius: f32,
+    ) -> std::collections::HashSet<usize> {
+        let mut cells = std::collections::HashSet::new();
+        // Rasterize the cell's footprint as well as the body. Otherwise a thin
+        // wall exactly between cell centres can disappear from the grid.
+        let radius = radius.max(grid.cell_size * 0.5);
+        for (n, primitive) in self.prims.iter().enumerate() {
+            if self
+                .tags
+                .get(n)
+                .and_then(|t| self.shapes.get(*t as usize))
+                .is_some_and(|s| s.mask & mask::MOVEMENT == 0)
+            {
+                continue;
+            }
+            let (lo, hi) = primitive.bounds();
+            let index = |p: f32, axis: usize, max: u32| {
+                (((p - grid.base[axis]) / grid.cell_size).floor() as i32)
+                    .clamp(0, max.saturating_sub(1) as i32) as u32
+            };
+            let x0 = index(lo[0] - radius, 0, grid.columns);
+            let x1 = index(hi[0] + radius, 0, grid.columns);
+            let y0 = index(lo[1] - radius, 1, grid.rows);
+            let y1 = index(hi[1] + radius, 1, grid.rows);
+            for y in y0..=y1 {
+                for x in x0..=x1 {
+                    let i = (y * grid.columns + x) as usize;
+                    if cells.contains(&i) {
+                        continue;
+                    }
+                    let m = grid.center((x, y));
+                    let z = crate::nav::height(grid, (x, y));
+                    let d = radius * std::f32::consts::FRAC_1_SQRT_2;
+                    let hit = [0.5, 1.0].iter().any(|up| {
+                        if z + up < lo[2] || z + up > hi[2] {
+                            return false;
+                        }
+                        [[radius, 0.0], [0.0, radius], [d, d], [d, -d]]
+                            .iter()
+                            .any(|&[dx, dy]| {
+                                let a = [m[0] - dx, m[1] - dy, z + up];
+                                primitive.hits(a, [2.0 * dx, 2.0 * dy, 0.0])
+                            })
+                    });
+                    if hit {
+                        cells.insert(i);
+                    }
+                }
+            }
+        }
+        cells
     }
 
     /// Whether anything lies on the segment from `a` to `b`.
@@ -967,18 +1028,24 @@ impl Parts {
     }
 }
 
-/// Collects a model's sight-blocking shapes into `out`, placed by `at`; `object` is the
+/// Collects a model's matching shapes into `out`, placed by `at`; `object` is the
 /// placed model they belong to, for [`ShapeInfo::object`].
-fn add_model(phy: &Phy, mmh: Option<&Mmh>, at: &Xf, object: Option<u32>, out: &mut Parts) {
+fn add_model(
+    phy: &Phy,
+    mmh: Option<&Mmh>,
+    at: &Xf,
+    object: Option<u32>,
+    filter: u32,
+    out: &mut Parts,
+) {
     for shape in &phy.shapes {
-        if shape.mask & mask::SIGHT == 0 {
+        if shape.mask & filter == 0 {
             continue;
         }
         out.shapes.push(ShapeInfo {
             mask: shape.mask,
             material: phy.sound_material,
             object,
-            room: None,
             outline: Outline::Mesh,
         });
         let mut xf = *at;
@@ -1078,6 +1145,11 @@ fn load_layout_with(
     };
     let mut models: std::collections::HashMap<String, Option<LoadedModel>> =
         std::collections::HashMap::new();
+    let filter = if speedtrees {
+        mask::CAMERA
+    } else {
+        mask::SIGHT
+    };
     let mut trees = std::collections::HashMap::new();
     let mut prims = Parts::default();
     for room in &arl.rooms {
@@ -1103,11 +1175,7 @@ fn load_layout_with(
                 1.0
             };
             let at = room_xf.then(&Xf::from_transform(&p.transform, scale));
-            let first_shape = prims.shapes.len();
-            add_model(&phy, mmh.as_deref(), &at, None, &mut prims);
-            for shape in &mut prims.shapes[first_shape..] {
-                shape.room = Some(room.id);
-            }
+            add_model(&phy, mmh.as_deref(), &at, None, filter, &mut prims);
         }
         if speedtrees {
             for tree in &rml.trees {
@@ -1122,7 +1190,7 @@ fn load_layout_with(
                     && tree.scale > 0.0
                 {
                     let at = room_xf.then(&Xf::from_transform(&tree.transform, tree.scale));
-                    add_model(phy, None, &at, None, &mut prims);
+                    add_model(phy, None, &at, None, filter, &mut prims);
                 }
             }
         }
@@ -1184,6 +1252,21 @@ fn speedtree_phy(data: &[u8]) -> Option<Phy> {
 /// `ModelName`) `.phy`, placed at the object's position and turned by its facing (degrees
 /// about +Z, as the renderer places it).
 pub fn load_placeables(global: &Vfs, placed: &[(String, V, f32)]) -> Collision {
+    load_placeables_mask(global, placed, mask::SIGHT)
+}
+
+/// Active placeable shapes queried by the exploration camera.
+pub fn load_camera_placeables(global: &Vfs, placed: &[(String, V, f32)]) -> Collision {
+    load_placeables_mask(global, placed, mask::CAMERA)
+}
+
+/// Placeable shapes queried by the creature controller; its mask includes more
+/// than the sight ray. Keep these separate so invisible walls do not block sight.
+pub(crate) fn load_movement_placeables(global: &Vfs, placed: &[(String, V, f32)]) -> Collision {
+    load_placeables_mask(global, placed, mask::MOVEMENT)
+}
+
+fn load_placeables_mask(global: &Vfs, placed: &[(String, V, f32)], filter: u32) -> Collision {
     let mut models: std::collections::HashMap<String, Option<LoadedModel>> =
         std::collections::HashMap::new();
     let mut prims = Parts::default();
@@ -1204,7 +1287,14 @@ pub fn load_placeables(global: &Vfs, placed: &[(String, V, f32)]) -> Collision {
             q: [0.0, 0.0, half.dsin(), half.dcos()],
             s: 1.0,
         };
-        add_model(&phy, mmh.as_deref(), &at, Some(index as u32), &mut prims);
+        add_model(
+            &phy,
+            mmh.as_deref(),
+            &at,
+            Some(index as u32),
+            filter,
+            &mut prims,
+        );
     }
     prims.build()
 }
@@ -1235,7 +1325,6 @@ mod tests {
                     mask,
                     material: 0,
                     object: None,
-                    room: None,
                     outline: Outline::Mesh,
                 })
                 .collect(),
@@ -1251,6 +1340,34 @@ mod tests {
             c.sweep([2.0, 0.0, 0.0], [2.0, 0.0, 0.0], 0.25, camera),
             None
         );
+    }
+
+    #[test]
+    fn doors_regression_f_movement_shapes_are_independent_of_sight_shapes() {
+        let phy = Phy {
+            shapes: vec![thedas_formats::phy::Shape {
+                parent: None,
+                mask: mask::TERRAIN_WALL,
+                pose: Transform::default(),
+                geometry: Geometry::Box { half: [1.0; 3] },
+            }],
+            ..Default::default()
+        };
+        let mut sight = Parts::default();
+        let mut movement = Parts::default();
+        add_model(&phy, None, &Xf::default(), None, mask::SIGHT, &mut sight);
+        add_model(
+            &phy,
+            None,
+            &Xf::default(),
+            None,
+            mask::MOVEMENT,
+            &mut movement,
+        );
+        let a = [-2.0, 0.0, 0.0];
+        let b = [2.0, 0.0, 0.0];
+        assert!(!sight.build().blocked(a, b));
+        assert!(movement.build().blocked(a, b));
     }
 
     #[test]
@@ -1295,7 +1412,6 @@ mod tests {
             mask: mask::STATIC,
             material,
             object,
-            room: None,
             outline,
         };
         // A two-triangle wall at x = 5 (one mesh shape), a sphere at x = 10, a box at x = 20.

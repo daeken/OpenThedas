@@ -82,7 +82,6 @@ mod padplay;
 mod report;
 mod reticle;
 mod rings;
-mod rooms;
 mod saves;
 mod screens;
 mod talkcam;
@@ -1657,7 +1656,7 @@ impl App {
             }
             // Creatures the game camera is inside fade (see `camfade`).
             if let Some(l) = self.live.as_mut() {
-                l.fade_near_camera(eye.map(|c| c.position), dt);
+                l.fade_near_camera(eye.map(|c| c.position), f.target_ground_z(), dt);
             }
             // A staged conversation line frames itself.
             if let Some(c) = self
@@ -2022,7 +2021,7 @@ impl App {
         a.frame(state);
         let voice = a.voice_ms();
         if let Some(g) = self.gfx.as_mut() {
-            g.ui.set_line_voice_ms(voice);
+            g.ui.set_line_voice_ms(voice, || a.voice_elapsed_ms());
         }
     }
 
@@ -5425,7 +5424,7 @@ fn line_is_voiced(audio: &audio::GameAudio, sim: &thedas_sim::Sim) -> bool {
     if voice_line(sim).is_some_and(|l| audio.line_voice(&l).is_some()) {
         return true;
     }
-    sim.conversation_line().is_none()
+    (sim.cutscene_controls_dialog_speech() || sim.conversation_line().is_none())
         && sim
             .world
             .cutscene
@@ -5434,36 +5433,42 @@ fn line_is_voiced(audio: &audio::GameAudio, sim: &thedas_sim::Sim) -> bool {
             .is_some_and(|l| l.vo_mode != 0)
 }
 
-/// The voice-over the line on screen wants: the still-presented conversation line (including
-/// a terminal NPC line), else a cutscene's line
-/// that has its own voice. With [`audio::GameAudio::line_voice`] this says whether the line
-/// is voiced (and for how long) as soon as it is chosen, before its voice plays.
+/// The voice-over for the current speech. An owned cut that says its dialog line drives
+/// audio from its timeline. Other conversations use the still-presented node, including
+/// terminal lines.
 pub(crate) fn voice_line(sim: &thedas_sim::Sim) -> Option<audio::VoiceLine> {
-    let line = sim.presented_conversation_line().and_then(|l| {
+    let open = sim.presented_conversation_line();
+    let cut_controls_speech = sim.cutscene_controls_dialog_speech();
+    if !cut_controls_speech
+        && let Some(l) = open
+        && let Some(strref) = l.strref
+        && sim.cut_line_speech() != thedas_sim::dialog::CutLineSpeech::Complete
+    {
         let female = sim
             .world
             .get(l.player)
             .is_some_and(|o| o.fields.get("Gender").copied() == Some(2));
-        Some(audio::VoiceLine {
+        return Some(audio::VoiceLine {
             dialog: l.dialog.to_string(),
-            strref: l.strref?,
+            strref,
             female,
             ambient: l.ambient,
-        })
-    });
-    if line.is_some() {
-        return line;
+        });
     }
     let c = sim.world.cutscene.as_ref()?;
     let l = c.line_now().filter(|l| l.vo_mode == 0)?;
     let conv = l.conversation.as_ref()?;
-    let female = sim
-        .world
-        .hero
-        .and_then(|h| sim.world.get(h))
+    // Keep the voice identity across a skip made in a track from the open dialog.
+    let (dialog, player) = open
+        .filter(|open| cut_controls_speech && open.dialog.eq_ignore_ascii_case(conv))
+        .map_or((conv.as_str(), sim.world.hero), |open| {
+            (open.dialog, Some(open.player))
+        });
+    let female = player
+        .and_then(|player| sim.world.get(player))
         .is_some_and(|o| o.fields.get("Gender").copied() == Some(2));
     Some(audio::VoiceLine {
-        dialog: conv.clone(),
+        dialog: dialog.to_string(),
         strref: l.strref,
         female,
         ambient: false,
@@ -7400,7 +7405,7 @@ fn main() -> Result<()> {
                                 a.record(state, dt as f32 / 1000.0);
                                 let voice = a.voice_ms();
                                 if let Some((layer, _)) = played.as_mut() {
-                                    layer.set_line_voice_ms(voice);
+                                    layer.set_line_voice_ms(voice, || a.voice_elapsed_ms());
                                 }
                             }
                             frames += 1;
@@ -7428,7 +7433,11 @@ fn main() -> Result<()> {
                             if let Some(c) = eye {
                                 camera = c;
                             }
-                            l.fade_near_camera(eye.map(|c| c.position), dt as f32 / 1000.0);
+                            l.fade_near_camera(
+                                eye.map(|c| c.position),
+                                follow.as_ref().and_then(follow::Follow::target_ground_z),
+                                dt as f32 / 1000.0,
+                            );
                         }
                         if let Some((_, s)) = played.as_ref() {
                             println!(
@@ -7774,7 +7783,11 @@ fn main() -> Result<()> {
             }
             // The capture's camera is the settled one, so its fade is settled too (a fade
             // reaches its opacity within a second).
-            l.fade_near_camera(eye.map(|c| c.position), 1.0);
+            l.fade_near_camera(
+                eye.map(|c| c.position),
+                follow.as_ref().and_then(follow::Follow::target_ground_z),
+                1.0,
+            );
             if follow.is_some()
                 && let Some(c) = l.conversation_camera(&camera)
             {

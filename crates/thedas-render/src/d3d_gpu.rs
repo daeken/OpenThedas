@@ -196,9 +196,6 @@ pub(crate) struct D3dPass {
     samples: u32,
     /// Per scene draw, the opacity its object is drawn at (1: as its material says).
     opacity: Vec<f32>,
-    shown_rooms: Option<std::collections::HashSet<i64>>,
-    draw_rooms: Vec<Option<i64>>,
-    emitter_rooms: Vec<Option<i64>>,
     /// Per-instance appearance gore, independent of shared materials.
     gore: Vec<Option<f32>>,
     pub draws: Vec<D3dDraw>,
@@ -2072,9 +2069,6 @@ impl D3dPass {
             color_format,
             samples,
             opacity: vec![1.0; scene.draws.len()],
-            shown_rooms: None,
-            draw_rooms: scene.draws.iter().map(|d| d.room_id).collect(),
-            emitter_rooms: scene.emitters.iter().map(|e| e.room_id).collect(),
             gore: vec![None; scene.draws.len()],
             draws,
             buffer,
@@ -2215,10 +2209,7 @@ impl D3dPass {
         let lights = DrawLights::default();
         let mut quads = Vec::new();
         for d in &self.particles {
-            let Some(e) = emitters
-                .get(d.emitter)
-                .filter(|_| self.emitter_room_shown(d.emitter))
-            else {
+            let Some(e) = emitters.get(d.emitter) else {
                 d.count.store(0, std::sync::atomic::Ordering::Relaxed);
                 continue;
             };
@@ -2495,25 +2486,6 @@ impl D3dPass {
     /// The last opacity multiplier given to a scene draw, for diagnostics.
     pub fn opacity(&self, draw: usize) -> Option<f32> {
         self.opacity.get(draw).copied()
-    }
-
-    pub(crate) fn set_visible_rooms(&mut self, rooms: Option<std::collections::HashSet<i64>>) {
-        self.shown_rooms = rooms;
-    }
-
-    fn room_shown(&self, room: Option<i64>) -> bool {
-        match (room, &self.shown_rooms) {
-            (Some(room), Some(shown)) => shown.contains(&room),
-            _ => true,
-        }
-    }
-
-    pub(crate) fn draw_room_shown(&self, draw: usize) -> bool {
-        self.room_shown(self.draw_rooms.get(draw).copied().flatten())
-    }
-
-    pub(crate) fn emitter_room_shown(&self, emitter: usize) -> bool {
-        self.room_shown(self.emitter_rooms.get(emitter).copied().flatten())
     }
 
     /// Draws scene draw `draw` at `opacity` (0..1) of its material's: its shaders' engine
@@ -2880,8 +2852,7 @@ impl D3dPass {
                     // its render nodes carry the fadeoutobject bit, which no shadow group
                     // draws).
                     let faded = self.opacity.get(c.draw).is_some_and(|&o| o < 1.0);
-                    let shown = !faded && self.draw_room_shown(c.draw);
-                    [0, 1].map(|k| shown && in_partition(&p[k], centre, radius))
+                    [0, 1].map(|k| !faded && in_partition(&p[k], centre, radius))
                 })
                 .collect();
             let key = shadow_key(&p, &self.casters, &visible, &self.worlds, &self.bones);
@@ -2968,9 +2939,6 @@ impl D3dPass {
             .map(|d| {
                 if warm {
                     return true;
-                }
-                if !self.draw_room_shown(d.draw) {
-                    return false;
                 }
                 if self.tree_lods.get(d.draw).is_some_and(|l| l.is_some())
                     && tree_frame.get(d.draw).is_none_or(|f| f.is_none())

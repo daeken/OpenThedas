@@ -113,7 +113,6 @@ pub struct LiveLevel {
     pub collider: thedas_render::collide::Collider,
     /// Origins camera collision comes from the layout's PHY shapes.
     camera_physics: Option<(thedas_sim::collision::Collision, bool)>,
-    room_visibility: std::collections::HashMap<i64, thedas_render::scene::RoomVisibility>,
 }
 
 /// The area's creatures and placeables, drawn over the level; rebuilt (alone) when an object
@@ -579,7 +578,6 @@ fn build_level_with(
         area_id: None,
         collider,
         camera_physics,
-        room_visibility: scene.room_visibility,
     })
 }
 
@@ -1247,6 +1245,15 @@ impl Live {
                 self.sweep_physics(physics, a, b, 0.0, thedas_formats::phy::mask::STATIC)
                     .is_none()
             };
+            {
+                let sim = self.sim();
+                let party_z = thedas_sim::engine::party_of(&sim)
+                    .into_iter()
+                    .filter_map(|id| sim.world.get(id))
+                    .filter(|member| member.active && member.area == sim.world.area)
+                    .map(|member| member.position[2]);
+                follow.update_tactical_height(party_z, dt);
+            }
             follow.resolve_tactical(feet, height, *exterior, &sweep, &sight);
             Some(follow.camera_clear(feet, height, dt, base, &sweep))
         } else {
@@ -1259,7 +1266,7 @@ impl Live {
     /// not the view (a conversation or cutscene frames the shot: no creature starts fading
     /// then, as in the executable's `GM_DIALOG` and `GM_CUTSCENE`). Creatures faded out are
     /// drawn at their opacity ([`Live::opacity`]).
-    pub fn fade_near_camera(&mut self, eye: Option<glam::Vec3>, dt: f32) {
+    pub fn fade_near_camera(&mut self, eye: Option<glam::Vec3>, target_z: Option<f32>, dt: f32) {
         let blocked = {
             let sim = self.sim();
             sim.world.cutscene.is_some() || sim.conversation_line().is_some()
@@ -1304,15 +1311,15 @@ impl Live {
         }
         self.camera_fade.update(touching, dt);
         self.combine_opacity();
-        // Roofs: cut away while the eye is high above the leader's feet.
-        let high = match (eye, self.leader_feet(), self.level.as_ref()) {
-            (Some(eye), Some(feet), Some(level)) => {
+        // Roofs: the eye rises above the framed target before its look offset (0x76f6e0).
+        let high = match (eye, target_z, self.level.as_ref()) {
+            (Some(eye), Some(target_z), Some(level)) => {
                 if self.cutaway.1 != level.layout {
                     // A new area starts at its state at once (the explore camera's
                     // activation forces it, 0x771019).
                     self.cutaway = (Cutaway::default(), level.layout.clone());
                 }
-                Some(eye.z - feet.z > level.cutaway_height)
+                Some(eye.z - target_z > level.cutaway_height)
             }
             _ => None,
         };
@@ -1336,22 +1343,6 @@ impl Live {
         {
             o.renderer.set_cutaway(ctx, v);
             o.cutaway_shown = v;
-        }
-    }
-
-    fn apply_room_visibility(&mut self) {
-        let visible = self.level.as_ref().and_then(|level| {
-            let (collision, exterior) = level.camera_physics.as_ref()?;
-            // Outdoor RMLs are grid sectors (0x5d1899, 0x5d18c4). The room
-            // array queried by the portal walk is populated by the indoor loader.
-            if *exterior {
-                return None;
-            }
-            crate::rooms::visible_rooms(&self.sim(), collision, &level.room_visibility)
-        });
-        if let Some(level) = self.level.as_mut() {
-            log::trace!("{}: visible rooms {:?}", level.layout, visible);
-            level.renderer.set_visible_rooms(visible);
         }
     }
 
@@ -2700,7 +2691,6 @@ impl Live {
         }
         self.set_shader_time();
         self.apply_cutaway(ctx);
-        self.apply_room_visibility();
         self.give_effect_lights(ctx);
         let aim = self.reticle(camera, (width, height), self.cursor);
         let format = self.format.unwrap_or(thedas_render::gpu::CAPTURE_FORMAT);
@@ -2870,7 +2860,6 @@ impl Live {
         }
         self.set_shader_time();
         self.apply_cutaway(ctx);
-        self.apply_room_visibility();
         self.give_effect_lights(ctx);
         let cut_effects = self.cut_effects();
         let aim = self.reticle(camera, (width, height), self.cursor);
@@ -3053,7 +3042,7 @@ impl Live {
                         .iter()
                         .map(|m| (m.clone(), [0.0; 3], 0.0))
                         .collect();
-                    Arc::new(thedas_sim::collision::load_placeables(vfs, &placed))
+                    Arc::new(thedas_sim::collision::load_camera_placeables(vfs, &placed))
                 });
                 if !collision.is_empty() {
                     camera_physics.push((m.id, collision.clone()));

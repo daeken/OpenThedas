@@ -89,8 +89,6 @@ pub mod field {
     pub const ROOM_BOUNDS_MAX: u32 = 3141;
 
     pub const RML_MODELS: u32 = 3050;
-    pub const RML_ADJACENT_ROOMS: u32 = 3047;
-    pub const RML_VISIBILITY_ROOMS: u32 = 3099;
     /// The rooms a room's lights also reach (DAOrigins.exe's room loader reads it into the
     /// room at `+0xc0`, 0x5d3c73; the lights' room test 0x53d210 searches it).
     pub const RML_LIGHT_ROOMS: u32 = 3164;
@@ -696,10 +694,6 @@ pub struct Rml {
     pub placements: Vec<Placement>,
     /// The trees, bushes and grass the room places.
     pub trees: Vec<TreePlacement>,
-    /// Candidate neighbouring rooms for visibility (3047, DAOrigins.exe 0x5d3b0a).
-    pub adjacent_rooms: Vec<i64>,
-    /// Rooms linked by sight through portals (3099, DAOrigins.exe 0x5d3bbe).
-    pub visibility_rooms: Vec<i64>,
     /// The other rooms (by [`ArlRoom::id`]) this room's lights and light probes reach
     /// (3164); a single -1 means every room. Its lights always reach the room itself.
     pub light_rooms: Vec<i64>,
@@ -776,17 +770,16 @@ impl Rml {
                 flag: d.opt_i64(t, field::TREE_FLAG)?.unwrap_or(0),
             });
         }
-        let room_ids = |field| {
-            d.numbers(root, field)
-                .map(|ids| ids.into_iter().map(|id| id as i64).collect())
-        };
+        let light_rooms = d
+            .numbers(root, field::RML_LIGHT_ROOMS)?
+            .into_iter()
+            .map(|v| v as i64)
+            .collect();
         Ok(Rml {
             transform,
             placements,
             trees,
-            adjacent_rooms: room_ids(field::RML_ADJACENT_ROOMS)?,
-            visibility_rooms: room_ids(field::RML_VISIBILITY_ROOMS)?,
-            light_rooms: room_ids(field::RML_LIGHT_ROOMS)?,
+            light_rooms,
         })
     }
 }
