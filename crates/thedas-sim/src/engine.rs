@@ -5497,8 +5497,18 @@ pub fn call(
             void()
         }
         "ClearThreatTable" => {
+            let retain =
+                h.sim.game == thedas_vfs::Game::DragonAge2 && a.len() > 1 && int(a, 1) == 0;
             if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
-                o.combat.threat.clear();
+                // 0x4e5cca -> 0x6c4e80: FALSE keeps the proximity term and IDs.
+                if retain {
+                    for entry in &mut o.combat.threat {
+                        entry.value = 0.0;
+                    }
+                    crate::threat::sort(&mut o.combat.threat);
+                } else {
+                    o.combat.threat.clear();
+                }
             }
             void()
         }
