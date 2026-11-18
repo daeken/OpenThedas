@@ -312,6 +312,18 @@ mod profile {
     }
 }
 
+fn global_x_bounds(movie: &mut UiMovie, get_bounds: &str) -> Option<(f64, f64)> {
+    let UiValue::Object(bounds) = movie.call(get_bounds, &[UiValue::Null]) else {
+        return None;
+    };
+    match (bounds.get("xMin"), bounds.get("xMax")) {
+        (Some(UiValue::Number(left)), Some(UiValue::Number(right))) if left < right => {
+            Some((*left, *right))
+        }
+        _ => None,
+    }
+}
+
 pub struct Stage {
     pub movies: Vec<UiMovie>,
     /// Where the mouse is (stage pixels), which a movie is told as it opens: a player takes
@@ -659,6 +671,56 @@ impl Stage {
     pub fn call_in(&mut self, movie: &str, path: &str, args: &[UiValue]) -> Option<UiValue> {
         let m = self.movies.iter_mut().find(|m| m.name == movie)?;
         Some(m.call(path, args))
+    }
+
+    /// Fits the tutorial's Codex tooltip over its panel so the edge of the translucent
+    /// panel does not cross the label. The movies center it above the button's hit area
+    /// and clamp it to the screen's safe zone. Add a panel inset for this button after
+    /// the movie has positioned and sized the tooltip.
+    pub fn fit_tutorial_codex_tooltip(&mut self) {
+        const PANEL: &str = "_root.TutorialContainer_mc.Fade_mc.Tutorial_mc.getBounds";
+        const DISPLAYED: &str =
+            "_root.TutorialContainer_mc.Fade_mc.Tutorial_mc.CodexButton_mc.IsDisplayed";
+        const SOURCE: &str =
+            "_root.TutorialContainer_mc.Fade_mc.Tutorial_mc.CodexButton_mc.TooltipSource";
+        const TIP_X: &str = "_root.SimpleFloatingTooltip_mc._x";
+        let Some(UiValue::String(text)) = self.bridge.value("GUITooltips.TooltipText") else {
+            return;
+        };
+        if text.is_empty() {
+            return;
+        }
+        let label = UiValue::String(text);
+        let Some(popup) = self.movies.iter_mut().find(|m| m.name == POPUP_LAYER) else {
+            return;
+        };
+        if popup.get(DISPLAYED) != UiValue::Bool(true) || popup.get(SOURCE) != label {
+            return;
+        }
+        let Some((panel_left, panel_right)) = global_x_bounds(popup, PANEL) else {
+            return;
+        };
+        let Some(tip) = self.movies.iter_mut().find(|m| m.name == "tooltips.gfx") else {
+            return;
+        };
+        if tip.get("_root.SimpleFloatingTooltip_mc.Text_mc.TextField.text") != label {
+            return;
+        }
+        // Both movies use the same centered, authored 1024 × 768 stage. Measure the
+        // background itself: the tooltip movie uses its inset HitArea_mc to position it.
+        let Some((tip_left, tip_right)) = global_x_bounds(
+            tip,
+            "_root.SimpleFloatingTooltip_mc.Background_mc.getBounds",
+        ) else {
+            return;
+        };
+        let shift = (panel_left - tip_left).ceil();
+        if shift > 0.0
+            && tip_right + shift <= panel_right
+            && let UiValue::Number(x) = tip.get(TIP_X)
+        {
+            tip.set(TIP_X, UiValue::Number(x + shift));
+        }
     }
 
     /// Whether one of the popup layer's dialog boxes is up.

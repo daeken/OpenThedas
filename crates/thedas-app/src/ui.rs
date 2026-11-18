@@ -2792,6 +2792,7 @@ impl UiLayer {
             self.stage
                 .call_in("tooltips.gfx", thedas_ui::avm1::TOOLTIP_RELAYOUT, &[]);
         }
+        self.stage.fit_tutorial_codex_tooltip();
         ready_conversation_responses(
             &mut messages,
             self.conversation_press.up && self.line.as_ref().is_some_and(Line::played),
