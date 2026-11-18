@@ -226,6 +226,9 @@ pub struct Object {
     pub base_appearance: Option<u16>,
     pub rank: i32,
     pub interactive: bool,
+    /// Origins' requested ambient interaction and its active animation phase.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interaction: Option<crate::interaction::Interaction>,
     /// Trigger polygon (XY used for containment).
     pub geometry: Vec<[f32; 3]>,
     /// Pending commands (front first).
@@ -327,6 +330,7 @@ impl Object {
             base_appearance: None,
             rank: 0,
             interactive: true,
+            interaction: None,
             geometry: Vec::new(),
             commands: Vec::new(),
             looping_animation: None,
@@ -405,6 +409,9 @@ pub struct Command {
     /// `COMMAND_TYPE_*`.
     pub ty: i32,
     pub name: String,
+    /// Execution metadata of an Origins ambient interaction; separate from script integers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interaction: Option<crate::interaction::CommandState>,
     /// AddCommand bStatic; native active-command clearing rules differ by game.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub is_static: bool,

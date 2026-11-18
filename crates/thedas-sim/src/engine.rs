@@ -3295,6 +3295,7 @@ pub fn call(
                 impacted: false,
                 arrived: false,
                 da2_target_prepared: false,
+                interaction: None,
                 da2_basic_attack_fallback: false,
                 da2_player_issued: false,
                 path: Vec::new(),
@@ -3488,6 +3489,9 @@ pub fn call(
                 c.cancellable_at = None;
                 c.cancellable = false;
                 c.da2_target_prepared = false;
+                if let Some(interaction) = c.interaction.as_mut() {
+                    interaction.stage = 0;
+                }
                 if c.name != "CommandMoveToMultiLocations" {
                     c.path.clear();
                 }
@@ -5248,6 +5252,53 @@ pub fn call(
         // interface; accepting a job is the screen's business.
         "ShowChantersGUI" => {
             h.sim.open_chanter_board(int(a, 0));
+            void()
+        }
+        "InteractWithObject" if h.sim.game == thedas_vfs::Game::Origins => {
+            let (who, target) = (obj(a, 0), obj(a, 1));
+            // 0x65c1e8: a failed first creature lookup stops the entire request.
+            if !h
+                .object(who)
+                .is_some_and(|o| o.kind == ObjectKind::Creature)
+            {
+                return void();
+            }
+            let settings = crate::interaction::Settings {
+                id: int(a, 2),
+                pose: a.get(3).map_or(1, |_| int(a, 3)),
+                loops: int(a, 4),
+                play_exit: a.get(5).is_none_or(|_| int(a, 5) != 0),
+            };
+            let Some(add) = h.sim.table.function_by_name("AddCommand").cloned() else {
+                return void();
+            };
+            for (actor, other, primary) in [(who, target, true), (target, who, false)] {
+                if let Some(command) =
+                    h.sim
+                        .request_interaction(actor, other, settings, primary, int(a, 6) != 0)
+                {
+                    let handle = h.sim.world.store(EngineData::Command(command));
+                    // 0x6a3a14: front insertion with table-selected add behavior.
+                    // Reuse the ordinary handler to preserve cancellation and statics.
+                    if let Err(error) = call(
+                        h,
+                        caller,
+                        &add,
+                        &[
+                            Value::Object(actor),
+                            Value::Engine {
+                                ty: ty.command,
+                                handle: Some(handle),
+                            },
+                            Value::Int(1),
+                            Value::Int(0),
+                            Value::Int(-1),
+                        ],
+                    )? {
+                        return Some(Err(error));
+                    }
+                }
+            }
             void()
         }
         "SetObjectInteractive" => {
@@ -14056,6 +14107,7 @@ mod tests {
                 impacted: false,
                 arrived: false,
                 da2_target_prepared: false,
+                interaction: None,
                 da2_basic_attack_fallback: false,
                 da2_player_issued: false,
                 path: vec![],

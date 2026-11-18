@@ -43,6 +43,7 @@ pub mod engine;
 mod engine_equality;
 pub mod fmath;
 mod heartbeat;
+pub mod interaction;
 pub mod inventory;
 pub mod journal;
 pub mod levelup;
