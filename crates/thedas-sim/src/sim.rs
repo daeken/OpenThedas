@@ -3965,7 +3965,7 @@ impl Sim {
         };
         self.world.following.remove(&id);
         if c.name == "CommandUseAbility" {
-            self.complete_da2_combat_target(id);
+            self.complete_combat_target(id);
         }
         if c.from.is_some() {
             self.da2_stop_locomotion(id);
@@ -4095,7 +4095,7 @@ impl Sim {
                             if let Some(o) = self.world.get_mut(id) {
                                 o.combat.previous_command = Some(o.commands.remove(slot));
                             }
-                            self.complete_da2_combat_target(id);
+                            self.complete_combat_target(id);
                             let mut ev = self.new_event("COMMAND_COMPLETE", Some(id));
                             ev.ints = vec![cmd.ty, if result == 1 { 1 } else { -3 }];
                             self.world.queue_event(APPROACH_CHECK_MS, id, ev, None);
@@ -4112,7 +4112,12 @@ impl Sim {
                             continue;
                         }
                     }
-                    self.prepare_da2_combat_target(id, &cmd);
+                    self.prepare_combat_target(id, &cmd);
+                    // Origins checks the complete payload after COMMAND_PENDING;
+                    // include preparation's execution marker in that comparison.
+                    if let Some(front) = self.world.get(id).and_then(|o| o.commands.first()) {
+                        cmd.da2_target_prepared = front.da2_target_prepared;
+                    }
                     // An attack asks its owner's script for the result first, which may
                     // also set how long it takes.
                     // An attacker out of reach walks up first (the attack starts when it
@@ -4753,7 +4758,7 @@ impl Sim {
             }
         }
         if cmd.name == "CommandUseAbility" {
-            self.complete_da2_combat_target(id);
+            self.complete_combat_target(id);
         }
         let continuing = if self.game == thedas_vfs::Game::Origins {
             self.continuing_animation(&cmd)
@@ -6150,6 +6155,7 @@ mod tests {
             command CommandWait(float seconds) = 1;\n\
             int AddCommand(object who, command cmd, int front, int fixed, int behavior) = 2;\n\
             command CommandAttack(object target) = 3;\n\
+            object GetAttackTarget(object who) = 4;\n\
             int GetLocalInt(object who, string name) = 63;\n\
             void SetLocalInt(object who, string name, int value) = 64;\n\
             int COMMAND_TYPE_ATTACK = 1;\n\
@@ -6380,6 +6386,7 @@ mod tests {
             };
             s.world.get_mut(who).unwrap().commands =
                 vec![active.clone(), waiting.clone(), must_finish.clone()];
+            s.world.get_mut(who).unwrap().combat.target = active.target;
             let incoming = Command {
                 ty: 39,
                 name: "CommandSheatheWeapons".into(),
@@ -6461,6 +6468,97 @@ mod tests {
         fresh.path.clear();
         assert_eq!(commands[1], fresh);
         assert_eq!(s.next_command(), Some((2000, who)));
+    }
+
+    #[test]
+    fn origins_conditional_add_uses_the_target_retained_during_a_wait() {
+        for incoming_target in [123, 456] {
+            let mut s = add_command_sim();
+            let who = s.world.spawn(ObjectKind::Creature, "actor");
+            let active = Command {
+                ty: 13,
+                name: "CommandWait".into(),
+                due: Some(2000),
+                ..Default::default()
+            };
+            let waiting = Command {
+                name: "CommandTurn".into(),
+                ..Default::default()
+            };
+            let actor = s.world.get_mut(who).unwrap();
+            actor.combat.target = Some(123);
+            actor.commands = vec![active, waiting.clone()];
+            let incoming = Command {
+                ty: 1,
+                name: "CommandAttack".into(),
+                target: Some(incoming_target),
+                ..Default::default()
+            };
+            add_command(&mut s, who, incoming.clone(), 0, 0, 3);
+            let expected = if incoming_target == 123 {
+                vec![waiting, incoming]
+            } else {
+                vec![incoming]
+            };
+            assert_eq!(s.world.get(who).unwrap().commands, expected);
+            assert_eq!(s.script_attack_target(who), Some(123));
+        }
+    }
+
+    #[test]
+    fn origins_completion_script_can_reattack_after_a_swing_or_failed_approach() {
+        for failed in [false, true] {
+            let mut s = add_command_sim();
+            let area = s.world.spawn(ObjectKind::Area, "arena");
+            let who = s.world.spawn(ObjectKind::Creature, "actor");
+            let target = s.world.spawn(ObjectKind::Creature, "target");
+            for id in [who, target] {
+                s.world.get_mut(id).unwrap().area = Some(area);
+            }
+            s.world.get_mut(target).unwrap().position = [30., 0., 0.];
+            s.order_attack(who, target);
+            s.next_command();
+            // Own completion script: re-attack the native remembered target.
+            // Use event dispatch so COMMAND_PENDING cannot run this callback.
+            s.world.tables.insert(
+                "#114",
+                &["Script"],
+                vec![(
+                    1004,
+                    vec![thedas_formats::gda::Cell::String("recover".into())],
+                )],
+            );
+            let mut code = Vec::new();
+            for value in [0_i32, 0, 0] {
+                code.extend([0x04, 0x03]);
+                code.extend(value.to_be_bytes());
+            }
+            code.extend([0x04, 0x06]);
+            code.extend(who.to_be_bytes());
+            code.extend([0x05, 0, 0, 4, 1, 0x05, 0, 0, 3, 1, 0x04, 0x06]);
+            code.extend(who.to_be_bytes());
+            code.extend([0x05, 0, 0, 2, 5, 0x1b, 0]);
+            code.extend((-4_i32).to_be_bytes());
+            code.extend([0x20, 0]);
+            let mut bytes = b"NCS V1.0B".to_vec();
+            bytes.extend(((13 + code.len()) as u32).to_be_bytes());
+            bytes.extend(code);
+            s.add_script("recover", Ncs::parse(&bytes).unwrap());
+            if failed {
+                s.fail_front_command(who, "COMMAND_FAILED_INVALID_PATH");
+            } else {
+                // A completed swing has no approach left to finish.
+                let command = &mut s.world.get_mut(who).unwrap().commands[0];
+                command.approach = None;
+                command.from = None;
+                s.finish_command(who);
+            }
+            s.tick(APPROACH_CHECK_MS);
+            assert!(s.world.trace.script_errors.is_empty());
+            let command = &s.world.get(who).unwrap().commands[0];
+            assert_eq!(command.name, "CommandAttack");
+            assert_eq!(command.target, Some(target), "failed={failed}");
+        }
     }
 
     #[test]

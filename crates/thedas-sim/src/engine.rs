@@ -3941,7 +3941,7 @@ pub fn call(
                     h.sim.da2_stop_locomotion(who);
                 }
                 if cmd.name == "CommandUseAbility" {
-                    h.sim.complete_da2_combat_target(who);
+                    h.sim.complete_combat_target(who);
                 }
                 let mut ev = h.sim.new_event("COMMAND_COMPLETE", Some(who));
                 ev.ints = vec![
@@ -3966,7 +3966,7 @@ pub fn call(
             });
             if let Some((ty, ability)) = running {
                 if ability {
-                    h.sim.complete_da2_combat_target(who);
+                    h.sim.complete_combat_target(who);
                 }
                 let mut ev = h.sim.new_event("COMMAND_COMPLETE", Some(who));
                 ev.ints = vec![ty, constant(&h.sim.table, "COMMAND_RESULT_INVALID")];
