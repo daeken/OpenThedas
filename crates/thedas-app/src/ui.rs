@@ -719,12 +719,18 @@ struct Line {
     cut_done: bool,
     /// Its own referenced cutscene has started. Automatic continuation waits for it.
     owns_cut: bool,
+    /// The cut showed this node's subtitle and began its voice.
+    resume_voice: bool,
 }
 
 impl Line {
-    fn set_voice_ms(&mut self, ms: Option<f64>) {
+    fn set_voice_ms(&mut self, ms: Option<f64>, voice_elapsed_ms: impl FnOnce() -> f64) {
         if self.voice_ms.is_none() && ms.is_some() {
-            self.voice_at = self.t;
+            self.voice_at = if self.resume_voice {
+                self.t - voice_elapsed_ms()
+            } else {
+                self.t
+            };
         }
         self.voice_ms = ms;
     }
@@ -845,9 +851,9 @@ impl UiLayer {
 
     /// The conversation line on screen speaks for this long (milliseconds; see
     /// [`crate::audio`]), or has no voice-over.
-    pub fn set_line_voice_ms(&mut self, ms: Option<f64>) {
+    pub fn set_line_voice_ms(&mut self, ms: Option<f64>, voice_elapsed_ms: impl FnOnce() -> f64) {
         if let Some(l) = self.line.as_mut() {
-            l.set_voice_ms(ms);
+            l.set_voice_ms(ms, voice_elapsed_ms);
         }
     }
 
@@ -2404,6 +2410,8 @@ impl UiLayer {
         sim: &Arc<Mutex<Sim>>,
         dt_ms: f64,
     ) -> Vec<thedas_ui::input::Aim> {
+        // An outro can end in this tick, after the screens have been reconciled.
+        let loading = self.loading.is_some() || self.travel_map;
         // The start menu offers loading when there are saves: they are listed from the start.
         if screens.front_end && !self.saves_listed {
             self.saves_listed = true;
@@ -2455,10 +2463,14 @@ impl UiLayer {
             let cutscene = sim.world.cutscene.is_some();
             let owns_cut =
                 sim.game == thedas_vfs::Game::Origins && sim.conversation_line_cutscene().is_some();
-            let line = thedas_ui::binding::conversation(&sim).map(|d| {
-                let key: LineKey = (d.dialog, d.line, d.replies.iter().map(|r| r.0).collect());
-                (key, waits, cutscene, owns_cut)
-            });
+            // An authored track owns the subtitle and voice while this cut plays. Start
+            // dialog timing at the handoff so a skip can still play an unfinished node.
+            let line = thedas_ui::binding::conversation(&sim)
+                .filter(|_| !sim.cutscene_controls_dialog_speech())
+                .map(|d| {
+                    let key: LineKey = (d.dialog, d.line, d.replies.iter().map(|r| r.0).collect());
+                    (key, waits, cutscene, owns_cut, sim.cut_line_speech())
+                });
             // Before a game, the start menu, or the screen it opened (options, the load
             // screen).
             let want = match (self.loading, screens.front_end, screens.menu) {
@@ -2488,7 +2500,7 @@ impl UiLayer {
             self.continue_pending = None;
         }
         self.line = match (line, self.line.take()) {
-            (Some((key, _, cutscene, owns_cut)), Some(mut l)) if l.key == key => {
+            (Some((key, _, cutscene, owns_cut, _)), Some(mut l)) if l.key == key => {
                 l.t += dt_ms;
                 l.cut_done |= l.cut_seen && !cutscene;
                 l.cut_done |= l.owns_cut && !owns_cut;
@@ -2496,14 +2508,19 @@ impl UiLayer {
                 l.owns_cut |= owns_cut;
                 Some(l)
             }
-            (Some((key, waits, cutscene, owns_cut)), _) => {
+            (Some((key, waits, cutscene, owns_cut, speech)), _) => {
+                use thedas_sim::dialog::CutLineSpeech;
                 log::debug!(
                     "conversation new line: {key:?} waits={waits} voiced={} cut={cutscene} owns_cut={owns_cut}",
                     self.line_voiced
                 );
                 Some(Line {
                     key,
-                    t: 0.0,
+                    t: if speech == CutLineSpeech::Complete {
+                        f64::INFINITY
+                    } else {
+                        0.0
+                    },
                     voice_ms: None,
                     voice_at: 0.0,
                     voiced: self.line_voiced,
@@ -2512,6 +2529,7 @@ impl UiLayer {
                     cut_seen: cutscene,
                     cut_done: false,
                     owns_cut,
+                    resume_voice: speech == CutLineSpeech::InProgress,
                 })
             }
             (None, _) => None,
@@ -2871,7 +2889,40 @@ impl UiLayer {
             }
         }
         self.update_drag_image();
+        self.update_status_messages(sim, loading);
         aims
+    }
+
+    fn update_status_messages(&mut self, sim: &Arc<Mutex<Sim>>, loading: bool) {
+        use thedas_ui::UiValue;
+
+        let movie = self
+            .stage
+            .movies
+            .iter_mut()
+            .find(|m| m.name == "floatylayer.gfx");
+        // Area-enter scripts can send the area's name behind a loading screen. Hold
+        // their messages through the outro so a direct handoff to the HUD can show
+        // them. A cutscene or another screen without the movie ends that handoff.
+        if loading && movie.is_none() {
+            return;
+        }
+        let messages = std::mem::take(
+            &mut sim
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .world
+                .status_messages,
+        );
+        // DAOrigins.exe 0x63c260 invokes the function on the registered live movie.
+        if let Some(movie) = movie {
+            for (text, colour) in messages {
+                movie.call(
+                    "_global.FloatyLayer.DisplayStatusMessage",
+                    &[UiValue::String(text), UiValue::Number(f64::from(colour))],
+                );
+            }
+        }
     }
 
     /// A left click while playing reached the interface: a conversation line still playing is
@@ -3260,7 +3311,6 @@ impl UiLayer {
             Vec::new(),
         );
         let portrait_messages;
-        let status_messages;
         let size = self.stage.size();
         let scale = thedas_ui::stage_scale(size, (1024.0, 768.0));
         let (w, h) = (size.0 as f32, size.1 as f32);
@@ -3344,7 +3394,6 @@ impl UiLayer {
                 });
             }
             portrait_messages = std::mem::take(&mut sim.world.portrait_messages);
-            status_messages = std::mem::take(&mut sim.world.status_messages);
             let mut per_target: std::collections::BTreeMap<u32, u32> = Default::default();
             self.floaties.retain_mut(|f| {
                 f.left_s -= dt_ms / 1000.0;
@@ -3494,16 +3543,6 @@ impl UiLayer {
                 &[UiValue::String(portrait_message_arg(
                     m.target, m.colour, &m.text,
                 ))],
-            );
-        }
-        // Status messages, as the exe hands them to the floaty layer (0x63c260):
-        // `FloatyLayer.DisplayStatusMessage` with the text and its colour. Provisional: that
-        // the script function reaches 0x63c260 (through the interface's virtual 0x5239d0) is
-        // inferred, not followed call by call.
-        for (text, colour) in status_messages {
-            self.stage.movies[movie].call(
-                &format!("{LAYER}.DisplayStatusMessage"),
-                &[UiValue::String(text), num(f64::from(colour))],
             );
         }
         let m = &mut self.stage.movies[movie];
@@ -4205,6 +4244,94 @@ mod tests {
 
     #[test]
     #[ignore = "requires THEDAS_INSTALL and an offscreen GPU"]
+    fn status_messages_survive_a_load_directly_to_the_hud() {
+        use thedas_ui::UiValue;
+
+        let mut ui = installed_popup_ui();
+        let sim = Sim::new(
+            ui.vfs.clone(),
+            Arc::new(thedas_script::EngineTable::default()),
+            1,
+        );
+        let sim = Arc::new(Mutex::new(sim));
+        ui.attach(&sim);
+        let mut screens = Screens::new(false);
+        let dt = 1000.0 / 30.0;
+        let count = |ui: &mut UiLayer| {
+            ui.stage.call_in(
+                "floatylayer.gfx",
+                "_global.StatusMessageRoller.StatusMessages.length.toString",
+                &[],
+            )
+        };
+        let queue = |text: &str| {
+            sim.lock()
+                .unwrap()
+                .world
+                .status_messages
+                .push((text.into(), 0xffffff));
+        };
+        let finish_load = |ui: &mut UiLayer, screens: &mut Screens, next| {
+            ui.loading_end();
+            for _ in 0..60 {
+                ui.play(screens, &sim, dt);
+                if screens.shown().contains(&next) {
+                    return;
+                }
+            }
+            panic!("loading did not reach {next:?}, got {:?}", screens.shown());
+        };
+
+        ui.loading_begin(LoadScreen::Light, None);
+        ui.play(&mut screens, &sim, dt);
+        assert!(screens.shown().contains(&Screen::LoadLight));
+        queue("Orzammar Commons");
+        ui.play(&mut screens, &sim, dt);
+        assert_eq!(count(&mut ui), None);
+        finish_load(&mut ui, &mut screens, Screen::Hud);
+        assert_eq!(count(&mut ui), Some(UiValue::String("1".into())));
+
+        ui.loading_begin(LoadScreen::Town, None);
+        ui.play(&mut screens, &sim, dt);
+        assert!(screens.shown().contains(&Screen::LoadTown));
+        queue("Dragon Age");
+        ui.play(&mut screens, &sim, dt);
+        sim.lock().unwrap().world.cutscene = Some(thedas_sim::cutscene::Cutscene {
+            name: "opening.cut".into(),
+            seconds: 1.0,
+            lines: Vec::new(),
+            elapsed_ms: 0,
+            from_dialog: false,
+            bound: Vec::new(),
+            placement: None,
+        });
+        finish_load(&mut ui, &mut screens, Screen::Cutscene);
+        assert_eq!(count(&mut ui), None);
+        queue("Cutscene status");
+        ui.play(&mut screens, &sim, dt);
+
+        {
+            let mut sim = sim.lock().unwrap();
+            sim.world.cutscene = None;
+            sim.world.training.step = 1;
+        }
+        for _ in 0..20 {
+            ui.play(&mut screens, &sim, dt);
+        }
+        assert!(screens.shown().contains(&Screen::Hud));
+        assert_eq!(
+            popup_property(&mut ui, "_root.TrainingTutorial_mc._visible"),
+            UiValue::Bool(true)
+        );
+        assert_eq!(count(&mut ui), Some(UiValue::String("0".into())));
+
+        queue("HUD status");
+        ui.play(&mut screens, &sim, dt);
+        assert_eq!(count(&mut ui), Some(UiValue::String("1".into())));
+    }
+
+    #[test]
+    #[ignore = "requires THEDAS_INSTALL and an offscreen GPU"]
     fn journal_close_message_does_not_reopen_its_movie() {
         let mut ui = installed_popup_ui();
         let sim = Arc::new(Mutex::new(Sim::new(
@@ -4795,6 +4922,7 @@ mod tests {
             cut_seen: false,
             cut_done: false,
             owns_cut: false,
+            resume_voice: false,
         }
     }
 
@@ -4816,10 +4944,10 @@ mod tests {
     fn a_delayed_voice_plays_from_its_start_not_the_dialogs_start() {
         let mut line = timing_line("A line chosen behind a loading screen.", true);
         line.t = 5000.0;
-        line.set_voice_ms(Some(2000.0));
+        line.set_voice_ms(Some(2000.0), || 0.0);
         assert!(!line.played());
         line.t = 6000.0;
-        line.set_voice_ms(Some(2000.0));
+        line.set_voice_ms(Some(2000.0), || 0.0);
         assert_eq!(
             line.voice_at, 5000.0,
             "later frames must not restart the clock"
@@ -4827,6 +4955,17 @@ mod tests {
         line.t = 6999.0;
         assert!(!line.played());
         line.t = 7000.0;
+        assert!(line.played());
+    }
+
+    #[test]
+    fn an_interrupted_cut_voice_keeps_its_playback_position() {
+        let mut line = timing_line("", true);
+        line.resume_voice = true;
+        line.set_voice_ms(Some(2000.0), || 1400.0);
+        line.t = 599.0;
+        assert!(!line.played());
+        line.t = 600.0;
         assert!(line.played());
     }
 
@@ -4867,6 +5006,7 @@ mod tests {
             cut_seen: true,
             cut_done: false,
             owns_cut: true,
+            resume_voice: false,
         };
         // Oskias node 17 has a 2.976 s voice and a 3.217 s cut. Presentation time
         // can also run ahead of the cut's capped simulation clock on slow frames.

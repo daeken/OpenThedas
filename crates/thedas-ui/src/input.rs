@@ -851,6 +851,7 @@ mod tests {
             chain: Vec::new(),
             cut_from: None,
             cut_lines_left: 0,
+            cut_line_speech: thedas_sim::dialog::CutLineSpeech::Dialog,
             staged: Vec::new(),
             staged_at: None,
             ambient_run: false,

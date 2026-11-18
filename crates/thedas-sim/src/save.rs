@@ -54,7 +54,9 @@ pub const SAVE_FORMAT: u32 = 1;
 ///   death-blow commands restart preparation when loaded.
 /// - 12: Origins visual effects bypass script validation. Earlier saves can have
 ///   already-spawned creatures without their appearance's crust; restore missing crusts.
-pub const SAVE_REVISION: u32 = 12;
+/// - 13: Origins retains its prepared combat target between commands. Earlier active
+///   attacks in combat recover their explicit target; idle queues have no history to recover.
+pub const SAVE_REVISION: u32 = 13;
 
 /// The trace channel loading reports save damage on.
 pub const SAVE_CHANNEL: i32 = -7;
@@ -327,7 +329,37 @@ impl Sim {
         // not traced.
         world.alerts.clear();
         world.uber_alerts.clear();
+        if self.game == thedas_vfs::Game::Origins
+            && let Some(cut) = world.cutscene.as_mut()
+            && cut.from_dialog
+            && !cut.lines.is_empty()
+            && cut.lines.iter().all(|line| !line.explicit_text)
+            && let Ok((data, _)) = self.vfs.read(&cut.name)
+            && let Some(authored) = crate::cutscene::Cutscene::parse(&data, &cut.name)
+        {
+            cut.restore_explicit_lines(&authored);
+        }
         self.world = world;
+        if self.game == thedas_vfs::Game::Origins && save_revision < 13 {
+            for object in self.world.objects.values_mut() {
+                if object.kind == crate::world::ObjectKind::Creature
+                    && let Some(command) = object.commands.first_mut()
+                    && command.name == "CommandAttack"
+                    && command.due.is_some()
+                    && !command.da2_target_prepared
+                {
+                    // An active attack has already prepared its explicit target.
+                    // Preserve an existing register and combat-exit clears. Older
+                    // idle/wait queues cannot tell us what was attacked before them.
+                    if object.combat.in_combat && object.combat.target.is_none() {
+                        object.combat.target = command
+                            .target
+                            .filter(|&target| target != thedas_script::vm::OBJECT_INVALID);
+                    }
+                    command.da2_target_prepared = true;
+                }
+            }
+        }
         self.restore_da2_encounters();
         self.restore_script_heartbeats();
         self.repair_body_bags();
@@ -768,6 +800,7 @@ mod tests {
             chain: Vec::new(),
             cut_from: None,
             cut_lines_left: 0,
+            cut_line_speech: crate::dialog::CutLineSpeech::Dialog,
             staged: Vec::new(),
             staged_at: None,
             ambient_run: false,
