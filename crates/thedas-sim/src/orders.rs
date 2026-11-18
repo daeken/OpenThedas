@@ -130,6 +130,7 @@ impl Sim {
 
     /// Counts an order the player gave `who` (see [`Sim::fail_blocked`]).
     pub(crate) fn note_player_order(&mut self, who: ObjectId) {
+        self.world.following.remove(&who);
         self.da2_stop_locomotion(who);
         if let Some(o) = self.world.get_mut(who) {
             o.combat.player_orders += 1;
@@ -298,7 +299,13 @@ impl Sim {
         self.note_player_order(who);
         let mut then = command(self, "COMMAND_TYPE_USE_OBJECT", "CommandUseObject");
         then.target = Some(target);
-        self.approach_then(who, target, then);
+        if self.game == thedas_vfs::Game::Origins {
+            if let Some(o) = self.world.get_mut(who) {
+                o.commands = vec![then];
+            }
+        } else {
+            self.approach_then(who, target, then);
+        }
     }
 
     /// Replaces `who`'s queue with a walk to within reach of `target`, when it is not already
@@ -414,6 +421,50 @@ mod tests {
             .unwrap()
             .facing;
         assert!(f.abs() < 1e-3 || (f - 360.0).abs() < 1e-3, "{f}");
+    }
+
+    #[test]
+    fn doors_regression_c_placeables_do_not_use_creature_appearance_radii() {
+        use thedas_formats::gda::Cell;
+        let (mut s, hero, door) = sim();
+        s.world.get_mut(door).unwrap().kind = ObjectKind::Placeable;
+        s.world.get_mut(door).unwrap().appearance = 82;
+        let tables = crate::m2da::Tables::empty();
+        tables.insert(
+            "apr_base",
+            &["ID", "PERSPACE"],
+            vec![(82, vec![Cell::Int(82), Cell::Float(3.0)])],
+        );
+        s.world.tables = Arc::new(tables);
+        assert_eq!(s.body_radius(door), crate::combat::DEFAULT_RADIUS);
+        assert_eq!(s.body_radius(hero), crate::combat::DEFAULT_RADIUS);
+    }
+
+    #[test]
+    fn doors_regression_c_scripted_use_approaches_before_sending_use() {
+        let (mut s, hero, target) = sim();
+        s.table = Arc::new(
+            EngineTable::parse(b"int EVENT_TYPE_USE = 14;\nint COMMAND_TYPE_USE_OBJECT = 31;\n")
+                .unwrap(),
+        );
+        s.world.get_mut(target).unwrap().kind = ObjectKind::Placeable;
+        let mut c = command(&s, "COMMAND_TYPE_USE_OBJECT", "CommandUseObject");
+        c.target = Some(target);
+        s.world.get_mut(hero).unwrap().commands.push(c);
+        s.world.trace.keep = true;
+        s.tick(500);
+        assert!(
+            s.world.get(hero).unwrap().position[0] > 0.0,
+            "the use command did not walk"
+        );
+        assert!(
+            !s.world
+                .trace
+                .entries
+                .iter()
+                .any(|e| matches!(e, crate::trace::TraceEntry::Command {command,status,..} if command=="CommandUseObject" && status=="complete")),
+            "USE completed from ten metres away"
+        );
     }
 
     #[test]
