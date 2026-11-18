@@ -46,6 +46,54 @@ pub(crate) fn texture(
     })
 }
 
+/// Bounds outside which a filtered picture remains transparent. Match the box
+/// kernels' scaled widths and repeated passes, with room for fractional sampling.
+pub(crate) fn picture_bounds(mut r: [f32; 4], filters: &[Filter], scale: f32) -> [f32; 4] {
+    if r[0] >= r[2] || r[1] >= r[3] {
+        return r;
+    }
+    for f in filters {
+        let (blur, passes, offset) = match *f {
+            Filter::Blur { blur, passes } | Filter::Glow { blur, passes, .. } => {
+                (blur, passes, (0.0, 0.0))
+            }
+            Filter::DropShadow {
+                blur,
+                passes,
+                angle,
+                distance,
+                ..
+            } => (
+                blur,
+                passes,
+                (
+                    angle.cos() * distance * scale,
+                    angle.sin() * distance * scale,
+                ),
+            ),
+            Filter::Other(_) => continue,
+        };
+        let pad = |width: f32| {
+            let width = ((width - 1.0) * scale + 1.0).clamp(1.0, 255.0);
+            if width <= 1.0 {
+                0.0
+            } else {
+                (((width - 1.0) * 0.5).ceil() + 1.0) * passes as f32
+            }
+        };
+        let (x, y) = (pad(blur.0), pad(blur.1));
+        // Keeping the unshifted source too is conservative for inner, knockout and
+        // hide-object filters, and avoids changing any of their edge pixels.
+        r = [
+            r[0].min(r[0] - x + offset.0),
+            r[1].min(r[1] - y + offset.1),
+            r[2].max(r[2] + x + offset.0),
+            r[3].max(r[3] + y + offset.1),
+        ];
+    }
+    [r[0].floor(), r[1].floor(), r[2].ceil(), r[3].ceil()]
+}
+
 impl Filters {
     pub(crate) fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
         let image = |binding| wgpu::BindGroupLayoutEntry {
