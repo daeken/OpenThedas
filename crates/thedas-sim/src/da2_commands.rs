@@ -145,7 +145,7 @@ impl Sim {
                     self.da2_stop_locomotion(who);
                 }
                 if old.name == "CommandUseAbility" {
-                    self.complete_da2_combat_target(who);
+                    self.complete_combat_target(who);
                 }
                 let result = constant(&self.table, "COMMAND_FAILED_COMMAND_CLEARED");
                 let mut event = self.new_event("COMMAND_COMPLETE", Some(who));

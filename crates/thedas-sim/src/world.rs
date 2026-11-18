@@ -409,8 +409,9 @@ pub struct Command {
     /// For player talk: its required approach succeeded, so dialogue can execute.
     #[serde(default)]
     pub arrived: bool,
-    /// DA2's combat-target preparation has run for this command, before approach.
+    /// Combat-target preparation has run for this command, before approach.
     /// Keep it across save/reload so a later combat exit is not undone on arrival.
+    /// The historical field name is retained for save compatibility.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub da2_target_prepared: bool,
     /// Native DA2 command boolean 2, forwarded to CHOOSE_BASIC_ATTACK integer 2.

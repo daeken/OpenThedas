@@ -54,7 +54,8 @@ existing death transition also leaves no combat target when leaving combat.
 No target validity filter is added to the getter: authored scripts own that
 decision. Old snapshots default to no stored target; nothing invents historical
 preparation when loading an old save. An absent target is omitted from JSON.
-Origins keeps its existing queue-based getter and does not populate the field.
+Origins now also uses this field, with its separately traced preparation and
+clear rules; see [Origins target lifetime](origins-combat-target.md).
 
 Preparation records the target before approach and before `COMMAND_PENDING`;
 basic attack selection now also precedes approach. A per-command marker survives
