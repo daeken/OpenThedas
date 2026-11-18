@@ -211,7 +211,7 @@ pub struct Sim {
 pub const MAX_DEPTH: usize = 24;
 
 /// The length of a route from `from` through `points`.
-fn path_length(from: [f32; 3], points: &[[f32; 3]]) -> f32 {
+pub(crate) fn path_length(from: [f32; 3], points: &[[f32; 3]]) -> f32 {
     let mut prev = from;
     let mut len = 0.0;
     for &p in points {
@@ -2745,6 +2745,7 @@ impl Sim {
                 impacted: false,
                 arrived: false,
                 da2_target_prepared: false,
+                interaction: None,
                 da2_basic_attack_fallback: false,
                 da2_player_issued: false,
                 path: Vec::new(),
@@ -3379,7 +3380,9 @@ impl Sim {
                         c.due = Some(now);
                         c.from = Some((here, now));
                         c.path = vec![here];
-                        if c.name == "CommandInitiateDialog" {
+                        if c.name == crate::interaction::COMMAND
+                            || c.name == "CommandInitiateDialog"
+                        {
                             c.approach = Some(here);
                         }
                     }
@@ -3510,6 +3513,9 @@ impl Sim {
         let Some(c) = o.commands.first() else {
             return false;
         };
+        if self.game == thedas_vfs::Game::Origins && c.name == crate::interaction::COMMAND {
+            return self.interaction_object_arrived(id);
+        }
         if c.name != "CommandInitiateDialog" && !c.name.starts_with("CommandMoveToObject") {
             return false;
         }
@@ -3644,37 +3650,34 @@ impl Sim {
     }
 
     /// Resolve the placeable's use slot before dispatching USE, including script orders.
-    fn use_approach(&mut self, id: ObjectId, cmd: &Command) -> Approach {
-        let Some(target) = cmd.target else {
-            return Approach::InReach;
-        };
-        let (Some(me), Some(other)) = (self.world.get(id), self.world.get(target)) else {
-            return Approach::InReach;
-        };
+    pub(crate) fn placeable_use_walk(
+        &mut self,
+        id: ObjectId,
+        target: ObjectId,
+    ) -> Option<(f32, [f32; 3])> {
+        let (me, other) = (self.world.get(id)?, self.world.get(target)?);
         if me.area != other.area || other.kind != ObjectKind::Placeable {
-            return Approach::InReach;
+            return None;
         }
         let from = me.position;
-        let Some(point) = self.placeable_use_point(id, target) else {
-            return Approach::InReach;
-        };
+        let point = self.placeable_use_point(id, target)?;
         // The actor's controller clearance around the use point, not an apr_base
         // row accidentally indexed by the placeable's appearance number.
         // Provisional margin until the native slot tolerance is fully recovered.
         let reach = self.capsule_radius(id) + crate::orders::INTERACT_GAP;
         let d = crate::engine::dist(from, point);
         if d <= reach + 0.05 {
-            return Approach::InReach;
+            return None;
         }
         let k = (d - reach) / d;
-        Approach::Walk(
+        Some((
             d - reach,
             [
                 from[0] + (point[0] - from[0]) * k,
                 from[1] + (point[1] - from[1]) * k,
                 from[2] + (point[2] - from[2]) * k,
             ],
-        )
+        ))
     }
 
     /// Where an attacker goes before its attack can start. Ranged attackers stop at range
@@ -4037,7 +4040,9 @@ impl Sim {
                 }
                 let c = o.commands.first()?;
                 Some(match c.due {
-                    Some(d) if !da2 => (o.id, Some(d), None),
+                    Some(d) if !da2 && c.name != crate::interaction::COMMAND => {
+                        (o.id, Some(d), None)
+                    }
                     _ => (o.id, None, Some(c.clone())),
                 })
             })
@@ -4067,6 +4072,14 @@ impl Sim {
             if commands_prepared
                 && self.world.get(id).and_then(|o| o.commands.first()) != Some(&cmd)
             {
+                continue;
+            }
+            if self.game == thedas_vfs::Game::Origins && cmd.name == crate::interaction::COMMAND {
+                if let Some(due) = self.interaction_deadline(id)
+                    && best.is_none_or(|(b, bid)| (due, id) < (b, bid))
+                {
+                    best = Some((due, id));
+                }
                 continue;
             }
             let due = match cmd.due {
@@ -4153,7 +4166,11 @@ impl Sim {
                     // So does a caster out of its ability's range.
                     let approach = match cmd.name.as_str() {
                         "CommandInitiateDialog" => Some(self.talk_approach(id, &cmd)),
-                        "CommandUseObject" if !da2 => Some(self.use_approach(id, &cmd)),
+                        "CommandUseObject" if !da2 => Some(
+                            cmd.target
+                                .and_then(|target| self.placeable_use_walk(id, target))
+                                .map_or(Approach::InReach, |(d, p)| Approach::Walk(d, p)),
+                        ),
                         "CommandAttack" => Some(self.approach_point(id, &cmd)),
                         "CommandUseAbility"
                             if self.game == thedas_vfs::Game::DragonAge2
@@ -4550,6 +4567,16 @@ impl Sim {
 
     /// Completes an object's front command: applies its movement and tells the object.
     fn finish_command(&mut self, id: ObjectId) {
+        if self.game == thedas_vfs::Game::Origins
+            && self.world.get(id).is_some_and(|o| {
+                o.commands
+                    .first()
+                    .is_some_and(|c| c.name == crate::interaction::COMMAND)
+            })
+            && self.advance_interaction(id)
+        {
+            return;
+        }
         let pending_goal = self.world.get(id).and_then(|o| {
             let c = o.commands.first()?;
             if !c.name.starts_with("CommandMoveTo") || c.from.is_none() || c.path.is_empty() {
@@ -7941,6 +7968,7 @@ mod tests {
             impacted: false,
             arrived: false,
             da2_target_prepared: false,
+            interaction: None,
             da2_basic_attack_fallback: false,
             da2_player_issued: false,
             path: Vec::new(),
@@ -8826,6 +8854,7 @@ mod tests {
             impacted: false,
             arrived: false,
             da2_target_prepared: false,
+            interaction: None,
             da2_basic_attack_fallback: false,
             da2_player_issued: false,
             path: Vec::new(),
@@ -9143,6 +9172,7 @@ mod tests {
             impacted: false,
             arrived: false,
             da2_target_prepared: false,
+            interaction: None,
             da2_basic_attack_fallback: false,
             da2_player_issued: false,
             path: Vec::new(),
@@ -9191,6 +9221,7 @@ mod tests {
             impacted: false,
             arrived: false,
             da2_target_prepared: false,
+            interaction: None,
             da2_basic_attack_fallback: false,
             da2_player_issued: false,
             path: Vec::new(),
@@ -9313,6 +9344,7 @@ mod tests {
             impacted: false,
             arrived: false,
             da2_target_prepared: false,
+            interaction: None,
             da2_basic_attack_fallback: false,
             da2_player_issued: false,
             path: Vec::new(),
@@ -9521,6 +9553,7 @@ mod tests {
                 impacted: false,
                 arrived: false,
                 da2_target_prepared: false,
+                interaction: None,
                 da2_basic_attack_fallback: false,
                 da2_player_issued: false,
                 path: Vec::new(),
@@ -9577,6 +9610,7 @@ mod tests {
             impacted: false,
             arrived: false,
             da2_target_prepared: false,
+            interaction: None,
             da2_basic_attack_fallback: false,
             da2_player_issued: false,
             path: Vec::new(),
@@ -9727,6 +9761,7 @@ mod tests {
             impacted: false,
             arrived: false,
             da2_target_prepared: false,
+            interaction: None,
             da2_basic_attack_fallback: false,
             da2_player_issued: false,
             path: Vec::new(),
@@ -9799,6 +9834,7 @@ mod tests {
             impacted: false,
             arrived: false,
             da2_target_prepared: false,
+            interaction: None,
             da2_basic_attack_fallback: false,
             da2_player_issued: false,
             path: Vec::new(),
@@ -9855,6 +9891,7 @@ mod tests {
             impacted: false,
             arrived: false,
             da2_target_prepared: false,
+            interaction: None,
             da2_basic_attack_fallback: false,
             da2_player_issued: false,
             path: Vec::new(),
@@ -10087,6 +10124,7 @@ mod tests {
                 impacted: false,
                 arrived: false,
                 da2_target_prepared: false,
+                interaction: None,
                 da2_basic_attack_fallback: false,
                 da2_player_issued: false,
                 path: Vec::new(),
@@ -10119,6 +10157,7 @@ mod tests {
             impacted: false,
             arrived: false,
             da2_target_prepared: false,
+            interaction: None,
             da2_basic_attack_fallback: false,
             da2_player_issued: false,
             path: Vec::new(),
@@ -10205,6 +10244,7 @@ mod tests {
             impacted: false,
             arrived: false,
             da2_target_prepared: false,
+            interaction: None,
             da2_basic_attack_fallback: false,
             da2_player_issued: false,
             path: Vec::new(),
@@ -10275,6 +10315,7 @@ mod tests {
             impacted: false,
             arrived: false,
             da2_target_prepared: false,
+            interaction: None,
             da2_basic_attack_fallback: false,
             da2_player_issued: false,
             path: Vec::new(),
@@ -10506,6 +10547,7 @@ mod tests {
             impacted: false,
             arrived: false,
             da2_target_prepared: false,
+            interaction: None,
             da2_basic_attack_fallback: false,
             da2_player_issued: false,
             path: Vec::new(),

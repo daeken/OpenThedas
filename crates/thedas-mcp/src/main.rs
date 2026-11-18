@@ -1993,6 +1993,7 @@ impl Server {
                 impacted: false,
                 arrived: false,
                 da2_target_prepared: false,
+                interaction: None,
                 da2_basic_attack_fallback: false,
                 da2_player_issued: false,
                 path: Vec::new(),

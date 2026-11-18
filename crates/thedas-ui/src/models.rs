@@ -1003,6 +1003,22 @@ fn creature_motion(sim: &Sim, o: &Object, standing: bool) -> Option<Motion> {
                 blend: Vec::new(),
             });
         }
+        if sim.game == thedas_vfs::Game::Origins
+            && c.name == thedas_sim::interaction::COMMAND
+            && c.interaction.as_ref().is_some_and(|m| m.stage == 2)
+            && let Some(playback) = o.interaction.as_ref().and_then(|s| s.playback.as_ref())
+            && let Some(action) = sim.world.tables().get(0, "").and_then(|table| {
+                text(table.cell_by_hash(COL_ANIM_ACTION, i64::from(playback.animation)))
+            })
+        {
+            return Some(Motion {
+                trees: trees(&[&ambient, &combat]),
+                actions: vec![action.to_ascii_lowercase(), action::PAUSE.into()],
+                time: secs(now.saturating_sub(playback.started)),
+                looping: playback.looping,
+                blend: Vec::new(),
+            });
+        }
         if c.name == "CommandPlayAnimation"
             && let Some(m) = played_animation(sim, o, c, &trees(&[&ambient, &combat]))
         {
@@ -1495,6 +1511,72 @@ pub fn area_models_cached(sim: &Sim, area: ObjectId, cache: &mut ModelCache) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interaction_motion_uses_its_phase_clock_and_stops_with_the_command() {
+        use std::sync::Arc;
+        use thedas_script::EngineTable;
+        use thedas_sim::interaction::{
+            COMMAND, COMMAND_TYPE, CommandState, Interaction, Playback, Settings,
+        };
+        use thedas_vfs::Vfs;
+        let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(EngineTable::default()), 1);
+        s.world.tables().insert(
+            "apr_base",
+            &["#500976ec"],
+            vec![(0, vec![Cell::String("humanoid.anb".into())])],
+        );
+        s.world.tables().insert(
+            "#0",
+            &["#7a398af9"],
+            vec![(700, vec![Cell::String("seat_loop".into())])],
+        );
+        let id = s.world.spawn(ObjectKind::Creature, "actor");
+        let settings = Settings {
+            id: 1,
+            pose: 1,
+            loops: -1,
+            play_exit: true,
+        };
+        let o = s.world.get_mut(id).unwrap();
+        o.interaction = Some(Interaction {
+            requested: settings,
+            playback: Some(Playback {
+                applied: settings,
+                phase: 1,
+                animation: 700,
+                started: 1000,
+                looping: true,
+            }),
+        });
+        o.commands.push(thedas_sim::world::Command {
+            name: COMMAND.into(),
+            ty: COMMAND_TYPE,
+            due: Some(u64::MAX),
+            interaction: Some(CommandState {
+                stage: 2,
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        s.world.time_ms = 1500;
+        let m = motion(&s, s.world.get(id).unwrap()).unwrap();
+        assert_eq!(m.trees, vec!["humanoid.anb"]);
+        assert_eq!(m.actions[0], "seat_loop");
+        assert_eq!(m.time, 0.5);
+        assert!(m.looping);
+        assert_eq!(
+            standing_motion(&s, s.world.get(id).unwrap())
+                .unwrap()
+                .actions,
+            vec![action::PAUSE]
+        );
+        s.world.get_mut(id).unwrap().commands.clear();
+        assert_eq!(
+            motion(&s, s.world.get(id).unwrap()).unwrap().actions,
+            vec![action::PAUSE]
+        );
+    }
 
     #[test]
     fn ring_weapon_queries_script_draw_invalidates_attachment_cache() {
