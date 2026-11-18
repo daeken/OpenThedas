@@ -2048,6 +2048,8 @@ impl App {
         if let Some(live) = self.live.as_mut() {
             // Transitions and journeys run behind their loading screens. Training can
             // deliver script events while its lesson holds the simulation clock.
+            // A zero-time automation frame settles direct UI callbacks only. Leave queued
+            // simulation events for the next eligible positive-duration frame.
             if (dt > 0.0 || self.control_step_ms.is_none())
                 && (!stopped || live.transition_pending() || live.journey() || live.training())
             {
@@ -4346,18 +4348,14 @@ impl App {
                 log.push(format!("key {code:?} {}", if down { "down" } else { "up" }));
             }
             &Step::PhysicalKey(code, down) => {
-                let name = format!("{code:?}");
-                let text = name
-                    .strip_prefix("Key")
-                    .or_else(|| name.strip_prefix("Digit"))
-                    .filter(|s| s.len() == 1)
-                    .map(str::to_ascii_lowercase);
                 let state = if down {
                     ElementState::Pressed
                 } else {
                     ElementState::Released
                 };
-                if self.window_key(code, text.as_deref(), state, false) {
+                // A physical key doesn't imply a character or a keyboard layout.
+                // Clients send literal characters with `text` or `windowkey`.
+                if self.window_key(code, None, state, false) {
                     self.quit = true;
                 }
                 if code == KeyCode::ShiftLeft
@@ -5422,6 +5420,16 @@ impl ApplicationHandler for App {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
+        // Only control clients drive input in fixed-clock mode. In particular, a
+        // native focus change must not clear held synthetic keys or the UI pointer.
+        if self.control_step_ms.is_some()
+            && !matches!(
+                event,
+                WindowEvent::CloseRequested | WindowEvent::Resized(_) | WindowEvent::RedrawRequested
+            )
+        {
+            return;
+        }
         // Mod mode's panels see input first while they are up (see [`modmode`]).
         if let (Some(m), Some(g)) = (self.mod_mode.as_mut(), self.gfx.as_ref()) {
             match m.window_event(&g.window, &event) {
@@ -7078,6 +7086,16 @@ fn main() -> Result<()> {
     ));
     raise_open_file_limit();
     let mut args = Args::parse();
+    if args.control_step_ms.is_some() {
+        anyhow::ensure!(
+            std::env::var_os("THEDAS_HIDDEN_WINDOW").is_some(),
+            "--control-step-ms requires THEDAS_HIDDEN_WINDOW=1"
+        );
+        anyhow::ensure!(
+            !args.audio && args.audio_wav.is_none(),
+            "--control-step-ms cannot be combined with --audio or --audio-wav"
+        );
+    }
     thedas_render::set_soft_shadows(args.soft_shadows == "on");
     if let Some(mode) = args
         .lighting
@@ -7100,7 +7118,7 @@ fn main() -> Result<()> {
         upload::set_automated();
     }
     // A newer build an update fetched takes over from the one the player started.
-    if args.capture.is_none() && args.check_report.is_none() {
+    if args.control_step_ms.is_none() && args.capture.is_none() && args.check_report.is_none() {
         if let Some(exe) = update::newest_build() {
             match std::process::Command::new(&exe)
                 .args(std::env::args_os().skip(1))

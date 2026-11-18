@@ -28,11 +28,12 @@
 //! Every reply has `"ok"`; failures carry `"error"`. Input reaches the simulation only as
 //! the player's own does (orders, interface clicks), so it stays deterministic.
 //!
-//! `--control-step-ms 20` opts into a fixed clock: only `run` advances time, including
-//! UI/presentation time; input settles before acknowledgement and loading workers consume
-//! no game time. Idle queries do not advance the game. `input` also accepts literal
-//! `text` or a physical `key` (optional boolean `down`, otherwise a tap), instead of
-//! `steps`. `quit` exits gracefully. Normal interactive timing is unchanged.
+//! `--control-step-ms 20` opts a hidden, audio-off session into a fixed clock. Only
+//! `run` advances that clock; loading workers consume none of a run's time. Send one
+//! request at a time to observe input after its zero-time UI frame. Queued simulation
+//! events wait for a positive frame. `input` accepts literal `text` or a physical `key`
+//! with no printable text (optional boolean `down`, otherwise a tap), instead of `steps`.
+//! `quit` exits gracefully. Normal interactive timing is unchanged.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
