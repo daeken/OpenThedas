@@ -5425,7 +5425,9 @@ impl ApplicationHandler for App {
         if self.control_step_ms.is_some()
             && !matches!(
                 event,
-                WindowEvent::CloseRequested | WindowEvent::Resized(_) | WindowEvent::RedrawRequested
+                WindowEvent::CloseRequested
+                    | WindowEvent::Resized(_)
+                    | WindowEvent::RedrawRequested
             )
         {
             return;
