@@ -409,8 +409,9 @@ pub struct Command {
     /// For player talk: its required approach succeeded, so dialogue can execute.
     #[serde(default)]
     pub arrived: bool,
-    /// DA2's combat-target preparation has run for this command, before approach.
+    /// Combat-target preparation has run for this command, before approach.
     /// Keep it across save/reload so a later combat exit is not undone on arrival.
+    /// The historical field name is retained for save compatibility.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub da2_target_prepared: bool,
     /// Native DA2 command boolean 2, forwarded to CHOOSE_BASIC_ATTACK integer 2.
@@ -864,6 +865,13 @@ pub struct World {
     /// controlling. For playing without a player.
     #[serde(default)]
     pub autopilot: bool,
+    /// Active party-follow moves and the next half-second follow update. Keeping
+    /// these with the world prevents a load/preview from retaining another
+    /// world's future timer or misclassifying a saved follow move as a script order.
+    #[serde(default)]
+    pub(crate) following: std::collections::BTreeSet<ObjectId>,
+    #[serde(default)]
+    pub(crate) next_follow_ms: u64,
     /// Followers waiting in the party pool get the experience the hero gets (see
     /// `Sim::share_pool_xp`). Off by default: provisional, no script does it.
     #[serde(default)]
@@ -1102,6 +1110,8 @@ impl World {
             zoom_request: None,
             difficulty: normal_difficulty(),
             autopilot: false,
+            following: Default::default(),
+            next_follow_ms: 0,
             pool_xp: false,
             destroy_at: Vec::new(),
             corpse_decay_max_ms: crate::decay::DEFAULT_MAX_MS,
