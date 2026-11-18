@@ -60,6 +60,9 @@ pub struct CutsceneLine {
     /// Provisional.
     #[serde(default)]
     pub vo_mode: u8,
+    /// An ASLN with its own TLK reference.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub explicit_text: bool,
 }
 
 /// A cutscene, and how far it has played.
@@ -151,6 +154,7 @@ impl Cutscene {
                     actor: name.clone(),
                     conversation,
                     vo_mode,
+                    explicit_text: true,
                 });
             }
         }
@@ -177,6 +181,30 @@ impl Cutscene {
             .iter()
             .rev()
             .find(|l| l.start <= seconds && seconds < l.end)
+    }
+
+    /// Authored speech in this dialog's bank, in cutscene order.
+    pub(crate) fn explicit_dialog_lines<'a>(
+        &'a self,
+        dialog: &'a str,
+    ) -> impl Iterator<Item = &'a CutsceneLine> {
+        self.lines.iter().filter(move |line| {
+            line.explicit_text
+                && line.start < line.end
+                && line
+                    .conversation
+                    .as_deref()
+                    .is_some_and(|name| name.eq_ignore_ascii_case(dialog))
+        })
+    }
+
+    /// Recover ASLN provenance in saves that predate the explicit-text flag. The cut
+    /// still has the saved clock and actor bindings.
+    pub(crate) fn restore_explicit_lines(&mut self, authored: &Self) {
+        for line in &mut self.lines {
+            line.explicit_text = true;
+            line.explicit_text = authored.lines.contains(line);
+        }
     }
 }
 
@@ -588,6 +616,22 @@ mod tests {
         assert!(Cutscene::from_gff4(&cut(b"CUT ", f32::NAN), "x").is_none());
         assert!(Cutscene::parse(b"junk", "x").is_none());
         assert_eq!(Cutscene::resource(" A.CUT "), "a.cut");
+    }
+
+    #[test]
+    fn restores_explicit_speech_from_the_resource_for_a_legacy_cut() {
+        let authored = Cutscene::from_gff4(&cut(b"CUT ", 10.0), "x").unwrap();
+        assert!(authored.lines.iter().all(|line| line.explicit_text));
+        let mut saved = authored.clone();
+        for line in &mut saved.lines {
+            line.explicit_text = false;
+        }
+        saved.lines[1].strref = 300;
+        saved.elapsed_ms = 500;
+        saved.restore_explicit_lines(&authored);
+        assert_eq!(saved.elapsed_ms, 500);
+        assert!(saved.lines[0].explicit_text);
+        assert!(!saved.lines[1].explicit_text);
     }
 
     #[test]

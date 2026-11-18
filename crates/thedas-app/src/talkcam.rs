@@ -237,7 +237,12 @@ impl TalkCamera {
             Some((l, since)) if *l == line => *since,
             _ => now,
         };
-        tracks.frame_effects_at(((now - since) / 1000.0) as f32)
+        let t = if sim.cut_line_speech() != thedas_sim::dialog::CutLineSpeech::Dialog {
+            tracks.seconds
+        } else {
+            ((now - since) / 1000.0) as f32
+        };
+        tracks.frame_effects_at(t)
     }
 
     /// The view of the shown line's own cutscene (see [`line_cut_view`]), when it is the
@@ -262,7 +267,11 @@ impl TalkCamera {
             Some((l, since)) if l == line => *since,
             _ => now,
         };
-        let t = ((now - since) / 1000.0) as f32;
+        let t = if sim.cut_line_speech() != thedas_sim::dialog::CutLineSpeech::Dialog {
+            tracks.seconds
+        } else {
+            ((now - since) / 1000.0) as f32
+        };
         let stage = tracks.stage_file.as_deref().and_then(|f| {
             let f = f.trim_end_matches('\0').to_ascii_lowercase();
             let f = f.strip_suffix(".stg").unwrap_or(&f).to_string();

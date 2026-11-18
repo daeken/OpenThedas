@@ -46,8 +46,11 @@ fn name(sim: &Sim, id: u32) -> String {
 /// not yet continued past (conversation.gfx shows it and sends `Conversation.SelectResponse
 /// 0` from its continue action).
 pub fn conversation(sim: &Sim) -> Option<thedas_sim::dialog::DialogState> {
-    sim.dialog_state()
-        .filter(|d| !d.ended || !d.line.is_empty())
+    sim.dialog_state().filter(|d| {
+        !d.ended
+            || !d.line.is_empty()
+            || sim.cut_line_speech() == thedas_sim::dialog::CutLineSpeech::InProgress
+    })
 }
 
 /// The text the simulation gives a reply with no text of its own (a plain "continue").

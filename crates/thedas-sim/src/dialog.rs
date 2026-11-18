@@ -205,6 +205,9 @@ pub struct Conversation {
     /// it: the conversation walks on through them (single unspoken replies) as it speaks.
     #[serde(default)]
     pub cut_lines_left: u32,
+    /// The current node's speech at the handoff from its cutscene.
+    #[serde(default, skip_serializing_if = "CutLineSpeech::is_dialog")]
+    pub cut_line_speech: CutLineSpeech,
     /// The creatures the shown line's own cutscene took, and where it leaves them when the
     /// line ends (see [`crate::cutactors`]).
     #[serde(default)]
@@ -216,6 +219,34 @@ pub struct Conversation {
     /// [`Sim::start_conversation`]): its lines stage nobody.
     #[serde(default)]
     pub ambient_run: bool,
+}
+
+/// Which parts of a dialog node's speech the owned cut already presented.
+#[derive(Clone, Copy, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum CutLineSpeech {
+    #[default]
+    Dialog,
+    /// The subtitle was shown. The same voice can finish after the player skips the cut.
+    InProgress,
+    /// Both the subtitle and the voice are finished.
+    Complete,
+}
+
+impl CutLineSpeech {
+    fn is_dialog(&self) -> bool {
+        *self == Self::Dialog
+    }
+}
+
+impl Conversation {
+    fn owns_cutscene(&self, cut: &crate::cutscene::Cutscene) -> bool {
+        cut.from_dialog
+            && self.cut_from == self.line
+            && self
+                .line
+                .and_then(|line| self.dlg.nodes.get(line)?.cutscene.as_deref())
+                .is_some_and(|name| crate::cutscene::Cutscene::resource(name) == cut.name)
+    }
 }
 
 /// A conversation said in passing, under way (DAOrigins.exe's ambient dialogs, updated at
@@ -399,6 +430,7 @@ impl Sim {
     fn speak(&mut self, mut c: Conversation, line: usize) -> Conversation {
         // The line shown before ends, and its cutscene with it.
         self.end_line_staging(&mut c);
+        c.cut_line_speech = CutLineSpeech::Dialog;
         let node = c.dlg.nodes[line].clone();
         self.mark_shown(&mut c, line);
         self.node_action(&node, &c);
@@ -667,6 +699,7 @@ impl Sim {
             chain: Vec::new(),
             cut_from: None,
             cut_lines_left: 0,
+            cut_line_speech: CutLineSpeech::Dialog,
             staged: Vec::new(),
             staged_at: None,
             ambient_run: false,
@@ -867,6 +900,7 @@ impl Sim {
             chain: Vec::new(),
             cut_from: None,
             cut_lines_left: 0,
+            cut_line_speech: CutLineSpeech::Dialog,
             staged: Vec::new(),
             staged_at: None,
             ambient_run: false,
@@ -1210,11 +1244,21 @@ impl Sim {
     }
 
     fn advance_reply(&mut self, choice: usize) -> Option<DialogState> {
-        let mut c = self.talk.take()?;
+        let c = self.talk.take()?;
         let Some(&reply) = c.replies.get(choice) else {
             self.talk = Some(c);
             return self.dialog_state();
         };
+        if let Some(c) = self.follow_reply(c, reply)
+            && self.talk.is_none()
+        {
+            self.talk = Some(c);
+        }
+        self.dialog_state()
+    }
+
+    /// Follow an eligible reply. An action that starts a new conversation can replace it.
+    fn follow_reply(&mut self, mut c: Conversation, reply: usize) -> Option<Conversation> {
         // The line answered ends. Provisional: before the reply's action runs.
         self.end_presented_line(&mut c);
         let node = c.dlg.nodes[reply].clone();
@@ -1223,10 +1267,10 @@ impl Sim {
         // The action started another conversation (a plot script's UT_Talk): it replaces
         // this one, as in the game.
         if self.talk.is_some() {
-            return self.dialog_state();
+            return None;
         }
         let next = node.children.iter().copied().find(|&n| self.usable(&c, n));
-        c = match next {
+        Some(match next {
             Some(n) => self.speak(c, n),
             None => Conversation {
                 // The selected reply has no next line. Do not leave the answered
@@ -1235,13 +1279,87 @@ impl Sim {
                 line: None,
                 ended: true,
                 replies: Vec::new(),
+                cut_line_speech: CutLineSpeech::Dialog,
                 ..c
             },
-        };
-        if self.talk.is_none() {
+        })
+    }
+
+    /// The Origins case where the CUTR starts by saying its owning node, identified by the
+    /// authored ASLN's dialog bank and TLK reference.
+    fn explicit_dialog_speech_matches(&self, cut: &crate::cutscene::Cutscene) -> bool {
+        self.game == thedas_vfs::Game::Origins
+            && self.talk.as_ref().is_some_and(|c| {
+                c.owns_cutscene(cut)
+                    && c.line
+                        .and_then(|line| c.dlg.nodes.get(line)?.strref)
+                        .is_some_and(|strref| {
+                            cut.explicit_dialog_lines(&c.dlg.name)
+                                .next()
+                                .is_some_and(|track| strref == track.strref)
+                        })
+            })
+    }
+
+    /// While this CUTR plays, the timeline controls speech for its owning dialog node.
+    pub fn cutscene_controls_dialog_speech(&self) -> bool {
+        self.world
+            .cutscene
+            .as_ref()
+            .is_some_and(|cut| self.explicit_dialog_speech_matches(cut))
+    }
+
+    /// The current node's speech at the handoff from an owned cutscene.
+    pub fn cut_line_speech(&self) -> CutLineSpeech {
+        self.talk
+            .as_ref()
+            .map_or(CutLineSpeech::Dialog, |c| c.cut_line_speech)
+    }
+
+    /// Reconcile the consecutive dialog lines the cut already presented. A skip leaves
+    /// unheard lines for dialog to present. An interrupted voice can finish across
+    /// the handoff without presenting its subtitle a second time.
+    pub(crate) fn finish_explicit_dialog_speech(&mut self, cut: &crate::cutscene::Cutscene) {
+        if !self.explicit_dialog_speech_matches(cut) {
+            return;
+        }
+        let mut c = self.talk.take().expect("matching dialog");
+        let dialog = c.dlg.name.clone();
+        let elapsed = cut.elapsed_ms as f32 / 1000.0;
+        for track in cut.explicit_dialog_lines(&dialog) {
+            if elapsed < track.start
+                || c.line.and_then(|line| c.dlg.nodes[line].strref) != Some(track.strref)
+            {
+                break;
+            }
+            if elapsed < track.end {
+                if track.vo_mode == 0 {
+                    c.cut_line_speech = CutLineSpeech::InProgress;
+                }
+                break;
+            }
+            c.cut_line_speech = CutLineSpeech::Complete;
+            let [reply] = c.replies[..] else { break };
+            if !c.dlg.nodes[reply].reply || !self.node_text(&c.dlg.nodes[reply]).trim().is_empty() {
+                break;
+            }
+            let Some(next) = self.follow_reply(c, reply) else {
+                return;
+            };
+            if self.talk.is_some() {
+                return;
+            }
+            c = next;
+            // The next node can start a cinematic of its own.
+            if c.cut_from.is_some() {
+                break;
+            }
+        }
+        if c.ended && c.cut_line_speech == CutLineSpeech::Complete {
+            self.end_presented_line(&mut c);
+        } else {
             self.talk = Some(c);
         }
-        self.dialog_state()
     }
 
     /// The shown line's own cutscene, for presentation: the conversation (resource name
@@ -1269,12 +1387,10 @@ impl Sim {
     /// whose conversation has ended and is still being presented.
     pub fn conversation_line_cutscene(&self) -> Option<&crate::cutscene::Cutscene> {
         let c = self.talk.as_ref()?;
-        let name = c.dlg.nodes.get(c.line?)?.cutscene.as_deref()?;
-        let resource = crate::cutscene::Cutscene::resource(name);
         self.world
             .cutscene
             .as_ref()
-            .filter(|cut| cut.from_dialog && cut.name == resource && c.cut_from == c.line)
+            .filter(|cut| c.owns_cutscene(cut))
     }
 
     pub fn conversation_line(&self) -> Option<OpenLine<'_>> {
@@ -1313,7 +1429,10 @@ impl Sim {
             speaker: line
                 .map(|n| self.line_speaker_tag(n, c.owner == c.player))
                 .unwrap_or_default(),
-            line: line.map(|n| self.node_text(n)).unwrap_or_default(),
+            line: line
+                .filter(|_| c.cut_line_speech.is_dialog())
+                .map(|n| self.node_text(n))
+                .unwrap_or_default(),
             replies: c
                 .replies
                 .iter()
@@ -1505,6 +1624,7 @@ mod tests {
             chain: vec![],
             cut_from: None,
             cut_lines_left: 0,
+            cut_line_speech: CutLineSpeech::Dialog,
             staged: Vec::new(),
             staged_at: None,
             ambient_run: false,
@@ -1676,6 +1796,7 @@ mod tests {
             chain: vec![],
             cut_from: None,
             cut_lines_left: 0,
+            cut_line_speech: CutLineSpeech::Dialog,
             staged: vec![],
             staged_at: None,
             ambient_run: false,
@@ -1745,6 +1866,7 @@ mod tests {
                 chain: vec![],
                 cut_from: None,
                 cut_lines_left: 0,
+                cut_line_speech: CutLineSpeech::Dialog,
                 staged: Vec::new(),
                 staged_at: None,
                 ambient_run: false,
@@ -1793,6 +1915,7 @@ mod tests {
             chain: vec![],
             cut_from: None,
             cut_lines_left: 0,
+            cut_line_speech: CutLineSpeech::Dialog,
             staged: Vec::new(),
             staged_at: None,
             ambient_run: false,
@@ -1875,6 +1998,7 @@ mod tests {
             chain: vec![],
             cut_from: None,
             cut_lines_left: 0,
+            cut_line_speech: CutLineSpeech::Dialog,
             staged: Vec::new(),
             staged_at: None,
             ambient_run: false,
@@ -1976,6 +2100,118 @@ mod tests {
         sim.world.cutscene.as_mut().unwrap().name = "intro.cut".into();
         sim.world.cutscene.as_mut().unwrap().from_dialog = false;
         assert!(sim.conversation_line_cutscene().is_none());
+    }
+
+    fn explicit_dialog_cut() -> Sim {
+        use crate::cutscene::{Cutscene, CutsceneLine};
+
+        let (mut sim, hero, npc) = passers_by();
+        let mut dlg = remarks("cinematic", &["First.", "Second.", "After reply."], false);
+        for node in &mut dlg.nodes {
+            node.ambient = false;
+            node.show_once = 1;
+        }
+        dlg.nodes[0].cutscene = Some("intro".into());
+        dlg.nodes[0].strref = Some(10);
+        dlg.nodes[2].strref = Some(20);
+        dlg.nodes[3].text = Some("My reply.".into());
+        assert!(sim.open_conversation(hero, npc, dlg, None));
+        sim.world.cutscenes.clear();
+        sim.world.dialog_cutscenes.clear();
+        sim.world.cutscene = Some(Cutscene {
+            name: "intro.cut".into(),
+            seconds: 8.0,
+            lines: [(1.0, 3.0, 10), (4.0, 7.0, 20)]
+                .map(|(start, end, strref)| CutsceneLine {
+                    start,
+                    end,
+                    strref,
+                    actor: "guard".into(),
+                    conversation: Some("Cinematic".into()),
+                    vo_mode: 0,
+                    explicit_text: true,
+                })
+                .to_vec(),
+            elapsed_ms: 0,
+            from_dialog: true,
+            bound: Vec::new(),
+            placement: None,
+        });
+        sim
+    }
+
+    #[test]
+    fn explicit_dialog_cut_leaves_unfinished_speech_and_keeps_player_replies() {
+        use CutLineSpeech::{Complete, Dialog, InProgress};
+        for (skip_at, line, speech, text) in [
+            (Some(500), 0, Dialog, "First."),
+            (Some(2500), 0, InProgress, ""),
+            (Some(3000), 2, Dialog, "Second."),
+            (Some(5500), 2, InProgress, ""),
+            (Some(7500), 2, Complete, ""),
+            (None, 2, Complete, ""),
+        ] {
+            let mut sim = explicit_dialog_cut();
+            assert!(sim.cutscene_controls_dialog_speech());
+            sim.tick(skip_at.unwrap_or(8000));
+            if skip_at.is_some() {
+                assert_eq!(sim.talk.as_ref().unwrap().line, Some(0));
+                sim.skip_cutscene();
+            }
+            assert!(!sim.cutscene_controls_dialog_speech());
+            assert_eq!(sim.presented_conversation_line().unwrap().line, Some(line));
+            assert_eq!(sim.cut_line_speech(), speech);
+            assert_eq!(sim.dialog_state().unwrap().line, text);
+            if line == 2 {
+                assert_eq!(sim.talk.as_ref().unwrap().shown, [0, 1, 2]);
+                assert_eq!(
+                    sim.dialog_state().unwrap().replies,
+                    [(3, "My reply.".into())]
+                );
+                assert_eq!(sim.choose_reply(0).unwrap().line, "After reply.");
+                assert_eq!(sim.cut_line_speech(), Dialog);
+            }
+        }
+    }
+
+    #[test]
+    fn only_matching_authored_cut_speech_is_consumed() {
+        for case in 0..4 {
+            let mut sim = explicit_dialog_cut();
+            let cut = sim.world.cutscene.as_mut().unwrap();
+            match case {
+                0 => cut.from_dialog = false,
+                1 => cut.lines[0].explicit_text = false,
+                2 => cut.lines[0].conversation = Some("unrelated".into()),
+                _ => cut.lines[0].strref = 12,
+            }
+            assert!(!sim.cutscene_controls_dialog_speech());
+            sim.tick(8000);
+            assert_eq!(sim.dialog_state().unwrap().line, "First.");
+            assert_eq!(sim.talk.as_ref().unwrap().shown, [0]);
+        }
+    }
+
+    #[test]
+    fn already_spoken_terminal_cut_line_dismisses_without_an_empty_screen() {
+        let mut sim = explicit_dialog_cut();
+        sim.talk.as_mut().unwrap().dlg.nodes[2].children.clear();
+        sim.tick(8000);
+        assert!(sim.talk.is_none());
+    }
+
+    #[test]
+    fn cut_handoff_never_takes_a_player_choice() {
+        let mut sim = explicit_dialog_cut();
+        sim.talk.as_mut().unwrap().dlg.nodes[1].text = Some("My reply.".into());
+        sim.tick(8000);
+        assert_eq!(sim.talk.as_ref().unwrap().line, Some(0));
+        assert_eq!(sim.cut_line_speech(), CutLineSpeech::Complete);
+        assert_eq!(
+            sim.dialog_state().unwrap().replies,
+            [(1, "My reply.".into())]
+        );
+        assert_eq!(sim.choose_reply(0).unwrap().line, "Second.");
     }
 
     #[test]
