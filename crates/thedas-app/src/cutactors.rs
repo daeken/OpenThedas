@@ -278,11 +278,18 @@ impl CutsceneActors {
                     let dlg = dlg.to_ascii_lowercase();
                     self.switch(Some(format!("line:{dlg}:{line}")), true);
                     let since = self.source.as_ref().map_or(self.clock_ms, |(_, s)| *s);
-                    let t = ((self.clock_ms - since) / 1000.0) as f32;
                     if let Some(tracks) = self
                         .line_cuts(sim, &dlg)
                         .and_then(|l| l.get(line).and_then(|c| c.tracks.clone()))
                     {
+                        // An owned cut already played this line. Use the inline cut's
+                        // closing pose while the player chooses a reply.
+                        let t =
+                            if sim.cut_line_speech() != thedas_sim::dialog::CutLineSpeech::Dialog {
+                                tracks.seconds
+                            } else {
+                                ((self.clock_ms - since) / 1000.0) as f32
+                            };
                         let stage = self.stage(sim, tracks.stage_file.as_deref());
                         let at = Moment {
                             t,
@@ -656,6 +663,7 @@ mod tests {
             chain: vec![],
             cut_from: Some(0),
             cut_lines_left: 0,
+            cut_line_speech: thedas_sim::dialog::CutLineSpeech::Dialog,
             staged: vec![],
             staged_at: None,
             ambient_run: false,

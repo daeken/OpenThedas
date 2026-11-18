@@ -2078,6 +2078,18 @@ impl GameAudio {
         self.voice.as_ref().and_then(|v| v.2)
     }
 
+    /// Elapsed voice time at a cut/dialog handoff, including a sample that finished
+    /// while the cut still showed its subtitle.
+    pub fn voice_elapsed_ms(&self) -> f64 {
+        let Some((_, Some(handle), ms)) = self.voice.as_ref() else {
+            return 0.0;
+        };
+        if !self.engine.is_playing(*handle) {
+            return ms.unwrap_or_default();
+        }
+        self.voice_position().map_or(0.0, |(_, at)| at * 1000.0)
+    }
+
     /// The game's sound this frame, on the system output's clock.
     pub fn frame(&mut self, state: AudioState) {
         let now = Instant::now();
