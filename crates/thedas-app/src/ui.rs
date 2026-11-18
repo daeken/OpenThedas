@@ -2437,6 +2437,7 @@ impl UiLayer {
             shown.journal = journal;
             shown.book_page = screens.menu.and_then(Screen::book_page);
             shown.menu_up = screens.menu.is_some();
+            shown.conversation_up = screens.shown().contains(&Screen::Conversation);
             shown.ability_scene = match screens.menu {
                 Some(Screen::Skills) => 3,
                 Some(Screen::SpellsTalents) => 1,

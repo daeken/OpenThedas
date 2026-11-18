@@ -157,6 +157,10 @@ pub struct Presentation {
     /// A full-screen menu (options, save and load, the game menu) is up: tutorial popups
     /// wait under it (the popup layer those screens load does not show them).
     pub menu_up: bool,
+    /// A conversation is on screen: a tutorial waits until it ends, as it does for a menu
+    /// (the step's panel over Rica's talk with Beraht's shopkeeper was a player report).
+    /// Provisional: the original's rule is not traced.
+    pub conversation_up: bool,
     /// The player is using a pad: the tutorial popup's title carries its pad control.
     pub pad_active: bool,
 }
@@ -1000,7 +1004,7 @@ fn sim_values_with(
     // Provisional: the original's rule for a tutorial waiting while a menu is up is not
     // traced; QA saw the panel over the options, save and game menus, where it does not
     // belong.
-    let tutorials_held = shown.menu_up || sim.tutorials_held();
+    let tutorials_held = shown.menu_up || shown.conversation_up || sim.tutorials_held();
     let tutorials: &[thedas_sim::journal::Tutorial] = if tutorials_held {
         &[]
     } else {
@@ -2278,6 +2282,36 @@ fn inventory(sim: &Sim, who: Option<u32>, filter: i32, v: &mut BTreeMap<String, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_conversation_holds_the_training_step_and_tutorials_back() {
+        let mut sim = Sim::new(
+            std::sync::Arc::new(thedas_vfs::Vfs::new()),
+            std::sync::Arc::new(thedas_script::EngineTable::default()),
+            1,
+        );
+        sim.world.tutorials.push(thedas_sim::journal::Tutorial {
+            resref: "lesson".into(),
+            title: None,
+            text: None,
+            pauses: false,
+        });
+        sim.world.training.step = 1;
+        let mut shown = Presentation {
+            conversation_up: true,
+            ..Default::default()
+        };
+        let v = sim_values_for(&sim, &shown);
+        assert_eq!(v["Tutorials.TutorialList"], UiValue::String(String::new()));
+        assert_eq!(v["Tutorials.TrainingStep"], num(0));
+        shown.conversation_up = false;
+        let v = sim_values_for(&sim, &shown);
+        assert_eq!(
+            v["Tutorials.TutorialList"],
+            UiValue::String("lesson".into())
+        );
+        assert_eq!(v["Tutorials.TrainingStep"], num(1));
+    }
 
     #[test]
     fn cinematic_tutorials_wait_and_reappear_with_their_pause() {
