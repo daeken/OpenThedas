@@ -8583,7 +8583,13 @@ mod tests {
             ]
         );
         assert!(parse_steps("pad q").is_err());
-        assert!(parse_steps("pad stick-left 0,1").is_err());
+        assert_eq!(
+            parse_steps("pad stick-left 0,1; pad stick-left 0,0").unwrap(),
+            vec![
+                Step::PadStick(pad::Stick::Left, 0.0, 1.0),
+                Step::PadStick(pad::Stick::Left, 0.0, 0.0),
+            ]
+        );
         assert!(parse_steps("pad").is_err());
         assert!(parse_steps("reply x").is_err());
         assert!(parse_steps("dance").is_err());
