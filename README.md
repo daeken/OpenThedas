@@ -8,6 +8,12 @@ parity.
 You need your own copy of the game. Nothing from the original game is, or will ever be, in this
 repository.
 
+## North star
+
+Provide a facility for faithfully playing the Dragon Age games on modern platforms with your own
+game data, while giving modders the tools they need to do their amazing work. Anything under that
+umbrella is in scope; anything outside it isn't.
+
 ## Getting it
 
 - **Test builds** (Windows x64, Windows on ARM, macOS on Apple silicon) are shared with the test
@@ -267,6 +273,8 @@ Test builds send it to the project, where it shows up in the Discord and as a Gi
 labelled `player-report`; your user name and home folder are left out. "Keep here" keeps a
 report on your computer only. Development builds and runs driven by `--control` never send
 anything.
+
+Developers: `thedas replay <report-folder-or-zip> [--save out.json]` checks the journal against the F8 state; see [replay testing](docs/handoff/streams/issue-reports.md#how-to-test-this-area).
 
 When a fix lands (a pull request that closes the report's issue) and a build with it is
 published, a test build offers it at start: it saves your game, downloads the new build into a

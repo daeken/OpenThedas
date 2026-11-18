@@ -34,7 +34,9 @@ fn command(sim: &Sim, ty: &str, name: &str) -> Command {
         impacted: false,
         arrived: false,
         da2_target_prepared: false,
+        interaction: None,
         da2_basic_attack_fallback: false,
+        da2_player_issued: false,
         path: Vec::new(),
         turned_at: None,
         is_static: false,
@@ -49,6 +51,7 @@ impl Sim {
     /// Makes `who` the party member the player controls (the hero when `None`, or when `who`
     /// is not in the party): its AI stops and the rest follow it.
     pub fn set_controlled(&mut self, who: Option<ObjectId>) {
+        self.world.script_controlled = None;
         self.world.controlled = who.filter(|&w| crate::engine::party_of(self).contains(&w));
     }
 
@@ -74,6 +77,9 @@ impl Sim {
 
     /// Walks `who` to `to` (in its area), dropping what it was doing.
     pub fn order_move(&mut self, who: ObjectId, to: [f32; 3]) {
+        if self.target_request_click(who, thedas_script::vm::OBJECT_INVALID, to) {
+            return;
+        }
         self.note_player_order(who);
         let Some((area, from, facing)) = self
             .world
@@ -125,6 +131,8 @@ impl Sim {
 
     /// Counts an order the player gave `who` (see [`Sim::fail_blocked`]).
     pub(crate) fn note_player_order(&mut self, who: ObjectId) {
+        self.world.following.remove(&who);
+        self.da2_stop_locomotion(who);
         if let Some(o) = self.world.get_mut(who) {
             o.combat.player_orders += 1;
         }
@@ -132,6 +140,9 @@ impl Sim {
 
     /// Walks `who` up to `target` and starts its conversation.
     pub fn order_talk(&mut self, who: ObjectId, target: ObjectId) {
+        if self.target_request_click(who, target, [0.0; 3]) {
+            return;
+        }
         self.note_player_order(who);
         let mut then = command(
             self,
@@ -223,7 +234,9 @@ impl Sim {
         c.target = Some(target);
         c.ints = vec![ability];
         c.strings = vec![item.to_string()];
-        if let Some(o) = self.world.get_mut(who) {
+        if self.game == thedas_vfs::Game::DragonAge2 {
+            self.da2_player_command(who, c);
+        } else if let Some(o) = self.world.get_mut(who) {
             o.commands.clear();
             o.commands.push(c);
         }
@@ -249,7 +262,9 @@ impl Sim {
         });
         c.ints = vec![ability];
         c.strings = vec![item.to_string()];
-        if let Some(o) = self.world.get_mut(who) {
+        if self.game == thedas_vfs::Game::DragonAge2 {
+            self.da2_player_command(who, c);
+        } else if let Some(o) = self.world.get_mut(who) {
             o.commands.clear();
             o.commands.push(c);
         }
@@ -279,10 +294,19 @@ impl Sim {
 
     /// Walks `who` up to `target` (a door, a container, a lever) and uses it.
     pub fn order_use(&mut self, who: ObjectId, target: ObjectId) {
+        if self.target_request_click(who, target, [0.0; 3]) {
+            return;
+        }
         self.note_player_order(who);
         let mut then = command(self, "COMMAND_TYPE_USE_OBJECT", "CommandUseObject");
         then.target = Some(target);
-        self.approach_then(who, target, then);
+        if self.game == thedas_vfs::Game::Origins {
+            if let Some(o) = self.world.get_mut(who) {
+                o.commands = vec![then];
+            }
+        } else {
+            self.approach_then(who, target, then);
+        }
     }
 
     /// Replaces `who`'s queue with a walk to within reach of `target`, when it is not already
@@ -398,6 +422,50 @@ mod tests {
             .unwrap()
             .facing;
         assert!(f.abs() < 1e-3 || (f - 360.0).abs() < 1e-3, "{f}");
+    }
+
+    #[test]
+    fn doors_regression_c_placeables_do_not_use_creature_appearance_radii() {
+        use thedas_formats::gda::Cell;
+        let (mut s, hero, door) = sim();
+        s.world.get_mut(door).unwrap().kind = ObjectKind::Placeable;
+        s.world.get_mut(door).unwrap().appearance = 82;
+        let tables = crate::m2da::Tables::empty();
+        tables.insert(
+            "apr_base",
+            &["ID", "PERSPACE"],
+            vec![(82, vec![Cell::Int(82), Cell::Float(3.0)])],
+        );
+        s.world.tables = Arc::new(tables);
+        assert_eq!(s.body_radius(door), crate::combat::DEFAULT_RADIUS);
+        assert_eq!(s.body_radius(hero), crate::combat::DEFAULT_RADIUS);
+    }
+
+    #[test]
+    fn doors_regression_c_scripted_use_approaches_before_sending_use() {
+        let (mut s, hero, target) = sim();
+        s.table = Arc::new(
+            EngineTable::parse(b"int EVENT_TYPE_USE = 14;\nint COMMAND_TYPE_USE_OBJECT = 31;\n")
+                .unwrap(),
+        );
+        s.world.get_mut(target).unwrap().kind = ObjectKind::Placeable;
+        let mut c = command(&s, "COMMAND_TYPE_USE_OBJECT", "CommandUseObject");
+        c.target = Some(target);
+        s.world.get_mut(hero).unwrap().commands.push(c);
+        s.world.trace.keep = true;
+        s.tick(500);
+        assert!(
+            s.world.get(hero).unwrap().position[0] > 0.0,
+            "the use command did not walk"
+        );
+        assert!(
+            !s.world
+                .trace
+                .entries
+                .iter()
+                .any(|e| matches!(e, crate::trace::TraceEntry::Command {command,status,..} if command=="CommandUseObject" && status=="complete")),
+            "USE completed from ten metres away"
+        );
     }
 
     #[test]

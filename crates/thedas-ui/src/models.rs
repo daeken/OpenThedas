@@ -708,15 +708,16 @@ fn equipment_tints(
     out
 }
 
-/// The creature's weapons: drawn into its hands while it is in combat, else sheathed (see
+/// The creature's weapons: drawn into its hands while it is in combat, or as an
+/// explicit Origins draw/sheath command left them (see
 /// [`weapon_node`]). In the hands they sit in the grip only once the combat stance closes
 /// the hands around them (the combat animation trees animate the fingers; nothing else
 /// poses them). Provisional: the original draws and sheathes them with animations
 /// (`COMMAND_UNSHEATHEWEAPONS`, `COMMAND_SHEATHEWEAPONS`) whose timing is not traced; here
-/// they are drawn for as long as the creature's combat state (`GetCombatState`) is set.
+/// explicit commands change the attachments at completion.
 fn weapons(sim: &Sim, o: &Object, gear: Gear) -> Vec<Attached> {
-    let drawn = o.combat.in_combat;
-    weapons_held(sim, o, gear, drawn, drawn)
+    let (main, off) = sim.weapon_drawn_hands(o);
+    weapons_held(sim, o, gear, main, off)
 }
 
 /// [`weapons`] with each hand's weapon drawn or sheathed as given.
@@ -742,7 +743,13 @@ fn weapons_held(sim: &Sim, o: &Object, gear: Gear, main: bool, off: bool) -> Vec
 /// sheathed as `main` says, the off hand's as `off` says, or as the creature's combat state
 /// has it when the cutscene has not touched it.
 pub fn weapons_in_cutscene(sim: &Sim, o: &Object, main: bool, off: Option<bool>) -> Vec<Attached> {
-    weapons_held(sim, o, Gear::World, main, off.unwrap_or(o.combat.in_combat))
+    weapons_held(
+        sim,
+        o,
+        Gear::World,
+        main,
+        off.unwrap_or(sim.weapon_drawn_hands(o).1),
+    )
 }
 
 /// The node an item hangs from: `BITM_base.gda`'s part for its slot (main or off hand) and
@@ -874,8 +881,9 @@ pub fn weapon_style(sim: &Sim, o: &Object) -> Option<&'static str> {
 /// How long an attack plays when the script set no duration (milliseconds). Provisional.
 pub const DEFAULT_ATTACK_MS: u64 = 1500;
 
-/// What a creature's body is doing: dead (the death animation from when it died, then its
-/// last pose), attacking (the attack animation over the attack's duration), moving (a
+/// What a creature's body is doing: a paired death blow (its recorded action and start,
+/// retaining the victim's final pose), dead (the death animation from when it died, then
+/// its last pose), attacking (the attack animation over the attack's duration), moving (a
 /// run), or standing (pause, the combat stance when fighting). Looping animations start at
 /// a different point per creature so a crowd does not move in step. Provisional: the
 /// original picks among variants (`attk_v1`..`v6`, weapon styles) that are not modelled.
@@ -935,6 +943,36 @@ fn creature_motion(sim: &Sim, o: &Object, standing: bool) -> Option<Motion> {
     let fighting = o.combat.in_combat;
     // Looked up only where it is shown: it reads the creature's equipment.
     let style = || weapon_style(sim, o).map(|s| format!("{s}.anb"));
+    if !standing {
+        // IsDead is already true during a paired reaction. Its saved action must win
+        // over generic death and remain the corpse pose until resurrection clears it.
+        let paired = o
+            .combat
+            .death_blow_reaction
+            .as_ref()
+            .map(|r| (&r.action, r.started_ms, r.ends_ms))
+            .or_else(|| {
+                o.combat
+                    .death_blow
+                    .as_ref()
+                    .map(|a| (&a.action, a.started_ms, a.ends_ms))
+            });
+        if let Some((action, started, ends)) = paired {
+            return Some(Motion {
+                trees: sim.ability_trees(o.id),
+                actions: vec![action.clone()],
+                // Departure can shorten the deadline: jump to the actual clip end,
+                // rather than holding a partially completed fall at departure time.
+                time: if now >= ends {
+                    f32::MAX
+                } else {
+                    secs(now.saturating_sub(started))
+                },
+                looping: false,
+                blend: Vec::new(),
+            });
+        }
+    }
     if o.dead && !standing {
         // From when it died, held on the last frame; a death of unknown time (a save from
         // before deaths were timed) shows the last frame. Dragon Age II's creatures die in
@@ -951,7 +989,7 @@ fn creature_motion(sim: &Sim, o: &Object, standing: bool) -> Option<Motion> {
         });
     }
     if let Some(c) = o.commands.first().filter(|_| !standing) {
-        if c.from.is_some() {
+        if c.from.is_some() && c.name != "CommandPlayAnimation" {
             let list = if fighting {
                 trees(&[&combat_move, &movement])
             } else {
@@ -962,6 +1000,22 @@ fn creature_motion(sim: &Sim, o: &Object, standing: bool) -> Option<Motion> {
                 actions: vec![action::RUN.into()],
                 time: secs(now) + phase,
                 looping: true,
+                blend: Vec::new(),
+            });
+        }
+        if sim.game == thedas_vfs::Game::Origins
+            && c.name == thedas_sim::interaction::COMMAND
+            && c.interaction.as_ref().is_some_and(|m| m.stage == 2)
+            && let Some(playback) = o.interaction.as_ref().and_then(|s| s.playback.as_ref())
+            && let Some(action) = sim.world.tables().get(0, "").and_then(|table| {
+                text(table.cell_by_hash(COL_ANIM_ACTION, i64::from(playback.animation)))
+            })
+        {
+            return Some(Motion {
+                trees: trees(&[&ambient, &combat]),
+                actions: vec![action.to_ascii_lowercase(), action::PAUSE.into()],
+                time: secs(now.saturating_sub(playback.started)),
+                looping: playback.looping,
                 blend: Vec::new(),
             });
         }
@@ -983,6 +1037,13 @@ fn creature_motion(sim: &Sim, o: &Object, standing: bool) -> Option<Motion> {
                 });
             }
         }
+    }
+    if !standing
+        && !fighting
+        && let Some(c) = &o.looping_animation
+        && let Some(m) = played_animation(sim, o, c, &trees(&[&ambient, &combat]))
+    {
+        return Some(m);
     }
     Some(Motion {
         trees: if fighting {
@@ -1099,11 +1160,10 @@ pub const COL_ANIM_ACTION: u32 = 0x7a39_8af9;
 
 /// What a creature playing `CommandPlayAnimation` (nAnimation, nLoops, bPlayNext,
 /// bBlendIn; `script.ldf`) shows: the `anim_base.gda` row's action in its ambient trees.
-/// An animation played forever (nLoops -1: the ambient system's sitting, leaning and
-/// working loops, `ambient_anim_patterns.gda`) loops on the world's clock, out of step per
-/// creature; any other plays from the command's start, held at its end. Provisional: the
-/// executable's command executor and its loop count are not traced; the simulation ends
-/// the command after half a second and the ambient scripts queue it again.
+/// Animation-table loops repeat from their recorded start, including the loop left
+/// playing after COMMAND_LOOPING releases the queue. Provisional: the
+/// presentation still shows the initial action rather than following the command's
+/// transition/loop/end stages; the simulation times those stages separately.
 fn played_animation(
     sim: &Sim,
     o: &Object,
@@ -1111,19 +1171,32 @@ fn played_animation(
     trees: &[String],
 ) -> Option<Motion> {
     let id = *c.ints.first()?;
-    let action = text(
-        sim.world
-            .tables()
-            .get(0, "anim_base")?
-            .cell_by_hash(COL_ANIM_ACTION, id as i64),
-    )?;
+    let origins = sim.game == thedas_vfs::Game::Origins;
+    let anims = sim
+        .world
+        .tables()
+        .get(0, if origins { "" } else { "anim_base" })?;
+    let action = text(anims.cell_by_hash(COL_ANIM_ACTION, id as i64))?;
     let now = sim.world.time_ms;
-    let looping = c.ints.get(1) == Some(&-1);
-    let time = if looping {
+    let looping = if origins {
+        c.ints.get(1).is_some_and(|&n| n != 0)
+            && matches!(anims.cell_by_hash(0x12a0_2374, id as i64), Some(Cell::Int(flags)) if flags & 1 != 0)
+    } else {
+        c.ints.get(1) == Some(&-1)
+    };
+    let time = if looping && c.from.is_none() {
         now as f32 / 1000.0 + (o.id % 97) as f32 * 0.37
     } else {
-        let start = c.due.map_or(now, |d| d.saturating_sub(500));
-        now.saturating_sub(start) as f32 / 1000.0
+        let start = c.from.map_or_else(
+            || c.due.map_or(now, |d| d.saturating_sub(500)),
+            |(_, start)| start,
+        );
+        let speed = if origins && c.seconds > 0.0 {
+            c.seconds
+        } else {
+            1.0
+        };
+        now.saturating_sub(start) as f32 / 1000.0 * speed
     };
     Some(Motion {
         trees: trees.to_vec(),
@@ -1176,6 +1249,7 @@ struct DrawnKey {
     in_chargen: bool,
     /// Weapons are drawn in combat and sheathed out of it (their attachment nodes).
     in_combat: bool,
+    weapon_hands: (bool, bool),
     equipment: Vec<(i32, ObjectId, Option<i32>, Option<i32>)>,
     /// A body bag's corpse, once handed off (see [`corpse_model`]).
     corpse: Option<i32>,
@@ -1193,6 +1267,7 @@ impl DrawnKey {
             && self.gender == o.fields.get("Gender").copied()
             && self.in_chargen == (sim.world.chargen == Some(o.id))
             && self.in_combat == o.combat.in_combat
+            && self.weapon_hands == sim.weapon_drawn_hands(o)
             && self.equipment.len() == o.equipment.len()
             && self
                 .equipment
@@ -1225,6 +1300,7 @@ impl DrawnKey {
             head_morph: sim.face_name(o.id).or_else(|| o.head_morph.clone()),
             in_chargen: sim.world.chargen == Some(o.id),
             in_combat: o.combat.in_combat,
+            weapon_hands: sim.weapon_drawn_hands(o),
             equipment: o
                 .equipment
                 .iter()
@@ -1435,6 +1511,95 @@ pub fn area_models_cached(sim: &Sim, area: ObjectId, cache: &mut ModelCache) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interaction_motion_uses_its_phase_clock_and_stops_with_the_command() {
+        use std::sync::Arc;
+        use thedas_script::EngineTable;
+        use thedas_sim::interaction::{
+            COMMAND, COMMAND_TYPE, CommandState, Interaction, Playback, Settings,
+        };
+        use thedas_vfs::Vfs;
+        let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(EngineTable::default()), 1);
+        s.world.tables().insert(
+            "apr_base",
+            &["#500976ec"],
+            vec![(0, vec![Cell::String("humanoid.anb".into())])],
+        );
+        s.world.tables().insert(
+            "#0",
+            &["#7a398af9"],
+            vec![(700, vec![Cell::String("seat_loop".into())])],
+        );
+        let id = s.world.spawn(ObjectKind::Creature, "actor");
+        let settings = Settings {
+            id: 1,
+            pose: 1,
+            loops: -1,
+            play_exit: true,
+        };
+        let o = s.world.get_mut(id).unwrap();
+        o.interaction = Some(Interaction {
+            requested: settings,
+            playback: Some(Playback {
+                applied: settings,
+                phase: 1,
+                animation: 700,
+                started: 1000,
+                looping: true,
+            }),
+        });
+        o.commands.push(thedas_sim::world::Command {
+            name: COMMAND.into(),
+            ty: COMMAND_TYPE,
+            due: Some(u64::MAX),
+            interaction: Some(CommandState {
+                stage: 2,
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        s.world.time_ms = 1500;
+        let m = motion(&s, s.world.get(id).unwrap()).unwrap();
+        assert_eq!(m.trees, vec!["humanoid.anb"]);
+        assert_eq!(m.actions[0], "seat_loop");
+        assert_eq!(m.time, 0.5);
+        assert!(m.looping);
+        assert_eq!(
+            standing_motion(&s, s.world.get(id).unwrap())
+                .unwrap()
+                .actions,
+            vec![action::PAUSE]
+        );
+        s.world.get_mut(id).unwrap().commands.clear();
+        assert_eq!(
+            motion(&s, s.world.get(id).unwrap()).unwrap().actions,
+            vec![action::PAUSE]
+        );
+    }
+
+    #[test]
+    fn ring_weapon_queries_script_draw_invalidates_attachment_cache() {
+        use std::sync::Arc;
+        use thedas_script::EngineTable;
+        use thedas_vfs::Vfs;
+        let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(EngineTable::default()), 1);
+        let id = s.world.spawn(ObjectKind::Creature, "guard");
+        let key = DrawnKey::of(&s, s.world.get(id).unwrap());
+        s.world
+            .get_mut(id)
+            .unwrap()
+            .fields
+            .insert("WeaponMainDrawn".into(), 1);
+        assert!(!key.matches(&s, s.world.get(id).unwrap()));
+        let key = DrawnKey::of(&s, s.world.get(id).unwrap());
+        assert!(key.matches(&s, s.world.get(id).unwrap()));
+        s.game = thedas_vfs::Game::DragonAge2;
+        assert_eq!(
+            s.weapon_drawn_hands(s.world.get(id).unwrap()),
+            (false, false)
+        );
+    }
 
     #[test]
     fn a_drawn_key_matches_what_it_was_made_from_until_that_changes() {
@@ -1889,6 +2054,93 @@ mod tests {
     }
 
     #[test]
+    fn a_scripted_animation_uses_its_recorded_start_with_a_long_deadline() {
+        use std::sync::Arc;
+        use thedas_script::{EngineTable, vm::Value};
+        use thedas_sim::{sim::ScriptHost, world::EngineData};
+        use thedas_vfs::Vfs;
+        let table = EngineTable::parse(
+            b"#define ENGINE_STRUCTURE_2 command\n\
+            command CommandPlayAnimation(int a) = 569;\n",
+        )
+        .unwrap();
+        let f = table
+            .function_by_name("CommandPlayAnimation")
+            .unwrap()
+            .clone();
+        let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(table), 1);
+        s.world.tables().insert(
+            "#0",
+            &["#7a398af9", "#12a02374"],
+            vec![
+                (10, vec![Cell::String("emote".into()), Cell::Int(0)]),
+                (11, vec![Cell::String("sit".into()), Cell::Int(1)]),
+            ],
+        );
+        s.world.tables().insert(
+            "apr_base",
+            &["#500976ec", "#de80b418"],
+            vec![(
+                0,
+                vec![
+                    Cell::String("emotes.anb".into()),
+                    Cell::String("combat.anb".into()),
+                ],
+            )],
+        );
+        let id = s.world.spawn(ObjectKind::Creature, "actor");
+        let mut host = ScriptHost {
+            sim: &mut s,
+            event: None,
+            script: "test".into(),
+        };
+        let Some(Value::Engine { handle, .. }) =
+            thedas_sim::engine::call(&mut host, id, &f, &[Value::Int(10)])
+                .unwrap()
+                .unwrap()
+        else {
+            panic!("handle")
+        };
+        let Some(EngineData::Command(cmd)) = s.world.handle(handle) else {
+            panic!("command")
+        };
+        let mut cmd = cmd.clone();
+        cmd.due = Some(4500);
+        cmd.from = Some(([0.0; 3], 1000));
+        s.world.time_ms = 1750;
+        let m = played_animation(&s, s.world.get(id).unwrap(), &cmd, &[]).unwrap();
+        assert!((m.time - 0.75).abs() < 1e-6);
+        s.world.get_mut(id).unwrap().commands.push(cmd.clone());
+        let m = motion(&s, s.world.get(id).unwrap()).unwrap();
+        assert_eq!(
+            m.actions[0], "emote",
+            "a recorded start does not make an animation run"
+        );
+        assert!((m.time - 0.75).abs() < 1e-6);
+        // Saves from before start-time tracking retain their previous presentation.
+        cmd.from = None;
+        cmd.due = Some(2000);
+        let m = played_animation(&s, s.world.get(id).unwrap(), &cmd, &[]).unwrap();
+        assert!((m.time - 0.25).abs() < 1e-6);
+        cmd.from = Some(([0.0; 3], 1000));
+        cmd.ints = vec![11, 2];
+        let m = played_animation(&s, s.world.get(id).unwrap(), &cmd, &[]).unwrap();
+        assert!(m.looping, "finite table-marked loops also repeat");
+        cmd.ints = vec![10, -1];
+        let m = played_animation(&s, s.world.get(id).unwrap(), &cmd, &[]).unwrap();
+        assert!(!m.looping, "an entering animation does not repeat");
+        cmd.ints = vec![11, -1];
+        let o = s.world.get_mut(id).unwrap();
+        o.commands.clear();
+        o.looping_animation = Some(cmd);
+        let m = motion(&s, s.world.get(id).unwrap()).unwrap();
+        assert_eq!(m.actions[0], "sit");
+        assert!(m.looping);
+        let idle = standing_motion(&s, s.world.get(id).unwrap()).unwrap();
+        assert_eq!(idle.actions[0], action::PAUSE);
+    }
+
+    #[test]
     fn the_dead_play_their_death_from_when_they_died() {
         use std::sync::Arc;
         use thedas_script::EngineTable;
@@ -1925,6 +2177,202 @@ mod tests {
         // A death of unknown time shows the end of the animation.
         s.world.get_mut(id).unwrap().died_at = None;
         assert_eq!(motion(&s, s.world.get(id).unwrap()).unwrap().time, f32::MAX);
+    }
+
+    fn paired_death_fixture() -> (Sim, ObjectId, ObjectId) {
+        use std::sync::Arc;
+        use thedas_script::EngineTable;
+        use thedas_sim::deathblow::{DeathBlow, DeathBlowImpact, DeathBlowReaction};
+        use thedas_sim::world::Command;
+        use thedas_vfs::Vfs;
+        let table = EngineTable::parse(
+            b"int INVENTORY_SLOT_MAIN = 0;\nint INVENTORY_SLOT_OFFHAND = 1;\nint EVENT_TYPE_DEATH = 4;\n",
+        )
+        .unwrap();
+        let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(table), 1);
+        let st = |v: &str| Cell::String(format!("{v}\0"));
+        for worksheet in ["apr_base", "#2"] {
+            s.world.tables().insert(
+                worksheet,
+                &["#500976ec", "#de80b418"],
+                vec![(15, vec![st("humanoid.anb"), st("combat_humanoid.anb")])],
+            );
+        }
+        s.world.tables().insert(
+            "#6",
+            &["#8bf8fc78", "#c0d6c7f2"],
+            vec![(2, vec![st("weapon_override.anb"), st("melee")])],
+        );
+        let weapon = s.world.spawn(ObjectKind::Item, "sword");
+        s.world
+            .get_mut(weapon)
+            .unwrap()
+            .fields
+            .insert("BaseItem".into(), 2);
+        let attacker = s.world.spawn(ObjectKind::Creature, "attacker");
+        let victim = s.world.spawn(ObjectKind::Creature, "victim");
+        let a = s.world.get_mut(attacker).unwrap();
+        a.appearance = 15;
+        a.equipment.insert(0, weapon);
+        a.commands.push(Command {
+            name: "CommandDeathBlow".into(),
+            due: Some(4_000),
+            ..Default::default()
+        });
+        a.combat.death_blow = Some(DeathBlow {
+            victim,
+            started_ms: 1_000,
+            ends_ms: 4_000,
+            animation: 300,
+            action: "db_h_ow_attk_v1".into(),
+            impacts: vec![DeathBlowImpact {
+                at_ms: 1_500,
+                hand: 0,
+            }],
+            next_impact: 1,
+        });
+        let v = s.world.get_mut(victim).unwrap();
+        v.appearance = 15;
+        v.dead = true;
+        // Died-at is deliberately different: playback follows the paired start.
+        v.died_at = Some(500);
+        v.combat.death_blow_reaction = Some(DeathBlowReaction {
+            attacker,
+            started_ms: 1_000,
+            ends_ms: 5_000,
+            animation: 306,
+            action: "db_h_ow_die_v1".into(),
+        });
+        s.world.time_ms = 2_250;
+        (s, attacker, victim)
+    }
+
+    fn paired_motion(s: &Sim, id: ObjectId) -> Motion {
+        motion(s, s.world.get(id).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn paired_death_actions_resume_at_their_recorded_starts_without_mutating_state() {
+        let (mut s, attacker, victim) = paired_death_fixture();
+        s.world
+            .get_mut(attacker)
+            .unwrap()
+            .combat
+            .death_blow
+            .as_mut()
+            .unwrap()
+            .started_ms = 750;
+        let before = s.save_json().unwrap();
+        let a = paired_motion(&s, attacker);
+        let v = paired_motion(&s, victim);
+        assert_eq!(a.actions, ["db_h_ow_attk_v1"]);
+        assert_eq!(v.actions, ["db_h_ow_die_v1"]);
+        assert_eq!(
+            a.trees,
+            ["weapon_override.anb", "ow.anb", "combat_humanoid.anb"]
+        );
+        assert_eq!(v.trees, ["combat_humanoid.anb"]);
+        for (m, elapsed) in [(a, 1.5), (v, 1.25)] {
+            assert_eq!(m.time, elapsed);
+            assert!(!m.looping);
+            assert!(m.blend.is_empty());
+        }
+        assert_eq!(
+            standing_motion(&s, s.world.get(victim).unwrap())
+                .unwrap()
+                .actions,
+            [action::PAUSE]
+        );
+        assert_eq!(before, s.save_json().unwrap());
+    }
+
+    #[test]
+    fn paired_death_reaction_holds_its_final_pose_at_and_after_the_deadline() {
+        let (mut s, attacker, victim) = paired_death_fixture();
+        for now in [5_000, 5_001, 60_000] {
+            s.world.time_ms = now;
+            // The attacker's command has completed; the corpse keeps its reaction.
+            s.world.get_mut(attacker).unwrap().combat.death_blow = None;
+            let m = paired_motion(&s, victim);
+            assert_eq!(m.actions, ["db_h_ow_die_v1"]);
+            assert_eq!(m.time, f32::MAX);
+            assert!(!m.looping);
+        }
+    }
+
+    #[test]
+    fn paired_death_motion_survives_save_load_mid_reaction() {
+        let (s, attacker, victim) = paired_death_fixture();
+        let (mut loaded, _, _) = paired_death_fixture();
+        loaded.load_json(&s.save_json().unwrap()).unwrap();
+        for id in [attacker, victim] {
+            assert_eq!(paired_motion(&s, id), paired_motion(&loaded, id));
+            loaded.world.time_ms = 3_000;
+            assert_eq!(paired_motion(&loaded, id).time, 2.0);
+            loaded.world.time_ms = s.world.time_ms;
+        }
+        loaded.world.time_ms = 5_000;
+        assert_eq!(paired_motion(&loaded, victim).time, f32::MAX);
+    }
+
+    #[test]
+    fn resurrection_releases_the_paired_corpse_pose() {
+        let (mut s, _, victim) = paired_death_fixture();
+        s.world.time_ms = 6_000;
+        assert_eq!(paired_motion(&s, victim).time, f32::MAX);
+        s.apply_effect(
+            victim,
+            thedas_sim::world::Effect {
+                ty: thedas_sim::combat::EFFECT_TYPE_RESURRECTION,
+                ..Default::default()
+            },
+        );
+        let v = s.world.get(victim).unwrap();
+        assert!(!v.dead);
+        assert!(v.combat.death_blow_reaction.is_none());
+        assert_eq!(paired_motion(&s, victim).actions, [action::PAUSE]);
+        assert!(paired_motion(&s, victim).looping);
+    }
+
+    #[test]
+    fn departure_shortened_reaction_holds_the_clip_end_instead_of_the_departure_frame() {
+        let (mut s, attacker, victim) = paired_death_fixture();
+        let old = s.world.spawn(ObjectKind::Area, "old");
+        let next = s.world.spawn(ObjectKind::Area, "next");
+        s.world.get_mut(next).unwrap().template = "next".into();
+        s.world.area = Some(old);
+        s.world.get_mut(victim).unwrap().area = Some(old);
+        s.world.queue_event(
+            2_750,
+            victim,
+            thedas_sim::world::Event {
+                ty: 4,
+                creator: Some(attacker),
+                ..Default::default()
+            },
+            None,
+        );
+        assert_eq!(paired_motion(&s, victim).time, 1.25);
+        s.enter_area("next", None).unwrap();
+        assert_eq!(
+            s.world
+                .get(victim)
+                .unwrap()
+                .combat
+                .death_blow_reaction
+                .as_ref()
+                .unwrap()
+                .ends_ms,
+            2_250
+        );
+        let held = paired_motion(&s, victim);
+        assert_eq!(held.time, f32::MAX);
+        assert_eq!(held.actions, ["db_h_ow_die_v1"]);
+        let (mut loaded, _, _) = paired_death_fixture();
+        loaded.load_json(&s.save_json().unwrap()).unwrap();
+        assert_eq!(paired_motion(&loaded, victim), held);
+        loaded.world.time_ms = 60_000;
+        assert_eq!(paired_motion(&loaded, victim), held);
     }
 
     #[test]

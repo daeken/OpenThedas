@@ -46,8 +46,11 @@ fn name(sim: &Sim, id: u32) -> String {
 /// not yet continued past (conversation.gfx shows it and sends `Conversation.SelectResponse
 /// 0` from its continue action).
 pub fn conversation(sim: &Sim) -> Option<thedas_sim::dialog::DialogState> {
-    sim.dialog_state()
-        .filter(|d| !d.ended || !d.line.is_empty())
+    sim.dialog_state().filter(|d| {
+        !d.ended
+            || !d.line.is_empty()
+            || sim.cut_line_speech() == thedas_sim::dialog::CutLineSpeech::InProgress
+    })
 }
 
 /// The text the simulation gives a reply with no text of its own (a plain "continue").
@@ -154,6 +157,12 @@ pub struct Presentation {
     /// A full-screen menu (options, save and load, the game menu) is up: tutorial popups
     /// wait under it (the popup layer those screens load does not show them).
     pub menu_up: bool,
+    /// Any screen but the HUD is up, however it came up (a conversation, or the inventory a
+    /// looted container opens from the simulation rather than the player): a tutorial waits
+    /// until it closes, as it does for a menu (the step's panel over Rica's talk with Beraht's
+    /// shopkeeper and over a footlocker's inventory were player reports). Provisional: the
+    /// original's rule is not traced.
+    pub screen_up: bool,
     /// The player is using a pad: the tutorial popup's title carries its pad control.
     pub pad_active: bool,
 }
@@ -997,7 +1006,7 @@ fn sim_values_with(
     // Provisional: the original's rule for a tutorial waiting while a menu is up is not
     // traced; QA saw the panel over the options, save and game menus, where it does not
     // belong.
-    let tutorials_held = shown.menu_up || sim.tutorials_held();
+    let tutorials_held = shown.menu_up || shown.screen_up || sim.tutorials_held();
     let tutorials: &[thedas_sim::journal::Tutorial] = if tutorials_held {
         &[]
     } else {
@@ -1040,12 +1049,16 @@ fn sim_values_with(
     }
     v.insert(
         "Tutorials.Enabled".into(),
-        num(u8::from(sim.show_tutorials)),
+        // Disabling new notifications must not hide an already queued pause's
+        // only release control (older saves can contain precisely that state).
+        num(u8::from(sim.show_tutorials || sim.tutorial_paused())),
     );
     // The training step shown (`trainingsteps.gda`'s row; 0 none), see `thedas_sim::training`.
     v.insert(
         "Tutorials.TrainingStep".into(),
-        num(if sim.tutorials_held() {
+        // Held back behind a screen, as the tutorial list is: the popup layer is over every
+        // screen now, and a step's panel over the journal or map is not the game's.
+        num(if tutorials_held {
             0
         } else {
             sim.world.training.step
@@ -1549,7 +1562,12 @@ fn item(sim: &Sim, prefix: &str, id: u32, v: &mut BTreeMap<String, UiValue>) {
     set("AbilityID", num(ability.unwrap_or(ITEM_ABILITY_INVALID)));
     set("RecipeID", field("CraftingRecipeID", 0));
     set("Unique", field("Unique", 0));
-    set("Irremovable", num(o.plot as u8));
+    let irremovable = if sim.game == thedas_vfs::Game::Origins {
+        sim.item_irremovable(id)
+    } else {
+        o.plot
+    };
+    set("Irremovable", num(irremovable as u8));
     for k in [
         "Damaged",
         "Indestructible",
@@ -2230,7 +2248,10 @@ fn inventory(sim: &Sim, who: Option<u32>, filter: i32, v: &mut BTreeMap<String, 
     let Some(o) = who.and_then(|w| sim.world.get(w)) else {
         return;
     };
-    v.insert("GUI.SelectedChar.CanChangeEquipment".into(), num(1));
+    v.insert(
+        "GUI.SelectedChar.CanChangeEquipment".into(),
+        num(sim.can_change_equipment(o.id) as u8),
+    );
     let (layout, can_switch) = equipment_layout(sim, &o.tag);
     v.insert("GUI.SelectedChar.EquipmentLayout".into(), num(layout));
     v.insert(
@@ -2265,6 +2286,36 @@ mod tests {
     use super::*;
 
     #[test]
+    fn any_screen_holds_the_training_step_and_tutorials_back() {
+        let mut sim = Sim::new(
+            std::sync::Arc::new(thedas_vfs::Vfs::new()),
+            std::sync::Arc::new(thedas_script::EngineTable::default()),
+            1,
+        );
+        sim.world.tutorials.push(thedas_sim::journal::Tutorial {
+            resref: "lesson".into(),
+            title: None,
+            text: None,
+            pauses: false,
+        });
+        sim.world.training.step = 1;
+        let mut shown = Presentation {
+            screen_up: true,
+            ..Default::default()
+        };
+        let v = sim_values_for(&sim, &shown);
+        assert_eq!(v["Tutorials.TutorialList"], UiValue::String(String::new()));
+        assert_eq!(v["Tutorials.TrainingStep"], num(0));
+        shown.screen_up = false;
+        let v = sim_values_for(&sim, &shown);
+        assert_eq!(
+            v["Tutorials.TutorialList"],
+            UiValue::String("lesson".into())
+        );
+        assert_eq!(v["Tutorials.TrainingStep"], num(1));
+    }
+
+    #[test]
     fn cinematic_tutorials_wait_and_reappear_with_their_pause() {
         let mut sim = Sim::new(
             std::sync::Arc::new(thedas_vfs::Vfs::new()),
@@ -2297,6 +2348,17 @@ mod tests {
         );
         assert_eq!(v["Tutorials.TrainingStep"], num(7));
         assert_eq!(v["Client.Paused"], num(1));
+        sim.show_tutorials = false;
+        let v = sim_values_for(&sim, &shown);
+        assert_eq!(
+            v["Tutorials.Enabled"],
+            num(1),
+            "queued pause stays actionable"
+        );
+        assert_eq!(
+            v["Tutorials.TutorialList.0"],
+            UiValue::String("lesson".into())
+        );
     }
 
     #[test]
@@ -2503,6 +2565,42 @@ mod tests {
             },
         );
         assert!(other.contains_key(&format!("{k}.0")));
+    }
+
+    #[test]
+    fn equipment_flags_use_native_state_instead_of_plot_or_unconditional_access() {
+        let mut sim = Sim::new(
+            std::sync::Arc::new(thedas_vfs::Vfs::new()),
+            std::sync::Arc::new(thedas_script::EngineTable::default()),
+            1,
+        );
+        let hero = sim.world.spawn(ObjectKind::Creature, "hero");
+        sim.world.hero = Some(hero);
+        let gear = sim.world.spawn(ObjectKind::Item, "gear");
+        sim.world.get_mut(hero).unwrap().inventory.push(gear);
+        sim.world
+            .get_mut(hero)
+            .unwrap()
+            .fields
+            .insert("CanChangeEquipment".into(), 0);
+        sim.world
+            .get_mut(gear)
+            .unwrap()
+            .fields
+            .insert("Irremovable".into(), 1);
+        let values = sim_values(&sim);
+        assert_eq!(values["GUI.SelectedChar.CanChangeEquipment"], num(0));
+        assert_eq!(
+            values["GUIInventory.PartyBackpackView.0.Item.Irremovable"],
+            num(1)
+        );
+        sim.game = thedas_vfs::Game::DragonAge2;
+        let values = sim_values(&sim);
+        assert_eq!(values["GUI.SelectedChar.CanChangeEquipment"], num(1));
+        assert_eq!(
+            values["GUIInventory.PartyBackpackView.0.Item.Irremovable"],
+            num(0)
+        );
     }
 
     #[test]

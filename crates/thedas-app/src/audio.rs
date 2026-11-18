@@ -867,6 +867,17 @@ fn gui_table(vfs: &Vfs) -> Vec<Option<String>> {
 }
 
 impl GameAudio {
+    pub fn report_sounds(&self) -> serde_json::Value {
+        let now = std::time::Instant::now();
+        serde_json::json!({
+            "window_s": 10, "limit": 512,
+            "starts": self.engine.recent_starts().map(|s| serde_json::json!({
+                "age_s": now.saturating_duration_since(s.at).as_secs_f32(),
+                "event": s.event, "position": s.position, "sample": s.programmer_sound,
+            })).collect::<Vec<_>>(),
+        })
+    }
+
     /// The game's sound on the default output; `None` (logged) with no output device.
     pub fn open(install: &Path, module: &str, vfs: &Arc<Vfs>, language: &str) -> Option<GameAudio> {
         let output = thedas_audio::device::Output::open()?;
@@ -2067,6 +2078,18 @@ impl GameAudio {
         self.voice.as_ref().and_then(|v| v.2)
     }
 
+    /// Elapsed voice time at a cut/dialog handoff, including a sample that finished
+    /// while the cut still showed its subtitle.
+    pub fn voice_elapsed_ms(&self) -> f64 {
+        let Some((_, Some(handle), ms)) = self.voice.as_ref() else {
+            return 0.0;
+        };
+        if !self.engine.is_playing(*handle) {
+            return ms.unwrap_or_default();
+        }
+        self.voice_position().map_or(0.0, |(_, at)| at * 1000.0)
+    }
+
     /// The game's sound this frame, on the system output's clock.
     pub fn frame(&mut self, state: AudioState) {
         let now = Instant::now();
@@ -2403,6 +2426,7 @@ impl GameAudio {
                 ..Default::default()
             },
         );
+        log::debug!("audio: voice timing {line:?}: {ms:?} ms, event={h:?}");
         (line, h, ms)
     }
 }

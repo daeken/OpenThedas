@@ -1,10 +1,10 @@
 //! Engine functions the shipped `script.ldf` does not declare, with signatures inferred from
 //! how compiled scripts call them. The GOG 1.05 engine has functions newer than the table it
 //! ships: even core `creature_core.ncs` calls #862. Everything here is provisional; names are
-//! descriptive guesses, not BioWare's.
+//! descriptive guesses except where an executable trace establishes the registration.
 //!
 //! - #859 `(object, int, int) -> int[]`: the result is stored in an `int[]` local
-//!   (`gxa_module_chargen`).
+//!   (`gxa_module_chargen`); Origins registers GetAbilityList at 0x6764c6.
 //! - #860 `(int, float, float, int, object, string) -> void` (`vgk400ar_siege_ext_a`).
 //! - #862 `(string) -> int`: called with `"core_ep1"` and tested directly; reads like "is this
 //!   package loaded" (`creature_core`, `placeable_core`).
@@ -25,26 +25,41 @@ fn p(ty: Type, name: &str, default: Option<&str>) -> Param {
 pub fn inferred() -> Vec<Function> {
     vec![
         Function {
+            id: 396,
+            name: "AddToParty".into(),
+            ret: Type::Void,
+            params: vec![
+                p(Type::Object, "oCreature", None),
+                p(Type::Object, "oUnusedPlayer", None),
+            ],
+        },
+        Function {
+            id: 397,
+            name: "RemoveFromParty".into(),
+            ret: Type::Void,
+            params: vec![p(Type::Object, "oCreature", None)],
+        },
+        Function {
             id: 859,
-            name: "Inferred859_GetIntArray".into(),
+            name: "GetAbilityList".into(),
             ret: Type::Array(Box::new(Type::Int)),
             params: vec![
                 p(Type::Object, "oObject", None),
-                p(Type::Int, "n1", None),
-                p(Type::Int, "n2", None),
+                p(Type::Int, "nAbilityType", None),
+                p(Type::Int, "bCoolingDown", None),
             ],
         },
         Function {
             id: 860,
-            name: "Inferred860".into(),
+            name: "RequestTarget".into(),
             ret: Type::Void,
             params: vec![
-                p(Type::Int, "n1", None),
-                p(Type::Float, "f1", None),
-                p(Type::Float, "f2", None),
-                p(Type::Int, "n2", None),
-                p(Type::Object, "oObject", None),
-                p(Type::String, "s1", None),
+                p(Type::Int, "nTargetMask", None),
+                p(Type::Float, "fRadius", None),
+                p(Type::Float, "fUnused", None),
+                p(Type::Int, "nEventType", None),
+                p(Type::Object, "oRecipient", None),
+                p(Type::String, "sScript", None),
             ],
         },
         Function {
@@ -52,6 +67,18 @@ pub fn inferred() -> Vec<Function> {
             name: "IsPackageLoaded".into(),
             ret: Type::Int,
             params: vec![p(Type::String, "sPackage", None)],
+        },
+        Function {
+            id: 861,
+            name: "SetPlotActionCooldown".into(),
+            ret: Type::Void,
+            params: vec![
+                p(Type::Int, "nPlotActionId", None),
+                p(Type::Float, "fSeconds", None),
+                p(Type::Int, "nEventType", None),
+                p(Type::Object, "oRecipient", None),
+                p(Type::String, "sScript", None),
+            ],
         },
     ]
 }

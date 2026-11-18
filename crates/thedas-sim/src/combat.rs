@@ -29,6 +29,8 @@
 //! - **Effects.** `ApplyEffectOnObject` runs the target's `EVENT_TYPE_APPLY_EFFECT` handler at
 //!   once, with `GetCurrentEffect` returning the effect. Unless the handler calls
 //!   `SetIsCurrentEffectValid(FALSE)`, an effect with a duration stays on the target.
+//!   Origins visual effects instead use the native type-4 handler without that event
+//!   (see `docs/notes/origins-visual-effect-dispatch.md`).
 //! - **Resurrection.** An accepted `EFFECT_TYPE_RESURRECTION` brings the target back; its
 //!   handler restores health.
 //! - **Death.** An `EFFECT_TYPE_DEATH` that its handler accepts kills the target (the rules
@@ -36,7 +38,7 @@
 //!   or below and is neither immortal nor plot dies and gets `EVENT_TYPE_DEATH`, with the
 //!   killer as creator and object 0.
 //!
-//! All of this is provisional: event layouts are read from how `rules_core` reads them, and
+//! Except where native addresses are cited, this is provisional: event layouts are read from how `rules_core` reads them, and
 //! the range and default attack time are guesses, not values taken from the executable.
 
 use serde::{Deserialize, Serialize};
@@ -86,9 +88,16 @@ pub const DEFAULT_ATTACK_MS: u64 = 1500;
 pub struct CombatData {
     /// `GetCombatState`.
     pub in_combat: bool,
-    /// DA2's `GetAttackTarget`: prepared combat target, independent of the command queue.
+    /// `GetAttackTarget`: prepared combat target, independent of the command queue.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<ObjectId>,
+    /// Origins attack-side paired death animation, independent of the victim's death event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub death_blow: Option<crate::deathblow::DeathBlow>,
+    /// Origins victim reaction. Presentation plays this from its recorded start,
+    /// including while scripts already see a dead creature.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub death_blow_reaction: Option<crate::deathblow::DeathBlowReaction>,
     /// Creatures this one currently perceives.
     pub perceived: Vec<ObjectId>,
     /// Those of them it perceived as hostile (an appearance is announced again when a
@@ -220,20 +229,13 @@ fn same_arc<T>(a: &Option<std::sync::Arc<T>>, b: &Option<std::sync::Arc<T>>) -> 
 }
 
 impl Sim {
-    /// DA2 0x4dd1a0 reads the creature's combat record, including a stale/dead target;
-    /// scripts validate the returned id themselves. Origins retains its queue-based view.
+    /// Origins 0x655000 and DA2 0x4dd1a0 read the creature's combat record,
+    /// including a stale/dead target; scripts validate the returned id themselves.
     pub(crate) fn script_attack_target(&self, id: ObjectId) -> Option<ObjectId> {
         let o = self.world.get(id)?;
-        if self.game == thedas_vfs::Game::DragonAge2 {
-            (o.kind == ObjectKind::Creature)
-                .then_some(o.combat.target)
-                .flatten()
-        } else {
-            o.commands
-                .first()
-                .filter(|c| c.name == "CommandAttack")
-                .and_then(|c| c.target)
-        }
+        (o.kind == ObjectKind::Creature)
+            .then_some(o.combat.target)
+            .flatten()
     }
 
     /// Native modern preparation (0x640fd1..0x641016) preserves self casts and casts
@@ -277,13 +279,45 @@ impl Sim {
         }
     }
 
+    /// Origins attack preparation (0x743038) stores the target before approach.
+    /// Ability preparation (0x7441f8..0x744204) preserves self casts; unlike DA2,
+    /// it also replaces the target for casts on another party member.
+    fn prepare_origins_combat_target(&mut self, id: ObjectId, cmd: &crate::world::Command) {
+        let target = cmd.target.unwrap_or(OBJECT_INVALID);
+        let attack = cmd.name == "CommandAttack";
+        if !attack && cmd.name != "CommandUseAbility" {
+            return;
+        }
+        if (target == OBJECT_INVALID && attack)
+            || (target != OBJECT_INVALID && self.world.get(target).is_none())
+            || (!attack
+                && !self
+                    .world
+                    .tables()
+                    .get(1, "")
+                    .is_some_and(|t| t.has_row(i64::from(cmd.ints.first().copied().unwrap_or(0)))))
+        {
+            return;
+        }
+        if let Some(o) = self
+            .world
+            .get_mut(id)
+            .filter(|o| o.kind == ObjectKind::Creature)
+        {
+            if let Some(c) = o.commands.first_mut() {
+                c.da2_target_prepared = true;
+            }
+            if attack || id != target {
+                o.combat.target = (target != OBJECT_INVALID).then_some(target);
+            }
+        }
+    }
+
     /// Prepare the persistent target once, before approach and COMMAND_PENDING.
     /// The marker belongs to the command: arriving/reloading must not restore a
     /// target that a combat-exit transition cleared while the caster walked.
-    pub(crate) fn prepare_da2_combat_target(&mut self, id: ObjectId, cmd: &crate::world::Command) {
-        if self.game != thedas_vfs::Game::DragonAge2
-            || cmd.name != "CommandUseAbility"
-            || cmd.da2_target_prepared
+    pub(crate) fn prepare_combat_target(&mut self, id: ObjectId, cmd: &crate::world::Command) {
+        if cmd.da2_target_prepared
             || self
                 .world
                 .get(id)
@@ -295,6 +329,13 @@ impl Sim {
                         && c.target == cmd.target
                 })
         {
+            return;
+        }
+        if self.game == thedas_vfs::Game::Origins {
+            self.prepare_origins_combat_target(id, cmd);
+            return;
+        }
+        if cmd.name != "CommandUseAbility" {
             return;
         }
         let ability = cmd.ints.first().copied().unwrap_or(0);
@@ -320,14 +361,14 @@ impl Sim {
         self.remember_da2_combat_target(id, target);
     }
 
-    /// Modern completion 0x676288..0x6762a2 clears outside combat for active
-    /// party members and non-party followers. The cached native membership flag
-    /// (0x5a00b8 / 0x5a05bc) uses the active list, unlike preparation's pool test.
-    pub(crate) fn complete_da2_combat_target(&mut self, id: ObjectId) {
-        if self.game != thedas_vfs::Game::DragonAge2 {
-            return;
-        }
-        if let Some(o) = self.world.get_mut(id) {
+    /// Ability completion (Origins 0x746d16..0x746d32, DA2 0x676288..0x6762a2)
+    /// clears outside combat for active party members and non-party followers.
+    /// DA2's cached native membership flag (0x5a00b8 / 0x5a05bc) uses the active
+    /// list, unlike its preparation's pool test.
+    pub(crate) fn complete_combat_target(&mut self, id: ObjectId) {
+        if self.game == thedas_vfs::Game::DragonAge2
+            && let Some(o) = self.world.get_mut(id)
+        {
             o.combat.animation_motion = None;
         }
         let member = crate::engine::party_of(self).contains(&id)
@@ -341,11 +382,16 @@ impl Sim {
         }
     }
 
-    /// Native SetCombatState (0x583c70 -> 0x579dd0) clears the target on leaving
-    /// combat. Repeating the current state does not run the transition again.
+    /// Native SetCombatState (Origins 0x6ae0a0 -> 0x6abbf0, DA2 0x583c70 ->
+    /// 0x579dd0) clears the target on leaving combat. Repeating the current state
+    /// does not run the transition again.
     pub(crate) fn set_combat_state(&mut self, id: ObjectId, on: bool) {
         if let Some(o) = self.world.get_mut(id) {
-            if self.game == thedas_vfs::Game::DragonAge2 && o.combat.in_combat && !on {
+            if self.game == thedas_vfs::Game::Origins && o.combat.in_combat != on {
+                o.fields.remove("WeaponMainDrawn");
+                o.fields.remove("WeaponOffDrawn");
+            }
+            if o.combat.in_combat && !on {
                 o.combat.target = None;
             }
             o.combat.in_combat = on;
@@ -950,8 +996,8 @@ impl Sim {
         self.world.get(seen).is_some_and(|o| o.combat.stealth) && self.hostile(who, seen)
     }
 
-    /// Runs a target's `APPLY_EFFECT` handler for an effect, keeps it if it lasts, and
-    /// checks for death afterwards.
+    /// Applies an effect, using the native Origins visual path or the target's
+    /// `APPLY_EFFECT` handler, and keeps it if it lasts.
     pub fn apply_effect(&mut self, target: ObjectId, mut effect: Effect) {
         if self.world.get(target).is_none() {
             return;
@@ -971,6 +1017,16 @@ impl Sim {
                 effect.ty, creator, effect.floats
             ),
         });
+        // DAOrigins.exe 0x7a0ee8..0x7a0f1a dispatches type 4 to 0x7a00a0,
+        // which attaches the visual without raising APPLY_EFFECT (0x79fe90).
+        // Do not expose this visual as the current script effect, including when
+        // it is applied from inside another effect's handler. DA2 is untraced.
+        if self.game == thedas_vfs::Game::Origins && effect.ty == 4 {
+            if effect.duration_type != constant_of(self, "EFFECT_DURATION_TYPE_INSTANT") {
+                self.world.get_mut(target).unwrap().effects.push(effect);
+            }
+            return;
+        }
         let health = constant_of(self, "PROPERTY_DEPLETABLE_HEALTH");
         let health_of = |s: &Sim| {
             s.world
@@ -995,6 +1051,7 @@ impl Sim {
         // A lethal hit arrives as EFFECT_TYPE_DEATH (7 in effects.gda) rather than as damage
         // that empties the health bar: the engine does the killing.
         if valid && effect.ty == EFFECT_TYPE_RESURRECTION {
+            self.cancel_death_blow_reaction(target);
             if let Some(o) = self.world.get_mut(target) {
                 o.dead = false;
                 o.died_at = None;
@@ -1104,6 +1161,11 @@ impl Sim {
             None => None,
         };
         let Some(effect) = removed else { return false };
+        // The paired native type-4 removal handler (0x7a0150) detaches the
+        // visual without REMOVE_EFFECT, just as application bypasses the hook.
+        if self.game == thedas_vfs::Game::Origins && effect.ty == 4 {
+            return true;
+        }
         // An area of effect goes with its effect (DAOrigins.exe 0x7a0520).
         let aoe = (effect.ty == crate::aoe::EFFECT_TYPE_AOE)
             .then(|| effect.objects.first().copied())
@@ -1330,6 +1392,13 @@ impl Sim {
 
     /// Marks a creature dead, clears what it was doing and sends it `EVENT_TYPE_DEATH`.
     pub fn kill(&mut self, id: ObjectId, killer: ObjectId) {
+        self.kill_with_event_delay(id, killer, 0);
+    }
+
+    /// Native death-animation tasks zero health at start and notify scripts at end
+    /// (0x7ab31d and 0x7ab401). Ordinary effect-driven deaths notify immediately.
+    pub(crate) fn kill_with_event_delay(&mut self, id: ObjectId, killer: ObjectId, delay: u64) {
+        self.da2_reset_locomotion(id);
         let health = constant_of(self, "PROPERTY_DEPLETABLE_HEALTH");
         let now = self.world.time_ms;
         if let Some(o) = self.world.get_mut(id) {
@@ -1345,14 +1414,15 @@ impl Sim {
             }
             o.commands.clear();
             o.combat.attack = None;
-            if self.game == thedas_vfs::Game::DragonAge2 && o.combat.in_combat {
+            o.combat.death_blow = None;
+            if o.combat.in_combat {
                 o.combat.target = None;
             }
             o.combat.in_combat = false;
         }
         let mut ev = self.new_event("DEATH", Some(killer));
         ev.objects = vec![killer];
-        self.world.queue_event(0, id, ev, None);
+        self.world.queue_event(delay, id, ev, None);
     }
 
     /// Fills a creature's tactics slots from a preset: the preset's row in
@@ -1479,6 +1549,9 @@ impl Sim {
 
     /// Orders a creature to attack another, as the player does by clicking an enemy.
     pub fn order_attack(&mut self, attacker: ObjectId, target: ObjectId) {
+        if self.target_request_click(attacker, target, [0.0; 3]) {
+            return;
+        }
         self.note_player_order(attacker);
         let mut cmd = crate::world::Command {
             ty: constant_of(self, "COMMAND_TYPE_ATTACK"),
@@ -1499,15 +1572,21 @@ impl Sim {
             impacted: false,
             arrived: false,
             da2_target_prepared: false,
+            interaction: None,
             da2_basic_attack_fallback: self.game == thedas_vfs::Game::DragonAge2,
+            da2_player_issued: false,
             path: Vec::new(),
             turned_at: None,
             is_static: false,
         };
         self.da2_default_attack_command(&mut cmd);
-        if let Some(o) = self.world.get_mut(attacker) {
+        if self.game == thedas_vfs::Game::DragonAge2 {
+            self.da2_player_command(attacker, cmd);
+        } else if let Some(o) = self.world.get_mut(attacker) {
             o.commands.clear();
             o.commands.push(cmd);
+        }
+        if let Some(o) = self.world.get_mut(attacker) {
             o.combat.in_combat = true;
         }
     }
@@ -1617,7 +1696,9 @@ impl Sim {
             impacted: false,
             arrived: false,
             da2_target_prepared: false,
+            interaction: None,
             da2_basic_attack_fallback: false,
+            da2_player_issued: false,
             path: Vec::new(),
             turned_at: None,
             is_static: false,
@@ -1676,8 +1757,26 @@ impl Sim {
         }
         let target = cmd.target.unwrap_or(OBJECT_INVALID);
         let ability = cmd.ints.first().copied().unwrap_or(0);
-        self.prepare_da2_combat_target(id, cmd);
+        self.prepare_combat_target(id, cmd);
+        // Preparation precedes the callback. Its marker is not a script-side
+        // replacement, including when a caller starts an unprepared payload.
+        let prepared = self
+            .world
+            .get(id)
+            .and_then(|o| o.commands.first())
+            .filter(|c| c.da2_target_prepared != cmd.da2_target_prepared)
+            .map(|c| {
+                let mut prepared = cmd.clone();
+                prepared.da2_target_prepared = c.da2_target_prepared;
+                prepared
+            });
+        let cmd = prepared.as_ref().unwrap_or(cmd);
         let item = self.ability_item(id, cmd);
+        let pending_command = if self.game == thedas_vfs::Game::DragonAge2 {
+            self.world.get(id).and_then(|o| o.commands.first()).cloned()
+        } else {
+            None
+        };
         let mut ev = self.new_event("COMMAND_PENDING", Some(id));
         ev.objects = vec![id, target, item];
         ev.ints = vec![cmd.ty, ability];
@@ -1693,7 +1792,7 @@ impl Sim {
                 if self.game == thedas_vfs::Game::Origins {
                     c == cmd
                 } else {
-                    c.name == cmd.name && c.ints == cmd.ints && c.target == cmd.target
+                    Some(c) == pending_command.as_ref()
                 }
             });
         if !still {
@@ -2018,13 +2117,20 @@ impl Sim {
     }
 
     pub(crate) fn finish_attack(&mut self, id: ObjectId, target: ObjectId) {
+        self.attack_impact_slots(id, target, &[0, 1]);
+        if let Some(o) = self.world.get_mut(id) {
+            o.combat.attack = None;
+        }
+    }
+
+    pub(crate) fn attack_impact_slots(&mut self, id: ObjectId, target: ObjectId, hands: &[usize]) {
         // An attack restored from a save made before DA2 resolution was implemented can
         // still have result zero. Resolve it once before delivering its impact.
         self.resolve_da2_attack(id, target);
         let Some(result) = self.world.get(id).and_then(|o| o.combat.attack.clone()) else {
             return;
         };
-        for hand in 0..2 {
+        for &hand in hands {
             let hit = result.results[hand];
             // Keep the previous fallback when the module or default attack's script
             // metadata is unavailable. Normal attacks already hold their script's roll.
@@ -2091,9 +2197,6 @@ impl Sim {
                     }
                 }
             }
-        }
-        if let Some(o) = self.world.get_mut(id) {
-            o.combat.attack = None;
         }
     }
 }
@@ -2287,8 +2390,8 @@ const SPELL_CONJURING_SPEEDS: i32 = 0x87;
 /// The animation tables (M2DA 0, `anim_*.gda`): the tree action an animation id plays
 /// (0x5cb558 maps the actions to ids), and the animation that follows it (0x5ca6c3: a
 /// conjure's start is followed by its loop).
-const COL_ANIM_ACTION: u32 = 0x7a39_8af9;
-const COL_ANIM_NEXT: u32 = 0xffc3_72e7;
+pub(crate) const COL_ANIM_ACTION: u32 = 0x7a39_8af9;
+pub(crate) const COL_ANIM_NEXT: u32 = 0xffc3_72e7;
 /// Animation event kinds that deliver an ability: the creature's animation-event handler
 /// (0x6c0bf0, its switch at 0x6c0c37) sends `ABILITY_CAST_IMPACT` on kind 7 (0x6c0c5f,
 /// 0x6af430); kind 9 goes on (0x6c0d2e, 0x694ee0) to the creature's release (0x6b6f60),
@@ -2383,8 +2486,9 @@ impl Sim {
 
     /// The trees a creature's ability animations are looked up in, first to last: its main
     /// weapon's own tree (`bitm_base.gda`, e.g. `Staff.anb`), its weapon-style tree, its
-    /// combat tree. Provisional (see [`Sim::ability_timing`]).
-    fn ability_trees(&self, id: ObjectId) -> Vec<String> {
+    /// combat tree. Read-only: presentation also uses this order for paired death-blow
+    /// actions already selected by the simulation. Provisional (see [`Sim::ability_timing`]).
+    pub fn ability_trees(&self, id: ObjectId) -> Vec<String> {
         let mut trees = Vec::new();
         let slot = constant_of(self, "INVENTORY_SLOT_MAIN");
         let weapon = self
@@ -2419,7 +2523,11 @@ impl Sim {
 
     /// An action's animation in the first of `trees` that has it (cached by tree and
     /// action).
-    fn ability_anim(&mut self, trees: &[String], action: &str) -> Option<AbilityAnimLen> {
+    pub(crate) fn ability_anim(
+        &mut self,
+        trees: &[String],
+        action: &str,
+    ) -> Option<AbilityAnimLen> {
         for tree in trees {
             let key = format!("{tree}|{action}");
             let found = match self.ability_anims.get(&key) {
@@ -2474,7 +2582,7 @@ pub(crate) struct AbilityAnimLen {
 /// as DAOrigins.exe's test (0x695390) reads it when the creature has no animation component
 /// to ask (0x6953ad -> 0x5ca610 with mask 1): set on the conjure loops (4097), clear on
 /// their starts (4096). With a component it asks the component (0xa5e940), not traced.
-fn anim_loops(anims: &crate::m2da::Table, anim: i64) -> bool {
+pub(crate) fn anim_loops(anims: &crate::m2da::Table, anim: i64) -> bool {
     matches!(anims.cell_by_hash(COL_ANIM_FLAGS, anim), Some(thedas_formats::gda::Cell::Int(v)) if v & 1 != 0)
 }
 
@@ -2582,7 +2690,12 @@ impl Sim {
     /// (`PERSPACE`: 0.35 for humans and walking corpses, 0.4 for hurlocks, 0.95 for an
     /// ogre), else [`DEFAULT_RADIUS`].
     pub fn body_radius(&self, id: ObjectId) -> f32 {
-        let app = self.world.get(id).map(|o| o.appearance).filter(|&a| a > 0);
+        let app = self
+            .world
+            .get(id)
+            .filter(|o| self.game != thedas_vfs::Game::Origins || o.kind == ObjectKind::Creature)
+            .map(|o| o.appearance)
+            .filter(|&a| a > 0);
         app.and_then(|a| {
             let t = self.world.tables().get(0, "apr_base")?;
             match t.cell("PERSPACE", a as i64)? {
@@ -2674,6 +2787,7 @@ mod tests {
     use super::*;
 
     const LDF: &str = "int EVENT_TYPE_PERCEPTION_APPEAR = 25;\n\
+        int COMMAND_TYPE_USE_ABILITY = 25;\n\
         int EVENT_TYPE_MANA_STAM_DEPLETED = 64;\n\
         int EVENT_TYPE_PERCEPTION_DISAPPEAR = 26;\n\
         int EVENT_TYPE_DEATH = 4;\n\
@@ -2918,7 +3032,7 @@ mod tests {
     }
 
     #[test]
-    fn target_storage_is_absent_from_old_saves_and_does_not_change_origins_getter() {
+    fn target_storage_is_absent_from_old_saves_and_getters_ignore_the_queue() {
         let old = serde_json::to_string(&CombatData::default()).unwrap();
         assert!(!old.contains("\"target\""));
         assert_eq!(
@@ -2935,8 +3049,6 @@ mod tests {
                 (game == thedas_vfs::Game::DragonAge2).then_some(target)
             );
             s.order_attack(who, target);
-            assert_eq!(stored_target(&mut s, who), target);
-            s.world.get_mut(who).unwrap().commands.clear();
             assert_eq!(
                 stored_target(&mut s, who),
                 if game == thedas_vfs::Game::DragonAge2 {
@@ -2945,9 +3057,181 @@ mod tests {
                     OBJECT_INVALID
                 }
             );
+            let cmd = s.world.get(who).unwrap().commands[0].clone();
+            if game == thedas_vfs::Game::Origins {
+                s.prepare_combat_target(who, &cmd);
+            }
+            assert_eq!(stored_target(&mut s, who), target);
+            s.world.get_mut(who).unwrap().commands.clear();
+            assert_eq!(stored_target(&mut s, who), target);
             let prop = s.world.spawn(ObjectKind::Placeable, "prop");
             s.world.get_mut(prop).unwrap().combat.target = Some(target);
             assert_eq!(stored_target(&mut s, prop), OBJECT_INVALID);
+        }
+    }
+
+    #[test]
+    fn origins_attack_target_survives_a_completed_swing_wait_and_queue_clear() {
+        let mut s = target_sim(thedas_vfs::Game::Origins);
+        let area = s.world.spawn(ObjectKind::Area, "arena");
+        let who = s.world.spawn(ObjectKind::Creature, "attacker");
+        let target = s.world.spawn(ObjectKind::Creature, "target");
+        for id in [who, target] {
+            s.world.get_mut(id).unwrap().area = Some(area);
+        }
+        s.world.get_mut(target).unwrap().position = [1., 0., 0.];
+        s.order_attack(who, target);
+        // Admission does not prepare; the executor does, before pending.
+        assert_eq!(stored_target(&mut s, who), OBJECT_INVALID);
+        s.tick(1);
+        assert_eq!(stored_target(&mut s, who), target);
+        s.tick(5000);
+        assert!(s.world.get(who).unwrap().commands.is_empty());
+        assert_eq!(
+            s.world
+                .get(who)
+                .unwrap()
+                .combat
+                .previous_command
+                .as_ref()
+                .unwrap()
+                .name,
+            "CommandAttack"
+        );
+        assert_eq!(stored_target(&mut s, who), target);
+        assert_eq!(s.attack_target(who), None);
+        s.order_wait(who, 2.);
+        assert_eq!(stored_target(&mut s, who), target);
+        target_call(&mut s, who, "ClearAllCommands", &[Value::Object(who)]);
+        assert_eq!(stored_target(&mut s, who), target);
+        // Scripts, not the native getter, reject dead and stale ids.
+        s.world.get_mut(target).unwrap().dead = true;
+        assert_eq!(stored_target(&mut s, who), target);
+        s.world.get_mut(who).unwrap().combat.target = Some(123456);
+        assert_eq!(stored_target(&mut s, who), 123456);
+        s.set_combat_state(who, false);
+        assert_eq!(stored_target(&mut s, who), OBJECT_INVALID);
+    }
+
+    #[test]
+    fn origins_approach_failure_keeps_target_and_reload_does_not_undo_combat_exit() {
+        let mut s = target_sim(thedas_vfs::Game::Origins);
+        let area = s.world.spawn(ObjectKind::Area, "arena");
+        let who = s.world.spawn(ObjectKind::Creature, "attacker");
+        let target = s.world.spawn(ObjectKind::Creature, "target");
+        for id in [who, target] {
+            s.world.get_mut(id).unwrap().area = Some(area);
+        }
+        s.world.get_mut(target).unwrap().position = [30., 0., 0.];
+        s.order_attack(who, target);
+        s.tick(1);
+        assert!(s.world.get(who).unwrap().commands[0].approach.is_some());
+        assert_eq!(stored_target(&mut s, who), target);
+        s.fail_front_command(who, "COMMAND_FAILED_INVALID_PATH");
+        assert!(s.world.get(who).unwrap().commands.is_empty());
+        s.order_wait(who, 2.);
+        s.tick(2100);
+        assert_eq!(stored_target(&mut s, who), target);
+        let json = serde_json::to_string(&s.world).unwrap();
+        s.world = serde_json::from_str(&json).unwrap();
+        assert_eq!(stored_target(&mut s, who), target);
+        s.order_attack(who, target);
+        s.tick(1);
+        s.set_combat_state(who, false);
+        let json = serde_json::to_string(&s.world).unwrap();
+        s.world = serde_json::from_str(&json).unwrap();
+        let cmd = s.world.get(who).unwrap().commands[0].clone();
+        assert!(cmd.da2_target_prepared);
+        s.prepare_combat_target(who, &cmd);
+        s.tick(7000);
+        assert_eq!(stored_target(&mut s, who), OBJECT_INVALID);
+    }
+
+    #[test]
+    fn origins_ability_target_preserves_self_but_updates_party_and_ground_casts() {
+        let mut s = target_sim(thedas_vfs::Game::Origins);
+        s.world.trace.keep = true;
+        let hero = s.world.spawn(ObjectKind::Creature, "hero");
+        let friend = s.world.spawn(ObjectKind::Creature, "friend");
+        let enemy = s.world.spawn(ObjectKind::Creature, "enemy");
+        s.world.hero = Some(hero);
+        s.world.get_mut(hero).unwrap().followers.push(friend);
+        s.set_combat_state(hero, true);
+        prepare_target(&mut s, hero, enemy, 3110);
+        assert_eq!(stored_target(&mut s, hero), enemy);
+        assert!(
+            s.world.trace.entries.iter().any(|e| matches!(e,
+            crate::trace::TraceEntry::Log { text, .. } if text.starts_with("ABILITY_CAST_START ")))
+        );
+        prepare_target(&mut s, hero, hero, 3110);
+        assert_eq!(stored_target(&mut s, hero), enemy);
+        prepare_target(&mut s, hero, friend, 3110);
+        assert_eq!(stored_target(&mut s, hero), friend);
+        for (target, ability) in [(enemy, 9999), (123456, 3110)] {
+            prepare_target(&mut s, hero, target, ability);
+            assert_eq!(stored_target(&mut s, hero), friend);
+        }
+        prepare_target(&mut s, hero, OBJECT_INVALID, 3110);
+        assert_eq!(stored_target(&mut s, hero), OBJECT_INVALID);
+        prepare_target(&mut s, hero, enemy, 3110);
+        s.complete_combat_target(hero);
+        assert_eq!(stored_target(&mut s, hero), enemy);
+        s.set_combat_state(hero, false);
+        prepare_target(&mut s, hero, enemy, 3110);
+        assert_eq!(stored_target(&mut s, hero), enemy);
+        s.complete_combat_target(hero);
+        assert_eq!(stored_target(&mut s, hero), OBJECT_INVALID);
+    }
+
+    #[test]
+    fn old_origins_saves_recover_only_active_attacks_in_combat() {
+        for game in [thedas_vfs::Game::Origins, thedas_vfs::Game::DragonAge2] {
+            for (active, combat, wait) in [
+                (true, true, false),
+                (false, true, false),
+                (true, false, false),
+                (true, true, true),
+            ] {
+                let mut s = target_sim(game);
+                let who = s.world.spawn(ObjectKind::Creature, "attacker");
+                let target = s.world.spawn(ObjectKind::Creature, "target");
+                let actor = s.world.get_mut(who).unwrap();
+                actor.combat.in_combat = combat;
+                actor.commands.push(crate::world::Command {
+                    name: if wait { "CommandWait" } else { "CommandAttack" }.into(),
+                    target: Some(target),
+                    due: active.then_some(2000),
+                    ..Default::default()
+                });
+                let mut old = s.save_game();
+                old.revision = 12;
+                s.load_game(old).unwrap();
+                let recovered = game == thedas_vfs::Game::Origins && active && combat && !wait;
+                assert_eq!(
+                    stored_target(&mut s, who),
+                    if recovered { target } else { OBJECT_INVALID }
+                );
+                // New snapshots keep the register and marker exactly, including
+                // a combat exit during an approach that must not be undone.
+                if recovered {
+                    s.set_combat_state(who, false);
+                }
+                let saved = s.save_game();
+                s.load_game(saved).unwrap();
+                assert_eq!(stored_target(&mut s, who), OBJECT_INVALID);
+                if game == thedas_vfs::Game::Origins && active && !wait {
+                    assert!(s.world.get(who).unwrap().commands[0].da2_target_prepared);
+                }
+                if recovered {
+                    // Earlier builds of this fix wrote revision 12. The old
+                    // marker must also preserve a clear after re-entering combat.
+                    s.set_combat_state(who, true);
+                    let mut earlier_branch_save = s.save_game();
+                    earlier_branch_save.revision = 12;
+                    s.load_game(earlier_branch_save).unwrap();
+                    assert_eq!(stored_target(&mut s, who), OBJECT_INVALID);
+                }
+            }
         }
     }
 
@@ -3965,7 +4249,9 @@ mod tests {
                 impacted: false,
                 arrived: false,
                 da2_target_prepared: false,
+                interaction: None,
                 da2_basic_attack_fallback: false,
+                da2_player_issued: false,
                 path: Vec::new(),
                 turned_at: None,
                 is_static: false,

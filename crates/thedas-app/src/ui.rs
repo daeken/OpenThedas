@@ -369,6 +369,12 @@ struct TextPopup {
 }
 
 impl TextPopup {
+    /// How many buttons the box shows: one per label, a trailing empty one left out (the
+    /// popup layer shows `NumButtons` of them, as a script's one-button `ShowPopup` does).
+    fn buttons(&self) -> usize {
+        if self.labels[1].is_empty() { 1 } else { 2 }
+    }
+
     /// Write immediately before showing: the previous dialog's answer and a script's
     /// bindings can change these shared values while this question waits.
     fn write_values(&self, b: &thedas_ui::protocol::GameBridge) {
@@ -378,7 +384,10 @@ impl TextPopup {
             &format!("{k}.DialogBoxText"),
             UiValue::String(self.prompt.clone()),
         );
-        b.set_value(&format!("{k}.NumButtons"), UiValue::Number(2.0));
+        b.set_value(
+            &format!("{k}.NumButtons"),
+            UiValue::Number(self.buttons() as f64),
+        );
         b.set_value(
             &format!("{k}.InputBox"),
             UiValue::Number(f64::from(u8::from(self.text.is_some()))),
@@ -485,6 +494,7 @@ pub struct UiLayer {
     shown: Arc<Mutex<thedas_ui::binding::Presentation>>,
     /// The conversation line on screen and how far it has played.
     line: Option<Line>,
+    conversation_press: crate::conversation_input::ConversationPress,
     /// The level whose resources and minimap the interface has.
     level: Option<String>,
     /// Frames since the minimap's creatures were last sent.
@@ -572,7 +582,7 @@ pub struct UiLayer {
     /// The creature the mouse is over (see [`UiLayer::set_hovered`]).
     hovered: Option<thedas_script::vm::ObjectId>,
     /// A conversation line's continue the movie could not send (see `continue_conversation`).
-    continue_pending: bool,
+    continue_pending: Option<LineKey>,
     next_floaty: u32,
     portraits: PortraitClock,
     paperdoll: PaperdollClock,
@@ -641,7 +651,8 @@ const PORTRAIT_RETRY_MS: f64 = 1000.0;
 
 /// What the portraits show, by member (the party, and the followers picked in an open party
 /// picker: see [`crate::live::portrait_subjects`]): who, in which slot, with which
-/// appearance, head morph and equipment. They are drawn again when it changes.
+/// appearance, head morph and equipment. [`crate::live::Live::portrait_key`] also tracks
+/// the models that have become available to render these inputs.
 pub fn portrait_key(sim: &thedas_sim::Sim) -> Vec<(u32, u64)> {
     use std::hash::{Hash, Hasher};
     crate::live::portrait_subjects(sim)
@@ -693,6 +704,9 @@ struct Line {
     /// How long its voice-over runs (milliseconds), when it has one: it plays that long
     /// instead of a reading time.
     voice_ms: Option<f64>,
+    /// Presentation time when audio first reported the playing voice's duration. Loading
+    /// can hold the voice long after the simulation chose this line.
+    voice_at: f64,
     /// Whether conversation.gfx was last told the line has a voice-over (see
     /// `UiLayer::play`).
     voiced: bool,
@@ -703,17 +717,39 @@ struct Line {
     /// cutscene has ended.
     cut_seen: bool,
     cut_done: bool,
+    /// Its own referenced cutscene has started. Automatic continuation waits for it.
+    owns_cut: bool,
+    /// The cut showed this node's subtitle and began its voice.
+    resume_voice: bool,
 }
 
 impl Line {
-    /// Whether it has played: its voice-over's (or reading) time has passed, or the
-    /// cutscene that spoke it has ended. The executable gives a line that plays its own
-    /// cutscene the cutscene's length (`GameModeDialog` 0x68e5be-0x68e5ff: the line's
-    /// timer +0x2c4 is the cutscene's 5000, +0x8). Provisional: a line whose cutscene is
-    /// played by the cutscene mode (a `CUTR` reference) is taken to end with it the same
-    /// way.
+    fn set_voice_ms(&mut self, ms: Option<f64>, voice_elapsed_ms: impl FnOnce() -> f64) {
+        if self.voice_ms.is_none() && ms.is_some() {
+            self.voice_at = if self.resume_voice {
+                self.t - voice_elapsed_ms()
+            } else {
+                self.t
+            };
+        }
+        self.voice_ms = ms;
+    }
+
+    /// Whether it has played. An automatic continuation waits for the line's own
+    /// referenced cut to complete (GameModeDialog 0x68de74–0x68df57), keeping its camera
+    /// and actors with the line. The presentation clock can run ahead of the cutscene's
+    /// capped simulation clock on slow frames.
     fn played(&self) -> bool {
-        self.cut_done || self.t >= self.voice_ms.unwrap_or_else(|| line_ms(&self.key.1))
+        if self.waits && self.owns_cut && !self.cut_done && self.t.is_finite() {
+            return false;
+        }
+        if self.cut_done || self.t == f64::INFINITY {
+            return true;
+        }
+        match self.voice_ms {
+            Some(ms) => self.t - self.voice_at >= ms,
+            None => !self.voiced && self.t >= line_ms(&self.key.1),
+        }
     }
 }
 
@@ -728,6 +764,20 @@ pub fn line_ms(text: &str) -> f64 {
     } else {
         (1500.0 + 55.0 * chars).min(12_000.0)
     }
+}
+
+/// Every response collected in a frame belongs to the line just presented. A movie
+/// callback and the engine's automatic continue can both answer the same click; neither
+/// may answer the next line, or bypass a voice that is still playing.
+fn ready_conversation_responses(messages: &mut Vec<GameMessage>, ready: bool) {
+    let mut answered = !ready;
+    messages.retain(|message| {
+        if matches!(message, GameMessage::Send(name, _) if name == thedas_ui::input::SELECT_RESPONSE) {
+            !std::mem::replace(&mut answered, true)
+        } else {
+            true
+        }
+    });
 }
 
 impl UiLayer {
@@ -801,9 +851,9 @@ impl UiLayer {
 
     /// The conversation line on screen speaks for this long (milliseconds; see
     /// [`crate::audio`]), or has no voice-over.
-    pub fn set_line_voice_ms(&mut self, ms: Option<f64>) {
+    pub fn set_line_voice_ms(&mut self, ms: Option<f64>, voice_elapsed_ms: impl FnOnce() -> f64) {
         if let Some(l) = self.line.as_mut() {
-            l.voice_ms = ms;
+            l.set_voice_ms(ms, voice_elapsed_ms);
         }
     }
 
@@ -837,7 +887,8 @@ impl UiLayer {
     /// optionsmenu.gfx sets each option as the player changes it and sends
     /// `ClientOptions.CommitOptions` only from OK (and from its resolution confirmation), so
     /// what was set without it is dropped when the screen goes. The difficulty, which the
-    /// simulation keeps, is put back the way the screen sets it (the same message).
+    /// simulation keeps, and the tutorial/auto-pause settings it reads, are put back the
+    /// way the screen sets them (the same message).
     /// Provisional: the exe's own handling (its handlers at 0x7946c0) is not traced.
     fn options_screen(&mut self, up: bool, sim: &Arc<Mutex<Sim>>) {
         match (up, self.options_before.take()) {
@@ -855,22 +906,51 @@ impl UiLayer {
             }
             (true, before) => self.options_before = before,
             (false, Some((options, difficulty))) => {
+                let restored = [
+                    (thedas_ui::options::DIFFICULTY, f64::from(difficulty)),
+                    (
+                        "GameOptions.ShowTutorials",
+                        options
+                            .get("GameOptions.ShowTutorials")
+                            .copied()
+                            .unwrap_or(1.0),
+                    ),
+                    (
+                        "GameOptions.AutoPauseCombat",
+                        options
+                            .get("GameOptions.AutoPauseCombat")
+                            .copied()
+                            .unwrap_or(0.0),
+                    ),
+                    (
+                        "GameOptions.ShowGore",
+                        if options.get("GameOptions.ShowGore").copied().unwrap_or(1.0) != 0.0 {
+                            1.0
+                        } else {
+                            0.0
+                        },
+                    ),
+                ];
                 if let Ok(mut shown) = self.shown.lock() {
                     shown.options = options;
                 }
                 let mut sim = sim.lock().unwrap_or_else(|p| p.into_inner());
-                if sim.world.difficulty != difficulty {
-                    sim.input(
-                        thedas_sim::commands::CommandSource::Player,
-                        thedas_sim::commands::SimCommand::ClientOptionMessage {
-                            name: thedas_sim::chargen::MSG_CLIENT_OPTION.to_string(),
-                            args: [
-                                thedas_ui::options::DIFFICULTY.to_string(),
-                                difficulty.to_string(),
-                            ]
-                            .to_vec(),
-                        },
-                    );
+                let current = [
+                    f64::from(sim.world.difficulty),
+                    f64::from(u8::from(sim.show_tutorials)),
+                    f64::from(u8::from(sim.auto_pause_combat)),
+                    f64::from(u8::from(sim.show_gore)),
+                ];
+                for ((name, value), current) in restored.into_iter().zip(current) {
+                    if value != current {
+                        sim.input(
+                            thedas_sim::commands::CommandSource::Player,
+                            thedas_sim::commands::SimCommand::ClientOptionMessage {
+                                name: thedas_sim::chargen::MSG_CLIENT_OPTION.to_string(),
+                                args: vec![name.to_string(), value.to_string()],
+                            },
+                        );
+                    }
                 }
             }
             (false, None) => {}
@@ -995,8 +1075,9 @@ impl UiLayer {
             options_before: None,
             show_all_names: false,
             line_voiced: false,
+            conversation_press: Default::default(),
             settings_file: None,
-            continue_pending: false,
+            continue_pending: None,
             next_floaty: 1,
             portraits: PortraitClock::default(),
             paperdoll: PaperdollClock::default(),
@@ -1738,6 +1819,12 @@ impl UiLayer {
         self.ask(id, prompt, None, a, b);
     }
 
+    /// Tells the player something with the game's own message box and a single button
+    /// (`ok`): the answer's `accepted` is true, and its text is empty.
+    pub fn ask_ok(&mut self, id: u32, prompt: &str, ok: &str) {
+        self.ask(id, prompt, None, ok, "");
+    }
+
     fn ask(&mut self, id: u32, prompt: &str, text: Option<&str>, ok: &str, cancel: &str) {
         self.text_popup = Some(TextPopup {
             id,
@@ -2301,7 +2388,12 @@ impl UiLayer {
     /// ends (the screens start over with it).
     pub fn close_all(&mut self) {
         self.stage.movies.clear();
+        if let Ok(mut shown) = self.shown.lock() {
+            shown.dragging = false;
+        }
         self.line = None;
+        self.continue_pending = None;
+        self.conversation_press.screen(false, true);
         self.floaties.clear();
         self.tooltip_text = None;
         self.tooltip_relayout = 0;
@@ -2318,11 +2410,17 @@ impl UiLayer {
         sim: &Arc<Mutex<Sim>>,
         dt_ms: f64,
     ) -> Vec<thedas_ui::input::Aim> {
+        // An outro can end in this tick, after the screens have been reconciled.
+        let loading = self.loading.is_some() || self.travel_map;
         // The start menu offers loading when there are saves: they are listed from the start.
         if screens.front_end && !self.saves_listed {
             self.saves_listed = true;
             self.refresh_saves();
         }
+        // A movie's X can have closed it in the last tick. Reconcile that before
+        // binding the presentation and computing wanted screens; otherwise the old
+        // menu reopens its movie once while sync clears the player's toggle.
+        screens.note_open(&|m| self.stage.movies.iter().any(|x| x.name == m));
         self.screens_opened(screens, sim);
         // The journal, while its screen is up (built from the plots: it needs the simulation
         // mutably, which the bindings do not have).
@@ -2339,6 +2437,7 @@ impl UiLayer {
             shown.journal = journal;
             shown.book_page = screens.menu.and_then(Screen::book_page);
             shown.menu_up = screens.menu.is_some();
+            shown.screen_up = !screens.exploring();
             shown.ability_scene = match screens.menu {
                 Some(Screen::Skills) => 3,
                 Some(Screen::SpellsTalents) => 1,
@@ -2363,10 +2462,16 @@ impl UiLayer {
             self.stage.bridge.bind(values);
             let waits = thedas_ui::binding::awaits_continue(&sim);
             let cutscene = sim.world.cutscene.is_some();
-            let line = thedas_ui::binding::conversation(&sim).map(|d| {
-                let key: LineKey = (d.dialog, d.line, d.replies.iter().map(|r| r.0).collect());
-                (key, waits, cutscene)
-            });
+            let owns_cut =
+                sim.game == thedas_vfs::Game::Origins && sim.conversation_line_cutscene().is_some();
+            // An authored track owns the subtitle and voice while this cut plays. Start
+            // dialog timing at the handoff so a skip can still play an unfinished node.
+            let line = thedas_ui::binding::conversation(&sim)
+                .filter(|_| !sim.cutscene_controls_dialog_speech())
+                .map(|d| {
+                    let key: LineKey = (d.dialog, d.line, d.replies.iter().map(|r| r.0).collect());
+                    (key, waits, cutscene, owns_cut, sim.cut_line_speech())
+                });
             // Before a game, the start menu, or the screen it opened (options, the load
             // screen).
             let want = match (self.loading, screens.front_end, screens.menu) {
@@ -2391,16 +2496,106 @@ impl UiLayer {
         {
             shown.examine = None;
         }
+        let line_changed = line.as_ref().map(|(key, ..)| key) != self.line.as_ref().map(|l| &l.key);
+        if line_changed {
+            self.continue_pending = None;
+        }
+        self.line = match (line, self.line.take()) {
+            (Some((key, _, cutscene, owns_cut, _)), Some(mut l)) if l.key == key => {
+                l.t += dt_ms;
+                l.cut_done |= l.cut_seen && !cutscene;
+                l.cut_done |= l.owns_cut && !owns_cut;
+                l.cut_seen |= cutscene;
+                l.owns_cut |= owns_cut;
+                Some(l)
+            }
+            (Some((key, waits, cutscene, owns_cut, speech)), _) => {
+                use thedas_sim::dialog::CutLineSpeech;
+                log::debug!(
+                    "conversation new line: {key:?} waits={waits} voiced={} cut={cutscene} owns_cut={owns_cut}",
+                    self.line_voiced
+                );
+                Some(Line {
+                    key,
+                    t: if speech == CutLineSpeech::Complete {
+                        f64::INFINITY
+                    } else {
+                        0.0
+                    },
+                    voice_ms: None,
+                    voice_at: 0.0,
+                    voiced: self.line_voiced,
+                    waits,
+                    continued: false,
+                    cut_seen: cutscene,
+                    cut_done: false,
+                    owns_cut,
+                    resume_voice: speech == CutLineSpeech::InProgress,
+                })
+            }
+            (None, _) => None,
+        };
+        // Movie construction reads these values too. Do not expose the binding's default
+        // ready flag or unvoiced flag while the conversation movie initializes.
+        if let Some(l) = &self.line {
+            self.stage.bridge.set_values([
+                (
+                    "Conversation.ResponsesReady".into(),
+                    thedas_ui::UiValue::Number(l.played() as u8 as f64),
+                ),
+                (
+                    "Conversation.HasVO".into(),
+                    thedas_ui::UiValue::Number(
+                        (self.line_voiced || l.voice_ms.is_some()) as u8 as f64,
+                    ),
+                ),
+            ]);
+        }
         let changes = screens.sync(want, &mut self.stage);
+        self.conversation_press.screen(
+            screens.shown().contains(&Screen::Conversation),
+            line_changed || changes.opened.contains(&Screen::Conversation),
+        );
+        if line_changed && let Some(l) = &self.line {
+            // A single empty continue can become a single real reply. The count remains
+            // one, so the movie's list observer must hear it again to reload its text.
+            self.stage.bridge.set_value(
+                "Conversation.Responses",
+                thedas_ui::UiValue::Number(l.key.2.len() as f64),
+            );
+            if let Some(m) = self
+                .stage
+                .movies
+                .iter_mut()
+                .find(|m| m.name == "conversation.gfx")
+            {
+                m.resend_observers(|token| token == "Conversation.Responses");
+            }
+        }
+
         // A screen that closes takes its tooltip with it: the movie that showed it is gone
         // and cannot clear it (a picker's tooltip stayed drawn over the HUD; a portrait's
         // over the tactics screen that replaced the HUD).
+        // Fixed tooltips share the tutorial's corner, and the movie fades the
+        // tutorial to zero alpha while one is up. A paused lesson must retain
+        // its release button even when a quickbar tooltip was left under the
+        // mouse/controller cursor. Later non-pausing pages allow tooltips again.
         if !changes.closed.is_empty() || !changes.opened.is_empty() {
             for k in ["GUI.TooltipText", "GUITooltips.TooltipText"] {
                 self.stage
                     .bridge
                     .set_value(k, thedas_ui::UiValue::String(String::new()));
             }
+        }
+        if screens.menu.is_none()
+            && sim
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .tutorial_paused()
+        {
+            self.stage
+                .bridge
+                .set_value("GUI.TooltipText", thedas_ui::UiValue::String(String::new()));
         }
         // The store's close button: the simulation's store closes too.
         if changes.dismissed.contains(&Screen::Store) {
@@ -2430,25 +2625,6 @@ impl UiLayer {
                 thedas_sim::commands::SimCommand::PartyPickerSubmit,
             );
         }
-        self.line = match (line, self.line.take()) {
-            (Some((key, _, cutscene)), Some(mut l)) if l.key == key => {
-                l.t += dt_ms;
-                l.cut_done |= l.cut_seen && !cutscene;
-                l.cut_seen |= cutscene;
-                Some(l)
-            }
-            (Some((key, waits, cutscene)), _) => Some(Line {
-                key,
-                t: 0.0,
-                voice_ms: None,
-                voiced: self.line_voiced,
-                waits,
-                continued: false,
-                cut_seen: cutscene,
-                cut_done: false,
-            }),
-            (None, _) => None,
-        };
         // Whether the line is voiced (`Conversation.HasVO`): conversation.gfx's
         // `UpdateMainText` hides a voiced NPC line when the Subtitles option is "No
         // subtitles" (`ClientOptions.GameOptions.SubtitlesLevel` 0, the default), and shows
@@ -2489,7 +2665,17 @@ impl UiLayer {
             );
             // The conversation screen is not up while a cutscene plays: the line goes on
             // once it is.
-            if played && l.waits && !l.continued {
+            if played && l.waits && !l.continued && self.conversation_press.up {
+                log::debug!(
+                    "conversation auto-continue: key={:?} t={} voice={:?} voiced={} cut_seen={} cut_done={} owns_cut={}",
+                    l.key,
+                    l.t,
+                    l.voice_ms,
+                    l.voiced,
+                    l.cut_seen,
+                    l.cut_done,
+                    l.owns_cut
+                );
                 l.continued = true;
                 self.continue_conversation();
             }
@@ -2563,7 +2749,9 @@ impl UiLayer {
                 Vec::new(),
             ));
         }
-        if std::mem::take(&mut self.continue_pending) {
+        if let Some(key) = self.continue_pending.take()
+            && self.line.as_ref().is_some_and(|l| l.key == key)
+        {
             messages.push(GameMessage::Send(
                 "Conversation.SelectResponse".into(),
                 vec!["0".into()],
@@ -2604,6 +2792,10 @@ impl UiLayer {
             self.stage
                 .call_in("tooltips.gfx", thedas_ui::avm1::TOOLTIP_RELAYOUT, &[]);
         }
+        ready_conversation_responses(
+            &mut messages,
+            self.conversation_press.up && self.line.as_ref().is_some_and(Line::played),
+        );
         let ignored = {
             let mut sim = sim.lock().unwrap_or_else(|p| p.into_inner());
             thedas_ui::input::apply_all(&mut sim, &messages)
@@ -2697,7 +2889,41 @@ impl UiLayer {
                 log::warn!("ui: the simulation does not handle {name} yet");
             }
         }
+        self.update_drag_image();
+        self.update_status_messages(sim, loading);
         aims
+    }
+
+    fn update_status_messages(&mut self, sim: &Arc<Mutex<Sim>>, loading: bool) {
+        use thedas_ui::UiValue;
+
+        let movie = self
+            .stage
+            .movies
+            .iter_mut()
+            .find(|m| m.name == "floatylayer.gfx");
+        // Area-enter scripts can send the area's name behind a loading screen. Hold
+        // their messages through the outro so a direct handoff to the HUD can show
+        // them. A cutscene or another screen without the movie ends that handoff.
+        if loading && movie.is_none() {
+            return;
+        }
+        let messages = std::mem::take(
+            &mut sim
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .world
+                .status_messages,
+        );
+        // DAOrigins.exe 0x63c260 invokes the function on the registered live movie.
+        if let Some(movie) = movie {
+            for (text, colour) in messages {
+                movie.call(
+                    "_global.FloatyLayer.DisplayStatusMessage",
+                    &[UiValue::String(text), UiValue::Number(f64::from(colour))],
+                );
+            }
+        }
     }
 
     /// A left click while playing reached the interface: a conversation line still playing is
@@ -2705,6 +2931,10 @@ impl UiLayer {
     /// `ContinueButtonAction`). Provisional: the game's input bindings for the conversation's
     /// contexts are not traced; any click stands in for them.
     pub fn clicked(&mut self) {
+        log::debug!("conversation click: {:?}", self.line_state());
+        if !self.conversation_press.up {
+            return;
+        }
         let Some(l) = self.line.as_mut() else {
             return;
         };
@@ -2812,16 +3042,18 @@ impl UiLayer {
     /// conversation.gfx's continue action (it sends `Conversation.SelectResponse 0` when the
     /// line has nothing to choose).
     fn continue_conversation(&mut self) {
+        let Some(key) = self.line.as_ref().map(|l| l.key.clone()) else {
+            return;
+        };
         let Some(m) = self
             .stage
             .movies
             .iter_mut()
             .find(|m| m.name == "conversation.gfx")
         else {
-            // The screen is not up yet (a conversation's first line, empty, plays out
-            // before its movie has loaded): the game's continue is sent for it, else the
-            // conversation waited for ever.
-            self.continue_pending = true;
+            // Movie loading failed or has not completed: queue the continue for this
+            // line only, so it cannot answer a later conversation.
+            self.continue_pending = Some(key);
             return;
         };
         // The movie's continue does nothing while it believes the line has replies to pick
@@ -2829,7 +3061,7 @@ impl UiLayer {
         let stale =
             m.call("_global.Conversation.HasResponses", &[]) == thedas_ui::UiValue::Bool(true);
         if stale {
-            self.continue_pending = true;
+            self.continue_pending = Some(key);
         } else {
             m.call("_global.Conversation.ContinueButtonAction", &[]);
         }
@@ -3080,7 +3312,6 @@ impl UiLayer {
             Vec::new(),
         );
         let portrait_messages;
-        let status_messages;
         let size = self.stage.size();
         let scale = thedas_ui::stage_scale(size, (1024.0, 768.0));
         let (w, h) = (size.0 as f32, size.1 as f32);
@@ -3164,7 +3395,6 @@ impl UiLayer {
                 });
             }
             portrait_messages = std::mem::take(&mut sim.world.portrait_messages);
-            status_messages = std::mem::take(&mut sim.world.status_messages);
             let mut per_target: std::collections::BTreeMap<u32, u32> = Default::default();
             self.floaties.retain_mut(|f| {
                 f.left_s -= dt_ms / 1000.0;
@@ -3314,16 +3544,6 @@ impl UiLayer {
                 &[UiValue::String(portrait_message_arg(
                     m.target, m.colour, &m.text,
                 ))],
-            );
-        }
-        // Status messages, as the exe hands them to the floaty layer (0x63c260):
-        // `FloatyLayer.DisplayStatusMessage` with the text and its colour. Provisional: that
-        // the script function reaches 0x63c260 (through the interface's virtual 0x5239d0) is
-        // inferred, not followed call by call.
-        for (text, colour) in status_messages {
-            self.stage.movies[movie].call(
-                &format!("{LAYER}.DisplayStatusMessage"),
-                &[UiValue::String(text), num(f64::from(colour))],
             );
         }
         let m = &mut self.stage.movies[movie];
@@ -3602,11 +3822,13 @@ impl UiLayer {
 
     pub fn mouse_move(&mut self, x: f64, y: f64) {
         self.stage.mouse_move(x, y);
+        self.update_drag_image();
     }
 
     /// The mouse left the window.
     pub fn mouse_leave(&mut self) {
         self.stage.mouse_leave();
+        self.stage.set_external_drag_image(None);
     }
 
     /// The mouse wheel turned `lines` (up positive) at (`x`, `y`): lists and text under the
@@ -3615,10 +3837,13 @@ impl UiLayer {
         self.stage.mouse_wheel(x, y, lines);
     }
 
-    pub fn mouse_button(&mut self, x: f64, y: f64, down: bool) {
-        self.stage.mouse_button(x, y, down);
-        // The drop was seen by the movies under the mouse (they read `GUI.Dragging`); the
-        // drag is over.
+    pub fn mouse_button(&mut self, x: f64, y: f64, down: bool) -> bool {
+        let accepted = self.conversation_press.button(down);
+        if accepted {
+            self.stage.mouse_button(x, y, down);
+        }
+        // The drag is over even if its release belonged to a screen that just closed.
+        // Only an accepted release is delivered to the current movie's drop targets.
         if !down {
             let dragging = self
                 .shown
@@ -3627,18 +3852,33 @@ impl UiLayer {
                 .unwrap_or(false);
             if dragging {
                 self.stage.drop_external();
+                self.stage.set_external_drag_image(None);
             }
         }
         // A click on a party portrait: portraits.gfx only says which member the mouse is
         // over (`GameModeExplore.GUITargetedPlayer`, set on roll-over and cleared on
         // roll-out; its own click handler is empty), and the game selects them.
-        if !down
+        if accepted
+            && !down
             && let Some(thedas_ui::UiValue::Number(id)) =
                 self.stage.bridge.value("GameModeExplore.GUITargetedPlayer")
             && id > 0.0
         {
             self.portrait_clicked = Some(id as u32);
         }
+        accepted
+    }
+
+    fn update_drag_image(&mut self) {
+        let dragging = self.shown.lock().is_ok_and(|s| s.dragging);
+        let image = dragging
+            .then(|| self.stage.bridge.value("GUI.DragData.DragImage"))
+            .flatten();
+        let image = match &image {
+            Some(thedas_ui::UiValue::String(s)) => Some(s.as_str()),
+            _ => None,
+        };
+        self.stage.set_external_drag_image(image);
     }
 
     /// The party member whose portrait was clicked becomes the one the player controls, as
@@ -3666,6 +3906,15 @@ impl UiLayer {
     }
 
     pub fn click_as(&mut self, button: f64, x: f64, y: f64) {
+        if self.conversation_press.up
+            && button == thedas_ui::avm1::MOUSE_LEFT + thedas_ui::avm1::DOUBLE_CLICK
+        {
+            if self.mouse_button(x, y, true) {
+                self.clicked();
+            }
+            self.mouse_button(x, y, false);
+            return;
+        }
         self.stage.click_as(button, x, y);
     }
 
@@ -3904,7 +4153,63 @@ fn gui_id(s: Screen, container: bool) -> Option<i32> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_message_with_one_button_shows_one_button() {
+        let popup = |cancel: &str| TextPopup {
+            id: 1,
+            prompt: "The start menu could not be opened".into(),
+            text: None,
+            labels: ["OK".into(), cancel.into()],
+            frames: 0,
+            free_text: false,
+            input_ready: false,
+            pending_keys: VecDeque::new(),
+        };
+        assert_eq!(popup("").buttons(), 1);
+        assert_eq!(popup("Cancel").buttons(), 2);
+    }
+
     use super::*;
+
+    #[test]
+    fn a_notice_uses_one_ok_button_and_no_text_field() {
+        use thedas_ui::{UiValue, protocol::GameBridge};
+        let bridge = GameBridge::new(Arc::new(|_| None));
+        let popup = TextPopup {
+            id: crate::report::FAILED_ID,
+            prompt: "Report not saved. The game is fine.".into(),
+            text: None,
+            labels: ["OK".into(), String::new()],
+            frames: 0,
+            free_text: false,
+            input_ready: false,
+            pending_keys: VecDeque::new(),
+        };
+        popup.write_values(&bridge);
+        assert_eq!(
+            bridge.value("GUIPopupLayer.NumButtons"),
+            Some(UiValue::Number(1.0))
+        );
+        assert_eq!(
+            bridge.value("GUIPopupLayer.InputBox"),
+            Some(UiValue::Number(0.0))
+        );
+        assert_eq!(
+            bridge.value("GUIPopupLayer.Label0"),
+            Some(UiValue::String("OK".into()))
+        );
+        assert_eq!(
+            bridge.value("GUIPopupLayer.DialogBoxText"),
+            Some(UiValue::String(popup.prompt))
+        );
+        assert_eq!(
+            bridge.value("GUIPopupLayer.Callback0"),
+            Some(UiValue::String(format!(
+                "{TEXT_POPUP_RESULT} {} 1",
+                popup.id
+            )))
+        );
+    }
 
     fn popup_property(ui: &mut UiLayer, path: &str) -> thedas_ui::UiValue {
         ui.stage
@@ -3936,6 +4241,294 @@ mod tests {
             ui.stage.tick(1000.0 / 30.0);
         }
         ui
+    }
+
+    #[test]
+    #[ignore = "requires THEDAS_INSTALL and an offscreen GPU"]
+    fn status_messages_survive_a_load_directly_to_the_hud() {
+        use thedas_ui::UiValue;
+
+        let mut ui = installed_popup_ui();
+        let sim = Sim::new(
+            ui.vfs.clone(),
+            Arc::new(thedas_script::EngineTable::default()),
+            1,
+        );
+        let sim = Arc::new(Mutex::new(sim));
+        ui.attach(&sim);
+        let mut screens = Screens::new(false);
+        let dt = 1000.0 / 30.0;
+        let count = |ui: &mut UiLayer| {
+            ui.stage.call_in(
+                "floatylayer.gfx",
+                "_global.StatusMessageRoller.StatusMessages.length.toString",
+                &[],
+            )
+        };
+        let queue = |text: &str| {
+            sim.lock()
+                .unwrap()
+                .world
+                .status_messages
+                .push((text.into(), 0xffffff));
+        };
+        let finish_load = |ui: &mut UiLayer, screens: &mut Screens, next| {
+            ui.loading_end();
+            for _ in 0..60 {
+                ui.play(screens, &sim, dt);
+                if screens.shown().contains(&next) {
+                    return;
+                }
+            }
+            panic!("loading did not reach {next:?}, got {:?}", screens.shown());
+        };
+
+        ui.loading_begin(LoadScreen::Light, None);
+        ui.play(&mut screens, &sim, dt);
+        assert!(screens.shown().contains(&Screen::LoadLight));
+        queue("Orzammar Commons");
+        ui.play(&mut screens, &sim, dt);
+        assert_eq!(count(&mut ui), None);
+        finish_load(&mut ui, &mut screens, Screen::Hud);
+        assert_eq!(count(&mut ui), Some(UiValue::String("1".into())));
+
+        ui.loading_begin(LoadScreen::Town, None);
+        ui.play(&mut screens, &sim, dt);
+        assert!(screens.shown().contains(&Screen::LoadTown));
+        queue("Dragon Age");
+        ui.play(&mut screens, &sim, dt);
+        sim.lock().unwrap().world.cutscene = Some(thedas_sim::cutscene::Cutscene {
+            name: "opening.cut".into(),
+            seconds: 1.0,
+            lines: Vec::new(),
+            elapsed_ms: 0,
+            from_dialog: false,
+            bound: Vec::new(),
+            placement: None,
+        });
+        finish_load(&mut ui, &mut screens, Screen::Cutscene);
+        assert_eq!(count(&mut ui), None);
+        queue("Cutscene status");
+        ui.play(&mut screens, &sim, dt);
+
+        {
+            let mut sim = sim.lock().unwrap();
+            sim.world.cutscene = None;
+            sim.world.training.step = 1;
+        }
+        for _ in 0..20 {
+            ui.play(&mut screens, &sim, dt);
+        }
+        assert!(screens.shown().contains(&Screen::Hud));
+        assert_eq!(
+            popup_property(&mut ui, "_root.TrainingTutorial_mc._visible"),
+            UiValue::Bool(true)
+        );
+        assert_eq!(count(&mut ui), Some(UiValue::String("0".into())));
+
+        queue("HUD status");
+        ui.play(&mut screens, &sim, dt);
+        assert_eq!(count(&mut ui), Some(UiValue::String("1".into())));
+    }
+
+    #[test]
+    #[ignore = "requires THEDAS_INSTALL and an offscreen GPU"]
+    fn journal_close_message_does_not_reopen_its_movie() {
+        let mut ui = installed_popup_ui();
+        let sim = Arc::new(Mutex::new(Sim::new(
+            ui.vfs.clone(),
+            Arc::new(thedas_script::EngineTable::default()),
+            1,
+        )));
+        ui.attach(&sim);
+        let mut screens = Screens::new(false);
+        ui.stage.movies[0].set("_root.thedas_retained", thedas_ui::UiValue::Bool(true));
+        screens.toggle(Screen::Journal);
+        for _ in 0..20 {
+            ui.play(&mut screens, &sim, 1000.0 / 30.0);
+        }
+        assert!(ui.stage.movies.iter().any(|m| m.name == "journal.gfx"));
+        // The X button's message, as read from journal.gfx's CloseButton_init.
+        ui.stage.call_in(
+            "journal.gfx",
+            "ExternalCommands.SendMessage",
+            &[thedas_ui::UiValue::String("GUI.HideFullScreenGUI".into())],
+        );
+        ui.play(&mut screens, &sim, 1000.0 / 30.0);
+        for _ in 0..5 {
+            ui.play(&mut screens, &sim, 1000.0 / 30.0);
+            assert_eq!(screens.menu, None);
+            assert_eq!(
+                screens.shown(),
+                &std::collections::BTreeSet::from([Screen::Hud])
+            );
+            assert!(!ui.stage.movies.iter().any(|m| m.name == "journal.gfx"));
+            assert_eq!(ui.shown.lock().unwrap().book_page, None);
+            for name in ["popuplayer.gfx", "navbar.gfx", "tooltips.gfx"] {
+                assert_eq!(ui.stage.movies.iter().filter(|m| m.name == name).count(), 1);
+            }
+            assert_eq!(
+                popup_property(&mut ui, "_root.thedas_retained"),
+                thedas_ui::UiValue::Bool(true)
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires THEDAS_INSTALL and an offscreen GPU"]
+    fn external_drag_image_tracks_mouse_and_clears_on_release() {
+        use thedas_ui::UiValue;
+        let mut ui = installed_popup_ui();
+        ui.stage.set_image(
+            "thedas_drag_test.png",
+            Some(&Rgba {
+                width: 1,
+                height: 2,
+                pixels: vec![255; 8],
+            }),
+        );
+        ui.stage.bridge.set_value(
+            "GUI.DragData.DragImage",
+            UiValue::String("thedas_drag_test.png".into()),
+        );
+        assert!(ui.front_end_message(&mut Screens::new(false), "GUI.StartDragging", &[]));
+        ui.mouse_move(640.0, 360.0);
+        let clip = "_root.thedas_external_drag";
+        assert_eq!(
+            popup_property(&mut ui, &format!("{clip}._width")),
+            UiValue::Number(29.0)
+        );
+        assert_eq!(
+            popup_property(&mut ui, &format!("{clip}._height")),
+            UiValue::Number(58.0)
+        );
+        assert_eq!(
+            popup_property(&mut ui, &format!("{clip}.hitTestDisable")),
+            UiValue::Bool(true)
+        );
+        let before = popup_property(&mut ui, &format!("{clip}._x"));
+        ui.mouse_move(740.0, 360.0);
+        let after = popup_property(&mut ui, &format!("{clip}._x"));
+        assert!(matches!((before, after), (UiValue::Number(a), UiValue::Number(b)) if b > a));
+        ui.mouse_button(740.0, 360.0, false);
+        assert!(!ui.shown.lock().unwrap().dragging);
+        assert_eq!(
+            popup_property(&mut ui, &format!("{clip}.image")),
+            UiValue::Undefined
+        );
+    }
+
+    #[test]
+    #[ignore = "requires THEDAS_INSTALL and an offscreen GPU"]
+    fn a_fixed_tooltip_cannot_hide_a_pausing_tutorial() {
+        use thedas_ui::UiValue;
+        let mut ui = installed_popup_ui();
+        let mut sim = Sim::new(
+            ui.vfs.clone(),
+            Arc::new(thedas_script::EngineTable::default()),
+            1,
+        );
+        sim.world.tutorials.push(thedas_sim::journal::Tutorial {
+            resref: "lesson".into(),
+            title: None,
+            text: None,
+            pauses: true,
+        });
+        sim.world.tutorial_paused = true;
+        let sim = Arc::new(Mutex::new(sim));
+        ui.attach(&sim);
+        let mut screens = Screens::new(false);
+        for _ in 0..30 {
+            ui.stage
+                .bridge
+                .set_value("GUI.TooltipText", UiValue::String("Item tooltip".into()));
+            ui.play(&mut screens, &sim, 1000.0 / 30.0);
+        }
+        assert_eq!(
+            ui.stage.bridge.value("GUI.TooltipText"),
+            Some(UiValue::String(String::new()))
+        );
+        let alpha = popup_property(&mut ui, "_root.TutorialContainer_mc.Fade_mc._alpha");
+        assert!(
+            matches!(alpha, UiValue::Number(a) if a >= 90.0),
+            "{alpha:?}"
+        );
+        assert_eq!(
+            popup_property(
+                &mut ui,
+                "_root.TutorialContainer_mc.Fade_mc.Tutorial_mc.MovieHidden"
+            ),
+            UiValue::Bool(false)
+        );
+        sim.lock().unwrap().consume_tutorial(false);
+        for _ in 0..30 {
+            ui.stage
+                .bridge
+                .set_value("GUI.TooltipText", UiValue::String("Item tooltip".into()));
+            ui.play(&mut screens, &sim, 1000.0 / 30.0);
+        }
+        assert_eq!(
+            ui.stage.bridge.value("GUI.TooltipText"),
+            Some(UiValue::String("Item tooltip".into()))
+        );
+    }
+
+    #[test]
+    #[ignore = "requires THEDAS_INSTALL and an offscreen GPU"]
+    fn pending_tutorial_survives_journal_and_skills_toggles() {
+        use thedas_ui::UiValue;
+        let mut ui = installed_popup_ui();
+        let mut sim = Sim::new(
+            ui.vfs.clone(),
+            Arc::new(thedas_script::EngineTable::default()),
+            1,
+        );
+        sim.world.tutorials.push(thedas_sim::journal::Tutorial {
+            resref: "lesson".into(),
+            title: None,
+            text: None,
+            pauses: false,
+        });
+        let sim = Arc::new(Mutex::new(sim));
+        ui.attach(&sim);
+        let mut screens = Screens::new(false);
+        for _ in 0..20 {
+            ui.play(&mut screens, &sim, 1000.0 / 30.0);
+        }
+        ui.stage
+            .movies
+            .iter_mut()
+            .find(|m| m.name == "popuplayer.gfx")
+            .unwrap()
+            .set("_root.thedas_retained", UiValue::Bool(true));
+        for screen in [Screen::Journal, Screen::Skills] {
+            screens.toggle(screen);
+            ui.play(&mut screens, &sim, 100.0);
+            assert_eq!(
+                ui.stage.bridge.value("Tutorials.TutorialList"),
+                Some(UiValue::String(String::new()))
+            );
+            screens.toggle(screen);
+            for _ in 0..30 {
+                ui.play(&mut screens, &sim, 1000.0 / 30.0);
+                assert_eq!(
+                    ui.stage.bridge.value("Tutorials.TutorialList"),
+                    Some(UiValue::String("lesson".into()))
+                );
+                assert_eq!(sim.lock().unwrap().world.tutorials.len(), 1);
+                assert_eq!(
+                    popup_property(&mut ui, "_root.thedas_retained"),
+                    UiValue::Bool(true)
+                );
+            }
+            assert_eq!(
+                popup_property(
+                    &mut ui,
+                    "_root.TutorialContainer_mc.Fade_mc.Tutorial_mc.MovieHidden"
+                ),
+                UiValue::Bool(false)
+            );
+        }
     }
 
     fn delay_report_input_init(ui: &mut UiLayer) {
@@ -4318,6 +4911,127 @@ mod tests {
         assert_eq!(line_ms(&"x".repeat(1000)), 12_000.0);
     }
 
+    fn timing_line(text: &str, voiced: bool) -> Line {
+        Line {
+            key: ("dialog".into(), text.into(), vec![1]),
+            t: 0.0,
+            voice_ms: None,
+            voice_at: 0.0,
+            voiced,
+            waits: true,
+            continued: false,
+            cut_seen: false,
+            cut_done: false,
+            owns_cut: false,
+            resume_voice: false,
+        }
+    }
+
+    #[test]
+    fn a_voiced_empty_line_waits_for_its_voice_duration() {
+        let mut line = timing_line("", true);
+        for t in [0.0, 100.0, 12_000.0, 60_000.0] {
+            line.t = t;
+            assert!(!line.played());
+        }
+        line.t = f64::INFINITY;
+        assert!(
+            line.played(),
+            "a deliberate skip still works without metadata"
+        );
+    }
+
+    #[test]
+    fn a_delayed_voice_plays_from_its_start_not_the_dialogs_start() {
+        let mut line = timing_line("A line chosen behind a loading screen.", true);
+        line.t = 5000.0;
+        line.set_voice_ms(Some(2000.0), || 0.0);
+        assert!(!line.played());
+        line.t = 6000.0;
+        line.set_voice_ms(Some(2000.0), || 0.0);
+        assert_eq!(
+            line.voice_at, 5000.0,
+            "later frames must not restart the clock"
+        );
+        line.t = 6999.0;
+        assert!(!line.played());
+        line.t = 7000.0;
+        assert!(line.played());
+    }
+
+    #[test]
+    fn an_interrupted_cut_voice_keeps_its_playback_position() {
+        let mut line = timing_line("", true);
+        line.resume_voice = true;
+        line.set_voice_ms(Some(2000.0), || 1400.0);
+        line.t = 599.0;
+        assert!(!line.played());
+        line.t = 600.0;
+        assert!(line.played());
+    }
+
+    #[test]
+    fn unvoiced_lines_keep_their_reading_time() {
+        for text in ["", "An unvoiced line."] {
+            let mut line = timing_line(text, false);
+            line.t = line_ms(text) - 1.0;
+            assert!(!line.played());
+            line.t += 1.0;
+            assert!(line.played());
+        }
+    }
+
+    #[test]
+    fn a_frame_cannot_answer_an_unplayed_or_a_second_line() {
+        let response =
+            |n: &str| GameMessage::Send(thedas_ui::input::SELECT_RESPONSE.into(), vec![n.into()]);
+        let other = GameMessage::Send("Party.HideAlert".into(), vec![]);
+        let mut messages = vec![response("0"), other.clone(), response("1")];
+        ready_conversation_responses(&mut messages, false);
+        assert_eq!(messages, std::slice::from_ref(&other));
+        let mut messages = vec![response("0"), other.clone(), response("0")];
+        ready_conversation_responses(&mut messages, true);
+        assert_eq!(messages, [response("0"), other]);
+    }
+
+    #[test]
+    fn a_referenced_cut_finishes_before_its_line_automatically_continues() {
+        let mut line = Line {
+            key: ("dialog".into(), "A cinematic line.".into(), vec![1]),
+            t: 3000.0,
+            voice_ms: Some(2976.0),
+            voice_at: 0.0,
+            voiced: true,
+            waits: true,
+            continued: false,
+            cut_seen: true,
+            cut_done: false,
+            owns_cut: true,
+            resume_voice: false,
+        };
+        // Oskias node 17 has a 2.976 s voice and a 3.217 s cut. Presentation time
+        // can also run ahead of the cut's capped simulation clock on slow frames.
+        assert!(!line.played());
+        line.t = 15_000.0;
+        line.voice_ms = None;
+        assert!(!line.played());
+        line.cut_done = true;
+        assert!(line.played());
+
+        // A later line spoken during another line's cut keeps its own timing.
+        line.cut_done = false;
+        line.owns_cut = false;
+        line.voice_ms = Some(2976.0);
+        assert!(line.played());
+        // Reply choices and an explicit skip retain their existing behavior.
+        line.owns_cut = true;
+        line.waits = false;
+        assert!(line.played());
+        line.waits = true;
+        line.t = f64::INFINITY;
+        assert!(line.played());
+    }
+
     #[test]
     fn portraits_are_drawn_once_and_again_only_when_what_they_show_changes() {
         let mut clock = PortraitClock::default();
@@ -4336,5 +5050,36 @@ mod tests {
         assert!(!clock.due(vec![(1, 8), (2, 9)], PORTRAIT_RETRY_MS - 1.0));
         assert!(clock.due(vec![(1, 8), (2, 9)], 1.0));
         assert_ne!(PortraitClock::name(1, 1), PortraitClock::name(1, 2));
+    }
+
+    #[test]
+    fn portrait_inputs_invalidate_the_cached_drawing() {
+        use thedas_sim::world::ObjectKind;
+        let mut sim = Sim::new(
+            Arc::new(Vfs::new()),
+            Arc::new(thedas_script::EngineTable::default()),
+            1,
+        );
+        let hero = sim.world.spawn(ObjectKind::Creature, "hero");
+        sim.world.hero = Some(hero);
+        let mut clock = PortraitClock::default();
+        assert!(clock.due(portrait_key(&sim), 0.0));
+        clock.drew(&[hero]);
+        for change in [
+            |o: &mut thedas_sim::world::Object| o.head_morph = Some("hm_face".into()),
+            |o: &mut thedas_sim::world::Object| o.appearance += 1,
+            |o: &mut thedas_sim::world::Object| {
+                o.equipment.insert(1, 42);
+            },
+            |o: &mut thedas_sim::world::Object| {
+                o.face_choices
+                    .insert(thedas_sim::appearance::PORTRAIT_DISTANCE, 0.8);
+            },
+        ] {
+            assert!(!clock.due(portrait_key(&sim), 60_000.0));
+            change(sim.world.get_mut(hero).unwrap());
+            assert!(clock.due(portrait_key(&sim), 0.0));
+            clock.drew(&[hero]);
+        }
     }
 }

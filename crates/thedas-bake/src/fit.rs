@@ -158,10 +158,17 @@ pub fn linear(c: u8, gamma: f32) -> f64 {
 #[derive(Clone, Debug)]
 pub struct LightFit {
     pub light_scale: Vec<f64>,
+    /// Per light, how many fitted texels it reached (a light under [`MIN_LIGHT_TEXELS`] is not
+    /// fitted: its scale is 0).
+    pub light_texels: Vec<usize>,
     pub ambient: Vec<Vec3>,
     pub texels: usize,
     pub rmse_levels: f64,
 }
+
+/// The fewest fitted texels a light needs before its brightness is fitted: lights seen on a
+/// few dozen texels otherwise soak up unrelated residual (scales of 60–80 were seen).
+pub const MIN_LIGHT_TEXELS: usize = 200;
 
 /// Fits `lm = ambient(room) + Σ k_l · colour_l · term_l`, per channel in linear space, to the
 /// texels `use_row` picks (ones where occlusion is believed to be 1).
@@ -177,12 +184,19 @@ pub fn fit_lights(
     let mut a = vec![vec![0.0f64; n]; n];
     let mut b = vec![0.0f64; n];
     let mut used = 0;
+    let mut light_texels = vec![0usize; nl];
+    for r in rows.iter().filter(|r| use_row(r)) {
+        for &(i, _) in &r.terms {
+            light_texels[i as usize] += 1;
+        }
+    }
     for r in rows.iter().filter(|r| use_row(r)) {
         used += 1;
         for c in 0..3 {
             let mut feats: Vec<(usize, f64)> = r
                 .terms
                 .iter()
+                .filter(|&&(i, _)| light_texels[i as usize] >= MIN_LIGHT_TEXELS)
                 .map(|&(i, t)| {
                     let col = lights[i as usize].color[c] as f64;
                     (i as usize, col * t as f64)
@@ -232,6 +246,7 @@ pub fn fit_lights(
     }
     LightFit {
         light_scale,
+        light_texels,
         ambient,
         texels: used,
         rmse_levels: (se / count.max(1) as f64).sqrt(),

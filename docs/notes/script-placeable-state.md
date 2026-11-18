@@ -20,6 +20,9 @@ they agree. Otherwise it queries the transition and destination-pose
 animations, then stores the requested unsigned-short state if it fits the
 controller count, or zero if it exceeds the count. The comparison precedes
 the bounds check, including for an already out-of-range current state.
+The transition query treats destination 0xffff as the current state's
+diagonal animation; an explicit setter request of -1 therefore queries
+that animation before storing normalized state zero.
 
 The simulation now applies these acceptance rules through both the script
 setter and successful action results. Synthetic engine-call regressions
@@ -40,7 +43,9 @@ window. In forward playback its synthetic event 13 occurs when previous
 time is strictly below the loaded clip duration and current time reaches
 or passes it. Its loop argument suppresses that endpoint notification.
 The caller at 0x811d10 derives this argument from the instantiated tree
-node's once flag. The loaded GAD duration comes from field 4009.
+node's once flag. The loaded ANI duration comes from field 4009 through
+0x811ce0 and 0x815fb0. This loader also reads the ANI tracks (4005);
+it must not be confused with the separate GAD duration query at 0xa38ed0.
 
 Playback progress uses unsigned-short normalized positions. The update at
 0x811be0 multiplies elapsed time by the playback rate, truncates the step,
@@ -55,12 +60,71 @@ The listener at 0x694ee0 sends event 13 to CCPlaceable's completion handler
 at 0x74d200. That handler clears the outstanding byte and checks current
 health and the current appearance's destruction predicate. On the enabled
 nonpositive-health path it targets opacity zero and requests destruction
-after 3000 ms. The request at 0x696a60 preserves the first pending request.
+after 3000 ms. The request at 0x696a60 preserves the first request.
 Opacity advances using client delta divided by 500 through 0x695a90.
 
-Animation playback, replacement/completion delivery, fading and destruction
-scheduling remain open under SCR-009. State-change PWK installation and door
-group restoration are implemented in `placeable-initial-state.md`; full
-physics remains open. These static
-traces used the existing Origins analysis files. The original executable
-was never run, and this note contains only our own description.
+The ordinary state-controller path now retains one-shot nodes in the
+simulation, including their unsigned-short progress and last update time.
+It starts at rate 1: 0x813d70 converts the requested rate to a float
+`65535 / duration`, resets both positions and enables the node. Neither
+the ANB default speed nor GAD field 4010 multiplies this explicit rate.
+0x811be0 truncates each update's normalized increment to an integer and
+uses its low unsigned short before adding and clamping. Consequently,
+splitting updates can change the endpoint tick; the saved normalized clip
+position must not be replaced by a rounded duration deadline.
+
+The loop query at 0xa5e940 reaches controller 0x5474a0 and component
+0x813ca0. A loaded node supplies the inverse of its once flag. Missing
+nodes fall back to animation-table flag bit 1. A nonzero transition updates
+the outstanding byte even if no playable resource is found; a zero
+transition leaves existing playback and that byte alone.
+
+Replacement is not blanket cancellation. 0x814260 advances every active
+node, including an outgoing node at zero weight. 0x811c70 deactivates a
+once node only when its position has reached 65535 and its weight is no
+longer positive. The endpoint emitter still runs at zero weight. Replaying
+the same node resets that node rather than adding a second instance.
+Completion 0x74d200 does not guard on the outstanding byte or require the
+notifying node to remain the current action. These details matter when a
+living object starts a transition and is killed before an outgoing node
+finishes, or when a looping replacement clears the outstanding byte.
+
+Notification 11 is distinct from endpoint 13. 0x815d6d tests a nonnegative
+per-node notification threshold; it does not announce every replacement.
+0xa5f9c0 sets that threshold through the optional transition lookup
+0xa5f350. The transition registry is installed by 0xa5d5a0, whose direct
+setup call is in the creature path at 0x6bdfb9. Ordinary placeables do not
+install that registry. Their playback starts with threshold -1 at
+0x813e2b. The listener routes notification 11 through 0x696bd0: ordinary
+clips reach completion, while the GAD 4011/4012 special modes request a
+weight change instead. This is not a reason to cancel all outgoing nodes.
+
+Completion clears the saved outstanding byte, rechecks current signed-short
+health and the low-short appearance predicate, records the opacity-zero
+target time and queues removal after 3000 ms. Existing native removal requests
+win. In-flight nodes, the request latch and the first removal deadline survive JSON
+reload; older snapshots do not invent an animation from their stored state.
+Parked playback pauses and refreshes its clock, and Active is independent.
+DA2 keeps its previous path.
+
+Presentation opacity interpolation, default-pose playback and other
+animation entry points remain open; this slice handles ordinary
+state-controller transition endpoints and removal. State-change PWK
+installation and door group restoration are implemented in
+`placeable-initial-state.md`; full physics remains open. Forced initialization
+selects the destination pose without starting a transition or scheduling its
+completion. Ordinary later changes retain transition playback and completion.
+These static traces used the existing Origins analysis files. The original
+executable was never run, and this note contains only our own description.
+
+### Guarded removal delivery
+
+The base-object message handler checks the current `IsDestroyable` byte before
+cleanup and deletion (`0x698b41..0x698b65`). This is separate from the request
+latch set by `0x696a60`. A blocked message is consumed without clearing that
+latch, so later completion notifications cannot retry the request. The saved
+Origins request latch and deadline queue now preserve that distinction. The
+existing forced lifetime queue keeps its own behavior. Tests change the flag
+between completion and delivery and reload both pending and blocked requests.
+The general script delay, item-specific path and exact frame delivery order
+remain outside this state-controller slice.

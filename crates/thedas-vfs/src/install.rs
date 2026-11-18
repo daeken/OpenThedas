@@ -5,8 +5,10 @@
 //! `packages/core/override` in the player's documents folder (0) and in the install (1), add-ins
 //! (9000 and below), the player's own copies of the campaign and core folders (20000 to
 //! 20007), the campaign (50000s), core (100000s). The order inside one package (loose files,
-//! archives, patch, override) follows the Origins source priorities below; Dragon Age II
-//! retains xoreos's order. Add-ins follow their registry's order (see `sort_addins`).
+//! archives, patch, override) follows the Origins source priorities below. Dragon Age II's
+//! install core follows its traced folder priorities; its other packages and ordering inside
+//! each core folder retain the provisional xoreos order. See `docs/resource-order-da2.md`.
+//! Add-ins follow their registry's order (see `sort_addins`).
 
 use std::path::{Path, PathBuf};
 
@@ -439,7 +441,11 @@ impl DaoInstall {
                 .replace(std::path::MAIN_SEPARATOR, "/");
             format!("{}{rel}", crate::mods::USER_LABEL)
         };
-        push_package(&mut vfs, &core, quality, game, false, &install)?;
+        if game == Game::DragonAge2 {
+            push_da2_core_package(&mut vfs, &core, quality, &install)?;
+        } else {
+            push_package(&mut vfs, &core, quality, game, false, &install)?;
+        }
         push_package(
             &mut vfs,
             &join_ci(&self.root, &campaign),
@@ -547,6 +553,54 @@ fn push_user_package(
             }
         }
     }
+    Ok(())
+}
+
+/// DA2's install core, lowest folder priority first. Startup registers sound/VO at
+/// 100008/100006, data at 100005, textures at 100003, and patch at 100000 (0x7b59c6,
+/// 0x7b5a09, 0x7b5a4c, 0x7afa60, 0x7b5be4). Thus patch and texture loose files beat
+/// archives in lower-priority folders too. Core override remains the separate overlay.
+///
+/// This changes only the order BETWEEN those folders, preserving their existing membership
+/// and internal loose/archive order. In particular, eagerly mounted data RIMs remain above
+/// loose data; native startup explicitly loads global RIMs at 100004 (0x7ae550). Named RIM
+/// lifetimes, archive-kind order, texture aliases and other package registrations still
+/// need their own complete implementation; see `docs/resource-order-da2.md`.
+fn push_da2_core_package(
+    vfs: &mut Vfs,
+    dir: &Path,
+    quality: TextureQuality,
+    label: &dyn Fn(&Path) -> String,
+) -> Result<()> {
+    let loose = |vfs: &mut Vfs, sub: &str, recursive: bool| -> Result<()> {
+        let d = join_ci(dir, sub);
+        if d.is_dir() {
+            vfs.push_directory(&d, recursive, label(&d))?;
+        }
+        Ok(())
+    };
+    let archives = |vfs: &mut Vfs, sub: &str| -> Result<()> {
+        for archive in archives_in(&join_ci(dir, sub))? {
+            vfs.push_archive(&archive, label(&archive))?;
+        }
+        Ok(())
+    };
+    loose(vfs, "audio", true)?;
+    for sub in [
+        "data",
+        "data/abilities",
+        "data/movies",
+        "data/talktables",
+        "data/cursors",
+    ] {
+        loose(vfs, sub, false)?;
+    }
+    archives(vfs, "data")?;
+    archives(vfs, "data/abilities")?;
+    loose(vfs, "textures", true)?;
+    archives(vfs, &format!("textures/{}", quality.dir()))?;
+    loose(vfs, "patch", false)?;
+    archives(vfs, "patch")?;
     Ok(())
 }
 
@@ -1366,6 +1420,45 @@ mod tests {
             "patch beats data; loose beats archive"
         );
         assert_eq!(read("d.gda"), "patch p0");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn da2_core_folder_priorities_apply_to_loose_files_and_archives() {
+        let root = std::env::temp_dir().join(format!("thedas-da2-core-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let write = |rel: &str, bytes: &[u8]| {
+            let p = root.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, bytes).unwrap();
+        };
+        std::fs::create_dir_all(root.join("modules/campaign_base")).unwrap();
+        write("packages/core/audio/sound/data_over_audio.bin", b"audio");
+        write(
+            "packages/core/data/data.erf",
+            &erf_v20(&[
+                ("data_over_audio.bin", b"data"),
+                ("texture_over_data.bin", b"data"),
+                ("patch_over_data.bin", b"data"),
+            ]),
+        );
+        write(
+            "packages/core/textures/high/texture_over_data.bin",
+            b"texture",
+        );
+        write(
+            "packages/core/textures/high/texture.erf",
+            &erf_v20(&[("patch_over_texture.bin", b"texture")]),
+        );
+        write("packages/core/patch/patch_over_data.bin", b"patch");
+        write("packages/core/patch/patch_over_texture.bin", b"patch");
+        let install = DaoInstall::open(&root).unwrap();
+        assert_eq!(install.game(), Game::DragonAge2);
+        let vfs = install.global_vfs(TextureQuality::High).unwrap();
+        assert_eq!(vfs.read("data_over_audio.bin").unwrap().0, b"data");
+        assert_eq!(vfs.read("texture_over_data.bin").unwrap().0, b"texture");
+        assert_eq!(vfs.read("patch_over_data.bin").unwrap().0, b"patch");
+        assert_eq!(vfs.read("patch_over_texture.bin").unwrap().0, b"patch");
         std::fs::remove_dir_all(&root).unwrap();
     }
 

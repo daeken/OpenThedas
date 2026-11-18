@@ -47,6 +47,7 @@ pub(super) fn scene(x: f32, semantic: &str) -> AreaScene {
                 vertex_offset: 0,
                 start_index: 0,
                 elements: vec![],
+                sphere: None,
                 bounds: None,
             },
             raw_vertices: vec![],

@@ -52,6 +52,7 @@ mod audio;
 mod camfade;
 mod chargen_stage;
 mod control;
+mod conversation_input;
 mod cursor;
 mod cutactors;
 mod cutcam;
@@ -73,6 +74,7 @@ mod looks;
 mod modconv;
 mod modmode;
 mod modworld;
+mod mouse;
 mod occlusion;
 mod pad;
 mod paddev;
@@ -211,6 +213,8 @@ struct Args {
     /// reticle), `pad a` (a game controller's button pressed and let go; `pad press rt`
     /// and `pad release rt` hold and let go), `pad stick-left X,Y MS` and
     /// `pad stick-right X,Y MS` (a stick held there while the game runs MS, then let go).
+    /// `windowkey down|repeat|up KeyCode [JSON text]` replays the window keyboard route,
+    /// e.g. `windowkey down Quote "'"; windowkey up Quote; windowkey down Enter`.
     #[arg(long, default_value = "")]
     steps: String,
     /// Module for `--save` and `--objects`; the install's base campaign when not given
@@ -225,9 +229,9 @@ struct Args {
     /// video option: `on` or `off`.
     #[arg(long, default_value = "on", value_parser = ["on", "off"])]
     frame_effects: String,
-    /// How the level is drawn: `faithful` (every material through the original's own
-    /// shaders, the reference) or `deferred` (our renderer: the level's static geometry lit
-    /// per pixel by every light in reach; see docs/deferred.md). F11 flips between them.
+    /// How the level is drawn: `faithful` (the original's material shaders) or `deferred`
+    /// (our renderer: static geometry lit per pixel by every light in reach; see
+    /// docs/deferred.md). Sun-shadow sampling is chosen separately. F11 flips renderers.
     #[arg(long, default_value = "faithful", value_parser = ["faithful", "deferred"])]
     renderer: String,
     /// What the deferred renderer does with the baked lightmaps: `baked` (as the original),
@@ -236,6 +240,10 @@ struct Args {
     /// `THEDAS_DEFERRED_BAKED_LIGHTING`, else `baked`.
     #[arg(long, value_parser = ["baked", "hybrid", "realtime"])]
     lighting: Option<String>,
+    /// Improved sun-shadow PCF and a 2 m partition blend. `off` keeps the original's
+    /// hard switch and filters. Deliberate OpenThedas visual deviation; same shadow maps.
+    #[arg(long, default_value = "on", value_parser = ["on", "off"])]
+    soft_shadows: String,
     /// Viewer (`--area`): place visual effects in the level, `MODEL@X,Y,Z` separated by `;`
     /// (`fxa_fireball_impact_p@10,4,0;fxa_storm_area_p@14,2,0`), each a model of the
     /// game's VFX (`.mmh` without the extension) standing there, its emitters running from
@@ -244,9 +252,9 @@ struct Args {
     #[arg(long, default_value = "")]
     vfx: String,
     /// The original's "Graphics Detail" video option, which picks the materials' techniques
-    /// and the bloom's blur: `low`, `medium` or `high` (High's materials draw as Medium's; its
-    /// sun shadows are 1024 texels a side and reach further).
-    #[arg(long, default_value = "medium", value_parser = ["low", "medium", "high"])]
+    /// and the bloom's blur: `low`, `medium` or `high` (Very High, original index 3;
+    /// materials draw as Medium's, sun shadows are 1024 texels and reach further).
+    #[arg(long, default_value = "high", value_parser = ["low", "medium", "high"])]
     detail: String,
     /// Multisampled anti-aliasing for the world: samples a pixel (the original's
     /// `AntialiasingLevel`; 1 is off, which leaves the post-process smoothing on). Limited to
@@ -451,22 +459,23 @@ pub fn programs_cached(
 /// loads the scene.
 fn load(
     install: &Path,
+    base_vfs: Arc<Vfs>,
     area: &str,
     shaders: &str,
     props: &[thedas_render::Prop],
     detail: thedas_render::scene::Detail,
 ) -> Result<Loaded> {
-    let install = DaoInstall::open(install)?;
-    let mut vfs = install.play_vfs(TextureQuality::High)?;
     if area == "none" {
         return Ok(Loaded {
-            vfs: Arc::new(vfs),
+            vfs: base_vfs,
             scene: None,
             shaders: shaders.to_string(),
             frame_effects: true,
             render_path: Default::default(),
         });
     }
+    let install = DaoInstall::open(install)?;
+    let mut vfs = base_vfs.as_ref().clone();
     let level = match install.mount_level(&mut vfs, area) {
         Ok(mount) => mount.level,
         Err(_) => {
@@ -630,14 +639,15 @@ fn capture(
             let comparison = std::env::var("THEDAS_BENCH_SHADOW_COMPARE").ok();
             if comparison
                 .as_deref()
-                .is_some_and(|s| s != "reuse" && s != "faithful")
+                .is_some_and(|s| !matches!(s, "reuse" | "faithful" | "soft"))
             {
-                bail!("THEDAS_BENCH_SHADOW_COMPARE must be reuse or faithful");
+                bail!("THEDAS_BENCH_SHADOW_COMPARE must be reuse, faithful or soft");
             }
             if compare.is_some() && comparison.is_some() {
                 bail!("choose one deferred benchmark comparison");
             }
             let original_path = live.render_path;
+            let original_soft = thedas_render::soft_shadows();
             let mut modes = Vec::new();
             let mut shadow_modes = Vec::new();
             for frame in 0..n {
@@ -716,6 +726,7 @@ fn capture(
                 }
                 match comparison.as_deref() {
                     Some("reuse") => live.set_deferred_shadow_reuse(Some(test)),
+                    Some("soft") => thedas_render::set_soft_shadows(test),
                     Some("faithful") => {
                         live.render_path = if test {
                             thedas_render::RenderPath::Deferred
@@ -753,6 +764,9 @@ fn capture(
             }
             live.render_path = original_path;
             live.set_deferred_shadow_reuse(None);
+            if comparison.as_deref() == Some("soft") {
+                thedas_render::set_soft_shadows(original_soft);
+            }
             let avg = ms.iter().sum::<f64>() / ms.len() as f64;
             let worst = ms.iter().cloned().fold(0.0, f64::max);
             println!("bench: {n} frames, avg {avg:.1} ms, worst {worst:.1} ms");
@@ -845,6 +859,8 @@ struct App {
     /// A loading screen is up for the level being built (see `Live::loading`).
     load_screen_up: bool,
     loaded: Loaded,
+    /// The run's play stack, without viewer or per-level mounts.
+    base_vfs: Arc<Vfs>,
     /// The running game, when playing.
     live: Option<live::Live>,
     /// The game camera, when following the party leader (playing; F toggles free-fly).
@@ -870,6 +886,7 @@ struct App {
     gfx: Option<Gfx>,
     keys: HashSet<KeyCode>,
     looking: bool,
+    right_click: mouse::RightClick,
     /// The right button went down over the interface: its release is the interface's too (an
     /// item's radial menu opens on the press and acts on the release).
     ui_right: bool,
@@ -882,6 +899,8 @@ struct App {
     swallow_release: bool,
     /// Where clients' requests arrive (`--control`).
     control: Option<control::Control>,
+    /// Bounded per-frame movement diagnostics, enabled only through the control port.
+    motion_trace: Option<Vec<J>>,
     /// Clients' input still playing, first come first played.
     remote: VecDeque<Remote>,
     control_step_ms: Option<u64>,
@@ -930,6 +949,8 @@ struct App {
     /// A report under way: its screenshot and the player's note, to come, and the client
     /// that asked for it (`--control`'s `report`), waiting for where it went.
     report_wait: Option<ReportWait>,
+    /// A failed report's message, kept until dismissed, and frames since last asked.
+    report_failure: Option<(String, u32)>,
     /// The settings the game was started with, for reports.
     started_with: J,
     /// The way back from a report: a fix offered, fetched and checked (see [`update`]).
@@ -1528,6 +1549,7 @@ impl App {
         );
         if let (Some(live), Some(_)) = (&self.live, &self.screens) {
             ui.attach(&live.sim);
+            seed_client_options(live, &ui);
             ui.set_saves(saves::SaveStore::new(self.saves_dir.clone()));
         }
         let reticle = reticle::ReticlePass::new(&ctx.device, config.format, 1);
@@ -1572,26 +1594,9 @@ impl App {
         self.pad = pad;
     }
 
-    fn update(&mut self, frame_ms: f64) {
-        let now = Instant::now();
-        let dt = if self.control_step_ms.is_some() {
-            (frame_ms / 1000.0) as f32
-        } else {
-            (now - self.last).as_secs_f32().min(0.1)
-        };
-        self.last = now;
+    fn update_input(&mut self, dt: f32) {
         self.key_walk();
         let k = |c| self.keys.contains(&c);
-        // The camera waits for a load to finish: it resets as the world comes up.
-        let loading = self.live.as_ref().is_some_and(|l| l.loading());
-        if let (Some(f), Some(l), false) = (self.follow.as_mut(), self.live.as_mut(), loading) {
-            if let Some(heading) = l.camera_reset_due() {
-                f.reset(heading);
-            }
-            if let Some(level) = l.zoom_request_due() {
-                f.set_zoom_level(level);
-            }
-        }
         if let Some(f) = self.follow.as_mut() {
             // A and D turn the camera round the leader: keymap.gda's `MoveCameraLeft` and
             // `MoveCameraRight`. Provisional: the rate.
@@ -1611,6 +1616,45 @@ impl App {
                     thedas_sim::commands::SimCommand::PlayerZoomedIn,
                 );
             }
+            return;
+        }
+        let speed = if k(KeyCode::ShiftLeft) || k(KeyCode::ShiftRight) {
+            15.0
+        } else {
+            4.0
+        } * dt;
+        let axis = |pos: bool, neg: bool| (pos as i32 - neg as i32) as f32;
+        let fwd = axis(k(KeyCode::KeyW), k(KeyCode::KeyS));
+        let right = axis(k(KeyCode::KeyD), k(KeyCode::KeyA));
+        // E up, Q down. C, which also lowered it, opens the character record while playing.
+        let c_lowers = self.screens.is_none();
+        let up = axis(
+            k(KeyCode::KeyE),
+            k(KeyCode::KeyQ) || (c_lowers && k(KeyCode::KeyC)),
+        );
+        self.camera.fly(fwd * speed, right * speed, up * speed);
+        let turn = 1.5 * dt;
+        let yaw = axis(k(KeyCode::ArrowLeft), k(KeyCode::ArrowRight));
+        let pitch = axis(k(KeyCode::ArrowUp), k(KeyCode::ArrowDown));
+        self.camera.look(yaw * turn, pitch * turn);
+    }
+
+    /// Resolve the view after the simulation has reached this frame.
+    /// Frame scheduling is provisional relative to the executable. A pre-step target
+    /// leaves the moving hero ahead of its camera by speed * frame dt, which oscillates
+    /// with uneven frame times.
+    fn update_camera(&mut self, dt: f32) {
+        // The camera waits for a load to finish: it resets as the world comes up.
+        let loading = self.live.as_ref().is_some_and(|l| l.loading());
+        if let (Some(f), Some(l), false) = (self.follow.as_mut(), self.live.as_mut(), loading) {
+            if let Some(heading) = l.camera_reset_due() {
+                f.reset(heading);
+            }
+            if let Some(level) = l.zoom_request_due() {
+                f.set_zoom_level(level);
+            }
+        }
+        if let Some(f) = self.follow.as_mut() {
             let eye = self
                 .live
                 .as_ref()
@@ -1647,27 +1691,7 @@ impl App {
             {
                 self.camera = c;
             }
-            return;
         }
-        let speed = if k(KeyCode::ShiftLeft) || k(KeyCode::ShiftRight) {
-            15.0
-        } else {
-            4.0
-        } * dt;
-        let axis = |pos: bool, neg: bool| (pos as i32 - neg as i32) as f32;
-        let fwd = axis(k(KeyCode::KeyW), k(KeyCode::KeyS));
-        let right = axis(k(KeyCode::KeyD), k(KeyCode::KeyA));
-        // E up, Q down. C, which also lowered it, opens the character record while playing.
-        let c_lowers = self.screens.is_none();
-        let up = axis(
-            k(KeyCode::KeyE),
-            k(KeyCode::KeyQ) || (c_lowers && k(KeyCode::KeyC)),
-        );
-        self.camera.fly(fwd * speed, right * speed, up * speed);
-        let turn = 1.5 * dt;
-        let yaw = axis(k(KeyCode::ArrowLeft), k(KeyCode::ArrowRight));
-        let pitch = axis(k(KeyCode::ArrowUp), k(KeyCode::ArrowDown));
-        self.camera.look(yaw * turn, pitch * turn);
     }
 
     /// A frame of the boot movies: only the movie is drawn, and only a key, a click or the
@@ -1744,23 +1768,24 @@ impl App {
         if self.intro.is_some() {
             return self.intro_frame();
         }
-        let wall_dt = self.last.elapsed().as_secs_f64() * 1000.0;
+        let now = Instant::now();
+        let wall_dt = (now - self.last).as_secs_f64() * 1000.0;
+        self.last = now;
         let Some(dt) = self.serve_control(wall_dt) else {
             std::thread::sleep(std::time::Duration::from_millis(5));
             return Ok(());
         };
-        self.control_started = true;
-        self.control_time_ms += if self.control_step_ms.is_some() {
-            dt as u64
-        } else {
-            0
-        };
+        if self.control_step_ms.is_some() {
+            self.control_started = true;
+            self.control_time_ms += dt as u64;
+        }
         self.pad_frame(dt);
         self.report_frame(dt);
+        self.report_failure_frame();
         self.resume_frame();
         self.mod_mode_frame(dt);
         self.returning_frame();
-        self.update(dt);
+        self.update_input((dt.min(live::MAX_STEP_MS) / 1000.0) as f32);
         let Some(g) = self.gfx.as_mut() else {
             return Ok(());
         };
@@ -1777,6 +1802,7 @@ impl App {
             g.surface.configure(&g.ctx.device, &g.config);
         }
         debug_assert_eq!(plan.draw, frame.is_some());
+        self.prepare_world(dt, plan.draw || plan.offscreen_frames)?;
         // No frame to draw into (the window hidden or occluded, the display asleep, a
         // resize): the game runs on all the same, only nothing is drawn, and clients waiting
         // for a presented frame get one drawn offscreen instead.
@@ -1787,6 +1813,7 @@ impl App {
             }
             return Ok(());
         };
+        let g = self.gfx.as_mut().expect("window is up");
         let view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
@@ -1796,32 +1823,6 @@ impl App {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("frame"),
             });
-        let stopped = self.screens.as_ref().is_some_and(|s| s.world_stopped());
-        if let Some(live) = self.live.as_mut() {
-            // A pending transition, or a world map journey, runs on behind its loading screen
-            // (which stops the world otherwise); a training lesson's events are delivered
-            // with a screen up too (its steps go on inside the inventory, the tactics), no
-            // time passing (see `Live::step`).
-            if (dt > 0.0 || self.control_step_ms.is_none())
-                && (!stopped || live.transition_pending() || live.journey() || live.training())
-            {
-                live.step(dt);
-            }
-            // While a level loads the world holds still: its presentation too.
-            if !live.loading() {
-                live.advance_presentation(dt);
-            }
-            live.frame_size = (g.config.width, g.config.height);
-            live.set_chargen_pose(g.ui.paperdoll_pose());
-            live.sync(&g.ctx, g.config.format)?;
-            if self.screens.is_some() {
-                loading_screen(live, &mut g.ui, &mut self.load_screen_up);
-            }
-            // Portraits are drawn by the objects' renderers, whose constants this frame's
-            // draws use too: they are drawn (and submitted) before the frame is encoded, so
-            // the frame is not drawn from the portrait camera.
-            draw_likenesses(live, &mut g.ui, self.screens.as_ref(), &g.ctx, dt);
-        }
         let size = (g.config.width, g.config.height);
         let drawn = match (self.live.as_mut(), g.renderer.as_mut()) {
             (Some(live), _) => {
@@ -1920,6 +1921,10 @@ impl App {
             }
         }
         for a in g.ui.take_text_answers() {
+            if a.id == report::FAILED_ID {
+                self.report_failure = None;
+                continue;
+            }
             // OK sends (or saves) the report with the note; the other button keeps it on
             // this computer only, unsent.
             if (UPDATE_ASK_ID..UPDATE_ASK_ID + 5).contains(&a.id) {
@@ -2031,8 +2036,51 @@ impl App {
         a.frame(state);
         let voice = a.voice_ms();
         if let Some(g) = self.gfx.as_mut() {
-            g.ui.set_line_voice_ms(voice);
+            g.ui.set_line_voice_ms(voice, || a.voice_elapsed_ms());
         }
+    }
+
+    /// Step once for both surface and offscreen frames, then resolve the camera and
+    /// pose that same simulation state. Input has already been issued by update_input.
+    fn prepare_world(&mut self, dt: f64, rendered: bool) -> Result<()> {
+        let stopped = self.screens.as_ref().is_some_and(|s| s.world_stopped());
+        let mut sim_ticks = 0;
+        if let Some(live) = self.live.as_mut() {
+            // Transitions and journeys run behind their loading screens. Training can
+            // deliver script events while its lesson holds the simulation clock.
+            if (dt > 0.0 || self.control_step_ms.is_none())
+                && (!stopped || live.transition_pending() || live.journey() || live.training())
+            {
+                sim_ticks = live.step(dt);
+            }
+            if !live.loading() {
+                live.advance_presentation(dt);
+            }
+        }
+        // Resolve the camera from the stepped state before sync applies the camera's
+        // creature fades to the renderer. The target and drawn hero now share a time.
+        self.update_camera((dt.min(live::MAX_STEP_MS) / 1000.0) as f32);
+        if let (Some(g), Some(live)) = (self.gfx.as_mut(), self.live.as_mut()) {
+            live.frame_size = (g.config.width, g.config.height);
+            live.set_chargen_pose(g.ui.paperdoll_pose());
+            live.sync(&g.ctx, g.config.format)?;
+            if self.screens.is_some() {
+                loading_screen(live, &mut g.ui, &mut self.load_screen_up);
+            }
+            // Submit portraits before encoding the world's draws, which use the same
+            // renderer constants.
+            draw_likenesses(live, &mut g.ui, self.screens.as_ref(), &g.ctx, dt);
+            control::record_motion(
+                &mut self.motion_trace,
+                live,
+                &self.camera,
+                self.follow.as_ref(),
+                dt,
+                sim_ticks,
+                rendered,
+            );
+        }
+        Ok(())
     }
 
     /// A frame with nothing to draw into: the simulation, its presentation and the interface
@@ -2041,32 +2089,6 @@ impl App {
         let Some(g) = self.gfx.as_mut() else {
             return Ok(());
         };
-        let stopped = self.screens.as_ref().is_some_and(|s| s.world_stopped());
-        if let Some(live) = self.live.as_mut() {
-            // A pending transition, or a world map journey, runs on behind its loading screen
-            // (which stops the world otherwise); a training lesson's events are delivered
-            // with a screen up too (its steps go on inside the inventory, the tactics), no
-            // time passing (see `Live::step`).
-            if (dt > 0.0 || self.control_step_ms.is_none())
-                && (!stopped || live.transition_pending() || live.journey() || live.training())
-            {
-                live.step(dt);
-            }
-            // While a level loads the world holds still: its presentation too.
-            if !live.loading() {
-                live.advance_presentation(dt);
-            }
-            live.frame_size = (g.config.width, g.config.height);
-            live.set_chargen_pose(g.ui.paperdoll_pose());
-            live.sync(&g.ctx, g.config.format)?;
-            if self.screens.is_some() {
-                loading_screen(live, &mut g.ui, &mut self.load_screen_up);
-            }
-            // The party's portraits and the paperdoll are drawn into their own targets, so
-            // they are kept up with no frame to present too (a hidden window's portraits
-            // stayed empty, and a client's offscreen frame showed them so).
-            draw_likenesses(live, &mut g.ui, self.screens.as_ref(), &g.ctx, dt);
-        }
         if self.live.is_none() {
             if let Some(r) = g.renderer.as_mut() {
                 r.advance_time(dt / 1000.0);
@@ -2115,6 +2137,10 @@ impl App {
             }
         }
         for a in g.ui.take_text_answers() {
+            if a.id == report::FAILED_ID {
+                self.report_failure = None;
+                continue;
+            }
             // OK sends (or saves) the report with the note; the other button keeps it on
             // this computer only, unsent.
             if (UPDATE_ASK_ID..UPDATE_ASK_ID + 5).contains(&a.id) {
@@ -2865,12 +2891,19 @@ impl App {
     /// asked for. `note` answers the question instead (a client's); `reply` hears where the
     /// report went once it is written.
     fn report(&mut self, note: Option<String>, reply: Option<std::sync::mpsc::Sender<J>>) {
-        if self.recorder.busy() {
+        if self.recorder.busy() || self.report_failure.is_some() {
             if let Some(r) = reply {
                 let _ = r.send(control::failure("a report is already under way"));
             }
             return;
         }
+        let capture_started = Instant::now();
+        let capture = report::Capture {
+            presentation: report::presentation_snapshot(self),
+            settings: self.settings.clone(),
+            data_dir: saves::data_dir(),
+        };
+        let presentation_ms = capture_started.elapsed().as_secs_f64() * 1000.0;
         let mut info = json!({
             "build": report::build_info(),
             "settings": self.started_with,
@@ -2905,6 +2938,9 @@ impl App {
         let mut trace = None;
         let mut journal = None;
         let mut pause = false;
+        let metadata_ms = capture_started.elapsed().as_secs_f64() * 1000.0 - presentation_ms;
+        let mut save_clone_ms = 0.0;
+        let mut trace_ms = 0.0;
         if let Some(live) = self.live.as_mut() {
             if !live.front_end {
                 journal = live.journal.as_mut().and_then(|j| j.files());
@@ -2913,17 +2949,25 @@ impl App {
                 info["game"]["hero"] = json!(sim.world.hero.map(|h| sim.display_name(h)));
                 info["game"]["area_name"] = json!(sim.world.area.map(|a| sim.display_name(a)));
                 info["game"]["coverage"] = sim.world.trace.coverage();
-                match sim.save_json() {
-                    Ok(b) => now_save = Some(b),
-                    Err(e) => log::warn!("report: the game's state: {e}"),
-                }
+                let stage = Instant::now();
+                now_save = Some(report::ReportSave::Game(Box::new(sim.save_game())));
+                save_clone_ms = stage.elapsed().as_secs_f64() * 1000.0;
+                let stage = Instant::now();
                 trace = serde_json::to_value(&sim.world.trace.recent).ok();
+                trace_ms = stage.elapsed().as_secs_f64() * 1000.0;
                 drop(sim);
                 pause = !live.paused;
             }
         }
-        let dir = self.recorder.start(now_save, trace, journal, info);
-        log::info!("report: started in {}", dir.display());
+        info["capture_ms"] = json!(capture_started.elapsed().as_secs_f64() * 1000.0);
+        info["capture_timings_ms"] = json!({ "presentation": presentation_ms, "metadata": metadata_ms,
+            "save_clone": save_clone_ms, "trace": trace_ms });
+        let dir = self.recorder.start(now_save, trace, journal, info, capture);
+        log::info!(
+            "report: captured state in {:.2} ms; started in {}",
+            capture_started.elapsed().as_secs_f64() * 1000.0,
+            dir.display()
+        );
         // The frame as presented, read back as the next one is drawn; drawn again
         // offscreen where the surface cannot be read back.
         let readable = self
@@ -3136,7 +3180,13 @@ impl App {
     /// One frame of reports: a snapshot of the game when one is due, and a report under
     /// way finished once its screenshot and note are in.
     fn report_frame(&mut self, dt_ms: f64) {
-        self.recorder.frame(dt_ms);
+        let context = report::frame_context(self);
+        let dt_ms = self
+            .gfx
+            .as_ref()
+            .and_then(|g| g.frames.last_frame_ms())
+            .unwrap_or(dt_ms);
+        self.recorder.frame(dt_ms, context);
         for a in std::mem::take(&mut self.mark_answers) {
             self.mark_answer(a);
         }
@@ -3206,7 +3256,7 @@ impl App {
                 }
             }
         }
-        let Some(dir) = self.recorder.finish() else {
+        let Some(result) = self.recorder.finish() else {
             return;
         };
         let Some(w) = self.report_wait.take() else {
@@ -3228,6 +3278,16 @@ impl App {
                 live.paused = false;
             }
         }
+        let dir = match result {
+            Ok(dir) => dir,
+            Err(message) => {
+                if let Some(r) = reply {
+                    let _ = r.send(control::failure(&message));
+                }
+                self.report_failure = Some((message, 0));
+                return;
+            }
+        };
         // Sent on when the player has set that up (see [`upload`]).
         if let (true, Some(d), Some(url)) = (w.send, dir.as_ref(), upload::webhook()) {
             upload::send_in_background(d.clone(), url);
@@ -3240,9 +3300,26 @@ impl App {
         }
     }
 
+    /// Retry if the popup layer is absent or a screen change loses the notice. Unlike
+    /// the optional report note, a failure notice waits until the player dismisses it.
+    fn report_failure_frame(&mut self) {
+        let (Some((message, frames)), Some(g)) = (self.report_failure.as_mut(), self.gfx.as_mut())
+        else {
+            return;
+        };
+        *frames = frames.saturating_add(1);
+        if !g.ui.stage.dialog_up() && (*frames == 1 || *frames > NOTE_REASK_FRAMES) {
+            g.ui.ask_ok(report::FAILED_ID, message, "OK");
+            *frames = 1;
+        }
+    }
+
     /// One frame of the way back from a report (see [`update`]): the check's result, the
     /// question up (asked again when lost, as the report's note), the answers, the fetch.
     fn returning_frame(&mut self) {
+        if self.report_failure.is_some() {
+            return;
+        }
         let answers = std::mem::take(&mut self.update_answers);
         for a in answers {
             self.update_answer(a);
@@ -3617,15 +3694,18 @@ impl App {
         }
     }
 
-    /// A left click at window pixel (`x`, `y`) while playing: the party leader is ordered to
-    /// whatever it lands on.
-    fn click(&mut self, x: f64, y: f64) {
+    /// A world click orders the party leader. Right clicks currently order ground only.
+    fn click(&mut self, x: f64, y: f64, ground_only: bool) {
         let (Some(live), Some(g)) = (self.live.as_mut(), self.gfx.as_ref()) else {
             return;
         };
         let (w, h) = (g.config.width as f32, g.config.height as f32);
         let (origin, dir) = self.camera.ray(x as f32, y as f32, w, h);
-        if let Some(order) = live.pick(origin, dir).and_then(|p| live.click(p)) {
+        if let Some(order) = live
+            .pick(origin, dir)
+            .filter(|p| !ground_only || matches!(p, live::Pick::Ground(_)))
+            .and_then(|p| live.click(p))
+        {
             log::info!("order: {order}");
         }
     }
@@ -3680,6 +3760,49 @@ impl App {
             None => {}
         }
         true
+    }
+
+    /// The window keyboard route, also used by control's `windowkey` replay.
+    /// Returns true when the key requests that the application close.
+    fn window_key(
+        &mut self,
+        code: KeyCode,
+        text: Option<&str>,
+        state: ElementState,
+        repeat: bool,
+    ) -> bool {
+        // A key skips a cutscene, as a click does. Provisional: the game's own
+        // skip key is not traced.
+        if state == ElementState::Pressed
+            && !repeat
+            && self
+                .screens
+                .as_ref()
+                .is_some_and(screens::Screens::in_cutscene)
+        {
+            if let Some(live) = self.live.as_ref() {
+                live.sim().input(
+                    thedas_sim::commands::CommandSource::Player,
+                    thedas_sim::commands::SimCommand::SkipCutscene,
+                );
+            }
+            return false;
+        }
+        if state == ElementState::Pressed && self.text_key(code, text) {
+            return false;
+        }
+        match state {
+            ElementState::Pressed => {
+                if !repeat && self.key_down(code) {
+                    return true;
+                }
+                self.keys.insert(code);
+            }
+            ElementState::Released => {
+                self.keys.remove(&code);
+            }
+        }
+        false
     }
 
     /// Draws the level the way `path` says, or the other way than now for `None` (F11),
@@ -3784,6 +3907,23 @@ impl App {
                     log::info!("weapon set switched");
                 }
             }
+            // In a conversation the number keys pick the replies (1 is the first), not the
+            // quickbar: the conversation screen lists them numbered.
+            c if self.live.is_some()
+                && quickslot_key(c).is_some()
+                && self
+                    .screens
+                    .as_ref()
+                    .is_some_and(|s| s.shown().contains(&screens::Screen::Conversation)) =>
+            {
+                let n = quickslot_key(c).unwrap_or(0) as usize;
+                if let Some(live) = self.live.as_mut() {
+                    let have = live.sim().dialog_state().map_or(0, |d| d.replies.len());
+                    if n < have {
+                        log::info!("{}", reply(live, n));
+                    }
+                }
+            }
             // The quickbar's first ten slots: 1 to 9, then 0.
             c if self.live.is_some() && quickslot_key(c).is_some() => {
                 let slot = quickslot_key(c).unwrap_or(0);
@@ -3873,6 +4013,7 @@ impl App {
 
     /// The mouse moves to window pixel (`x`, `y`).
     fn cursor_to(&mut self, x: f64, y: f64) {
+        self.right_click.cursor_to((x, y));
         self.cursor = (x, y);
         self.pad_last = false;
         if let Some(Marking::On {
@@ -3889,7 +4030,10 @@ impl App {
 
     /// The left button goes down or up at the cursor.
     fn left_button(&mut self, pressed: bool) {
-        self.left_down = pressed;
+        let was_down = std::mem::replace(&mut self.left_down, pressed);
+        if pressed && was_down {
+            return;
+        }
         let (x, y) = self.cursor;
         self.recorder.input(format!(
             "{} {x:.0},{y:.0}",
@@ -3938,7 +4082,9 @@ impl App {
         }
         if double {
             if let Some(g) = self.gfx.as_mut() {
-                if self.screens.as_ref().is_some_and(|s| !s.exploring()) {
+                if self.screens.as_ref().is_some_and(|s| {
+                    !s.exploring() && !s.shown().contains(&screens::Screen::Conversation)
+                }) {
                     g.ui.click_as(
                         thedas_ui::avm1::MOUSE_LEFT + thedas_ui::avm1::DOUBLE_CLICK,
                         x,
@@ -3958,13 +4104,13 @@ impl App {
                     .as_ref()
                     .is_none_or(|s| world_takes_click(&g.ui, s, x, y));
             }
-            g.ui.mouse_button(x, y, pressed);
-            if pressed && !to_world && self.live.is_some() && self.screens.is_some() {
+            let accepted = g.ui.mouse_button(x, y, pressed);
+            if accepted && pressed && !to_world && self.live.is_some() && self.screens.is_some() {
                 g.ui.clicked();
             }
         }
         if to_world {
-            self.click(x, y);
+            self.click(x, y, false);
         }
     }
 
@@ -3980,8 +4126,9 @@ impl App {
             if pressed { "rpress" } else { "rrelease" }
         ));
         // Over the interface (or with a menu up) a right click is the interface's (an item's
-        // actions); elsewhere it turns the camera.
+        // actions); elsewhere a drag turns the camera and a tap orders a ground move.
         if pressed {
+            self.right_click = Default::default();
             if let (Some(g), Some(s)) = (self.gfx.as_mut(), self.screens.as_ref()) {
                 if !s.exploring() || g.ui.covers(x, y) {
                     g.ui.button_as(thedas_ui::avm1::MOUSE_RIGHT, x, y, true);
@@ -4001,10 +4148,28 @@ impl App {
                 log::info!("ability {} not aimed", aim.ability);
                 return;
             }
+            if self
+                .live
+                .as_ref()
+                .is_some_and(|l| l.sim().game == thedas_vfs::Game::Origins)
+                && self.ui.is_empty()
+            {
+                self.right_click.press((x, y));
+            }
         }
         self.looking = pressed;
         if let Some(g) = &self.gfx {
             g.window.set_cursor_visible(!self.looking);
+        }
+        if !pressed
+            && let Some((px, py)) = self.right_click.release()
+            && self.ui.is_empty()
+            && let (Some(g), Some(s)) = (self.gfx.as_ref(), self.screens.as_ref())
+            && s.exploring()
+            && world_takes_click(&g.ui, s, x, y)
+            && world_takes_click(&g.ui, s, px, py)
+        {
+            self.click(px, py, true);
         }
     }
 
@@ -4020,16 +4185,17 @@ impl App {
             }
             &Step::ClickAs(button, x, y) => {
                 self.cursor_to(x, y);
-                if let Some(g) = self.gfx.as_mut() {
+                if button == thedas_ui::avm1::MOUSE_RIGHT {
+                    self.right_button(true);
+                    self.right_button(false);
+                } else if let Some(g) = self.gfx.as_mut() {
                     g.ui.click_as(button, x, y);
                 }
                 log.push(format!("click {x},{y} as button {button}"));
             }
             &Step::RightAt(x, y, down) => {
                 self.cursor_to(x, y);
-                if let Some(g) = self.gfx.as_mut() {
-                    g.ui.button_as(thedas_ui::avm1::MOUSE_RIGHT, x, y, down);
-                }
+                self.right_button(down);
                 log.push(format!(
                     "right {} {x},{y}",
                     if down { "press" } else { "release" }
@@ -4096,6 +4262,12 @@ impl App {
                 log.push(format!(
                     "key {k:?}: {}",
                     if typed { "typed" } else { "no text field" }
+                ));
+            }
+            Step::WindowKey(code, text, state, repeat) => {
+                self.quit |= self.window_key(*code, text.as_deref(), *state, *repeat);
+                log.push(format!(
+                    "windowkey {state:?} {code:?} {text:?} repeat={repeat}"
                 ));
             }
             Step::Wipe => {
@@ -4174,42 +4346,24 @@ impl App {
                 log.push(format!("key {code:?} {}", if down { "down" } else { "up" }));
             }
             &Step::PhysicalKey(code, down) => {
-                if down {
-                    let name = format!("{code:?}");
-                    let text = name
-                        .strip_prefix("Key")
-                        .or_else(|| name.strip_prefix("Digit"))
-                        .filter(|s| s.len() == 1)
-                        .map(str::to_ascii_lowercase);
-                    if self
-                        .screens
-                        .as_ref()
-                        .is_some_and(screens::Screens::in_cutscene)
-                    {
-                        if let Some(l) = self.live.as_ref() {
-                            l.sim().input(
-                                thedas_sim::commands::CommandSource::Player,
-                                thedas_sim::commands::SimCommand::SkipCutscene,
-                            );
-                        }
-                    } else if !self.text_key(code, text.as_deref()) {
-                        self.keys.insert(code);
-                        if code == KeyCode::ShiftLeft
-                            && let Some(g) = self.gfx.as_mut()
-                        {
-                            g.ui.stage.set_shift(true);
-                        }
-                        if self.key_down(code) {
-                            self.quit = true;
-                        }
-                    }
+                let name = format!("{code:?}");
+                let text = name
+                    .strip_prefix("Key")
+                    .or_else(|| name.strip_prefix("Digit"))
+                    .filter(|s| s.len() == 1)
+                    .map(str::to_ascii_lowercase);
+                let state = if down {
+                    ElementState::Pressed
                 } else {
-                    self.keys.remove(&code);
-                    if code == KeyCode::ShiftLeft
-                        && let Some(g) = self.gfx.as_mut()
-                    {
-                        g.ui.stage.set_shift(false);
-                    }
+                    ElementState::Released
+                };
+                if self.window_key(code, text.as_deref(), state, false) {
+                    self.quit = true;
+                }
+                if code == KeyCode::ShiftLeft
+                    && let Some(g) = self.gfx.as_mut()
+                {
+                    g.ui.stage.set_shift(self.keys.contains(&code));
                 }
                 log.push(format!("keyboard {code:?} {down}"));
             }
@@ -4308,6 +4462,10 @@ impl App {
                     _ => KeyCode::KeyI,
                 });
                 log.push(format!("{m:?}"));
+            }
+            &Step::RawKey(code) => {
+                self.key_down(code);
+                log.push(format!("rawkey {code:?}"));
             }
             &Step::Leader(n) => {
                 let tag = self.live.as_mut().and_then(|l| l.choose_leader(n));
@@ -4598,12 +4756,23 @@ impl App {
             let cmd = r.body["cmd"].as_str().unwrap_or_default().to_string();
             let answer = match cmd.as_str() {
                 "status" => Some(self.status()),
+                "motion_trace" => Some(if r.body["enabled"].as_bool() == Some(true) {
+                    self.motion_trace = Some(Vec::new());
+                    json!({ "ok": true, "limit": control::MOTION_TRACE_LIMIT })
+                } else {
+                    json!({ "ok": true, "frames": self.motion_trace.take().unwrap_or_default() })
+                }),
                 "quit" => {
                     if let Some(l) = self.live.as_mut() {
                         l.close_journal();
                     }
+                    if r.reply.send(json!({"ok": true})).is_ok()
+                        && let Some(written) = r.written
+                    {
+                        let _ = written.recv_timeout(std::time::Duration::from_secs(1));
+                    }
                     self.quit = true;
-                    Some(json!({"ok": true}))
+                    return None;
                 }
                 // The frame as presented, read back as the next one is drawn; a surface that
                 // cannot be read back is drawn again offscreen instead.
@@ -4931,16 +5100,21 @@ impl App {
             // A game (new or loaded) opens on a worker while the window keeps presenting,
             // the running one held behind it (see `Live::hold`); the start menu opens at once.
             if matches!(r, ui::FrontEnd::StartMenu) {
-                match live::Live::open(&self.install, &self.module, start, &self.shaders) {
+                match live::Live::open(
+                    &self.install,
+                    self.base_vfs.clone(),
+                    &self.module,
+                    start,
+                    &self.shaders,
+                ) {
                     Ok(l) => self.install_live(l),
                     Err(e) => {
                         log::warn!("front end: {r:?} failed: {e:#}");
                         // Say so: the game just carries on, which looks like a dead button.
                         if let Some(g) = self.gfx.as_mut() {
-                            g.ui.ask_choice(
+                            g.ui.ask_ok(
                                 RETURN_FAILED_ID,
                                 &format!("The start menu could not be opened: {e:#}"),
-                                "OK",
                                 "OK",
                             );
                         }
@@ -4952,8 +5126,9 @@ impl App {
                 log::info!("front end: {r:?} ignored, a game is already opening");
                 continue;
             }
-            let (install, module, shaders) = (
+            let (install, base_vfs, module, shaders) = (
                 self.install.clone(),
+                self.base_vfs.clone(),
                 self.module.clone(),
                 self.shaders.clone(),
             );
@@ -4971,7 +5146,9 @@ impl App {
                         (None, Some(dir)) => live::Start::Resume(dir),
                         (None, None) => live::Start::NewGame,
                     };
-                    let _ = tx.send(live::Live::open(&install, &module, start, &shaders));
+                    let _ = tx.send(live::Live::open(
+                        &install, base_vfs, &module, start, &shaders,
+                    ));
                 });
             match spawned {
                 Ok(_) => {
@@ -5034,7 +5211,10 @@ impl App {
     /// game not quit normally, newer than the newest save (see [`journal::resumable`]).
     /// Ours: the original has no journal.
     fn resume_frame(&mut self) {
-        if self.resume_offer != ResumeOffer::Unchecked || self.opening.is_some() {
+        if self.resume_offer != ResumeOffer::Unchecked
+            || self.opening.is_some()
+            || self.report_failure.is_some()
+        {
             return;
         }
         let at_menu = self.live.as_ref().is_some_and(|l| l.front_end)
@@ -5294,39 +5474,8 @@ impl ApplicationHandler for App {
                 let PhysicalKey::Code(code) = event.physical_key else {
                     return;
                 };
-                // A key skips a cutscene (and the movie it plays), as a click does.
-                // Provisional: the game's own skip key is not traced.
-                if event.state == ElementState::Pressed
-                    && !event.repeat
-                    && self
-                        .screens
-                        .as_ref()
-                        .is_some_and(screens::Screens::in_cutscene)
-                {
-                    if let Some(live) = self.live.as_ref() {
-                        live.sim().input(
-                            thedas_sim::commands::CommandSource::Player,
-                            thedas_sim::commands::SimCommand::SkipCutscene,
-                        );
-                    }
-                    return;
-                }
-                // While a movie's text field has focus, keys type into it (repeats too).
-                if event.state == ElementState::Pressed
-                    && self.text_key(code, event.text.as_deref())
-                {
-                    return;
-                }
-                match event.state {
-                    ElementState::Pressed => {
-                        if !event.repeat && self.key_down(code) {
-                            event_loop.exit();
-                        }
-                        self.keys.insert(code);
-                    }
-                    ElementState::Released => {
-                        self.keys.remove(&code);
-                    }
+                if self.window_key(code, event.text.as_deref(), event.state, event.repeat) {
+                    event_loop.exit();
                 }
             }
             WindowEvent::CursorMoved { position, .. } => self.cursor_to(position.x, position.y),
@@ -5360,6 +5509,7 @@ impl ApplicationHandler for App {
             WindowEvent::Focused(false) => {
                 self.keys.clear();
                 self.looking = false;
+                self.right_click = Default::default();
                 if let Some(g) = self.gfx.as_mut() {
                     g.ui.stage.set_shift(false);
                     g.ui.mouse_leave();
@@ -5380,6 +5530,7 @@ impl ApplicationHandler for App {
         }
         if let DeviceEvent::MouseMotion { delta } = event {
             if self.looking {
+                self.right_click.motion(delta);
                 // The player's control options: mouse sensitivity scales the turn (1, the
                 // default, is the old fixed 0.003 radians a pixel) and the axes may be
                 // inverted. Provisional: the exe's sensitivity curve is not traced.
@@ -5428,7 +5579,7 @@ fn line_is_voiced(audio: &audio::GameAudio, sim: &thedas_sim::Sim) -> bool {
     if voice_line(sim).is_some_and(|l| audio.line_voice(&l).is_some()) {
         return true;
     }
-    sim.conversation_line().is_none()
+    (sim.cutscene_controls_dialog_speech() || sim.conversation_line().is_none())
         && sim
             .world
             .cutscene
@@ -5437,35 +5588,42 @@ fn line_is_voiced(audio: &audio::GameAudio, sim: &thedas_sim::Sim) -> bool {
             .is_some_and(|l| l.vo_mode != 0)
 }
 
-/// The voice-over the line on screen wants: the conversation's line, else a cutscene's line
-/// that has its own voice. With [`audio::GameAudio::line_voice`] this says whether the line
-/// is voiced (and for how long) as soon as it is chosen, before its voice plays.
+/// The voice-over for the current speech. An owned cut that says its dialog line drives
+/// audio from its timeline. Other conversations use the still-presented node, including
+/// terminal lines.
 pub(crate) fn voice_line(sim: &thedas_sim::Sim) -> Option<audio::VoiceLine> {
-    let line = sim.conversation_line().and_then(|l| {
+    let open = sim.presented_conversation_line();
+    let cut_controls_speech = sim.cutscene_controls_dialog_speech();
+    if !cut_controls_speech
+        && let Some(l) = open
+        && let Some(strref) = l.strref
+        && sim.cut_line_speech() != thedas_sim::dialog::CutLineSpeech::Complete
+    {
         let female = sim
             .world
             .get(l.player)
             .is_some_and(|o| o.fields.get("Gender").copied() == Some(2));
-        Some(audio::VoiceLine {
+        return Some(audio::VoiceLine {
             dialog: l.dialog.to_string(),
-            strref: l.strref?,
+            strref,
             female,
             ambient: l.ambient,
-        })
-    });
-    if line.is_some() {
-        return line;
+        });
     }
     let c = sim.world.cutscene.as_ref()?;
     let l = c.line_now().filter(|l| l.vo_mode == 0)?;
     let conv = l.conversation.as_ref()?;
-    let female = sim
-        .world
-        .hero
-        .and_then(|h| sim.world.get(h))
+    // Keep the voice identity across a skip made in a track from the open dialog.
+    let (dialog, player) = open
+        .filter(|open| cut_controls_speech && open.dialog.eq_ignore_ascii_case(conv))
+        .map_or((conv.as_str(), sim.world.hero), |open| {
+            (open.dialog, Some(open.player))
+        });
+    let female = player
+        .and_then(|player| sim.world.get(player))
         .is_some_and(|o| o.fields.get("Gender").copied() == Some(2));
     Some(audio::VoiceLine {
-        dialog: conv.clone(),
+        dialog: dialog.to_string(),
         strref: l.strref,
         female,
         ambient: false,
@@ -5923,8 +6081,8 @@ impl padplay::Host for HeadlessHost<'_> {
                 layer.render_movies();
                 let w = world_takes_click(layer, s, x, y);
                 layer.mouse_move(x, y);
-                layer.mouse_button(x, y, down);
-                if down && !w {
+                let accepted = layer.mouse_button(x, y, down);
+                if accepted && down && !w {
                     layer.clicked();
                 }
                 w
@@ -6083,7 +6241,7 @@ fn draw_likenesses(
     let Some(screens) = screens else {
         return;
     };
-    let key = ui::portrait_key(&live.sim());
+    let key = live.portrait_key();
     if ui.wants_portraits(key, dt) {
         let shots = live.portraits(ctx, ui::PORTRAIT_SIZE);
         ui.set_portraits(shots);
@@ -6156,6 +6314,9 @@ enum Step {
     /// A key for the focused text field (`key backspace`, `enter`, `delete`, `left`, `right`,
     /// `home`, `end`, `tab`, `escape`, `ctrl+a`).
     TextKey(thedas_ui::UiKey),
+    /// A window key event through App::text_key and the normal game key routing:
+    /// `windowkey down|repeat|up KeyCode [JSON text]` (winit's physical key names).
+    WindowKey(KeyCode, Option<String>, ElementState, bool),
     /// The whole party falls, as the game sees it after a wipe (for trying the death screen
     /// headless).
     Wipe,
@@ -6279,6 +6440,9 @@ enum Step {
     /// A movement key held or let go (`keydown w`, `keyup w`; w, a, s, d, q or e), as the
     /// keyboard holds it.
     HoldKey(KeyCode, bool),
+    /// `rawkey NAME`: a key pressed as the window delivers it (1 to 0, space, enter, escape,
+    /// tab), so what the game does with the key itself is tested.
+    RawKey(KeyCode),
     PhysicalKey(KeyCode, bool),
     /// The highlight key held or let go (`allnames on`, `allnames off`): every creature near
     /// shows its name, as while Tab is down.
@@ -6357,7 +6521,11 @@ fn pad_steps(arg: &str) -> Result<Vec<Step>> {
 /// options screen before New Game reaches it here (the tutorials, auto-pause in combat).
 fn seed_client_options(l: &live::Live, ui: &ui::UiLayer) {
     let mut sim = l.sim();
-    for name in ["GameOptions.ShowTutorials", "GameOptions.AutoPauseCombat"] {
+    for name in [
+        "GameOptions.ShowTutorials",
+        "GameOptions.AutoPauseCombat",
+        "GameOptions.ShowGore",
+    ] {
         if let Some(v) = ui.client_option(name) {
             sim.input(
                 thedas_sim::commands::CommandSource::Player,
@@ -6665,6 +6833,23 @@ fn parse_step(s: &str) -> Result<Step> {
         "key" if arg.eq_ignore_ascii_case("space") => Step::Pause,
         "key" if arg == "/" => Step::SwapWeapons,
         "key" if arg.eq_ignore_ascii_case("f10") => Step::ModMode,
+        "rawkey" => Step::RawKey(match arg.trim().to_ascii_lowercase().as_str() {
+            "1" => KeyCode::Digit1,
+            "2" => KeyCode::Digit2,
+            "3" => KeyCode::Digit3,
+            "4" => KeyCode::Digit4,
+            "5" => KeyCode::Digit5,
+            "6" => KeyCode::Digit6,
+            "7" => KeyCode::Digit7,
+            "8" => KeyCode::Digit8,
+            "9" => KeyCode::Digit9,
+            "0" => KeyCode::Digit0,
+            "space" => KeyCode::Space,
+            "enter" => KeyCode::Enter,
+            "escape" => KeyCode::Escape,
+            "tab" => KeyCode::Tab,
+            other => bail!("rawkey takes 1 to 0, space, enter, escape or tab, not {other:?}"),
+        }),
         "modmode" => Step::ModMode,
         "modselect" if !arg.is_empty() => Step::ModSelect(arg.to_string()),
         "modframe" => Step::ModFrame(arg.parse().context("modframe takes a frame number")?),
@@ -6781,6 +6966,27 @@ fn parse_step(s: &str) -> Result<Step> {
         "key" if arg.eq_ignore_ascii_case("f11") => Step::Renderer(None),
         "wipe" => Step::Wipe,
         "type" => Step::Type(arg.to_string()),
+        "windowkey" => {
+            let mut words = arg.splitn(3, ' ');
+            let state = words.next().unwrap_or_default();
+            let name = words
+                .next()
+                .context("windowkey takes down|repeat|up KeyCode [JSON text]")?;
+            let code = serde_json::from_value(J::String(name.into()))
+                .with_context(|| format!("unknown windowkey physical key {name:?}"))?;
+            let (state, repeat) = match state {
+                "down" => (ElementState::Pressed, false),
+                "repeat" => (ElementState::Pressed, true),
+                "up" => (ElementState::Released, false),
+                _ => bail!("windowkey takes down|repeat|up KeyCode [JSON text]"),
+            };
+            let text = words
+                .next()
+                .map(serde_json::from_str::<String>)
+                .transpose()
+                .context("windowkey text must be a JSON string")?;
+            Step::WindowKey(code, text, state, repeat)
+        }
         "key" if text_key(arg).is_some() => {
             Step::TextKey(text_key(arg).unwrap_or(thedas_ui::UiKey::Enter))
         }
@@ -6819,11 +7025,60 @@ fn parse_step(s: &str) -> Result<Step> {
 /// The viewer's level when `--area` is not given.
 const DEFAULT_AREA: &str = "lgt101d";
 
+/// The open-file limit the game asks for at start.
+const OPEN_FILES_WANTED: u64 = 10_240;
+
+/// The soft open-file limit to ask for: `wanted`, or the hard limit when that is lower;
+/// never lower than the current soft limit.
+#[cfg(unix)]
+fn open_files_target(soft: u64, hard: u64, wanted: u64) -> u64 {
+    wanted.min(hard).max(soft)
+}
+
+/// Raises the process's soft open-file limit (`RLIMIT_NOFILE`) to [`OPEN_FILES_WANTED`], or
+/// the hard limit when that is lower. Every archive of the install stays open for each
+/// mounted file system (several in a game, one more while the start menu opens), which
+/// passes the 2560 a Terminal-started process gets on macOS. Logged; a failure only warns.
+#[cfg(unix)]
+fn raise_open_file_limit() {
+    // SAFETY: getrlimit and setrlimit only read and write the `rlimit` passed to them.
+    unsafe {
+        let mut lim = std::mem::zeroed::<libc::rlimit>();
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) != 0 {
+            log::warn!(
+                "open-file limit: getrlimit failed: {}",
+                std::io::Error::last_os_error()
+            );
+            return;
+        }
+        let (soft, hard): (u64, u64) = (lim.rlim_cur, lim.rlim_max);
+        let target = open_files_target(soft, hard, OPEN_FILES_WANTED);
+        if target == soft {
+            log::info!("open-file limit: {soft} (hard {hard})");
+            return;
+        }
+        lim.rlim_cur = target;
+        if libc::setrlimit(libc::RLIMIT_NOFILE, &lim) == 0 {
+            log::info!("open-file limit: raised from {soft} to {target} (hard {hard})");
+        } else {
+            log::warn!(
+                "open-file limit: could not raise {soft} to {target}: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn raise_open_file_limit() {}
+
 fn main() -> Result<()> {
     report::init_logging(env_logger::Builder::from_env(
         env_logger::Env::default().default_filter_or("info,wgpu=warn,naga=warn"),
     ));
+    raise_open_file_limit();
     let mut args = Args::parse();
+    thedas_render::set_soft_shadows(args.soft_shadows == "on");
     if let Some(mode) = args
         .lighting
         .as_deref()
@@ -6951,9 +7206,13 @@ fn main() -> Result<()> {
         Some(live::Start::Menu)
     };
     let boot = matches!(start, Some(live::Start::Menu));
+    // One play stack for this run. Sessions and level builds share its archive handles;
+    // each mounts level resources on its own clone.
+    let base_vfs = Arc::new(DaoInstall::open(&install)?.play_vfs(TextureQuality::High)?);
     let mut live = match start {
         Some(start) => Some(live::Live::open(
             &install,
+            base_vfs.clone(),
             &args.module,
             start,
             &args.shaders,
@@ -6981,8 +7240,20 @@ fn main() -> Result<()> {
         args.area.as_deref().unwrap_or(DEFAULT_AREA)
     };
     let detail = thedas_render::scene::Detail::parse(&args.detail).unwrap_or_default();
+    log::info!(
+        "graphics: detail={}, soft-shadows={}",
+        detail.name(),
+        args.soft_shadows
+    );
     let vfx = parse_vfx(&args.vfx)?;
-    let mut loaded = load(&install, area, &args.shaders, &vfx, detail)?;
+    let mut loaded = load(
+        &install,
+        base_vfs.clone(),
+        area,
+        &args.shaders,
+        &vfx,
+        detail,
+    )?;
     loaded.frame_effects = args.frame_effects == "on";
     loaded.render_path = thedas_render::RenderPath::parse(&args.renderer).unwrap_or_default();
     if let Some(l) = live.as_mut() {
@@ -7040,6 +7311,7 @@ fn main() -> Result<()> {
                     layer.set_settings_file(path.clone());
                 }
                 layer.attach(&l.sim);
+                seed_client_options(l, &layer);
                 layer.set_saves(saves::SaveStore::new(saves_dir.clone()));
                 let mut s = screens::Screens::new(l.front_end);
                 l.aiming = layer.play(&mut s, &l.sim, 0.0).pop();
@@ -7189,11 +7461,11 @@ fn main() -> Result<()> {
                                 layer.render_movies();
                                 let w = world_takes_click(layer, s, x, y);
                                 layer.mouse_move(x, y);
-                                layer.mouse_button(x, y, true);
-                                layer.mouse_button(x, y, false);
-                                if !w {
+                                let accepted = layer.mouse_button(x, y, true);
+                                if accepted && !w {
                                     layer.clicked();
                                 }
+                                layer.mouse_button(x, y, false);
                                 w
                             }
                             None => true,
@@ -7269,7 +7541,7 @@ fn main() -> Result<()> {
                                     level.map(|x| x.layout.as_str()),
                                     level.map(|x| &x.vfs),
                                 );
-                                let key = ui::portrait_key(&l.sim());
+                                let key = l.portrait_key();
                                 if layer.wants_portraits(key, dt) {
                                     let shots = l.portraits(&ctx, ui::PORTRAIT_SIZE);
                                     layer.set_portraits(shots);
@@ -7327,7 +7599,7 @@ fn main() -> Result<()> {
                                 a.record(state, dt as f32 / 1000.0);
                                 let voice = a.voice_ms();
                                 if let Some((layer, _)) = played.as_mut() {
-                                    layer.set_line_voice_ms(voice);
+                                    layer.set_line_voice_ms(voice, || a.voice_elapsed_ms());
                                 }
                             }
                             frames += 1;
@@ -7379,6 +7651,9 @@ fn main() -> Result<()> {
                             "type {t:?}: {}",
                             if typed { "typed" } else { "no text field" }
                         );
+                    }
+                    Step::WindowKey(..) => {
+                        bail!("windowkey requires a window with --control");
                     }
                     &Step::TextKey(k) => {
                         let typed = played.as_mut().is_some_and(|(layer, _)| layer.key(k));
@@ -7463,8 +7738,8 @@ fn main() -> Result<()> {
                         println!("allnames {on}");
                     }
                     // The movement keys are the window's (see `App::key_walk`).
-                    Step::HoldKey(..) | Step::PhysicalKey(..) => {
-                        println!("keydown and keyup need a window")
+                    Step::HoldKey(..) | Step::RawKey(..) | Step::PhysicalKey(..) => {
+                        println!("keydown, keyup, rawkey and physical keys need a window")
                     }
                     Step::AskChoice(prompt) => {
                         if let Some((layer, _)) = played.as_mut() {
@@ -7627,7 +7902,13 @@ fn main() -> Result<()> {
                             ui::FrontEnd::Load(b) => live::Start::SaveBytes(b),
                             ui::FrontEnd::StartMenu => live::Start::Menu,
                         };
-                        let mut n = live::Live::open(&install, &args.module, start, &args.shaders)?;
+                        let mut n = live::Live::open(
+                            &install,
+                            base_vfs.clone(),
+                            &args.module,
+                            start,
+                            &args.shaders,
+                        )?;
                         n.shader_time = args.time;
                         n.movies_wait = true;
                         layer.close_all();
@@ -7794,6 +8075,7 @@ fn main() -> Result<()> {
         }
     }
     let mut app = App {
+        base_vfs,
         load_screen_up: false,
         loaded,
         live,
@@ -7814,6 +8096,7 @@ fn main() -> Result<()> {
         gfx: None,
         keys: HashSet::new(),
         looking: false,
+        right_click: Default::default(),
         ui_right: false,
         last: Instant::now(),
         error: None,
@@ -7821,6 +8104,7 @@ fn main() -> Result<()> {
         last_press: None,
         swallow_release: false,
         control,
+        motion_trace: None,
         remote: VecDeque::new(),
         control_step_ms: args.control_step_ms,
         control_time_ms: 0,
@@ -7850,6 +8134,7 @@ fn main() -> Result<()> {
         intro_pad_held: false,
         zoom_key: 0.0,
         recorder: report::Recorder::new(report::Recorder::default_dir()),
+        report_failure: None,
         report_wait: None,
         returning: match &args.check_report {
             Some(dir) => Returning::Asking(Box::new(UpdatePrompt {
@@ -7872,6 +8157,7 @@ fn main() -> Result<()> {
             "frame_effects": args.frame_effects,
             "renderer": args.renderer,
             "lighting": args.lighting,
+            "soft_shadows": args.soft_shadows,
             "language": args.language,
             "module": args.module,
             "install": report::install_info(&install, &args.language),
@@ -7934,6 +8220,48 @@ fn pack_note(name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn new_graphics_defaults_and_shadow_override() {
+        use clap::Parser;
+        let args = super::Args::try_parse_from(["thedas-app"]).unwrap();
+        assert_eq!(args.detail, "high");
+        assert_eq!(args.soft_shadows, "on");
+        assert_eq!(
+            thedas_render::scene::Detail::default(),
+            thedas_render::scene::Detail::High
+        );
+        assert_eq!(
+            thedas_ui::options::DEFAULTS
+                .iter()
+                .find(|(key, _)| *key == "VideoOptions.GraphicsDetailLevel")
+                .unwrap()
+                .1,
+            3.0
+        );
+        let args = super::Args::try_parse_from([
+            "thedas-app",
+            "--detail",
+            "medium",
+            "--soft-shadows",
+            "off",
+        ])
+        .unwrap();
+        assert_eq!(args.detail, "medium");
+        assert_eq!(args.soft_shadows, "off");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_open_file_limit_is_raised_to_the_wanted_count_within_the_hard_limit() {
+        use super::open_files_target;
+        // A Terminal-started process on macOS: 2560 soft, no hard limit.
+        assert_eq!(open_files_target(2560, u64::MAX, 10_240), 10_240);
+        // A hard limit under the wanted count caps it.
+        assert_eq!(open_files_target(256, 4096, 10_240), 4096);
+        // Already higher: left as it is, never lowered.
+        assert_eq!(open_files_target(1_048_576, u64::MAX, 10_240), 1_048_576);
+    }
+
     #[test]
     fn vfx_specs_parse_into_effect_props() {
         let props = super::parse_vfx("fxa_fire_aoe_p@1,2,3; FXA_Ice_Cld_P.mmh @ -4.5,0,7").unwrap();
@@ -8097,6 +8425,26 @@ mod tests {
             Some(UiKey::SelectAll)
         );
         assert_eq!(text_edit_key(KeyCode::KeyA, false, false), None);
+    }
+
+    #[test]
+    fn window_keys_keep_physical_codes_text_and_repeats_separate() {
+        use ElementState::{Pressed, Released};
+        assert_eq!(
+            parse_steps(r#"windowkey down F8; windowkey up F8; windowkey down Quote "'"; windowkey repeat KeyA "A"; windowkey down Space " "; windowkey down Enter"#).unwrap(),
+            vec![
+                Step::WindowKey(KeyCode::F8, None, Pressed, false),
+                Step::WindowKey(KeyCode::F8, None, Released, false),
+                Step::WindowKey(KeyCode::Quote, Some("'".into()), Pressed, false),
+                Step::WindowKey(KeyCode::KeyA, Some("A".into()), Pressed, true),
+                Step::WindowKey(KeyCode::Space, Some(" ".into()), Pressed, false),
+                Step::WindowKey(KeyCode::Enter, None, Pressed, false),
+            ]
+        );
+        assert!(parse_steps("windowkey down NotAKey x").is_err());
+        assert!(parse_steps("windowkey sideways Enter").is_err());
+        assert!(parse_steps("windowkey down").is_err());
+        assert!(parse_steps("windowkey down KeyA unquoted").is_err());
     }
 
     #[test]

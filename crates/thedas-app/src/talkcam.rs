@@ -8,12 +8,10 @@
 //! Presentation only: reads the simulation and the dialog and stage resources.
 //!
 //! A line whose own cutscene cuts between camera actors is seen through that cutscene's
-//! camera as it plays (see [`line_cut_view`], traced).
-//!
-//! Once a line with its own cinematics has run its length (the cut's, 5000) and the player
-//! has replies to choose, the view moves to the stage's `decision` camera. Provisional, and
-//! our own invention: the executable has no `decision` string and no such fallback was found
-//! in `GameModeDialog`; what the original shows while the player chooses is not traced.
+//! camera for as long as the line is presented, including while replies wait (see
+//! [`line_cut_view`], traced). Timeline completion keeps the cinematic attached and ticking;
+//! its active camera actor remains the source. Stage cameras, including ones named
+//! `decision`, are selected only by authored jumps, not by reply availability or a timer.
 //!
 //! Provisional: the camera's field of view is taken as vertical; camera moves between
 //! lines, and within a line whose cutscene has no camera cuts, are not followed; nor are
@@ -38,10 +36,6 @@ use crate::cutactors::{DrawnRoots, drawn_object, stage_place};
 #[derive(Clone, Debug, PartialEq)]
 pub struct Staged {
     pub camera: Camera,
-    /// The stage's `decision` camera, which frames the player choosing a reply.
-    pub decision: Option<Camera>,
-    /// How long the line's cinematics run (milliseconds), when it has its own.
-    pub line_ms: Option<f64>,
 }
 
 /// Which conversation line: the conversation (dialog name, owner) and the node shown.
@@ -114,19 +108,16 @@ impl TalkCamera {
         self.clock_ms += dt_ms.max(0.0);
     }
 
-    /// The camera for the open conversation: the line's shot, or the stage's decision camera
-    /// once a line with its own cinematics has run its length and the player has replies
-    /// to choose. Provisional: the decision camera as a fallback is our own invention (see
-    /// the module docs); the original's line length is its voice-over's; the cut's
-    /// length (5000) is taken instead, and lines without one keep their shot.
+    /// The camera for the open conversation: the line's authored shot, kept while that
+    /// line is presented, including while the player chooses a reply.
     ///
     /// A line without a shot of its own is framed as the executable frames a line that
     /// plays no cinematics (see [`default_framing`]); `face` gives a creature's eyes as
     /// drawn, offset from where it stands.
     ///
     /// A line that plays its own cutscene with camera cuts is seen through that cutscene's
-    /// camera as it plays (see [`line_cut_view`]); `roots` gives where the drawn objects
-    /// are, which cameras linked to them follow.
+    /// camera throughout the reply wait too (see [`line_cut_view`]); `roots` gives where
+    /// the drawn objects are, which cameras linked to them follow.
     pub fn camera(
         &mut self,
         sim: &Sim,
@@ -136,29 +127,22 @@ impl TalkCamera {
     ) -> Option<Camera> {
         self.hidden = None;
         let open = sim.conversation_line()?;
-        let choosing = open.choosing;
         let line: LineKey = ((open.dialog.to_ascii_lowercase(), open.owner), open.line);
         let now = self.clock_ms;
         let staging = self.staging(sim, base).cloned();
-        let shown = self.shown.clone();
         if let Some(view) = self.line_cut_camera(sim, &line, now, base, roots) {
+            log::trace!(
+                "conversation camera {} line {:?}: source=line cutscene, camera={view:?}",
+                line.0.0,
+                line.1
+            );
             return Some(view);
         }
         let held_here = self.held.as_ref().is_some_and(|(held, _)| *held == line);
         if !held_here && line.1.is_some() {
             return self.unstaged(sim, base, face);
         }
-        let staged = staging?;
-        let line_done = match (&self.held, shown) {
-            (Some((held, _)), Some((line, since))) if *held == line => {
-                staged.line_ms.is_some_and(|ms| now - since >= ms)
-            }
-            _ => false,
-        };
-        Some(match staged.decision {
-            Some(d) if choosing && line_done => d,
-            _ => staged.camera,
-        })
+        Some(staging?.camera)
     }
 
     /// The default framing of the open conversation's current line (its speaker, seen from
@@ -253,7 +237,12 @@ impl TalkCamera {
             Some((l, since)) if *l == line => *since,
             _ => now,
         };
-        tracks.frame_effects_at(((now - since) / 1000.0) as f32)
+        let t = if sim.cut_line_speech() != thedas_sim::dialog::CutLineSpeech::Dialog {
+            tracks.seconds
+        } else {
+            ((now - since) / 1000.0) as f32
+        };
+        tracks.frame_effects_at(t)
     }
 
     /// The view of the shown line's own cutscene (see [`line_cut_view`]), when it is the
@@ -278,13 +267,33 @@ impl TalkCamera {
             Some((l, since)) if l == line => *since,
             _ => now,
         };
-        let t = ((now - since) / 1000.0) as f32;
+        let t = if sim.cut_line_speech() != thedas_sim::dialog::CutLineSpeech::Dialog {
+            tracks.seconds
+        } else {
+            ((now - since) / 1000.0) as f32
+        };
         let stage = tracks.stage_file.as_deref().and_then(|f| {
             let f = f.trim_end_matches('\0').to_ascii_lowercase();
             let f = f.strip_suffix(".stg").unwrap_or(&f).to_string();
             self.stage(sim, &f)
         });
         let view = line_cut_view(&tracks, t, placement, stage.as_deref(), bound, roots, base);
+        if log::log_enabled!(log::Level::Trace) {
+            let active = tracks.cuts.iter().rev().find(|(start, _)| *start <= t);
+            let source = active.and_then(|(_, id)| {
+                let actor = tracks.actors.iter().find(|a| a.id == *id)?;
+                let jump = actor
+                    .camera_jumps
+                    .iter()
+                    .rev()
+                    .find(|j| (j.start..=j.end).contains(&t));
+                Some((&actor.name, jump))
+            });
+            log::trace!(
+                "conversation camera {dlg} line {at}: t={t:.4}s, stage={:?}, placement={placement:?}, active={active:?}, source={source:?}",
+                tracks.stage_file,
+            );
+        }
         if view.is_none() {
             log::debug!(
                 "line {at} of {dlg}: its cutscene gives no camera {t:.2}s in (stage {:?})",
@@ -385,10 +394,6 @@ impl TalkCamera {
         );
         Some(Staged {
             camera: place_camera(placed.position, placed.facing, cam, base),
-            decision: stage
-                .camera("decision")
-                .map(|d| place_camera(placed.position, placed.facing, d, base)),
-            line_ms: shot.seconds.map(|s| s as f64 * 1000.0),
         })
     }
 }
@@ -481,8 +486,10 @@ pub fn default_framing(
 /// (`ActionChangeActiveCamera`, kind 11, e.g. a "Primary Camera" at 0 s and a "Secondary
 /// Camera" at 2.5 s) and jumps from stage camera to stage camera within the line.
 ///
-/// Provisional: once the cutscene has run its length the view holds its last pose (nothing
-/// else in `GameModeDialog` sets the camera that was found; not traced to the end).
+/// The dialog-owned cutscene bypasses automatic stop at timeline completion (0x7f0b2b,
+/// 0x7e440b-0x7e441c) and keeps ticking while replies wait (0x68df79). Its active camera
+/// actor remains the source (0x7dd6b8-0x7dd6f8, consumed at 0x6c2320-0x6c234a), so the
+/// presentation clock continues rather than freezing the camera at the cut's length.
 pub fn line_cut_view(
     tracks: &Tracks,
     t: f32,
@@ -579,6 +586,71 @@ mod tests {
     use thedas_sim::cuttracks::{Actor, CameraJump};
 
     #[test]
+    fn replies_do_not_select_an_unrequested_stage_camera() {
+        let mut sim = Sim::new(
+            Arc::new(thedas_vfs::Vfs::new()),
+            Arc::new(thedas_script::EngineTable::default()),
+            1,
+        );
+        let owner = sim.world.spawn(ObjectKind::Creature, "speaker");
+        let player = sim.world.spawn(ObjectKind::Creature, "player");
+        sim.world.spawn(ObjectKind::Stage, "stage");
+        let node = serde_json::json!({
+            "reply": false, "strref": null, "text": "Line", "speaker": "OWNER",
+            "listener": "PLAYER", "condition": thedas_sim::dialog::PlotRef::default(),
+            "action": thedas_sim::dialog::PlotRef::default(), "children": [1]
+        });
+        let mut reply = node.clone();
+        reply["reply"] = true.into();
+        reply["text"] = "Answer".into();
+        let mut save = sim.save_game();
+        save.talk = serde_json::from_value(serde_json::json!({
+            "dlg": {"name": "test", "starts": [0], "nodes": [node, reply]},
+            "owner": owner, "player": player, "line": 0, "replies": [1], "ended": false
+        }))
+        .unwrap();
+        sim.load_game(save).unwrap();
+        assert!(sim.conversation_line().unwrap().choosing);
+        let shot = StageCamera {
+            name: "line".into(),
+            position: [1.0, 2.0, 3.0],
+            rotation: [0.0, 0.0, 0.0, 1.0],
+            fov: 30.0,
+        };
+        let mut talk = TalkCamera::default();
+        talk.shots.insert(
+            "test".into(),
+            Some(Arc::new(vec![Some(LineShot {
+                stage: "stage".into(),
+                stage_file: "stage".into(),
+                place: "line".into(),
+                by_place: false,
+                actors: Vec::new(),
+                seconds: Some(1.0),
+            })])),
+        );
+        talk.stages.insert(
+            "stage".into(),
+            Some(Arc::new(Stage {
+                places: Vec::new(),
+                cameras: vec![
+                    shot.clone(),
+                    StageCamera {
+                        name: "decision".into(),
+                        position: [100.0; 3],
+                        ..shot
+                    },
+                ],
+            })),
+        );
+        let base = Camera::new(Vec3::ZERO, 0.0, 0.0);
+        let first = talk.camera(&sim, &base, &|_| None, &|_| None).unwrap();
+        talk.advance(30_000.0);
+        let waiting = talk.camera(&sim, &base, &|_| None, &|_| None).unwrap();
+        assert_eq!(waiting, first);
+    }
+
+    #[test]
     fn places_the_stage_camera_in_the_world() {
         // Half a turn about Z: the camera looks along -Y in the stage.
         let cam = StageCamera {
@@ -640,7 +712,7 @@ mod tests {
         use thedas_formats::stage::Place;
         // A line made like Irving's in the Harrowing: the "Primary Camera" (id 3) is on the
         // speaker's place's default camera, the "Secondary Camera" (id 5) on a wide camera
-        // from 0.5 s.
+        // from 0.5 s. Its name `decision` is an authored selection, not a fallback.
         let stage = Stage {
             places: vec![Place {
                 name: "speaker".into(),
@@ -656,7 +728,7 @@ mod tests {
                     fov: 30.0,
                 },
                 StageCamera {
-                    name: "wide".into(),
+                    name: "decision".into(),
                     position: [4.0, 0.0, 1.5],
                     // A quarter turn about Z: it looks along stage -X.
                     rotation: [0.0, 0.0, FRAC_1_SQRT_2, FRAC_1_SQRT_2],
@@ -667,7 +739,7 @@ mod tests {
         let tracks = Tracks {
             actors: vec![
                 camera_actor(3, "Primary Camera", "speaker", true),
-                camera_actor(5, "Secondary Camera", "wide", false),
+                camera_actor(5, "Secondary Camera", "decision", false),
             ],
             stage_file: Some("line.stg".into()),
             seconds: 7.7,

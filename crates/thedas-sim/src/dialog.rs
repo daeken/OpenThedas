@@ -205,6 +205,9 @@ pub struct Conversation {
     /// it: the conversation walks on through them (single unspoken replies) as it speaks.
     #[serde(default)]
     pub cut_lines_left: u32,
+    /// The current node's speech at the handoff from its cutscene.
+    #[serde(default, skip_serializing_if = "CutLineSpeech::is_dialog")]
+    pub cut_line_speech: CutLineSpeech,
     /// The creatures the shown line's own cutscene took, and where it leaves them when the
     /// line ends (see [`crate::cutactors`]).
     #[serde(default)]
@@ -216,6 +219,34 @@ pub struct Conversation {
     /// [`Sim::start_conversation`]): its lines stage nobody.
     #[serde(default)]
     pub ambient_run: bool,
+}
+
+/// Which parts of a dialog node's speech the owned cut already presented.
+#[derive(Clone, Copy, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum CutLineSpeech {
+    #[default]
+    Dialog,
+    /// The subtitle was shown. The same voice can finish after the player skips the cut.
+    InProgress,
+    /// Both the subtitle and the voice are finished.
+    Complete,
+}
+
+impl CutLineSpeech {
+    fn is_dialog(&self) -> bool {
+        *self == Self::Dialog
+    }
+}
+
+impl Conversation {
+    fn owns_cutscene(&self, cut: &crate::cutscene::Cutscene) -> bool {
+        cut.from_dialog
+            && self.cut_from == self.line
+            && self
+                .line
+                .and_then(|line| self.dlg.nodes.get(line)?.cutscene.as_deref())
+                .is_some_and(|name| crate::cutscene::Cutscene::resource(name) == cut.name)
+    }
 }
 
 /// A conversation said in passing, under way (DAOrigins.exe's ambient dialogs, updated at
@@ -399,6 +430,7 @@ impl Sim {
     fn speak(&mut self, mut c: Conversation, line: usize) -> Conversation {
         // The line shown before ends, and its cutscene with it.
         self.end_line_staging(&mut c);
+        c.cut_line_speech = CutLineSpeech::Dialog;
         let node = c.dlg.nodes[line].clone();
         self.mark_shown(&mut c, line);
         self.node_action(&node, &c);
@@ -425,6 +457,9 @@ impl Sim {
         let speaker = match self.line_speaker_tag(&node, c.owner == c.player).as_str() {
             "OWNER" | "" => c.owner,
             "PLAYER" => c.player,
+            tag if self.game == thedas_vfs::Game::Origins => self
+                .cutscene_actor_object(tag, Some(c.owner), Some(c.player))
+                .unwrap_or(c.owner),
             tag => self.world.by_tag(tag).next().map_or(c.owner, |o| o.id),
         };
         let t = self.world.time_ms;
@@ -442,10 +477,20 @@ impl Sim {
         // (see [`Sim::advance_ambient`]). Presentation is told of it.
         if c.ambient_run {
             let (voiced, ms) = self.ambient_line_time(&c, line);
+            let text = self.node_text(&node);
+            // An entry with no text is passed over, not presented (0x7f206e-0x7f207b take
+            // the bypass at 0x7f2139): it takes no time and shows nothing.
+            if text.is_empty() {
+                c.ended = replies.is_empty();
+                c.replies = replies;
+                return c;
+            }
+            let until = self.world.time_ms + u64::from(ms);
+            let end = self.ambient_speaking.entry(speaker).or_insert(until);
+            *end = (*end).max(until);
             if self.world.ambient_lines.len() >= 64 {
                 self.world.ambient_lines.remove(0);
             }
-            let text = self.node_text(&node);
             self.world.ambient_lines.push(crate::world::AmbientLine {
                 speaker,
                 dialog: c.dlg.name.clone(),
@@ -542,6 +587,7 @@ impl Sim {
                     && let Some(o) = self.world.get_mut(id)
                 {
                     o.active = true;
+                    o.da2_locomotion = None;
                 }
             }
             if let Some(stage) = &cut.da2_stage {
@@ -564,6 +610,42 @@ impl Sim {
         let staged = std::mem::take(&mut c.staged);
         c.staged_at = None;
         self.release_cutscene_actors(staged);
+    }
+
+    /// A reply or dialog cleanup ends the presented cinematic too. Internal `speak`
+    /// recursion can walk several nodes said by one CUTR, so it only ends inline staging.
+    fn end_presented_line(&mut self, c: &mut Conversation) {
+        // CUTR resources belong to the line just as inline CUT data does. Origins
+        // destroys the old cinematic before installing a new line (0x68e3f8-0x68e43d)
+        // and when closing/resetting dialog (0x68f4a7-0x68f4c3, 0x691115-0x691131).
+        // Leaving one queued until after `talk` disappears loses its stage context in
+        // bind_cutscene_file and presents its local camera at the world's origin.
+        if self.game == thedas_vfs::Game::Origins
+            && let Some(line) = c.cut_from.take()
+            && let Some(name) = c.dlg.nodes.get(line).and_then(|n| n.cutscene.as_deref())
+        {
+            let res = crate::cutscene::Cutscene::resource(name);
+            if let Some(i) = self.world.dialog_cutscenes.iter().position(|n| *n == res) {
+                self.world.dialog_cutscenes.remove(i);
+                if let Some(i) = self
+                    .world
+                    .cutscenes
+                    .iter()
+                    .position(|n| crate::cutscene::Cutscene::resource(n) == res)
+                {
+                    self.world.cutscenes.remove(i);
+                }
+            }
+            if self
+                .world
+                .cutscene
+                .as_ref()
+                .is_some_and(|cut| cut.from_dialog && cut.name == res)
+            {
+                self.skip_cutscene();
+            }
+        }
+        self.end_line_staging(c);
     }
 
     /// How many lines of conversation `dlg` cutscene `cut` says (its `ASLN` tracks naming
@@ -591,7 +673,7 @@ impl Sim {
     /// conversation is walked, then the world is put back as it was: what a condition
     /// script would set is reported in `sets` and not kept (the world, the random numbers,
     /// the conversations going on). Simulation state outside the world (`training_done`,
-    /// `following`, `next_follow_ms`) is not put back. `None` when there is no such
+    /// resource caches) is not put back. `None` when there is no such
     /// conversation.
     pub fn conversation_conditions(
         &mut self,
@@ -617,6 +699,7 @@ impl Sim {
             chain: Vec::new(),
             cut_from: None,
             cut_lines_left: 0,
+            cut_line_speech: CutLineSpeech::Dialog,
             staged: Vec::new(),
             staged_at: None,
             ambient_run: false,
@@ -817,6 +900,7 @@ impl Sim {
             chain: Vec::new(),
             cut_from: None,
             cut_lines_left: 0,
+            cut_line_speech: CutLineSpeech::Dialog,
             staged: Vec::new(),
             staged_at: None,
             ambient_run: false,
@@ -858,6 +942,20 @@ impl Sim {
         {
             return true;
         }
+        // Nor does a speaker still saying a line in passing begin another, even once its
+        // conversation was cleared (`ClearAmbientDialogs`, as UT_Talk does on a click):
+        // DAOrigins.exe's ambient manager refuses a line for a speaker whose line is still
+        // going (0x6ffaa0 -> 0x6ff190). Clicking the Dust Town beggar again and again
+        // began his remark over each time.
+        if ambient(self)
+            && self.game == thedas_vfs::Game::Origins
+            && self
+                .ambient_speaking
+                .get(&target)
+                .is_some_and(|&until| until > self.world.time_ms)
+        {
+            return true;
+        }
         let c = Conversation {
             ambient_run: ambient(self),
             ..c
@@ -893,7 +991,7 @@ impl Sim {
         }
         // A conversation begun over another ends the other's line.
         if let Some(mut old) = self.talk.take() {
-            self.end_line_staging(&mut old);
+            self.end_presented_line(&mut old);
         }
         let live = !c.ended;
         self.talk = Some(c);
@@ -976,6 +1074,10 @@ impl Sim {
     /// voiced. Provisional: the exe counts a line as voiced when its voice started to play,
     /// so with voices off or a sample that fails it takes the unvoiced time.
     fn ambient_line_time(&mut self, c: &Conversation, line: usize) -> (bool, u32) {
+        // A line with no text is not presented (see [`Sim::speak`]) and takes no time.
+        if self.node_text(&c.dlg.nodes[line]).is_empty() {
+            return (false, 0);
+        }
         let female = self.player_is_female(c.player);
         let voice = match (&self.install_root, c.dlg.nodes[line].strref) {
             (Some(root), Some(strref)) => self.voices.line_ms(root, &c.dlg.name, strref, female),
@@ -1003,6 +1105,8 @@ impl Sim {
     /// modes (0x6ff5a3 to 0x6ff633), here they run with the simulation's clock; they are
     /// not saved.
     pub(crate) fn advance_ambient(&mut self, ms: u64) {
+        let now = self.world.time_ms;
+        self.ambient_speaking.retain(|_, until| *until > now);
         if self.ambient.is_empty() {
             return;
         }
@@ -1140,34 +1244,122 @@ impl Sim {
     }
 
     fn advance_reply(&mut self, choice: usize) -> Option<DialogState> {
-        let mut c = self.talk.take()?;
+        let c = self.talk.take()?;
         let Some(&reply) = c.replies.get(choice) else {
             self.talk = Some(c);
             return self.dialog_state();
         };
+        if let Some(c) = self.follow_reply(c, reply)
+            && self.talk.is_none()
+        {
+            self.talk = Some(c);
+        }
+        self.dialog_state()
+    }
+
+    /// Follow an eligible reply. An action that starts a new conversation can replace it.
+    fn follow_reply(&mut self, mut c: Conversation, reply: usize) -> Option<Conversation> {
         // The line answered ends. Provisional: before the reply's action runs.
-        self.end_line_staging(&mut c);
+        self.end_presented_line(&mut c);
         let node = c.dlg.nodes[reply].clone();
         self.mark_shown(&mut c, reply);
         self.node_action(&node, &c);
         // The action started another conversation (a plot script's UT_Talk): it replaces
         // this one, as in the game.
         if self.talk.is_some() {
-            return self.dialog_state();
+            return None;
         }
         let next = node.children.iter().copied().find(|&n| self.usable(&c, n));
-        c = match next {
+        Some(match next {
             Some(n) => self.speak(c, n),
             None => Conversation {
+                // The selected reply has no next line. Do not leave the answered
+                // NPC line on screen to be timed and continued a second time.
+                // DAOrigins.exe 0x68dbca-0x68dbd5 ends the dialog on this path.
+                line: None,
                 ended: true,
                 replies: Vec::new(),
+                cut_line_speech: CutLineSpeech::Dialog,
                 ..c
             },
-        };
-        if self.talk.is_none() {
+        })
+    }
+
+    /// The Origins case where the CUTR starts by saying its owning node, identified by the
+    /// authored ASLN's dialog bank and TLK reference.
+    fn explicit_dialog_speech_matches(&self, cut: &crate::cutscene::Cutscene) -> bool {
+        self.game == thedas_vfs::Game::Origins
+            && self.talk.as_ref().is_some_and(|c| {
+                c.owns_cutscene(cut)
+                    && c.line
+                        .and_then(|line| c.dlg.nodes.get(line)?.strref)
+                        .is_some_and(|strref| {
+                            cut.explicit_dialog_lines(&c.dlg.name)
+                                .next()
+                                .is_some_and(|track| strref == track.strref)
+                        })
+            })
+    }
+
+    /// While this CUTR plays, the timeline controls speech for its owning dialog node.
+    pub fn cutscene_controls_dialog_speech(&self) -> bool {
+        self.world
+            .cutscene
+            .as_ref()
+            .is_some_and(|cut| self.explicit_dialog_speech_matches(cut))
+    }
+
+    /// The current node's speech at the handoff from an owned cutscene.
+    pub fn cut_line_speech(&self) -> CutLineSpeech {
+        self.talk
+            .as_ref()
+            .map_or(CutLineSpeech::Dialog, |c| c.cut_line_speech)
+    }
+
+    /// Reconcile the consecutive dialog lines the cut already presented. A skip leaves
+    /// unheard lines for dialog to present. An interrupted voice can finish across
+    /// the handoff without presenting its subtitle a second time.
+    pub(crate) fn finish_explicit_dialog_speech(&mut self, cut: &crate::cutscene::Cutscene) {
+        if !self.explicit_dialog_speech_matches(cut) {
+            return;
+        }
+        let mut c = self.talk.take().expect("matching dialog");
+        let dialog = c.dlg.name.clone();
+        let elapsed = cut.elapsed_ms as f32 / 1000.0;
+        for track in cut.explicit_dialog_lines(&dialog) {
+            if elapsed < track.start
+                || c.line.and_then(|line| c.dlg.nodes[line].strref) != Some(track.strref)
+            {
+                break;
+            }
+            if elapsed < track.end {
+                if track.vo_mode == 0 {
+                    c.cut_line_speech = CutLineSpeech::InProgress;
+                }
+                break;
+            }
+            c.cut_line_speech = CutLineSpeech::Complete;
+            let [reply] = c.replies[..] else { break };
+            if !c.dlg.nodes[reply].reply || !self.node_text(&c.dlg.nodes[reply]).trim().is_empty() {
+                break;
+            }
+            let Some(next) = self.follow_reply(c, reply) else {
+                return;
+            };
+            if self.talk.is_some() {
+                return;
+            }
+            c = next;
+            // The next node can start a cinematic of its own.
+            if c.cut_from.is_some() {
+                break;
+            }
+        }
+        if c.ended && c.cut_line_speech == CutLineSpeech::Complete {
+            self.end_presented_line(&mut c);
+        } else {
             self.talk = Some(c);
         }
-        self.dialog_state()
     }
 
     /// The shown line's own cutscene, for presentation: the conversation (resource name
@@ -1191,8 +1383,28 @@ impl Sim {
         self.talk.as_ref().and_then(|c| c.cut_from)
     }
 
+    /// The shown line's referenced cutscene while it is playing, including a final line
+    /// whose conversation has ended and is still being presented.
+    pub fn conversation_line_cutscene(&self) -> Option<&crate::cutscene::Cutscene> {
+        let c = self.talk.as_ref()?;
+        self.world
+            .cutscene
+            .as_ref()
+            .filter(|cut| c.owns_cutscene(cut))
+    }
+
     pub fn conversation_line(&self) -> Option<OpenLine<'_>> {
-        let c = self.talk.as_ref().filter(|c| !c.ended)?;
+        self.talk.as_ref().filter(|c| !c.ended)?;
+        self.presented_conversation_line()
+    }
+
+    /// The NPC line still being presented, including a terminal line whose graph has
+    /// ended. Audio must finish that line before the interface dismisses it.
+    pub fn presented_conversation_line(&self) -> Option<OpenLine<'_>> {
+        let c = self.talk.as_ref()?;
+        if c.ended && c.line.is_none() {
+            return None;
+        }
         let node = c.line.and_then(|l| c.dlg.nodes.get(l));
         Some(OpenLine {
             dialog: c.dlg.name.as_str(),
@@ -1217,7 +1429,10 @@ impl Sim {
             speaker: line
                 .map(|n| self.line_speaker_tag(n, c.owner == c.player))
                 .unwrap_or_default(),
-            line: line.map(|n| self.node_text(n)).unwrap_or_default(),
+            line: line
+                .filter(|_| c.cut_line_speech.is_dialog())
+                .map(|n| self.node_text(n))
+                .unwrap_or_default(),
             replies: c
                 .replies
                 .iter()
@@ -1239,7 +1454,7 @@ impl Sim {
 
     pub fn end_conversation(&mut self) {
         if let Some(mut c) = self.talk.take() {
-            self.end_line_staging(&mut c);
+            self.end_presented_line(&mut c);
         }
     }
 }
@@ -1409,6 +1624,7 @@ mod tests {
             chain: vec![],
             cut_from: None,
             cut_lines_left: 0,
+            cut_line_speech: CutLineSpeech::Dialog,
             staged: Vec::new(),
             staged_at: None,
             ambient_run: false,
@@ -1422,6 +1638,39 @@ mod tests {
         let st = sim.choose_reply(0).unwrap();
         assert_eq!(st.line, "line 13");
         assert!(st.ended);
+    }
+
+    #[test]
+    fn a_reply_without_a_next_line_does_not_replay_the_answered_line() {
+        // Kasch and the Tapster's bartender end on a reply with no children.
+        // A real terminal NPC line still needs to be presented; taking a reply
+        // that ends the exchange must instead clear the line already answered.
+        for game in [thedas_vfs::Game::Origins, thedas_vfs::Game::DragonAge2] {
+            let mut sim = Sim::new(
+                std::sync::Arc::new(thedas_vfs::Vfs::new()),
+                std::sync::Arc::new(thedas_script::EngineTable::default()),
+                1,
+            );
+            sim.game = game;
+            let hero = sim.world.spawn(crate::world::ObjectKind::Creature, "hero");
+            let npc = sim.world.spawn(crate::world::ObjectKind::Creature, "npc");
+            sim.world.hero = Some(hero);
+            let dlg = Dlg::from_gff4(&doc(), "test").unwrap();
+            assert!(sim.open_conversation(hero, npc, dlg.clone(), None));
+            assert_eq!(sim.dialog_state().unwrap().line, "line 10");
+            assert_eq!(sim.dialog_state().unwrap().replies.len(), 2);
+            let state = sim.choose_reply(1).unwrap();
+            assert!(state.ended);
+            assert!(state.line.is_empty());
+            assert!(state.replies.is_empty());
+            assert!(sim.conversation_line().is_none());
+            assert!(sim.talk.as_ref().unwrap().staged.is_empty());
+
+            assert!(sim.open_conversation(hero, npc, dlg, None));
+            let state = sim.choose_reply(0).unwrap();
+            assert!(state.ended);
+            assert_eq!(state.line, "line 13", "a new terminal NPC line still plays");
+        }
     }
 
     #[test]
@@ -1547,6 +1796,7 @@ mod tests {
             chain: vec![],
             cut_from: None,
             cut_lines_left: 0,
+            cut_line_speech: CutLineSpeech::Dialog,
             staged: vec![],
             staged_at: None,
             ambient_run: false,
@@ -1616,6 +1866,7 @@ mod tests {
                 chain: vec![],
                 cut_from: None,
                 cut_lines_left: 0,
+                cut_line_speech: CutLineSpeech::Dialog,
                 staged: Vec::new(),
                 staged_at: None,
                 ambient_run: false,
@@ -1664,6 +1915,7 @@ mod tests {
             chain: vec![],
             cut_from: None,
             cut_lines_left: 0,
+            cut_line_speech: CutLineSpeech::Dialog,
             staged: Vec::new(),
             staged_at: None,
             ambient_run: false,
@@ -1746,6 +1998,7 @@ mod tests {
             chain: vec![],
             cut_from: None,
             cut_lines_left: 0,
+            cut_line_speech: CutLineSpeech::Dialog,
             staged: Vec::new(),
             staged_at: None,
             ambient_run: false,
@@ -1815,6 +2068,294 @@ mod tests {
     }
 
     #[test]
+    fn the_presented_line_owns_only_its_current_referenced_cutscene() {
+        let (mut sim, hero, npc) = passers_by();
+        let mut dlg = remarks("cinematic", &["First.", "Last."], false);
+        for node in &mut dlg.nodes {
+            node.ambient = false;
+        }
+        dlg.nodes[0].cutscene = Some("INTRO.CUT".into());
+        dlg.nodes[2].cutscene = Some("intro".into());
+        assert!(sim.open_conversation(hero, npc, dlg, None));
+        assert!(sim.conversation_line_cutscene().is_none());
+        sim.world.cutscene = Some(crate::cutscene::Cutscene {
+            name: "intro.cut".into(),
+            seconds: 4.0,
+            lines: Vec::new(),
+            elapsed_ms: 100,
+            from_dialog: true,
+            bound: Vec::new(),
+            placement: None,
+        });
+        assert!(sim.conversation_line_cutscene().is_some());
+        // Final lines remain presented after the conversation walker marks them ended.
+        sim.talk.as_mut().unwrap().ended = true;
+        assert!(sim.conversation_line_cutscene().is_some());
+        // A later line, a different resource, and a script's cut have separate ownership.
+        sim.talk.as_mut().unwrap().line = Some(2);
+        assert!(sim.conversation_line_cutscene().is_none());
+        sim.talk.as_mut().unwrap().line = Some(0);
+        sim.world.cutscene.as_mut().unwrap().name = "other.cut".into();
+        assert!(sim.conversation_line_cutscene().is_none());
+        sim.world.cutscene.as_mut().unwrap().name = "intro.cut".into();
+        sim.world.cutscene.as_mut().unwrap().from_dialog = false;
+        assert!(sim.conversation_line_cutscene().is_none());
+    }
+
+    fn explicit_dialog_cut() -> Sim {
+        use crate::cutscene::{Cutscene, CutsceneLine};
+
+        let (mut sim, hero, npc) = passers_by();
+        let mut dlg = remarks("cinematic", &["First.", "Second.", "After reply."], false);
+        for node in &mut dlg.nodes {
+            node.ambient = false;
+            node.show_once = 1;
+        }
+        dlg.nodes[0].cutscene = Some("intro".into());
+        dlg.nodes[0].strref = Some(10);
+        dlg.nodes[2].strref = Some(20);
+        dlg.nodes[3].text = Some("My reply.".into());
+        assert!(sim.open_conversation(hero, npc, dlg, None));
+        sim.world.cutscenes.clear();
+        sim.world.dialog_cutscenes.clear();
+        sim.world.cutscene = Some(Cutscene {
+            name: "intro.cut".into(),
+            seconds: 8.0,
+            lines: [(1.0, 3.0, 10), (4.0, 7.0, 20)]
+                .map(|(start, end, strref)| CutsceneLine {
+                    start,
+                    end,
+                    strref,
+                    actor: "guard".into(),
+                    conversation: Some("Cinematic".into()),
+                    vo_mode: 0,
+                    explicit_text: true,
+                })
+                .to_vec(),
+            elapsed_ms: 0,
+            from_dialog: true,
+            bound: Vec::new(),
+            placement: None,
+        });
+        sim
+    }
+
+    #[test]
+    fn explicit_dialog_cut_leaves_unfinished_speech_and_keeps_player_replies() {
+        use CutLineSpeech::{Complete, Dialog, InProgress};
+        for (skip_at, line, speech, text) in [
+            (Some(500), 0, Dialog, "First."),
+            (Some(2500), 0, InProgress, ""),
+            (Some(3000), 2, Dialog, "Second."),
+            (Some(5500), 2, InProgress, ""),
+            (Some(7500), 2, Complete, ""),
+            (None, 2, Complete, ""),
+        ] {
+            let mut sim = explicit_dialog_cut();
+            assert!(sim.cutscene_controls_dialog_speech());
+            sim.tick(skip_at.unwrap_or(8000));
+            if skip_at.is_some() {
+                assert_eq!(sim.talk.as_ref().unwrap().line, Some(0));
+                sim.skip_cutscene();
+            }
+            assert!(!sim.cutscene_controls_dialog_speech());
+            assert_eq!(sim.presented_conversation_line().unwrap().line, Some(line));
+            assert_eq!(sim.cut_line_speech(), speech);
+            assert_eq!(sim.dialog_state().unwrap().line, text);
+            if line == 2 {
+                assert_eq!(sim.talk.as_ref().unwrap().shown, [0, 1, 2]);
+                assert_eq!(
+                    sim.dialog_state().unwrap().replies,
+                    [(3, "My reply.".into())]
+                );
+                assert_eq!(sim.choose_reply(0).unwrap().line, "After reply.");
+                assert_eq!(sim.cut_line_speech(), Dialog);
+            }
+        }
+    }
+
+    #[test]
+    fn only_matching_authored_cut_speech_is_consumed() {
+        for case in 0..4 {
+            let mut sim = explicit_dialog_cut();
+            let cut = sim.world.cutscene.as_mut().unwrap();
+            match case {
+                0 => cut.from_dialog = false,
+                1 => cut.lines[0].explicit_text = false,
+                2 => cut.lines[0].conversation = Some("unrelated".into()),
+                _ => cut.lines[0].strref = 12,
+            }
+            assert!(!sim.cutscene_controls_dialog_speech());
+            sim.tick(8000);
+            assert_eq!(sim.dialog_state().unwrap().line, "First.");
+            assert_eq!(sim.talk.as_ref().unwrap().shown, [0]);
+        }
+    }
+
+    #[test]
+    fn already_spoken_terminal_cut_line_dismisses_without_an_empty_screen() {
+        let mut sim = explicit_dialog_cut();
+        sim.talk.as_mut().unwrap().dlg.nodes[2].children.clear();
+        sim.tick(8000);
+        assert!(sim.talk.is_none());
+    }
+
+    #[test]
+    fn cut_handoff_never_takes_a_player_choice() {
+        let mut sim = explicit_dialog_cut();
+        sim.talk.as_mut().unwrap().dlg.nodes[1].text = Some("My reply.".into());
+        sim.tick(8000);
+        assert_eq!(sim.talk.as_ref().unwrap().line, Some(0));
+        assert_eq!(sim.cut_line_speech(), CutLineSpeech::Complete);
+        assert_eq!(
+            sim.dialog_state().unwrap().replies,
+            [(1, "My reply.".into())]
+        );
+        assert_eq!(sim.choose_reply(0).unwrap().line, "Second.");
+    }
+
+    #[test]
+    fn a_terminal_npc_line_remains_available_to_audio_until_dismissed() {
+        let (mut sim, hero, npc) = passers_by();
+        let mut dlg = remarks("terminal", &["The last line."], false);
+        dlg.nodes[0].ambient = false;
+        dlg.nodes[0].strref = Some(274106);
+        dlg.nodes[0].children.clear();
+        assert!(sim.open_conversation(hero, npc, dlg, None));
+        assert!(sim.dialog_state().unwrap().ended);
+        assert!(sim.conversation_line().is_none());
+        assert_eq!(
+            sim.presented_conversation_line().unwrap().strref,
+            Some(274106)
+        );
+        // An exhausted reply clears its answered line; it must not be voiced again.
+        sim.talk.as_mut().unwrap().line = None;
+        assert!(sim.presented_conversation_line().is_none());
+        sim.talk = None;
+        assert!(sim.presented_conversation_line().is_none());
+    }
+
+    #[test]
+    fn referenced_cinematics_end_with_the_line_that_placed_them() {
+        use crate::cutactors::Bound;
+        use crate::cuttracks::Placement;
+
+        // Exercise queued and playing CUTR resources through every foreground cleanup
+        // path. These used to survive the dialog and play with placement=None.
+        for playing in [false, true] {
+            for exit in 0..3 {
+                let (mut sim, hero, npc) = passers_by();
+                let mut dlg = remarks("cinematic", &["First.", "Last."], false);
+                for node in &mut dlg.nodes {
+                    node.ambient = false;
+                }
+                dlg.nodes[0].cutscene = Some("INTRO.CUT".into());
+                sim.world.get_mut(npc).unwrap().position = [160.0, 100.0, 28.0];
+                assert!(sim.open_conversation(hero, npc, dlg, None));
+                if playing {
+                    sim.world.cutscenes.clear();
+                    sim.world.dialog_cutscenes.clear();
+                    sim.world.cutscene = Some(crate::cutscene::Cutscene {
+                        name: "intro.cut".into(),
+                        seconds: 10.0,
+                        lines: Vec::new(),
+                        elapsed_ms: 100,
+                        from_dialog: true,
+                        bound: vec![Bound {
+                            object: npc,
+                            actor: 0,
+                            position: [160.0, 100.0, 28.0],
+                            facing: 0.0,
+                            end: Some(([161.0, 101.0, 28.0], 45.0)),
+                            restore: false,
+                            snaps: false,
+                            da2_stage: false,
+                        }],
+                        placement: Some(Placement::facing([160.0, 100.0, 28.0], 285.0)),
+                    });
+                    // Making replies available does not release the cinematic.
+                    assert!(sim.conversation_line_cutscene().is_some());
+                    sim.dialog_state();
+                    assert!(sim.world.cutscene.is_some());
+                }
+                sim.world.cutscenes.push("script_scene".into());
+                match exit {
+                    0 => {
+                        sim.choose_reply(0).unwrap();
+                    }
+                    1 => sim.end_conversation(),
+                    _ => {
+                        sim.talk.as_mut().unwrap().ended = true;
+                        let mut replacement = remarks("replacement", &["Hello."], false);
+                        replacement.nodes[0].ambient = false;
+                        assert!(sim.open_conversation(hero, npc, replacement, None));
+                    }
+                }
+                assert!(
+                    sim.world.cutscene.is_none(),
+                    "playing={playing}, exit={exit}"
+                );
+                assert!(sim.world.dialog_cutscenes.is_empty());
+                assert_eq!(sim.world.cutscenes, ["script_scene"]);
+                if playing {
+                    assert_eq!(sim.world.get(npc).unwrap().position, [161.0, 101.0, 28.0]);
+                    assert_eq!(sim.world.get(npc).unwrap().facing, 45.0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn walking_nodes_inside_one_cinematic_keeps_its_owner_until_dialog_cleanup() {
+        let (mut sim, hero, npc) = passers_by();
+        let mut dlg = remarks("cinematic", &["First.", "Last."], true);
+        for node in &mut dlg.nodes {
+            node.ambient = false;
+        }
+        dlg.nodes[0].cutscene = Some("intro".into());
+        assert!(sim.open_conversation(hero, npc, dlg, None));
+        let c = sim.talk.as_ref().unwrap();
+        assert_eq!(c.line, Some(1));
+        assert_eq!(c.cut_from, Some(0));
+        assert_eq!(sim.world.cutscenes, ["intro"]);
+        assert_eq!(sim.world.dialog_cutscenes, ["intro.cut"]);
+        sim.end_conversation();
+        assert!(sim.world.cutscenes.is_empty());
+        assert!(sim.world.dialog_cutscenes.is_empty());
+    }
+
+    #[test]
+    fn closing_a_dialog_leaves_script_cutscenes_and_da2_playback_alone() {
+        for game in [thedas_vfs::Game::Origins, thedas_vfs::Game::DragonAge2] {
+            let (mut sim, hero, npc) = passers_by();
+            sim.game = game;
+            let mut dlg = remarks("cinematic", &["Hello."], false);
+            dlg.nodes[0].ambient = false;
+            dlg.nodes[0].cutscene = Some("intro".into());
+            assert!(sim.open_conversation(hero, npc, dlg, None));
+            sim.world.cutscene = Some(crate::cutscene::Cutscene {
+                name: "intro.cut".into(),
+                seconds: 10.0,
+                lines: Vec::new(),
+                elapsed_ms: 100,
+                from_dialog: game == thedas_vfs::Game::DragonAge2,
+                bound: Vec::new(),
+                placement: None,
+            });
+            sim.end_conversation();
+            assert!(sim.world.cutscene.is_some());
+            assert_eq!(
+                sim.world.dialog_cutscenes.is_empty(),
+                game == thedas_vfs::Game::Origins
+            );
+            assert_eq!(
+                sim.world.cutscenes.is_empty(),
+                game == thedas_vfs::Game::Origins
+            );
+        }
+    }
+
+    #[test]
     fn a_conversation_said_in_passing_says_one_line_at_a_time() {
         // King Endrin at the feast answered "Quickly, find Trian and send him to me." and
         // nobody heard it: the whole conversation was run at once and kept from the
@@ -1874,7 +2415,8 @@ mod tests {
                 sim.order_talk(hero, npc);
                 sim.tick(600);
             }
-            assert_eq!(requested(&sim), game != thedas_vfs::Game::Origins);
+            // DIALOGUE goes to the target every time (rules_core decides what to do).
+            assert!(requested(&sim));
             assert_eq!(said(&sim), ["one"]);
             sim.tick(u64::from(AMBIENT_LINE_MS));
             sim.world.trace.entries.clear();
@@ -1885,6 +2427,39 @@ mod tests {
                 "a new click is accepted after the line ends"
             );
         }
+    }
+
+    #[test]
+    fn a_cleared_ambient_line_is_not_begun_again_while_it_is_still_said() {
+        // UT_Talk clears the target's ambient dialogs, then begins the conversation: for
+        // a creature whose conversation is itself said in passing, that must not start its
+        // line over while the line is still going (the Dust Town beggar).
+        let (mut sim, hero, npc) = passers_by();
+        assert!(sim.open_conversation(hero, npc, remarks("beggar", &["one"], true), None));
+        for _ in 0..5 {
+            sim.tick(600);
+            sim.clear_ambient(npc);
+            assert!(sim.open_conversation(hero, npc, remarks("beggar", &["one"], true), None));
+        }
+        assert_eq!(said(&sim), ["one"]);
+        sim.tick(u64::from(AMBIENT_LINE_MS));
+        sim.clear_ambient(npc);
+        assert!(sim.open_conversation(hero, npc, remarks("beggar", &["one"], true), None));
+        assert_eq!(
+            said(&sim),
+            ["one", "one"],
+            "said again once the line is over"
+        );
+    }
+
+    #[test]
+    fn an_ambient_entry_without_text_is_passed_over_at_once() {
+        // Tapster's patrons begin on an empty routing entry: it showed nothing for seven
+        // seconds before their first line (0x7f206e takes the bypass for empty text).
+        let (mut sim, hero, npc) = passers_by();
+        assert!(sim.open_conversation(hero, npc, remarks("patron", &["", "two"], true), None));
+        sim.tick(100);
+        assert_eq!(said(&sim), ["two"]);
     }
 
     #[test]

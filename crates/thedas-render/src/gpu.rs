@@ -1440,6 +1440,11 @@ impl AreaRenderer {
         self.d3d.world(draw)
     }
 
+    /// The opacity multiplier last given to a draw, including cutscene hiding.
+    pub fn draw_opacity(&self, draw: usize) -> Option<f32> {
+        self.d3d.opacity(draw)
+    }
+
     pub fn set_transform(&mut self, ctx: &GpuContext, draw: usize, transform: glam::Mat4) {
         if let Some(Some(i)) = self.stand_in_of.get(draw) {
             let model = transform.to_cols_array_2d();
@@ -1499,6 +1504,18 @@ impl AreaRenderer {
             if self.cut_away_emitters.contains(&e) {
                 state.opacity = value;
             }
+        }
+    }
+
+    /// Set a creature appearance's gore threshold on its body and attachments
+    /// (Origins 0x65d650 -> 0x6b73c0 -> 0x6b1bc0). The owner supplies read-only
+    /// simulation state. Rendering never accumulates damage.
+    pub fn set_prop_gore(&mut self, scene: &AreaScene, prop: usize, amount: f32) {
+        let Some(prop) = scene.props.get(prop) else {
+            return;
+        };
+        for draw in prop.draws.clone() {
+            self.d3d.set_gore(draw, amount);
         }
     }
 
@@ -2927,6 +2944,7 @@ mod tests {
             vertex_offset: 0,
             start_index: 0,
             elements: vec![],
+            sphere: None,
             bounds: None,
         };
         let xml = br#"<MaterialObject Name="t"><Material Name="static.mat"/></MaterialObject>"#;
