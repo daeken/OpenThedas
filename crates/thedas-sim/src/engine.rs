@@ -593,7 +593,6 @@ const PRESENTATION: &[&str] = &[
     "PlaySoundObject",
     "LinkAreaMiniMaps",
     "SendGameEventRunDatabase",
-    "SetMapPinState",
     "SetCameraTarget",
     "ApplyEffectVisualEffectOnLocation",
     "SetLookAtEnabled",
@@ -1010,7 +1009,9 @@ pub fn call(
         }
         h.sim.world.sounds.push(req);
     }
-    if PRESENTATION.contains(&name) {
+    if PRESENTATION.contains(&name)
+        || (name == "SetMapPinState" && h.sim.game != thedas_vfs::Game::Origins)
+    {
         *h.sim
             .world
             .trace
@@ -1146,6 +1147,30 @@ pub fn call(
         "Random" => ok(Value::Int(h.sim.world.rng.below(int(a, 0)))),
         "RandomFloat" => ok(Value::Float(h.sim.world.rng.unit())),
         "Vector" => ok(Value::Vector([float(a, 0), float(a, 1), float(a, 2)])),
+        "GetVectorMagnitude" | "GetVectorNormalize" if h.sim.game == thedas_vfs::Game::Origins => {
+            let v = vector(a, 0);
+            // x87 sums extended products, then stores the squared length as f32.
+            let squared = v.iter().map(|&x| f64::from(x) * f64::from(x)).sum::<f64>() as f32;
+            if name == "GetVectorMagnitude" {
+                ok(Value::Float(squared.sqrt()))
+            } else {
+                let out = if !v.iter().any(|x| !x.is_nan() && *x != 0.0) {
+                    [0.0; 3]
+                } else if squared < 1.0e-6 {
+                    [1.0, 0.0, 0.0]
+                } else {
+                    let inverse = 1.0 / squared.sqrt();
+                    v.map(|x| x * inverse)
+                };
+                ok(Value::Vector(out))
+            }
+        }
+        "GetDebugHelpersEnabled" | "IsPRC" if h.sim.game == thedas_vfs::Game::Origins => {
+            ok(Value::Int(0))
+        }
+        "GetTlkTableString" if h.sim.game == thedas_vfs::Game::Origins => ok(Value::String(
+            h.sim.string(int(a, 0) as u32).unwrap_or_default(),
+        )),
         // Whether x, y and z each compare equal to 0.0 (DAOrigins.exe's handler for function
         // 40, 0x64f010): -0.0 counts as empty, NaN does not, as float comparison gives.
         "IsVectorEmpty" => ok(b(vector(a, 0) == [0.0; 3])),
@@ -2189,8 +2214,18 @@ pub fn call(
         //   within its total when the base or modifiers change.
         // - UpdateCreatureProperty adds to the current value or the modifiers in the same
         //   way; for TOTAL and BASE it does nothing.
-        "GetCreatureProperty" => {
+        "GetCreatureProperty" | "GetCreatureAttribute"
+            if name == "GetCreatureProperty" || h.sim.game == thedas_vfs::Game::Origins =>
+        {
             let (id, p, vt) = (obj(a, 0), int(a, 1), int(a, 2));
+            if name == "GetCreatureAttribute"
+                && (!h.object(id).is_some_and(|o| o.kind == ObjectKind::Creature)
+                    || !(1..=4).contains(&vt)
+                    || (property_bounds(h.sim, p).is_none()
+                        && !h.object(id).is_some_and(|o| o.properties.contains_key(&p))))
+            {
+                return ok(Value::Int(-1));
+            }
             let kind = property_kind(h.sim, p);
             let v = if vt == constant(&h.sim.table, "PROPERTY_VALUE_BASE") {
                 h.object(id)
@@ -2213,7 +2248,11 @@ pub fn call(
             } else {
                 h.sim.property_total(id, p)
             };
-            ok(Value::Float(v))
+            if name == "GetCreatureAttribute" {
+                ok(Value::Int(v as i32))
+            } else {
+                ok(Value::Float(v))
+            }
         }
         // Mana (or stamina): DAOrigins.exe reads and writes the creature's depletable
         // property 8 (PROPERTY_DEPLETABLE_MANA_STAMINA) directly: GetCreatureMana its current
@@ -3711,6 +3750,106 @@ pub fn call(
             };
             if let (Some(l), Some(o)) = (l, h.sim.world.get_mut(obj(a, 0))) {
                 o.locals.locations.insert("__roam_location".into(), l);
+            }
+            void()
+        }
+        "GetRoamLocation" if h.sim.game == thedas_vfs::Game::Origins => {
+            let l = h
+                .object(obj(a, 0))
+                .filter(|o| o.kind == ObjectKind::Creature)
+                .map(|o| Location {
+                    area: o.area.unwrap_or(OBJECT_INVALID),
+                    position: o
+                        .locals
+                        .locations
+                        .get("__roam_location")
+                        .map_or([0.0; 3], |l| l.position),
+                    facing: 0.0,
+                })
+                .unwrap_or(Location {
+                    area: OBJECT_INVALID,
+                    position: [0.0; 3],
+                    facing: 0.0,
+                });
+            let hd = h.sim.world.store(EngineData::Location(l));
+            ok(Value::Engine {
+                ty: ty.location,
+                handle: Some(hd),
+            })
+        }
+        "IsMoving" if h.sim.game == thedas_vfs::Game::Origins => {
+            ok(b(h.object(obj(a, 0)).is_some_and(|o| {
+                o.kind == ObjectKind::Creature
+                    && o.commands.first().is_some_and(|c| c.from.is_some())
+            })))
+        }
+        "GetAILevel" if h.sim.game == thedas_vfs::Game::Origins => ok(Value::Int(
+            h.object(obj(a, 0))
+                .filter(|o| {
+                    !matches!(
+                        o.kind,
+                        ObjectKind::Module
+                            | ObjectKind::Area
+                            | ObjectKind::Stage
+                            | ObjectKind::Party
+                            | ObjectKind::Map
+                            | ObjectKind::MapPin
+                    )
+                })
+                .map_or(-1, |o| o.fields.get("AILevel").copied().unwrap_or(-1)),
+        )),
+        "IsItemStealable" if h.sim.game == thedas_vfs::Game::Origins => {
+            ok(b(h.object(obj(a, 0)).is_some_and(|o| {
+                o.kind == ObjectKind::Item && o.fields.get("Stealable").copied().unwrap_or(0) != 0
+            })))
+        }
+        "GetAOEFlags" if h.sim.game == thedas_vfs::Game::Origins => ok(Value::Int(
+            h.object(obj(a, 0))
+                .filter(|o| o.kind == ObjectKind::AreaOfEffect)
+                .and_then(|o| o.fields.get("AOEFlags").copied())
+                .unwrap_or(0),
+        )),
+        "SetAOEFlags" if h.sim.game == thedas_vfs::Game::Origins => {
+            if let Some(o) = h
+                .sim
+                .world
+                .get_mut(obj(a, 0))
+                .filter(|o| o.kind == ObjectKind::AreaOfEffect)
+            {
+                o.fields.insert("AOEFlags".into(), int(a, 1));
+            }
+            void()
+        }
+        "GetMapPinState" if h.sim.game == thedas_vfs::Game::Origins => ok(Value::Int(
+            h.object(obj(a, 0))
+                .filter(|o| o.kind == ObjectKind::MapPin)
+                .map_or(-1, |o| o.fields.get("MapPinState").copied().unwrap_or(0)),
+        )),
+        "SetMapPinState" if h.sim.game == thedas_vfs::Game::Origins => {
+            if let Some(o) = h
+                .sim
+                .world
+                .get_mut(obj(a, 0))
+                .filter(|o| o.kind == ObjectKind::MapPin)
+            {
+                o.fields
+                    .insert("MapPinState".into(), i32::from(int(a, 1) != 0));
+            }
+            void()
+        }
+        "IsFollowerLocked" if h.sim.game == thedas_vfs::Game::Origins => {
+            ok(b(h.sim.party_pool().contains(&obj(a, 0))
+                && h.object(obj(a, 0)).is_some_and(|o| {
+                    o.fields.get("FollowerLocked").copied().unwrap_or(0) != 0
+                })))
+        }
+        "SetFollowerLocked" if h.sim.game == thedas_vfs::Game::Origins => {
+            let id = obj(a, 0);
+            if h.sim.party_pool().contains(&id)
+                && let Some(o) = h.sim.world.get_mut(id)
+            {
+                o.fields
+                    .insert("FollowerLocked".into(), i32::from(int(a, 1) != 0));
             }
             void()
         }
@@ -7086,6 +7225,411 @@ mod tests {
             script: "test".into(),
         };
         assert!(super::call(&mut host, creature, &function, &[Value::Object(door)]).is_none());
+    }
+
+    fn small_native_sim() -> Sim {
+        let ldf = b"#define ENGINE_STRUCTURE_1 location\n\
+            float GetVectorMagnitude(vector v) = 42;\n\
+            vector GetVectorNormalize(vector v) = 43;\n\
+            int GetDebugHelpersEnabled() = 331;\n\
+            int IsPRC(string s, int n) = 857;\n\
+            string GetTlkTableString(int r, int g = 0) = 14;\n\
+            int GetCreatureAttribute(object o, int p, int v = 1) = 248;\n\
+            int GetAILevel(object o) = 221;\n\
+            void SetAILevel(object o, int n) = 222;\n\
+            int IsItemStealable(object o) = 641;\n\
+            int GetAOEFlags(object o) = 334;\n\
+            void SetAOEFlags(object o, int n) = 335;\n\
+            int GetMapPinState(object o) = 653;\n\
+            void SetMapPinState(object o, int n) = 652;\n\
+            location GetRoamLocation(object o) = 826;\n\
+            int IsMoving(object o) = 388;\n\
+            int IsFollowerLocked(object o) = 146;\n\
+            void SetFollowerLocked(object o, int b) = 147;\n\
+            int FOLLOWER_STATE_ACTIVE = 1;\n\
+            int FOLLOWER_STATE_AVAILABLE = 2;\n\
+            int PROPERTY_VALUE_TOTAL = 1;\n\
+            int PROPERTY_VALUE_BASE = 2;\n\
+            int PROPERTY_VALUE_CURRENT = 3;\n\
+            int PROPERTY_VALUE_MODIFIER = 4;";
+        Sim::new(
+            Arc::new(Vfs::new()),
+            Arc::new(EngineTable::parse(ldf).unwrap()),
+            1,
+        )
+    }
+
+    #[test]
+    fn small_native_vector_length_and_normalization_include_z() {
+        let mut s = small_native_sim();
+        let v = [Value::Vector([2.0, -3.0, 6.0])];
+        assert_eq!(
+            run(&mut s, 1, "GetVectorMagnitude", &v),
+            Some(Value::Float(7.0))
+        );
+        let Some(Value::Vector(unit)) = run(&mut s, 1, "GetVectorNormalize", &v) else {
+            panic!("vector")
+        };
+        for (actual, expected) in unit.into_iter().zip([2.0 / 7.0, -3.0 / 7.0, 6.0 / 7.0]) {
+            assert!((actual - expected).abs() < 1.0e-6);
+        }
+        assert_eq!(
+            run(&mut s, 1, "GetVectorNormalize", &[Value::Vector([0.0; 3])]),
+            Some(Value::Vector([0.0; 3]))
+        );
+        assert_eq!(
+            run(
+                &mut s,
+                1,
+                "GetVectorNormalize",
+                &[Value::Vector([0.0, -0.0001, 0.0])]
+            ),
+            Some(Value::Vector([1.0, 0.0, 0.0]))
+        );
+    }
+
+    #[test]
+    fn small_native_release_flags_and_missing_tlk_string() {
+        let mut s = small_native_sim();
+        assert_eq!(
+            run(&mut s, 1, "GetDebugHelpersEnabled", &[]),
+            Some(Value::Int(0))
+        );
+        assert_eq!(
+            run(
+                &mut s,
+                1,
+                "IsPRC",
+                &[Value::String("ignored".into()), Value::Int(-7)]
+            ),
+            Some(Value::Int(0))
+        );
+        assert_eq!(
+            run(
+                &mut s,
+                1,
+                "GetTlkTableString",
+                &[Value::Int(-1), Value::Int(17)]
+            ),
+            Some(Value::String(String::new()))
+        );
+    }
+
+    #[test]
+    fn small_native_attribute_truncates_and_rejects_invalid_requests() {
+        let mut s = small_native_sim();
+        let id = s.world.spawn(ObjectKind::Creature, "c");
+        let door = s.world.spawn(ObjectKind::Placeable, "door");
+        s.world
+            .get_mut(id)
+            .unwrap()
+            .properties
+            .insert(1, (13.75, 9.0));
+        s.world.get_mut(id).unwrap().modifiers.insert(1, -1.5);
+        for (vt, expected) in [(1, 12), (2, 13), (3, -1), (4, -1), (5, -1), (0, -1)] {
+            assert_eq!(
+                run(
+                    &mut s,
+                    id,
+                    "GetCreatureAttribute",
+                    &[Value::Object(id), Value::Int(1), Value::Int(vt)]
+                ),
+                Some(Value::Int(expected))
+            );
+        }
+        for (o, p) in [(door, 1), (OBJECT_INVALID, 1), (id, -999)] {
+            assert_eq!(
+                run(
+                    &mut s,
+                    id,
+                    "GetCreatureAttribute",
+                    &[Value::Object(o), Value::Int(p), Value::Int(1)]
+                ),
+                Some(Value::Int(-1))
+            );
+        }
+    }
+
+    #[test]
+    fn small_native_ai_item_and_aoe_reads_are_kind_checked() {
+        let mut s = small_native_sim();
+        let c = s.world.spawn(ObjectKind::Creature, "c");
+        let item = s.world.spawn(ObjectKind::Item, "item");
+        let aoe = s.world.spawn(ObjectKind::AreaOfEffect, "aoe");
+        let module = s.world.spawn(ObjectKind::Module, "module");
+        assert_eq!(
+            run(&mut s, c, "GetAILevel", &[Value::Object(c)]),
+            Some(Value::Int(-1))
+        );
+        run(&mut s, c, "SetAILevel", &[Value::Object(c), Value::Int(3)]);
+        assert_eq!(
+            run(&mut s, c, "GetAILevel", &[Value::Object(c)]),
+            Some(Value::Int(3))
+        );
+        s.world
+            .get_mut(module)
+            .unwrap()
+            .fields
+            .insert("AILevel".into(), 99);
+        assert_eq!(
+            run(&mut s, c, "GetAILevel", &[Value::Object(module)]),
+            Some(Value::Int(-1))
+        );
+        for id in [item, c] {
+            s.world
+                .get_mut(id)
+                .unwrap()
+                .fields
+                .insert("Stealable".into(), -5);
+        }
+        assert_eq!(
+            run(&mut s, c, "IsItemStealable", &[Value::Object(item)]),
+            Some(Value::Int(1))
+        );
+        assert_eq!(
+            run(&mut s, c, "IsItemStealable", &[Value::Object(c)]),
+            Some(Value::Int(0))
+        );
+        for id in [aoe, c, OBJECT_INVALID] {
+            run(
+                &mut s,
+                c,
+                "SetAOEFlags",
+                &[Value::Object(id), Value::Int(i32::MIN)],
+            );
+        }
+        assert_eq!(
+            run(&mut s, c, "GetAOEFlags", &[Value::Object(aoe)]),
+            Some(Value::Int(i32::MIN))
+        );
+        assert_eq!(
+            run(&mut s, c, "GetAOEFlags", &[Value::Object(c)]),
+            Some(Value::Int(0))
+        );
+    }
+
+    #[test]
+    fn small_native_pin_and_follower_flags_round_trip_without_changing_status() {
+        let mut s = small_native_sim();
+        let pin = s.world.spawn(ObjectKind::MapPin, "pin");
+        let wp = s.world.spawn(ObjectKind::Waypoint, "waypoint");
+        let follower = s.world.spawn(ObjectKind::Creature, "follower");
+        let outsider = s.world.spawn(ObjectKind::Creature, "outsider");
+        s.world
+            .get_mut(follower)
+            .unwrap()
+            .fields
+            .insert("FollowerState".into(), 2);
+        assert_eq!(
+            run(&mut s, follower, "GetMapPinState", &[Value::Object(wp)]),
+            Some(Value::Int(-1))
+        );
+        for flag in [-7, 0, 1] {
+            run(
+                &mut s,
+                follower,
+                "SetMapPinState",
+                &[Value::Object(pin), Value::Int(flag)],
+            );
+            assert_eq!(
+                run(&mut s, follower, "GetMapPinState", &[Value::Object(pin)]),
+                Some(Value::Int(i32::from(flag != 0)))
+            );
+            for id in [follower, outsider] {
+                run(
+                    &mut s,
+                    follower,
+                    "SetFollowerLocked",
+                    &[Value::Object(id), Value::Int(flag)],
+                );
+            }
+            assert_eq!(
+                run(
+                    &mut s,
+                    follower,
+                    "IsFollowerLocked",
+                    &[Value::Object(follower)]
+                ),
+                Some(Value::Int(i32::from(flag != 0)))
+            );
+            assert_eq!(
+                run(
+                    &mut s,
+                    follower,
+                    "IsFollowerLocked",
+                    &[Value::Object(outsider)]
+                ),
+                Some(Value::Int(0))
+            );
+        }
+        assert_eq!(
+            s.world.get(follower).unwrap().fields.get("FollowerState"),
+            Some(&2)
+        );
+    }
+
+    #[test]
+    fn small_native_roam_location_uses_current_area_and_zero_orientation() {
+        let mut s = small_native_sim();
+        let c = s.world.spawn(ObjectKind::Creature, "c");
+        let o = s.world.get_mut(c).unwrap();
+        o.area = Some(99);
+        o.locals.locations.insert(
+            "__roam_location".into(),
+            Location {
+                area: 42,
+                position: [2.0, 3.0, 4.0],
+                facing: 70.0,
+            },
+        );
+        for (id, area, position) in [
+            (c, 99, [2.0, 3.0, 4.0]),
+            (OBJECT_INVALID, OBJECT_INVALID, [0.0; 3]),
+        ] {
+            let v = run(&mut s, c, "GetRoamLocation", &[Value::Object(id)]).unwrap();
+            let Some(EngineData::Location(l)) = s.world.handle(handle(&[v], 0)) else {
+                panic!("location")
+            };
+            assert_eq!(
+                *l,
+                Location {
+                    area,
+                    position,
+                    facing: 0.0
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn small_native_moving_excludes_queued_commands_and_noncreatures() {
+        let mut s = small_native_sim();
+        let c = s.world.spawn(ObjectKind::Creature, "c");
+        let door = s.world.spawn(ObjectKind::Placeable, "door");
+        for id in [c, door] {
+            s.world.get_mut(id).unwrap().commands.push(Command {
+                name: "CommandMoveToLocation".into(),
+                ..Default::default()
+            });
+        }
+        assert_eq!(
+            run(&mut s, c, "IsMoving", &[Value::Object(c)]),
+            Some(Value::Int(0))
+        );
+        for id in [c, door] {
+            s.world.get_mut(id).unwrap().commands[0].from = Some(([0.0; 3], 0));
+        }
+        assert_eq!(
+            run(&mut s, c, "IsMoving", &[Value::Object(c)]),
+            Some(Value::Int(1))
+        );
+        assert_eq!(
+            run(&mut s, c, "IsMoving", &[Value::Object(door)]),
+            Some(Value::Int(0))
+        );
+        assert_eq!(
+            run(&mut s, c, "IsMoving", &[Value::Object(OBJECT_INVALID)]),
+            Some(Value::Int(0))
+        );
+        s.world.get_mut(c).unwrap().commands.clear();
+        assert_eq!(
+            run(&mut s, c, "IsMoving", &[Value::Object(c)]),
+            Some(Value::Int(0))
+        );
+    }
+
+    #[test]
+    fn small_native_da2_dispatch_preserves_implemented_queries() {
+        let mut s = small_native_sim();
+        s.game = thedas_vfs::Game::DragonAge2;
+        let pin = s.world.spawn(ObjectKind::MapPin, "pin");
+        assert_eq!(
+            run(
+                &mut s,
+                pin,
+                "SetMapPinState",
+                &[Value::Object(pin), Value::Int(1)]
+            ),
+            None
+        );
+        assert!(!s.world.get(pin).unwrap().fields.contains_key("MapPinState"));
+        assert_eq!(s.world.trace.presentation.get("SetMapPinState"), Some(&1));
+        for name in [
+            "GetVectorMagnitude",
+            "GetVectorNormalize",
+            "GetCreatureAttribute",
+            "GetAOEFlags",
+            "GetMapPinState",
+            "GetRoamLocation",
+            "IsPRC",
+            "IsItemStealable",
+            "IsFollowerLocked",
+            "GetTlkTableString",
+            "GetDebugHelpersEnabled",
+        ] {
+            let function = s.table.function_by_name(name).cloned().unwrap();
+            let mut host = ScriptHost {
+                sim: &mut s,
+                event: None,
+                script: "test".into(),
+            };
+            assert!(call(&mut host, 1, &function, &[]).is_none(), "{name}");
+        }
+        // DA2 locomotion merged independently of these Origins getters.
+        // Keep the unsupported-native checks above and exercise both results.
+        let creature = s.world.spawn(ObjectKind::Creature, "walker");
+        for id in [creature, OBJECT_INVALID] {
+            assert_eq!(
+                run(&mut s, creature, "IsMoving", &[Value::Object(id)]),
+                Some(Value::Int(0))
+            );
+        }
+        s.da2_begin_locomotion(creature, false);
+        assert_eq!(
+            run(&mut s, creature, "IsMoving", &[Value::Object(creature)]),
+            Some(Value::Int(1))
+        );
+        s.da2_reset_locomotion(creature);
+        assert_eq!(
+            run(&mut s, creature, "IsMoving", &[Value::Object(creature)]),
+            Some(Value::Int(0))
+        );
+        // Main also implements DA2's automatic priority and manual lock.
+        // Check its invalid-object result and both priority modes here.
+        assert_eq!(
+            run(
+                &mut s,
+                creature,
+                "GetAILevel",
+                &[Value::Object(OBJECT_INVALID)]
+            ),
+            Some(Value::Int(-1))
+        );
+        s.world.hero = Some(creature);
+        assert_eq!(
+            run(&mut s, creature, "GetAILevel", &[Value::Object(creature)]),
+            Some(Value::Int(4))
+        );
+        run(
+            &mut s,
+            creature,
+            "SetAILevel",
+            &[Value::Object(creature), Value::Int(2)],
+        );
+        assert_eq!(
+            run(&mut s, creature, "GetAILevel", &[Value::Object(creature)]),
+            Some(Value::Int(2))
+        );
+        run(
+            &mut s,
+            creature,
+            "SetAILevel",
+            &[Value::Object(creature), Value::Int(-1)],
+        );
+        assert_eq!(
+            run(&mut s, creature, "GetAILevel", &[Value::Object(creature)]),
+            Some(Value::Int(4))
+        );
     }
 
     #[test]
