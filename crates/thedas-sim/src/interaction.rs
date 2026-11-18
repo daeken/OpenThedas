@@ -148,6 +148,23 @@ impl Sim {
             return self.approach_interaction(who, &cmd, state.requested);
         }
         if stage == 1 {
+            // Like USE, recheck the footprint after walking: route repair can
+            // leave us outside its clearance, and the placeable can change state.
+            if target == ObjectKind::Placeable
+                && metadata.facing.is_none()
+                && !metadata.object_approach
+            {
+                let target = self.world.get(cmd.target?)?;
+                let actor = self.world.get(who)?;
+                let from = actor.position;
+                if actor.area.is_none() || actor.area != target.area {
+                    self.fail_front_command(who, "COMMAND_FAILED_INVALID_PATH");
+                    return None;
+                }
+                if let Some((_, to)) = self.placeable_use_walk(who, cmd.target?) {
+                    return self.walk_interaction(who, from, to);
+                }
+            }
             let facing = metadata.facing.or_else(|| {
                 let target = self.world.get(cmd.target?)?;
                 let actor = self.world.get(who)?;
@@ -255,10 +272,16 @@ impl Sim {
             self.fail_front_command(who, "COMMAND_FAILED_INVALID_PATH");
             return None;
         }
-        let (to, facing, tolerance) = if target_kind == ObjectKind::Placeable
-            && let Some((point, facing)) = self.interaction_point(target_id, settings.id)
-        {
-            (point, Some(facing), self.body_radius(who))
+        let (goal, facing) = if target_kind == ObjectKind::Placeable {
+            if let Some((point, facing)) = self.interaction_point(target_id, settings.id) {
+                let walk = crate::engine::dist(from, point) > self.body_radius(who);
+                (walk.then_some(point), Some(facing))
+            } else {
+                (
+                    self.placeable_use_walk(who, target_id).map(|(_, to)| to),
+                    None,
+                )
+            }
         } else {
             // 0x743872 supplies max range 0.1 and minimum 0 to the ordinary
             // move-to-object subcommand; capsule contact can end that walk.
@@ -271,36 +294,43 @@ impl Sim {
                 self.fail_front_command(who, "COMMAND_FAILED_INVALID_PATH");
                 return None;
             };
-            (goal.position, None, 0.15)
+            let walk = crate::engine::dist(from, goal.position) > 0.15;
+            (walk.then_some(goal.position), None)
         };
-        let path = if crate::engine::dist(from, to) > tolerance {
-            match self.route_to(who, to) {
-                crate::nav::Routed::Path(p) => p,
-                crate::nav::Routed::Straight => vec![to],
-                crate::nav::Routed::InvalidPath => {
-                    self.fail_front_command(who, "COMMAND_FAILED_INVALID_PATH");
-                    return None;
-                }
-                crate::nav::Routed::Door(door) => {
-                    self.fail_blocked(who, door);
-                    return None;
-                }
-            }
-        } else {
-            Vec::new()
-        };
-        let now = self.world.time_ms;
-        let ms = (crate::sim::path_length(from, &path) / self.move_speed(who) * 1000.0) as u64;
         let o = self.world.get_mut(who)?;
         let c = o.commands.first_mut()?;
         let metadata = c.interaction.as_mut()?;
         metadata.stage = 1;
-        metadata.object_approach = facing.is_none();
+        metadata.object_approach = target_kind != ObjectKind::Placeable;
         metadata.facing = facing;
-        if path.is_empty() {
-            return self.interaction_deadline(who);
+        match goal {
+            Some(to) => self.walk_interaction(who, from, to),
+            None => self.interaction_deadline(who),
         }
+    }
+
+    fn walk_interaction(&mut self, who: ObjectId, from: [f32; 3], to: [f32; 3]) -> Option<u64> {
+        let path = match self.route_to(who, to) {
+            crate::nav::Routed::Path(p) => p,
+            crate::nav::Routed::Straight => vec![to],
+            crate::nav::Routed::InvalidPath => {
+                self.fail_front_command(who, "COMMAND_FAILED_INVALID_PATH");
+                return None;
+            }
+            crate::nav::Routed::Door(door) => {
+                self.fail_blocked(who, door);
+                return None;
+            }
+        };
+        let distance = crate::sim::path_length(from, &path);
+        if distance < 0.02 && crate::engine::dist(from, to) > 0.05 {
+            self.fail_front_command(who, "COMMAND_FAILED_INVALID_PATH");
+            return None;
+        }
+        let now = self.world.time_ms;
+        let ms = (distance / self.move_speed(who) * 1000.0) as u64;
         let due = now.saturating_add(ms.max(1));
+        let c = self.world.get_mut(who)?.commands.first_mut()?;
         c.approach = Some(to);
         c.from = Some((from, now));
         c.path = path;
@@ -792,6 +822,43 @@ mod tests {
                 assert_eq!(animation(&s, a), 11);
             }
         }
+    }
+
+    #[test]
+    fn a_placeable_without_an_authored_point_uses_the_shared_approach() {
+        let (mut s, actor, target) = sim();
+        let area = s.world.spawn(ObjectKind::Area, "area");
+        s.world.get_mut(actor).unwrap().area = Some(area);
+        let placeable = s.world.get_mut(target).unwrap();
+        placeable.area = Some(area);
+        placeable.position = [0.0, 4.0, 0.0];
+        let settings = Settings {
+            id: 1,
+            pose: 1,
+            loops: -1,
+            play_exit: true,
+        };
+        let cmd = s
+            .request_interaction(actor, target, settings, true, false)
+            .unwrap();
+        s.world.get_mut(actor).unwrap().commands.push(cmd);
+        let (_, first_goal) = s.placeable_use_walk(actor, target).unwrap();
+        s.tick(0);
+        let command = &s.world.get(actor).unwrap().commands[0];
+        assert_eq!(command.approach, Some(first_goal));
+        let first_due = command.due.unwrap();
+
+        // The first route is now short of the placeable's use clearance.
+        s.world.get_mut(target).unwrap().position[1] += 2.0;
+        s.tick(first_due);
+        let (_, final_goal) = s.placeable_use_walk(actor, target).unwrap();
+        let command = &s.world.get(actor).unwrap().commands[0];
+        assert_eq!(command.approach, Some(final_goal));
+        let remaining = command.due.unwrap() - s.world.time_ms;
+        s.tick(remaining + 1);
+        assert_eq!(s.world.get(actor).unwrap().position, final_goal);
+        assert!(s.placeable_use_walk(actor, target).is_none());
+        assert_eq!(animation(&s, actor), 21);
     }
 
     #[test]

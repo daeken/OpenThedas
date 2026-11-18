@@ -43,8 +43,10 @@ length. The exit flag controls the final phase.
 
 The headless implementation retains requests and phase progress in saves,
 uses the existing navigation/mover and command-completion paths, and reads
-animation lengths through the existing cached animation reader. The placeable
-tolerance is the actor's personal space (`0x6a21a0`). The fallback supplies
+animation lengths through the existing cached animation reader. Authored
+placeable points use the actor's personal space (`0x6a21a0`) as tolerance.
+Without an authored point, placeables use the same footprint and controller
+clearance as USE and are rechecked after the walk. Other targets supply
 maximum 0.1 and minimum zero, as the factory does, to the existing ground-goal
 search and capsule-contact completion. Turn rate, animation-tree arbitration,
 linked animation sequences and root blending remain approximations. Presentation

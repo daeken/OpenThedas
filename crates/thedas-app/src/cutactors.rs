@@ -1,7 +1,7 @@
-//! Cutscene actors as drawn: while a cutscene plays, or a conversation line plays its own
-//! cutscene, the creatures that play its actors are drawn where its tracks put them and
-//! with its animations, and actors no creature of the world plays are drawn as the
-//! cutscene's own creatures (see [`thedas_sim::cutactors`]).
+//! Cutscene actors as drawn during playback and while a staged conversation awaits a
+//! reply. Bound creatures follow the cutscene's placement and animation tracks. An
+//! actor no creature of the world plays can appear as the cutscene's own creature
+//! (see [`thedas_sim::cutactors`]).
 //!
 //! Traced in DAOrigins.exe: a cutscene's tracks move the model of the object playing an
 //! actor, not the object (0x7cf450); an actor no object plays is a creature the cutscene
@@ -30,7 +30,9 @@ use thedas_formats::stage::Stage;
 use thedas_script::vm::ObjectId;
 use thedas_sim::Sim;
 use thedas_sim::cutactors::{Bound, LineCut};
+use thedas_sim::cutscene::Cutscene;
 use thedas_sim::cuttracks::{Finders, Placement, Tracks, facing_of};
+use thedas_sim::dialog::OpenLine;
 use thedas_sim::world::ObjectKind;
 use thedas_ui::models::ObjectModel;
 
@@ -139,6 +141,26 @@ pub struct CutLight {
     pub show: thedas_sim::cuttracks::LightShow,
 }
 
+/// An Origins reply still shows the referenced cutscene that staged the line. The
+/// simulation removes it at timeline completion, so keep its presentation inputs.
+struct ReplyCut {
+    dialog: String,
+    owner: ObjectId,
+    line: Option<usize>,
+    cut: Cutscene,
+    tracks: Arc<Tracks>,
+    since_ms: Option<f64>,
+}
+
+impl ReplyCut {
+    fn matches(&self, line: OpenLine<'_>) -> bool {
+        line.choosing
+            && self.dialog == line.dialog
+            && self.owner == line.owner
+            && self.line == line.line
+    }
+}
+
 #[derive(Default)]
 pub struct CutsceneActors {
     lines: HashMap<String, Option<Arc<Vec<LineCut>>>>,
@@ -154,6 +176,8 @@ pub struct CutsceneActors {
     /// Animations creatures keep from the cutscenes and lines of the open conversation
     /// that have ended (a creature that sat down stays seated).
     kept: HashMap<ObjectId, Vec<CutAnimation>>,
+    /// The referenced line cutscene to continue staging while its reply is pending.
+    reply_cut: Option<ReplyCut>,
 }
 
 impl CutsceneActors {
@@ -196,22 +220,40 @@ impl CutsceneActors {
     ///
     /// `roots` gives where the drawn objects are, which actors linked to them follow.
     pub fn shown(&mut self, sim: &Sim, tracks: Option<Arc<Tracks>>, roots: &DrawnRoots) -> Shown {
-        let open = sim.conversation_line().is_some();
+        let line = sim.conversation_line();
+        let open = line.is_some();
+        let reply = self
+            .reply_cut
+            .take()
+            .filter(|reply| line.is_some_and(|line| reply.matches(line)));
         let mut out = Shown::default();
         if let (Some(c), Some(tracks)) = (sim.world.cutscene.as_ref(), tracks) {
+            if sim.game == thedas_vfs::Game::Origins
+                && let Some(line) = line.filter(|line| line.choosing)
+                && sim.conversation_line_cutscene().is_some()
+            {
+                self.reply_cut = Some(
+                    reply
+                        .filter(|reply| reply.cut.name == c.name && reply.since_ms.is_none())
+                        .unwrap_or_else(|| ReplyCut {
+                            dialog: line.dialog.to_owned(),
+                            owner: line.owner,
+                            line: line.line,
+                            cut: c.clone(),
+                            tracks: tracks.clone(),
+                            since_ms: None,
+                        }),
+                );
+            }
             self.switch(Some(format!("cut:{}", c.name)), open || c.from_dialog);
-            let t = c.elapsed_ms as f32 / 1000.0;
-            let placement = c.placement.unwrap_or(Placement::NONE);
-            let stage = self.stage(sim, tracks.stage_file.as_deref());
-            let at = Moment {
-                t,
-                placement,
-                stage: stage.as_deref(),
-                bound: &c.bound,
+            self.show_file(
+                sim,
+                c,
+                &tracks,
+                c.elapsed_ms as f32 / 1000.0,
                 roots,
-            };
-            self.pose_bound(&tracks, &at, &mut out);
-            out.lights = lights(&tracks, &at);
+                &mut out,
+            );
             out.speaker =
                 c.line_now()
                     .filter(|l| l.vo_mode == 0)
@@ -221,18 +263,14 @@ impl CutsceneActors {
                         })
                     })
                     .and_then(|i| drawn_object(&tracks, &c.bound, i));
-            // Actors no object plays: the cutscene's own creatures.
-            let name = c.name.clone();
-            if self.own.as_ref().is_none_or(|(n, _)| *n != name) {
-                self.own = Some((name, own_creatures(sim, &tracks, &c.bound)));
-            }
-            if let Some((_, own)) = &self.own {
-                for (i, model) in own {
-                    if let Some(show) = show(&tracks, *i, &at) {
-                        out.own.push((model.clone(), show));
-                    }
-                }
-            }
+        } else if let Some(mut reply) = reply {
+            // GameModeDialog keeps ticking its attached cutscene after the timeline
+            // completes (0x68df64 -> 0x7e3d30), including the actors' base poses and
+            // draw actions. It releases the cut when the line changes (0x68e3f8).
+            let since = *reply.since_ms.get_or_insert(self.clock_ms);
+            let t = reply.cut.seconds + ((self.clock_ms - since) / 1000.0) as f32;
+            self.show_file(sim, &reply.cut, &reply.tracks, t, roots, &mut out);
+            self.reply_cut = Some(reply);
         } else {
             self.own = None;
             match sim.line_staging() {
@@ -240,11 +278,18 @@ impl CutsceneActors {
                     let dlg = dlg.to_ascii_lowercase();
                     self.switch(Some(format!("line:{dlg}:{line}")), true);
                     let since = self.source.as_ref().map_or(self.clock_ms, |(_, s)| *s);
-                    let t = ((self.clock_ms - since) / 1000.0) as f32;
                     if let Some(tracks) = self
                         .line_cuts(sim, &dlg)
                         .and_then(|l| l.get(line).and_then(|c| c.tracks.clone()))
                     {
+                        // An owned cut already played this line. Use the inline cut's
+                        // closing pose while the player chooses a reply.
+                        let t =
+                            if sim.cut_line_speech() != thedas_sim::dialog::CutLineSpeech::Dialog {
+                                tracks.seconds
+                            } else {
+                                ((self.clock_ms - since) / 1000.0) as f32
+                            };
                         let stage = self.stage(sim, tracks.stage_file.as_deref());
                         let at = Moment {
                             t,
@@ -262,6 +307,38 @@ impl CutsceneActors {
         }
         out.kept = self.kept.clone();
         out
+    }
+
+    fn show_file(
+        &mut self,
+        sim: &Sim,
+        cut: &Cutscene,
+        tracks: &Tracks,
+        t: f32,
+        roots: &DrawnRoots,
+        out: &mut Shown,
+    ) {
+        let stage = self.stage(sim, tracks.stage_file.as_deref());
+        let at = Moment {
+            t,
+            placement: cut.placement.unwrap_or(Placement::NONE),
+            stage: stage.as_deref(),
+            bound: &cut.bound,
+            roots,
+        };
+        self.pose_bound(tracks, &at, out);
+        out.lights = lights(tracks, &at);
+        // Actors no object plays: the cutscene's own creatures and props.
+        if self.own.as_ref().is_none_or(|(name, _)| *name != cut.name) {
+            self.own = Some((cut.name.clone(), own_creatures(sim, tracks, &cut.bound)));
+        }
+        if let Some((_, own)) = &self.own {
+            for (i, model) in own {
+                if let Some(show) = show(tracks, *i, &at) {
+                    out.own.push((model.clone(), show));
+                }
+            }
+        }
     }
 
     fn pose_bound(&mut self, tracks: &Tracks, at: &Moment, out: &mut Shown) {
@@ -525,6 +602,142 @@ mod tests {
         assert!(actors.ending.is_empty());
         actors.switch(Some("line:next:0".into()), true);
         assert!(actors.kept.is_empty());
+    }
+
+    #[test]
+    fn referenced_line_keeps_the_drawn_bow_and_aim_pose_during_replies() {
+        use thedas_sim::cuttracks::{Actor, WeaponDraw};
+        use thedas_sim::dialog::{Conversation, Dlg, Node};
+
+        let mut sim = Sim::new(
+            Arc::new(thedas_vfs::Vfs::new()),
+            Arc::new(thedas_script::EngineTable::default()),
+            1,
+        );
+        let player = sim.world.spawn(ObjectKind::Creature, "player");
+        let owner = sim.world.spawn(ObjectKind::Creature, "speaker");
+        let line = Node {
+            reply: false,
+            strref: None,
+            text: Some("What should we do?".into()),
+            speaker: "OWNER".into(),
+            listener: "PLAYER".into(),
+            condition: Default::default(),
+            action: Default::default(),
+            children: vec![1],
+            show_once: 0,
+            cnv_flags: None,
+            ambient: false,
+            cutscene: Some("aim".into()),
+        };
+        let reply = Node {
+            reply: true,
+            text: Some("Let them go.".into()),
+            children: vec![2],
+            cutscene: None,
+            ..line.clone()
+        };
+        let next = Node {
+            text: Some("What now?".into()),
+            children: vec![3],
+            cutscene: None,
+            ..line.clone()
+        };
+        let last_reply = Node {
+            children: vec![],
+            ..reply.clone()
+        };
+        let mut save = sim.save_game();
+        save.talk = Some(Conversation {
+            dlg: Dlg {
+                name: "test".into(),
+                starts: vec![0],
+                nodes: vec![line, reply, next, last_reply],
+            },
+            owner,
+            player,
+            line: Some(0),
+            replies: vec![1],
+            ended: false,
+            shown: vec![],
+            chain: vec![],
+            cut_from: Some(0),
+            cut_lines_left: 0,
+            cut_line_speech: thedas_sim::dialog::CutLineSpeech::Dialog,
+            staged: vec![],
+            staged_at: None,
+            ambient_run: false,
+        });
+        sim.load_game(save).unwrap();
+        let cut = Cutscene {
+            name: "aim.cut".into(),
+            seconds: 4.0,
+            lines: vec![],
+            elapsed_ms: 3500,
+            from_dialog: true,
+            bound: vec![Bound {
+                object: owner,
+                actor: 0,
+                position: [0.0; 3],
+                facing: 0.0,
+                end: None,
+                restore: false,
+                snaps: false,
+                da2_stage: false,
+            }],
+            placement: None,
+        };
+        let tracks = Arc::new(Tracks {
+            seconds: cut.seconds,
+            tree: Some("aim.cub".into()),
+            actors: vec![Actor {
+                id: 0,
+                name: "OWNER".into(),
+                creature: None,
+                model: None,
+                tag: None,
+                end_position: [0.0; 3],
+                end_rotation: [0.0, 0.0, 0.0, 1.0],
+                snaps: false,
+                pose: Some(11),
+                position: [0.0; 3],
+                rotation: [0.0, 0.0, 0.0, 1.0],
+                motion: vec![],
+                turn: vec![],
+                fov: vec![],
+                animations: vec![],
+                places: vec![],
+                camera_jumps: vec![],
+                links: vec![],
+                shakes: vec![],
+                head_tracks: vec![],
+                visibility: vec![],
+                weapon_draws: vec![WeaponDraw {
+                    start: 0.0,
+                    main: true,
+                    off: false,
+                }],
+                light: None,
+            }],
+            ..Default::default()
+        });
+        let mut actors = CutsceneActors::default();
+        let draw = |show: Shown, time| {
+            let show = &show.actors[&owner];
+            assert_eq!(show.weapons, Some((true, None)));
+            assert_eq!(show.animations[0].node, "pose_11");
+            assert_eq!(show.animations[0].time, time);
+        };
+        sim.world.cutscene = Some(cut);
+        draw(actors.shown(&sim, Some(tracks), &|_| None), 3.5);
+        sim.world.cutscene = None;
+        draw(actors.shown(&sim, None, &|_| None), 4.0);
+        actors.advance(5000.0);
+        draw(actors.shown(&sim, None, &|_| None), 9.0);
+
+        sim.choose_reply(0);
+        assert_eq!(sim.conversation_line().unwrap().line, Some(2));
+        assert!(actors.shown(&sim, None, &|_| None).actors.is_empty());
     }
 
     #[test]

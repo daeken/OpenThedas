@@ -48,6 +48,7 @@ pub mod inventory;
 pub mod journal;
 pub mod levelup;
 pub mod m2da;
+mod movement;
 mod native_queries;
 pub mod nav;
 pub mod orders;
