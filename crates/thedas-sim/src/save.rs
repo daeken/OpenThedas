@@ -339,6 +339,15 @@ impl Sim {
         {
             cut.restore_explicit_lines(&authored);
         }
+        if self.game == thedas_vfs::Game::Origins {
+            // Older saves have the parked flag but no pause timestamp. The save's
+            // clock is the earliest known point from which we can suspend the front.
+            for o in world.objects.values_mut() {
+                if o.parked.is_some() && o.commands.first().is_some_and(|c| c.due.is_some()) {
+                    o.command_parked_at.get_or_insert(world.time_ms);
+                }
+            }
+        }
         self.world = world;
         if self.game == thedas_vfs::Game::Origins && save_revision < 13 {
             for object in self.world.objects.values_mut() {
