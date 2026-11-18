@@ -123,10 +123,6 @@ pub struct Sim {
     pub training_done: u32,
     /// Objects whose scripts' engine calls are all traced (log channel -6), for debugging.
     pub watch_calls: std::collections::BTreeSet<ObjectId>,
-    /// Followers whose front command is the move [`Sim::keep_party_together`] gave them.
-    following: std::collections::BTreeSet<ObjectId>,
-    /// When followers are next looked at (see [`FOLLOW_PERIOD_MS`]).
-    next_follow_ms: u64,
     /// Tags (lowercase) whose objects' engine calls are traced too, including objects
     /// created later (an area not yet entered).
     pub watch_tags: std::collections::BTreeSet<String>,
@@ -165,9 +161,10 @@ pub struct Sim {
     /// Each area transition's interaction volume (see [`crate::contact`]) and the key of the
     /// model and placement it was built from. Not saved.
     pub(crate) contact_shapes: HashMap<ObjectId, (u64, Option<Arc<crate::collision::Collision>>)>,
-    /// Walkers held up by another creature's body: since when, and whether that was
+    /// Walkers held up by collision: since when, and whether that was
     /// reported (see `Sim::advance_movers`). Not saved.
     pub(crate) blocked_since: HashMap<ObjectId, (u64, bool)>,
+    pub(crate) movement_cache: crate::movement::MovementCache,
     /// Perception's sight-line answers between two creatures, kept while neither moves
     /// and the area's collision is the same (see `Sim::update_perception`). Not saved: a
     /// pure function of positions and geometry, worked out again when missing.
@@ -402,6 +399,24 @@ fn remaining_points(from: [f32; 3], points: &[[f32; 3]], f: f32) -> Vec<[f32; 3]
         prev = p;
     }
     points.last().map(|&p| vec![p]).unwrap_or_default()
+}
+
+/// Intermediate corners crossed during an update, followed by its proposed end.
+/// Sweeping directly to that end would cut across walls on a long tick.
+fn traversed_points(from: [f32; 3], points: &[[f32; 3]], start: f32, end: f32) -> Vec<[f32; 3]> {
+    let total = path_length(from, points);
+    let mut walked = 0.0;
+    let mut prev = from;
+    let mut out = Vec::new();
+    for &p in points {
+        walked += crate::engine::dist(prev, p);
+        if walked > total * start + 1e-5 && walked < total * end - 1e-5 {
+            out.push(p);
+        }
+        prev = p;
+    }
+    out.push(along(from, points, end));
+    out
 }
 
 /// The party formation (DAOrigins.exe's default table at 0xc0d240, chosen in 0x7605b0): each
@@ -681,8 +696,6 @@ impl Sim {
             show_gore: true,
             training_done: 0,
             watch_calls: Default::default(),
-            following: Default::default(),
-            next_follow_ms: 0,
             watch_tags: Default::default(),
             current_effect: None,
             current_effect_target: None,
@@ -702,6 +715,7 @@ impl Sim {
             door_collisions: HashMap::new(),
             contact_shapes: HashMap::new(),
             blocked_since: HashMap::new(),
+            movement_cache: Default::default(),
             sight_memo: Default::default(),
             prcscr: None,
             prcscr_ran: None,
@@ -771,6 +785,7 @@ impl Sim {
         self.door_collisions.clear();
         self.contact_shapes.clear();
         self.blocked_since.clear();
+        self.movement_cache = Default::default();
     }
 
     /// A script `location` value for a place, for tools that call engine functions taking
@@ -1145,6 +1160,35 @@ impl Sim {
 
     /// Advances time by `ms`, delivering every event that falls due and running commands.
     pub fn tick(&mut self, ms: u64) {
+        let before = self.world.hero.and_then(|id| self.world.get(id)).map(|o| {
+            (
+                o.id,
+                o.area,
+                o.position,
+                o.commands.first().map(|c| c.name.clone()),
+            )
+        });
+        self.tick_inner(ms);
+        if let Some((id, area, from, command)) = before
+            && let Some(o) = self.world.get(id)
+        {
+            let distance = crate::engine::dist(from, o.position);
+            if distance > 2.0 {
+                let text = format!(
+                    "hero position jump: {distance:.3} m in {ms} ms at {} ms, {from:?} -> {:?}, area {area:?} -> {:?}, command {command:?}",
+                    self.world.time_ms, o.position, o.area
+                );
+                log::info!("{text}");
+                self.world.trace.push(TraceEntry::Log {
+                    t: self.world.time_ms,
+                    channel: 0,
+                    text,
+                });
+            }
+        }
+    }
+
+    fn tick_inner(&mut self, ms: u64) {
         // A cutscene playing holds the world still: its own clock runs instead, and what
         // is left of the tick once it ends goes on as usual.
         let ms = match self.world.cutscene.is_some() {
@@ -1298,24 +1342,21 @@ impl Sim {
                 }
                 (_, Some((due, id))) if due <= until => {
                     self.world.time_ms = self.world.time_ms.max(due);
-                    let talking = self
+                    let moving = self
                         .world
                         .get(id)
                         .and_then(|o| o.commands.first())
-                        .is_some_and(|c| c.name == "CommandInitiateDialog");
+                        .is_some_and(|c| c.from.is_some());
                     self.advance_movers();
                     self.advance_da2_projectiles();
-                    // Body contact can extend or fail this approach while advancing.
-                    // Its old deadline cannot complete the talk or a later order.
-                    if talking
+                    // Collision can extend or fail any walk/approach. A cached deadline
+                    // must not complete it, or a replacement order, after that update.
+                    if moving
                         && self
                             .world
                             .get(id)
                             .and_then(|o| o.commands.first())
-                            .is_none_or(|c| {
-                                c.name != "CommandInitiateDialog"
-                                    || c.due.is_none_or(|d| d > self.world.time_ms)
-                            })
+                            .is_none_or(|c| c.due.is_none_or(|d| d > self.world.time_ms))
                     {
                         continue;
                     }
@@ -1389,7 +1430,17 @@ impl Sim {
                     };
                     match (approached, impact) {
                         // In reach now: the attack itself starts next.
-                        (Some(at), _) => self.move_object(id, at, None),
+                        (Some(at), _) => {
+                            // Origins' controller owns the grounded arrival position.
+                            // An approach endpoint interpolated up stairs can be above
+                            // or below the floor sampled by locomotion.
+                            let at = if da2 {
+                                at
+                            } else {
+                                self.world.get(id).map_or(at, |o| o.position)
+                            };
+                            self.move_object(id, at, None);
+                        }
                         (None, Some(cmd)) => self.finish_ability(id, &cmd),
                         (None, None) => self.finish_command(id),
                     }
@@ -2077,7 +2128,7 @@ impl Sim {
                 self.travel_arrived();
                 // `arrive` has already placed every member at a searched formation slot.
                 for id in party.iter().skip(1) {
-                    self.following.remove(id);
+                    self.world.following.remove(id);
                     if let Some(o) = self.world.get_mut(*id) {
                         // What a member was doing in the old area ends with it: a move under
                         // way would otherwise carry on from where it began there, putting
@@ -2523,7 +2574,7 @@ impl Sim {
             // A move of its own (a script's order, such as Alistair's walk to the tent after
             // Ostagar's war council) is left to finish: carried along meanwhile, it was
             // resumed when the walk stopped, and the follower walked back across the camp.
-            let following = self.following.contains(&f);
+            let following = self.world.following.contains(&f);
             let ok = self.world.get(f).is_some_and(|o| {
                 !o.dead
                     && o.area == area
@@ -2547,7 +2598,9 @@ impl Sim {
     /// place moves more than [`FOLLOW_RETARGET`] from where it is heading. Places use the
     /// ordinary follow table (`behind`), with the same membership order as
     /// [`Sim::follow_leader`]. Provisional: movement-vector heading, formation mirroring,
-    /// perception-based warping and the full native re-target rule are not modelled.
+    /// and the full native re-target rule are not modelled. Origins recovers eligible
+    /// followers outside the leader's perception with the compact formation, as
+    /// 0x7610d7..0x761133 does; it never warps a busy or fighting follower.
     pub fn keep_party_together(&mut self) {
         let combat = constant(&self.table, "GM_COMBAT");
         let Some(leader) = self.world.controlled().or(self.world.hero) else {
@@ -2562,6 +2615,7 @@ impl Sim {
         };
         // Follow moves that have ended are no longer ours.
         let ended: Vec<ObjectId> = self
+            .world
             .following
             .iter()
             .copied()
@@ -2574,29 +2628,31 @@ impl Sim {
             })
             .collect();
         for f in ended {
-            self.following.remove(&f);
+            self.world.following.remove(&f);
         }
         if combat != 0 && self.world.game_mode == combat {
             return;
         }
         // The exe looks every half second, not every frame.
-        if self.world.time_ms < self.next_follow_ms {
+        if self.world.time_ms < self.world.next_follow_ms {
             return;
         }
-        self.next_follow_ms = (self.world.time_ms / FOLLOW_PERIOD_MS + 1) * FOLLOW_PERIOD_MS;
+        self.world.next_follow_ms = (self.world.time_ms / FOLLOW_PERIOD_MS + 1) * FOLLOW_PERIOD_MS;
         let leader_walking = self.world.get(leader).is_some_and(|o| {
             o.commands
                 .first()
                 .is_some_and(|c| c.name.starts_with("CommandMoveTo") && c.from.is_some())
         });
         for (f, i) in self.follower_formation(leader) {
-            let ours = self.following.contains(&f);
+            let ours = self.world.following.contains(&f);
             let Some(o) = self.world.get(f) else { continue };
             let free = !o.dead
                 && o.area == area
                 && !o.combat.in_combat
                 && o.fields.get("FollowPartyLeader").copied().unwrap_or(1) != 0
-                && (ours || o.commands.first().is_none_or(|c| c.name == "CommandWait"));
+                && o.commands.first().is_none_or(|c| {
+                    c.name == "CommandWait" || (ours && c.name == "CommandMoveToLocation")
+                });
             if !free {
                 continue;
             }
@@ -2611,6 +2667,42 @@ impl Sim {
             }
             let ground =
                 |a: [f32; 3], b: [f32; 3]| ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2)).sqrt();
+            let eligible_distance =
+                ground(o.position, pos) >= start && ground(o.position, place) > FOLLOW_RETARGET;
+            let perceived = self
+                .world
+                .get(leader)
+                .is_some_and(|l| l.combat.perceived.contains(&f));
+            if self.game == thedas_vfs::Game::Origins && !perceived && eligible_distance {
+                let Some(area) = area else { continue };
+                let compact = formation_position(
+                    pos,
+                    facing,
+                    ARRIVAL_FORMATION[i.min(ARRIVAL_FORMATION.len() - 1)],
+                );
+                let point = match self.nav_grid(area) {
+                    Some(_) => self.safe_search(
+                        area,
+                        compact,
+                        crate::nav::SafeSearch {
+                            radius: 2.0,
+                            body_radius: self.capsule_radius(f),
+                            mover: Some(f),
+                            standable_keeps: false,
+                        },
+                    ),
+                    None => Some(compact),
+                };
+                if let Some(point) = point {
+                    if let Some(o) = self.world.get_mut(f) {
+                        o.commands.clear();
+                        o.facing = facing;
+                    }
+                    self.world.following.remove(&f);
+                    self.move_object(f, point, None);
+                }
+                continue;
+            }
             let heading = o
                 .commands
                 .first()
@@ -2620,9 +2712,7 @@ impl Sim {
             let due = match heading {
                 // A follow move under way is re-aimed at the new place (in place in the exe).
                 Some(h) => ground(h, place) > FOLLOW_RETARGET,
-                None => {
-                    ground(o.position, pos) >= start && ground(o.position, place) > FOLLOW_RETARGET
-                }
+                None => eligible_distance,
             };
             if !due {
                 continue;
@@ -2670,7 +2760,7 @@ impl Sim {
                 o.commands.clear();
                 o.commands.push(cmd);
             }
-            self.following.insert(f);
+            self.world.following.insert(f);
         }
     }
 
@@ -2822,74 +2912,54 @@ impl Sim {
     }
 
     fn route_inner(&mut self, id: ObjectId, to: [f32; 3]) -> crate::nav::Routed {
-        use crate::nav::Routed;
         self.route_approach.clear();
         let Some((from, Some(area))) = self.world.get(id).map(|o| (o.position, o.area)) else {
-            return Routed::Straight;
+            return crate::nav::Routed::Straight;
         };
+        self.route_from(id, area, from, to)
+    }
+
+    fn route_from(
+        &mut self,
+        id: ObjectId,
+        area: ObjectId,
+        from: [f32; 3],
+        to: [f32; 3],
+    ) -> crate::nav::Routed {
+        use crate::nav::Routed;
+        self.route_approach.clear();
         let Some(g) = self.nav_grid(area) else {
             return Routed::Straight;
         };
-        let mut doors = self.closed_doors(area);
-        // A mover standing in a closed door's doorway (set down there by a jump, a save, a
-        // body's push, or the door shutting on it) can walk out: the cells of that doorway
-        // on its own side of the leaf, those it reaches without the line from where it
-        // stands crossing a closed door's collision, do not block it. The far side stays
-        // shut. Without the leaf's collision (no game data) the whole doorway is open to it.
-        if let Some(own) = g.cell(from).map(|c| (c.1 * g.columns + c.0) as usize) {
-            if doors.iter().any(|d| d.1.contains(&own)) {
-                // Out of the doorway, not about in it: an end that is itself in a closed
-                // doorway is not walked to from inside one (a cell on the mover's side can
-                // reach past the leaf, and two such steps would cross it).
-                let to_cell = g.cell(to).map(|c| (c.1 * g.columns + c.0) as usize);
-                if to_cell.is_some_and(|i| doors.iter().any(|d| d.1.contains(&i))) {
-                    return Routed::Path(vec![from]);
-                }
-                let leaves = self.door_sight(area);
-                let mut eye = [from[0], from[1], from[2] + 1.0];
-                // Standing inside the leaf itself (set down there before doorways were
-                // kept clear), its side is the one it is nearest: the lines are drawn
-                // from the nearest point outside the leaf.
-                let inside = |q: [f32; 3]| {
-                    leaves
-                        .solid
-                        .iter()
-                        .any(|l| l.blocked(q, [q[0], q[1], q[2] + 0.01]))
-                };
-                if inside(eye) {
-                    'out: for k in 1..=16 {
-                        let r = k as f32 * 0.05;
-                        for a in 0..16 {
-                            let t = a as f32 * std::f32::consts::TAU / 16.0;
-                            let q = [eye[0] + r * t.dcos(), eye[1] + r * t.dsin(), eye[2]];
-                            if !inside(q) {
-                                eye = q;
-                                break 'out;
-                            }
-                        }
-                    }
-                }
-                let near = |i: usize| {
-                    let c = ((i as u32) % g.columns, (i as u32) / g.columns);
-                    let m = g.center(c);
-                    let m = [m[0], m[1], crate::nav::height(&g, c) + 1.0];
-                    !leaves.solid.iter().any(|l| l.blocked(eye, m))
-                };
-                for d in doors.iter_mut().filter(|d| d.1.contains(&own)) {
-                    let far: Vec<usize> = d.1.iter().copied().filter(|&i| !near(i)).collect();
-                    // With every line cut (deep in a thick leaf) it is let out all the same.
-                    d.1 = if far.len() == d.1.len() {
-                        Vec::new()
-                    } else {
-                        far
-                    };
-                }
-            }
+        let doors = self.closed_doors(area);
+        // A destination inside a closed doorway is not approached from inside it:
+        // another short step must not carry the body across the leaf.
+        let cell = |p| g.cell(p).map(|c| (c.1 * g.columns + c.0) as usize);
+        if cell(from).is_some_and(|i| doors.iter().any(|d| d.1.contains(&i)))
+            && cell(to).is_some_and(|i| doors.iter().any(|d| d.1.contains(&i)))
+        {
+            return Routed::Path(vec![from]);
         }
-        let blocked: std::collections::HashSet<usize> =
-            doors.iter().flat_map(|d| d.1.iter().copied()).collect();
+        let doors = self.doors_from(area, &g, from, doors);
+        let scenery = self.movement_cells(id, &g);
+        let blocked: std::collections::HashSet<usize> = doors
+            .iter()
+            .flat_map(|d| d.1.iter().copied())
+            .chain(scenery.iter().copied())
+            .collect();
         if let Some(p) = crate::nav::route_avoiding(&g, from, to, &blocked) {
             return Routed::Path(p);
+        }
+        // A locked PWK writes kind 8 into the area grid. For locating a path action,
+        // search with those door cells opened; the actual walk still stops before
+        // the first closed leaf. Never open unrelated kind-8 obstacles.
+        let mut opened = (*g).clone();
+        for &i in doors.iter().flat_map(|d| &d.1) {
+            if let Some(value) = opened.data.get_mut(i)
+                && *value & 0xf == 8
+            {
+                *value = (*value & 0xf0) | 1;
+            }
         }
         // Through closed doors that can be opened rather than locked ones, when such a route
         // exists (provisional: the original's pathfinder is not traced; this keeps a mover from
@@ -2907,14 +2977,16 @@ impl Sim {
                 })
             })
             .flat_map(|d| d.1.iter().copied())
+            .chain(scenery.iter().copied())
             .collect();
         let unlocked_route = if locked.is_empty() {
             None
         } else {
-            crate::nav::route_avoiding(&g, from, to, &locked)
+            crate::nav::route_avoiding(&opened, from, to, &locked)
         };
         let origins = self.game == thedas_vfs::Game::Origins;
-        let mut found = unlocked_route.or_else(|| crate::nav::route(&g, from, to));
+        let mut found =
+            unlocked_route.or_else(|| crate::nav::route_avoiding(&opened, from, to, &scenery));
         // Origins 0x73ea80 moves a goal that is not on walkable ground (0xa62a90) before
         // it searches: back toward the walker, up to 2 m (0x73e7f0; see
         // docs/notes/path-fallback-endpoints.md). Ambient walkers' random destinations
@@ -2926,10 +2998,14 @@ impl Sim {
         if found.is_none() && origins && !crate::nav::on_walkable(&g, to) {
             if let Some(q) = self.repair_goal(area, &g, id, from, to) {
                 to = q;
-                found = crate::nav::route(&g, from, to);
+                found = crate::nav::route_avoiding(&opened, from, to, &scenery);
             }
         }
         let Some(p) = found else {
+            if let Some((door, prefix)) = crate::nav::first_door_on_path(&g, from, &[to], &doors) {
+                self.route_approach = prefix;
+                return Routed::Door(door);
+            }
             // Origins 0x73ea80 tries a collision-tested direct path after a failed search
             // only when |start.z - goal.z| <= 0.5 (0x73ee88, constant 0xb1b7b4).
             // Status 5/8 then stops locomotion and returns INVALID_PATH (-4) in
@@ -2944,6 +3020,18 @@ impl Sim {
             if origins && !crate::nav::flat_fallback_clear(&g, from, to) {
                 return Routed::InvalidPath;
             }
+            if origins
+                && !scenery.is_empty()
+                && crate::nav::first_door_on_path(
+                    &g,
+                    from,
+                    &[to],
+                    &[(id, scenery.iter().copied().collect())],
+                )
+                .is_some()
+            {
+                return Routed::InvalidPath;
+            }
             return Routed::Straight;
         };
         if blocked.is_empty() {
@@ -2953,21 +3041,15 @@ impl Sim {
         // A destination inside a closed door (walking to the door itself) is reached at the
         // door: the walk ends where the route would enter it.
         let goal_door = cell_of(to).and_then(|i| doors.iter().find(|d| d.1.contains(&i)));
-        // The first closed door the open-door route goes through.
-        for (n, q) in p.iter().enumerate() {
-            if let Some(i) = cell_of(*q) {
-                if let Some((door, _)) = doors.iter().find(|d| d.1.contains(&i)) {
-                    if goal_door.is_some_and(|g| g.0 == *door) {
-                        let mut up_to = p[..n].to_vec();
-                        if up_to.is_empty() {
-                            up_to.push(from);
-                        }
-                        return Routed::Path(up_to);
-                    }
-                    self.route_approach = p[..n].to_vec();
-                    return Routed::Door(*door);
+        if let Some((door, mut prefix)) = crate::nav::first_door_on_path(&g, from, &p, &doors) {
+            if goal_door.is_some_and(|g| g.0 == door) {
+                if prefix.is_empty() {
+                    prefix.push(from);
                 }
+                return Routed::Path(prefix);
             }
+            self.route_approach = prefix;
+            return Routed::Door(door);
         }
         Routed::Path(p)
     }
@@ -3062,7 +3144,7 @@ impl Sim {
             })
     }
 
-    /// Keeps track of a walker held up by bodies, logging once when it has made no progress
+    /// Keeps track of a walker held up by collision, logging once when it has made no progress
     /// for [`BLOCKED_REPORT_MS`] (for finding stuck walkers).
     fn note_blocked(&mut self, id: ObjectId, progressed: bool) {
         let now = self.world.time_ms;
@@ -3078,7 +3160,10 @@ impl Sim {
                 .get(id)
                 .map(|o| o.tag.clone())
                 .unwrap_or_default();
-            let text = format!("walker {id} ({tag}) blocked by bodies for {} ms", now - e.0);
+            let text = format!(
+                "walker {id} ({tag}) blocked by collision for {} ms",
+                now - e.0
+            );
             self.world.trace.push(crate::trace::TraceEntry::Log {
                 t: now,
                 channel: 0,
@@ -3126,10 +3211,30 @@ impl Sim {
             let Some(was) = self.world.get(id).map(|o| o.position) else {
                 continue;
             };
-            // Other creatures' bodies stop it: it slides along them, and its move carries on
-            // from where it got to.
-            if let Some(slid) = self.slide_past_bodies(id, was, p) {
-                p = slid;
+            // Sweep each traversed leg, including bodies: a straight sweep from
+            // the old position to the final point would cut across route corners.
+            let mut at = was;
+            let legs = if self.game == thedas_vfs::Game::Origins {
+                traversed_points(from, &points, progress_of(from, &points, was), f)
+            } else {
+                vec![p]
+            };
+            let mut collided = false;
+            for wanted in legs {
+                let step = self.scenery_step(id, at, wanted);
+                let slid = self.slide_past_bodies(id, at, step);
+                collided |= slid.is_some();
+                at = match slid {
+                    Some(slid) => self.scenery_step(id, at, slid),
+                    None => step,
+                };
+                if ((at[0] - wanted[0]).powi(2) + (at[1] - wanted[1]).powi(2)).sqrt() > 1e-5 {
+                    collided = true;
+                    break;
+                }
+            }
+            p = at;
+            if collided {
                 // From where the walker was, not where it meant to get to: a waypoint the
                 // blocked step would have passed is still ahead of it.
                 let mut rest = remaining_points(from, &points, progress_of(from, &points, was));
@@ -3148,7 +3253,34 @@ impl Sim {
                         || ((rest[0][0] - was[0]).powi(2) + (rest[0][1] - was[1]).powi(2)).sqrt()
                             < WAYPOINT_REACHED)
                 {
+                    // A covered or nearby waypoint may still be the corner
+                    // around a wall. Drop it only if the new leg remains clear.
+                    let next = rest[1];
+                    let reached = self.scenery_step(id, p, next);
+                    if ((reached[0] - next[0]).powi(2) + (reached[1] - next[1]).powi(2)).sqrt()
+                        > 1e-5
+                    {
+                        break;
+                    }
                     rest.remove(0);
+                }
+                if self.game == thedas_vfs::Game::Origins
+                    && let (Some(&next), Some(&end), Some(area)) = (
+                        rest.first(),
+                        points.last(),
+                        self.world.get(id).and_then(|o| o.area),
+                    )
+                {
+                    let reached = self.scenery_step(id, p, next);
+                    if ((reached[0] - next[0]).powi(2) + (reached[1] - next[1]).powi(2)).sqrt()
+                        > 1e-5
+                        && let crate::nav::Routed::Path(path) = self.route_from(id, area, p, end)
+                    {
+                        // A body can push the mover behind a corner already
+                        // passed. Rebuild the remainder from the actual position;
+                        // retrying the old next point would cut through the wall.
+                        rest = path;
+                    }
                 }
                 // At the speed the move was set going at (a walk stays a walk).
                 let speed = (path_length(from, &points) * 1000.0 / (due - t0) as f32).max(0.01);
@@ -3508,6 +3640,40 @@ impl Sim {
         }
     }
 
+    /// Resolve the placeable's use slot before dispatching USE, including script orders.
+    fn use_approach(&mut self, id: ObjectId, cmd: &Command) -> Approach {
+        let Some(target) = cmd.target else {
+            return Approach::InReach;
+        };
+        let (Some(me), Some(other)) = (self.world.get(id), self.world.get(target)) else {
+            return Approach::InReach;
+        };
+        if me.area != other.area || other.kind != ObjectKind::Placeable {
+            return Approach::InReach;
+        }
+        let from = me.position;
+        let Some(point) = self.placeable_use_point(id, target) else {
+            return Approach::InReach;
+        };
+        // The actor's controller clearance around the use point, not an apr_base
+        // row accidentally indexed by the placeable's appearance number.
+        // Provisional margin until the native slot tolerance is fully recovered.
+        let reach = self.capsule_radius(id) + crate::orders::INTERACT_GAP;
+        let d = crate::engine::dist(from, point);
+        if d <= reach + 0.05 {
+            return Approach::InReach;
+        }
+        let k = (d - reach) / d;
+        Approach::Walk(
+            d - reach,
+            [
+                from[0] + (point[0] - from[0]) * k,
+                from[1] + (point[1] - from[1]) * k,
+                from[2] + (point[2] - from[2]) * k,
+            ],
+        )
+    }
+
     /// Where an attacker goes before its attack can start. Ranged attackers stop at range
     /// on the straight line. Melee attackers walk to a place on the target's melee ring, as
     /// DAOrigins.exe's attack command does (0x742fd0 queues move-to-object 0x7aa560, then
@@ -3797,6 +3963,7 @@ impl Sim {
         else {
             return;
         };
+        self.world.following.remove(&id);
         if c.name == "CommandUseAbility" {
             self.complete_combat_target(id);
         }
@@ -3983,6 +4150,7 @@ impl Sim {
                     // So does a caster out of its ability's range.
                     let approach = match cmd.name.as_str() {
                         "CommandInitiateDialog" => Some(self.talk_approach(id, &cmd)),
+                        "CommandUseObject" if !da2 => Some(self.use_approach(id, &cmd)),
                         "CommandAttack" => Some(self.approach_point(id, &cmd)),
                         "CommandUseAbility"
                             if self.game == thedas_vfs::Game::DragonAge2
@@ -4010,9 +4178,10 @@ impl Sim {
                         if let Some(stop) = stop {
                             let pos = self.world.get(id).map(|o| o.position);
                             let path = if walk.is_some() {
-                                match self.route_to(id, stop) {
-                                    crate::nav::Routed::Path(p) => p,
-                                    crate::nav::Routed::Straight
+                                match self.route_and_approach(id, stop) {
+                                    (crate::nav::Routed::Path(p), _) => p,
+                                    (crate::nav::Routed::Door(_), p) if !p.is_empty() => p,
+                                    (crate::nav::Routed::Straight, _)
                                         if cmd.name == "CommandInitiateDialog"
                                             && self
                                                 .world
@@ -4026,12 +4195,12 @@ impl Sim {
                                         self.fail_front_command(id, "COMMAND_FAILED_INVALID_PATH");
                                         continue;
                                     }
-                                    crate::nav::Routed::Straight => Vec::new(),
-                                    crate::nav::Routed::InvalidPath => {
+                                    (crate::nav::Routed::Straight, _) => Vec::new(),
+                                    (crate::nav::Routed::InvalidPath, _) => {
                                         self.fail_front_command(id, "COMMAND_FAILED_INVALID_PATH");
                                         continue;
                                     }
-                                    crate::nav::Routed::Door(door) => {
+                                    (crate::nav::Routed::Door(door), _) => {
                                         self.fail_blocked(id, door);
                                         continue;
                                     }
@@ -4043,6 +4212,16 @@ impl Sim {
                                 Some(p) if !path.is_empty() => path_length(p, &path),
                                 _ => d,
                             });
+                            if !da2
+                                && walk.is_some_and(|d| d < 0.02)
+                                && pos.is_some_and(|p| crate::engine::dist(p, stop) > 0.05)
+                            {
+                                // A repaired endpoint at our feet is not an
+                                // approach. Fail rather than retry every millisecond
+                                // while the target remains out of reach.
+                                self.fail_front_command(id, "COMMAND_FAILED_INVALID_PATH");
+                                continue;
+                            }
                             let ms = match walk {
                                 Some(d) => ((d / self.move_speed(id)) * 1000.0).max(1.0) as u64,
                                 None => 1000,
@@ -4052,7 +4231,7 @@ impl Sim {
                                 self.world.get_mut(id).and_then(|o| o.commands.first_mut())
                             {
                                 c.due = Some(due);
-                                c.approach = Some(stop);
+                                c.approach = Some(path.last().copied().unwrap_or(stop));
                                 c.from = pos.map(|p| (p, now));
                                 c.ring_wait |= wait;
                                 c.arrived = false;
@@ -4068,6 +4247,15 @@ impl Sim {
                     let attack_ms = if cmd.name == "CommandAttack"
                         || cmd.name == "CommandUseAbility"
                     {
+                        if !da2
+                            && cmd.name == "CommandAttack"
+                            && cmd
+                                .target
+                                .is_some_and(|target| !self.attack_sight_clear(id, target))
+                        {
+                            self.fail_front_command(id, "COMMAND_FAILED");
+                            continue;
+                        }
                         if !da2 {
                             commands_prepared = true;
                             // Native preparation already owns an active command when
@@ -4216,17 +4404,18 @@ impl Sim {
                         });
                         if let (Some(to), Some(p)) = (to, pos) {
                             path = match if to == p {
-                                crate::nav::Routed::Path(vec![p])
+                                (crate::nav::Routed::Path(vec![p]), Vec::new())
                             } else {
-                                self.route_to(id, to)
+                                self.route_and_approach(id, to)
                             } {
-                                crate::nav::Routed::Path(p) => p,
-                                crate::nav::Routed::Straight => Vec::new(),
-                                crate::nav::Routed::InvalidPath => {
+                                (crate::nav::Routed::Path(p), _) => p,
+                                (crate::nav::Routed::Straight, _) => Vec::new(),
+                                (crate::nav::Routed::Door(_), p) if !p.is_empty() => p,
+                                (crate::nav::Routed::InvalidPath, _) => {
                                     self.fail_front_command(id, "COMMAND_FAILED_INVALID_PATH");
                                     continue;
                                 }
-                                crate::nav::Routed::Door(door) => {
+                                (crate::nav::Routed::Door(door), _) => {
                                     self.fail_blocked(id, door);
                                     continue;
                                 }
@@ -4358,6 +4547,23 @@ impl Sim {
 
     /// Completes an object's front command: applies its movement and tells the object.
     fn finish_command(&mut self, id: ObjectId) {
+        let pending_goal = self.world.get(id).and_then(|o| {
+            let c = o.commands.first()?;
+            if !c.name.starts_with("CommandMoveTo") || c.from.is_none() || c.path.is_empty() {
+                return None;
+            }
+            let goal = c
+                .location
+                .map(|l| l.position)
+                .or_else(|| c.target.and_then(|t| self.world.get(t)).map(|t| t.position))?;
+            (crate::engine::dist(o.position, goal) > 0.05).then_some(goal)
+        });
+        if let Some(goal) = pending_goal
+            && let crate::nav::Routed::Door(door) = self.route_to(id, goal)
+        {
+            self.fail_blocked(id, door);
+            return;
+        }
         // DAOrigins.exe 0x7a4100 searches with radius 20, snap and check enabled
         // (the builder 0x670010 sets the check). Only result 1 places the jumper;
         // a standable-but-blocked point or an exhausted search fails with -1.
@@ -4399,6 +4605,7 @@ impl Sim {
         if let Some(location) = jump_location {
             cmd.location = Some(location);
         }
+        self.world.following.remove(&id);
         if cmd.from.is_some() {
             self.da2_stop_locomotion(id);
         }
@@ -4441,6 +4648,9 @@ impl Sim {
         // A command's location is where it goes, except an ability's, which is where it lands.
         let location = cmd
             .location
+            // Locomotion already placed the body at its collision-tested route end.
+            // The requested goal can be in a wall, another floor, or beyond a door.
+            .filter(|_| !(walked && cmd.from.is_some()))
             .filter(|_| cmd.name != "CommandUseAbility")
             .filter(|_| {
                 !(self.game == thedas_vfs::Game::Origins
@@ -8652,6 +8862,12 @@ mod tests {
                     let o = s.world.get_mut(leader).unwrap();
                     o.position = pos;
                     o.facing = 270.0;
+                    o.combat.perceived = members
+                        .iter()
+                        .copied()
+                        .chain([escort])
+                        .filter(|&id| id != leader)
+                        .collect();
                     if timed {
                         s.keep_party_together();
                     } else {
@@ -8703,6 +8919,7 @@ mod tests {
                 o.position = [20.0, 30.0, 0.0];
             }
             s.world.get_mut(members[0]).unwrap().position = [0.0; 3];
+            s.world.get_mut(members[0]).unwrap().combat.perceived = members[1..].to_vec();
             s.world.get_mut(members[1]).unwrap().dead = true;
             s.world.get_mut(members[2]).unwrap().area = None;
             s.world
@@ -8751,6 +8968,114 @@ mod tests {
         assert!(near(behind([10.0, 0.0, 1.0], 270.0, 0), [9.0, 1.5, 1.0]));
         // Past the table, the last slot.
         assert_eq!(behind([0.0; 3], 0.0, 30), behind([0.0; 3], 0.0, 10));
+    }
+
+    #[test]
+    fn doors_regression_b_unseen_followers_catch_up_but_busy_followers_stay() {
+        let mut s = sim();
+        let area = s.world.spawn(ObjectKind::Area, "a");
+        let hero = s.world.spawn(ObjectKind::Creature, "hero");
+        let follower = s.world.spawn(ObjectKind::Creature, "follower");
+        let busy = s.world.spawn(ObjectKind::Creature, "busy");
+        s.world.hero = Some(hero);
+        s.world.get_mut(hero).unwrap().followers = vec![follower, busy];
+        for id in [hero, follower, busy] {
+            s.world.get_mut(id).unwrap().area = Some(area);
+        }
+        s.world.get_mut(follower).unwrap().position = [30.0, 0.0, 0.0];
+        let o = s.world.get_mut(busy).unwrap();
+        o.position = [30.0, 0.0, 0.0];
+        s.order_move(busy, [31.0, 0.0, 0.0]);
+        s.keep_party_together();
+        assert_eq!(
+            s.world.get(follower).unwrap().position,
+            formation_position([0.0; 3], 0.0, ARRIVAL_FORMATION[0])
+        );
+        assert!(s.world.get(follower).unwrap().commands.is_empty());
+        assert_eq!(s.world.get(busy).unwrap().position, [30.0, 0.0, 0.0]);
+        assert_eq!(s.world.get(busy).unwrap().commands.len(), 1);
+    }
+
+    #[test]
+    fn doors_regression_e_large_hero_steps_are_recorded_with_the_tick() {
+        let mut s = sim();
+        let area = s.world.spawn(ObjectKind::Area, "a");
+        let hero = s.world.spawn(ObjectKind::Creature, "hero");
+        s.world.hero = Some(hero);
+        s.world.get_mut(hero).unwrap().area = Some(area);
+        s.world.trace.keep = true;
+        s.order_move(hero, [10.0, 0.0, 0.0]);
+        s.tick(500);
+        s.tick(16);
+        let jumps: Vec<_> = s
+            .world
+            .trace
+            .entries
+            .iter()
+            .filter_map(|e| match e {
+                TraceEntry::Log { text, .. } if text.starts_with("hero position jump:") => {
+                    Some(text)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(jumps.len(), 1);
+        assert!(jumps[0].contains("500 ms") && jumps[0].contains("CommandMoveToLocation"));
+    }
+
+    #[test]
+    fn doors_regression_b_loading_restores_follow_ownership_and_timer() {
+        let mut s = sim();
+        let area = s.world.spawn(ObjectKind::Area, "a");
+        let hero = s.world.spawn(ObjectKind::Creature, "hero");
+        let follower = s.world.spawn(ObjectKind::Creature, "follower");
+        s.world.hero = Some(hero);
+        for id in [hero, follower] {
+            s.world.get_mut(id).unwrap().area = Some(area);
+        }
+        s.world.get_mut(hero).unwrap().followers = vec![follower];
+        s.world.get_mut(hero).unwrap().combat.perceived = vec![follower];
+        s.world.get_mut(follower).unwrap().position = [30.0, 0.0, 0.0];
+        s.keep_party_together();
+        let save = s.save_json().unwrap();
+        assert!(s.world.following.contains(&follower));
+        let next = s.world.next_follow_ms;
+        s.world.time_ms = 20_000;
+        s.world.next_follow_ms = 20_500;
+        s.world.following.clear();
+        s.load_json(&save).unwrap();
+        assert_eq!(s.world.next_follow_ms, next);
+        assert!(s.world.following.contains(&follower));
+    }
+
+    #[test]
+    fn doors_regression_b_an_explicit_move_is_not_an_owned_follow_move() {
+        let mut s = sim();
+        let area = s.world.spawn(ObjectKind::Area, "a");
+        let hero = s.world.spawn(ObjectKind::Creature, "hero");
+        let follower = s.world.spawn(ObjectKind::Creature, "follower");
+        s.world.hero = Some(hero);
+        for id in [hero, follower] {
+            s.world.get_mut(id).unwrap().area = Some(area);
+        }
+        s.world.get_mut(hero).unwrap().followers = vec![follower];
+        s.world.get_mut(hero).unwrap().combat.perceived = vec![follower];
+        s.world.get_mut(follower).unwrap().position = [30.0, 0.0, 0.0];
+        s.keep_party_together();
+        assert!(s.world.following.contains(&follower));
+        s.order_move(follower, [32.0, 0.0, 0.0]);
+        s.world.get_mut(hero).unwrap().combat.perceived.clear();
+        s.world.time_ms = 500;
+        s.keep_party_together();
+        assert_eq!(s.world.get(follower).unwrap().position, [30.0, 0.0, 0.0]);
+        assert!(!s.world.following.contains(&follower));
+        assert_eq!(
+            s.world.get(follower).unwrap().commands[0]
+                .location
+                .unwrap()
+                .position,
+            [32.0, 0.0, 0.0]
+        );
     }
 
     #[test]

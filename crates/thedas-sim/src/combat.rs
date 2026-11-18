@@ -2688,7 +2688,12 @@ impl Sim {
     /// (`PERSPACE`: 0.35 for humans and walking corpses, 0.4 for hurlocks, 0.95 for an
     /// ogre), else [`DEFAULT_RADIUS`].
     pub fn body_radius(&self, id: ObjectId) -> f32 {
-        let app = self.world.get(id).map(|o| o.appearance).filter(|&a| a > 0);
+        let app = self
+            .world
+            .get(id)
+            .filter(|o| self.game != thedas_vfs::Game::Origins || o.kind == ObjectKind::Creature)
+            .map(|o| o.appearance)
+            .filter(|&a| a > 0);
         app.and_then(|a| {
             let t = self.world.tables().get(0, "apr_base")?;
             match t.cell("PERSPACE", a as i64)? {

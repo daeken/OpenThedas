@@ -141,6 +141,10 @@ impl Sim {
         if matches!(behavior, 1 | 2) {
             // 0x5ca4c0: both paths prune ordinary waiting entries. The current
             // command is separate; equality prevents clearing it.
+            // A pending follow move can also be pruned before it starts.
+            if active == 0 && o.commands.first().is_some_and(|old| !old.is_static) {
+                self.world.following.remove(&who);
+            }
             let mut index = 0;
             self.world.get_mut(who).unwrap().commands.retain(|old| {
                 let keep = index < active || old.is_static;
@@ -161,6 +165,7 @@ impl Sim {
                 });
             if clear {
                 let old = self.world.get_mut(who).unwrap().commands.remove(0);
+                self.world.following.remove(&who);
                 if old.from.is_some() {
                     self.da2_stop_locomotion(who);
                 }
@@ -190,10 +195,14 @@ impl Sim {
             command: c.name.clone(),
             status: "queued".into(),
         });
+        let commands = &self.world.get(who).unwrap().commands;
+        let active = usize::from(commands.first().is_some_and(|c| c.due.is_some()));
+        if commands.is_empty() || (front == 1 && active == 0) {
+            self.world.following.remove(&who);
+        }
         let o = self.world.get_mut(who).unwrap();
         if front == 1 {
-            let at = usize::from(o.commands.first().is_some_and(|c| c.due.is_some()));
-            o.commands.insert(at, c);
+            o.commands.insert(active, c);
         } else {
             o.commands.push(c);
         }
@@ -327,6 +336,43 @@ mod tests {
         // Matching uses payload, not the active copy's due/readiness fields.
         assert!(add(&mut s, who, active.clone(), 1, false, 1));
         assert_eq!(s.world.get(who).unwrap().commands, vec![active]);
+    }
+
+    #[test]
+    fn script_order_releases_follow_ownership_when_it_replaces_the_follow_move() {
+        let (mut s, who) = sim();
+        let follow = Command {
+            name: "CommandMoveToLocation".into(),
+            ty: 2,
+            due: Some(10_000),
+            ..Default::default()
+        };
+        s.world.get_mut(who).unwrap().commands = vec![follow.clone()];
+        s.world.following.insert(who);
+        assert!(add(&mut s, who, wait(10.), 1, false, 0));
+        assert!(s.world.following.contains(&who));
+        assert_eq!(s.world.get(who).unwrap().commands[0], follow);
+        assert!(add(&mut s, who, wait(20.), 1, false, 1));
+        assert!(!s.world.following.contains(&who));
+
+        let pending = Command {
+            due: None,
+            ..follow
+        };
+        s.world.get_mut(who).unwrap().commands = vec![pending.clone()];
+        s.world.following.insert(who);
+        assert!(add(&mut s, who, wait(30.), 1, false, 0));
+        assert!(!s.world.following.contains(&who));
+
+        let fixed = Command {
+            is_static: true,
+            ..wait(40.)
+        };
+        s.world.get_mut(who).unwrap().commands = vec![pending, fixed.clone()];
+        s.world.following.insert(who);
+        assert!(add(&mut s, who, wait(50.), 0, false, 1));
+        assert_eq!(s.world.get(who).unwrap().commands, vec![fixed, wait(50.)]);
+        assert!(!s.world.following.contains(&who));
     }
 
     #[test]
