@@ -2615,6 +2615,42 @@ mod tests {
     }
 
     #[test]
+    fn origins_retreat_finishes_at_the_repaired_route_end() {
+        use crate::world::{Command, ObjectKind};
+        let (mut s, mover) = walled(|x, _| (x >= 4).then_some((9, 0.0)));
+        let area = s.world.area.unwrap();
+        let target = s.world.spawn(ObjectKind::Creature, "threat");
+        let t = s.world.get_mut(target).unwrap();
+        t.area = Some(area);
+        t.position = [0.5, 1.5, 0.0];
+        let m = s.world.get_mut(mover).unwrap();
+        m.position = [2.5, 1.5, 0.0];
+        m.commands.push(Command {
+            ty: 21,
+            name: "CommandMoveAwayFromObject".into(),
+            target: Some(target),
+            seconds: 4.0,
+            ints: vec![1],
+            ..Default::default()
+        });
+        s.tick(0);
+        let retreat = &s.world.get(mover).unwrap().commands[0];
+        let requested = retreat.location.unwrap().position;
+        let routed_end = *retreat.path.last().expect("route to repaired goal");
+        let grid = s.nav_grid(area).unwrap();
+        assert!(!on_walkable(&grid, requested), "{requested:?}");
+        assert!(on_walkable(&grid, routed_end) && routed_end[0] > 2.5);
+        s.tick(3_000);
+        let m = s.world.get(mover).unwrap();
+        assert!(m.commands.is_empty());
+        assert!(
+            crate::engine::dist(m.position, routed_end) < 0.01,
+            "retreat ended at {:?}, not the resolved route end {routed_end:?}",
+            m.position
+        );
+    }
+
+    #[test]
     fn doors_regression_e_a_distant_start_cell_is_not_a_route_origin() {
         let mut g = floor(10, 3);
         for y in 0..g.rows {
