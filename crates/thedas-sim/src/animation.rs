@@ -420,12 +420,16 @@ mod tests {
         assert!(s.world.get(c).unwrap().commands.is_empty());
         assert_eq!(s.world.get(c).unwrap().locals.ints["result"], 1);
         let cmd = command(&mut s, 10, -1, 1);
-        s.world.get_mut(c).unwrap().commands.push(cmd);
+        let target = s.world.spawn(ObjectKind::Creature, "target");
+        let actor = s.world.get_mut(c).unwrap();
+        actor.combat.target = Some(target);
+        actor.commands.push(cmd);
         s.tick(1200);
         let actor = s.world.get(c).unwrap();
         assert!(actor.commands.is_empty());
         assert_eq!(actor.looping_animation.as_ref().unwrap().ints[0], 11);
         assert_eq!(actor.locals.ints["result"], 2);
+        assert_eq!(s.script_attack_target(c), Some(target));
         let saved = serde_json::to_string(&s.world).unwrap();
         let tables = s.world.tables.clone();
         s.world = serde_json::from_str(&saved).unwrap();
@@ -449,6 +453,7 @@ mod tests {
         s.tick(100);
         assert!(s.world.get(c).unwrap().commands.is_empty());
         assert!(s.world.get(c).unwrap().looping_animation.is_some());
+        assert_eq!(s.script_attack_target(c), Some(target));
         let cmd = command(&mut s, 19, 0, 0);
         s.world.get_mut(c).unwrap().commands.push(cmd);
         s.tick(1);
