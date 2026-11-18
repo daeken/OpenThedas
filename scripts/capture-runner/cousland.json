@@ -1,0 +1,15 @@
+{
+  "steps": "run 500",
+  "save": "cousland-save.json",
+  "options": {
+    "size": "1280x720",
+    "time": 3,
+    "renderer": "deferred"
+  },
+  "cameras": [
+    {
+      "name": "cousland-hall",
+      "camera": "-42.68,-3.63,2.01,2.5,-5"
+    }
+  ]
+}
