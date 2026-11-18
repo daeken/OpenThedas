@@ -32,7 +32,9 @@ use crate::fmath::DetMath;
 use serde::{Deserialize, Serialize};
 use thedas_formats::gda::Cell;
 use thedas_script::vm::{OBJECT_INVALID, ObjectId};
+use thedas_vfs::Game;
 
+use crate::m2da::Table;
 use crate::sim::Sim;
 use crate::world::{Effect, ObjectKind};
 
@@ -40,6 +42,9 @@ use crate::world::{Effect, ObjectKind};
 pub const VFX_PERSISTENT_TABLE: i32 = 96;
 /// `VFX Persistent`'s script column (name unknown).
 const COL_SCRIPT: u32 = 0x53e7_6f70;
+// DragonAge2.exe 0x541484 and 0x5414a7 read these numeric columns.
+const DA2_COL_SHAPE: u32 = 0x4de7_0e62;
+const DA2_COL_RADIUS: u32 = 0xad5f_b9f8;
 /// The effect type of `EffectAreaOfEffect` (`Area of Effect (AOE)` in effects.gda).
 pub const EFFECT_TYPE_AOE: i32 = 5;
 
@@ -93,7 +98,52 @@ impl AoeShape {
     }
 }
 
+fn da2_sphere(table: Option<&Table>, row: i32) -> Option<AoeShape> {
+    let table = table?;
+    let row = i64::from(row);
+    (crate::engine::cell_int(table.cell_by_hash(DA2_COL_SHAPE, row)) == 1).then(|| {
+        AoeShape::Circle(crate::engine::cell_float(
+            table.cell_by_hash(DA2_COL_RADIUS, row),
+        ))
+    })
+}
+
 impl Sim {
+    /// Older DA2 saves decoded the numeric shape as a string and stored no geometry.
+    /// Rebuild that geometry without replaying effect creation or its first heartbeat.
+    pub(crate) fn restore_da2_aoe_spheres(&mut self) {
+        let table = self.world.tables.get(VFX_PERSISTENT_TABLE, "");
+        for state in self
+            .world
+            .objects
+            .values_mut()
+            .filter_map(|o| o.aoe.as_mut())
+        {
+            if state.shape == AoeShape::None
+                && let Some(shape) = da2_sphere(table.as_deref(), state.row)
+            {
+                state.shape = shape;
+            }
+        }
+    }
+
+    fn aoe_contains_creature(
+        &self,
+        shape: AoeShape,
+        center: [f32; 3],
+        facing: f32,
+        creature: ObjectId,
+        position: [f32; 3],
+    ) -> bool {
+        if self.game == Game::DragonAge2
+            && let AoeShape::Circle(radius) = shape
+        {
+            // 0x55e723 and 0x52c9c0: the sphere reaches the creature's personal space.
+            return crate::engine::dist(center, position) <= radius + self.body_radius(creature);
+        }
+        shape.contains(center, facing, position)
+    }
+
     /// Makes the area of effect an effect of type 5 leaves at `position` in `area` (facing
     /// `facing`), or on `follows`; returns the object. `expires` is when a location's
     /// temporary effect runs out.
@@ -126,6 +176,11 @@ impl Sim {
                 length: float("Length"),
             },
             _ => AoeShape::None,
+        };
+        let shape = if self.game == Game::DragonAge2 {
+            da2_sphere(table.as_deref(), row).unwrap_or(shape)
+        } else {
+            shape
         };
         let label = text(table.as_ref().and_then(|t| t.cell("Label", row as i64)));
         let script = effect
@@ -256,7 +311,7 @@ impl Sim {
             if c_area != area {
                 continue;
             }
-            let inside = state.shape.contains(center, facing, at);
+            let inside = self.aoe_contains_creature(state.shape, center, facing, c, at);
             let member = members.contains(&c);
             if inside && !member {
                 members.push(c);
@@ -304,10 +359,9 @@ impl Sim {
         // Taken out first, so a script that destroys it again while it goes finds nothing.
         let Some(state) = o.aoe.take() else { return };
         for &c in &state.members {
-            let inside = self
-                .world
-                .get(c)
-                .is_some_and(|m| state.shape.contains(center, facing, m.position));
+            let inside = self.world.get(c).is_some_and(|m| {
+                self.aoe_contains_creature(state.shape, center, facing, c, m.position)
+            });
             if inside && self.world.get(id).is_some() {
                 let ev = self.aoe_event(id, &state, c, false);
                 self.deliver(id, ev, script.clone());
@@ -429,6 +483,40 @@ mod tests {
         let o = s.world.get_mut(c).unwrap();
         (o.area, o.position) = (Some(area), p);
         c
+    }
+
+    #[test]
+    fn da2_persistent_spheres_read_numeric_rows_and_include_personal_space() {
+        let mut s = sim();
+        s.game = Game::DragonAge2;
+        let tables = crate::m2da::Tables::empty();
+        tables.insert(
+            "#96",
+            &["#4de70e62", "#ad5fb9f8"],
+            vec![(501, vec![Cell::Int(1), Cell::Float(1.25)])],
+        );
+        s.world.tables = Arc::new(tables);
+        let area = s.world.spawn(ObjectKind::Area, "area");
+        let overlapping = creature(&mut s, area, [0.0, 0.0, 1.75]);
+        let distant = creature(&mut s, area, [0.0, 0.0, 2.0]);
+        let effect = Effect {
+            ints: vec![501],
+            ..Default::default()
+        };
+        let aoe = s.create_aoe(&effect, area, [0.0; 3], 0.0, None, None);
+        assert_eq!(s.aoe_members(aoe), vec![overlapping]);
+        let state = s.world.get_mut(aoe).unwrap().aoe.as_mut().unwrap();
+        assert_eq!(state.shape, AoeShape::Circle(1.25));
+
+        // Old DA2 snapshots retain the row while losing the shape and its members.
+        state.shape = AoeShape::None;
+        state.members.clear();
+        let saved = s.save_json().unwrap();
+        s.load_json(&saved).unwrap();
+        assert!(s.aoe_members(aoe).is_empty());
+        s.update_aoes();
+        assert_eq!(s.aoe_members(aoe), vec![overlapping]);
+        assert!(!s.aoe_members(aoe).contains(&distant));
     }
 
     /// A queued event: (type, target, creator, integer 0, object 0).
