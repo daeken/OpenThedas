@@ -199,6 +199,22 @@ class RunnerTests(unittest.TestCase):
                 self.assertEqual(self.invoke(), 2)
                 self.assertFalse(self.output.exists())
 
+    def test_explicit_movies_and_replay_steps_cannot_mix(self):
+        original = self.spec
+        movies = {"ui": "hud"}
+        self.spec = original | {"options": original["options"] | movies}
+        self.assertEqual(self.invoke(), 2)
+        self.assertFalse(self.output.exists())
+
+        # A per-camera replay and a per-side movie override still conflict.
+        self.spec = original | {"steps": "", "candidate": {"options": movies}}
+        self.assertEqual(self.invoke(), 2)
+        self.assertFalse(self.output.exists())
+
+        # A static movie capture remains valid, including one over a saved scene.
+        self.spec = self.spec | {"cameras": [{"name": "movie"}]}
+        self.assertEqual(self.invoke("--repeat", "1"), 0)
+
     def test_invalid_cli_controls(self):
         for extra in (("--threshold", "-1"), ("--amplify", "nan"), ("--repeat", "0"),
                       ("--repeat-threshold", "256"),

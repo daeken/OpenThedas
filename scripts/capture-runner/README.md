@@ -24,18 +24,11 @@ save paths in scenarios are relative to the JSON file. CLI paths are relative to
 the current directory. Output must be a **new** directory: existing runs are
 never overwritten. Keep output outside the repository; it includes a save copy.
 
-On the shared development Mac, run the entire command through `cargo-slot.sh`
-and `scripts/capped.sh` from the shared testdata, with enough `LIM_T` for all
-captures. Use the job's own target directory, `-j 2`, and `cargo-slot.sh` when
-building binaries. The runner starts only one engine process at a time.
-
-```sh
-LIM_T=3600 "$BRIEFS/cargo-slot.sh" "$TESTDATA/scripts/capped.sh" \
-  .capture-venv/bin/python scripts/capture_runner.py scripts/capture-runner/cousland.json \
-  --save "$TESTDATA/01_cousland_start.json" --install "$GAME" \
-  --baseline "$BASELINE_APP" --candidate "$CANDIDATE_APP" \
-  --output "$TESTDATA/codex-captures/my-stream/cousland-002"
-```
+On the shared development Mac, Marten agents run the comparison through
+`openthedas_game_slot` and build the binaries separately through
+`openthedas_cargo_slot`, reusing their assigned target directory. Do not nest
+slots. The runner starts only one engine process at a time; `--timeout` bounds
+each capture, not the entire comparison.
 
 For a commit comparison, build that commit's `thedas-app` in an isolated checkout
 and supply its binary and commit label with `--baseline` and `--baseline-label`.
@@ -86,6 +79,8 @@ can also compare renderers or environment options:
   `lighting`, `detail`, `shaders`, `fov`, `antialiasing`, `frame-effects`, `ui`,
   `ui-frames`, `vfx`. Spell keys as in the engine CLI. Baseline/candidate can each
   override `options` and `env`; both must use the same size. Unknown keys fail.
+  An explicit `ui` option loads standalone movies instead of attaching the game
+  UI. Use it for a static capture; the runner rejects it with any replay steps.
 - Defaults are 1280x720, shader clock 3 seconds, faithful, medium detail,
   original shaders, FOV 60, AA 1, frame effects on, UI frames 30. Engine defaults
   apply to omitted optional switches. With a save, `run` steps advance the shader
@@ -108,10 +103,12 @@ are isolated in the child process. The caller's environment is untouched.
 `THEDAS_HIDDEN_WINDOW=1` and `THEDAS_NO_AUDIO=1` are forced for every engine launch.
 `--capture` itself creates no window, so captures do not require a display.
 
-The live `--control` channel shares input syntax but its window advances between
-requests; socket timing does not define a repeatable frame. This runner therefore
-uses the headless path instead of polling live screenshots. It is intended for
-fixed rendering checkpoints, not timing tests of the window's loading movies.
+This runner uses the headless capture path, not the live `--control` path.
+Headless checkpoints are not evidence of live-window timing or presentation
+parity: for example, a standing particle effect may not be visible in a short
+capture before its emitters warm up. For such cases, cross-check a settled
+hidden live frame using the fixed-clock control mode where available (see
+[fixed-clock playthrough control](../../docs/notes/control-playthrough.md)).
 
 By default every side/camera is captured twice. Repeats must match **exact RGB
 pixels**, independently of the comparison threshold; a mismatch writes the report

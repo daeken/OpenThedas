@@ -140,6 +140,11 @@ def load_spec(path, save_override=None):
             raise ValueError("camera steps must be a string")
         if "area" in spec and camera.get("steps", "").strip():
             raise ValueError("camera steps need a save")
+    if spec.get("steps", "").strip() or any(c.get("steps", "").strip() for c in cameras):
+        for side in ("baseline", "candidate"):
+            if "ui" in spec[side]["options"]:
+                raise ValueError(f"{side}: steps cannot be combined with options.ui "
+                                 "(an explicit UI movie disables attached game UI)")
     return spec
 
 
