@@ -3545,8 +3545,8 @@ pub fn call(
             let c = h
                 .object(obj(a, 0))
                 .and_then(|o| o.commands.first())
-                // Origins 0x73c5f0 reads only the separate active executor.
-                .filter(|c| h.sim.game != thedas_vfs::Game::Origins || c.due.is_some())
+                // Origins 0x73c5f0 and DA2 0x5a8d40 read the separate active executor.
+                .filter(|c| c.due.is_some())
                 .cloned();
             let hd = c.map(|c| h.sim.world.store(EngineData::Command(c)));
             ok(Value::Engine {
@@ -9643,10 +9643,7 @@ mod tests {
             // Before the scheduler starts it, the front is still waiting.
             assert_eq!(size(&mut s, who), Some(Value::Int(1)));
             assert_eq!(command_at(&mut s, who, 0).unwrap().seconds, 1.);
-            assert_eq!(
-                current(&mut s),
-                (game == thedas_vfs::Game::DragonAge2).then_some(1.)
-            );
+            assert_eq!(current(&mut s), None);
             s.tick(100);
             assert_eq!(current(&mut s), Some(1.));
             assert_eq!(size(&mut s, who), Some(Value::Int(0)));
@@ -16397,5 +16394,50 @@ mod coverage_tests {
         }
         assert_eq!(s.save_json().unwrap(), before);
         assert!(s.world.trace.unimplemented.is_empty());
+    }
+
+    #[test]
+    fn da2_current_command_excludes_unstarted_front_and_preserves_ready_executor() {
+        fn current(s: &mut Sim, who: ObjectId) -> Option<Command> {
+            let Some(Value::Engine { handle, .. }) =
+                run(s, who, "GetCurrentCommand", &[Value::Object(who)])
+            else {
+                panic!("expected command");
+            };
+            match s.world.handle(handle) {
+                Some(EngineData::Command(c)) => Some(c.clone()),
+                _ => None,
+            }
+        }
+        for game in [thedas_vfs::Game::Origins, thedas_vfs::Game::DragonAge2] {
+            let table = EngineTable::parse(
+                b"#define ENGINE_STRUCTURE_2 command\ncommand GetCurrentCommand(object o)=539;\n",
+            )
+            .unwrap();
+            let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(table), 1);
+            s.game = game;
+            let who = s.world.spawn(ObjectKind::Creature, "actor");
+            assert!(current(&mut s, who).is_none());
+            assert!(current(&mut s, OBJECT_INVALID).is_none());
+            let waiting = Command {
+                name: "CommandWait".into(),
+                ty: 13,
+                seconds: 1.,
+                ..Default::default()
+            };
+            s.world.get_mut(who).unwrap().commands = vec![waiting.clone()];
+            assert_eq!(current(&mut s, who), None);
+            let active = Command {
+                due: Some(1000),
+                cancellable: true,
+                ..waiting.clone()
+            };
+            s.world.get_mut(who).unwrap().commands = vec![active.clone(), waiting.clone()];
+            assert_eq!(current(&mut s, who), Some(active.clone()));
+            s.world = serde_json::from_str(&serde_json::to_string(&s.world).unwrap()).unwrap();
+            assert_eq!(current(&mut s, who), Some(active.clone()));
+            s.world.get_mut(who).unwrap().commands = vec![waiting.clone(), active];
+            assert_eq!(current(&mut s, who), None);
+        }
     }
 }
