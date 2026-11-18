@@ -521,6 +521,23 @@ impl Stage {
         // _root.DialogBoxCallbackN`). Provisional: the value's form (the file name with its
         // extension) is inferred from the movies.
         m.set("_root.Filename", UiValue::String(name.to_string()));
+        // Conversation.StartScene derives the letterbox height from this aspect ratio.
+        // On a wider viewport its usual 16:9 value produces a negative height, which
+        // leaves the authored black bars at full size and shifts the replies down.
+        const ASPECT: &str = "_global.GUISystem.AspectRatio";
+        if name == "conversation.gfx"
+            && let UiValue::Number(aspect) = m.get(ASPECT)
+        {
+            let size = m.size();
+            let scale = crate::stage_scale(size, m.authored);
+            let width = f64::from(size.0) / scale;
+            let height = f64::from(size.1) / scale;
+            if width / aspect > height {
+                // Round the ratio up so a zero bar height cannot round negative.
+                let viewport_aspect = width / height * (1.0 + f64::EPSILON);
+                m.set(ASPECT, UiValue::Number(viewport_aspect));
+            }
+        }
         m.call(START_SCENE, &[]);
         m.call(crate::avm1::INSTALL, &[]);
         // Movies anchor their elements to the screen when the engine asks them to lay out.
@@ -1166,6 +1183,122 @@ fn is_hide_request(m: &GameMessage) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires THEDAS_INSTALL and an offscreen GPU"]
+    fn conversation_replies_fit_while_they_fade_in() {
+        let install = thedas_vfs::DaoInstall::open(
+            std::env::var_os("THEDAS_INSTALL").expect("THEDAS_INSTALL"),
+        )
+        .unwrap();
+        let vfs = Arc::new(
+            install
+                .play_vfs(thedas_vfs::install::TextureQuality::High)
+                .unwrap(),
+        );
+        let (device, queue) = thedas_gfx::gpu::test_device();
+        let gpu = Gpu { device, queue };
+        const MOVIE: &str = "conversation.gfx";
+        const BUTTONS: &str = "_level0.ButtonContainer_mc.Buttons_mc";
+        for size in [
+            (1280, 720),
+            (1600, 900),
+            (2560, 1440),
+            (1024, 768),
+            (1920, 800),
+        ] {
+            for count in [4, 5] {
+                let mut stage = Stage::new(gpu.clone(), &vfs, size);
+                stage.bridge.set_values([
+                    (
+                        "GameModeController.CurrentGameMode".into(),
+                        UiValue::Number(4.0),
+                    ),
+                    (
+                        "Conversation.Responses".into(),
+                        UiValue::Number(f64::from(count)),
+                    ),
+                    ("Conversation.ResponsesReady".into(), UiValue::Number(0.0)),
+                    (
+                        "Conversation.NPCLine".into(),
+                        UiValue::String("What do you think?".into()),
+                    ),
+                ]);
+                for i in 0..count {
+                    stage.bridge.set_values([
+                        (
+                            format!("Conversation.Responses.{i}.Text"),
+                            UiValue::String("We should decide where to go before we leave.".into()),
+                        ),
+                        (
+                            format!("Conversation.Responses.{i}.Icon"),
+                            UiValue::Number(0.0),
+                        ),
+                    ]);
+                }
+                stage.open(MOVIE).unwrap();
+                let authored = stage.movies[0].authored;
+                let scale = crate::stage_scale(size, authored);
+                let bottom = (authored.1 + f64::from(size.1) / scale) / 2.0;
+                let frame_ms = 1000.0 / 30.0;
+                for _ in 0..20 {
+                    stage.tick(frame_ms);
+                }
+                stage
+                    .bridge
+                    .set_value("Conversation.ResponsesReady", UiValue::Number(1.0));
+                let mut saw_fade = false;
+                let mut saw_settled = false;
+                for _ in 0..20 {
+                    stage.tick(frame_ms);
+                    let UiValue::String(tree) =
+                        stage.movies[0].call("_global.thedas_tree_list", &[])
+                    else {
+                        panic!("conversation display tree is unavailable");
+                    };
+                    let rows = tree.split(';').filter_map(|row| row.split_once('|'));
+                    let Some((_, group)) = rows.clone().find(|(path, _)| *path == BUTTONS) else {
+                        continue;
+                    };
+                    let alpha: f64 = group.rsplit('|').next().unwrap().parse().unwrap();
+                    if alpha <= 0.0 {
+                        continue;
+                    }
+                    saw_fade |= alpha < 100.0;
+                    saw_settled |= alpha == 100.0;
+                    for suffix in [".RollOver_mc.Text_mc", ".HitArea_mc"] {
+                        let elements = rows.clone().filter(|(path, _)| {
+                            path.starts_with(BUTTONS) && path.ends_with(suffix)
+                        });
+                        let mut visible = 0;
+                        for (path, bounds) in elements {
+                            let y_max: f64 = bounds.split('|').nth(3).unwrap().parse().unwrap();
+                            assert!(
+                                y_max <= bottom,
+                                "{size:?}, {count} replies, alpha {alpha}: {path} ends at {y_max}, below {bottom}"
+                            );
+                            visible += 1;
+                        }
+                        assert_eq!(visible, count, "{size:?}, alpha {alpha}, {suffix}");
+                    }
+                }
+                assert!(saw_fade && saw_settled, "{size:?}, {count} replies");
+
+                let hit = stage.movies[0]
+                    .focus_targets()
+                    .into_iter()
+                    .find(|target| target.path.contains(&format!(".Response{count}_mc")))
+                    .expect("last reply is clickable");
+                let [x0, y0, x1, y1] = hit.rect;
+                stage.click_as(crate::avm1::MOUSE_LEFT, (x0 + x1) / 2.0, (y0 + y1) / 2.0);
+                assert!(stage.tick(frame_ms).iter().any(|message| matches!(
+                    message,
+                    GameMessage::Send(name, args)
+                        if name == "Conversation.SelectResponse" && args == &[(count - 1).to_string()]
+                )));
+            }
+        }
+    }
 
     #[test]
     fn multiply_darkens_by_the_colour_and_leaves_clear_pixels_alone() {
