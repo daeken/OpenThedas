@@ -1470,6 +1470,7 @@ impl Sim {
         self.decay_corpses(elapsed);
         self.kick_ambient_creatures(elapsed);
         self.advance_script_heartbeats(elapsed);
+        self.advance_placeable_animations();
         self.update_threat(elapsed);
         self.expire_effects();
         self.update_aoes();
