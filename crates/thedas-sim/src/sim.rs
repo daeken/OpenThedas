@@ -4661,7 +4661,10 @@ impl Sim {
         // and is not set down at the end asked for, inside the doorway or past the leaf. (A
         // held stick aims three metres ahead, often into a doorway: the hero was put in a
         // locked door's doorway, or through it.) Jumps go where they say.
-        let walked = cmd.name.starts_with("CommandMoveTo");
+        // Origins' retreat also finishes through the path follower (type 21 builds
+        // action 0x0f at 0x7470a0). Keep its resolved endpoint, not the raw goal.
+        let walked = cmd.name.starts_with("CommandMoveTo")
+            || (self.game == thedas_vfs::Game::Origins && cmd.name == "CommandMoveAwayFromObject");
         let at_door = |s: &mut Self, p: [f32; 3], area: Option<ObjectId>| {
             walked && area.is_some_and(|a| s.in_closed_doorway(a, p))
         };
