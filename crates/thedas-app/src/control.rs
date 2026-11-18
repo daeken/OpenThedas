@@ -27,6 +27,13 @@
 //!
 //! Every reply has `"ok"`; failures carry `"error"`. Input reaches the simulation only as
 //! the player's own does (orders, interface clicks), so it stays deterministic.
+//!
+//! `--control-step-ms 20` opts a hidden, audio-off session into a fixed clock. Only
+//! `run` advances that clock; loading workers consume none of a run's time. Send one
+//! request at a time to observe input after its zero-time UI frame. Queued simulation
+//! events wait for a positive frame. `input` accepts literal `text` or a physical `key`
+//! with no printable text (optional boolean `down`, otherwise a tap), instead of `steps`.
+//! `quit` exits gracefully. Normal interactive timing is unchanged.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -71,6 +78,8 @@ pub fn record_motion(
 pub struct Request {
     pub body: J,
     pub reply: mpsc::Sender<J>,
+    /// Only `quit` needs to know the reply reached the socket before the app exits.
+    pub written: Option<mpsc::Receiver<()>>,
 }
 
 /// The listening channel: requests arrive here for the frame loop to serve.
@@ -139,6 +148,7 @@ fn serve(stream: TcpStream, tx: mpsc::Sender<Request>) {
             Ok(_) => {}
         }
         let too_long = line.len() > MAX_REQUEST;
+        let mut written = None;
         let reply = if too_long {
             failure(format!("request longer than {MAX_REQUEST} bytes"))
         } else {
@@ -147,7 +157,7 @@ fn serve(stream: TcpStream, tx: mpsc::Sender<Request>) {
                 continue;
             }
             match serde_json::from_str::<J>(&text) {
-                Ok(body) => ask(&tx, body),
+                Ok(body) => ask(&tx, body, &mut written),
                 Err(e) => failure(format!("not JSON: {e}")),
             }
         };
@@ -156,13 +166,28 @@ fn serve(stream: TcpStream, tx: mpsc::Sender<Request>) {
         if out.write_all(text.as_bytes()).is_err() || too_long {
             return;
         }
+        if let Some(written) = written {
+            let _ = written.send(());
+        }
     }
 }
 
 /// Hands a request to the frame loop and waits for its answer.
-fn ask(tx: &mpsc::Sender<Request>, body: J) -> J {
+fn ask(tx: &mpsc::Sender<Request>, body: J, written_tx: &mut Option<mpsc::Sender<()>>) -> J {
     let (reply, answer) = mpsc::channel();
-    if tx.send(Request { body, reply }).is_err() {
+    let written = (body["cmd"] == "quit").then(|| {
+        let (tx, rx) = mpsc::channel();
+        *written_tx = Some(tx);
+        rx
+    });
+    if tx
+        .send(Request {
+            body,
+            reply,
+            written,
+        })
+        .is_err()
+    {
         return failure("the game has stopped");
     }
     answer
@@ -173,6 +198,83 @@ fn ask(tx: &mpsc::Sender<Request>, body: J) -> J {
 /// A failed reply.
 pub fn failure(msg: impl std::fmt::Display) -> J {
     json!({ "ok": false, "error": msg.to_string() })
+}
+
+/// Names of physical keys accepted by the control protocol (case insensitive).
+pub fn key_code(name: &str) -> Result<winit::keyboard::KeyCode> {
+    use winit::keyboard::KeyCode::*;
+    let name = name.to_ascii_lowercase();
+    Ok(match name.as_str() {
+        "a" => KeyA,
+        "b" => KeyB,
+        "c" => KeyC,
+        "d" => KeyD,
+        "e" => KeyE,
+        "f" => KeyF,
+        "g" => KeyG,
+        "h" => KeyH,
+        "i" => KeyI,
+        "j" => KeyJ,
+        "k" => KeyK,
+        "l" => KeyL,
+        "m" => KeyM,
+        "n" => KeyN,
+        "o" => KeyO,
+        "p" => KeyP,
+        "q" => KeyQ,
+        "r" => KeyR,
+        "s" => KeyS,
+        "t" => KeyT,
+        "u" => KeyU,
+        "v" => KeyV,
+        "w" => KeyW,
+        "x" => KeyX,
+        "y" => KeyY,
+        "z" => KeyZ,
+        "0" => Digit0,
+        "1" => Digit1,
+        "2" => Digit2,
+        "3" => Digit3,
+        "4" => Digit4,
+        "5" => Digit5,
+        "6" => Digit6,
+        "7" => Digit7,
+        "8" => Digit8,
+        "9" => Digit9,
+        "f1" => F1,
+        "f2" => F2,
+        "f3" => F3,
+        "f4" => F4,
+        "f5" => F5,
+        "f6" => F6,
+        "f7" => F7,
+        "f8" => F8,
+        "f9" => F9,
+        "f10" => F10,
+        "f11" => F11,
+        "f12" => F12,
+        "space" => Space,
+        "escape" | "esc" => Escape,
+        "enter" | "return" => Enter,
+        "tab" => Tab,
+        "backspace" => Backspace,
+        "delete" => Delete,
+        "left" => ArrowLeft,
+        "right" => ArrowRight,
+        "up" => ArrowUp,
+        "down" => ArrowDown,
+        "home" => Home,
+        "end" => End,
+        "pageup" => PageUp,
+        "pagedown" => PageDown,
+        "shift" => ShiftLeft,
+        "ctrl" | "control" => ControlLeft,
+        "alt" => AltLeft,
+        "meta" | "cmd" => SuperLeft,
+        "/" => Slash,
+        "\\" => Backslash,
+        _ => bail!("unknown physical key {name:?}"),
+    })
 }
 
 #[cfg(test)]

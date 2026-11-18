@@ -117,6 +117,10 @@ use winit::window::{Window, WindowId};
     about = "Walk through a Dragon Age: Origins area"
 )]
 struct Args {
+    /// Advance only requested input/run frames, at most this many ms per frame. Requires
+    /// --control; the world and UI wait between requests (for reproducible automation).
+    #[arg(long, requires = "control", value_parser = clap::value_parser!(u64).range(1..=100))]
+    control_step_ms: Option<u64>,
     /// Install root (the folder holding packages/ and modules/). Defaults to $THEDAS_INSTALL.
     #[arg(long)]
     install: Option<PathBuf>,
@@ -899,6 +903,10 @@ struct App {
     motion_trace: Option<Vec<J>>,
     /// Clients' input still playing, first come first played.
     remote: VecDeque<Remote>,
+    control_step_ms: Option<u64>,
+    control_time_ms: u64,
+    control_started: bool,
+    control_last_press: Option<(u64, (f64, f64))>,
     /// Clients waiting for the next presented frame, and how much smaller they want it.
     frame_requests: Vec<(std::sync::mpsc::Sender<J>, u32)>,
     /// Game controllers (none headless, or where the platform has no support).
@@ -1761,9 +1769,16 @@ impl App {
             return self.intro_frame();
         }
         let now = Instant::now();
-        let dt = (now - self.last).as_secs_f64() * 1000.0;
+        let wall_dt = (now - self.last).as_secs_f64() * 1000.0;
         self.last = now;
-        self.serve_control(dt);
+        let Some(dt) = self.serve_control(wall_dt) else {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            return Ok(());
+        };
+        if self.control_step_ms.is_some() {
+            self.control_started = true;
+            self.control_time_ms += dt as u64;
+        }
         self.pad_frame(dt);
         self.report_frame(dt);
         self.report_failure_frame();
@@ -2033,7 +2048,11 @@ impl App {
         if let Some(live) = self.live.as_mut() {
             // Transitions and journeys run behind their loading screens. Training can
             // deliver script events while its lesson holds the simulation clock.
-            if !stopped || live.transition_pending() || live.journey() || live.training() {
+            // A zero-time automation frame settles direct UI callbacks only. Leave queued
+            // simulation events for the next eligible positive-duration frame.
+            if (dt > 0.0 || self.control_step_ms.is_none())
+                && (!stopped || live.transition_pending() || live.journey() || live.training())
+            {
                 sim_ticks = live.step(dt);
             }
             if !live.loading() {
@@ -4048,12 +4067,20 @@ impl App {
         // A second press close in time and place is a double click (the movies use them:
         // equipping from the backpack).
         let double = pressed
-            && self.last_press.is_some_and(|(t, (px, py))| {
-                t.elapsed().as_secs_f64() < DOUBLE_CLICK_SECS
-                    && (px - x).hypot(py - y) < DOUBLE_CLICK_PIXELS
-            });
+            && if self.control_step_ms.is_some() {
+                self.control_last_press.is_some_and(|(t, (px, py))| {
+                    self.control_time_ms.saturating_sub(t) < (DOUBLE_CLICK_SECS * 1000.0) as u64
+                        && (px - x).hypot(py - y) < DOUBLE_CLICK_PIXELS
+                })
+            } else {
+                self.last_press.is_some_and(|(t, (px, py))| {
+                    t.elapsed().as_secs_f64() < DOUBLE_CLICK_SECS
+                        && (px - x).hypot(py - y) < DOUBLE_CLICK_PIXELS
+                })
+            };
         if pressed {
             self.last_press = (!double).then(|| (Instant::now(), (x, y)));
+            self.control_last_press = (!double).then_some((self.control_time_ms, (x, y)));
         }
         if double {
             if let Some(g) = self.gfx.as_mut() {
@@ -4319,6 +4346,24 @@ impl App {
                     self.keys.remove(&code);
                 }
                 log.push(format!("key {code:?} {}", if down { "down" } else { "up" }));
+            }
+            &Step::PhysicalKey(code, down) => {
+                let state = if down {
+                    ElementState::Pressed
+                } else {
+                    ElementState::Released
+                };
+                // A physical key doesn't imply a character or a keyboard layout.
+                // Clients send literal characters with `text` or `windowkey`.
+                if self.window_key(code, None, state, false) {
+                    self.quit = true;
+                }
+                if code == KeyCode::ShiftLeft
+                    && let Some(g) = self.gfx.as_mut()
+                {
+                    g.ui.stage.set_shift(self.keys.contains(&code));
+                }
+                log.push(format!("keyboard {code:?} {down}"));
             }
             Step::AskChoice(prompt) => {
                 if let Some(g) = self.gfx.as_mut() {
@@ -4703,7 +4748,7 @@ impl App {
 
     /// Serves the control channel's requests, and plays the steps clients sent: one client's
     /// at a time, a `run` lasting that long in frames (`dt_ms` is this frame's).
-    fn serve_control(&mut self, dt_ms: f64) {
+    fn serve_control(&mut self, dt_ms: f64) -> Option<f64> {
         let requests = self.control.as_ref().map(|c| c.poll()).unwrap_or_default();
         for r in requests {
             let cmd = r.body["cmd"].as_str().unwrap_or_default().to_string();
@@ -4715,8 +4760,27 @@ impl App {
                 } else {
                     json!({ "ok": true, "frames": self.motion_trace.take().unwrap_or_default() })
                 }),
+                "quit" => {
+                    if let Some(l) = self.live.as_mut() {
+                        l.close_journal();
+                    }
+                    if r.reply.send(json!({"ok": true})).is_ok()
+                        && let Some(written) = r.written
+                    {
+                        let _ = written.recv_timeout(std::time::Duration::from_secs(1));
+                    }
+                    self.quit = true;
+                    return None;
+                }
                 // The frame as presented, read back as the next one is drawn; a surface that
                 // cannot be read back is drawn again offscreen instead.
+                "screenshot" if self.control_step_ms.is_some() => {
+                    let scale = r.body["scale"].as_u64().unwrap_or(1).clamp(1, 16) as u32;
+                    Some(
+                        self.screenshot_scaled(scale)
+                            .unwrap_or_else(control::failure),
+                    )
+                }
                 "screenshot" => match self
                     .gfx
                     .as_ref()
@@ -4744,7 +4808,7 @@ impl App {
                     self.report(note, Some(r.reply.clone()));
                     None
                 }
-                "input" => match parse_steps(r.body["steps"].as_str().unwrap_or_default()) {
+                "input" => match control_steps(&r.body) {
                     Ok(steps) => {
                         self.remote.push_back(Remote {
                             steps: steps.into(),
@@ -4762,12 +4826,47 @@ impl App {
                 let _ = r.reply.send(a);
             }
         }
+        if let Some(step_ms) = self.control_step_ms {
+            // Loading workers may take arbitrary wall time. Pump the renderer at zero
+            // game time until ready, without consuming the client's requested duration.
+            if self.opening.is_some() || self.live.as_ref().is_some_and(|l| l.loading()) {
+                return Some(0.0);
+            }
+            while let Some(mut r) = self.remote.pop_front() {
+                if r.wait_ms > 0.0 {
+                    let dt = r.wait_ms.min(step_ms as f64);
+                    r.wait_ms -= dt;
+                    self.remote.push_front(r);
+                    return Some(dt);
+                }
+                match r.steps.pop_front() {
+                    Some(Step::Run(ms)) => {
+                        r.log.push(format!("run {ms}"));
+                        r.wait_ms = ms as f64;
+                        self.remote.push_front(r);
+                    }
+                    Some(step) => {
+                        self.play_step(&step, &mut r.log);
+                        self.remote.push_front(r);
+                        // Let the interface handle this event before the next action;
+                        // acknowledge only on the following frame, after it has settled.
+                        return Some(0.0);
+                    }
+                    None => {
+                        let mut out = self.status();
+                        out["log"] = json!(r.log);
+                        let _ = r.reply.send(out);
+                    }
+                }
+            }
+            return (!self.control_started || !self.frame_requests.is_empty()).then_some(0.0);
+        }
         while let Some(mut r) = self.remote.pop_front() {
             if r.wait_ms > 0.0 {
                 r.wait_ms -= dt_ms;
                 if r.wait_ms > 0.0 {
                     self.remote.push_front(r);
-                    return;
+                    return Some(dt_ms);
                 }
             }
             match r.steps.pop_front() {
@@ -4787,21 +4886,26 @@ impl App {
                 }
             }
         }
+        Some(dt_ms)
     }
 
     /// Where the game is, for clients.
     fn status(&self) -> J {
         let mut out = json!({
             "ok": true,
+            "pid": std::process::id(),
             "camera": self.camera.spec(),
             "size": self.gfx.as_ref().map(|g| [g.config.width, g.config.height]),
             "playing": self.live.is_some(),
             "mod_mode": self.mod_mode_up(),
+            "control_step_ms": self.control_step_ms,
+            "control_time_ms": self.control_time_ms,
+            "loading": self.opening.is_some() || self.live.as_ref().is_some_and(|l| l.loading()),
         });
         let Some(live) = self.live.as_ref() else {
             return out;
         };
-        let sim = live.sim();
+        let mut sim = live.sim();
         let tag = |id: Option<thedas_script::vm::ObjectId>| {
             id.and_then(|i| sim.world.get(i)).map(|o| o.tag.clone())
         };
@@ -4816,6 +4920,32 @@ impl App {
             "position": o.position,
             "commands": o.commands.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
         })));
+        let health = thedas_sim::sim::constant(&sim.table, "PROPERTY_DEPLETABLE_HEALTH");
+        let creature = |id| {
+            sim.world.get(id).map(|o| {
+                json!({
+                    "id": o.id, "tag": o.tag, "position": o.position, "dead": o.dead,
+                    "health": {"current": o.properties.get(&health).map(|p| p.1),
+                               "max": sim.property_total(id, health)},
+                    "in_combat": o.combat.in_combat,
+                    "target": sim.attack_target(id),
+                })
+            })
+        };
+        out["hero"] = json!(sim.world.hero.and_then(creature));
+        out["party_members"] = json!(
+            thedas_sim::engine::party_of(&sim)
+                .into_iter()
+                .filter_map(creature)
+                .collect::<Vec<_>>()
+        );
+        out["combat"] = json!(
+            thedas_sim::engine::party_of(&sim)
+                .into_iter()
+                .any(|id| sim.world.get(id).is_some_and(|o| o.combat.in_combat))
+        );
+        out["tutorial_paused"] = json!(sim.tutorial_paused() || sim.training_paused());
+        out["front_end"] = json!(live.front_end);
         out["party"] = json!(
             thedas_sim::engine::party_of(&sim)
                 .into_iter()
@@ -4823,6 +4953,8 @@ impl App {
                 .collect::<Vec<_>>()
         );
         out["dialog"] = json!(sim.dialog_state().map(|d| json!({
+            "resource": d.dialog,
+            "owner": d.owner,
             "speaker": d.speaker,
             "line": d.line,
             "replies": d.replies.iter().map(|(_, t)| t.as_str()).collect::<Vec<_>>(),
@@ -4835,6 +4967,12 @@ impl App {
             "lines": c.lines.len(),
         })));
         out["screens"] = json!(self.screens.as_ref().map(|s| format!("{:?}", s.shown())));
+        out["screen_names"] = json!(self.screens.as_ref().map(|s| {
+            s.shown()
+                .iter()
+                .map(|s| format!("{s:?}"))
+                .collect::<Vec<_>>()
+        }));
         // The movies' input contexts, innermost last, and whether a dialog box has the input.
         if let Some(g) = self.gfx.as_ref() {
             out["contexts"] = json!(g.ui.stage.bridge.contexts());
@@ -4842,21 +4980,33 @@ impl App {
             out["cursor"] = json!(self.cursors.as_ref().map_or("", |c| c.shown()));
             out["popup"] = json!(g.ui.stage.dialog_up());
         }
+        let journal = sim.journal();
+        let quest = |q: &thedas_sim::journal::QuestView| {
+            json!({
+                "resref": q.resref, "name": q.name.and_then(|s| sim.string(s)),
+                "text": q.description.and_then(|s| sim.string(s)),
+                "completed": q.completed, "updated": q.updated,
+            })
+        };
+        out["journal"] = json!({
+            "active_quest": journal.active_quest,
+            "active": journal.active.iter().map(quest).collect::<Vec<_>>(),
+            "completed": journal.completed.iter().map(quest).collect::<Vec<_>>(),
+            "codex_entries": journal.codex.iter().map(|g| g.entries.len()).sum::<usize>(),
+        });
         out
     }
 
     /// The frame as the player sees it (world, reticle, interface), as a base64 PNG.
     fn screenshot(&mut self) -> Result<J> {
+        self.screenshot_scaled(1)
+    }
+
+    fn screenshot_scaled(&mut self, scale: u32) -> Result<J> {
         let frame = self.screenshot_rgba()?;
-        let (w, h) = (frame.width, frame.height);
-        let png = thedas_ui::stage::encode_png(&frame).context("encoding the screenshot")?;
-        use base64::Engine as _;
-        Ok(json!({
-            "ok": true,
-            "width": w,
-            "height": h,
-            "png": base64::engine::general_purpose::STANDARD.encode(png),
-        }))
+        let mut reply = frame_reply(&frame, scale)?;
+        reply["presented"] = json!(false);
+        Ok(reply)
     }
 
     /// The frame as the player would see it, drawn offscreen: the world, the aiming reticle
@@ -5270,6 +5420,18 @@ impl ApplicationHandler for App {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
+        // Only control clients drive input in fixed-clock mode. In particular, a
+        // native focus change must not clear held synthetic keys or the UI pointer.
+        if self.control_step_ms.is_some()
+            && !matches!(
+                event,
+                WindowEvent::CloseRequested
+                    | WindowEvent::Resized(_)
+                    | WindowEvent::RedrawRequested
+            )
+        {
+            return;
+        }
         // Mod mode's panels see input first while they are up (see [`modmode`]).
         if let (Some(m), Some(g)) = (self.mod_mode.as_mut(), self.gfx.as_ref()) {
             match m.window_event(&g.window, &event) {
@@ -5373,6 +5535,9 @@ impl ApplicationHandler for App {
     }
 
     fn device_event(&mut self, _: &ActiveEventLoop, _: DeviceId, event: DeviceEvent) {
+        if self.control_step_ms.is_some() {
+            return;
+        }
         if let DeviceEvent::MouseMotion { delta } = event {
             if self.looking {
                 self.right_click.motion(delta);
@@ -6288,6 +6453,7 @@ enum Step {
     /// `rawkey NAME`: a key pressed as the window delivers it (1 to 0, space, enter, escape,
     /// tab), so what the game does with the key itself is tested.
     RawKey(KeyCode),
+    PhysicalKey(KeyCode, bool),
     /// The highlight key held or let go (`allnames on`, `allnames off`): every creature near
     /// shows its name, as while Tab is down.
     AllNames(bool),
@@ -6327,6 +6493,19 @@ fn pad_steps(arg: &str) -> Result<Vec<Step>> {
         }
         ["press", b] => vec![Step::PadButton(button(b)?, true)],
         ["release", b] => vec![Step::PadButton(button(b)?, false)],
+        [stick @ ("stick-left" | "stick-right"), xy] => {
+            let stick = if *stick == "stick-left" {
+                pad::Stick::Left
+            } else {
+                pad::Stick::Right
+            };
+            let (x, y) = xy.split_once(',').context("a stick takes x,y")?;
+            let (x, y): (f32, f32) = (x.parse()?, y.parse()?);
+            if !x.is_finite() || !y.is_finite() || x.abs() > 1.0 || y.abs() > 1.0 {
+                bail!("stick axes must be finite and within -1..1");
+            }
+            vec![Step::PadStick(stick, x, y)]
+        }
         [stick @ ("stick-left" | "stick-right"), xy, ms] => {
             let stick = if *stick == "stick-left" {
                 pad::Stick::Left
@@ -6564,6 +6743,31 @@ fn parse_steps(spec: &str) -> Result<Vec<Step>> {
         }
     }
     Ok(out)
+}
+
+/// Structured input keeps literal text (including semicolons/newlines) out of the step
+/// language, and routes physical keys through the window's keyboard handling.
+fn control_steps(body: &J) -> Result<Vec<Step>> {
+    match (body.get("text"), body.get("key"), body.get("steps")) {
+        (Some(text), None, None) => Ok(vec![Step::Type(
+            text.as_str().context("text must be a string")?.into(),
+        )]),
+        (None, Some(key), None) => {
+            let code = control::key_code(key.as_str().context("key must be a string")?)?;
+            match body.get("down") {
+                Some(down) => Ok(vec![Step::PhysicalKey(
+                    code,
+                    down.as_bool().context("down must be boolean")?,
+                )]),
+                None => Ok(vec![
+                    Step::PhysicalKey(code, true),
+                    Step::PhysicalKey(code, false),
+                ]),
+            }
+        }
+        (None, None, Some(steps)) => parse_steps(steps.as_str().context("steps must be a string")?),
+        _ => bail!("input requires exactly one of steps, text, key"),
+    }
 }
 
 fn parse_step(s: &str) -> Result<Step> {
@@ -6884,6 +7088,16 @@ fn main() -> Result<()> {
     ));
     raise_open_file_limit();
     let mut args = Args::parse();
+    if args.control_step_ms.is_some() {
+        anyhow::ensure!(
+            std::env::var_os("THEDAS_HIDDEN_WINDOW").is_some(),
+            "--control-step-ms requires THEDAS_HIDDEN_WINDOW=1"
+        );
+        anyhow::ensure!(
+            !args.audio && args.audio_wav.is_none(),
+            "--control-step-ms cannot be combined with --audio or --audio-wav"
+        );
+    }
     thedas_render::set_soft_shadows(args.soft_shadows == "on");
     if let Some(mode) = args
         .lighting
@@ -6906,7 +7120,7 @@ fn main() -> Result<()> {
         upload::set_automated();
     }
     // A newer build an update fetched takes over from the one the player started.
-    if args.capture.is_none() && args.check_report.is_none() {
+    if args.control_step_ms.is_none() && args.capture.is_none() && args.check_report.is_none() {
         if let Some(exe) = update::newest_build() {
             match std::process::Command::new(&exe)
                 .args(std::env::args_os().skip(1))
@@ -7544,8 +7758,8 @@ fn main() -> Result<()> {
                         println!("allnames {on}");
                     }
                     // The movement keys are the window's (see `App::key_walk`).
-                    Step::HoldKey(..) | Step::RawKey(..) => {
-                        println!("keydown, keyup and rawkey need a window")
+                    Step::HoldKey(..) | Step::RawKey(..) | Step::PhysicalKey(..) => {
+                        println!("keydown, keyup, rawkey and physical keys need a window")
                     }
                     Step::AskChoice(prompt) => {
                         if let Some((layer, _)) = played.as_mut() {
@@ -7912,8 +8126,16 @@ fn main() -> Result<()> {
         control,
         motion_trace: None,
         remote: VecDeque::new(),
+        control_step_ms: args.control_step_ms,
+        control_time_ms: 0,
+        control_started: false,
+        control_last_press: None,
         frame_requests: Vec::new(),
-        pads: paddev::Pads::new(),
+        pads: if args.control_step_ms.is_some() {
+            None
+        } else {
+            paddev::Pads::new()
+        },
         pad: padplay::PadPlay::default(),
         remote_pad: pad::PadState::default(),
         cursors: None,
@@ -8146,6 +8368,41 @@ mod tests {
     use super::*;
 
     #[test]
+    fn control_input_preserves_literal_text_and_rejects_ambiguous_events() {
+        assert_eq!(
+            control_steps(&json!({"text": "A; key space\nB"})).unwrap(),
+            vec![Step::Type("A; key space\nB".into())]
+        );
+        assert_eq!(
+            control_steps(&json!({"key": "ESC"})).unwrap(),
+            vec![
+                Step::PhysicalKey(KeyCode::Escape, true),
+                Step::PhysicalKey(KeyCode::Escape, false)
+            ]
+        );
+        assert_eq!(
+            control_steps(&json!({"key": "w", "down": false})).unwrap(),
+            vec![Step::PhysicalKey(KeyCode::KeyW, false)]
+        );
+        for body in [
+            json!({}),
+            json!({"text": "x", "steps": "run 1"}),
+            json!({"key": "unknown"}),
+            json!({"key": "w", "down": 1}),
+            json!({"text": 3}),
+        ] {
+            assert!(control_steps(&body).is_err(), "{body}");
+        }
+        assert_eq!(
+            parse_steps("pad stick-right 0.5,-1").unwrap(),
+            vec![Step::PadStick(pad::Stick::Right, 0.5, -1.0)]
+        );
+        for spec in ["pad stick-left NaN,0", "pad stick-left 2,0"] {
+            assert!(parse_steps(spec).is_err());
+        }
+    }
+
+    #[test]
     fn shrinks_frames_by_averaging_blocks() {
         let img = thedas_ui::Rgba {
             width: 4,
@@ -8346,7 +8603,13 @@ mod tests {
             ]
         );
         assert!(parse_steps("pad q").is_err());
-        assert!(parse_steps("pad stick-left 0,1").is_err());
+        assert_eq!(
+            parse_steps("pad stick-left 0,1; pad stick-left 0,0").unwrap(),
+            vec![
+                Step::PadStick(pad::Stick::Left, 0.0, 1.0),
+                Step::PadStick(pad::Stick::Left, 0.0, 0.0),
+            ]
+        );
         assert!(parse_steps("pad").is_err());
         assert!(parse_steps("reply x").is_err());
         assert!(parse_steps("dance").is_err());
