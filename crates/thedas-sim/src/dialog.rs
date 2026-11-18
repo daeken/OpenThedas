@@ -1393,6 +1393,23 @@ impl Sim {
             .filter(|cut| c.owns_cutscene(cut))
     }
 
+    /// Whether the presented line's referenced cut is queued or playing.
+    pub fn presented_line_waits_for_cutscene(&self) -> bool {
+        if self.conversation_line_cutscene().is_some() {
+            return true;
+        }
+        self.talk.as_ref().is_some_and(|c| {
+            c.cut_from == c.line
+                && c.line
+                    .and_then(|line| c.dlg.nodes.get(line)?.cutscene.as_ref())
+                    .is_some_and(|name| {
+                        self.world
+                            .dialog_cutscenes
+                            .contains(&crate::cutscene::Cutscene::resource(name))
+                    })
+        })
+    }
+
     pub fn conversation_line(&self) -> Option<OpenLine<'_>> {
         self.talk.as_ref().filter(|c| !c.ended)?;
         self.presented_conversation_line()
@@ -2078,6 +2095,9 @@ mod tests {
         dlg.nodes[2].cutscene = Some("intro".into());
         assert!(sim.open_conversation(hero, npc, dlg, None));
         assert!(sim.conversation_line_cutscene().is_none());
+        assert!(sim.presented_line_waits_for_cutscene());
+        sim.world.dialog_cutscenes.clear();
+        assert!(!sim.presented_line_waits_for_cutscene());
         sim.world.cutscene = Some(crate::cutscene::Cutscene {
             name: "intro.cut".into(),
             seconds: 4.0,
@@ -2088,12 +2108,14 @@ mod tests {
             placement: None,
         });
         assert!(sim.conversation_line_cutscene().is_some());
+        assert!(sim.presented_line_waits_for_cutscene());
         // Final lines remain presented after the conversation walker marks them ended.
         sim.talk.as_mut().unwrap().ended = true;
         assert!(sim.conversation_line_cutscene().is_some());
         // A later line, a different resource, and a script's cut have separate ownership.
         sim.talk.as_mut().unwrap().line = Some(2);
         assert!(sim.conversation_line_cutscene().is_none());
+        assert!(!sim.presented_line_waits_for_cutscene());
         sim.talk.as_mut().unwrap().line = Some(0);
         sim.world.cutscene.as_mut().unwrap().name = "other.cut".into();
         assert!(sim.conversation_line_cutscene().is_none());
