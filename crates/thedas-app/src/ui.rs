@@ -2410,6 +2410,8 @@ impl UiLayer {
         sim: &Arc<Mutex<Sim>>,
         dt_ms: f64,
     ) -> Vec<thedas_ui::input::Aim> {
+        // An outro can end in this tick, after the screens have been reconciled.
+        let loading = self.loading.is_some() || self.travel_map;
         // The start menu offers loading when there are saves: they are listed from the start.
         if screens.front_end && !self.saves_listed {
             self.saves_listed = true;
@@ -2887,7 +2889,40 @@ impl UiLayer {
             }
         }
         self.update_drag_image();
+        self.update_status_messages(sim, loading);
         aims
+    }
+
+    fn update_status_messages(&mut self, sim: &Arc<Mutex<Sim>>, loading: bool) {
+        use thedas_ui::UiValue;
+
+        let movie = self
+            .stage
+            .movies
+            .iter_mut()
+            .find(|m| m.name == "floatylayer.gfx");
+        // Area-enter scripts can send the area's name behind a loading screen. Hold
+        // their messages through the outro so a direct handoff to the HUD can show
+        // them. A cutscene or another screen without the movie ends that handoff.
+        if loading && movie.is_none() {
+            return;
+        }
+        let messages = std::mem::take(
+            &mut sim
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .world
+                .status_messages,
+        );
+        // DAOrigins.exe 0x63c260 invokes the function on the registered live movie.
+        if let Some(movie) = movie {
+            for (text, colour) in messages {
+                movie.call(
+                    "_global.FloatyLayer.DisplayStatusMessage",
+                    &[UiValue::String(text), UiValue::Number(f64::from(colour))],
+                );
+            }
+        }
     }
 
     /// A left click while playing reached the interface: a conversation line still playing is
@@ -3276,7 +3311,6 @@ impl UiLayer {
             Vec::new(),
         );
         let portrait_messages;
-        let status_messages;
         let size = self.stage.size();
         let scale = thedas_ui::stage_scale(size, (1024.0, 768.0));
         let (w, h) = (size.0 as f32, size.1 as f32);
@@ -3360,7 +3394,6 @@ impl UiLayer {
                 });
             }
             portrait_messages = std::mem::take(&mut sim.world.portrait_messages);
-            status_messages = std::mem::take(&mut sim.world.status_messages);
             let mut per_target: std::collections::BTreeMap<u32, u32> = Default::default();
             self.floaties.retain_mut(|f| {
                 f.left_s -= dt_ms / 1000.0;
@@ -3510,16 +3543,6 @@ impl UiLayer {
                 &[UiValue::String(portrait_message_arg(
                     m.target, m.colour, &m.text,
                 ))],
-            );
-        }
-        // Status messages, as the exe hands them to the floaty layer (0x63c260):
-        // `FloatyLayer.DisplayStatusMessage` with the text and its colour. Provisional: that
-        // the script function reaches 0x63c260 (through the interface's virtual 0x5239d0) is
-        // inferred, not followed call by call.
-        for (text, colour) in status_messages {
-            self.stage.movies[movie].call(
-                &format!("{LAYER}.DisplayStatusMessage"),
-                &[UiValue::String(text), num(f64::from(colour))],
             );
         }
         let m = &mut self.stage.movies[movie];
@@ -4217,6 +4240,94 @@ mod tests {
             ui.stage.tick(1000.0 / 30.0);
         }
         ui
+    }
+
+    #[test]
+    #[ignore = "requires THEDAS_INSTALL and an offscreen GPU"]
+    fn status_messages_survive_a_load_directly_to_the_hud() {
+        use thedas_ui::UiValue;
+
+        let mut ui = installed_popup_ui();
+        let sim = Sim::new(
+            ui.vfs.clone(),
+            Arc::new(thedas_script::EngineTable::default()),
+            1,
+        );
+        let sim = Arc::new(Mutex::new(sim));
+        ui.attach(&sim);
+        let mut screens = Screens::new(false);
+        let dt = 1000.0 / 30.0;
+        let count = |ui: &mut UiLayer| {
+            ui.stage.call_in(
+                "floatylayer.gfx",
+                "_global.StatusMessageRoller.StatusMessages.length.toString",
+                &[],
+            )
+        };
+        let queue = |text: &str| {
+            sim.lock()
+                .unwrap()
+                .world
+                .status_messages
+                .push((text.into(), 0xffffff));
+        };
+        let finish_load = |ui: &mut UiLayer, screens: &mut Screens, next| {
+            ui.loading_end();
+            for _ in 0..60 {
+                ui.play(screens, &sim, dt);
+                if screens.shown().contains(&next) {
+                    return;
+                }
+            }
+            panic!("loading did not reach {next:?}, got {:?}", screens.shown());
+        };
+
+        ui.loading_begin(LoadScreen::Light, None);
+        ui.play(&mut screens, &sim, dt);
+        assert!(screens.shown().contains(&Screen::LoadLight));
+        queue("Orzammar Commons");
+        ui.play(&mut screens, &sim, dt);
+        assert_eq!(count(&mut ui), None);
+        finish_load(&mut ui, &mut screens, Screen::Hud);
+        assert_eq!(count(&mut ui), Some(UiValue::String("1".into())));
+
+        ui.loading_begin(LoadScreen::Town, None);
+        ui.play(&mut screens, &sim, dt);
+        assert!(screens.shown().contains(&Screen::LoadTown));
+        queue("Dragon Age");
+        ui.play(&mut screens, &sim, dt);
+        sim.lock().unwrap().world.cutscene = Some(thedas_sim::cutscene::Cutscene {
+            name: "opening.cut".into(),
+            seconds: 1.0,
+            lines: Vec::new(),
+            elapsed_ms: 0,
+            from_dialog: false,
+            bound: Vec::new(),
+            placement: None,
+        });
+        finish_load(&mut ui, &mut screens, Screen::Cutscene);
+        assert_eq!(count(&mut ui), None);
+        queue("Cutscene status");
+        ui.play(&mut screens, &sim, dt);
+
+        {
+            let mut sim = sim.lock().unwrap();
+            sim.world.cutscene = None;
+            sim.world.training.step = 1;
+        }
+        for _ in 0..20 {
+            ui.play(&mut screens, &sim, dt);
+        }
+        assert!(screens.shown().contains(&Screen::Hud));
+        assert_eq!(
+            popup_property(&mut ui, "_root.TrainingTutorial_mc._visible"),
+            UiValue::Bool(true)
+        );
+        assert_eq!(count(&mut ui), Some(UiValue::String("0".into())));
+
+        queue("HUD status");
+        ui.play(&mut screens, &sim, dt);
+        assert_eq!(count(&mut ui), Some(UiValue::String("1".into())));
     }
 
     #[test]

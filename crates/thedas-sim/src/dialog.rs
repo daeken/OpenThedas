@@ -673,7 +673,7 @@ impl Sim {
     /// conversation is walked, then the world is put back as it was: what a condition
     /// script would set is reported in `sets` and not kept (the world, the random numbers,
     /// the conversations going on). Simulation state outside the world (`training_done`,
-    /// `following`, `next_follow_ms`) is not put back. `None` when there is no such
+    /// resource caches) is not put back. `None` when there is no such
     /// conversation.
     pub fn conversation_conditions(
         &mut self,
