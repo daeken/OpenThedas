@@ -3068,6 +3068,42 @@ impl Sim {
         Routed::Path(p)
     }
 
+    /// Origins action 0x0f's positive-distance branch (0x7a6ca0 -> 0x7a5450) searches
+    /// around the target, validates candidates and finds a route before following it.
+    /// Provisional: use the area grid for the native terrain queries and start at the
+    /// radial bearing, then alternate sides (no native random jitter or untraced weaker
+    /// candidate test). A clipped route is not a route to the candidate.
+    fn origins_retreat_route(
+        &mut self,
+        id: ObjectId,
+        grid: &thedas_formats::level::NavGrid,
+        center: [f32; 3],
+        [dx, dy]: [f32; 2],
+        radius: f32,
+    ) -> Option<Vec<[f32; 3]>> {
+        let step = ((self.body_radius(id) * 360.0 / (1.26 * radius)) as i32).clamp(10, 90);
+        let angles = std::iter::once(0).chain((1..=170 / step).flat_map(|i| [i * step, -i * step]));
+        for angle in angles {
+            let angle = (angle as f32).to_radians();
+            let (sin, cos) = (angle.dsin(), angle.dcos());
+            let mut goal = [
+                center[0] + radius * (dx * cos - dy * sin),
+                center[1] + radius * (dx * sin + dy * cos),
+                center[2],
+            ];
+            let Some(cell) = grid.cell(goal).filter(|&c| crate::nav::walkable(grid, c)) else {
+                continue;
+            };
+            goal[2] = crate::nav::height(grid, cell);
+            if let crate::nav::Routed::Path(path) = self.route_to(id, goal)
+                && path.last() == Some(&goal)
+            {
+                return Some(path);
+            }
+        }
+        None
+    }
+
     /// A creature's collision capsule radius: 0.6 of its personal space, at least 0.1 m
     /// (DAOrigins.exe's character controller, set up at 0x6b1fb7).
     pub fn capsule_radius(&self, id: ObjectId) -> f32 {
@@ -4398,18 +4434,23 @@ impl Sim {
                             c.location = cmd.location;
                         }
                     }
-                    // Moving away from an object: to the point at the asked distance from it,
-                    // on the line from it through the mover (closer in when the mover is
-                    // farther off), as script.ldf describes the command. Provisional: the
-                    // exe's search round the target for a clear line of sight is not traced.
+                    // A positive Origins creature retreat searches for a grounded point at
+                    // the requested radius. Other MoveAway variants retain the radial goal.
                     if cmd.name == "CommandMoveAwayFromObject" {
                         let away = cmd.seconds.max(0.0);
-                        let here = self.world.get(id).map(|o| (o.position, o.area, o.facing));
+                        let here = self
+                            .world
+                            .get(id)
+                            .map(|o| (o.position, o.area, o.facing, o.kind));
                         let there = cmd
                             .target
                             .and_then(|t| self.world.get(t))
-                            .map(|o| o.position);
-                        if let (Some((p, Some(area), facing)), Some(t)) = (here, there) {
+                            .map(|o| (o.position, o.area, o.kind));
+                        if let (
+                            Some((p, Some(area), facing, kind)),
+                            Some((t, target_area, target_kind)),
+                        ) = (here, there)
+                        {
                             let (dx, dy) = (p[0] - t[0], p[1] - t[1]);
                             let len = (dx * dx + dy * dy).sqrt();
                             let (dx, dy) = if len > 1e-3 {
@@ -4418,7 +4459,24 @@ impl Sim {
                                 let h = crate::world::heading_of(facing).to_radians();
                                 (-h.dcos(), -h.dsin())
                             };
-                            let to = [t[0] + dx * away, t[1] + dy * away, p[2]];
+                            let mut to = [t[0] + dx * away, t[1] + dy * away, p[2]];
+                            if self.game == thedas_vfs::Game::Origins
+                                && kind == ObjectKind::Creature
+                                && target_kind == ObjectKind::Creature
+                                && target_area == Some(area)
+                                && away > 0.0
+                                && away.is_finite()
+                                && let Some(grid) = self.nav_grid(area)
+                            {
+                                let Some(route) =
+                                    self.origins_retreat_route(id, &grid, t, [dx, dy], away)
+                                else {
+                                    self.fail_front_command(id, "COMMAND_FAILED_INVALID_PATH");
+                                    continue;
+                                };
+                                to = route[route.len() - 1];
+                                path = route;
+                            }
                             cmd.location = Some(crate::world::Location {
                                 area,
                                 position: to,
@@ -4457,23 +4515,25 @@ impl Sim {
                                 .map(|o| o.position)
                         });
                         if let (Some(to), Some(p)) = (to, pos) {
-                            path = match if to == p {
-                                (crate::nav::Routed::Path(vec![p]), Vec::new())
-                            } else {
-                                self.route_and_approach(id, to)
-                            } {
-                                (crate::nav::Routed::Path(p), _) => p,
-                                (crate::nav::Routed::Straight, _) => Vec::new(),
-                                (crate::nav::Routed::Door(_), p) if !p.is_empty() => p,
-                                (crate::nav::Routed::InvalidPath, _) => {
-                                    self.fail_front_command(id, "COMMAND_FAILED_INVALID_PATH");
-                                    continue;
-                                }
-                                (crate::nav::Routed::Door(door), _) => {
-                                    self.fail_blocked(id, door);
-                                    continue;
-                                }
-                            };
+                            if path.is_empty() {
+                                path = match if to == p {
+                                    (crate::nav::Routed::Path(vec![p]), Vec::new())
+                                } else {
+                                    self.route_and_approach(id, to)
+                                } {
+                                    (crate::nav::Routed::Path(p), _) => p,
+                                    (crate::nav::Routed::Straight, _) => Vec::new(),
+                                    (crate::nav::Routed::Door(_), p) if !p.is_empty() => p,
+                                    (crate::nav::Routed::InvalidPath, _) => {
+                                        self.fail_front_command(id, "COMMAND_FAILED_INVALID_PATH");
+                                        continue;
+                                    }
+                                    (crate::nav::Routed::Door(door), _) => {
+                                        self.fail_blocked(id, door);
+                                        continue;
+                                    }
+                                };
+                            }
                             if !path.is_empty() {
                                 ms = (path_length(p, &path) / self.command_speed(id, &cmd) * 1000.0)
                                     as u64;
