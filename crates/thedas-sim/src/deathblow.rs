@@ -7,6 +7,7 @@ use thedas_formats::anim::{AnimInfo, AnimTree, parse_events_with_text};
 use thedas_script::vm::ObjectId;
 
 use crate::Sim;
+use crate::nav::{MAX_STEP, height, walkable};
 use crate::world::{Command, ObjectKind};
 
 const SYNC_DEATH_ANIMATIONS: i32 = 102;
@@ -38,6 +39,17 @@ pub struct DeathBlow {
     pub action: String,
     pub impacts: Vec<DeathBlowImpact>,
     pub next_impact: usize,
+    /// Present only when the pair's own placement entered a nonwalkable cell.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement_repair: Option<PairPlacement>,
+}
+
+/// The stationary in-flight placement recorded for an Origins pair's finish.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PairPlacement {
+    area: ObjectId,
+    before: [f32; 3],
+    placed: [f32; 3],
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -160,6 +172,7 @@ impl Sim {
         // radii plus 1.2 m (0x746384), along the victim-to-attacker bearing.
         // Provisional: large-creature sync-table placement, floor projection and
         // the native placement blend are not ported.
+        let mut placement_repair = None;
         if !(19..=23).contains(&row) {
             let from = self.world.get(id)?.position;
             let target = self.world.get(victim)?.position;
@@ -167,15 +180,24 @@ impl Sim {
             let length = (dx * dx + dy * dy).sqrt();
             if length > 1e-6 {
                 let distance = self.capsule_radius(id) + self.capsule_radius(victim) + 1.2;
-                self.move_object(
-                    id,
-                    [
-                        target[0] - dx / length * distance,
-                        target[1] - dy / length * distance,
-                        from[2],
-                    ],
-                    None,
-                );
+                let placed = [
+                    target[0] - dx / length * distance,
+                    target[1] - dy / length * distance,
+                    from[2],
+                ];
+                if let Some(area) = self.world.get(id)?.area
+                    && let Some(g) = self.nav_grid(area)
+                    && let Some(cell) = g.cell(placed)
+                    && g.cell(from).is_some_and(|before| before != cell)
+                    && !walkable(&g, cell)
+                {
+                    placement_repair = Some(PairPlacement {
+                        area,
+                        before: from,
+                        placed,
+                    });
+                }
+                self.move_object(id, placed, None);
                 self.world.get_mut(id)?.facing = crate::world::facing_toward(dx, dy);
                 self.world.get_mut(victim)?.facing = crate::world::facing_toward(-dx, -dy);
             }
@@ -198,6 +220,7 @@ impl Sim {
             action: attack.action,
             impacts,
             next_impact: 0,
+            placement_repair,
         });
         self.world.get_mut(victim)?.combat.death_blow_reaction = Some(DeathBlowReaction {
             attacker: id,
@@ -208,6 +231,122 @@ impl Sim {
         });
         self.kill_with_event_delay(victim, id, reaction.duration_ms.max(1));
         Some(due.saturating_sub(now))
+    }
+
+    /// Origins type 38 attempts safe placement at public completion (0x747447 calls
+    /// 0x73e370 with a 5 m radius; a changed result is written by 0x695540).
+    /// Provisional: only repair the pair's own baked/patched wall placement, prefer the
+    /// saved pre-pair point within the normal 1.5-cell start repair bound, and use Sim's
+    /// floor, body and obstacle grid in place of the native scene queries.
+    pub(crate) fn finish_death_blow_placement(&mut self, id: ObjectId) {
+        let Some(p) = self.world.get(id).and_then(|o| {
+            let p = o.combat.death_blow.as_ref()?.placement_repair?;
+            (o.active
+                && !o.dead
+                && o.parked.is_none()
+                && o.area == Some(p.area)
+                && o.position == p.placed)
+                .then_some(p)
+        }) else {
+            return;
+        };
+        let Some(g) = self.nav_grid(p.area) else {
+            return;
+        };
+        let Some(own) = g.cell(p.placed) else { return };
+        if walkable(&g, own) || !(g.cell_size > 0.0 && g.cell_size.is_finite()) {
+            return;
+        }
+        let scenery = self.movement_cells(id, &g);
+        let doors = self.closed_doors(p.area);
+        let leaves = self.door_sight(p.area);
+        let free = |c: (u32, u32)| {
+            let index = (c.1 * g.columns + c.0) as usize;
+            walkable(&g, c)
+                && !scenery.contains(&index)
+                && !doors.iter().any(|d| d.1.contains(&index))
+        };
+        let feet = p.placed;
+        let radius = self.capsule_radius(id);
+        let candidate = |q: [f32; 3], bound: f32| {
+            if !q.iter().all(|x| x.is_finite()) {
+                return None;
+            }
+            let (dx, dy) = (q[0] - feet[0], q[1] - feet[1]);
+            let distance = dx.hypot(dy);
+            if distance > bound {
+                return None;
+            }
+            let cell = g.cell(q)?;
+            let z = height(&g, cell);
+            if !free(cell) || (z - q[2]).abs() > MAX_STEP || (z - feet[2]).abs() > MAX_STEP {
+                return None;
+            }
+            let q = [q[0], q[1], z];
+            if self.body_in_the_way(p.area, q, radius, Some(id)) {
+                return None;
+            }
+            // Permit leaving only the invalid cell the pair put us into. Its
+            // stored height is not a floor; use the retained feet until we exit.
+            let mut prev = own;
+            let mut floor = feet[2];
+            let n = (distance / (g.cell_size * 0.5)).ceil().max(1.0) as u32;
+            for k in 1..=n {
+                let t = k as f32 / n as f32;
+                let c = g.cell([feet[0] + t * dx, feet[1] + t * dy, z])?;
+                if c == prev {
+                    continue;
+                }
+                let level = |c| free(c) && (height(&g, c) - feet[2]).abs() <= MAX_STEP;
+                if !level(c)
+                    || (height(&g, c) - floor).abs() > MAX_STEP
+                    || (c.0 != prev.0
+                        && c.1 != prev.1
+                        && !(level((c.0, prev.1)) && level((prev.0, c.1))))
+                {
+                    return None;
+                }
+                prev = c;
+                floor = height(&g, c);
+            }
+            // Grid doorway masks can miss a straddling leaf. Do not snap through one.
+            if leaves.solid.iter().any(|leaf| {
+                leaf.blocked([feet[0], feet[1], feet[2] + 1.0], [q[0], q[1], q[2] + 1.0])
+            }) {
+                return None;
+            }
+            Some(q)
+        };
+        const REACH: f32 = 5.0;
+        let repaired = candidate(p.before, (g.cell_size * 1.5).min(REACH)).or_else(|| {
+            // As in 0x73e370, advance in half-cell square rings, bottom/top then
+            // left/right. The extra ring-count cap bounds work on very fine grids.
+            let step = g.cell_size * 0.5;
+            let rings = ((REACH / step) as i32).min(40);
+            for r in 1..=rings {
+                for (xs, ys, swap) in [(-r..=r, [-r, r], false), (1 - r..=r - 1, [-r, r], true)] {
+                    for i in xs {
+                        for j in ys {
+                            let (x, y) = if swap { (j, i) } else { (i, j) };
+                            if let Some(q) = candidate(
+                                [
+                                    feet[0] + x as f32 * step,
+                                    feet[1] + y as f32 * step,
+                                    feet[2],
+                                ],
+                                REACH,
+                            ) {
+                                return Some(q);
+                            }
+                        }
+                    }
+                }
+            }
+            None
+        });
+        if let Some(q) = repaired {
+            self.move_object(id, q, None);
+        }
     }
 
     /// Keep the existing simulation's resurrection consistent with paired state.
@@ -540,6 +679,169 @@ mod tests {
             victim,
             directory,
         }
+    }
+
+    fn placement_fixture() -> (Fixture, [f32; 3], thedas_formats::level::NavGrid) {
+        let mut f = fixture(false);
+        let before = [2.75, 2.75, -1.0];
+        let separation = f.sim.capsule_radius(f.attacker) + f.sim.capsule_radius(f.victim) + 1.2;
+        let a = f.sim.world.get_mut(f.attacker).unwrap();
+        a.position = before;
+        let area = a.area.unwrap();
+        f.sim.world.get_mut(f.victim).unwrap().position =
+            [before[0] + separation - 0.7, before[1], before[2]];
+        f.sim.area_layouts.insert(area, "pair_grid".into());
+        let mut g = thedas_formats::level::NavGrid {
+            columns: 12,
+            rows: 12,
+            cell_size: 0.5,
+            clearance: 2.0,
+            base: [0.0; 3],
+            normal: [0.0, 0.0, 1.0],
+            data: vec![1; 144],
+            heights: vec![-16.0; 144],
+            surfaces: Vec::new(),
+        };
+        g.data[5 * 12 + 4] = 9;
+        g.heights[5 * 12 + 4] = 32.0; // The wall's sample is not the mover's floor.
+        (f, before, g)
+    }
+
+    #[test]
+    fn pair_wall_repairs_to_pre_pair_feet_at_finish_after_resume() {
+        let (mut f, before, g) = placement_fixture();
+        f.sim
+            .nav_grids
+            .insert("pair_grid".into(), Some(Arc::new(g)));
+        f.sim.tick(0);
+        let a = f.sim.world.get(f.attacker).unwrap();
+        let placed = a.position;
+        let facing = a.facing;
+        let pair = a.combat.death_blow.as_ref().unwrap();
+        assert_eq!(pair.placement_repair.unwrap().before, before);
+        let saved: crate::save::SaveGame =
+            serde_json::from_slice(&f.sim.save_json().unwrap()).unwrap();
+        let ends = pair.ends_ms;
+        // Load normally, then remount the synthetic grid (no installed layout).
+        let grid = f.sim.nav_grids["pair_grid"].clone();
+        let area = a.area.unwrap();
+        f.sim.load_game(saved).unwrap();
+        f.sim.area_layouts.insert(area, "pair_grid".into());
+        f.sim.nav_grids.insert("pair_grid".into(), grid);
+        f.sim.tick(ends - 1);
+        assert_eq!(f.sim.world.get(f.attacker).unwrap().position, placed);
+        f.sim.tick(1);
+        let a = f.sim.world.get(f.attacker).unwrap();
+        assert_eq!((a.position, a.facing), (before, facing));
+        assert!(a.combat.death_blow.is_none());
+        assert!(f.sim.world.get(f.victim).unwrap().dead);
+        f.sim.order_move(f.attacker, [3.75, 2.75, -1.0]);
+        f.sim.tick(250);
+        assert!(f.sim.world.get(f.attacker).unwrap().position[0] > before[0]);
+    }
+
+    #[test]
+    fn pair_wall_rejects_unsafe_original_point_before_trying_a_local_alternate() {
+        let (mut f, before, g) = placement_fixture();
+        f.sim
+            .nav_grids
+            .insert("pair_grid".into(), Some(Arc::new(g)));
+        f.sim.tick(0);
+        let a = f.sim.world.get(f.attacker).unwrap();
+        let placed = a.position;
+        let area = a.area;
+        let ends = a.combat.death_blow.as_ref().unwrap().ends_ms;
+        let other = f.sim.world.spawn(ObjectKind::Creature, "other");
+        let o = f.sim.world.get_mut(other).unwrap();
+        o.area = area;
+        o.position = before;
+        f.sim.tick(ends);
+        let q = f.sim.world.get(f.attacker).unwrap().position;
+        assert_ne!(q, before);
+        assert_ne!(q, placed);
+        assert_eq!(q[2], before[2]);
+        assert!(crate::engine::dist(q, placed) < 1.0);
+    }
+
+    #[test]
+    fn pair_wall_keeps_placement_when_the_only_exit_is_on_another_floor() {
+        let (mut f, _, mut g) = placement_fixture();
+        for (i, v) in g.data.iter_mut().enumerate() {
+            if i != 5 * 12 + 5 {
+                *v = 9;
+            }
+        }
+        g.heights[5 * 12 + 5] = 16.0;
+        f.sim
+            .nav_grids
+            .insert("pair_grid".into(), Some(Arc::new(g)));
+        f.sim.tick(0);
+        let a = f.sim.world.get(f.attacker).unwrap();
+        let placed = a.position;
+        let ends = a.combat.death_blow.as_ref().unwrap().ends_ms;
+        f.sim.tick(ends);
+        assert_eq!(f.sim.world.get(f.attacker).unwrap().position, placed);
+    }
+
+    #[test]
+    fn pair_wall_does_not_cross_a_newly_blocked_exit_to_a_free_island() {
+        let (mut f, _, mut g) = placement_fixture();
+        let exit = 5 * 12 + 5;
+        let island = 5 * 12 + 7;
+        for (i, v) in g.data.iter_mut().enumerate() {
+            if i != exit && i != island {
+                *v = 9;
+            }
+        }
+        f.sim
+            .nav_grids
+            .insert("pair_grid".into(), Some(Arc::new(g)));
+        f.sim.tick(0);
+        let a = f.sim.world.get(f.attacker).unwrap();
+        let placed = a.position;
+        let ends = a.combat.death_blow.as_ref().unwrap().ends_ms;
+        let area = a.area.unwrap();
+        f.sim
+            .world
+            .nav_patches
+            .entry(area)
+            .or_default()
+            .insert(exit as u32, 8);
+        f.sim.tick(ends);
+        assert_eq!(f.sim.world.get(f.attacker).unwrap().position, placed);
+    }
+
+    #[test]
+    fn pair_wall_never_rewrites_an_externally_displaced_attacker() {
+        let (mut f, _, g) = placement_fixture();
+        f.sim
+            .nav_grids
+            .insert("pair_grid".into(), Some(Arc::new(g)));
+        f.sim.tick(0);
+        let a = f.sim.world.get_mut(f.attacker).unwrap();
+        let placed = a.position;
+        let ends = a.combat.death_blow.as_ref().unwrap().ends_ms;
+        let external = [placed[0] + 0.05, placed[1], placed[2]];
+        a.position = external;
+        f.sim.tick(ends);
+        assert_eq!(f.sim.world.get(f.attacker).unwrap().position, external);
+    }
+
+    #[test]
+    fn a_legal_pair_placement_keeps_its_position_and_needs_no_repair_record() {
+        let (mut f, _, mut g) = placement_fixture();
+        g.data[5 * 12 + 4] = 1;
+        g.heights[5 * 12 + 4] = -16.0;
+        f.sim
+            .nav_grids
+            .insert("pair_grid".into(), Some(Arc::new(g)));
+        f.sim.tick(0);
+        let a = f.sim.world.get(f.attacker).unwrap();
+        let placed = a.position;
+        let pair = a.combat.death_blow.as_ref().unwrap();
+        assert!(pair.placement_repair.is_none());
+        f.sim.tick(pair.ends_ms);
+        assert_eq!(f.sim.world.get(f.attacker).unwrap().position, placed);
     }
 
     fn impacts(sim: &Sim) -> Vec<(u64, i32)> {

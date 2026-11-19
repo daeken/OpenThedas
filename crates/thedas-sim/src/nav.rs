@@ -1020,7 +1020,7 @@ impl Sim {
 
     /// Whether a living creature's body in `area` reaches within `radius` of `p`.
     /// `mover`, the body being placed, does not count.
-    fn body_in_the_way(
+    pub(crate) fn body_in_the_way(
         &self,
         area: ObjectId,
         p: [f32; 3],

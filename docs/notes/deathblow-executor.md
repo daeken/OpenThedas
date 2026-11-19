@@ -78,6 +78,24 @@ separation shifts the actor along that bearing. The final optional floor
 projection calls 0x73d520 at 0x7a5e62. Playback installs the resulting placement
 through 0x7a3370.
 
+## Public completion and safe placement
+
+Preparation sets creature `+0x420` at `0x7463d9`. The type-38 finish handler
+`0x747360` calls the creature's virtual `+0x178` (`CCCreature` implementation
+`0x6ba870`). When set, the flag is consumed and the function calls
+`0x6b1790(0)`; a controller overlap query and area/path conditions gate its
+position correction. Separately, `0x747447` calls `0x73e370` on the current
+position with radius **5 m**. It can keep a valid current position or search
+nearby locations. On success `0x747459` calls `0x695540` with the resulting
+position; the zero flag leaves unchanged positions alone. Both checks precede
+generic completion at `0x747467 -> 0x746900`. A failed query does not prevent
+completion. These are conditional attempts, not a native unconditional snap.
+
+The normal queue-clear path (`0x73c930 -> 0x73c730`) does not override a
+protected type-38 command. If the command does reach the dispatcher, `0x742190`
+selects `0x747360` regardless of its result. Player forced-interruption callers
+and unload do not follow from that dispatch alone.
+
 ## Sim contract and provisional boundaries
 
 The victim exposes `combat.death_blow_reaction`, containing attacker id,
@@ -102,6 +120,19 @@ placement is immediate, with the attacker's previous height. The native placemen
 blend, floor projection, large-creature table geometry and animation root motion
 remain unported. Missing pair resources retain the old 500 ms stored-result
 fallback. DA2 keeps its existing command behavior.
+
+**Provisional post-pair recovery:** on normal completion of an ordinary pair
+that moved its attacker into an in-grid nonwalkable cell, and only if the living
+attacker remains at that exact pose in that area, try the recorded pre-pair
+position first (within 1.5 cells). Otherwise try half-cell rings bounded by the
+native 5 m query radius. Sim validates current walkability, floor height, door
+and scenery masks, living endpoint occupancy and the short exit segment. The
+segment may leave the original nonwalkable cell but cannot cross another
+blocked cell. The grid, the pre-pair preference and the narrow guards are Sim
+policy, not ports of the native overlap or safe-location point queries. No
+candidate leaves the existing pose unchanged. This does not repair a legacy
+save without that placement record or alter other movement or interruption
+behavior.
 
 Older saves with an active opaque death-blow command restart preparation at load
 time because those saves contain no animation start. Saves containing the new
