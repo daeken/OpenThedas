@@ -131,6 +131,7 @@ const STICKY: u64 = u64::MAX;
 struct State {
     values: BTreeMap<String, UiValue>,
     contexts: Vec<String>,
+    mouse_swapped: bool,
     unanswered: BTreeMap<String, u64>,
     sounds: Vec<String>,
     /// Messages the handler already acted on, oldest first (their text).
@@ -206,6 +207,17 @@ fn written_value(name: &str, text: &str) -> UiValue {
 }
 
 impl GameBridge {
+    /// The committed physical button mapping, shared with the window input router.
+    pub fn set_mouse_swapped(&self, swapped: bool) {
+        if let Ok(mut state) = self.state.lock() {
+            state.mouse_swapped = swapped;
+        }
+    }
+
+    pub fn mouse_swapped(&self) -> bool {
+        self.state.lock().is_ok_and(|s| s.mouse_swapped)
+    }
+
     pub fn new(strings: StringLookup) -> Self {
         let mut state = State::default();
         for (k, v) in [
@@ -631,6 +643,7 @@ impl GameBridge {
                 // Key tags name the keys bound to actions (see `crate::keys`).
                 let text = crate::keys::replace_key_tags(
                     &text,
+                    self.mouse_swapped(),
                     |action| {
                         let s = self.state.lock().ok()?;
                         match s
@@ -1014,6 +1027,29 @@ mod tests {
             replace_designer_tags("<male>x</male>", "A"),
             "<male>x</male>"
         );
+    }
+
+    #[test]
+    fn designer_mouse_tags_follow_the_committed_mapping() {
+        let b = GameBridge::new(Arc::new(|id| match id {
+            330711 => Some("Left-click".into()),
+            330712 => Some("Right-click".into()),
+            _ => None,
+        }));
+        let tag = "<RightClickDefaultCapped/>";
+        for (swapped, expected) in [
+            (false, "Right-click"),
+            (true, "Left-click"),
+            (false, "Right-click"),
+        ] {
+            b.set_mouse_swapped(swapped);
+            for kind in [CallKind::FsCommand, CallKind::ExternalInterface] {
+                assert_eq!(
+                    b.respond(&call(kind, "ReplaceDesignerTags", &[tag])),
+                    UiValue::String(expected.into())
+                );
+            }
+        }
     }
 
     #[test]

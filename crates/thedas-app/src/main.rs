@@ -886,6 +886,7 @@ struct App {
     gfx: Option<Gfx>,
     keys: HashSet<KeyCode>,
     looking: bool,
+    mouse_buttons: mouse::Buttons,
     right_click: mouse::RightClick,
     /// The right button went down over the interface: its release is the interface's too (an
     /// item's radial menu opens on the press and acts on the release).
@@ -4066,6 +4067,21 @@ impl App {
         }
     }
 
+    /// Window and control input names the physical button; the pad and the report
+    /// recorder use the logical buttons. Provisional: Origins' full dispatch across
+    /// movies and world input has not been traced (see the orders tutorial note).
+    fn physical_button(&mut self, button: mouse::Button, pressed: bool) {
+        let swapped = self
+            .gfx
+            .as_ref()
+            .is_some_and(|g| g.ui.stage.bridge.mouse_swapped());
+        match self.mouse_buttons.edge(button, pressed, swapped) {
+            Some(mouse::Button::Left) => self.left_button(pressed),
+            Some(mouse::Button::Right) => self.right_button(pressed),
+            None => {}
+        }
+    }
+
     /// The left button goes down or up at the cursor.
     fn left_button(&mut self, pressed: bool) {
         let was_down = std::mem::replace(&mut self.left_down, pressed);
@@ -4217,15 +4233,15 @@ impl App {
         match step {
             &Step::Click(x, y) => {
                 self.cursor_to(x, y);
-                self.left_button(true);
-                self.left_button(false);
+                self.physical_button(mouse::Button::Left, true);
+                self.physical_button(mouse::Button::Left, false);
                 log.push(format!("click {x},{y}"));
             }
             &Step::ClickAs(button, x, y) => {
                 self.cursor_to(x, y);
                 if button == thedas_ui::avm1::MOUSE_RIGHT {
-                    self.right_button(true);
-                    self.right_button(false);
+                    self.physical_button(mouse::Button::Right, true);
+                    self.physical_button(mouse::Button::Right, false);
                 } else if let Some(g) = self.gfx.as_mut() {
                     g.ui.click_as(button, x, y);
                 }
@@ -4233,7 +4249,7 @@ impl App {
             }
             &Step::RightAt(x, y, down) => {
                 self.cursor_to(x, y);
-                self.right_button(down);
+                self.physical_button(mouse::Button::Right, down);
                 log.push(format!(
                     "right {} {x},{y}",
                     if down { "press" } else { "release" }
@@ -4751,7 +4767,7 @@ impl App {
             &Step::Press(x, y) | &Step::Release(x, y) => {
                 let down = matches!(step, Step::Press(..));
                 self.cursor_to(x, y);
-                self.left_button(down);
+                self.physical_button(mouse::Button::Left, down);
                 log.push(format!(
                     "{} {x},{y}",
                     if down { "press" } else { "release" }
@@ -5547,12 +5563,12 @@ impl ApplicationHandler for App {
                 state,
                 button: MouseButton::Left,
                 ..
-            } => self.left_button(state == ElementState::Pressed),
+            } => self.physical_button(mouse::Button::Left, state == ElementState::Pressed),
             WindowEvent::MouseInput {
                 state,
                 button: MouseButton::Right,
                 ..
-            } => self.right_button(state == ElementState::Pressed),
+            } => self.physical_button(mouse::Button::Right, state == ElementState::Pressed),
             WindowEvent::MouseWheel { delta, .. } => {
                 let steps = match delta {
                     winit::event::MouseScrollDelta::LineDelta(_, y) => y,
@@ -5564,6 +5580,10 @@ impl ApplicationHandler for App {
                 self.keys.clear();
                 self.looking = false;
                 self.right_click = Default::default();
+                self.mouse_buttons = Default::default();
+                self.left_down = false;
+                self.swallow_release = false;
+                self.ui_right = false;
                 if let Some(g) = self.gfx.as_mut() {
                     g.ui.stage.set_shift(false);
                     g.ui.mouse_leave();
@@ -8170,6 +8190,7 @@ fn main() -> Result<()> {
         gfx: None,
         keys: HashSet::new(),
         looking: false,
+        mouse_buttons: Default::default(),
         right_click: Default::default(),
         ui_right: false,
         last: Instant::now(),

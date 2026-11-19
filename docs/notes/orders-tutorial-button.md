@@ -77,7 +77,7 @@ right-button behavior is unchanged.
   been traced; the new tap detector permits 4 pixels of jitter and latches a
   drag once exceeded. Relative device motion also counts when the cursor is
   confined.
-- Swapped-button controls are not implemented; this fix uses default controls.
+- UI-057 now honors the committed Swap Mouse Buttons setting in Origins window/control input. Physical left/right exchange the existing logical actions; a press and release keep the same mapping. The resolved designer mouse tags use that setting too. The movie/world dispatch is provisional; the trace above verifies the names, not every original mouse action. Pad input and offscreen movie steps retain their logical button roles, and DA2 is unchanged.
 - This fix adds ground orders only. Right-click world-object interactions and
   selection modifiers still need a separate input-binding trace. The offscreen
   `--capture --steps` movie-only right-button path is also separate from the
