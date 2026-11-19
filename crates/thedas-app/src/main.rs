@@ -5607,6 +5607,8 @@ pub(crate) fn voice_line(sim: &thedas_sim::Sim) -> Option<audio::VoiceLine> {
     if !cut_controls_speech
         && let Some(l) = open
         && let Some(strref) = l.strref
+        && !(sim.game == thedas_vfs::Game::Origins
+            && sim.presented_line_cut().is_some_and(|cut| cut.no_voice))
         && sim.cut_line_speech() != thedas_sim::dialog::CutLineSpeech::Complete
     {
         let female = sim
