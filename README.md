@@ -302,6 +302,11 @@ For side-by-side comparisons, render a fixed view with no window:
 
 The camera is `x,y,z,yaw,pitch` in world units and degrees; Z is up and yaw 0 looks along +X.
 
+For repeatable save/steps/camera sweeps against another binary, use the
+[scripted capture runner](scripts/capture-runner/README.md). One command captures
+both builds without a visible window and writes per-frame pixel-delta metrics,
+heatmaps and labelled baseline/candidate/delta panels, with exact repeat checks.
+
 `--ui` plays interface movies over the scene: `--ui menu` (the in-game menu), `--ui hud`
 (portraits, quick bar, minimap), or any comma-separated movie names (`--ui startmenu2`).
 `--area none` shows the interface alone. With `--capture`, `--ui-frames` sets how many movie
