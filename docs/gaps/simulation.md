@@ -77,7 +77,7 @@ Each entry gives what the original does, what we do, evidence, a rough size (S <
 ### E. Items and inventory
 
 1. **One shared party pack**: as the game shows it (provisional). Stored follower inventories exist.
-2. **SetItemDamaged and RemoveAllItemVisualEffects** lack Origins implementations (11 and 5 static calls). **Item heraldry presentation** is still missing: `GetItemHeraldry`/`SetItemHeraldry` read/write the saved item byte, but setting it does not yet refresh the wearer's appearance. See [script-item-heraldry.md](../notes/script-item-heraldry.md).
+2. **SetItemDamaged** still lacks an Origins implementation (11 static calls). Origins `GetItemHeraldry`/`SetItemHeraldry` read/write the saved item byte without refreshing the wearer's appearance ([trace](../notes/script-item-heraldry.md)). `RemoveAllItemVisualEffects` removes ordinary type-4 effects from the item list, preserves duration types 4–6, and does not implement native visual detachment or presentation notifications.
 3. **Body bags that die when empty** (DieWhenEmpty, coin pouch model) are not removed; pool creatures (CreatePool) are not modelled. Size S.
 4. **Stores**: implemented. Buy and sell price rules have not been re-checked against the exe. Size S.
 5. **Item stacking**: done per the exe (#237).

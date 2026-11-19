@@ -117,7 +117,6 @@ SetPartyLeader, CloseQuestGroup, the trap-difficulty getters and the item functi
 | GetAILevel | 221 | 5 | 5 |
 | SetCanChangeEquipment | 391 | 5 | 4 |
 | GetMeleeRingPosition | 606 | 5 | 5 |
-| RemoveAllItemVisualEffects | 783 | 5 | 2 |
 | SetFacingPosition | 23 | 4 | 4 |
 | SetReactionOverride | 471 | 4 | 4 |
 | StopSoundObject | 481 | 4 | 4 |

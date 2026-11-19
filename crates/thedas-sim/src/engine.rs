@@ -3245,6 +3245,20 @@ pub fn call(
             }
             void()
         }
+        "RemoveAllItemVisualEffects" if h.sim.game == thedas_vfs::Game::Origins => {
+            if let Some(item) = h
+                .sim
+                .world
+                .get_mut(obj(a, 0))
+                .filter(|o| o.kind == ObjectKind::Item)
+            {
+                // 0x6748e0 selects type 4; 0x7a0c90 excludes durations 4–6.
+                // Type-4 removal detaches the visual without a REMOVE_EFFECT hook.
+                item.effects
+                    .retain(|e| e.ty != 4 || (4..=6).contains(&e.duration_type));
+            }
+            void()
+        }
         "RemoveAllEffects" => {
             let (who, keep_injuries) = (obj(a, 0), a.len() < 2 || int(a, 1) != 0);
             let death = int(a, 2) != 0;
@@ -16593,6 +16607,64 @@ mod coverage_tests {
             (4, 3, vec![1077])
         );
         assert!(s.world.get(man).unwrap().effects.is_empty());
+    }
+
+    #[test]
+    fn origins_remove_all_item_vfx_only_clears_unprotected_item_visuals() {
+        let table =
+            EngineTable::parse(b"void RemoveAllItemVisualEffects(object o) = 783;\n").unwrap();
+        let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(table), 1);
+        s.game = thedas_vfs::Game::Origins;
+        let item = s.world.spawn(ObjectKind::Item, "sword");
+        let other = s.world.spawn(ObjectKind::Item, "other_sword");
+        let wearer = s.world.spawn(ObjectKind::Creature, "wearer");
+        // CONST OBJECT_SELF, ACTION 783/1, RETN, assembled here without game bytes.
+        let script = thedas_script::Ncs::parse(
+            b"NCS V1.0B\x00\x00\x00\x1a\x04\x06\x00\x00\x00\x00\x05\x00\x03\x0f\x01\x20\x00",
+        )
+        .unwrap();
+        s.add_script("clear_vfx", script);
+        let mut effects: Vec<_> = (0..=7)
+            .map(|duration_type| Effect {
+                ty: 4,
+                duration_type,
+                ints: vec![100 + duration_type],
+                ..Default::default()
+            })
+            .collect();
+        effects.insert(
+            1,
+            Effect {
+                ty: 5,
+                duration_type: 3,
+                ints: vec![103],
+                ..Default::default()
+            },
+        );
+        let kept: Vec<_> = [1, 5, 6, 7]
+            .into_iter()
+            .map(|i| effects[i].clone())
+            .collect();
+        for target in [item, other, wearer] {
+            s.world
+                .get_mut(target)
+                .unwrap()
+                .effects
+                .clone_from(&effects);
+        }
+        for target in [OBJECT_INVALID, wearer, item, item] {
+            assert_eq!(s.run_script("clear_vfx", target, None), None);
+        }
+        assert_eq!(s.world.get(item).unwrap().effects, kept);
+        assert_eq!(s.world.get(wearer).unwrap().effects, effects);
+        assert_eq!(s.world.get(other).unwrap().effects, effects);
+        let save = s.save_json().unwrap();
+        s.load_json(&save).unwrap();
+        assert_eq!(s.world.get(item).unwrap().effects, kept);
+
+        s.game = thedas_vfs::Game::DragonAge2;
+        s.run_script("clear_vfx", other, None);
+        assert_eq!(s.world.get(other).unwrap().effects, effects);
     }
 
     #[test]
