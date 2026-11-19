@@ -1812,25 +1812,14 @@ pub fn call(
             void()
         }
         "CreateObject" => {
-            let kind = if h.sim.game == thedas_vfs::Game::Origins {
-                // 0x669550 converts the type bit to log2(type) + 1; the non-pooled
-                // factory at 0x6861f0 accepts only kinds 6 and 10. Preserve the
-                // ordinary SSE2 path's positive conversion ranges, including
-                // noncanonical type bits (see script-created-object-types.md).
-                match int(a, 0) {
-                    32..=63 => ObjectKind::Creature,
-                    512..=1023 => ObjectKind::Placeable,
-                    _ => return ok(Value::Object(OBJECT_INVALID)),
-                }
-            } else {
-                match int(a, 0) {
-                    32 => ObjectKind::Creature,
-                    512 => ObjectKind::Placeable,
-                    64 => ObjectKind::Item,
-                    4096 => ObjectKind::Waypoint,
-                    128 => ObjectKind::Trigger,
-                    _ => ObjectKind::Placeable,
-                }
+            // Origins 0x669550 and DA2 0x503b30 truncate log2(type), then add 1.
+            // The non-pooled factories accept only internal kinds 6 and 10, so
+            // preserve their ordinary SSE2 path's positive conversion ranges.
+            // The native template-keyed pool lookup is not modeled here.
+            let kind = match int(a, 0) {
+                32..=63 => ObjectKind::Creature,
+                512..=1023 => ObjectKind::Placeable,
+                _ => return ok(Value::Object(OBJECT_INVALID)),
             };
             let template = string(a, 1)
                 .trim_end_matches(".utc")
@@ -7973,13 +7962,16 @@ mod tests {
         float GetUpgradableAbilityHashedM2DAFloat(object o, int nColumnHash, int nAbilityId) = 876;\n";
 
     #[test]
-    fn origins_create_object_only_uses_its_creature_and_placeable_factories() {
+    fn create_object_only_uses_unpooled_creature_and_placeable_factories() {
         use thedas_formats::gff3::{Field, Gff3, Struct, Value as G};
 
         let dir = std::env::temp_dir().join(format!("thedas-create-types-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let mut vfs = Vfs::new();
-        for (ext, file_type) in [("utc", *b"UTC "), ("utp", *b"UTP ")] {
+        for (ext, file_type, tag) in [
+            ("utc", *b"UTC ", b"from_utc"),
+            ("utp", *b"UTP ", b"from_utp"),
+        ] {
             let template = Gff3 {
                 file_type,
                 file_version: *b"V3.2",
@@ -7987,7 +7979,7 @@ mod tests {
                     id: u32::MAX,
                     fields: vec![Field {
                         label: "Tag".into(),
-                        value: G::ExoString(b"from_template".to_vec()),
+                        value: G::ExoString(tag.to_vec()),
                     }],
                 }],
             };
@@ -7998,89 +7990,85 @@ mod tests {
         let table = EngineTable::parse(
             b"#define ENGINE_STRUCTURE_1 location\n\
               int EVENT_TYPE_SPAWN = 1000;\n\
-              object CreateObject(int kind, resource template, location position, string script, int active, int no_perm) = 306;",
+              object CreateObject(int kind, resource template, location position, string script, int active) = 306;",
         )
         .unwrap();
-        let mut s = Sim::new(Arc::new(vfs), Arc::new(table), 1);
-        let area = s.world.spawn(ObjectKind::Area, "area");
-        s.world.area = Some(area);
-        let location = s.world.store(EngineData::Location(Location {
-            area,
-            position: [1.0, 2.0, 3.0],
-            facing: 90.0,
-        }));
-        let args = |kind| {
-            vec![
-                Value::Int(kind),
-                Value::Resource("created".into()),
-                Value::Engine {
-                    ty: 1,
-                    handle: Some(location),
-                },
-                Value::String("override_script".into()),
-                Value::Int(0),
-                Value::Int(0),
-            ]
-        };
-        let before = serde_json::to_value(&s.world).unwrap();
-        for kind in [
-            i32::MIN,
-            -1,
-            0,
-            1,
-            16,
-            31,
-            64,
-            128,
-            256,
-            511,
-            1024,
-            4096,
-            i32::MAX,
-        ] {
-            assert_eq!(
-                run(&mut s, area, "CreateObject", &args(kind)),
-                Some(Value::Object(OBJECT_INVALID)),
-                "type {kind}"
-            );
-            assert_eq!(
-                serde_json::to_value(&s.world).unwrap(),
-                before,
-                "no object, event or id allocation for type {kind}"
-            );
-        }
-        for (kind, expected) in [
-            (32, ObjectKind::Creature),
-            (33, ObjectKind::Creature),
-            (63, ObjectKind::Creature),
-            (512, ObjectKind::Placeable),
-            (700, ObjectKind::Placeable),
-            (1023, ObjectKind::Placeable),
-        ] {
-            let Some(Value::Object(id)) = run(&mut s, area, "CreateObject", &args(kind)) else {
-                panic!("no object for {kind}")
+        let vfs = Arc::new(vfs);
+        let table = Arc::new(table);
+        for game in [thedas_vfs::Game::Origins, thedas_vfs::Game::DragonAge2] {
+            let mut s = Sim::new(vfs.clone(), table.clone(), 1);
+            s.game = game;
+            let area = s.world.spawn(ObjectKind::Area, "area");
+            s.world.area = Some(area);
+            let location = s.world.store(EngineData::Location(Location {
+                area,
+                position: [1.0, 2.0, 3.0],
+                facing: 90.0,
+            }));
+            let args = |kind| {
+                vec![
+                    Value::Int(kind),
+                    Value::Resource("created".into()),
+                    Value::Engine {
+                        ty: 1,
+                        handle: Some(location),
+                    },
+                    Value::String("override_script".into()),
+                    Value::Int(0),
+                ]
             };
-            let object = s.world.get(id).unwrap();
-            assert_eq!(object.kind, expected);
-            assert_eq!(object.tag, "from_template");
-            assert_eq!(
-                (object.area, object.position, object.facing),
-                (Some(area), [1.0, 2.0, 3.0], 90.0)
-            );
-            assert!(!object.active);
-            assert_eq!(object.script.as_deref(), Some("override_script"));
-        }
-        s.game = thedas_vfs::Game::DragonAge2;
-        for (kind, expected) in [
-            (64, ObjectKind::Item),
-            (128, ObjectKind::Trigger),
-            (4096, ObjectKind::Waypoint),
-            (0, ObjectKind::Placeable),
-        ] {
-            let Some(Value::Object(id)) = run(&mut s, area, "CreateObject", &args(kind)) else {
-                panic!("DA2 type {kind}")
-            };
-            assert_eq!(s.world.get(id).unwrap().kind, expected, "DA2 type {kind}");
+            let before = serde_json::to_value(&s.world).unwrap();
+            for kind in [
+                0,
+                i32::MIN,
+                -1,
+                1,
+                16,
+                31,
+                64,
+                128,
+                256,
+                511,
+                1024,
+                4096,
+                i32::MAX,
+            ] {
+                assert_eq!(
+                    run(&mut s, area, "CreateObject", &args(kind)),
+                    Some(Value::Object(OBJECT_INVALID)),
+                    "{game:?}: rejecting type {kind}"
+                );
+                assert_eq!(
+                    serde_json::to_value(&s.world).unwrap(),
+                    before,
+                    "{game:?}: no object, event or ID allocation for type {kind}"
+                );
+            }
+            for (kind, expected, tag) in [
+                (32, ObjectKind::Creature, "from_utc"),
+                (33, ObjectKind::Creature, "from_utc"),
+                (63, ObjectKind::Creature, "from_utc"),
+                (512, ObjectKind::Placeable, "from_utp"),
+                (700, ObjectKind::Placeable, "from_utp"),
+                (1023, ObjectKind::Placeable, "from_utp"),
+            ] {
+                let queued = s.world.queue.len();
+                let Some(Value::Object(id)) = run(&mut s, area, "CreateObject", &args(kind)) else {
+                    panic!("{game:?}: no object for {kind}")
+                };
+                let object = s.world.get(id).unwrap();
+                assert_eq!(object.kind, expected, "{game:?}: type {kind}");
+                assert_eq!(object.tag, tag);
+                assert_eq!(
+                    (object.area, object.position, object.facing),
+                    (Some(area), [1.0, 2.0, 3.0], 90.0)
+                );
+                assert!(!object.active);
+                assert_eq!(object.script.as_deref(), Some("override_script"));
+                assert_eq!(s.world.queue.len(), queued + 1);
+                let ((due, _), spawn) = s.world.queue.last_key_value().unwrap();
+                assert_eq!((*due, spawn.target, spawn.event.ty), (s.world.time_ms, id, 1000));
+            }
         }
         std::fs::remove_dir_all(dir).unwrap();
     }
