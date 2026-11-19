@@ -1310,6 +1310,31 @@ fn read_frame(
     }
 }
 
+/// Only the owned spot-note dialog covers live report marks. Ordinary HUD, other
+/// popups, the pad pointer, and the report writer keep their usual ordering.
+fn report_lines_under_note(ui: &mut ui::UiLayer, lines: &[[glam::Vec2; 2]]) -> bool {
+    !lines.is_empty() && ui.stage.owns_dialog(report::REGION_ID)
+}
+
+fn capture_report_underlay(
+    ui: &mut ui::UiLayer,
+    device: &wgpu::Device,
+    frame: &mut thedas_ui::Rgba,
+    lines: &[[glam::Vec2; 2]],
+) -> Result<()> {
+    let size = (frame.width, frame.height);
+    ui.stage.capture_with_popup_underlay(
+        frame,
+        &mut |encoder, target| {
+            let view = target.create_view(&Default::default());
+            reticle::ReticlePass::new(device, target.format(), 1)
+                .draw(device, encoder, &view, size, lines);
+        },
+        &mut |rgba| reticle::draw_rgba(&mut rgba.pixels, size, lines),
+    )?;
+    Ok(())
+}
+
 /// `frame` with `paint` drawn over it on the GPU (in the window's `format`), read back.
 fn paint_over(
     ctx: &GpuContext,
@@ -1982,13 +2007,24 @@ impl App {
             g.reticle
                 .draw(&g.ctx.device, &mut encoder, &view, size, &lines);
         }
-        g.ui.composite(&mut encoder, &frame.texture, g.config.format);
-        // The pad's pointer goes over the interface.
+        let under_note = report_lines_under_note(&mut g.ui, &marks);
+        let mut draw_marks = |encoder: &mut wgpu::CommandEncoder, _: &wgpu::Texture| {
+            g.reticle.draw(&g.ctx.device, encoder, &view, size, &marks);
+        };
+        g.ui.composite(
+            &mut encoder,
+            &frame.texture,
+            g.config.format,
+            under_note.then_some(&mut draw_marks),
+        );
+        // The pad's pointer always goes over the interface.
         let ctx = self
             .pad
             .context_for(self.screens.as_ref(), g.ui.stage.dialog_up());
         let mut pointer = self.pad.pointer(self.cursor, ctx);
-        pointer.extend(marks);
+        if !under_note {
+            pointer.extend(marks);
+        }
         g.reticle
             .draw(&g.ctx.device, &mut encoder, &view, size, &pointer);
         // Mod mode's panels go over everything, the interface included.
@@ -5012,6 +5048,7 @@ impl App {
     /// The frame as the player would see it, drawn offscreen: the world, the aiming reticle
     /// and the interface.
     fn screenshot_rgba(&mut self) -> Result<thedas_ui::Rgba> {
+        let marks = self.marking_lines();
         let g = self.gfx.as_mut().context("the window is not up yet")?;
         let (w, h) = (g.config.width, g.config.height);
         let mut reticle = Vec::new();
@@ -5033,12 +5070,19 @@ impl App {
             pixels: pixels.unwrap_or_else(|| [0, 0, 0, 255].repeat(w as usize * h as usize)),
         };
         reticle::draw_rgba(&mut frame.pixels, (w, h), &reticle);
-        g.ui.capture_over(&mut frame)?;
+        let under_note = report_lines_under_note(&mut g.ui, &marks);
+        if under_note {
+            capture_report_underlay(&mut g.ui, &g.ctx.device, &mut frame, &marks)?;
+        } else {
+            g.ui.capture_over(&mut frame)?;
+        }
         let ctx = self
             .pad
             .context_for(self.screens.as_ref(), g.ui.stage.dialog_up());
         let mut over = self.pad.pointer(self.cursor, ctx);
-        over.extend(self.marking_lines());
+        if !under_note {
+            over.extend(marks);
+        }
         reticle::draw_rgba(&mut frame.pixels, (w, h), &over);
         if let (Some(m), Some(g)) = (self.mod_mode.as_mut().filter(|m| m.open), self.gfx.as_ref()) {
             frame = paint_over(&g.ctx, g.config.format, frame, |encoder, view| {

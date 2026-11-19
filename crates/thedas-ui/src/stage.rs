@@ -1107,7 +1107,11 @@ impl Stage {
     }
 
     /// [`Stage::capture_over`] drawing straight onto `base` on the GPU.
-    fn capture_direct(&mut self, base: &mut Rgba) -> Result<(), UiError> {
+    fn capture_direct(
+        &mut self,
+        base: &mut Rgba,
+        underlay: Option<&mut PopupUnderlay<'_>>,
+    ) -> Result<(), UiError> {
         let (device, queue) = (self.gpu.device.clone(), self.gpu.queue.clone());
         let (w, h) = (base.width, base.height);
         if w == 0 || h == 0 || base.pixels.len() != (w * h * 4) as usize {
@@ -1150,7 +1154,7 @@ impl Stage {
             mapped_at_creation: false,
         });
         let mut encoder = device.create_command_encoder(&Default::default());
-        self.draw_into(&mut encoder, &texture);
+        self.draw_into_with_popup_underlay(&mut encoder, &texture, underlay);
         encoder.copy_texture_to_buffer(
             texture.as_image_copy(),
             wgpu::TexelCopyBufferInfo {
@@ -1199,7 +1203,23 @@ impl Stage {
     /// Draws every movie, in order, over `target` (the frame) into `encoder` (see
     /// [`crate::direct`]).
     pub fn draw_into(&mut self, encoder: &mut wgpu::CommandEncoder, target: &wgpu::Texture) {
+        self.draw_into_with_popup_underlay(encoder, target, None);
+    }
+
+    /// Inserts an optional paint step immediately before the popup movie, without
+    /// moving that movie or changing the order of any other movie.
+    pub fn draw_into_with_popup_underlay(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &wgpu::Texture,
+        mut underlay: Option<&mut PopupUnderlay<'_>>,
+    ) {
         for m in &mut self.movies {
+            if m.name == POPUP_LAYER
+                && let Some(paint) = underlay.take()
+            {
+                paint(encoder, target);
+            }
             m.draw_into(encoder, target);
         }
     }
@@ -1207,8 +1227,28 @@ impl Stage {
     /// Renders every movie and blends the frames over `base` (straight RGBA): drawn
     /// straight onto it on the GPU (see [`crate::direct`]), or else blended on the CPU.
     pub fn capture_over(&mut self, base: &mut Rgba) -> Result<(), UiError> {
+        self.capture_layers(base, None, None)
+    }
+
+    /// Like [`Stage::capture_over`], inserting the underlay before the popup in
+    /// whichever compositor is active. The other backend's callback is not called.
+    pub fn capture_with_popup_underlay(
+        &mut self,
+        base: &mut Rgba,
+        gpu: &mut PopupUnderlay<'_>,
+        cpu: &mut dyn FnMut(&mut Rgba),
+    ) -> Result<(), UiError> {
+        self.capture_layers(base, Some(gpu), Some(cpu))
+    }
+
+    fn capture_layers(
+        &mut self,
+        base: &mut Rgba,
+        gpu: Option<&mut PopupUnderlay<'_>>,
+        mut cpu: Option<&mut dyn FnMut(&mut Rgba)>,
+    ) -> Result<(), UiError> {
         if crate::direct() {
-            return self.capture_direct(base);
+            return self.capture_direct(base, gpu);
         }
         // The movies' multiplied clips first, onto the picture under the whole interface
         // (see `UiMovie::render_multiply`).
@@ -1218,6 +1258,11 @@ impl Stage {
             }
         }
         for m in &mut self.movies {
+            if m.name == POPUP_LAYER
+                && let Some(paint) = cpu.take()
+            {
+                paint(base);
+            }
             m.render();
             let frame = m
                 .capture()
@@ -1237,6 +1282,9 @@ impl Stage {
     }
 }
 
+/// GPU paint step in a stage's existing movie order, directly below the popup movie.
+pub type PopupUnderlay<'a> = dyn FnMut(&mut wgpu::CommandEncoder, &wgpu::Texture) + 'a;
+
 /// `GUI.HideFullScreenGUI`: the movie asks the game to take its screen away.
 fn is_hide_request(m: &GameMessage) -> bool {
     matches!(m, GameMessage::Send(n, _) if n == "GUI.HideFullScreenGUI")
@@ -1245,6 +1293,76 @@ fn is_hide_request(m: &GameMessage) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn popup_underlay_paints_after_hud_before_popup() {
+        // Two synthetic SWF v8 stages, each with one opaque rectangle and no actions.
+        // The green HUD covers x=32..84 and the red popup x=128..180 (both y=307..413).
+        const HUD: &[u8] = b"FWS\x08\x47\0\0\0\x80\0\x03\x20\0\0\x01\xc2\0\0\x1e\x01\0\
+            \x24\x08\x01\0\x80\x14\0\x34\x80\xbf\xe1\x02\x20\x01\0\x19\x87\x46\xff\0\x10\
+            \x0d\xe0\xa0\x0b\xfe\x7b\x08\x21\xda\x84\x8e\xcd\xf8\x76\xde\xe0\0\
+            \x86\x06\x06\x01\0\x01\0\0\x40\0\0\0";
+        const POPUP: &[u8] = b"FWS\x08\x47\0\0\0\x80\0\x03\x20\0\0\x01\xc2\0\0\x1e\x01\0\
+            \x24\x08\x01\0\x80\x50\0\x70\x80\xbf\xe1\x02\x20\x01\0\xe6\x23\x2c\xff\0\x10\
+            \x0d\xe2\x80\x0b\xfe\x7b\x08\x21\xda\x84\x8e\xcd\xf8\x76\xde\xe0\0\
+            \x86\x06\x06\x01\0\x01\0\0\x40\0\0\0";
+        let (device, queue) = thedas_gfx::gpu::test_device();
+        let gpu = Gpu { device, queue };
+        let size = (1280, 720);
+        let mut stage = Stage::new(gpu, &Arc::new(Vfs::new()), size);
+        for (name, bytes) in [("test-hud.swf", HUD), (POPUP_LAYER, POPUP)] {
+            let mut movie = UiMovie::new(
+                &stage.gpu,
+                name,
+                bytes,
+                size,
+                stage.lookup.clone(),
+                stage.images.clone(),
+                None,
+            )
+            .unwrap();
+            movie.run_frame();
+            stage.movies.push(movie);
+        }
+        let mut frame = Rgba {
+            width: size.0,
+            height: size.1,
+            pixels: [0, 0, 0, 255].repeat((size.0 * size.1) as usize),
+        };
+        let pixel = |rgba: &Rgba, x: usize| {
+            let i = (360 * rgba.width as usize + x) * 4;
+            <[u8; 4]>::try_from(&rgba.pixels[i..i + 4]).unwrap()
+        };
+        stage.capture_direct(&mut frame, None).unwrap();
+        assert_eq!(pixel(&frame, 48), [25, 135, 70, 255]);
+        assert_eq!(pixel(&frame, 144), [230, 35, 44, 255]);
+
+        // Paint a full-frame blue underlay: it should cover the HUD but not the popup.
+        let mut times = 0;
+        stage
+            .capture_direct(
+                &mut frame,
+                Some(&mut |encoder, target| {
+                    times += 1;
+                    encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: &target.create_view(&Default::default()),
+                            resolve_target: None,
+                            depth_slice: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(wgpu::Color::BLUE),
+                                store: wgpu::StoreOp::Store,
+                            },
+                        })],
+                        ..Default::default()
+                    });
+                }),
+            )
+            .unwrap();
+        assert_eq!(times, 1);
+        assert_eq!(pixel(&frame, 48), [0, 0, 255, 255]);
+        assert_eq!(pixel(&frame, 144), [230, 35, 44, 255]);
+    }
 
     #[test]
     #[ignore = "requires THEDAS_INSTALL and an offscreen GPU"]
