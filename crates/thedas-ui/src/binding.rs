@@ -463,7 +463,10 @@ fn sim_values_with(
         num(members.len() as f64),
     );
     set("Party.SelectedCount".into(), num(hero.is_some() as u8));
-    set("Party.QuickbarLocked".into(), num(0));
+    // Origins quickbar.gfx owns its toggle; a per-frame bind would erase its writes.
+    if sim.game != thedas_vfs::Game::Origins {
+        set(crate::protocol::PARTY_QUICKBAR_LOCKED.into(), num(0));
+    }
     // The member the player controls is the selected one (the hero until another is chosen).
     let controlled = sim.world.controlled();
     for i in 0..4 {
@@ -2601,6 +2604,23 @@ mod tests {
             values["GUIInventory.PartyBackpackView.0.Item.Irremovable"],
             num(0)
         );
+    }
+
+    #[test]
+    fn origins_party_quickbar_lock_is_not_a_simulation_binding() {
+        use crate::protocol::PARTY_QUICKBAR_LOCKED;
+        let mut sim = Sim::new(
+            std::sync::Arc::new(thedas_vfs::Vfs::new()),
+            std::sync::Arc::new(thedas_script::EngineTable::default()),
+            1,
+        );
+        let hero = sim.world.spawn(ObjectKind::Creature, "hero");
+        sim.world.hero = Some(hero);
+        let origins = sim_values(&sim);
+        assert!(!origins.contains_key(PARTY_QUICKBAR_LOCKED));
+        assert_eq!(origins["GUI.SelectedChar.Stats.QuickbarLocked"], num(0));
+        sim.game = thedas_vfs::Game::DragonAge2;
+        assert_eq!(sim_values(&sim)[PARTY_QUICKBAR_LOCKED], num(0));
     }
 
     #[test]

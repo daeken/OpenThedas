@@ -2508,6 +2508,10 @@ impl UiLayer {
         let (want, line) = {
             let sim = sim.lock().unwrap_or_else(|p| p.into_inner());
             let shown = self.shown.lock().map(|s| s.clone()).unwrap_or_default();
+            let origins = sim.game == thedas_vfs::Game::Origins;
+            if origins {
+                self.stage.bridge.seed_origins_quickbar_lock();
+            }
             let values = thedas_ui::binding::sim_values_cached(&sim, &shown, &mut self.value_cache);
             for (group, rows) in std::mem::take(&mut self.value_cache.updates) {
                 self.stage.bridge.bind_sticky(&group, rows);
@@ -2518,7 +2522,6 @@ impl UiLayer {
             self.stage.bridge.bind(values);
             let waits = thedas_ui::binding::awaits_continue(&sim);
             let cutscene = sim.world.cutscene.is_some();
-            let origins = sim.game == thedas_vfs::Game::Origins;
             let owns_cut = origins && sim.presented_line_waits_for_cutscene();
             // An authored track owns the subtitle and voice while this cut plays. Start
             // dialog timing at the handoff so a skip can still play an unfinished node.

@@ -124,6 +124,9 @@ pub const FINISH_SCENE: &str = "_global.GUISystem.FinishSceneFromGame";
 /// after starting a movie and when the resolution changes.
 pub const LAYOUT: &str = "_global.MovieUtils.UpdateAllLayouts";
 
+/// The Origins quickbar's movie-owned lock toggle (not the creature's script lock).
+pub const PARTY_QUICKBAR_LOCKED: &str = "Party.QuickbarLocked";
+
 /// What `bound` holds for a name in a sticky group: kept by every bind.
 const STICKY: u64 = u64::MAX;
 
@@ -131,6 +134,7 @@ const STICKY: u64 = u64::MAX;
 struct State {
     values: BTreeMap<String, UiValue>,
     contexts: Vec<String>,
+    party_quickbar_preference: bool,
     unanswered: BTreeMap<String, u64>,
     sounds: Vec<String>,
     /// Messages the handler already acted on, oldest first (their text).
@@ -153,6 +157,20 @@ impl State {
         self.generation += 1;
         self.changed.insert(name.to_string(), self.generation);
         self.values.insert(name.to_string(), value);
+    }
+
+    fn put_movie_value(&mut self, name: &str, text: &str) {
+        if self.party_quickbar_preference && name == PARTY_QUICKBAR_LOCKED {
+            // The authored toggle writes Boolean values through SetValue's string wire.
+            let locked = match text {
+                "true" | "1" => true,
+                "false" | "0" => false,
+                _ => return,
+            };
+            self.put(name, UiValue::Bool(locked));
+        } else {
+            self.put(name, written_value(name, text));
+        }
     }
 }
 
@@ -206,6 +224,17 @@ fn written_value(name: &str, text: &str) -> UiValue {
 }
 
 impl GameBridge {
+    /// Seed the Origins player's quickbar lock once per UI stage. A new save on the
+    /// same stage, or rebuilding the quickbar movie, must not discard the player's toggle.
+    pub fn seed_origins_quickbar_lock(&self) {
+        if let Ok(mut state) = self.state.lock()
+            && !state.party_quickbar_preference
+        {
+            state.party_quickbar_preference = true;
+            state.put(PARTY_QUICKBAR_LOCKED, UiValue::Bool(false));
+        }
+    }
+
     pub fn new(strings: StringLookup) -> Self {
         let mut state = State::default();
         for (k, v) in [
@@ -508,7 +537,7 @@ impl GameBridge {
                 let text = call.args.first().map(as_string).unwrap_or_default();
                 let (k, v) = text.split_once(' ').unwrap_or((&text, ""));
                 if let Ok(mut s) = self.state.lock() {
-                    s.put(k, written_value(k, v));
+                    s.put_movie_value(k, v);
                 }
                 UiValue::Undefined
             }
@@ -759,7 +788,7 @@ impl GameBridge {
         match call.name.as_str() {
             "SetValue" | "SetValueUnicode" => {
                 let (k, v) = text.split_once(' ').unwrap_or((&text, ""));
-                s.put(k, written_value(k, v));
+                s.put_movie_value(k, v);
                 // The journal's own attributes are game state: a movie writing one (journal.gfx
                 // clearing a quest's `Updated` as it is read) is passed on to the game, as are
                 // the tactics screen's (tactics.gfx writing a slot's target, condition, command
@@ -829,6 +858,38 @@ mod tests {
         }
         b.handle(call(CallKind::FsCommand, "SetValue", &["GUI.Page 123"]));
         assert_eq!(b.value("GUI.Page"), Some(UiValue::Number(123.0)));
+    }
+
+    #[test]
+    fn origins_quickbar_toggle_survives_binding_and_stage_reattach() {
+        let b = bridge();
+        let read = call(CallKind::FsCommand, "GetBool", &[PARTY_QUICKBAR_LOCKED]);
+        b.seed_origins_quickbar_lock();
+        assert_eq!(b.respond(&read), UiValue::Bool(false));
+        for (text, expected) in [("true", true), ("false", false)] {
+            let since = b.generation();
+            let args = format!("{PARTY_QUICKBAR_LOCKED} {text}");
+            let write = call(CallKind::FsCommand, "SetValue", &[&args]);
+            b.respond(&write);
+            assert_eq!(b.respond(&read), UiValue::Bool(expected));
+            assert_eq!(b.handle(write), None);
+            b.bind([("Party.SelectedCount".into(), UiValue::Number(1.0))]);
+            b.seed_origins_quickbar_lock();
+            assert_eq!(b.respond(&read), UiValue::Bool(expected));
+            assert_eq!(
+                b.observe(&[(PARTY_QUICKBAR_LOCKED, false)], since).1,
+                [Some(Some(UiValue::Bool(expected)))]
+            );
+        }
+        let invalid = call(
+            CallKind::FsCommand,
+            "SetValue",
+            &["Party.QuickbarLocked junk"],
+        );
+        b.respond(&invalid);
+        b.handle(invalid);
+        assert_eq!(b.respond(&read), UiValue::Bool(false));
+        assert_eq!(b.value("GUI.SelectedChar.Stats.QuickbarLocked"), None);
     }
 
     #[test]
