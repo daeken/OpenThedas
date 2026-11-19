@@ -175,8 +175,8 @@ const MOUSE: &[&str] = &[
 pub enum Tag {
     /// The key bound to an action (its primary binding).
     Action(&'static str),
-    /// A talk-table string (the mouse buttons' names, for unswapped buttons).
-    Text(u32),
+    /// Talk-table strings for the default and swapped physical button, respectively.
+    Mouse(u32, u32),
 }
 
 /// The designer tags DAOrigins.exe's `ReplaceDesignerTags` knows (0x51d6a7 on), with what
@@ -207,18 +207,18 @@ pub const TAGS: &[(&str, Tag)] = &[
     ("TacticsKey", Tag::Action("ToggleTactics")),
     ("ZoomInMouse", Tag::Action("ZoomIn")),
     ("ZoomOutMouse", Tag::Action("ZoomOut")),
-    // Unswapped buttons, as ReplaceDesignerTags selects them with SwapMouseButtons = 0.
+    // ReplaceDesignerTags reads SwapMouseButtons (DAOrigins.exe 0x51d692).
     // core_en-us.tlk: 399131 = right-click, 399132 = left-click (not numerical left/right
     // order); 399133/4 = right/left-clicking, 399135/6 = Right/Left-clicking,
     // 330711/2 = Left/Right-click, 399137/8 = right/left.
-    ("LeftClickDefault", Tag::Text(399132)),
-    ("RightClickDefault", Tag::Text(399131)),
-    ("LeftClickingDefault", Tag::Text(399134)),
-    ("RightClickingDefault", Tag::Text(399133)),
-    ("LeftClickingDefaultCapped", Tag::Text(399136)),
-    ("LeftClickDefaultCapped", Tag::Text(330711)),
-    ("RightClickDefaultCapped", Tag::Text(330712)),
-    ("RightButtonDefault", Tag::Text(399137)),
+    ("LeftClickDefault", Tag::Mouse(399132, 399131)),
+    ("RightClickDefault", Tag::Mouse(399131, 399132)),
+    ("LeftClickingDefault", Tag::Mouse(399134, 399133)),
+    ("RightClickingDefault", Tag::Mouse(399133, 399134)),
+    ("LeftClickingDefaultCapped", Tag::Mouse(399136, 399135)),
+    ("LeftClickDefaultCapped", Tag::Mouse(330711, 330712)),
+    ("RightClickDefaultCapped", Tag::Mouse(330712, 330711)),
+    ("RightButtonDefault", Tag::Mouse(399137, 399138)),
 ];
 
 /// "No key mapped": an action with no binding.
@@ -271,6 +271,7 @@ pub fn binding_name(binding: &str, name: impl Fn(i64) -> Option<String>) -> Opti
 /// action, `string` a talk-table string. Other tags are left for the caller.
 pub fn replace_key_tags(
     text: &str,
+    swapped: bool,
     action: impl Fn(&str) -> Option<String>,
     string: impl Fn(u32) -> Option<String>,
 ) -> String {
@@ -285,7 +286,7 @@ pub fn replace_key_tags(
         }
         let with = match what {
             Tag::Action(a) => action(a).or_else(|| string(NO_KEY)),
-            Tag::Text(s) => string(*s),
+            Tag::Mouse(default, swapped_id) => string(if swapped { *swapped_id } else { *default }),
         }
         .unwrap_or_default();
         out = out.replace(&full, &with);
@@ -298,7 +299,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn unswapped_mouse_tags_keep_the_shipped_tlk_button_names() {
+    fn mouse_tags_name_the_physical_buttons() {
         // The strings shipped in core_en-us.tlk. In particular the orders lesson uses
         // RightClickDefaultCapped, not a tag whose name refers to the selection button.
         let strings = |id| {
@@ -321,8 +322,12 @@ mod tests {
         };
         let text = "<LeftClickDefault/>|<RightClickDefault/>|<LeftClickingDefault/>|<RightClickingDefault/>|<LeftClickingDefaultCapped/>|<LeftClickDefaultCapped/>|<RightClickDefaultCapped/>|<RightButtonDefault/>";
         assert_eq!(
-            replace_key_tags(text, |_| None, strings),
+            replace_key_tags(text, false, |_| None, strings),
             "left-click|right-click|left-clicking|right-clicking|Left-clicking|Left-click|Right-click|right"
+        );
+        assert_eq!(
+            replace_key_tags(text, true, |_| None, strings),
+            "right-click|left-click|right-clicking|left-clicking|Right-clicking|Right-click|Left-click|left"
         );
     }
 
@@ -354,6 +359,7 @@ mod tests {
         assert_eq!(
             replace_key_tags(
                 "Use <MoveForwardKey/> or <RightClickDefault/>; <PauseKey/>. <FirstName/>",
+                false,
                 action,
                 string
             ),

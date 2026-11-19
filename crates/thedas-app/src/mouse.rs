@@ -1,4 +1,42 @@
-//! Distinguishes a right-button ground click from a camera drag.
+//! Routes physical mouse buttons and distinguishes a ground click from a camera drag.
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Button {
+    Left,
+    Right,
+}
+
+/// A gesture keeps its mapping until both buttons are up, even if Options changes it.
+#[derive(Default)]
+pub struct Buttons {
+    held: u8,
+    swapped: bool,
+}
+
+impl Buttons {
+    pub fn edge(&mut self, button: Button, down: bool, swap: bool) -> Option<Button> {
+        let bit = match button {
+            Button::Left => 1,
+            Button::Right => 2,
+        };
+        if (self.held & bit != 0) == down {
+            return None;
+        }
+        if down {
+            if self.held == 0 {
+                self.swapped = swap;
+            }
+            self.held |= bit;
+        } else {
+            self.held &= !bit;
+        }
+        Some(match (button, self.swapped) {
+            (b, false) => b,
+            (Button::Left, true) => Button::Right,
+            (Button::Right, true) => Button::Left,
+        })
+    }
+}
 
 /// Provisional: the original's drag threshold has not been traced.
 const DRAG_PIXELS: f64 = 4.0;
@@ -39,6 +77,24 @@ impl RightClick {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn swapping_changes_both_edges_and_waits_until_neither_button_is_held() {
+        use Button::{Left, Right};
+        let mut buttons = Buttons::default();
+        assert_eq!(buttons.edge(Left, false, true), None);
+        assert_eq!(buttons.edge(Left, true, false), Some(Left));
+        assert_eq!(buttons.edge(Left, true, true), None);
+        assert_eq!(buttons.edge(Right, true, true), Some(Right));
+        assert_eq!(buttons.edge(Left, false, true), Some(Left));
+        assert_eq!(buttons.edge(Right, false, true), Some(Right));
+        assert_eq!(buttons.edge(Left, true, true), Some(Right));
+        assert_eq!(buttons.edge(Left, false, false), Some(Right));
+        assert_eq!(buttons.edge(Right, true, true), Some(Left));
+        assert_eq!(buttons.edge(Right, false, true), Some(Left));
+        assert_eq!(buttons.edge(Right, true, false), Some(Right));
+        assert_eq!(buttons.edge(Right, false, false), Some(Right));
+    }
 
     #[test]
     fn a_tap_orders_once_and_an_unpaired_release_never_orders() {
