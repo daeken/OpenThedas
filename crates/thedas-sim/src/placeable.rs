@@ -12,6 +12,238 @@ use crate::fmath::DetMath;
 use crate::sim::Sim;
 use crate::world::{ObjectKind, PlaceableClip};
 
+#[cfg(test)]
+mod pwk_use_tests;
+
+type Bounds = ([f32; 3], [f32; 3]);
+
+struct UseFootprint {
+    origin: [f32; 3],
+    sin: f32,
+    cos: f32,
+    bounds: Bounds,
+}
+
+impl UseFootprint {
+    fn new(origin: [f32; 3], facing: f32, bounds: Bounds) -> Self {
+        let (sin, cos) = facing.to_radians().dsin_cos();
+        Self {
+            origin,
+            sin,
+            cos,
+            bounds,
+        }
+    }
+
+    fn local(&self, point: [f32; 3]) -> [f32; 2] {
+        let (dx, dy) = (point[0] - self.origin[0], point[1] - self.origin[1]);
+        [
+            dx * self.cos + dy * self.sin,
+            -dx * self.sin + dy * self.cos,
+        ]
+    }
+
+    fn world(&self, [x, y]: [f32; 2], z: f32) -> [f32; 3] {
+        [
+            self.origin[0] + x * self.cos - y * self.sin,
+            self.origin[1] + x * self.sin + y * self.cos,
+            z,
+        ]
+    }
+
+    fn clamp(&self, [x, y]: [f32; 2]) -> [f32; 2] {
+        let (lo, hi) = self.bounds;
+        [x.clamp(lo[0], hi[0]), y.clamp(lo[1], hi[1])]
+    }
+
+    fn project(&self, point: [f32; 3]) -> [f32; 3] {
+        self.world(self.clamp(self.local(point)), point[2])
+    }
+
+    fn reaches(&self, grid: &NavGrid, point: [f32; 3], reach: f32) -> bool {
+        let mut slot = self.project(point);
+        let Some(cell) = grid.cell(slot) else {
+            return false;
+        };
+        slot[2] = crate::nav::height(grid, cell);
+        crate::engine::dist(point, slot) <= reach && crate::engine::dist(point, self.origin) <= 1.0
+    }
+}
+
+impl Sim {
+    fn use_footprint_model(&self, appearance: i32) -> Option<String> {
+        let types = self.world.tables().get(93, "")?;
+        match types.cell_by_hash(0xfd84_03d5, i64::from(appearance as u16))? {
+            Cell::String(m) => Some(crate::engine::clean(m).to_string()),
+            _ => None,
+        }
+    }
+
+    fn use_pwk_bounds(&self, model: &str, appearance: i32, state: i32) -> Option<Bounds> {
+        let (data, _) = self.vfs.read(&format!("{model}_{appearance}.pwk")).ok()?;
+        let pwk = thedas_formats::pwk::Pwk::parse(&data).ok()?;
+        let g = pwk.states.get(state as u16 as usize)?.as_ref()?;
+        Some((
+            g.base,
+            [
+                g.base[0] + g.columns as f32 * g.cell_size,
+                g.base[1] + g.rows as f32 * g.cell_size,
+                g.base[2],
+            ],
+        ))
+    }
+
+    fn alternate_use_footprint(
+        &mut self,
+        id: ObjectId,
+        target: ObjectId,
+    ) -> Option<(ObjectId, Arc<NavGrid>, UseFootprint)> {
+        let actor = self.world.get(id)?;
+        let area = actor.area?;
+        let target = self.world.get(target)?;
+        if self.game != thedas_vfs::Game::Origins
+            || actor.kind != ObjectKind::Creature
+            || !actor.active
+            || actor.dead
+            || actor.parked.is_some()
+            || target.kind != ObjectKind::Placeable
+            || !target.active
+            || !target.interactive
+            || target.parked.is_some()
+            || target.area != Some(area)
+        {
+            return None;
+        }
+        let appearance = target.appearance;
+        let model = self.use_footprint_model(appearance)?;
+        let state = target
+            .fields
+            .get("State")
+            .or_else(|| target.fields.get("AnimContState"))
+            .copied()
+            .unwrap_or(0);
+        let bounds = self.use_pwk_bounds(&model, appearance, state)?;
+        if (0..2).any(|i| {
+            !bounds.0[i].is_finite() || !bounds.1[i].is_finite() || bounds.0[i] >= bounds.1[i]
+        }) {
+            return None;
+        }
+        let footprint = UseFootprint::new(target.position, target.facing, bounds);
+        Some((area, self.nav_grid(area)?, footprint))
+    }
+
+    fn standable_use_floor(
+        &mut self,
+        id: ObjectId,
+        area: ObjectId,
+        grid: &Arc<NavGrid>,
+        point: [f32; 3],
+    ) -> Option<[f32; 3]> {
+        let cell = grid.cell(point)?;
+        if self
+            .movement_cells(id, grid)
+            .contains(&((cell.1 * grid.columns + cell.0) as usize))
+        {
+            return None;
+        }
+        self.safe_search(
+            area,
+            point,
+            crate::nav::SafeSearch {
+                radius: 0.0,
+                body_radius: self.capsule_radius(id),
+                mover: Some(id),
+                standable_keeps: true,
+            },
+        )
+    }
+
+    /// Provisional: native resolves and checks alternate PWK points (0x74f240),
+    /// but the (1,1) re-query at 0x7aa81e is gated on native -9, not Sim's
+    /// no-progress -4. Native also has a timed (1,0) refresh and can fail. Which
+    /// native branch handles this short stop is unknown. For this single Sim
+    /// fallback, try only bounded, exact, same-face routes in the existing reach
+    /// and the conservative native <=1 m origin predicate (0x74d0a0).
+    pub(crate) fn alternate_pwk_use_path(
+        &mut self,
+        id: ObjectId,
+        target: ObjectId,
+    ) -> Option<Vec<[f32; 3]>> {
+        use crate::engine::dist;
+        let (area, grid, shape) = self.alternate_use_footprint(id, target)?;
+        let from = self.world.get(id)?.position;
+        let reach = self.capsule_radius(id) + crate::orders::INTERACT_GAP;
+        let local = shape.local(from);
+        let face = shape.clamp(local);
+        let outside = [local[0] - face[0], local[1] - face[1]];
+        let normal = usize::from(outside[1].abs() > outside[0].abs());
+        if !outside[normal].is_finite() || outside[normal] == 0.0 {
+            return None;
+        }
+        let tangent = 1 - normal;
+        let (lo, hi) = shape.bounds;
+        let midline = 0.0_f32.clamp(lo[tangent], hi[tangent]);
+        let step = grid.cell_size;
+        let samples = [
+            face[tangent],
+            (face[tangent] + midline) * 0.5,
+            midline,
+            midline - step,
+            midline + step,
+            (lo[tangent] + hi[tangent]) * 0.5,
+        ];
+        let mut examined = Vec::new();
+        for band in [0.95, 0.5] {
+            for along in samples {
+                let mut q = face;
+                q[tangent] = along.clamp(lo[tangent], hi[tangent]);
+                q[normal] += outside[normal].signum() * band * reach;
+                let point = shape.world(q, from[2]);
+                if examined.contains(&point) {
+                    continue;
+                }
+                examined.push(point);
+                let Some(goal) = self.standable_use_floor(id, area, &grid, point) else {
+                    continue;
+                };
+                if !shape.reaches(&grid, goal, reach + 0.05) || dist(from, goal) < 0.02 {
+                    continue;
+                }
+                let (crate::nav::Routed::Path(path), _) = self.route_and_approach(id, goal) else {
+                    continue;
+                };
+                if path.last() == Some(&goal) {
+                    return Some(path);
+                }
+            }
+        }
+        None
+    }
+
+    pub(crate) fn pwk_use_arrived(
+        &mut self,
+        id: ObjectId,
+        target: ObjectId,
+        goal: [f32; 3],
+    ) -> bool {
+        let Some((area, grid, shape)) = self.alternate_use_footprint(id, target) else {
+            return false;
+        };
+        let feet = self.world.get(id).unwrap().position;
+        // Only float rounding tolerance on the walked endpoint, not extra reach.
+        let near = |a, b| crate::engine::dist(a, b) <= 0.001;
+        near(feet, goal)
+            && self
+                .standable_use_floor(id, area, &grid, feet)
+                .is_some_and(|floor| near(floor, feet))
+            && shape.reaches(
+                &grid,
+                feet,
+                self.capsule_radius(id) + crate::orders::INTERACT_GAP + 0.05,
+            )
+    }
+}
+
 impl Sim {
     /// Point on the current footprint nearest the user. Native slot resolution uses
     /// the transformed PWK rectangle (0x74f240 -> 0x74dfb0), independently of
@@ -31,45 +263,15 @@ impl Sim {
             .or_else(|| o.fields.get("AnimContState"))
             .copied()
             .unwrap_or(0);
-        let model = self.world.tables().get(93, "").and_then(|t| {
-            match t.cell_by_hash(0xfd84_03d5, i64::from(appearance as u16))? {
-                Cell::String(m) => Some(crate::engine::clean(m).to_string()),
-                _ => None,
-            }
+        let bounds = self.use_footprint_model(appearance).and_then(|model| {
+            self.use_pwk_bounds(&model, appearance, state).or_else(|| {
+                crate::collision::load_movement_placeables(&self.vfs, &[(model, [0.0; 3], 0.0)])
+                    .bounds()
+            })
         });
-        let bounds = model.and_then(|model| {
-            let grid = self
-                .vfs
-                .read(&format!("{model}_{appearance}.pwk"))
-                .ok()
-                .and_then(|(d, _)| thedas_formats::pwk::Pwk::parse(&d).ok())
-                .and_then(|p| p.states.get(state as u16 as usize).cloned().flatten());
-            if let Some(g) = grid {
-                return Some((
-                    g.base,
-                    [
-                        g.base[0] + g.columns as f32 * g.cell_size,
-                        g.base[1] + g.rows as f32 * g.cell_size,
-                        g.base[2],
-                    ],
-                ));
-            }
-            crate::collision::load_movement_placeables(&self.vfs, &[(model, [0.0; 3], 0.0)])
-                .bounds()
+        let mut point = bounds.map_or(position, |bounds| {
+            UseFootprint::new(position, facing, bounds).project(me)
         });
-        let mut point = position;
-        if let Some((lo, hi)) = bounds {
-            let (sin, cos) = facing.to_radians().dsin_cos();
-            let (dx, dy) = (me[0] - position[0], me[1] - position[1]);
-            let local = [dx * cos + dy * sin, -dx * sin + dy * cos];
-            let x = local[0].clamp(lo[0], hi[0]);
-            let y = local[1].clamp(lo[1], hi[1]);
-            point = [
-                position[0] + x * cos - y * sin,
-                position[1] + x * sin + y * cos,
-                me[2],
-            ];
-        }
         if let Some(g) = self.nav_grid(area)
             && let Some(c) = g.cell(point)
         {
@@ -1266,6 +1468,102 @@ mod tests {
         assert_eq!(writes, BTreeMap::from([(6, 1), (10, 1)]));
         assert!(clear_walkmesh_cells(&mut destination, &source, [100.0; 3], 0.0).is_empty());
         assert_eq!(destination.data[5], 6);
+    }
+
+    #[test]
+    fn pwk_use_unmarked_normal_unreachable_and_stale_guard() {
+        use crate::trace::TraceEntry;
+        use thedas_script::EngineTable;
+        use thedas_vfs::Vfs;
+
+        for (blocked, marked_move, marked_timer) in [
+            (false, false, false),
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+        ] {
+            let table = EngineTable::parse(b"int EVENT_TYPE_USE = 14;\nint COMMAND_TYPE_USE_OBJECT = 31;\nint COMMAND_FAILED_INVALID_PATH = -4;\n").unwrap();
+            let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(table), 1);
+            s.world.trace.keep = true;
+            let area = s.world.spawn(ObjectKind::Area, "test");
+            s.world.area = Some(area);
+            s.area_layouts.insert(area, "test".into());
+            let data = if blocked {
+                vec![7, 0, 0, 0, 7]
+            } else {
+                vec![7; 5]
+            };
+            s.nav_grids
+                .insert("test".into(), Some(Arc::new(grid(5, 1, data))));
+            let actor = s.world.spawn(ObjectKind::Creature, "walker");
+            let target = s.world.spawn(ObjectKind::Placeable, "lever");
+            let o = s.world.get_mut(actor).unwrap();
+            o.area = Some(area);
+            o.position = [0.5, 0.5, 0.0];
+            let o = s.world.get_mut(target).unwrap();
+            o.area = Some(area);
+            o.position = [4.5, 0.5, 0.0];
+            o.script = Some("synthetic_lever".into());
+            s.order_use(actor, target);
+            let mut walked = false;
+            let mut injected = false;
+            for _ in 0..250 {
+                s.tick(20);
+                let o = s.world.get_mut(actor).unwrap();
+                if let Some(cmd) = o.commands.first_mut() {
+                    let walking = cmd.approach.is_some();
+                    walked |= walking && o.position[0] > 0.5;
+                    // Simulate a marked command that lost its PWK registration in flight
+                    // or during its use timer. It must fail, not retry or deliver USE.
+                    if !injected
+                        && ((marked_move && walking)
+                            || (marked_timer && !walking && cmd.due.is_some()))
+                    {
+                        cmd.arrived = true;
+                        injected = true;
+                    } else if !marked_move && !marked_timer {
+                        assert!(!cmd.arrived, "not a PWK alternative");
+                    }
+                }
+            }
+            assert_eq!(injected, marked_move || marked_timer);
+            let uses = s
+                .world
+                .trace
+                .entries
+                .iter()
+                .filter(|e| {
+                    matches!(e,
+                TraceEntry::EventDelivered { ty: 14, target: id, .. } if *id == target)
+                })
+                .count();
+            let ok = !blocked && !injected;
+            assert_eq!(uses, usize::from(ok));
+            if blocked {
+                // Route repair can move within the near island. Never cross its wall.
+                assert!(s.world.get(actor).unwrap().position[0] < 1.0);
+            } else {
+                assert!(walked, "normal and marked routes must actually walk");
+            }
+            if blocked {
+                continue;
+            }
+            let expected = if ok { "complete" } else { "failed -4" };
+            assert_eq!(
+                s.world
+                    .trace
+                    .entries
+                    .iter()
+                    .filter(|e| matches!(e,
+                TraceEntry::Command { object, command, status, .. }
+                    if *object == actor && command == "CommandUseObject" && status == expected))
+                    .count(),
+                1,
+                "marked_move={marked_move}, marked_timer={marked_timer}, {:?}",
+                s.world.trace.entries,
+            );
+            assert!(s.world.get(actor).unwrap().commands.is_empty());
+        }
     }
 
     #[test]
