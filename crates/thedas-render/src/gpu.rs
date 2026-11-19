@@ -188,7 +188,6 @@ pub(crate) struct GpuTexture {
     pub kind: DdsKind,
 }
 
-/// Uploads a 2D or cube DDS (all mips), compressed when the device allows it.
 /// A volume texture (the smoke's `smpDecalVolume`), expanded to RGBA8 with its whole mip
 /// chain.
 fn upload_volume(ctx: &GpuContext, name: &str, dds: &Dds) -> Option<GpuTexture> {
@@ -238,6 +237,7 @@ fn upload_volume(ctx: &GpuContext, name: &str, dds: &Dds) -> Option<GpuTexture> 
     })
 }
 
+/// Uploads the authored DDS mip chain, compressed when the device allows it.
 fn upload_dds(ctx: &GpuContext, name: &str, dds: &Dds) -> Option<GpuTexture> {
     if dds.kind == DdsKind::Volume {
         return upload_volume(ctx, name, dds);
@@ -251,18 +251,7 @@ fn upload_dds(ctx: &GpuContext, name: &str, dds: &Dds) -> Option<GpuTexture> {
         (true, DdsFormat::Bc3) => wgpu::TextureFormat::Bc3RgbaUnorm,
         _ => wgpu::TextureFormat::Rgba8Unorm,
     };
-    // A compressed chain stops at the last level that is still a whole number of blocks in
-    // wgpu's eyes; smaller levels are rarely sampled at our distances.
-    let mips = if compressed {
-        (0..dds.mip_count)
-            .take_while(|&m| {
-                let (w, h, _) = dds.mip_size(m);
-                m == 0 || (w % 4 == 0 && h % 4 == 0)
-            })
-            .count() as u32
-    } else {
-        dds.mip_count
-    };
+    let mips = dds.mip_count;
     let texture = ctx.device.create_texture(&wgpu::TextureDescriptor {
         label: Some(name),
         size: wgpu::Extent3d {
@@ -307,11 +296,14 @@ fn upload_dds(ctx: &GpuContext, name: &str, dds: &Dds) -> Option<GpuTexture> {
                 bytes_per_row: Some(bytes_per_row),
                 rows_per_image: Some(rows),
             },
+            // Even a partial BC block occupies a whole block in the copy. This does
+            // not change the logical mip dimensions visible to shaders and samplers.
             wgpu::Extent3d {
-                width: if compressed { w.div_ceil(4) * 4 } else { w },
-                height: if compressed { h.div_ceil(4) * 4 } else { h },
+                width: w,
+                height: h,
                 depth_or_array_layers: 1,
-            },
+            }
+            .physical_size(format),
         );
     }
     let dimension = if dds.kind == DdsKind::Cube {
@@ -2856,6 +2848,10 @@ fn create_pipeline(
         cache: None,
     })
 }
+
+#[cfg(test)]
+#[path = "gpu/dds_tests.rs"]
+mod dds_tests;
 
 #[cfg(test)]
 mod tests {
