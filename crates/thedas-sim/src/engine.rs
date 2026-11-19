@@ -1581,6 +1581,35 @@ pub fn call(
             }
             void()
         }
+        "SetReactionOverride" | "ResetReaction" if h.sim.game == thedas_vfs::Game::Origins => {
+            use crate::combat::{GROUP_FORCE_HOSTILE, GROUP_OVERRIDDEN};
+            // 0x65bb70 / 0x65bbe0 write CCObject data, not the group table.
+            // The cast through 0x5d5be0 is shared with the base-health handlers.
+            if let Some(o) = h.sim.world.get_mut(obj(a, 0)).filter(|o| {
+                matches!(
+                    o.kind,
+                    ObjectKind::Creature
+                        | ObjectKind::Placeable
+                        | ObjectKind::Item
+                        | ObjectKind::Trigger
+                        | ObjectKind::Sound
+                        | ObjectKind::Waypoint
+                        | ObjectKind::Projectile
+                        | ObjectKind::Store
+                        | ObjectKind::AreaOfEffect
+                )
+            }) {
+                if name == "SetReactionOverride" {
+                    o.fields.insert(GROUP_OVERRIDDEN.into(), 1);
+                    o.fields.insert(GROUP_FORCE_HOSTILE.into(), int(a, 1));
+                } else {
+                    // Absent fields read as zero, the native construction default.
+                    o.fields.remove(GROUP_OVERRIDDEN);
+                    o.fields.remove(GROUP_FORCE_HOSTILE);
+                }
+            }
+            void()
+        }
         "GetTeamId" => ok(Value::Int(h.object(obj(a, 0)).map_or(-1, |o| o.team))),
         "SetTeamId" => {
             if let Some(o) = h.sim.world.get_mut(obj(a, 0)) {
@@ -17133,6 +17162,176 @@ mod coverage_tests {
             );
         }
     }
+    fn reaction_test_sim(game: thedas_vfs::Game) -> Sim {
+        let table = EngineTable::parse(
+            b"int EVENT_TYPE_PERCEPTION_APPEAR = 25;\n\
+               int IsObjectHostile(object a, object b) = 468;\n\
+               void SetReactionOverride(object o, int reaction) = 471;\n\
+               void ResetReaction(object o) = 669;\n",
+        )
+        .unwrap();
+        let mut s = Sim::new(Arc::new(Vfs::new()), Arc::new(table), 1);
+        s.game = game;
+        s
+    }
+
+    // Invoke synthetic bytecode with real ACTION ids and right-to-left pushes.
+    // Object operand 0 is self, operand 1 invalid; other values are literal ids.
+    fn reaction_action(s: &mut Sim, id: u16, who: ObjectId, args: &[(u8, u32)]) -> Option<Value> {
+        let mut code = Vec::new();
+        for &(ty, val) in args.iter().rev() {
+            code.extend([4, ty]); // CONST
+            code.extend(val.to_be_bytes());
+        }
+        code.extend([5, 0]); // ACTION
+        code.extend(id.to_be_bytes());
+        code.extend([args.len() as u8, 0x20, 0]); // argc; RETN
+        let mut bytes = b"NCS V1.0B".to_vec();
+        bytes.extend(((13 + code.len()) as u32).to_be_bytes());
+        bytes.extend(code);
+        // Distinct cache keys for each invocation: add_script uses a cache.
+        let key = format!("reaction_{id}_{args:?}");
+        s.add_script(&key, thedas_script::Ncs::parse(&bytes).unwrap());
+        s.run_script(&key, who, None)
+    }
+
+    #[test]
+    fn origins_reaction_actions_change_cross_group_hostility_and_perception() {
+        use crate::combat::{GROUP_FORCE_HOSTILE, GROUP_OVERRIDDEN};
+        let mut s = reaction_test_sim(thedas_vfs::Game::Origins);
+        let area = s.world.spawn(ObjectKind::Area, "area");
+        let a = s.world.spawn(ObjectKind::Creature, "a");
+        let b = s.world.spawn(ObjectKind::Creature, "b");
+        s.world.hero = Some(a);
+        for (id, group) in [(a, 3), (b, 4)] {
+            let o = s.world.get_mut(id).unwrap();
+            o.area = Some(area);
+            o.group = group;
+            o.team = 7;
+        }
+        let set = |s: &mut Sim, who, n| reaction_action(s, 471, who, &[(6, 0), (3, n)]);
+        let reset = |s: &mut Sim, who| reaction_action(s, 669, who, &[(6, 0)]);
+        let query = |s: &mut Sim, who, target| reaction_action(s, 468, who, &[(6, 0), (6, target)]);
+        let assert_pair = |s: &mut Sim, hostile: bool| {
+            for (x, y) in [(a, b), (b, a)] {
+                assert_eq!(query(s, x, y), Some(Value::Int(i32::from(hostile))));
+                assert_eq!(s.hostile(x, y), hostile);
+            }
+        };
+        let appeared = |s: &Sim| {
+            s.world
+                .queue
+                .values()
+                .filter(|q| q.event.ty == 25)
+                .map(|q| (q.target, q.event.objects[0], q.event.ints[2]))
+                .collect::<Vec<_>>()
+        };
+        assert_pair(&mut s, false);
+        s.update_perception();
+        assert_eq!(appeared(&s), [(a, b, 0), (b, a, 0)]);
+        s.world.queue.clear();
+        set(&mut s, b, 1);
+        assert_pair(&mut s, true);
+        assert!(s.world.queue.is_empty());
+        s.update_perception();
+        assert_eq!(appeared(&s), [(a, b, 1), (b, a, 1)]);
+        assert_eq!(s.world.get(a).unwrap().combat.perceived_hostile, [b]);
+        s.world.queue.clear();
+        s.update_perception();
+        assert!(s.world.queue.is_empty(), "no duplicate appearance");
+        set(&mut s, a, 0);
+        assert_pair(&mut s, true); // Exact hostile value wins over a conflicting override.
+        reset(&mut s, b);
+        assert_pair(&mut s, false);
+        s.update_perception();
+        assert_eq!(appeared(&s), [(a, b, 1), (b, a, 1)]); // Existing was-hostile flag.
+        assert!(s.world.get(a).unwrap().combat.perceived_hostile.is_empty());
+
+        s.world.hostility.insert((3, 4), true);
+        assert_pair(&mut s, false); // Enabled zero suppresses hostile group table.
+        set(&mut s, a, 257);
+        assert_pair(&mut s, false); // Runtime dword is not truthy and is not narrowed.
+        s.load_json(&s.save_json().unwrap()).unwrap();
+        assert_eq!(s.world.get(a).unwrap().fields[GROUP_FORCE_HOSTILE], 257);
+        assert_eq!(s.world.get(a).unwrap().fields[GROUP_OVERRIDDEN], 1);
+        assert_pair(&mut s, false);
+        reset(&mut s, a);
+        assert_pair(&mut s, true);
+        assert_eq!(s.world.hostility.len(), 1);
+        assert!(s.world.hostility[&(3, 4)]);
+        assert_eq!(s.world.get(a).unwrap().group, 3);
+        assert_eq!(s.world.get(a).unwrap().team, 7);
+        assert_eq!(s.world.get(b).unwrap().group, 4);
+        // A disabled raw 1 counts only when the other side enables the override.
+        s.world.hostility.clear();
+        s.world
+            .get_mut(b)
+            .unwrap()
+            .fields
+            .insert(GROUP_FORCE_HOSTILE.into(), 1);
+        assert_pair(&mut s, false);
+        set(&mut s, a, 0);
+        assert_pair(&mut s, true);
+        s.world.get_mut(b).unwrap().group = 3;
+        assert_pair(&mut s, false);
+        assert_eq!(query(&mut s, a, 0), Some(Value::Int(0)), "self");
+        assert_eq!(query(&mut s, a, 1), Some(Value::Int(0)), "invalid");
+        assert!(s.world.trace.unimplemented.is_empty());
+    }
+
+    #[test]
+    fn reaction_actions_respect_the_ccobject_cast_and_leave_da2_alone() {
+        use crate::combat::{GROUP_FORCE_HOSTILE, GROUP_OVERRIDDEN};
+        let mut s = reaction_test_sim(thedas_vfs::Game::Origins);
+        let item = s.world.spawn(ObjectKind::Item, "item");
+        let actor = s.world.spawn(ObjectKind::Creature, "actor");
+        reaction_action(&mut s, 471, item, &[(6, 0), (3, 1)]);
+        assert_eq!(s.world.get(item).unwrap().fields[GROUP_FORCE_HOSTILE], 1);
+        assert!(!s.hostile(actor, item)); // 468 uses the narrower creature cast.
+        reaction_action(&mut s, 669, item, &[(6, 0)]);
+        assert!(
+            !s.world
+                .get(item)
+                .unwrap()
+                .fields
+                .contains_key(GROUP_OVERRIDDEN)
+        );
+        for kind in [ObjectKind::Module, ObjectKind::Area, ObjectKind::Party] {
+            let id = s.world.spawn(kind, "not_ccobject");
+            reaction_action(&mut s, 471, id, &[(6, 0), (3, 1)]);
+            assert!(s.world.get(id).unwrap().fields.is_empty());
+            s.world
+                .get_mut(id)
+                .unwrap()
+                .fields
+                .insert(GROUP_OVERRIDDEN.into(), 1);
+            reaction_action(&mut s, 669, id, &[(6, 0)]);
+            assert_eq!(s.world.get(id).unwrap().fields[GROUP_OVERRIDDEN], 1);
+        }
+        let before = s.world.get(actor).unwrap().clone();
+        reaction_action(&mut s, 471, actor, &[(6, 1), (3, 1)]);
+        reaction_action(&mut s, 669, actor, &[(6, 1)]);
+        assert_eq!(s.world.get(actor).unwrap(), &before);
+
+        // Matching fields and function names do not change DA2's query or dispatch.
+        s.game = thedas_vfs::Game::DragonAge2;
+        let other = s.world.spawn(ObjectKind::Creature, "other");
+        let o = s.world.get_mut(other).unwrap();
+        o.group = 1;
+        o.fields.insert(GROUP_OVERRIDDEN.into(), 1);
+        o.fields.insert(GROUP_FORCE_HOSTILE.into(), 1);
+        let saved = o.clone();
+        reaction_action(&mut s, 471, other, &[(6, 0), (3, 0)]);
+        reaction_action(&mut s, 669, other, &[(6, 0)]);
+        assert_eq!(s.world.get(other).unwrap(), &saved);
+        assert_eq!(
+            reaction_action(&mut s, 468, actor, &[(6, 0), (6, other)]),
+            Some(Value::Int(0))
+        );
+        s.world.hostility.insert((0, 1), true);
+        assert!(s.hostile(actor, other));
+    }
+
     #[test]
     fn da2_desktop_platform_and_presentation_stubs_leave_simulation_unchanged() {
         let table = Arc::new(EngineTable::parse(

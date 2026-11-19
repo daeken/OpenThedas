@@ -56,7 +56,7 @@ Each entry gives what the original does, what we do, evidence, a rough size (S <
 ### C. AI and tactics
 
 1. **Tactics engine**: slots, conditions and target types are implemented. Coverage of every condition and command type against AI Tactics Conditions/Base Conditions (M2DA 137/139/140/141) has not been audited. Size M.
-2. **Creature AI** runs from scripts (ai_main and friends). Engine functions the AI uses that we stub (GetAILevel, SetReactionOverride, ShowAsAllyOnMap…) are minor. Size S.
+2. **Creature AI** runs from scripts (ai_main and friends). Origins `SetReactionOverride` and `ResetReaction` affect live creature-pair hostility and the next perception update without rewriting the group table ([trace](../notes/script-reaction-override.md)).
 3. **Party AI while the player controls one member**: autopilot exists. The exe's rules for followers in combat when no tactics are set are not verified. Size M.
 4. **SetPartyLeader and SetPrimaryControlled** are not implemented (36 and 7 calls): scripted control switches (e.g. playing as another character) won't happen. Size S–M.
 
