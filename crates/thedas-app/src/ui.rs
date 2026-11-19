@@ -4019,19 +4019,22 @@ impl UiLayer {
     }
 
     /// Draws every movie over `frame`, in order: straight into it (see `thedas_ui::direct`),
-    /// or rendered each into its texture and composited.
+    /// or rendered each into its texture and composited. An optional underlay is
+    /// painted just before the popup movie, without moving any movie.
     pub fn composite(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
         frame: &wgpu::Texture,
         format: wgpu::TextureFormat,
+        underlay: Option<&mut thedas_ui::stage::PopupUnderlay<'_>>,
     ) {
         if self.stage.movies.is_empty() {
             return;
         }
         // Each movie draws its cached draw list straight over the frame, in order.
         if thedas_ui::direct() {
-            self.stage.draw_into(encoder, frame);
+            self.stage
+                .draw_into_with_popup_underlay(encoder, frame, underlay);
             return;
         }
         let target = &frame.create_view(&Default::default());
@@ -4069,7 +4072,11 @@ impl UiLayer {
                 groups.push((group(&tex), true));
             }
         }
+        let mut popup = None;
         for m in &mut self.stage.movies {
+            if underlay.is_some() && m.name == thedas_ui::stage::POPUP_LAYER && popup.is_none() {
+                popup = Some(groups.len());
+            }
             // A movie whose clips multiply onto its own art (the loading screen's stains):
             // its passes are copies, so it renders them after its own frame is copied too.
             if m.multiplies_over() {
@@ -4088,27 +4095,36 @@ impl UiLayer {
             let Some(tex) = m.texture() else { continue };
             groups.push((group(&tex), false));
         }
-        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("ui composite"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: target,
-                resolve_target: None,
-                depth_slice: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Load,
-                    store: wgpu::StoreOp::Store,
-                },
-            })],
-            ..Default::default()
-        });
-        for (g, multiply) in &groups {
-            pass.set_pipeline(if *multiply {
-                &comp.multiply
-            } else {
-                &comp.pipeline
+        let draw = |encoder: &mut wgpu::CommandEncoder, groups: &[(wgpu::BindGroup, bool)]| {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("ui composite"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: target,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                ..Default::default()
             });
-            pass.set_bind_group(0, g, &[]);
-            pass.draw(0..3, 0..1);
+            for (g, multiply) in groups {
+                pass.set_pipeline(if *multiply {
+                    &comp.multiply
+                } else {
+                    &comp.pipeline
+                });
+                pass.set_bind_group(0, g, &[]);
+                pass.draw(0..3, 0..1);
+            }
+        };
+        if let (Some(at), Some(paint)) = (popup, underlay) {
+            draw(encoder, &groups[..at]);
+            paint(encoder, frame);
+            draw(encoder, &groups[at..]);
+        } else {
+            draw(encoder, &groups);
         }
     }
 
