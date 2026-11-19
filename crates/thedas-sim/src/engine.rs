@@ -8067,7 +8067,10 @@ mod tests {
                 assert_eq!(object.script.as_deref(), Some("override_script"));
                 assert_eq!(s.world.queue.len(), queued + 1);
                 let ((due, _), spawn) = s.world.queue.last_key_value().unwrap();
-                assert_eq!((*due, spawn.target, spawn.event.ty), (s.world.time_ms, id, 1000));
+                assert_eq!(
+                    (*due, spawn.target, spawn.event.ty),
+                    (s.world.time_ms, id, 1000)
+                );
             }
         }
         std::fs::remove_dir_all(dir).unwrap();
