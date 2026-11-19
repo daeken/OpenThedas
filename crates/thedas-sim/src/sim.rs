@@ -4897,6 +4897,7 @@ impl Sim {
                     .get(id)
                     .is_some_and(|o| o.combat.death_blow.is_some())
             {
+                self.finish_death_blow_placement(id);
                 // Authored hits were delivered by death_blow_impact. Paired clips
                 // without a hit marker end without inventing another attack impact.
                 if let Some(o) = self.world.get_mut(id) {
