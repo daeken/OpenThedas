@@ -41,11 +41,12 @@ pub struct DeathBlow {
     pub next_impact: usize,
     /// Present only when the pair's own placement entered a nonwalkable cell.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    placement_repair: Option<PairPlacement>,
+    pub placement_repair: Option<PairPlacement>,
 }
 
+/// The stationary in-flight placement recorded for an Origins pair's finish.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
-struct PairPlacement {
+pub struct PairPlacement {
     area: ObjectId,
     before: [f32; 3],
     placed: [f32; 3],

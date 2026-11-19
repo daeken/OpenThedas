@@ -2230,6 +2230,7 @@ mod tests {
                 hand: 0,
             }],
             next_impact: 1,
+            placement_repair: None,
         });
         let v = s.world.get_mut(victim).unwrap();
         v.appearance = 15;
