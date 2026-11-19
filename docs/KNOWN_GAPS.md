@@ -178,7 +178,6 @@ Concrete defects found during the code read. Each is small and independent.
 | `SIM-148` | The module's start position is parsed and never used (barely visible: single player's start area is left at once) |
 | `RND-043` | Alpha-tested casters are skipped, so foliage, fences and hair cast no sun shadow |
 | `RND-095` | Location effects with an instant duration are discarded and never drawn |
-| `RND-139` | Compressed textures lose their smallest mip levels |
 | `FMT-009` | The `Offers/` folder is not mounted for resources, though audio reads it |
 
 Several stale comments and README sections were also found; they are listed in the area files
