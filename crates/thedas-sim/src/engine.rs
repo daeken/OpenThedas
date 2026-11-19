@@ -3161,6 +3161,31 @@ pub fn call(
         // integer 0, and gives it to the item. It stays on the item for presentation.
         // DAOrigins.exe (0x665510) sets the item's indestructible flag (0x752c30); kept
         // in the item's fields.
+        "GetItemHeraldry" if h.sim.game == thedas_vfs::Game::Origins => {
+            // 0x65d770: typed item lookup, then zero-extend byte +0x46c.
+            let value = h
+                .sim
+                .world
+                .get(obj(a, 0))
+                .filter(|o| o.kind == ObjectKind::Item)
+                .and_then(|o| o.fields.get("Heraldry").copied())
+                .unwrap_or(0);
+            ok(Value::Int(i32::from(value as u8)))
+        }
+        "SetItemHeraldry" if h.sim.game == thedas_vfs::Game::Origins => {
+            // 0x65d7d0 stores the low byte even on an unowned item. The later
+            // creature appearance update is not modelled.
+            if let [Value::Object(item), Value::Int(value)] = a
+                && let Some(o) = h
+                    .sim
+                    .world
+                    .get_mut(*item)
+                    .filter(|o| o.kind == ObjectKind::Item)
+            {
+                o.fields.insert("Heraldry".into(), i32::from(*value as u8));
+            }
+            void()
+        }
         "SetItemIrremovable" if h.sim.game == thedas_vfs::Game::Origins => {
             if let Some(o) = h
                 .sim
@@ -6877,6 +6902,74 @@ mod tests {
     use thedas_vfs::Vfs;
 
     use super::*;
+
+    #[test]
+    fn origins_item_heraldry_script_byte_survives_save_and_ignores_non_items() {
+        let table = EngineTable::parse(
+            b"int GetItemHeraldry(object o) = 171;\n\
+              void SetItemHeraldry(object o, int n) = 172;\n",
+        )
+        .unwrap();
+        let mut sim = Sim::new(Arc::new(Vfs::new()), Arc::new(table), 1);
+        sim.game = thedas_vfs::Game::Origins;
+        let item = sim.world.spawn(ObjectKind::Item, "shield");
+        let other = sim.world.spawn(ObjectKind::Item, "other_shield");
+        let creature = sim.world.spawn(ObjectKind::Creature, "wearer");
+        sim.world
+            .get_mut(creature)
+            .unwrap()
+            .fields
+            .insert("Heraldry".into(), 12);
+        sim.world
+            .get_mut(other)
+            .unwrap()
+            .fields
+            .insert("Heraldry".into(), 130);
+
+        // Each script calls the real LDF IDs with OBJECT_SELF. The setter's int
+        // precedes SELF on the stack, so the VM pops the object first.
+        for (name, value) in [
+            ("read", None),
+            ("wrap", Some(0x1234_i32)),
+            ("negative", Some(-1)),
+            ("clear", Some(256)),
+        ] {
+            let mut code = Vec::new();
+            if let Some(value) = value {
+                code.extend([4, 3]);
+                code.extend(value.to_be_bytes());
+                code.extend([4, 6, 0, 0, 0, 0, 5, 0, 0, 172, 2]);
+            }
+            code.extend([4, 6, 0, 0, 0, 0, 5, 0, 0, 171, 1, 0x20, 0]);
+            let mut bytes = b"NCS V1.0B".to_vec();
+            bytes.extend(((13 + code.len()) as u32).to_be_bytes());
+            bytes.extend(code);
+            sim.add_script(name, thedas_script::Ncs::parse(&bytes).unwrap());
+        }
+        assert_eq!(sim.run_script("read", item, None), Some(Value::Int(0)));
+        assert_eq!(sim.run_script("read", other, None), Some(Value::Int(130)));
+        for target in [creature, OBJECT_INVALID] {
+            assert_eq!(
+                sim.run_script("negative", target, None),
+                Some(Value::Int(0))
+            );
+        }
+        assert_eq!(sim.world.get(creature).unwrap().fields["Heraldry"], 12);
+        assert_eq!(sim.run_script("wrap", item, None), Some(Value::Int(52)));
+        assert_eq!(
+            sim.run_script("negative", item, None),
+            Some(Value::Int(255))
+        );
+        let saved = sim.save_json().unwrap();
+        sim.load_json(&saved).unwrap();
+        assert_eq!(sim.run_script("read", item, None), Some(Value::Int(255)));
+        assert_eq!(sim.run_script("clear", item, None), Some(Value::Int(0)));
+        assert_eq!(sim.run_script("read", other, None), Some(Value::Int(130)));
+
+        sim.game = thedas_vfs::Game::DragonAge2;
+        assert_eq!(sim.run_script("negative", other, None), Some(Value::Int(0)));
+        assert_eq!(sim.world.get(other).unwrap().fields["Heraldry"], 130);
+    }
 
     fn legacy_party_sim() -> (Sim, ObjectId, ObjectId) {
         let table = EngineTable::parse(b"void SetFollowerState(object o, int s) = 706;\nint FOLLOWER_STATE_ACTIVE = 1;\nint FOLLOWER_STATE_LOCKEDACTIVE = 5;\n").unwrap().with_inferred();
