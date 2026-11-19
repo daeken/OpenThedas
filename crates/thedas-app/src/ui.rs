@@ -2508,17 +2508,21 @@ impl UiLayer {
         let (want, line) = {
             let sim = sim.lock().unwrap_or_else(|p| p.into_inner());
             let shown = self.shown.lock().map(|s| s.clone()).unwrap_or_default();
+            let origins = sim.game == thedas_vfs::Game::Origins;
             // Options stages changes until OK. In particular, ticking the swap checkbox
             // must not change which button presses OK or Cancel.
             let controls = self
                 .options_before
                 .as_ref()
                 .map_or(&shown.options, |(opts, _)| opts);
-            let swapped = sim.game == thedas_vfs::Game::Origins
+            let swapped = origins
                 && controls
                     .get("ControlOptions.SwapMouseButtons")
                     .is_some_and(|&v| v != 0.0);
             self.stage.bridge.set_mouse_swapped(swapped);
+            if origins {
+                self.stage.bridge.seed_origins_quickbar_lock();
+            }
             let values = thedas_ui::binding::sim_values_cached(&sim, &shown, &mut self.value_cache);
             for (group, rows) in std::mem::take(&mut self.value_cache.updates) {
                 self.stage.bridge.bind_sticky(&group, rows);
@@ -2529,7 +2533,6 @@ impl UiLayer {
             self.stage.bridge.bind(values);
             let waits = thedas_ui::binding::awaits_continue(&sim);
             let cutscene = sim.world.cutscene.is_some();
-            let origins = sim.game == thedas_vfs::Game::Origins;
             let owns_cut = origins && sim.presented_line_waits_for_cutscene();
             // An authored track owns the subtitle and voice while this cut plays. Start
             // dialog timing at the handoff so a skip can still play an unfinished node.
