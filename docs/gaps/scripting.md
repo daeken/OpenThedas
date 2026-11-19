@@ -79,7 +79,7 @@ adds inferred signatures for three of them, and the sim session loads them with 
 4088 of 4158 scripts finish. The rest fail as follows: 58 exhaust the instruction budget of 2,000,000 (looping test/debug scripts such as zz_*), 4 call
 unknown ids, 2 IsInTrigger with 0 args, 2 SetFacingPosition with 1 arg, 2 division by zero, 1 bad stack offset.
 
-### Unimplemented functions scripts call (all 66, by static call count)
+### Script functions flagged by the static gap scan
 
 Static call sites / distinct scripts. The debug and console ones (DEBUG_ConsoleCommand, GetDebugHelpersEnabled,
 SetCheatUsedFlag, Screenshot, SendOnlineTelemetry) matter less. InteractWithObject, ShowAsAllyOnMap,
@@ -117,9 +117,7 @@ SetPartyLeader, CloseQuestGroup, the trap-difficulty getters and the item functi
 | GetAILevel | 221 | 5 | 5 |
 | SetCanChangeEquipment | 391 | 5 | 4 |
 | GetMeleeRingPosition | 606 | 5 | 5 |
-| RemoveAllItemVisualEffects | 783 | 5 | 2 |
 | SetFacingPosition | 23 | 4 | 4 |
-| SetReactionOverride | 471 | 4 | 4 |
 | StopSoundObject | 481 | 4 | 4 |
 | OpenItemUpgradeGUI | 636 | 4 | 4 |
 | GetMapPinState | 653 | 4 | 4 |
@@ -127,7 +125,7 @@ SetPartyLeader, CloseQuestGroup, the trap-difficulty getters and the item functi
 | RemoveQuest | 850 | 4 | 1 |
 | IsVectorEmpty | 40 | 3 | 3 |
 | GetWeaponsUnsheathedStatus | 160 | 3 | 3 |
-| SetItemHeraldry | 172 | 3 | 3 |
+| SetItemHeraldry (appearance refresh missing; item byte implemented) | 172 | 3 | 3 |
 | PlayMovie | 173 | 3 | 3 |
 | GetAOEFlags | 334 | 3 | 2 |
 | GetPCSpeaker | 438 | 3 | 3 |

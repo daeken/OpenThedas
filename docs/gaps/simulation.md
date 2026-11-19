@@ -56,7 +56,7 @@ Each entry gives what the original does, what we do, evidence, a rough size (S <
 ### C. AI and tactics
 
 1. **Tactics engine**: slots, conditions and target types are implemented. Coverage of every condition and command type against AI Tactics Conditions/Base Conditions (M2DA 137/139/140/141) has not been audited. Size M.
-2. **Creature AI** runs from scripts (ai_main and friends). Engine functions the AI uses that we stub (GetAILevel, SetReactionOverride, ShowAsAllyOnMap…) are minor. Size S.
+2. **Creature AI** runs from scripts (ai_main and friends). Origins `SetReactionOverride` and `ResetReaction` affect live creature-pair hostility and the next perception update without rewriting the group table ([trace](../notes/script-reaction-override.md)).
 3. **Party AI while the player controls one member**: autopilot exists. The exe's rules for followers in combat when no tactics are set are not verified. Size M.
 4. **SetPartyLeader and SetPrimaryControlled** are not implemented (36 and 7 calls): scripted control switches (e.g. playing as another character) won't happen. Size S–M.
 
@@ -77,7 +77,7 @@ Each entry gives what the original does, what we do, evidence, a rough size (S <
 ### E. Items and inventory
 
 1. **One shared party pack**: as the game shows it (provisional). Stored follower inventories exist.
-2. **SetItemIrremovable, SetItemDamaged, SetCanChangeEquipment, SetItemHeraldry, MoveAllItems, RemoveAllItemVisualEffects** are not implemented (21, 11, 5, 3, 20, 5 calls). Size S each.
+2. **SetItemDamaged** still lacks an Origins implementation (11 static calls). Origins `GetItemHeraldry`/`SetItemHeraldry` read/write the saved item byte without refreshing the wearer's appearance ([trace](../notes/script-item-heraldry.md)). `RemoveAllItemVisualEffects` removes ordinary type-4 effects from the item list, preserves duration types 4–6, and does not implement native visual detachment or presentation notifications.
 3. **Body bags that die when empty** (DieWhenEmpty, coin pouch model) are not removed; pool creatures (CreatePool) are not modelled. Size S.
 4. **Stores**: implemented. Buy and sell price rules have not been re-checked against the exe. Size S.
 5. **Item stacking**: done per the exe (#237).

@@ -17,8 +17,8 @@
 //!   module's end-of-fight check returns to explore and gets fallen members up). The engine
 //!   only applies the change and tells the module with `GAMEMODE_CHANGE`
 //!   ([`Sim::update_game_mode`] keeps the harness's view of the fight).
-//! - **Hostility.** Creatures are hostile when their groups are set hostile with
-//!   `SetGroupHostility`.
+//! - **Hostility.** Creatures in different groups use `SetGroupHostility`'s group table
+//!   unless an Origins `SetReactionOverride` supersedes it.
 //! - **Attacks.** When a `CommandAttack` reaches the front of the queue, its owner gets
 //!   `EVENT_TYPE_COMMAND_PENDING` (objects: owner, target; integers: command type, id). The
 //!   script answers with `SetAttackResult` and `SetAttackDuration`. When the attack's time is
@@ -41,11 +41,47 @@
 //! Except where native addresses are cited, this is provisional: event layouts are read from how `rules_core` reads them, and
 //! the range and default attack time are guesses, not values taken from the executable.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 use thedas_script::vm::{OBJECT_INVALID, ObjectId};
+use thedas_vfs::Game;
 
 use crate::sim::Sim;
-use crate::world::{Effect, ObjectKind};
+use crate::world::{Effect, Object, ObjectKind};
+
+pub(crate) const GROUP_OVERRIDDEN: &str = "GroupOverridden";
+pub(crate) const GROUP_FORCE_HOSTILE: &str = "GroupForceHsti";
+
+#[derive(Clone, Copy, Default)]
+struct Reaction {
+    group: i32,
+    overridden: bool,
+    force_hostile: bool,
+}
+
+impl Reaction {
+    fn of(o: &Object, game: Game) -> Self {
+        Self {
+            group: o.group,
+            overridden: game == Game::Origins && o.fields.get(GROUP_OVERRIDDEN) == Some(&1),
+            force_hostile: game == Game::Origins && o.fields.get(GROUP_FORCE_HOSTILE) == Some(&1),
+        }
+    }
+
+    fn hostile_to(self, other: Self, groups: &BTreeMap<(i32, i32), bool>) -> bool {
+        let (g, h) = (self.group, other.group);
+        if g == h {
+            return false;
+        }
+        // Origins 0x64b900: once either side enables the override, either side's
+        // value of exactly 1 wins, even if that side didn't enable the override.
+        if self.overridden || other.overridden {
+            return self.force_hostile || other.force_hostile;
+        }
+        groups.get(&(g.min(h), g.max(h))).copied().unwrap_or(false)
+    }
+}
 
 /// How far a creature notices others when ranges.gda cannot say, in metres. Provisional.
 pub const PERCEPTION_RANGE: f32 = 30.0;
@@ -439,7 +475,7 @@ impl Sim {
             .unwrap_or(PERCEPTION_RANGE)
     }
 
-    /// Whether two objects are hostile: both creatures, in groups set hostile.
+    /// Whether two distinct creatures are hostile, including Origins reaction overrides.
     pub fn hostile(&self, a: ObjectId, b: ObjectId) -> bool {
         let (Some(x), Some(y)) = (self.world.get(a), self.world.get(b)) else {
             return false;
@@ -447,14 +483,7 @@ impl Sim {
         if x.kind != ObjectKind::Creature || y.kind != ObjectKind::Creature || a == b {
             return false;
         }
-        let (g, h) = (x.group, y.group);
-        g != h
-            && self
-                .world
-                .hostility
-                .get(&(g.min(h), g.max(h)))
-                .copied()
-                .unwrap_or(false)
+        Reaction::of(x, self.game).hostile_to(Reaction::of(y, self.game), &self.world.hostility)
     }
 
     pub(crate) fn alive(&self, id: ObjectId) -> bool {
@@ -482,14 +511,18 @@ impl Sim {
             .map(|o| (o.id, o.position))
             .collect();
         // What the pair test reads of each creature, looked up once a tick rather than once
-        // a pair (the settled Ostagar camp has some hundreds of creatures): alive, group and
-        // stealth, as `Sim::alive`, `Sim::hostile` and `Sim::hidden_from` read them.
-        // Indexed as `creatures`, so the pair test reads them without a map lookup.
-        let facts: Vec<(bool, i32, bool)> = creatures
+        // a pair (the settled Ostagar camp has some hundreds of creatures): alive, reaction
+        // and stealth, as `Sim::alive`, `Sim::hostile` and `Sim::hidden_from` read them.
+        // Indexed as `creatures`, so the pair test does not read an object's field map.
+        let facts: Vec<(bool, Reaction, bool)> = creatures
             .iter()
             .map(|&(c, _)| {
-                self.world.get(c).map_or((false, 0, false), |o| {
-                    (o.active && !o.dead, o.group, o.combat.stealth)
+                self.world.get(c).map_or_else(Default::default, |o| {
+                    (
+                        o.active && !o.dead,
+                        Reaction::of(o, self.game),
+                        o.combat.stealth,
+                    )
                 })
             })
             .collect();
@@ -517,15 +550,7 @@ impl Sim {
         }
         // (Perception only queues events, so none of this changes during the update.)
         let hostility = self.world.hostility.clone();
-        let hostile = |i: usize, j: usize| -> bool {
-            let (g, h) = (facts[i].1, facts[j].1);
-            i != j
-                && g != h
-                && hostility
-                    .get(&(g.min(h), g.max(h)))
-                    .copied()
-                    .unwrap_or(false)
-        };
+        let hostile = |i: usize, j: usize| i != j && facts[i].1.hostile_to(facts[j].1, &hostility);
         let hidden = |who: usize, seen: usize| facts[seen].2 && hostile(who, seen);
         // Closed doors block sight (see `Sim::door_sight`).
         let doors = self.door_sight(area);
