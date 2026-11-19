@@ -2614,40 +2614,94 @@ mod tests {
         );
     }
 
-    #[test]
-    fn origins_retreat_finishes_at_the_repaired_route_end() {
+    fn queue_retreat(s: &mut Sim, mover: u32, threat: [f32; 3], radius: f32) {
         use crate::world::{Command, ObjectKind};
-        let (mut s, mover) = walled(|x, _| (x >= 4).then_some((9, 0.0)));
-        let area = s.world.area.unwrap();
+        let area = s.world.area;
         let target = s.world.spawn(ObjectKind::Creature, "threat");
         let t = s.world.get_mut(target).unwrap();
-        t.area = Some(area);
-        t.position = [0.5, 1.5, 0.0];
-        let m = s.world.get_mut(mover).unwrap();
-        m.position = [2.5, 1.5, 0.0];
-        m.commands.push(Command {
+        t.area = area;
+        t.position = threat;
+        s.world.get_mut(mover).unwrap().commands.push(Command {
             ty: 21,
             name: "CommandMoveAwayFromObject".into(),
             target: Some(target),
-            seconds: 4.0,
+            seconds: radius,
             ints: vec![1],
             ..Default::default()
         });
+    }
+
+    #[test]
+    fn origins_retreat_searches_the_radius_when_the_radial_goal_is_off_mesh() {
+        let (mut s, mover) = disconnected_levels(0.0);
+        let mut grid = floor(9, 9);
+        grid.data[4 * 9 + 6] = 9;
+        s.nav_grids.insert("levels".into(), Some(Arc::new(grid)));
+        s.world.get_mut(mover).unwrap().position = [5.5, 4.5, 0.0];
+        let threat = [3.5, 4.5, 0.0];
+        queue_retreat(&mut s, mover, threat, 3.0);
         s.tick(0);
         let retreat = &s.world.get(mover).unwrap().commands[0];
-        let requested = retreat.location.unwrap().position;
-        let routed_end = *retreat.path.last().expect("route to repaired goal");
-        let grid = s.nav_grid(area).unwrap();
-        assert!(!on_walkable(&grid, requested), "{requested:?}");
-        assert!(on_walkable(&grid, routed_end) && routed_end[0] > 2.5);
+        let goal = retreat.location.unwrap().position;
+        assert_ne!(goal, [6.5, 4.5, 0.0], "radial point is blocked");
+        assert!(
+            (crate::engine::dist(goal, threat) - 3.0).abs() < 0.01,
+            "{goal:?}"
+        );
+        assert_eq!(retreat.path.last(), Some(&goal));
+        s.tick(3_000);
+        let m = s.world.get(mover).unwrap();
+        assert!(m.commands.is_empty());
+        assert!(
+            crate::engine::dist(m.position, goal) < 0.01,
+            "{:?} != {goal:?}",
+            m.position
+        );
+    }
+
+    #[test]
+    fn origins_retreat_routes_to_the_floor_height_before_walking_down_a_ramp() {
+        let (mut s, mover) = walled(|x, _| Some((1, (1.5 - 0.5 * x as f32).max(0.0))));
+        let m = s.world.get_mut(mover).unwrap();
+        m.position = [1.5, 1.5, 1.0];
+        queue_retreat(&mut s, mover, [0.5, 1.5, 1.5], 5.0);
+        s.tick(0);
+        let retreat = &s.world.get(mover).unwrap().commands[0];
+        let goal = [5.5, 1.5, 0.0];
+        assert_eq!(retreat.location.unwrap().position, goal);
+        assert_eq!(retreat.path.last(), Some(&goal));
+        s.tick(3_000);
+        let m = s.world.get(mover).unwrap();
+        assert!(m.commands.is_empty());
+        assert!(
+            crate::engine::dist(m.position, goal) < 0.01,
+            "{:?}",
+            m.position
+        );
+    }
+
+    #[test]
+    fn origins_retreat_finishes_at_the_walked_pose_not_a_stale_goal() {
+        let (mut s, mover) = walled(|x, _| (x >= 4).then_some((9, 0.0)));
+        s.world.get_mut(mover).unwrap().position = [2.5, 1.5, 0.0];
+        queue_retreat(&mut s, mover, [0.5, 1.5, 0.0], 3.0);
+        s.tick(0);
+        let retreat = &mut s.world.get_mut(mover).unwrap().commands[0];
+        let routed_end = *retreat.path.last().expect("routed retreat");
+        // A started command can carry a stale location distinct from its path
+        // (for example when resuming a retreat planned before goal validation).
+        let loc = retreat.location.as_mut().unwrap();
+        loc.position = [4.5, 1.5, 4.0];
+        loc.facing = 90.0;
         s.tick(3_000);
         let m = s.world.get(mover).unwrap();
         assert!(m.commands.is_empty());
         assert!(
             crate::engine::dist(m.position, routed_end) < 0.01,
-            "retreat ended at {:?}, not the resolved route end {routed_end:?}",
+            "{:?}",
             m.position
         );
+        assert_ne!(m.facing, 90.0, "restored the stale goal facing");
     }
 
     #[test]
