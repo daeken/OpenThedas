@@ -377,6 +377,11 @@ impl Sim {
         // end (saves made by test drivers can hold one; reloading it would put the last
         // line on screen again). One still going is kept.
         self.talk = save.talk.filter(|c| !c.ended);
+        if self.game == thedas_vfs::Game::Origins
+            && let Some(dialog) = self.talk.as_ref().map(|c| c.dlg.name.clone())
+        {
+            self.conversation_line_cuts(&dialog);
+        }
         // What was being said in passing belonged to the game left behind.
         self.ambient.clear();
         self.ambient_speaking.clear();

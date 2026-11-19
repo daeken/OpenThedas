@@ -691,18 +691,28 @@ const MAP_WITHIN_RADIUS: u32 = 16;
 /// The minimap's creatures are sent every this many frames.
 const MINIMAP_EVERY: u32 = 3;
 
-/// A conversation line: the dialog, the line's text and its replies' nodes.
-type LineKey = (String, String, Vec<usize>);
+/// A conversation line: its dialog, owner and node, followed by its text and replies.
+type LineKey = (
+    (String, thedas_script::vm::ObjectId, Option<usize>),
+    String,
+    Vec<usize>,
+);
 
-/// The conversation line on screen: while it plays its replies are held back
-/// (`Conversation.ResponsesReady` 0, which conversation.gfx watches to show them); once it
-/// has played they show, or, with nothing to choose, the conversation goes on.
+#[derive(Clone, Copy, Default)]
+struct OriginsLineTiming {
+    inline_ms: Option<f64>,
+    no_voice: bool,
+    cut_waits_for_voice: bool,
+}
+
+/// The line on screen. The movie watches `Conversation.ResponsesReady` to show
+/// replies or enable Continue. Automatic advancement has its own playback check.
 struct Line {
     key: LineKey,
+    origins: Option<OriginsLineTiming>,
     /// Milliseconds it has been up.
     t: f64,
-    /// How long its voice-over runs (milliseconds), when it has one: it plays that long
-    /// instead of a reading time.
+    /// How long its voice-over runs (milliseconds), when it has one.
     voice_ms: Option<f64>,
     /// Presentation time when audio first reported the playing voice's duration. Loading
     /// can hold the voice long after the simulation chose this line.
@@ -710,14 +720,14 @@ struct Line {
     /// Whether conversation.gfx was last told the line has a voice-over (see
     /// `UiLayer::play`).
     voiced: bool,
-    /// Nothing to choose: it continues by itself once played.
+    /// There are no substantive replies. The line can end by itself or on Continue.
     waits: bool,
     continued: bool,
     /// A cutscene played while it was up (a line its cutscene speaks), and whether that
     /// cutscene has ended.
     cut_seen: bool,
     cut_done: bool,
-    /// Its own referenced cutscene has started. Automatic continuation waits for it.
+    /// Its own referenced cutscene is queued or has started. Automatic continuation waits for it.
     owns_cut: bool,
     /// The cut showed this node's subtitle and began its voice.
     resume_voice: bool,
@@ -746,18 +756,64 @@ impl Line {
         if self.cut_done || self.t == f64::INFINITY {
             return true;
         }
+        if let Some(origins) = self.origins
+            && origins.inline_ms.is_some_and(|ms| self.t < ms)
+        {
+            return false;
+        }
         match self.voice_ms {
             Some(ms) => self.t - self.voice_at >= ms,
-            None => !self.voiced && self.t >= line_ms(&self.key.1),
+            None => !self.voiced && (self.origins.is_some() || self.t >= da2_line_ms(&self.key.1)),
         }
+    }
+
+    /// Origins prepares responses 300 ms before the authored cut or voice ends
+    /// (GameModeDialog 0x68ebfc). No VO In Game can supply a fixed 1 s timer.
+    fn responses_ready(&self) -> bool {
+        let Some(origins) = self.origins else {
+            return self.played();
+        };
+        if self.cut_done || self.t == f64::INFINITY || (self.waits && self.owns_cut) {
+            return self.played();
+        }
+        if let Some(ms) = origins.inline_ms {
+            if origins.no_voice && origins.cut_waits_for_voice {
+                return self.t >= ms.min(700.0);
+            }
+            return self.t >= (ms - 300.0).max(0.0);
+        }
+        if origins.no_voice && !self.key.1.trim().is_empty() {
+            return self.t >= 700.0;
+        }
+        match self.voice_ms {
+            Some(ms) => self.t - self.voice_at >= (ms - 300.0).max(0.0),
+            None => !self.voiced,
+        }
+    }
+
+    fn automatically_continues(&self) -> bool {
+        if !self.waits || !self.played() || !self.responses_ready() {
+            return false;
+        }
+        let Some(origins) = self.origins else {
+            return true;
+        };
+        if self.cut_done || self.t == f64::INFINITY {
+            return true;
+        }
+        // The native no-cut auto-continue requires a voice handle (0x68e046).
+        // A textless graph entry can be passed through without a player action.
+        if origins.inline_ms.is_none() {
+            return self.voiced || self.key.1.trim().is_empty();
+        }
+        // A terminal No VO In Game entry can ask for a manual continue even with
+        // a cinematic (0x7f1da7, 0x690b97–0x690bb4, 0x68dee3).
+        !(origins.no_voice && origins.cut_waits_for_voice && self.key.2.is_empty())
     }
 }
 
-/// How long a line plays before the conversation goes on by itself (milliseconds), standing
-/// in for its voice-over: a reading time for its text, a moment for a line without text (a
-/// node that only moves the conversation on: across the game's conversations none of them
-/// carries staging of its own). Provisional.
-pub fn line_ms(text: &str) -> f64 {
+/// Provisional DA2 timing for lines without voice, in milliseconds.
+fn da2_line_ms(text: &str) -> f64 {
     let chars = text.trim().chars().count() as f64;
     if chars == 0.0 {
         100.0
@@ -2462,15 +2518,34 @@ impl UiLayer {
             self.stage.bridge.bind(values);
             let waits = thedas_ui::binding::awaits_continue(&sim);
             let cutscene = sim.world.cutscene.is_some();
-            let owns_cut =
-                sim.game == thedas_vfs::Game::Origins && sim.conversation_line_cutscene().is_some();
+            let origins = sim.game == thedas_vfs::Game::Origins;
+            let owns_cut = origins && sim.presented_line_waits_for_cutscene();
             // An authored track owns the subtitle and voice while this cut plays. Start
             // dialog timing at the handoff so a skip can still play an unfinished node.
             let line = thedas_ui::binding::conversation(&sim)
                 .filter(|_| !sim.cutscene_controls_dialog_speech())
                 .map(|d| {
-                    let key: LineKey = (d.dialog, d.line, d.replies.iter().map(|r| r.0).collect());
-                    (key, waits, cutscene, owns_cut, sim.cut_line_speech())
+                    let node = sim.presented_conversation_line().and_then(|line| line.line);
+                    let key = (
+                        (d.dialog, d.owner, node),
+                        d.line,
+                        d.replies.iter().map(|r| r.0).collect(),
+                    );
+                    let speech = sim.cut_line_speech();
+                    let timing = origins.then(|| {
+                        let cut = sim.presented_line_cut();
+                        OriginsLineTiming {
+                            // On handoff the referenced cut already played this line's
+                            // staging. A skipped cut's voice can finish from its current time.
+                            inline_ms: cut
+                                .filter(|_| speech == thedas_sim::dialog::CutLineSpeech::Dialog)
+                                .and_then(|c| c.tracks.as_ref())
+                                .map(|tracks| f64::from(tracks.seconds) * 1000.0),
+                            no_voice: cut.is_some_and(|c| c.no_voice),
+                            cut_waits_for_voice: cut.is_some_and(|c| c.wait_for_voice),
+                        }
+                    });
+                    (key, waits, cutscene, owns_cut, speech, timing)
                 });
             // Before a game, the start menu, or the screen it opened (options, the load
             // screen).
@@ -2501,7 +2576,7 @@ impl UiLayer {
             self.continue_pending = None;
         }
         self.line = match (line, self.line.take()) {
-            (Some((key, _, cutscene, owns_cut, _)), Some(mut l)) if l.key == key => {
+            (Some((key, _, cutscene, owns_cut, _, _)), Some(mut l)) if l.key == key => {
                 l.t += dt_ms;
                 l.cut_done |= l.cut_seen && !cutscene;
                 l.cut_done |= l.owns_cut && !owns_cut;
@@ -2509,7 +2584,7 @@ impl UiLayer {
                 l.owns_cut |= owns_cut;
                 Some(l)
             }
-            (Some((key, waits, cutscene, owns_cut, speech)), _) => {
+            (Some((key, waits, cutscene, owns_cut, speech, origins)), _) => {
                 use thedas_sim::dialog::CutLineSpeech;
                 log::debug!(
                     "conversation new line: {key:?} waits={waits} voiced={} cut={cutscene} owns_cut={owns_cut}",
@@ -2517,6 +2592,7 @@ impl UiLayer {
                 );
                 Some(Line {
                     key,
+                    origins,
                     t: if speech == CutLineSpeech::Complete {
                         f64::INFINITY
                     } else {
@@ -2541,7 +2617,7 @@ impl UiLayer {
             self.stage.bridge.set_values([
                 (
                     "Conversation.ResponsesReady".into(),
-                    thedas_ui::UiValue::Number(l.played() as u8 as f64),
+                    thedas_ui::UiValue::Number(l.responses_ready() as u8 as f64),
                 ),
                 (
                     "Conversation.HasVO".into(),
@@ -2658,14 +2734,13 @@ impl UiLayer {
             );
         }
         if let Some(l) = self.line.as_mut() {
-            let played = l.played();
             self.stage.bridge.set_value(
                 "Conversation.ResponsesReady",
-                thedas_ui::UiValue::Number(played as u8 as f64),
+                thedas_ui::UiValue::Number(l.responses_ready() as u8 as f64),
             );
             // The conversation screen is not up while a cutscene plays: the line goes on
             // once it is.
-            if played && l.waits && !l.continued && self.conversation_press.up {
+            if l.automatically_continues() && !l.continued && self.conversation_press.up {
                 log::debug!(
                     "conversation auto-continue: key={:?} t={} voice={:?} voiced={} cut_seen={} cut_done={} owns_cut={}",
                     l.key,
@@ -2795,7 +2870,7 @@ impl UiLayer {
         self.stage.fit_tutorial_codex_tooltip();
         ready_conversation_responses(
             &mut messages,
-            self.conversation_press.up && self.line.as_ref().is_some_and(Line::played),
+            self.conversation_press.up && self.line.as_ref().is_some_and(Line::responses_ready),
         );
         let ignored = {
             let mut sim = sim.lock().unwrap_or_else(|p| p.into_inner());
@@ -2939,7 +3014,7 @@ impl UiLayer {
         let Some(l) = self.line.as_mut() else {
             return;
         };
-        if !l.played() {
+        if !l.responses_ready() {
             // Skip to the end of the line: its replies show (or it goes on) next frame.
             l.t = f64::INFINITY;
         } else if l.waits && !l.continued {
@@ -2949,9 +3024,9 @@ impl UiLayer {
     }
 
     /// The conversation line on screen: whether it has played (its replies show), and
-    /// whether it has nothing to choose (it continues).
+    /// whether it has nothing to choose (the continue action).
     pub fn line_state(&self) -> Option<(bool, bool)> {
-        self.line.as_ref().map(|l| (l.played(), l.waits))
+        self.line.as_ref().map(|l| (l.responses_ready(), l.waits))
     }
 
     /// Highlights conversation reply `n` (from 0) the way the reply buttons highlight
@@ -4905,16 +4980,17 @@ mod tests {
     }
 
     #[test]
-    fn lines_play_for_a_reading_time() {
-        assert_eq!(line_ms(""), 100.0);
-        assert_eq!(line_ms("  "), 100.0);
-        assert!(line_ms("Short.") < line_ms("A much longer line that takes a while to read."));
-        assert_eq!(line_ms(&"x".repeat(1000)), 12_000.0);
+    fn da2_lines_keep_their_reading_time() {
+        assert_eq!(da2_line_ms(""), 100.0);
+        assert_eq!(da2_line_ms("  "), 100.0);
+        assert!(da2_line_ms("Short.") < da2_line_ms("A longer line that takes a while to read."));
+        assert_eq!(da2_line_ms(&"x".repeat(1000)), 12_000.0);
     }
 
     fn timing_line(text: &str, voiced: bool) -> Line {
         Line {
-            key: ("dialog".into(), text.into(), vec![1]),
+            key: (("dialog".into(), 1, Some(0)), text.into(), vec![1]),
+            origins: Some(OriginsLineTiming::default()),
             t: 0.0,
             voice_ms: None,
             voice_at: 0.0,
@@ -4954,10 +5030,14 @@ mod tests {
             line.voice_at, 5000.0,
             "later frames must not restart the clock"
         );
+        line.t = 6699.0;
+        assert!(!line.responses_ready());
+        line.t = 6700.0;
+        assert!(line.responses_ready());
         line.t = 6999.0;
-        assert!(!line.played());
+        assert!(!line.automatically_continues());
         line.t = 7000.0;
-        assert!(line.played());
+        assert!(line.automatically_continues());
     }
 
     #[test]
@@ -4972,14 +5052,75 @@ mod tests {
     }
 
     #[test]
-    fn unvoiced_lines_keep_their_reading_time() {
+    fn da2_unvoiced_lines_keep_their_reading_time() {
         for text in ["", "An unvoiced line."] {
             let mut line = timing_line(text, false);
-            line.t = line_ms(text) - 1.0;
-            assert!(!line.played());
+            line.origins = None;
+            line.t = da2_line_ms(text) - 1.0;
+            assert!(!line.automatically_continues());
             line.t += 1.0;
-            assert!(line.played());
+            assert!(line.automatically_continues());
         }
+    }
+
+    #[test]
+    fn origins_text_only_lines_wait_for_input() {
+        let mut line = timing_line("An unvoiced line.", false);
+        line.waits = false; // An ordinary line with a substantive reply.
+        assert!(line.responses_ready());
+        assert!(!line.automatically_continues());
+        line.waits = true; // A sole empty reply.
+        assert!(line.responses_ready());
+        assert!(!line.automatically_continues());
+        line.key.2.clear(); // A terminal entry has no reply other than Continue.
+        line.t = 60_000.0;
+        assert!(!line.automatically_continues());
+        line.key.1.clear();
+        assert!(line.automatically_continues());
+    }
+
+    #[test]
+    fn origins_inline_cut_times_replies_and_automatic_continuation() {
+        let mut line = timing_line("A staged line.", false);
+        line.origins.as_mut().unwrap().inline_ms = Some(2500.0);
+        line.key.2.clear();
+        line.t = 2199.0;
+        assert!(!line.responses_ready());
+        line.t = 2200.0;
+        assert!(line.responses_ready());
+        assert!(!line.automatically_continues());
+        line.t = 2500.0;
+        assert!(line.automatically_continues());
+
+        line.voiced = true;
+        line.voice_ms = Some(3200.0);
+        assert!(!line.automatically_continues());
+        line.t = 3200.0;
+        assert!(line.automatically_continues());
+    }
+
+    #[test]
+    fn origins_no_voice_flag_can_prepare_an_early_manual_continue() {
+        let mut line = timing_line("An authored silent line.", false);
+        line.key.2.clear();
+        line.origins = Some(OriginsLineTiming {
+            inline_ms: Some(2500.0),
+            no_voice: true,
+            cut_waits_for_voice: true,
+        });
+        line.t = 699.0;
+        assert!(!line.responses_ready());
+        line.t = 700.0;
+        assert!(line.responses_ready());
+        line.t = 2500.0;
+        assert!(!line.automatically_continues());
+
+        line.origins.as_mut().unwrap().inline_ms = None;
+        line.t = 699.0;
+        assert!(!line.responses_ready());
+        line.t = 700.0;
+        assert!(line.responses_ready());
+        assert!(!line.automatically_continues());
     }
 
     #[test]
@@ -4998,7 +5139,12 @@ mod tests {
     #[test]
     fn a_referenced_cut_finishes_before_its_line_automatically_continues() {
         let mut line = Line {
-            key: ("dialog".into(), "A cinematic line.".into(), vec![1]),
+            key: (
+                ("dialog".into(), 1, Some(0)),
+                "A cinematic line.".into(),
+                vec![1],
+            ),
+            origins: Some(OriginsLineTiming::default()),
             t: 3000.0,
             voice_ms: Some(2976.0),
             voice_at: 0.0,

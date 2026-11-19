@@ -88,6 +88,10 @@ pub struct LineCut {
     pub stage: Option<String>,
     pub unstaged: bool,
     pub tracks: Option<Arc<Tracks>>,
+    /// Origins DLG 12216, No VO In Game (GameModeDialog 0x68d8a0).
+    pub no_voice: bool,
+    /// Origins inline CUT 5018, Play Until VO Completes (0x7e210a).
+    pub wait_for_voice: bool,
     /// DA2 performance bindings, activated when this line is taken. Full DA2
     /// performance placement is separate from this world-state side effect.
     pub activate: Vec<String>,
@@ -138,6 +142,7 @@ const FIELD_LINES: u32 = 12002;
 const FIELD_LINE_STAGE: u32 = 12100;
 const FIELD_LINE_UNSTAGED: u32 = 12104;
 const FIELD_LINE_CUT: u32 = 12211;
+const FIELD_LINE_NO_VOICE: u32 = 12216;
 
 /// Each line of a conversation file (in its line list's order, 12002) and its staging.
 pub fn line_cuts(g: &Gff4) -> Vec<LineCut> {
@@ -167,6 +172,14 @@ pub fn line_cuts(g: &Gff4) -> Vec<LineCut> {
                     .and_then(Value::as_i64)
                     .is_some_and(|v| v != 0),
                 tracks: cut.map(|c| Arc::new(Tracks::from_cut(g, c))),
+                no_voice: g
+                    .field(line, FIELD_LINE_NO_VOICE)
+                    .and_then(Value::as_i64)
+                    .is_some_and(|v| v != 0),
+                wait_for_voice: cut
+                    .and_then(|c| g.field(c, 5018))
+                    .and_then(Value::as_i64)
+                    .is_some_and(|v| v != 0),
                 activate: Vec::new(),
                 da2_stage: None,
             }
@@ -175,6 +188,17 @@ pub fn line_cuts(g: &Gff4) -> Vec<LineCut> {
 }
 
 impl Sim {
+    /// Authored presentation data for the current line, including a terminal entry.
+    /// Speaking a line or loading an active conversation populates the cache.
+    pub fn presented_line_cut(&self) -> Option<&LineCut> {
+        let talk = self.talk.as_ref()?;
+        let name = &talk.dlg.name;
+        self.line_cuts
+            .get(name)
+            .or_else(|| self.line_cuts.get(&name.to_ascii_lowercase()))?
+            .get(talk.line?)
+    }
+
     /// The party members a playing cutscene does not cast, which presentation should not
     /// draw while it plays (empty when no full cutscene plays). Traced in Origins:
     /// GameModeCutscene enter 0x692980 -> 0x7cd0d0 enables playback; after actor binding
