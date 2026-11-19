@@ -1074,8 +1074,9 @@ pub fn call(
             if a.len() > 2 { int(a, 2) } else { 9 },
         ))),
         "IntToFloat" => ok(Value::Float(int(a, 0) as f32)),
-        "FloatToInt" if h.sim.game == thedas_vfs::Game::Origins => {
-            // 0x64f3f0 -> 0x8e34f0 uses the CRT's SSE2 truncating conversion.
+        "FloatToInt" => {
+            // Origins 0x64f3f0 -> 0x8e34f0 and DA2 0x4e3130 -> 0xb2a680
+            // both use the CRT's SSE2 truncating conversion.
             // Its invalid result is i32::MIN, including NaNs and positive overflow.
             let value = float(a, 0);
             ok(Value::Int(
@@ -1086,7 +1087,6 @@ pub fn call(
                 },
             ))
         }
-        "FloatToInt" => ok(Value::Int(float(a, 0) as i32)),
         "StringToInt" | "HexStringToInt" if h.sim.game == thedas_vfs::Game::Origins => {
             ok(Value::Int(origins_string_to_int(&string(a, 0))))
         }
@@ -9699,43 +9699,54 @@ mod tests {
     }
 
     #[test]
-    fn origins_float_to_int_uses_the_native_sse2_invalid_result() {
+    fn float_to_int_uses_the_native_sse2_invalid_result_in_both_games() {
+        use thedas_script::ncs::{Ncs, tc};
+        use thedas_script::vm::Vm;
+
         let table = Arc::new(EngineTable::parse(b"int FloatToInt(float f) = 49;").unwrap());
-        let mut s = Sim::new(Arc::new(Vfs::new()), table, 1);
-        for (value, expected, da2_expected) in [
-            (0.0, 0, 0),
-            (-0.0, 0, 0),
-            (f32::from_bits(1), 0, 0),
-            (-f32::from_bits(1), 0, 0),
-            (0.99, 0, 0),
-            (-0.99, 0, 0),
-            (1.0, 1, 1),
-            (-1.0, -1, -1),
-            (1.99, 1, 1),
-            (-1.99, -1, -1),
-            (f32::from_bits(0x4effffff), 2147483520, 2147483520),
-            (2147483648.0, i32::MIN, i32::MAX),
-            (f32::from_bits(0x4f000001), i32::MIN, i32::MAX),
-            (-2147483648.0, i32::MIN, i32::MIN),
-            (f32::from_bits(0xceffffff), -2147483520, -2147483520),
-            (f32::from_bits(0xcf000001), i32::MIN, i32::MIN),
-            (f32::MAX, i32::MIN, i32::MAX),
-            (f32::MIN, i32::MIN, i32::MIN),
-            (f32::INFINITY, i32::MIN, i32::MAX),
-            (f32::NEG_INFINITY, i32::MIN, i32::MIN),
-            (f32::NAN, i32::MIN, 0),
-            (-f32::NAN, i32::MIN, 0),
-            (f32::from_bits(0x7f800001), i32::MIN, 0),
-            (f32::from_bits(0xff800001), i32::MIN, 0),
+        let mut s = Sim::new(Arc::new(Vfs::new()), table.clone(), 1);
+        for (value, expected) in [
+            (0.0, 0),
+            (-0.0, 0),
+            (f32::from_bits(1), 0),
+            (-f32::from_bits(1), 0),
+            (0.99, 0),
+            (-0.99, 0),
+            (1.0, 1),
+            (-1.0, -1),
+            (1.99, 1),
+            (-1.99, -1),
+            (f32::from_bits(0x4effffff), 2147483520),
+            (2147483648.0, i32::MIN),
+            (f32::from_bits(0x4f000001), i32::MIN),
+            (-2147483648.0, i32::MIN),
+            (f32::from_bits(0xceffffff), -2147483520),
+            (f32::from_bits(0xcf000001), i32::MIN),
+            (f32::MAX, i32::MIN),
+            (f32::MIN, i32::MIN),
+            (f32::INFINITY, i32::MIN),
+            (f32::NEG_INFINITY, i32::MIN),
+            (f32::NAN, i32::MIN),
+            (-f32::NAN, i32::MIN),
+            (f32::from_bits(0x7f800001), i32::MIN),
+            (f32::from_bits(0xff800001), i32::MIN),
         ] {
-            for (game, result) in [
-                (thedas_vfs::Game::Origins, expected),
-                (thedas_vfs::Game::DragonAge2, da2_expected),
-            ] {
+            let mut bytes = b"NCS V1.0B".to_vec();
+            bytes.extend(26_u32.to_be_bytes());
+            bytes.extend([0x04, tc::FLOAT]);
+            bytes.extend(value.to_bits().to_be_bytes());
+            bytes.extend([0x05, 0, 0, 49, 1, 0x20, 0]); // ACTION 49/1; RETN
+            let vm = Vm::new(Arc::new(Ncs::parse(&bytes).unwrap()), table.clone());
+            for game in [thedas_vfs::Game::Origins, thedas_vfs::Game::DragonAge2] {
                 s.game = game;
+                let mut host = ScriptHost {
+                    sim: &mut s,
+                    event: None,
+                    script: "test_float_to_int".into(),
+                };
                 assert_eq!(
-                    run(&mut s, 1, "FloatToInt", &[Value::Float(value)]),
-                    Some(Value::Int(result)),
+                    vm.run(&mut host, 1).unwrap().value,
+                    Some(Value::Int(expected)),
                     "{game:?}, float bits {:08x}",
                     value.to_bits()
                 );
