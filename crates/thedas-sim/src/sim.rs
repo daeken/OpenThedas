@@ -1409,7 +1409,8 @@ impl Sim {
                             let at = c.approach.take()?;
                             c.due = None;
                             c.from = None;
-                            c.arrived = c.name == "CommandAttack"
+                            c.arrived = (!da2 && Self::marked_pwk_use(c))
+                                || c.name == "CommandAttack"
                                 || c.name == "CommandInitiateDialog"
                                 || (da2
                                     && c.name == "CommandUseAbility"
@@ -3222,11 +3223,23 @@ impl Sim {
         }
     }
 
+    // `arrived` is otherwise unused by type 31, and new commands start unmarked.
+    // Keep it through the walk and normal use timer to forbid a second attempt.
+    fn marked_pwk_use(cmd: &Command) -> bool {
+        cmd.ty == 31 && cmd.name == "CommandUseObject" && cmd.arrived
+    }
+
+    fn marked_pwk_use_valid(&mut self, id: ObjectId, cmd: &Command) -> bool {
+        cmd.target
+            .zip(cmd.path.last().copied())
+            .is_some_and(|(target, goal)| self.pwk_use_arrived(id, target, goal))
+    }
+
     fn advance_movers(&mut self) {
         self.advance_da2_locomotion();
         let now = self.world.time_ms;
         // (mover, start, start time, due, the points after the start)
-        type Move = (ObjectId, [f32; 3], u64, u64, Vec<[f32; 3]>);
+        type Move = (ObjectId, [f32; 3], u64, u64, Vec<[f32; 3]>, bool);
         // Only creatures and placeables carry commands that move (see `World::actor_ids`).
         let actors = self.world.actor_ids();
         let origins = self.game == thedas_vfs::Game::Origins;
@@ -3248,10 +3261,17 @@ impl Sim {
                     } else {
                         c.path.clone()
                     };
-                Some((o.id, from, t0, due, points))
+                Some((
+                    o.id,
+                    from,
+                    t0,
+                    due,
+                    points,
+                    origins && Self::marked_pwk_use(c),
+                ))
             })
             .collect();
-        for (id, from, t0, due, points) in moving {
+        for (id, from, t0, due, points, bounded_use) in moving {
             if due <= t0 {
                 continue;
             }
@@ -3285,7 +3305,9 @@ impl Sim {
                 }
             }
             p = at;
-            if collided {
+            // The single PWK alternate uses the same sweeps, but its deadline and
+            // exact endpoint must survive a block. Do not repair/restart this leg.
+            if collided && !bounded_use {
                 // From where the walker was, not where it meant to get to: a waypoint the
                 // blocked step would have passed is still ahead of it.
                 let mut rest = remaining_points(from, &points, progress_of(from, &points, was));
@@ -4236,6 +4258,13 @@ impl Sim {
                     // So does a caster out of its ability's range.
                     let approach = match cmd.name.as_str() {
                         "CommandInitiateDialog" => Some(self.talk_approach(id, &cmd)),
+                        "CommandUseObject" if !da2 && Self::marked_pwk_use(&cmd) => {
+                            if !self.marked_pwk_use_valid(id, &cmd) {
+                                self.fail_front_command(id, "COMMAND_FAILED_INVALID_PATH");
+                                continue;
+                            }
+                            Some(Approach::InReach)
+                        }
                         "CommandUseObject" if !da2 => Some(
                             cmd.target
                                 .and_then(|target| self.placeable_use_walk(id, target))
@@ -4267,9 +4296,13 @@ impl Sim {
                         };
                         if let Some(stop) = stop {
                             let pos = self.world.get(id).map(|o| o.position);
-                            let path = if walk.is_some() {
+                            let mut routed_path = false;
+                            let mut path = if walk.is_some() {
                                 match self.route_and_approach(id, stop) {
-                                    (crate::nav::Routed::Path(p), _) => p,
+                                    (crate::nav::Routed::Path(p), _) => {
+                                        routed_path = true;
+                                        p
+                                    }
                                     (crate::nav::Routed::Door(_), p) if !p.is_empty() => p,
                                     (crate::nav::Routed::Straight, _)
                                         if cmd.name == "CommandInitiateDialog"
@@ -4298,19 +4331,35 @@ impl Sim {
                             } else {
                                 Vec::new()
                             };
-                            let walk = walk.map(|d| match pos {
+                            let mut walk = walk.map(|d| match pos {
                                 Some(p) if !path.is_empty() => path_length(p, &path),
                                 _ => d,
                             });
+                            let mut alternate = false;
                             if !da2
                                 && walk.is_some_and(|d| d < 0.02)
                                 && pos.is_some_and(|p| crate::engine::dist(p, stop) > 0.05)
                             {
-                                // A repaired endpoint at our feet is not an
-                                // approach. Fail rather than retry every millisecond
-                                // while the target remains out of reach.
-                                self.fail_front_command(id, "COMMAND_FAILED_INVALID_PATH");
-                                continue;
+                                // A repaired endpoint at our feet is not an approach.
+                                // Only ordinary type-31 PWK use may try one exact alternate.
+                                let alternative = (routed_path
+                                    && cmd.ty == 31
+                                    && cmd.name == "CommandUseObject"
+                                    && !cmd.arrived)
+                                    .then(|| {
+                                        cmd.target.and_then(|target| {
+                                            self.alternate_pwk_use_path(id, target)
+                                        })
+                                    })
+                                    .flatten();
+                                if let (Some(p), Some(from)) = (alternative, pos) {
+                                    walk = Some(path_length(from, &p));
+                                    path = p;
+                                    alternate = true;
+                                } else {
+                                    self.fail_front_command(id, "COMMAND_FAILED_INVALID_PATH");
+                                    continue;
+                                }
                             }
                             let ms = match walk {
                                 Some(d) => ((d / self.move_speed(id)) * 1000.0).max(1.0) as u64,
@@ -4324,7 +4373,7 @@ impl Sim {
                                 c.approach = Some(path.last().copied().unwrap_or(stop));
                                 c.from = pos.map(|p| (p, now));
                                 c.ring_wait |= wait;
-                                c.arrived = false;
+                                c.arrived = alternate;
                                 c.path = path;
                             }
                             self.da2_begin_locomotion(id, true);
@@ -4661,6 +4710,18 @@ impl Sim {
 
     /// Completes an object's front command: applies its movement and tells the object.
     fn finish_command(&mut self, id: ObjectId) {
+        if self.game == thedas_vfs::Game::Origins
+            && let Some(cmd) = self
+                .world
+                .get(id)
+                .and_then(|o| o.commands.first())
+                .filter(|c| Self::marked_pwk_use(c))
+                .cloned()
+            && !self.marked_pwk_use_valid(id, &cmd)
+        {
+            self.fail_front_command(id, "COMMAND_FAILED_INVALID_PATH");
+            return;
+        }
         if self.game == thedas_vfs::Game::Origins
             && self.world.get(id).is_some_and(|o| {
                 o.commands
