@@ -624,6 +624,39 @@ impl PortraitClock {
         self.missing = self.key.iter().any(|(id, _)| !ids.contains(id));
     }
 
+    /// Registers the images before giving their names to the movie. A successful capture
+    /// can still contain only the renderer's opaque-black clear colour (unchanged by portrait
+    /// gain). This provisional readiness guard leaves that member missing for the existing
+    /// retry. Match the exact RGBA clear value, not a brightness or uniformity threshold.
+    fn publish(
+        &mut self,
+        shots: Vec<(u32, Vec<u8>)>,
+        mut register: impl FnMut(&str, &Rgba),
+    ) -> std::collections::BTreeMap<u32, String> {
+        self.drawn += 1;
+        let mut names = std::collections::BTreeMap::new();
+        for (id, pixels) in shots {
+            if pixels.len() != (PORTRAIT_SIZE * PORTRAIT_SIZE * 4) as usize {
+                continue;
+            }
+            if pixels.chunks_exact(4).all(|p| p == [0, 0, 0, 255]) {
+                continue;
+            }
+            let name = Self::name(id, self.drawn);
+            register(
+                &name,
+                &Rgba {
+                    width: PORTRAIT_SIZE,
+                    height: PORTRAIT_SIZE,
+                    pixels,
+                },
+            );
+            names.insert(id, name);
+        }
+        self.drew(&names.keys().copied().collect::<Vec<_>>());
+        names
+    }
+
     /// The image name of member `id`'s portrait in drawing `drawn`.
     fn name(id: u32, drawn: u32) -> String {
         format!("thedas_portrait_{id}_{drawn}.png")
@@ -3250,21 +3283,9 @@ impl UiLayer {
         for name in old {
             self.stage.set_image(&name, None);
         }
-        self.portraits.drawn += 1;
-        let ids: Vec<u32> = shots.iter().map(|(id, _)| *id).collect();
-        self.portraits.drew(&ids);
-        let made = self.portraits.drawn;
-        let mut names = std::collections::BTreeMap::new();
-        for (id, pixels) in shots {
-            let name = PortraitClock::name(id, made);
-            let img = Rgba {
-                width: PORTRAIT_SIZE,
-                height: PORTRAIT_SIZE,
-                pixels,
-            };
-            self.stage.set_image(&name, Some(&img));
-            names.insert(id, name);
-        }
+        let names = self
+            .portraits
+            .publish(shots, |name, image| self.stage.set_image(name, Some(image)));
         if let Ok(mut shown) = self.shown.lock() {
             shown.portraits = names;
         }
@@ -5227,6 +5248,64 @@ mod tests {
         assert!(!clock.due(vec![(1, 8), (2, 9)], PORTRAIT_RETRY_MS - 1.0));
         assert!(clock.due(vec![(1, 8), (2, 9)], 1.0));
         assert_ne!(PortraitClock::name(1, 1), PortraitClock::name(1, 2));
+    }
+
+    #[test]
+    fn blank_portrait_is_not_published_and_retries_for_the_same_member() {
+        let mut clock = PortraitClock::default();
+        let key = vec![(1, 7), (2, 9), (3, 11)];
+        let size = (PORTRAIT_SIZE * PORTRAIT_SIZE) as usize;
+        let blank = [0, 0, 0, 255].repeat(size);
+        let mut dark = blank.clone();
+        dark[2] = 1;
+        let neighbor = [128, 0, 0, 255].repeat(size);
+        let mut other_alpha = blank.clone();
+        other_alpha[3] = 254;
+        let mut registered = Vec::new();
+        let mut register = |name: &str, image: &Rgba| {
+            registered.push((name.to_owned(), image.pixels[..4].to_vec()));
+        };
+
+        assert!(clock.due(key.clone(), 0.0));
+        let first = clock.publish(
+            vec![(1, blank), (2, neighbor.clone()), (3, other_alpha.clone())],
+            &mut register,
+        );
+        assert_eq!(first.len(), 2);
+        assert_eq!(first[&2], PortraitClock::name(2, 1));
+        assert_eq!(first[&3], PortraitClock::name(3, 1));
+        assert!(!clock.due(key.clone(), PORTRAIT_RETRY_MS - 1.0));
+        assert!(clock.due(key.clone(), 1.0));
+        let second = clock.publish(
+            vec![(1, dark), (2, neighbor), (3, other_alpha)],
+            &mut register,
+        );
+        assert_eq!(second[&1], PortraitClock::name(1, 2));
+        assert_eq!(second[&2], PortraitClock::name(2, 2));
+        assert_eq!(second[&3], PortraitClock::name(3, 2));
+        assert_eq!(
+            registered,
+            vec![
+                (first[&2].clone(), vec![128, 0, 0, 255]),
+                (first[&3].clone(), vec![0, 0, 0, 254]),
+                (second[&1].clone(), vec![0, 0, 1, 255]),
+                (second[&2].clone(), vec![128, 0, 0, 255]),
+                (second[&3].clone(), vec![0, 0, 0, 254]),
+            ]
+        );
+        assert!(!clock.due(key, PORTRAIT_RETRY_MS));
+    }
+
+    #[test]
+    fn malformed_portrait_is_not_registered() {
+        let mut clock = PortraitClock::default();
+        let key = vec![(1, 7)];
+        assert!(clock.due(key.clone(), 0.0));
+        let names = clock.publish(vec![(1, vec![1, 0, 0, 255])], |_, _| {
+            panic!("malformed portrait reached registration");
+        });
+        assert!(names.is_empty());
+        assert!(clock.due(key, PORTRAIT_RETRY_MS));
     }
 
     #[test]
