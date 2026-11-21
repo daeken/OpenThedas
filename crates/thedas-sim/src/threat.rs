@@ -21,12 +21,15 @@
 //! traced), and the update runs once per simulation tick rather than per rendered frame.
 
 use thedas_script::vm::ObjectId;
+use thedas_vfs::Game;
 
 use crate::sim::Sim;
 use crate::world::ObjectKind;
 
 /// Threat_Decrease_Rate.
 pub const PROPERTY_THREAT_DECREASE_RATE: i32 = 40;
+/// DragonAge2.exe 0x543a21 reads property 41 (Threat_Decay_Rate).
+const DA2_PROPERTY_THREAT_DECAY_RATE: i32 = 41;
 /// How far away an enemy still adds proximity threat (metres).
 pub const PROXIMITY_RANGE: f32 = 60.0;
 /// The proximity threat of an enemy standing on top of the creature.
@@ -112,6 +115,7 @@ pub fn proximity(distance: f32) -> f32 {
 impl Sim {
     /// The engine's part of every creature's threat over `ms`: see the module docs.
     pub fn update_threat(&mut self, ms: u64) {
+        let da2 = self.game == Game::DragonAge2;
         let ids: Vec<ObjectId> = self
             .world
             .objects
@@ -125,28 +129,48 @@ impl Sim {
             let Some(o) = self.world.get(id) else {
                 continue;
             };
-            // A simple property: its base and what effects add (not the larger of base and
-            // current, which a negative rate would lose).
-            let rate = o
-                .properties
-                .get(&PROPERTY_THREAT_DECREASE_RATE)
-                .map_or(0.0, |v| v.0)
-                + self.effect_modifier(id, PROPERTY_THREAT_DECREASE_RATE);
+            let rate = if da2 {
+                if !o.properties.contains_key(&DA2_PROPERTY_THREAT_DECAY_RATE) {
+                    continue;
+                }
+                let rate = self.property_total(id, DA2_PROPERTY_THREAT_DECAY_RATE);
+                // 0x543a52 skips the whole pass at zero, even the proximity update.
+                if rate == 0.0 {
+                    continue;
+                }
+                rate
+            } else {
+                // Origins uses the base and effects, including a negative decay rate.
+                o.properties
+                    .get(&PROPERTY_THREAT_DECREASE_RATE)
+                    .map_or(0.0, |v| v.0)
+                    + self.effect_modifier(id, PROPERTY_THREAT_DECREASE_RATE)
+            };
+            let decay = if da2 {
+                // The native code multiplies milliseconds by the encoded 0.001f32 factor,
+                // then multiplies by the rate before rounding the combined delta to f32.
+                (f64::from(rate) * ms as f64 * f64::from(0.001_f32)) as f32
+            } else {
+                rate * seconds
+            };
             let at = o.position;
             let near: Vec<f32> = o
                 .combat
                 .threat
                 .iter()
                 .map(|t| {
-                    self.world.get(t.enemy).map_or(0.0, |e| {
-                        let (dx, dy) = (e.position[0] - at[0], e.position[1] - at[1]);
-                        proximity((dx * dx + dy * dy).sqrt())
-                    })
+                    self.world
+                        .get(t.enemy)
+                        .filter(|e| !da2 || e.kind == ObjectKind::Creature)
+                        .map_or(0.0, |e| {
+                            let (dx, dy) = (e.position[0] - at[0], e.position[1] - at[1]);
+                            proximity((dx * dx + dy * dy).sqrt())
+                        })
                 })
                 .collect();
             if let Some(o) = self.world.get_mut(id) {
                 for (t, n) in o.combat.threat.iter_mut().zip(near) {
-                    t.value = (t.value + rate * seconds).max(0.0);
+                    t.value = (t.value + decay).max(0.0);
                     t.near = n.max(0.0);
                 }
                 sort(&mut o.combat.threat);
@@ -241,5 +265,77 @@ mod tests {
         }
         let c: C = serde_json::from_str(r#"{"threat": [[7, 2.5]]}"#).unwrap();
         assert_eq!(c.threat, vec![t(7, 2.5)]);
+    }
+
+    #[test]
+    fn da2_threat_decays_with_property_41_and_skips_the_update_at_zero() {
+        use std::sync::Arc;
+        let table = Arc::new(thedas_script::EngineTable::parse(b"").unwrap());
+        let mut s = Sim::new(Arc::new(thedas_vfs::Vfs::new()), table, 1);
+        s.game = Game::DragonAge2;
+        let me = s.world.spawn(ObjectKind::Creature, "hurlock");
+        let target = s.world.spawn(ObjectKind::Creature, "mage");
+        let o = s.world.get_mut(me).unwrap();
+        o.properties.insert(40, (99.0, 0.0));
+        o.properties.insert(41, (-1.0, 0.0));
+        o.combat.threat = vec![t(target, 9.0)];
+
+        s.update_threat(2000);
+        let o = s.world.get_mut(me).unwrap();
+        assert_eq!(o.combat.threat[0].value, 7.0);
+        assert_eq!(o.combat.threat[0].near, 100.0);
+        o.properties.insert(41, (0.0, 0.0));
+        s.world.get_mut(target).unwrap().position = [70.0, 0.0, 0.0];
+        s.update_threat(2000);
+        let threats = &s.world.get(me).unwrap().combat.threat;
+        assert_eq!(threats[0].value, 7.0);
+        assert_eq!(threats[0].near, 100.0);
+    }
+
+    #[test]
+    fn da2_clear_threat_can_keep_the_existing_targets_and_proximity() {
+        use std::sync::Arc;
+        use thedas_script::vm::Value;
+
+        let table = Arc::new(
+            thedas_script::EngineTable::parse(
+                b"void ClearThreatTable(object o, int remove = 1) = 202;",
+            )
+            .unwrap(),
+        );
+        let mut s = Sim::new(Arc::new(thedas_vfs::Vfs::new()), table.clone(), 1);
+        s.game = Game::DragonAge2;
+        let me = s.world.spawn(ObjectKind::Creature, "hurlock");
+        let weak = Threat {
+            near: 1.0,
+            ..t(2, 30.0)
+        };
+        let close = Threat {
+            near: 5.0,
+            ..t(3, 2.0)
+        };
+        s.world.get_mut(me).unwrap().combat.threat = vec![weak, close];
+        let function = table.function_by_name("ClearThreatTable").unwrap();
+        let mut host = crate::sim::ScriptHost {
+            sim: &mut s,
+            event: None,
+            script: "test".into(),
+        };
+        crate::engine::call(&mut host, me, function, &[Value::Object(me), Value::Int(0)])
+            .unwrap()
+            .unwrap();
+        let threats = &host.sim.world.get(me).unwrap().combat.threat;
+        assert_eq!(
+            threats[0],
+            Threat {
+                value: 0.0,
+                ..close
+            }
+        );
+        assert_eq!(threats[1], Threat { value: 0.0, ..weak });
+        crate::engine::call(&mut host, me, function, &[Value::Object(me)])
+            .unwrap()
+            .unwrap();
+        assert!(host.sim.world.get(me).unwrap().combat.threat.is_empty());
     }
 }
